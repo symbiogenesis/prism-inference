@@ -99,6 +99,7 @@ struct Observation {
     terminated: Arc<AtomicBool>,
     row_workers: Option<usize>,
     prompt_reuse: bonsai_prism_runtime::runtime::PromptReuse,
+    prompt_reuse_checkpoints: Option<usize>,
     kv_cache: Option<bonsai_prism_runtime::graph::KvCachePolicy>,
     cpu_prefill: Option<bonsai_prism_runtime::swift_session::CpuPrefill>,
     cpu_speculation: Option<bonsai_prism_runtime::swift_session::CpuSpeculation>,
@@ -144,6 +145,7 @@ impl worker::Engine for FakeEngine {
         Ok(ModelProfile {
             row_workers: self.0.row_workers.unwrap_or(1),
             prompt_reuse: self.0.prompt_reuse,
+            prompt_reuse_checkpoints: self.0.prompt_reuse_checkpoints.unwrap_or(1),
             kv_cache: self
                 .0
                 .kv_cache

@@ -8,9 +8,9 @@ use bonsai_prism_runtime::{
     model::swift::Representation,
     runtime::PromptReuse,
     swift_session::{
-        CpuPrefill, CpuSpeculation, DEFAULT_MAX_IMAGE_TOKENS, MAX_IMAGE_TOKENS, MIN_IMAGE_TOKENS,
-        MMPROJ_MEMORY_BYTES, SwiftSession, validate_context_capacity_with_kv,
-        validate_execution_capacity_with_kv,
+        BranchCheckpoints, CpuPrefill, CpuSpeculation, DEFAULT_MAX_IMAGE_TOKENS, MAX_IMAGE_TOKENS,
+        MIN_IMAGE_TOKENS, MMPROJ_MEMORY_BYTES, SwiftSession, validate_context_capacity_with_kv,
+        validate_execution_capacity_with_reuse,
     },
 };
 use bonsai_windows_credentials::validate_read_path;
@@ -38,6 +38,7 @@ struct Config {
     mmproj: Option<PathBuf>,
     image_max_tokens: usize,
     prompt_reuse: PromptReuse,
+    branch_checkpoints: BranchCheckpoints,
     kv_cache: KvCachePolicy,
     cpu_prefill: Option<CpuPrefill>,
     cpu_speculation: Option<CpuSpeculation>,
@@ -88,9 +89,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut mmproj = None;
     let mut image_max_tokens = None;
     let mut prompt_reuse = None;
+    let (mut reuse_checkpoints, mut reuse_checkpoint_bytes) = (None, None);
     let mut kv_cache = None;
     let mut placement = None;
-    let (mut prefill_tokens, mut prefill_scratch) = (None, None);
+    let (mut prefill_tokens, mut prefill_scratch, mut prefill_gdn) = (None, None, None);
     let (mut spec_type, mut draft_max) = (None, None);
     let (mut speculative_tokens, mut verification_scratch, mut speculative_checkpoint) =
         (None, None, None);
@@ -126,6 +128,13 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             }
             Some("--cpu-prefill-scratch-bytes") if prefill_scratch.is_none() => {
                 prefill_scratch = Some(value);
+            }
+            Some("--cpu-prefill-gdn") if prefill_gdn.is_none() => {
+                prefill_gdn = Some(match value.to_str() {
+                    Some("sequential") => false,
+                    Some("wy-f32") => true,
+                    _ => return Err(invalid()),
+                });
             }
             Some("--cpu-speculative-tokens") if speculative_tokens.is_none() => {
                 speculative_tokens = Some(value);
@@ -167,8 +176,15 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                 prompt_reuse = Some(match value.to_str() {
                     Some("disabled") => PromptReuse::Disabled,
                     Some("latest") => PromptReuse::Latest,
+                    Some("prompt-end-and-latest") => PromptReuse::PromptEndAndLatest,
                     _ => return Err(invalid()),
                 });
+            }
+            Some("--prompt-reuse-checkpoints") if reuse_checkpoints.is_none() => {
+                reuse_checkpoints = Some(value);
+            }
+            Some("--prompt-reuse-checkpoint-bytes") if reuse_checkpoint_bytes.is_none() => {
+                reuse_checkpoint_bytes = Some(value);
             }
             Some("--kv-cache") if kv_cache.is_none() => {
                 kv_cache = Some(match value.to_str() {
@@ -248,8 +264,9 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         mmproj,
         image_max_tokens: resolved_image_max_tokens,
         prompt_reuse: prompt_reuse.unwrap_or_default(),
+        branch_checkpoints: parse_branch_checkpoints(reuse_checkpoints, reuse_checkpoint_bytes)?,
         kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
-        cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch)?,
+        cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch, prefill_gdn)?,
         cpu_speculation: resolve_speculation(
             spec_type,
             draft_max,
@@ -266,17 +283,32 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     if config.mmproj.is_some() && config.cpu_speculation.is_some() {
         return Err(invalid());
     }
-    if config.cpu_prefill.is_some() || config.cpu_speculation.is_some() {
+    let requires_reuse_capacity = config.prompt_reuse == PromptReuse::PromptEndAndLatest
+        || config.branch_checkpoints.checkpoints() > 1
+        || config.branch_checkpoints.checkpoint_bytes().is_some();
+    if config.prompt_reuse == PromptReuse::Disabled
+        && (config.branch_checkpoints.checkpoints() > 1
+            || config.branch_checkpoints.checkpoint_bytes().is_some())
+    {
+        return Err(invalid());
+    }
+    if config.cpu_prefill.is_some()
+        || config.cpu_speculation.is_some()
+        || requires_reuse_capacity
+    {
         let (context, memory) = config.capacity.ok_or_else(invalid)?;
-        if kv_cache.is_none() {
+        if (config.cpu_prefill.is_some() || config.cpu_speculation.is_some()) && kv_cache.is_none()
+        {
             return Err(invalid());
         }
-        validate_execution_capacity_with_kv(
+        validate_execution_capacity_with_reuse(
             context,
             memory,
             config.cpu_prefill,
             config.cpu_speculation,
             config.kv_cache,
+            config.prompt_reuse,
+            config.branch_checkpoints,
         )
         .map_err(|_| invalid())?;
     }
@@ -337,9 +369,15 @@ fn resolve_speculation(
 fn parse_prefill(
     tokens: Option<OsString>,
     scratch: Option<OsString>,
+    chunkwise_gdn: Option<bool>,
 ) -> io::Result<Option<CpuPrefill>> {
     match (tokens, scratch) {
-        (None, None) => Ok(None),
+        (None, None) => {
+            if chunkwise_gdn.is_some() {
+                return Err(invalid());
+            }
+            Ok(None)
+        }
         (Some(tokens), Some(scratch)) => {
             let tokens = tokens
                 .to_str()
@@ -351,11 +389,37 @@ fn parse_prefill(
                 .ok_or_else(invalid)?
                 .parse::<usize>()
                 .map_err(|_| invalid())?;
-            CpuPrefill::new(tokens, scratch)
-                .map(Some)
-                .map_err(|_| invalid())
+            let prefill = CpuPrefill::new(tokens, scratch).map_err(|_| invalid())?;
+            Ok(Some(if chunkwise_gdn == Some(true) {
+                prefill.with_chunkwise_gdn()
+            } else {
+                prefill
+            }))
         }
         _ => Err(invalid()),
+    }
+}
+
+fn parse_branch_checkpoints(
+    checkpoints: Option<OsString>,
+    checkpoint_bytes: Option<OsString>,
+) -> io::Result<BranchCheckpoints> {
+    let parse_usize = |raw: OsString| -> io::Result<usize> {
+        raw.to_str()
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())
+    };
+    match (checkpoints, checkpoint_bytes) {
+        (None, None) => Ok(BranchCheckpoints::default()),
+        (Some(slots), None) => BranchCheckpoints::new(parse_usize(slots)?).map_err(|_| invalid()),
+        (None, Some(bytes)) => {
+            BranchCheckpoints::with_checkpoint_bytes(1, parse_usize(bytes)?).map_err(|_| invalid())
+        }
+        (Some(slots), Some(bytes)) => {
+            BranchCheckpoints::with_checkpoint_bytes(parse_usize(slots)?, parse_usize(bytes)?)
+                .map_err(|_| invalid())
+        }
     }
 }
 
@@ -546,7 +610,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     let prepared_transport = prepare_transport(&config.transport)?;
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
-    let mut session = SwiftSession::load_profile_with_execution(
+    let mut session = SwiftSession::load_profile_with_execution_and_reuse(
         &config.model,
         config.representation,
         config.adapter.as_deref(),
@@ -560,11 +624,10 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         ),
         config.cpu_prefill,
         config.cpu_speculation,
+        config.prompt_reuse,
+        config.branch_checkpoints,
     )
     .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
-    session
-        .set_prompt_reuse(config.prompt_reuse)
-        .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
     if let Some(ref mmproj) = config.mmproj {
         session
             .load_vision(mmproj, config.image_max_tokens)

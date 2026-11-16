@@ -78,6 +78,7 @@ impl Engine for SwiftSession {
             vision: self.has_vision(),
             image_max_tokens: self.has_vision().then(|| self.max_image_tokens()),
             prompt_reuse: self.prompt_reuse(),
+            prompt_reuse_checkpoints: self.prompt_reuse_checkpoints(),
             row_workers: self.row_workers(),
             context_tokens: self.context_tokens(),
             kv_cache: self.kv_cache_policy(),
@@ -610,6 +611,13 @@ fn valid_graph_profile(profile: &ModelProfile) -> bool {
     if profile.cpu_speculation.is_some() && profile.cpu_prefill.is_none() {
         return false;
     }
+    if !(1..=bonsai_prism_runtime::swift_session::MAX_REUSABLE_CHECKPOINTS)
+        .contains(&profile.prompt_reuse_checkpoints)
+        || (profile.prompt_reuse == bonsai_prism_runtime::runtime::PromptReuse::Disabled
+            && profile.prompt_reuse_checkpoints > 1)
+    {
+        return false;
+    }
     let Some(identity) = profile.startup_graph_identity.as_deref() else {
         return profile.kv_cache == KvCachePolicy::F16 && profile.cpu_prefill.is_none();
     };
@@ -636,7 +644,15 @@ fn valid_graph_profile(profile: &ModelProfile) -> bool {
                 && !identity.contains(":gdn-wy-f32-v1")
         },
         |prefill| {
+            if prefill.chunkwise_gdn()
+                && (profile.kv_cache != KvCachePolicy::F16 || profile.cpu_speculation.is_some())
+            {
+                return false;
+            }
             let mut suffix = format!(":cpu-tiled-ffn-v1:{}", prefill.tokens());
+            if prefill.chunkwise_gdn() {
+                suffix.push_str(":gdn-wy-f32-v1");
+            }
             if profile.cpu_speculation.is_some() {
                 suffix.push_str(":cpu-tiled-verify-v1");
             }
@@ -660,13 +676,20 @@ impl Worker {
     ) -> Result<Self, NativeBackendError> {
         let mut profile = engine.profile()?;
         profile.placement = placement;
+        let Ok(branch_checkpoints) = bonsai_prism_runtime::swift_session::BranchCheckpoints::new(
+            profile.prompt_reuse_checkpoints,
+        ) else {
+            return Err(NativeBackendError::Configuration);
+        };
         if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers)
-            || bonsai_prism_runtime::swift_session::validate_execution_capacity_with_kv(
+            || bonsai_prism_runtime::swift_session::validate_execution_capacity_with_reuse(
                 profile.context_tokens,
                 u64::MAX,
                 profile.cpu_prefill,
                 profile.cpu_speculation,
                 profile.kv_cache,
+                profile.prompt_reuse,
+                branch_checkpoints,
             )
             .is_err()
             || !valid_graph_profile(&profile)

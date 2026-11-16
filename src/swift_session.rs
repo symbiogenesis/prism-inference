@@ -158,15 +158,20 @@ pub fn validate_context_capacity_with_kv(
     Ok(())
 }
 
+/// Maximum number of reusable branch prefix checkpoints admitted by the runtime.
+pub const MAX_REUSABLE_CHECKPOINTS: usize = 8;
+
 /// Explicit exact CPU prompt tiles and their separately charged scratch reserve.
 ///
-/// The selected KV policy is retained. This uses sequential-GDN tile
-/// arithmetic, not the separately identified triangular GDN approximation.
+/// The selected KV policy is retained. By default this uses sequential-GDN tile
+/// arithmetic; calling [`Self::with_chunkwise_gdn`] selects the separately
+/// identified FP32 triangular GDN chunk algorithm on the FP16 KV profile.
 /// Owners must add the full reserve to their process allowance before loading.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuPrefill {
     tokens: usize,
     scratch_bytes: usize,
+    chunkwise_gdn: bool,
 }
 
 impl CpuPrefill {
@@ -186,7 +191,21 @@ impl CpuPrefill {
         Ok(Self {
             tokens,
             scratch_bytes,
+            chunkwise_gdn: false,
         })
+    }
+
+    /// Enable the separately identified FP32 triangular GDN chunk prefill algorithm.
+    #[must_use]
+    pub const fn with_chunkwise_gdn(mut self) -> Self {
+        self.chunkwise_gdn = true;
+        self
+    }
+
+    /// Whether the FP32 triangular chunkwise GDN prefill algorithm is enabled.
+    #[must_use]
+    pub const fn chunkwise_gdn(self) -> bool {
+        self.chunkwise_gdn
     }
 
     /// Maximum prompt tokens sharing one layer-major projection tile.
@@ -199,6 +218,69 @@ impl CpuPrefill {
     #[must_use]
     pub const fn scratch_bytes(self) -> usize {
         self.scratch_bytes
+    }
+}
+
+/// Explicit sparse multi-branch prefix checkpoint slots and optional byte reserve.
+///
+/// Retaining more than one reusable branch slot or enabling prompt-end capture
+/// charges `checkpoints * selected_state_budget` (or a larger explicit caller
+/// reserve) against the process memory allowance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BranchCheckpoints {
+    checkpoints: usize,
+    checkpoint_bytes: Option<usize>,
+}
+
+impl Default for BranchCheckpoints {
+    fn default() -> Self {
+        Self {
+            checkpoints: 1,
+            checkpoint_bytes: None,
+        }
+    }
+}
+
+impl BranchCheckpoints {
+    /// Construct a validated reusable checkpoint slot count (`1..=8`).
+    ///
+    /// # Errors
+    /// Rejects counts outside `1..=MAX_REUSABLE_CHECKPOINTS`.
+    pub fn new(checkpoints: usize) -> Result<Self> {
+        if !(1..=MAX_REUSABLE_CHECKPOINTS).contains(&checkpoints) {
+            return Err(invalid("branch checkpoint count must be from 1 through 8"));
+        }
+        Ok(Self {
+            checkpoints,
+            checkpoint_bytes: None,
+        })
+    }
+
+    /// Construct a validated reusable checkpoint slot count (`1..=8`) paired
+    /// with an explicit caller-charged checkpoint byte reserve.
+    ///
+    /// # Errors
+    /// Rejects counts outside `1..=MAX_REUSABLE_CHECKPOINTS` or a zero byte reserve.
+    pub fn with_checkpoint_bytes(checkpoints: usize, checkpoint_bytes: usize) -> Result<Self> {
+        if !(1..=MAX_REUSABLE_CHECKPOINTS).contains(&checkpoints) || checkpoint_bytes == 0 {
+            return Err(invalid("invalid branch checkpoint count or byte reserve"));
+        }
+        Ok(Self {
+            checkpoints,
+            checkpoint_bytes: Some(checkpoint_bytes),
+        })
+    }
+
+    /// Configured reusable checkpoint slot count (`1..=8`).
+    #[must_use]
+    pub const fn checkpoints(self) -> usize {
+        self.checkpoints
+    }
+
+    /// Explicit caller-supplied checkpoint byte reserve, when separately configured.
+    #[must_use]
+    pub const fn checkpoint_bytes(self) -> Option<usize> {
+        self.checkpoint_bytes
     }
 }
 
@@ -301,10 +383,72 @@ pub fn validate_execution_capacity(
     )
 }
 
+fn branch_checkpoint_charge(
+    context_tokens: usize,
+    kv_cache: KvCachePolicy,
+    prompt_reuse: PromptReuse,
+    branch_checkpoints: BranchCheckpoints,
+) -> Result<usize> {
+    if !(1..=MAX_REUSABLE_CHECKPOINTS).contains(&branch_checkpoints.checkpoints) {
+        return Err(invalid("branch checkpoint count must be from 1 through 8"));
+    }
+    if prompt_reuse == PromptReuse::Disabled {
+        if branch_checkpoints.checkpoints > 1 || branch_checkpoints.checkpoint_bytes.is_some() {
+            return Err(invalid(
+                "branch checkpoints require prompt reuse to be enabled",
+            ));
+        }
+        return Ok(0);
+    }
+    let state_budget = selected_state_budget(context_tokens, kv_cache)?;
+    let minimum = branch_checkpoints
+        .checkpoints
+        .checked_mul(state_budget)
+        .ok_or_else(|| invalid("Swift branch checkpoint reservation overflow"))?;
+    if let Some(explicit_bytes) = branch_checkpoints.checkpoint_bytes {
+        if explicit_bytes < minimum {
+            return Err(invalid(
+                "branch checkpoint reserve is below selected state budget",
+            ));
+        }
+        return Ok(explicit_bytes);
+    }
+    if branch_checkpoints.checkpoints > 1 || prompt_reuse == PromptReuse::PromptEndAndLatest {
+        return Ok(minimum);
+    }
+    Ok(0)
+}
+
+/// Validate selected-cache context, execution reserves, and sparse branch checkpoints.
+///
+/// Retaining more than one reusable branch checkpoint slot or selecting
+/// [`PromptReuse::PromptEndAndLatest`] charges `slots * selected_state_budget`
+/// (or a larger caller-supplied reserve) against `memory_limit_bytes`.
+///
+/// # Errors
+/// Rejects invalid pairing, undersized reserves, capacity overflow or insufficient allowance.
+pub fn validate_execution_capacity_with_reuse(
+    context_tokens: usize,
+    memory_limit_bytes: u64,
+    prefill: Option<CpuPrefill>,
+    speculation: Option<CpuSpeculation>,
+    kv_cache: KvCachePolicy,
+    prompt_reuse: PromptReuse,
+    branch_checkpoints: BranchCheckpoints,
+) -> Result<()> {
+    let branch_charge =
+        branch_checkpoint_charge(context_tokens, kv_cache, prompt_reuse, branch_checkpoints)?;
+    let available = memory_limit_bytes
+        .checked_sub(u64::try_from(branch_charge)?)
+        .ok_or_else(|| invalid("Swift branch checkpoint memory allowance rejected"))?;
+    validate_execution_capacity_with_kv(context_tokens, available, prefill, speculation, kv_cache)
+}
+
 /// Validate selected-cache context plus complete tile and speculative reserves.
 ///
 /// # Errors
-/// Rejects context/state limits, missing tiles, insufficient reserves or overflow.
+/// Rejects context/state limits, missing tiles, incompatible chunkwise GDN,
+/// insufficient reserves or overflow.
 pub fn validate_execution_capacity_with_kv(
     context_tokens: usize,
     memory_limit_bytes: u64,
@@ -312,6 +456,11 @@ pub fn validate_execution_capacity_with_kv(
     speculation: Option<CpuSpeculation>,
     kv_cache: KvCachePolicy,
 ) -> Result<()> {
+    if prefill.is_some_and(CpuPrefill::chunkwise_gdn) && speculation.is_some() {
+        return Err(invalid(
+            "chunkwise GDN prefill is incompatible with CPU speculation",
+        ));
+    }
     let additional = if let Some(speculation) = speculation {
         if prefill.is_none()
             || speculation.checkpoint_bytes < selected_state_budget(context_tokens, kv_cache)?
@@ -356,13 +505,19 @@ pub fn validate_prefill_capacity(
 /// Validate selected-cache context and the entire additional tile reservation.
 ///
 /// # Errors
-/// Rejects invalid context capacity, insufficient memory and reservation overflow.
+/// Rejects invalid context capacity, non-FP16 chunkwise GDN, insufficient memory
+/// and reservation overflow.
 pub fn validate_prefill_capacity_with_kv(
     context_tokens: usize,
     memory_limit_bytes: u64,
     prefill: Option<CpuPrefill>,
     kv_cache: KvCachePolicy,
 ) -> Result<()> {
+    if prefill.is_some_and(CpuPrefill::chunkwise_gdn) && kv_cache != KvCachePolicy::F16 {
+        return Err(invalid(
+            "chunkwise GDN prefill requires the separate FP16 KV cache profile",
+        ));
+    }
     let reserve = prefill.map_or(0, CpuPrefill::scratch_bytes);
     let available = memory_limit_bytes
         .checked_sub(u64::try_from(reserve)?)
@@ -590,6 +745,8 @@ pub struct SwiftSession {
     seed: u32,
     delivery_fault: bool,
     prompt_reuse: PromptReuse,
+    branch_checkpoints: BranchCheckpoints,
+    runtime_checkpoints: usize,
     last_speculative_stats: Option<SpeculativeStats>,
     vision: Option<Arc<SwiftVisionEncoder>>,
     mmproj_receipt: Option<MmprojLoadReceipt>,
@@ -806,6 +963,49 @@ impl SwiftSession {
         cpu_prefill: Option<CpuPrefill>,
         cpu_speculation: Option<CpuSpeculation>,
     ) -> Result<Self> {
+        Self::load_profile_with_execution_and_reuse(
+            path,
+            representation,
+            adapter_path,
+            backend,
+            seed,
+            parallelism,
+            kv_cache,
+            context_tokens,
+            cpu_prefill,
+            cpu_speculation,
+            PromptReuse::Disabled,
+            BranchCheckpoints::default(),
+        )
+    }
+
+    /// Load an immutable CPU/accelerator profile with explicit prompt-reuse and
+    /// sparse multi-branch checkpoint retention (`1..=8` reusable slots).
+    ///
+    /// Invalid combinations (including chunkwise GDN outside FP16 or alongside
+    /// speculation, and branch checkpoints when reuse is disabled) reject before
+    /// any artifact I/O.
+    ///
+    /// # Errors
+    /// Returns execution/reuse admission, artifact, graph and allocation failures.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Explicit prompt reuse and branch checkpoint slots extend the immutable execution loader."
+    )]
+    pub fn load_profile_with_execution_and_reuse(
+        path: &Path,
+        representation: Representation,
+        adapter_path: Option<&Path>,
+        backend: MatvecBackend,
+        seed: u32,
+        parallelism: RowParallelism,
+        kv_cache: KvCachePolicy,
+        context_tokens: usize,
+        cpu_prefill: Option<CpuPrefill>,
+        cpu_speculation: Option<CpuSpeculation>,
+        prompt_reuse: PromptReuse,
+        branch_checkpoints: BranchCheckpoints,
+    ) -> Result<Self> {
         Self::load_selected_profile(
             path,
             representation,
@@ -817,6 +1017,8 @@ impl SwiftSession {
             context_tokens,
             cpu_prefill,
             cpu_speculation,
+            prompt_reuse,
+            branch_checkpoints,
         )
     }
 
@@ -856,6 +1058,8 @@ impl SwiftSession {
             context_tokens,
             None,
             None,
+            PromptReuse::Disabled,
+            BranchCheckpoints::default(),
         )
     }
 
@@ -874,21 +1078,28 @@ impl SwiftSession {
         context_tokens: usize,
         cpu_prefill: Option<CpuPrefill>,
         cpu_speculation: Option<CpuSpeculation>,
+        prompt_reuse: PromptReuse,
+        branch_checkpoints: BranchCheckpoints,
     ) -> Result<Self> {
         if let AdapterSelection::Edited(candidate) = &adapter_selection {
             candidate.validate_identity()?;
         }
-        validate_execution_capacity_with_kv(
+        validate_execution_capacity_with_reuse(
             context_tokens,
             u64::MAX,
             cpu_prefill,
             cpu_speculation,
             kv_cache,
+            prompt_reuse,
+            branch_checkpoints,
         )?;
         let state_budget = selected_state_budget(context_tokens, kv_cache)?;
+        let branch_budget =
+            branch_checkpoint_charge(context_tokens, kv_cache, prompt_reuse, branch_checkpoints)?;
         let checkpoint_budget = CHECKPOINT_MEMORY_BYTES
             .max(state_budget)
             .checked_add(cpu_speculation.map_or(0, CpuSpeculation::checkpoint_bytes))
+            .and_then(|bytes| bytes.checked_add(branch_budget))
             .ok_or_else(|| invalid("Swift checkpoint reservation overflow"))?;
         let sampler = SwiftSampler::new(seed)?;
         let (model, receipt) =
@@ -921,18 +1132,27 @@ impl SwiftSession {
         decoder.set_row_parallelism(parallelism);
         if let Some(prefill) = cpu_prefill {
             decoder = decoder.with_tiled_prefill(prefill.tokens, prefill.scratch_bytes)?;
+            if prefill.chunkwise_gdn() {
+                decoder = decoder.with_chunkwise_gdn_prefill()?;
+            }
         }
         if let Some(speculation) = cpu_speculation {
             decoder = decoder.with_tiled_verification(speculation.verification_scratch_bytes)?;
         }
-        let runtime = Runtime::new(
+        let runtime_checkpoints = if prompt_reuse == PromptReuse::Disabled {
+            0
+        } else {
+            branch_checkpoints.checkpoints()
+        };
+        let mut runtime = Runtime::new(
             decoder,
             Limits {
                 context_tokens,
-                checkpoints: 0,
+                checkpoints: runtime_checkpoints,
                 checkpoint_bytes: checkpoint_budget,
             },
         )?;
+        runtime.set_retain_prompt_end(prompt_reuse == PromptReuse::PromptEndAndLatest);
         Ok(Self {
             owner: Arc::new(()),
             representation,
@@ -947,7 +1167,9 @@ impl SwiftSession {
             sampler,
             seed,
             delivery_fault: false,
-            prompt_reuse: PromptReuse::Disabled,
+            prompt_reuse,
+            branch_checkpoints,
+            runtime_checkpoints,
             last_speculative_stats: None,
             vision: None,
             mmproj_receipt: None,
@@ -1076,6 +1298,18 @@ impl SwiftSession {
         self.prompt_reuse
     }
 
+    /// Configured sparse multi-branch prefix checkpoint slot count (`1..=8`).
+    #[must_use]
+    pub const fn prompt_reuse_checkpoints(&self) -> usize {
+        self.branch_checkpoints.checkpoints()
+    }
+
+    /// Configured sparse multi-branch prefix checkpoint selection and optional reserve.
+    #[must_use]
+    pub const fn branch_checkpoints(&self) -> BranchCheckpoints {
+        self.branch_checkpoints
+    }
+
     /// Select exact latest-state reuse, clearing live state when policy changes.
     ///
     /// No extra prefix snapshots are retained. This experimental policy requires
@@ -1171,8 +1405,8 @@ impl SwiftSession {
     ) -> Result<SwiftExecutionMemoryLedger> {
         let checkpoint_slots = match self.prompt_reuse {
             PromptReuse::Disabled => 1,
-            PromptReuse::Latest => 2,
-            PromptReuse::PromptEndAndLatest => 3,
+            PromptReuse::Latest => 1 + self.branch_checkpoints.checkpoints(),
+            PromptReuse::PromptEndAndLatest => 2 + self.branch_checkpoints.checkpoints(),
         };
         SwiftExecutionMemoryLedger::for_swift_profile(
             self.context_tokens(),
@@ -1502,7 +1736,7 @@ impl SwiftSession {
         let completion = if is_multimodal {
             execute_multimodal_completion(
                 &mut self.runtime,
-                self.prompt_reuse,
+                self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0,
                 &mut self.sampler,
                 prompt,
                 &options,
@@ -1524,7 +1758,7 @@ impl SwiftSession {
             )?;
             recorded_stats = Some(stats);
             completion
-        } else if self.prompt_reuse == PromptReuse::Disabled {
+        } else if self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0 {
             self.runtime.generate_sampled_until_for_reset(
                 &prompt.tokens,
                 &options,
@@ -1578,7 +1812,7 @@ impl SwiftSession {
 )]
 fn execute_multimodal_completion(
     runtime: &mut Runtime<Qwen35>,
-    prompt_reuse: PromptReuse,
+    reset_only: bool,
     sampler: &mut SwiftSampler,
     prompt: &PreparedChat,
     options: &crate::runtime::Generation,
@@ -1595,7 +1829,7 @@ fn execute_multimodal_completion(
             embeddings: &chunk.encoded.embeddings,
         })
         .collect();
-    if prompt_reuse == PromptReuse::Disabled {
+    if reset_only {
         runtime.generate_multimodal_sampled_until_for_reset(
             &prompt.tokens,
             &chunks,
@@ -2334,6 +2568,270 @@ mod tests {
         );
         assert!(super::validate_multimodal_budget(&parsed, 1021, 1024).is_err());
         super::validate_multimodal_budget(&parsed, 64, 1024)?;
+        Ok(())
+    }
+
+    #[test]
+    fn chunkwise_gdn_requires_fp16_without_speculation_before_artifact_io() -> Result<()> {
+        let context = 8_192;
+        let reserve = 64 * 1024 * 1024;
+        let sequential = CpuPrefill::new(16, reserve)?;
+        assert!(!sequential.chunkwise_gdn());
+        let chunkwise = sequential.with_chunkwise_gdn();
+        assert!(chunkwise.chunkwise_gdn());
+        assert_eq!(chunkwise.tokens(), 16);
+        assert_eq!(chunkwise.scratch_bytes(), reserve);
+
+        let f16_required = NON_CONTEXT_MEMORY_BYTES
+            + u64::try_from(context)? * context_token_memory_bytes(KvCachePolicy::F16)
+            + u64::try_from(reserve)?;
+        super::validate_prefill_capacity_with_kv(
+            context,
+            f16_required,
+            Some(chunkwise),
+            KvCachePolicy::F16,
+        )?;
+        validate_execution_capacity_with_kv(
+            context,
+            f16_required,
+            Some(chunkwise),
+            None,
+            KvCachePolicy::F16,
+        )?;
+
+        for rotated in [
+            KvCachePolicy::Rotated4,
+            KvCachePolicy::Rotated4FittedValues,
+            KvCachePolicy::Rotated4Keys3Values,
+        ] {
+            assert!(
+                super::validate_prefill_capacity_with_kv(
+                    context,
+                    u64::MAX,
+                    Some(chunkwise),
+                    rotated
+                )
+                .is_err()
+            );
+            assert!(
+                validate_execution_capacity_with_kv(
+                    context,
+                    u64::MAX,
+                    Some(chunkwise),
+                    None,
+                    rotated
+                )
+                .is_err()
+            );
+            let error = SwiftSession::load_profile_with_execution(
+                Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
+                Representation::Pq2,
+                None,
+                MatvecBackend::Scalar,
+                42,
+                RowParallelism::default(),
+                rotated,
+                context,
+                Some(chunkwise),
+                None,
+            )
+            .err()
+            .ok_or("non-FP16 chunkwise GDN reached artifact loading")?;
+            assert_eq!(
+                error.to_string(),
+                "chunkwise GDN prefill requires the separate FP16 KV cache profile"
+            );
+        }
+
+        let speculation = CpuSpeculation::new(4, 16 * 1024 * 1024, STATE_MEMORY_BYTES)?;
+        assert!(
+            validate_execution_capacity_with_kv(
+                context,
+                u64::MAX,
+                Some(chunkwise),
+                Some(speculation),
+                KvCachePolicy::F16,
+            )
+            .is_err()
+        );
+        let error = SwiftSession::load_profile_with_execution(
+            Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
+            Representation::Pq2,
+            None,
+            MatvecBackend::Scalar,
+            42,
+            RowParallelism::default(),
+            KvCachePolicy::F16,
+            context,
+            Some(chunkwise),
+            Some(speculation),
+        )
+        .err()
+        .ok_or("speculative chunkwise GDN reached artifact loading")?;
+        assert_eq!(
+            error.to_string(),
+            "chunkwise GDN prefill is incompatible with CPU speculation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn branch_checkpoints_charge_explicit_state_budgets_and_reject_invalid_bounds() -> Result<()> {
+        use super::{
+            BranchCheckpoints, MAX_REUSABLE_CHECKPOINTS, validate_execution_capacity_with_reuse,
+        };
+        use crate::runtime::PromptReuse;
+
+        assert_eq!(MAX_REUSABLE_CHECKPOINTS, 8);
+        assert_eq!(BranchCheckpoints::default().checkpoints(), 1);
+        assert_eq!(BranchCheckpoints::default().checkpoint_bytes(), None);
+        for invalid_slots in [0, MAX_REUSABLE_CHECKPOINTS + 1, usize::MAX] {
+            assert!(BranchCheckpoints::new(invalid_slots).is_err());
+            assert!(BranchCheckpoints::with_checkpoint_bytes(invalid_slots, 1).is_err());
+        }
+        assert!(BranchCheckpoints::with_checkpoint_bytes(1, 0).is_err());
+
+        let context = 8_192;
+        let cache = KvCachePolicy::Rotated4;
+        let base = NON_CONTEXT_MEMORY_BYTES
+            + u64::try_from(context)? * context_token_memory_bytes(cache);
+        let state_budget = u64::try_from(selected_state_budget(context, cache)?)?;
+
+        // Default checkpoints=1 with Disabled or Latest adds no extra process reserve.
+        for reuse in [PromptReuse::Disabled, PromptReuse::Latest] {
+            validate_execution_capacity_with_reuse(
+                context,
+                base,
+                None,
+                None,
+                cache,
+                reuse,
+                BranchCheckpoints::default(),
+            )?;
+        }
+
+        // Disabled rejects slots > 1 or explicit checkpoint reserves before artifact I/O.
+        for bad in [
+            BranchCheckpoints::new(2)?,
+            BranchCheckpoints::with_checkpoint_bytes(1, selected_state_budget(context, cache)?)?,
+        ] {
+            assert!(
+                validate_execution_capacity_with_reuse(
+                    context,
+                    u64::MAX,
+                    None,
+                    None,
+                    cache,
+                    PromptReuse::Disabled,
+                    bad,
+                )
+                .is_err()
+            );
+            assert!(
+                SwiftSession::load_profile_with_execution_and_reuse(
+                    Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
+                    Representation::Pq2,
+                    None,
+                    MatvecBackend::Scalar,
+                    42,
+                    RowParallelism::default(),
+                    cache,
+                    context,
+                    None,
+                    None,
+                    PromptReuse::Disabled,
+                    bad,
+                )
+                .is_err()
+            );
+        }
+
+        // PromptEndAndLatest with slots=1 charges 1 * selected_state_budget.
+        let prompt_end_required = base + state_budget;
+        validate_execution_capacity_with_reuse(
+            context,
+            prompt_end_required,
+            None,
+            None,
+            cache,
+            PromptReuse::PromptEndAndLatest,
+            BranchCheckpoints::default(),
+        )?;
+        assert!(
+            validate_execution_capacity_with_reuse(
+                context,
+                prompt_end_required - 1,
+                None,
+                None,
+                cache,
+                PromptReuse::PromptEndAndLatest,
+                BranchCheckpoints::default(),
+            )
+            .is_err()
+        );
+
+        // Multi-branch slots (2..=8) charge slots * selected_state_budget for both reuse modes.
+        for slots in 2..=MAX_REUSABLE_CHECKPOINTS {
+            let branches = BranchCheckpoints::new(slots)?;
+            let required = base + u64::try_from(slots)? * state_budget;
+            for reuse in [PromptReuse::Latest, PromptReuse::PromptEndAndLatest] {
+                validate_execution_capacity_with_reuse(
+                    context, required, None, None, cache, reuse, branches,
+                )?;
+                assert!(
+                    validate_execution_capacity_with_reuse(
+                        context,
+                        required - 1,
+                        None,
+                        None,
+                        cache,
+                        reuse,
+                        branches,
+                    )
+                    .is_err()
+                );
+            }
+        }
+
+        // Explicit byte reserve rejects undersized values and charges the full caller reserve.
+        let min_four = 4 * selected_state_budget(context, cache)?;
+        let undersized = BranchCheckpoints::with_checkpoint_bytes(4, min_four - 1)?;
+        assert!(
+            validate_execution_capacity_with_reuse(
+                context,
+                u64::MAX,
+                None,
+                None,
+                cache,
+                PromptReuse::Latest,
+                undersized,
+            )
+            .is_err()
+        );
+        let extra = min_four + 64 * 1024 * 1024;
+        let explicit = BranchCheckpoints::with_checkpoint_bytes(4, extra)?;
+        let required_explicit = base + u64::try_from(extra)?;
+        validate_execution_capacity_with_reuse(
+            context,
+            required_explicit,
+            None,
+            None,
+            cache,
+            PromptReuse::Latest,
+            explicit,
+        )?;
+        assert!(
+            validate_execution_capacity_with_reuse(
+                context,
+                required_explicit - 1,
+                None,
+                None,
+                cache,
+                PromptReuse::Latest,
+                explicit,
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

@@ -134,6 +134,7 @@ pub(super) struct ModelProfile {
     pub vision: bool,
     pub image_max_tokens: Option<usize>,
     pub prompt_reuse: PromptReuse,
+    pub prompt_reuse_checkpoints: usize,
     pub row_workers: usize,
     pub context_tokens: usize,
     pub kv_cache: KvCachePolicy,
@@ -152,6 +153,7 @@ impl Default for ModelProfile {
             vision: false,
             image_max_tokens: None,
             prompt_reuse: PromptReuse::default(),
+            prompt_reuse_checkpoints: 1,
             row_workers: 1,
             context_tokens: swift::CONTEXT_TOKENS,
             kv_cache: KvCachePolicy::F16,
@@ -194,8 +196,15 @@ impl ModelProfile {
                 model["image_max_tokens"] = json!(max_tokens);
             }
         }
-        if self.prompt_reuse == PromptReuse::Latest {
-            model["prompt_reuse"] = json!("latest");
+        match self.prompt_reuse {
+            PromptReuse::Disabled => {}
+            PromptReuse::Latest => model["prompt_reuse"] = json!("latest"),
+            PromptReuse::PromptEndAndLatest => {
+                model["prompt_reuse"] = json!("prompt-end-and-latest");
+            }
+        }
+        if self.prompt_reuse_checkpoints > 1 {
+            model["prompt_reuse_checkpoints"] = json!(self.prompt_reuse_checkpoints);
         }
         if self.kv_cache != KvCachePolicy::F16 {
             model["kv_cache"] = json!(self.kv_cache.name());
@@ -203,6 +212,9 @@ impl ModelProfile {
         if let Some(prefill) = self.cpu_prefill {
             model["cpu_prefill_tokens"] = json!(prefill.tokens());
             model["cpu_prefill_scratch_bytes"] = json!(prefill.scratch_bytes());
+            if prefill.chunkwise_gdn() {
+                model["cpu_prefill_gdn"] = json!("wy-f32");
+            }
         }
         if let Some(speculation) = self.cpu_speculation {
             model["cpu_speculative_tokens"] = json!(speculation.tokens());

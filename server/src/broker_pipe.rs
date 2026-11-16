@@ -20,6 +20,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -278,12 +279,13 @@ pub struct VerifiedSectionDescriptor {
 
 struct SectionState {
     sections: Vec<VerifiedSectionDescriptor>,
+    sealed: bool,
     ready: bool,
+    reader_closed: bool,
 }
 
 struct SectionShared {
     state: Mutex<SectionState>,
-    #[cfg(test)]
     updated: Condvar,
 }
 
@@ -292,9 +294,10 @@ impl SectionShared {
         Arc::new(Self {
             state: Mutex::new(SectionState {
                 sections: Vec::new(),
+                sealed: false,
                 ready: false,
+                reader_closed: false,
             }),
-            #[cfg(test)]
             updated: Condvar::new(),
         })
     }
@@ -406,15 +409,8 @@ impl ServerEndpoint {
         ))
     }
 
-    /// Returns broker-attested section descriptors received before server readiness.
+    /// Returns broker-attested section descriptors sealed before readiness.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Consumed by attested section mapping during service integration."
-        )
-    )]
     #[expect(
         unreachable_pub,
         reason = "broker_pipe is crate-private until attested section intake is exposed externally."
@@ -423,23 +419,55 @@ impl ServerEndpoint {
         self.verified_sections.get().map_or(&[], Vec::as_slice)
     }
 
-    #[cfg(test)]
-    fn wait_for_verified_sections(&self, expected: usize) -> io::Result<()> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut guard = lock_unpoisoned(&self.sections.state);
-        while guard.sections.len() < expected {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+    /// Waits up to `timeout` for exactly `expected` attested section frames and
+    /// seals the list against later frames.
+    ///
+    /// # Errors
+    /// Returns `TimedOut` if fewer than `expected` frames arrive in time, or
+    /// `InvalidData` / `AlreadyExists` if more than `expected` arrived or the
+    /// section list was already sealed or marked ready.
+    pub(crate) fn wait_for_verified_sections(
+        &self,
+        expected: usize,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        let snapshot = {
+            let mut guard = lock_unpoisoned(&self.sections.state);
+            if guard.sealed || guard.ready {
                 return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for verified section intake",
+                    io::ErrorKind::AlreadyExists,
+                    "verified sections already sealed",
                 ));
-            };
-            guard = match self.sections.updated.wait_timeout(guard, remaining) {
-                Ok((guard, _)) => guard,
-                Err(poisoned) => poisoned.into_inner().0,
-            };
-        }
-        drop(guard);
+            }
+            while guard.sections.len() < expected {
+                if guard.reader_closed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "broker pipe closed before verified section intake completed",
+                    ));
+                }
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for verified section intake",
+                    ));
+                };
+                guard = match self.sections.updated.wait_timeout(guard, remaining) {
+                    Ok((guard, _)) => guard,
+                    Err(poisoned) => poisoned.into_inner().0,
+                };
+            }
+            if guard.sections.len() != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected verified section frame count",
+                ));
+            }
+            guard.sealed = true;
+            guard.sections.clone()
+        };
+        let _ = self.verified_sections.set(snapshot);
         Ok(())
     }
 
@@ -817,6 +845,7 @@ fn handle_verified_section_frame<R: Read>(
     let descriptor = decode_verified_section(&payload)?;
     let mut section_state = lock_unpoisoned(&sections.state);
     if section_state.ready
+        || section_state.sealed
         || section_state.sections.len() >= MAX_VERIFIED_SECTIONS
         || section_state
             .sections
@@ -830,7 +859,6 @@ fn handle_verified_section_frame<R: Read>(
     }
     section_state.sections.push(descriptor);
     drop(section_state);
-    #[cfg(test)]
     sections.updated.notify_all();
     Ok(())
 }
@@ -985,6 +1013,10 @@ fn run_reader<R: Read>(
             }
         }
     }
+    let mut section_state = lock_unpoisoned(&sections.state);
+    section_state.reader_closed = true;
+    drop(section_state);
+    sections.updated.notify_all();
 }
 
 fn run_writer<W: Write>(mut writer: W, tx: &Arc<TxShared>, pool: &BufferPool) {
@@ -1354,8 +1386,8 @@ mod tests {
     }
 
     #[test]
-    fn verified_section_frames_store_up_to_eight_before_ready_and_preserve_streams() -> io::Result<()>
-    {
+    fn verified_section_frames_store_up_to_eight_before_ready_and_preserve_streams()
+    -> io::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -1385,7 +1417,8 @@ mod tests {
                     sha256: digest,
                 });
             }
-            endpoint.wait_for_verified_sections(MAX_VERIFIED_SECTIONS)?;
+            endpoint.wait_for_verified_sections(MAX_VERIFIED_SECTIONS, Duration::from_secs(2))?;
+            assert_eq!(endpoint.verified_sections(), expected.as_slice());
             endpoint.mark_ready()?;
             assert_eq!(
                 read_frame(&mut c_to_p_r)?,
@@ -1406,10 +1439,7 @@ mod tests {
             conn.write_all(b"pong").await?;
             conn.shutdown().await?;
             drop(conn);
-            assert_eq!(
-                read_frame(&mut c_to_p_r)?,
-                (1, KIND_DATA, b"pong".to_vec())
-            );
+            assert_eq!(read_frame(&mut c_to_p_r)?, (1, KIND_DATA, b"pong".to_vec()));
             assert_eq!(read_frame(&mut c_to_p_r)?, (1, KIND_EOF, Vec::new()));
             drop(p_to_c_w);
             assert!(endpoint.accept().await?.is_none());
@@ -1482,12 +1512,8 @@ mod tests {
                 c_to_p_r.read_exact(&mut ack)?;
                 for idx in 0..=MAX_VERIFIED_SECTIONS {
                     let slot = u32::try_from(idx + 1).map_err(io::Error::other)?;
-                    let payload = encode_section_payload(
-                        slot,
-                        0x100 + u64::from(slot),
-                        4096,
-                        [0xCC; 32],
-                    );
+                    let payload =
+                        encode_section_payload(slot, 0x100 + u64::from(slot), 4096, [0xCC; 32]);
                     write_frame(&mut p_to_c_w, 0, KIND_VERIFIED_SECTION, &payload)?;
                 }
                 assert!(endpoint.accept().await.is_err());

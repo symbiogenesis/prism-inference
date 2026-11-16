@@ -54,6 +54,10 @@ pub const STATE_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 pub const CHECKPOINT_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 /// Conservative fixed model/runtime allowance, excluding context growth.
 pub const NON_CONTEXT_MEMORY_BYTES: u64 = 11 * 1024 * 1024 * 1024;
+/// Calibrated fixed model/runtime allowance for the repacked PTQ1 export (`PQ2 - PTQ1 = 1_259_520_000`).
+pub const PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES: u64 = NON_CONTEXT_MEMORY_BYTES - 1_259_520_000;
+/// Maximum unsealed tail page tokens kept writable across copy-on-write rollback copies.
+pub const COW_UNSEALED_TAIL_TOKENS: usize = 64;
 /// Native sequential FP16 live/rollback KV, attention scores and bookkeeping.
 /// Publisher microbatch scratch is a separate execution profile.
 pub const CONTEXT_TOKEN_MEMORY_BYTES: u64 = 2 * 65_536 + 24 * 4 + 128;
@@ -349,7 +353,11 @@ impl CpuSpeculation {
     }
 }
 
-fn selected_state_budget(context_tokens: usize, kv_cache: KvCachePolicy) -> Result<usize> {
+/// Selected state/checkpoint budget required for `context_tokens` and `kv_cache`.
+///
+/// # Errors
+/// Rejects out-of-range context tokens or checked arithmetic overflow.
+pub fn selected_state_budget(context_tokens: usize, kv_cache: KvCachePolicy) -> Result<usize> {
     validate_context_capacity_with_kv(context_tokens, u64::MAX, kv_cache)?;
     let bytes = context_tokens
         .checked_mul(kv_token_memory_bytes(kv_cache) + 96 + 128)
@@ -442,6 +450,127 @@ pub fn validate_execution_capacity_with_reuse(
         .checked_sub(u64::try_from(branch_charge)?)
         .ok_or_else(|| invalid("Swift branch checkpoint memory allowance rejected"))?;
     validate_execution_capacity_with_kv(context_tokens, available, prefill, speculation, kv_cache)
+}
+
+/// Compute the calibrated physical process allowance for an explicit `CoW` shape.
+///
+/// Pairs representation-calibrated fixed runtime bytes (`PQ2_0` or repacked
+/// `PTQ1_0`), explicit `F32` recurrent/convolution copies (active, rollback,
+/// prompt-reuse/branch slots, and speculative verification copy), copy-on-write
+/// sealed-page `KV` storage (one shared history plus a 64-token unsealed tail),
+/// and prefill/speculation execution scratch.
+///
+/// # Errors
+/// Rejects invalid context/KV bounds, incompatible execution options, undersized
+/// caller reserves, or checked arithmetic overflow.
+pub fn calibrated_cow_execution_memory_bytes(
+    context_tokens: usize,
+    representation: Representation,
+    prefill: Option<CpuPrefill>,
+    speculation: Option<CpuSpeculation>,
+    kv_cache: KvCachePolicy,
+    prompt_reuse: PromptReuse,
+    branch_checkpoints: BranchCheckpoints,
+) -> Result<u64> {
+    validate_execution_capacity_with_reuse(
+        context_tokens,
+        u64::MAX,
+        prefill,
+        speculation,
+        kv_cache,
+        prompt_reuse,
+        branch_checkpoints,
+    )?;
+    let fixed_bytes = match representation {
+        Representation::Pq2 => NON_CONTEXT_MEMORY_BYTES,
+        Representation::CurrentRepackedPtq1 => PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES,
+    };
+    let reuse_slots = match prompt_reuse {
+        PromptReuse::Disabled => 0_usize,
+        PromptReuse::Latest => branch_checkpoints.checkpoints(),
+        PromptReuse::PromptEndAndLatest => branch_checkpoints
+            .checkpoints()
+            .checked_add(1)
+            .ok_or_else(|| invalid("Swift reuse checkpoint count overflow"))?,
+    };
+    let base_copies = 2_usize
+        .checked_add(usize::from(speculation.is_some()))
+        .ok_or_else(|| invalid("Swift recurrent copy count overflow"))?;
+    let base_recurrent_bytes = u64::try_from(base_copies)?
+        .checked_mul(u64::try_from(RECURRENT_MEMORY_BYTES)?)
+        .ok_or_else(|| invalid("Swift base recurrent memory overflow"))?;
+    let min_reuse_bytes = u64::try_from(reuse_slots)?
+        .checked_mul(u64::try_from(RECURRENT_MEMORY_BYTES)?)
+        .ok_or_else(|| invalid("Swift reuse recurrent memory overflow"))?;
+    let reuse_recurrent_bytes = branch_checkpoints
+        .checkpoint_bytes()
+        .map_or(Ok(min_reuse_bytes), |explicit| {
+            u64::try_from(explicit).map(|explicit_u64| explicit_u64.max(min_reuse_bytes))
+        })?;
+    let recurrent_bytes = base_recurrent_bytes
+        .checked_add(reuse_recurrent_bytes)
+        .ok_or_else(|| invalid("Swift total recurrent memory overflow"))?;
+
+    let kv_bytes = u64::try_from(kv_token_memory_bytes(kv_cache))?;
+    let per_token_cow = kv_bytes
+        .checked_add(96 + 128)
+        .ok_or_else(|| invalid("Swift CoW token memory overflow"))?;
+    let shared_kv = u64::try_from(context_tokens)?
+        .checked_mul(per_token_cow)
+        .ok_or_else(|| invalid("Swift CoW shared KV overflow"))?;
+    let unsealed_tail = u64::try_from(context_tokens.min(COW_UNSEALED_TAIL_TOKENS))?
+        .checked_mul(kv_bytes)
+        .ok_or_else(|| invalid("Swift CoW tail KV overflow"))?;
+    let cow_kv_bytes = shared_kv
+        .checked_add(unsealed_tail)
+        .ok_or_else(|| invalid("Swift CoW total KV overflow"))?;
+
+    let prefill_scratch = u64::try_from(prefill.map_or(0, CpuPrefill::scratch_bytes))?;
+    let verify_scratch =
+        u64::try_from(speculation.map_or(0, CpuSpeculation::verification_scratch_bytes))?;
+    let scratch_bytes = prefill_scratch
+        .checked_add(verify_scratch)
+        .ok_or_else(|| invalid("Swift CoW scratch overflow"))?;
+
+    fixed_bytes
+        .checked_add(recurrent_bytes)
+        .and_then(|bytes| bytes.checked_add(cow_kv_bytes))
+        .and_then(|bytes| bytes.checked_add(scratch_bytes))
+        .ok_or_else(|| invalid("Swift calibrated CoW capacity overflow"))
+}
+
+/// Validate a calibrated representation- and CoW-aware process memory allowance.
+///
+/// # Errors
+/// Rejects invalid context/execution combinations or `memory_limit_bytes` below
+/// [`calibrated_cow_execution_memory_bytes`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Validates calibrated physical capacity before artifact I/O using explicit shape fields."
+)]
+pub fn validate_calibrated_cow_execution_capacity(
+    context_tokens: usize,
+    memory_limit_bytes: u64,
+    representation: Representation,
+    prefill: Option<CpuPrefill>,
+    speculation: Option<CpuSpeculation>,
+    kv_cache: KvCachePolicy,
+    prompt_reuse: PromptReuse,
+    branch_checkpoints: BranchCheckpoints,
+) -> Result<()> {
+    let required = calibrated_cow_execution_memory_bytes(
+        context_tokens,
+        representation,
+        prefill,
+        speculation,
+        kv_cache,
+        prompt_reuse,
+        branch_checkpoints,
+    )?;
+    if memory_limit_bytes < required {
+        return Err(invalid("Swift calibrated CoW memory allowance rejected"));
+    }
+    Ok(())
 }
 
 /// Validate selected-cache context plus complete tile and speculative reserves.
@@ -2693,8 +2822,8 @@ mod tests {
 
         let context = 8_192;
         let cache = KvCachePolicy::Rotated4;
-        let base = NON_CONTEXT_MEMORY_BYTES
-            + u64::try_from(context)? * context_token_memory_bytes(cache);
+        let base =
+            NON_CONTEXT_MEMORY_BYTES + u64::try_from(context)? * context_token_memory_bytes(cache);
 
         for reuse in [PromptReuse::Disabled, PromptReuse::Latest] {
             validate_execution_capacity_with_reuse(
@@ -2755,8 +2884,8 @@ mod tests {
 
         let context = 8_192;
         let cache = KvCachePolicy::Rotated4;
-        let base = NON_CONTEXT_MEMORY_BYTES
-            + u64::try_from(context)? * context_token_memory_bytes(cache);
+        let base =
+            NON_CONTEXT_MEMORY_BYTES + u64::try_from(context)? * context_token_memory_bytes(cache);
         let state_budget = u64::try_from(selected_state_budget(context, cache)?)?;
 
         // PromptEndAndLatest with slots=1 charges 1 * selected_state_budget.
@@ -2842,6 +2971,136 @@ mod tests {
                 cache,
                 PromptReuse::Latest,
                 explicit,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn calibrated_cow_execution_capacity_accounts_for_packing_and_shared_kv() -> Result<()> {
+        use super::{
+            BranchCheckpoints, COW_UNSEALED_TAIL_TOKENS, PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES,
+            RECURRENT_MEMORY_BYTES, Representation, calibrated_cow_execution_memory_bytes,
+            validate_calibrated_cow_execution_capacity,
+        };
+        use crate::runtime::PromptReuse;
+
+        let ctx = 262_144;
+        let kv = KvCachePolicy::Rotated4;
+        let kv_per_tok = u64::try_from(kv_token_memory_bytes(kv))?;
+        let dflt = BranchCheckpoints::default();
+        let pq2 = calibrated_cow_execution_memory_bytes(
+            ctx,
+            Representation::Pq2,
+            None,
+            None,
+            kv,
+            PromptReuse::Latest,
+            dflt,
+        )?;
+        let ptq1 = calibrated_cow_execution_memory_bytes(
+            ctx,
+            Representation::CurrentRepackedPtq1,
+            None,
+            None,
+            kv,
+            PromptReuse::Latest,
+            dflt,
+        )?;
+        assert_eq!(pq2 - ptq1, 1_259_520_000);
+        let expected_pq2 = NON_CONTEXT_MEMORY_BYTES
+            + 3 * u64::try_from(RECURRENT_MEMORY_BYTES)?
+            + u64::try_from(ctx)? * (kv_per_tok + 96 + 128)
+            + u64::try_from(COW_UNSEALED_TAIL_TOKENS)? * kv_per_tok;
+        assert_eq!(pq2, expected_pq2);
+        assert_eq!(
+            ptq1,
+            PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES + (expected_pq2 - NON_CONTEXT_MEMORY_BYTES)
+        );
+        validate_calibrated_cow_execution_capacity(
+            ctx,
+            pq2,
+            Representation::Pq2,
+            None,
+            None,
+            kv,
+            PromptReuse::Latest,
+            dflt,
+        )?;
+        assert!(
+            validate_calibrated_cow_execution_capacity(
+                ctx,
+                pq2 - 1,
+                Representation::Pq2,
+                None,
+                None,
+                kv,
+                PromptReuse::Latest,
+                dflt,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn calibrated_cow_execution_capacity_charges_branch_and_speculative_reserves() -> Result<()> {
+        use super::{
+            BranchCheckpoints, CpuPrefill, CpuSpeculation, RECURRENT_MEMORY_BYTES, Representation,
+            calibrated_cow_execution_memory_bytes, selected_state_budget,
+            validate_calibrated_cow_execution_capacity,
+        };
+        use crate::runtime::PromptReuse;
+
+        let ctx = 262_144;
+        let kv = KvCachePolicy::Rotated4;
+        let ptq1 = calibrated_cow_execution_memory_bytes(
+            ctx,
+            Representation::CurrentRepackedPtq1,
+            None,
+            None,
+            kv,
+            PromptReuse::Latest,
+            BranchCheckpoints::default(),
+        )?;
+        let prefill = CpuPrefill::new(16, 64 * 1024 * 1024)?;
+        let spec = CpuSpeculation::new(4, 16 * 1024 * 1024, selected_state_budget(ctx, kv)?)?;
+        let branches = BranchCheckpoints::new(2)?;
+        let reuse = PromptReuse::PromptEndAndLatest;
+        let spec_req = calibrated_cow_execution_memory_bytes(
+            ctx,
+            Representation::CurrentRepackedPtq1,
+            Some(prefill),
+            Some(spec),
+            kv,
+            reuse,
+            branches,
+        )?;
+        assert_eq!(
+            spec_req - ptq1,
+            3 * u64::try_from(RECURRENT_MEMORY_BYTES)? + 80 * 1024 * 1024
+        );
+        validate_calibrated_cow_execution_capacity(
+            ctx,
+            spec_req,
+            Representation::CurrentRepackedPtq1,
+            Some(prefill),
+            Some(spec),
+            kv,
+            reuse,
+            branches,
+        )?;
+        assert!(
+            validate_calibrated_cow_execution_capacity(
+                ctx,
+                spec_req - 1,
+                Representation::CurrentRepackedPtq1,
+                Some(prefill),
+                Some(spec),
+                kv,
+                reuse,
+                branches,
             )
             .is_err()
         );

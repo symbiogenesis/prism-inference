@@ -5,11 +5,15 @@ use std::{ffi::OsString, io, path::PathBuf};
 use bonsai_prism_runtime::{
     graph::KvCachePolicy,
     kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
-    model::swift::Representation,
+    model::{
+        lora::{SWIFT_ADAPTER_BYTES, SWIFT_ADAPTER_SHA256},
+        swift::{MMPROJ_BYTES, MMPROJ_SHA256, Representation},
+    },
     runtime::PromptReuse,
     swift_session::{
         BranchCheckpoints, CpuPrefill, CpuSpeculation, DEFAULT_MAX_IMAGE_TOKENS, MAX_IMAGE_TOKENS,
-        MIN_IMAGE_TOKENS, MMPROJ_MEMORY_BYTES, SwiftSession, validate_context_capacity_with_kv,
+        MIN_IMAGE_TOKENS, MMPROJ_MEMORY_BYTES, SwiftSession,
+        validate_calibrated_cow_execution_capacity, validate_context_capacity_with_kv,
         validate_execution_capacity_with_reuse,
     },
 };
@@ -27,10 +31,19 @@ enum ChildTransport {
     BrokerPipe,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AdmissionPolicy {
+    #[default]
+    Conservative,
+    CalibratedCow,
+}
+
 struct Config {
     placement: Placement,
     model: PathBuf,
     transport: ChildTransport,
+    verified_sections: Option<usize>,
+    admission_policy: AdmissionPolicy,
     seed: u32,
     row_workers: usize,
     representation: Representation,
@@ -81,6 +94,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut arguments = arguments.into_iter();
     let mut child = false;
     let mut broker_pipe = false;
+    let mut verified_sections = None;
+    let mut admission_policy = None;
     let (mut model, mut key, mut port, mut seed) = (None, None, None, None);
     let mut row_workers = None;
     let mut cpu_family = None;
@@ -210,6 +225,24 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                 });
             }
             Some("--draft-max") if draft_max.is_none() => draft_max = Some(value),
+            Some("--verified-sections") if verified_sections.is_none() => {
+                let parsed = value
+                    .to_str()
+                    .ok_or_else(invalid)?
+                    .parse::<usize>()
+                    .map_err(|_| invalid())?;
+                if !(1..=8).contains(&parsed) {
+                    return Err(invalid());
+                }
+                verified_sections = Some(parsed);
+            }
+            Some("--admission-policy") if admission_policy.is_none() => {
+                admission_policy = Some(match value.to_str() {
+                    Some("conservative") => AdmissionPolicy::Conservative,
+                    Some("calibrated-cow") => AdmissionPolicy::CalibratedCow,
+                    _ => return Err(invalid()),
+                });
+            }
             Some("--placement") if placement.is_none() => {
                 placement = Some(match value.to_str() {
                     Some("auto") => Placement::Auto,
@@ -243,15 +276,23 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         }
         ChildTransport::BrokerPipe
     } else {
+        if verified_sections.is_some() {
+            return Err(invalid());
+        }
         let key = key.ok_or_else(invalid)?;
         let port = port.filter(|&n| n >= 1024).ok_or_else(invalid)?;
         validate_read_path(&key)?;
         ChildTransport::Loopback { port, key }
     };
+    let resolved_kv_cache =
+        kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE);
+    let resolved_policy = admission_policy.unwrap_or_default();
     let config = Config {
         placement: placement.unwrap_or_default(),
         model: model.ok_or_else(invalid)?,
         transport,
+        verified_sections,
+        admission_policy: resolved_policy,
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
         row_workers: row_workers
             .unwrap_or_else(|| cpu_family.map_or(1, CpuFamily::default_row_workers)),
@@ -265,7 +306,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         image_max_tokens: resolved_image_max_tokens,
         prompt_reuse: prompt_reuse.unwrap_or_default(),
         branch_checkpoints: parse_branch_checkpoints(reuse_checkpoints, reuse_checkpoint_bytes)?,
-        kv_cache: kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
+        kv_cache: resolved_kv_cache,
         cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch, prefill_gdn)?,
         cpu_speculation: resolve_speculation(
             spec_type,
@@ -274,12 +315,20 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             verification_scratch,
             speculative_checkpoint,
         )?,
-        capacity: parse_capacity(
+        capacity: parse_capacity_with_policy(
             context_tokens,
             memory_limit_bytes,
-            kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
+            resolved_kv_cache,
+            resolved_policy,
         )?,
     };
+    if let Some(expected_sections) = config.verified_sections {
+        let configured_sections =
+            1_usize + usize::from(config.adapter.is_some()) + usize::from(config.mmproj.is_some());
+        if expected_sections != configured_sections {
+            return Err(invalid());
+        }
+    }
     if config.mmproj.is_some() && config.cpu_speculation.is_some() {
         return Err(invalid());
     }
@@ -292,25 +341,42 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     {
         return Err(invalid());
     }
-    if config.cpu_prefill.is_some()
-        || config.cpu_speculation.is_some()
-        || requires_reuse_capacity
-    {
-        let (context, memory) = config.capacity.ok_or_else(invalid)?;
-        if (config.cpu_prefill.is_some() || config.cpu_speculation.is_some()) && kv_cache.is_none()
-        {
-            return Err(invalid());
+    if (config.cpu_prefill.is_some() || config.cpu_speculation.is_some()) && kv_cache.is_none() {
+        return Err(invalid());
+    }
+    match config.admission_policy {
+        AdmissionPolicy::Conservative => {
+            if config.cpu_prefill.is_some()
+                || config.cpu_speculation.is_some()
+                || requires_reuse_capacity
+            {
+                let (context, memory) = config.capacity.ok_or_else(invalid)?;
+                validate_execution_capacity_with_reuse(
+                    context,
+                    memory,
+                    config.cpu_prefill,
+                    config.cpu_speculation,
+                    config.kv_cache,
+                    config.prompt_reuse,
+                    config.branch_checkpoints,
+                )
+                .map_err(|_| invalid())?;
+            }
         }
-        validate_execution_capacity_with_reuse(
-            context,
-            memory,
-            config.cpu_prefill,
-            config.cpu_speculation,
-            config.kv_cache,
-            config.prompt_reuse,
-            config.branch_checkpoints,
-        )
-        .map_err(|_| invalid())?;
+        AdmissionPolicy::CalibratedCow => {
+            let (context, memory) = config.capacity.ok_or_else(invalid)?;
+            validate_calibrated_cow_execution_capacity(
+                context,
+                memory,
+                config.representation,
+                config.cpu_prefill,
+                config.cpu_speculation,
+                config.kv_cache,
+                config.prompt_reuse,
+                config.branch_checkpoints,
+            )
+            .map_err(|_| invalid())?;
+        }
     }
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
         || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
@@ -450,10 +516,11 @@ fn parse_speculation(
     }
 }
 
-fn parse_capacity(
+fn parse_capacity_with_policy(
     context_tokens: Option<OsString>,
     memory_limit_bytes: Option<OsString>,
     kv_cache: KvCachePolicy,
+    admission_policy: AdmissionPolicy,
 ) -> io::Result<Option<(usize, u64)>> {
     match (context_tokens, memory_limit_bytes) {
         (None, None) => Ok(None),
@@ -474,11 +541,128 @@ fn parse_capacity(
             {
                 return Err(invalid());
             }
-            validate_context_capacity_with_kv(context, memory, kv_cache).map_err(|_| invalid())?;
+            match admission_policy {
+                AdmissionPolicy::Conservative => {
+                    validate_context_capacity_with_kv(context, memory, kv_cache)
+                        .map_err(|_| invalid())?;
+                }
+                AdmissionPolicy::CalibratedCow => {
+                    validate_context_capacity_with_kv(context, u64::MAX, kv_cache)
+                        .map_err(|_| invalid())?;
+                }
+            }
             Ok(Some((context, memory)))
         }
         _ => Err(invalid()),
     }
+}
+
+#[cfg(test)]
+fn parse_capacity(
+    context_tokens: Option<OsString>,
+    memory_limit_bytes: Option<OsString>,
+    kv_cache: KvCachePolicy,
+) -> io::Result<Option<(usize, u64)>> {
+    parse_capacity_with_policy(
+        context_tokens,
+        memory_limit_bytes,
+        kv_cache,
+        AdmissionPolicy::Conservative,
+    )
+}
+
+fn decode_sha256_hex(hex: &str) -> io::Result<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return Err(invalid());
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let hi = match pair[0] {
+            b'0'..=b'9' => pair[0] - b'0',
+            b'a'..=b'f' => pair[0] - b'a' + 10,
+            _ => return Err(invalid()),
+        };
+        let lo = match pair[1] {
+            b'0'..=b'9' => pair[1] - b'0',
+            b'a'..=b'f' => pair[1] - b'a' + 10,
+            _ => return Err(invalid()),
+        };
+        let slot = digest.get_mut(index).ok_or_else(invalid)?;
+        *slot = (hi << 4) | lo;
+    }
+    Ok(digest)
+}
+
+fn expected_verified_sections(config: &Config) -> io::Result<Vec<(u32, u64, [u8; 32])>> {
+    let mut expected = Vec::with_capacity(3);
+    expected.push((
+        0_u32,
+        config.representation.model_bytes(),
+        decode_sha256_hex(config.representation.model_sha256())?,
+    ));
+    if config.adapter.is_some() {
+        let slot = u32::try_from(expected.len()).map_err(|_| invalid())?;
+        expected.push((
+            slot,
+            SWIFT_ADAPTER_BYTES,
+            decode_sha256_hex(SWIFT_ADAPTER_SHA256)?,
+        ));
+    }
+    if config.mmproj.is_some() {
+        let slot = u32::try_from(expected.len()).map_err(|_| invalid())?;
+        expected.push((slot, MMPROJ_BYTES, decode_sha256_hex(MMPROJ_SHA256)?));
+    }
+    Ok(expected)
+}
+
+fn verify_broker_pipe_sections(
+    endpoint: &crate::broker_pipe::ServerEndpoint,
+    config: &Config,
+    expected_count: usize,
+) -> io::Result<()> {
+    let expected = expected_verified_sections(config)
+        .map_err(|error| startup::at(Stage::Arguments, &error))?;
+    if expected.len() != expected_count {
+        return Err(startup::at(Stage::Arguments, &invalid()));
+    }
+    endpoint
+        .wait_for_verified_sections(expected_count, std::time::Duration::from_secs(15))
+        .map_err(|error| startup::at(Stage::Model, &error))?;
+    let received = endpoint.verified_sections();
+    if received.len() != expected.len() {
+        return Err(startup::at(
+            Stage::Model,
+            &io::Error::new(
+                io::ErrorKind::InvalidData,
+                "broker-pipe verified section count mismatch",
+            ),
+        ));
+    }
+    for (slot, byte_len, sha256) in expected {
+        let matched = received
+            .iter()
+            .find(|descriptor| descriptor.slot == slot)
+            .ok_or_else(|| {
+                startup::at(
+                    Stage::Model,
+                    &io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing broker-pipe verified section slot",
+                    ),
+                )
+            })?;
+        if matched.handle == 0 || matched.byte_len != byte_len || matched.sha256 != sha256 {
+            return Err(startup::at(
+                Stage::Model,
+                &io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "broker-pipe verified section attestation mismatch",
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 enum PreparedTransport {
@@ -608,6 +792,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         ));
     }
     let prepared_transport = prepare_transport(&config.transport)?;
+    if let (PreparedTransport::BrokerPipe { endpoint, .. }, Some(expected_sections)) =
+        (&prepared_transport, config.verified_sections)
+    {
+        verify_broker_pipe_sections(endpoint, &config, expected_sections)?;
+    }
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
     let mut session = SwiftSession::load_profile_with_execution_and_reuse(
@@ -1724,6 +1913,123 @@ mod tests {
             args.extend(bad.into_iter().map(OsString::from));
             assert!(parse(args).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_verified_sections_and_calibrated_cow_policy_enforce_contracts() -> io::Result<()>
+    {
+        use bonsai_prism_runtime::swift_session::{
+            calibrated_cow_execution_memory_bytes, selected_state_budget,
+        };
+        let (directory, [model, key, adapter]) = files()?;
+        let mmproj = directory.path().join("mmproj.gguf");
+        std::fs::write(&mmproj, [])?;
+
+        let pipe_base: Vec<OsString> = vec![
+            "--native-engine-child".into(),
+            "--broker-pipe".into(),
+            "--model".into(),
+            model.clone(),
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        let mut sec1 = pipe_base.clone();
+        sec1.extend(["--verified-sections", "1"].map(OsString::from));
+        assert_eq!(parse(sec1.clone())?.verified_sections, Some(1));
+        sec1.extend(["--verified-sections", "1"].map(OsString::from));
+        assert!(parse(sec1).is_err());
+
+        let mut sec3 = pipe_base.clone();
+        sec3.extend([
+            "--abliterate-lora".into(),
+            adapter,
+            "--mmproj".into(),
+            mmproj.into_os_string(),
+            "--verified-sections".into(),
+            "3".into(),
+        ]);
+        assert_eq!(parse(sec3.clone())?.verified_sections, Some(3));
+        // Wrong count against 3 artifacts must fail.
+        sec3.pop();
+        sec3.push("2".into());
+        assert!(parse(sec3).is_err());
+
+        for bad_count in ["0", "9", "abc"] {
+            let mut bad = pipe_base.clone();
+            bad.extend(["--verified-sections", bad_count].map(OsString::from));
+            assert!(parse(bad).is_err());
+        }
+        let loopback_verified = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8081".into(),
+            "--seed".into(),
+            "42".into(),
+            "--verified-sections".into(),
+            "1".into(),
+        ];
+        assert!(parse(loopback_verified).is_err());
+
+        // Calibrated CoW policy admits calibrated PTQ1 + shared KV budgets that conservative mode rejects.
+        let context = 262_144_usize;
+        let ptq1_cow_mem = calibrated_cow_execution_memory_bytes(
+            context,
+            Representation::CurrentRepackedPtq1,
+            None,
+            None,
+            KvCachePolicy::Rotated4,
+            PromptReuse::Latest,
+            BranchCheckpoints::default(),
+        )
+        .map_err(io::Error::other)?;
+        let mut calibrated = pipe_base.clone();
+        calibrated.extend([
+            "--use-repacked-ptq1".into(),
+            "--kv-cache".into(),
+            "rsq4".into(),
+            "--prompt-reuse".into(),
+            "latest".into(),
+            "--context-tokens".into(),
+            context.to_string().into(),
+            "--memory-limit-bytes".into(),
+            ptq1_cow_mem.to_string().into(),
+            "--admission-policy".into(),
+            "calibrated-cow".into(),
+        ]);
+        let parsed_cow = parse(calibrated.clone())?;
+        assert_eq!(parsed_cow.admission_policy, AdmissionPolicy::CalibratedCow);
+        assert_eq!(parsed_cow.capacity, Some((context, ptq1_cow_mem)));
+
+        let mut below_cow = calibrated.clone();
+        below_cow[14] = (ptq1_cow_mem - 1).to_string().into();
+        assert!(parse(below_cow).is_err());
+
+        let mut conservative = calibrated.clone();
+        conservative[16] = "conservative".into();
+        assert!(parse(conservative).is_err());
+
+        // Missing capacity with calibrated-cow or unknown policy string must fail.
+        let mut missing_cap = pipe_base;
+        missing_cap.extend(["--admission-policy", "calibrated-cow"].map(OsString::from));
+        assert!(parse(missing_cap).is_err());
+        let mut dup_policy = calibrated.clone();
+        dup_policy.extend(["--admission-policy", "calibrated-cow"].map(OsString::from));
+        assert!(parse(dup_policy).is_err());
+        let mut unknown_policy = calibrated;
+        unknown_policy[16] = "auto".into();
+        assert!(parse(unknown_policy).is_err());
+
+        // Ensure spec checkpoint helper aligns with selected_state_budget.
+        assert!(
+            selected_state_budget(context, KvCachePolicy::Rotated4).map_err(io::Error::other)?
+                > bonsai_prism_runtime::swift_session::STATE_MEMORY_BYTES
+        );
         Ok(())
     }
 }

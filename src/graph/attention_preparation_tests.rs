@@ -137,7 +137,7 @@ fn assert_bits_equal(expected: &[f32], actual: &[f32]) {
 #[test]
 fn attention_preparation_preserves_serial_bits_across_worker_partitions() -> Result<()> {
     #[cfg(feature = "parallel-rows")]
-    let worker_counts = [1, 2, 3, 4, 7, 18];
+    let worker_counts = [1, 2, 3, 4, 6, 7, 8, 18];
     #[cfg(not(feature = "parallel-rows"))]
     let worker_counts = [1];
     for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
@@ -162,7 +162,7 @@ fn attention_preparation_preserves_serial_bits_across_worker_partitions() -> Res
 #[test]
 fn attention_preparation_query_failure_precedes_earlier_key_value_failures() -> Result<()> {
     #[cfg(feature = "parallel-rows")]
-    let worker_counts = [1, 2, 3, 4, 7, 18];
+    let worker_counts = [1, 2, 3, 4, 6, 7, 8, 18];
     #[cfg(not(feature = "parallel-rows"))]
     let worker_counts = [1];
     for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
@@ -186,7 +186,7 @@ fn attention_preparation_query_failure_precedes_earlier_key_value_failures() -> 
 #[test]
 fn attention_preparation_keeps_earliest_key_value_chunk_failure() -> Result<()> {
     for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
-        for workers in [2, 4] {
+        for workers in [2, 3, 4, 6, 7, 8] {
             let mut fixture = Fixture::new()?;
             // The first task's value overflow must outrank a later task's
             // malformed key, matching the original paired-dispatch order.

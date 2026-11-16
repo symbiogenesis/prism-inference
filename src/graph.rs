@@ -4097,9 +4097,9 @@ impl Evaluation<'_, '_> {
         };
         let parallelism = self.projection.matvec.row_parallelism();
         let heads_per_kv = g.heads / g.kv_heads;
-        if parallelism.workers() > 1 && g.kv_heads.is_multiple_of(parallelism.workers()) {
-            // With aligned partitions, each task owns the same query/KV heads
-            // as the two original dispatches. Defer KV errors until every query
+        if parallelism.workers() > 1 && g.kv_heads > 1 {
+            // Partition by KV heads so every worker prepares its own query/KV
+            // heads under a single barrier. Defer KV errors until every query
             // task succeeds, preserving query-first and earliest-KV-task error
             // precedence without synchronizing successful tasks with each other.
             // Only provisional scratch changes before complete graph publication.

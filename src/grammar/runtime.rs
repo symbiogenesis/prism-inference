@@ -11,7 +11,11 @@ pub use super::gss::{GrammarGss, GssCheckpoint};
 pub use super::mask::{GrammarMaskCache, VocabularyRadixTrie};
 
 use super::{Element, Grammar};
-use crate::{Result, invalid};
+use crate::{
+    Result, invalid,
+    kernels::is_finite_slice,
+    sampling::{FiniteLogits, Sampler},
+};
 
 /// A checked instruction location in independently owned grammar storage.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -44,6 +48,49 @@ pub struct Candidate {
     pub partial_utf8: PartialUtf8,
     /// Token ID for explicit TOKEN and `TOKEN_NOT` rules.
     pub id: i32,
+}
+
+impl Candidate {
+    /// Decodes a vocabulary piece from a clean UTF-8 boundary into a candidate.
+    ///
+    /// # Errors
+    /// Rejects token IDs above `i32::MAX`, pieces longer than 65,536 bytes, or
+    /// decoded sequences with 1,024 or more non-zero code points.
+    pub fn from_piece(token_id: u32, piece: &[u8]) -> Result<Self> {
+        if piece.len() > 65536 {
+            return Err(invalid("grammar token piece exceeds bound"));
+        }
+        let id = i32::try_from(token_id)?;
+        let (mut code_points, partial_utf8) = decode_utf8(piece, PartialUtf8::default());
+        if code_points.len() >= 1024 {
+            return Err(invalid("grammar candidate code-point vector exceeds bound"));
+        }
+        code_points.push(0);
+        Ok(Self {
+            index: token_id,
+            code_points,
+            partial_utf8,
+            id,
+        })
+    }
+}
+
+fn validate_candidate(candidate: &Candidate) -> Result<()> {
+    let Some((&last, prefix)) = candidate.code_points.split_last() else {
+        return Err(invalid(
+            "grammar candidate extent or partial state outside bound",
+        ));
+    };
+    if candidate.code_points.len() > 1024
+        || last != 0
+        || prefix.contains(&0)
+        || !(-1..=3).contains(&candidate.partial_utf8.remaining)
+    {
+        return Err(invalid(
+            "grammar candidate extent or partial state outside bound",
+        ));
+    }
+    Ok(())
 }
 
 /// Stack-only checkpoint valid for its originating execution owner.
@@ -525,6 +572,13 @@ impl GrammarState {
         Ok(())
     }
 
+    /// Returns `true` when at least one active stack has completed the root rule
+    /// and no incomplete UTF-8 sequence is pending.
+    #[must_use]
+    pub fn is_accepting(&self) -> bool {
+        self.partial.remaining == 0 && self.stacks.iter().any(Vec::is_empty)
+    }
+
     /// Accepts a token ID and its exact vocabulary piece bytes.
     ///
     /// Explicit token terminals consume the token ID. Character terminals
@@ -546,26 +600,10 @@ impl GrammarState {
             let element = instruction(&self.rules, position)?;
             if matches!(element.kind, 8 | 9) {
                 if match_token(element, token) {
-                    let mut following = stack[..stack.len() - 1].to_vec();
-                    let after = next(position);
-                    if !end(instruction(&self.rules, after)?) {
-                        following.push(after);
-                    }
-                    advance(&self.rules, following, &mut output)?;
+                    advance_matched_token(&self.rules, stack, position, &mut output)?;
                 }
             } else {
-                let mut current = vec![stack.clone()];
-                for &point in &points {
-                    let mut following = Vec::new();
-                    for branch in &current {
-                        accept_character(&self.rules, branch, point, &mut following)?;
-                    }
-                    current = following;
-                    if current.is_empty() {
-                        break;
-                    }
-                }
-                for branch in current {
+                for branch in advance_character_points(&self.rules, stack, &points)? {
                     if !output.contains(&branch) {
                         output.push(branch);
                     }
@@ -579,6 +617,131 @@ impl GrammarState {
                 "Unexpected empty grammar stack after accepting piece: {} ({token})",
                 bounded_utf8_preview(piece)
             )));
+        }
+        Ok(())
+    }
+
+    /// Atomically advances this grammar state by a pre-decoded [`Candidate`].
+    ///
+    /// Preserves existing stacks and partial UTF-8 state on any error.
+    ///
+    /// # Errors
+    /// Rejects malformed candidates, invalid UTF-8 state, or candidates
+    /// leaving zero surviving grammar stacks.
+    pub fn accept_candidate(&mut self, candidate: &Candidate) -> Result<()> {
+        validate_candidate(candidate)?;
+        if candidate.partial_utf8.remaining < 0 {
+            return Err(invalid("grammar candidate carries invalid UTF-8 state"));
+        }
+        let points = &candidate.code_points[..candidate.code_points.len() - 1];
+        let mut output = Vec::new();
+        for stack in &self.stacks {
+            let Some(&position) = stack.last() else {
+                continue;
+            };
+            let element = instruction(&self.rules, position)?;
+            if matches!(element.kind, 8 | 9) {
+                if candidate.partial_utf8.remaining == 0 && match_token(element, candidate.id) {
+                    advance_matched_token(&self.rules, stack, position, &mut output)?;
+                }
+            } else if points.is_empty() {
+                if candidate.partial_utf8.remaining > 0
+                    && match_partial(&self.rules, position, candidate.partial_utf8)?
+                    && !output.contains(stack)
+                {
+                    output.push(stack.clone());
+                }
+            } else {
+                for branch in advance_character_points(&self.rules, stack, points)? {
+                    if candidate.partial_utf8.remaining > 0 {
+                        let Some(&pos) = branch.last() else {
+                            continue;
+                        };
+                        if matches!(instruction(&self.rules, pos)?.kind, 8 | 9)
+                            || !match_partial(&self.rules, pos, candidate.partial_utf8)?
+                        {
+                            continue;
+                        }
+                    }
+                    if !output.contains(&branch) {
+                        output.push(branch);
+                    }
+                }
+            }
+        }
+        if output.is_empty() {
+            return Err(invalid(format!(
+                "Unexpected empty grammar stack after accepting candidate ({})",
+                candidate.id
+            )));
+        }
+        self.stacks = output;
+        self.partial = candidate.partial_utf8;
+        Ok(())
+    }
+
+    /// Evaluates every candidate without mutating state, returning an entry-aligned
+    /// boolean acceptance mask matching [`Self::accept_candidate`].
+    ///
+    /// # Errors
+    /// Rejects candidate tables above 1,048,576 entries, malformed candidates,
+    /// or grammar stack expansion bounds.
+    pub fn filter_candidates(&self, candidates: &[Candidate]) -> Result<Vec<bool>> {
+        let mut allowed = Vec::new();
+        self.filter_candidates_into(candidates, &mut allowed)?;
+        Ok(allowed)
+    }
+
+    /// Populates `allowed` with per-candidate acceptance booleans matching
+    /// [`Self::accept_candidate`] without mutating grammar state.
+    ///
+    /// # Errors
+    /// Rejects candidate tables above 1,048,576 entries, malformed candidates,
+    /// allocation errors, or grammar stack expansion bounds.
+    pub fn filter_candidates_into(
+        &self,
+        candidates: &[Candidate],
+        allowed: &mut Vec<bool>,
+    ) -> Result<()> {
+        if candidates.len() > 1_048_576 {
+            return Err(invalid("grammar candidate table exceeds bound"));
+        }
+        for candidate in candidates {
+            validate_candidate(candidate)?;
+        }
+        allowed.clear();
+        allowed.try_reserve(candidates.len())?;
+        allowed.resize(candidates.len(), false);
+        if candidates.is_empty() || self.stacks.is_empty() {
+            return Ok(());
+        }
+        let mut rejected_flags = Vec::new();
+        rejected_flags.try_reserve(candidates.len())?;
+        rejected_flags.resize(candidates.len(), false);
+        let mut cursors = Vec::new();
+        for stack in &self.stacks {
+            cursors.clear();
+            for (index, candidate) in candidates.iter().enumerate() {
+                if !allowed[index] && candidate.partial_utf8.remaining >= 0 {
+                    cursors.push((index, 0));
+                }
+            }
+            if cursors.is_empty() {
+                break;
+            }
+            let rejected =
+                reject_for_stack_inner::<true>(&self.rules, stack.clone(), candidates, &cursors)?;
+            for &(index, _) in &rejected {
+                rejected_flags[index] = true;
+            }
+            for &(index, _) in &cursors {
+                if !rejected_flags[index] {
+                    allowed[index] = true;
+                }
+            }
+            for &(index, _) in &rejected {
+                rejected_flags[index] = false;
+            }
         }
         Ok(())
     }
@@ -609,13 +772,47 @@ impl GrammarState {
                 "grammar candidate extent or partial state outside bound",
             ));
         }
-        let cursors = (0..candidates.len()).map(|index| (index, 0)).collect();
-        let rejected = reject_for_stack(&self.rules, stack.clone(), candidates, cursors)?;
+        let cursors: Vec<Cursor> = (0..candidates.len()).map(|index| (index, 0)).collect();
+        let rejected =
+            reject_for_stack_inner::<false>(&self.rules, stack.clone(), candidates, &cursors)?;
         Ok(rejected
             .into_iter()
             .map(|(index, _)| candidates[index].clone())
             .collect())
     }
+}
+
+fn advance_matched_token(
+    rules: &[Vec<Element>],
+    stack: &Stack,
+    position: Position,
+    output: &mut Vec<Stack>,
+) -> Result<()> {
+    let mut following = stack[..stack.len() - 1].to_vec();
+    let after = next(position);
+    if !end(instruction(rules, after)?) {
+        following.push(after);
+    }
+    advance(rules, following, output)
+}
+
+fn advance_character_points(
+    rules: &[Vec<Element>],
+    stack: &Stack,
+    points: &[u32],
+) -> Result<Vec<Stack>> {
+    let mut current = vec![stack.clone()];
+    for &point in points {
+        let mut following = Vec::new();
+        for branch in &current {
+            accept_character(rules, branch, point, &mut following)?;
+        }
+        current = following;
+        if current.is_empty() {
+            break;
+        }
+    }
+    Ok(current)
 }
 
 type Cursor = (usize, usize);
@@ -625,13 +822,13 @@ enum RejectWork {
     Finish(Vec<Cursor>),
 }
 
-fn reject_for_stack(
+fn reject_for_stack_inner<const STRICT: bool>(
     rules: &[Vec<Element>],
     stack: Stack,
     candidates: &[Candidate],
-    cursors: Vec<Cursor>,
+    initial: &[Cursor],
 ) -> Result<Vec<Cursor>> {
-    let mut todo = vec![RejectWork::Stack(stack, cursors)];
+    let mut todo = vec![RejectWork::Stack(stack, initial.to_vec())];
     let mut rejected = Vec::new();
     while let Some(work) = todo.pop() {
         match work {
@@ -643,7 +840,11 @@ fn reject_for_stack(
                 }
             }
             RejectWork::Finish(mut immediate) => {
-                immediate.extend(rejected.iter().map(|&(index, offset)| (index, offset - 1)));
+                immediate.extend(
+                    rejected
+                        .iter()
+                        .map(|&(index, offset)| (index, offset.saturating_sub(1))),
+                );
                 rejected = immediate;
             }
             RejectWork::Stack(stack, cursors) => {
@@ -652,7 +853,8 @@ fn reject_for_stack(
                     rejected = cursors
                         .into_iter()
                         .filter(|&(index, offset)| {
-                            candidates[index].code_points[offset] != 0
+                            (STRICT && offset == 0)
+                                || candidates[index].code_points[offset] != 0
                                 || candidates[index].partial_utf8.remaining != 0
                         })
                         .collect();
@@ -664,7 +866,15 @@ fn reject_for_stack(
                         .into_iter()
                         .filter(|&(index, offset)| {
                             let candidate = &candidates[index];
-                            if candidate.code_points[offset] == 0 {
+                            if STRICT {
+                                if offset == 0 {
+                                    candidate.partial_utf8.remaining != 0
+                                        || !match_token(element, candidate.id)
+                                } else {
+                                    candidate.code_points[offset] != 0
+                                        || candidate.partial_utf8.remaining != 0
+                                }
+                            } else if candidate.code_points[offset] == 0 {
                                 candidate.partial_utf8.remaining != 0
                             } else {
                                 !match_token(element, candidate.id)
@@ -678,9 +888,16 @@ fn reject_for_stack(
                     let candidate = &candidates[index];
                     let point = candidate.code_points[offset];
                     if point == 0 {
-                        if candidate.partial_utf8.remaining != 0
-                            && !match_partial(rules, position, candidate.partial_utf8)?
-                        {
+                        let invalid_partial = if STRICT {
+                            candidate.partial_utf8.remaining < 0
+                                || (candidate.partial_utf8.remaining > 0
+                                    && !match_partial(rules, position, candidate.partial_utf8)?)
+                                || (candidate.partial_utf8.remaining == 0 && offset == 0)
+                        } else {
+                            candidate.partial_utf8.remaining != 0
+                                && !match_partial(rules, position, candidate.partial_utf8)?
+                        };
+                        if invalid_partial {
                             rejected.push((index, offset));
                         }
                     } else if match_character(rules, position, point)?.0 {
@@ -703,6 +920,230 @@ fn reject_for_stack(
         }
     }
     Ok(rejected)
+}
+
+/// Sampler adapter that enforces a [`GrammarState`] mask over an inner
+/// [`Sampler`] and commits grammar transitions atomically after each draw.
+///
+/// Rejected tokens are masked to `f32::NEG_INFINITY` in reusable scratch. When
+/// the wrapped sampler strictly requires finite inputs (such as
+/// [`crate::sampling::Greedy`] or [`crate::sampling::ReferenceSampler`]), the
+/// adapter retries once over the compacted slice of allowed finite logits in
+/// ascending token-ID order and maps the selected index back to the vocabulary
+/// token ID. Cloning copies semantic sampler and grammar state without copying
+/// reusable scratch buffers.
+#[derive(Debug)]
+pub struct GrammarConstrainedSampler<S> {
+    inner: S,
+    grammar: GrammarState,
+    candidates: Arc<[Candidate]>,
+    eog_tokens: Arc<[u32]>,
+    masked_logits: Vec<f32>,
+    allowed: Vec<bool>,
+    allowed_indices: Vec<u32>,
+    allowed_logits: Vec<f32>,
+}
+
+impl<S: Clone> Clone for GrammarConstrainedSampler<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            grammar: self.grammar.clone(),
+            candidates: Arc::clone(&self.candidates),
+            eog_tokens: Arc::clone(&self.eog_tokens),
+            masked_logits: Vec::new(),
+            allowed: Vec::new(),
+            allowed_indices: Vec::new(),
+            allowed_logits: Vec::new(),
+        }
+    }
+}
+
+impl<S> GrammarConstrainedSampler<S> {
+    /// Creates a grammar-constrained sampler over a fixed candidate table
+    /// indexed by token ID `0..candidates.len()`.
+    ///
+    /// # Errors
+    /// Rejects empty or oversized (`> 1_048_576`) candidate tables, malformed
+    /// candidates, or EOG token IDs outside `candidates.len()`.
+    pub fn new(
+        inner: S,
+        grammar: GrammarState,
+        candidates: Arc<[Candidate]>,
+        eog_tokens: Arc<[u32]>,
+    ) -> Result<Self> {
+        if candidates.is_empty() || candidates.len() > 1_048_576 {
+            return Err(invalid(
+                "grammar-constrained sampling requires 1..=1_048_576 candidates",
+            ));
+        }
+        for candidate in &*candidates {
+            validate_candidate(candidate)?;
+        }
+        for &eog in &*eog_tokens {
+            if !usize::try_from(eog).is_ok_and(|idx| idx < candidates.len()) {
+                return Err(invalid("grammar EOG token outside vocabulary extent"));
+            }
+        }
+        Ok(Self {
+            inner,
+            grammar,
+            candidates,
+            eog_tokens,
+            masked_logits: Vec::new(),
+            allowed: Vec::new(),
+            allowed_indices: Vec::new(),
+            allowed_logits: Vec::new(),
+        })
+    }
+
+    /// Borrows the wrapped inner sampler.
+    #[must_use]
+    pub const fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Mutably borrows the wrapped inner sampler.
+    pub const fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    /// Borrows the current [`GrammarState`].
+    #[must_use]
+    pub const fn grammar(&self) -> &GrammarState {
+        &self.grammar
+    }
+
+    /// Borrows the fixed candidate vocabulary table.
+    #[must_use]
+    pub fn candidates(&self) -> &[Candidate] {
+        &self.candidates
+    }
+
+    /// Borrows the configured end-of-generation / stop token IDs.
+    #[must_use]
+    pub fn eog_tokens(&self) -> &[u32] {
+        &self.eog_tokens
+    }
+
+    /// Consumes this wrapper and returns `(inner, grammar)`.
+    #[must_use]
+    pub fn into_inner(self) -> (S, GrammarState) {
+        (self.inner, self.grammar)
+    }
+}
+
+impl<S: Sampler> GrammarConstrainedSampler<S> {
+    fn sample_validated(&mut self, logits: &[f32]) -> Result<u32> {
+        self.grammar
+            .filter_candidates_into(&self.candidates, &mut self.allowed)?;
+        let accepting = self.grammar.is_accepting();
+        for &eog in &*self.eog_tokens {
+            let idx = usize::try_from(eog)?;
+            if idx >= self.allowed.len() {
+                return Err(invalid("grammar EOG token outside vocabulary extent"));
+            }
+            self.allowed[idx] = accepting;
+        }
+        self.masked_logits.clear();
+        self.masked_logits.try_reserve(logits.len())?;
+        let mut allowed_count = 0_usize;
+        for (&logit, &is_allowed) in logits.iter().zip(&self.allowed) {
+            if is_allowed {
+                self.masked_logits.push(logit);
+                allowed_count += 1;
+            } else {
+                self.masked_logits.push(f32::NEG_INFINITY);
+            }
+        }
+        if allowed_count == 0 {
+            return Err(invalid(
+                "grammar-constrained sampling found no allowed tokens",
+            ));
+        }
+        let token = if allowed_count == logits.len() {
+            self.inner.sample(&self.masked_logits)?
+        } else {
+            match self.inner.sample(&self.masked_logits) {
+                Ok(token) => token,
+                Err(error) if is_finite_logits_rejection(&error) => {
+                    self.sample_compacted_allowed(logits, allowed_count)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let idx = usize::try_from(token)
+            .map_err(|_| invalid("inner sampler returned an out-of-vocabulary token"))?;
+        let candidate = self
+            .candidates
+            .get(idx)
+            .ok_or_else(|| invalid("inner sampler returned an out-of-vocabulary token"))?;
+        if !self.allowed[idx] {
+            return Err(invalid(
+                "inner sampler selected a token disallowed by grammar",
+            ));
+        }
+        if accepting && self.eog_tokens.contains(&token) {
+            return Ok(token);
+        }
+        let mut provisional = self.grammar.clone();
+        provisional.accept_candidate(candidate)?;
+        self.grammar = provisional;
+        Ok(token)
+    }
+
+    fn sample_compacted_allowed(&mut self, logits: &[f32], allowed_count: usize) -> Result<u32> {
+        self.allowed_indices.clear();
+        self.allowed_logits.clear();
+        self.allowed_indices.try_reserve(allowed_count)?;
+        self.allowed_logits.try_reserve(allowed_count)?;
+        for (index, (&logit, &is_allowed)) in logits.iter().zip(&self.allowed).enumerate() {
+            if is_allowed {
+                self.allowed_indices.push(u32::try_from(index)?);
+                self.allowed_logits.push(logit);
+            }
+        }
+        let selected = self.inner.sample(&self.allowed_logits)?;
+        let pos = usize::try_from(selected)
+            .map_err(|_| invalid("inner sampler returned an out-of-range compacted token"))?;
+        self.allowed_indices
+            .get(pos)
+            .copied()
+            .ok_or_else(|| invalid("inner sampler returned an out-of-range compacted token"))
+    }
+}
+
+fn is_finite_logits_rejection(error: &crate::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_error| {
+            io_error.kind() == std::io::ErrorKind::InvalidData
+                && io_error.to_string().contains("finite")
+        })
+}
+
+impl<S: Sampler + Clone> Sampler for GrammarConstrainedSampler<S> {
+    fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+        if logits.len() != self.candidates.len()
+            || logits.is_empty()
+            || logits.len() > 1_048_576
+            || !is_finite_slice(logits)
+        {
+            return Err(invalid(
+                "grammar-constrained sampling requires bounded finite logits matching candidate vocabulary",
+            ));
+        }
+        self.sample_validated(logits)
+    }
+
+    fn sample_finite(&mut self, logits: FiniteLogits<'_>) -> Result<u32> {
+        if logits.as_slice().len() != self.candidates.len() {
+            return Err(invalid(
+                "grammar-constrained sampling requires logits matching candidate vocabulary",
+            ));
+        }
+        self.sample_validated(logits.as_slice())
+    }
 }
 
 #[cfg(test)]
@@ -767,6 +1208,210 @@ mod tests {
             .ok_or_else(|| invalid("unexpected error suffix"))?;
         assert!(preview.len() <= MAX_DIAGNOSTIC_PREVIEW_BYTES);
         assert!(preview.ends_with("..."));
+        Ok(())
+    }
+
+    #[test]
+    fn filter_candidates_matches_atomic_accept_candidate_across_grammars() -> Result<()> {
+        let pieces: Vec<&[u8]> = vec![
+            b"",
+            b"{",
+            b"}",
+            b"a",
+            b"ab",
+            b"\"ok\"",
+            b"1",
+            &[0xc3],
+            &[0xa9],
+            &[b'a', 0xc3],
+            &[0x80],
+        ];
+        let candidates: Vec<Candidate> = pieces
+            .iter()
+            .enumerate()
+            .map(|(index, piece)| Candidate::from_piece(u32::try_from(index)?, piece))
+            .collect::<Result<Vec<_>>>()?;
+
+        let grammars = [
+            "root ::= \"{\" (\"a\" | \"ab\" | \"1\")+ \"}\"",
+            "root ::= \"\\\"ok\\\"\" | \"a\" \"é\"",
+            "root ::= \"a\"*",
+            "root ::= <[0]> \"a\"",
+            "root ::= !<[4]> \"}\"",
+        ];
+        for source in grammars {
+            let mut state = GrammarState::from_grammar(Grammar::parse(source)?, "root")?;
+            for step in 0..3 {
+                let mask = state.filter_candidates(&candidates)?;
+                assert_eq!(mask.len(), candidates.len());
+                for (candidate, &allowed) in candidates.iter().zip(&mask) {
+                    let mut probe = state.clone();
+                    let accepted = probe.accept_candidate(candidate);
+                    assert_eq!(
+                        accepted.is_ok(),
+                        allowed,
+                        "grammar {source:?} step {step} candidate {} mismatch",
+                        candidate.index
+                    );
+                }
+                let Some(first_allowed) = mask.iter().position(|&flag| flag) else {
+                    break;
+                };
+                let snapshot_stacks = state.stacks().to_vec();
+                let snapshot_partial = state.partial_utf8();
+                if let Some(first_rejected) = mask.iter().position(|&flag| !flag) {
+                    assert!(state.accept_candidate(&candidates[first_rejected]).is_err());
+                    assert_eq!(state.stacks(), snapshot_stacks.as_slice());
+                    assert_eq!(state.partial_utf8(), snapshot_partial);
+                }
+                state.accept_candidate(&candidates[first_allowed])?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_sampler_masks_neg_infinity_gates_eog_and_rejects_dead_ends_without_rng_advance()
+    -> Result<()> {
+        use crate::sampling::{Greedy, ReferenceSampler, Sampling};
+
+        #[derive(Clone)]
+        struct RecordingNegInfSampler {
+            observed: Vec<Vec<u32>>,
+            forced_choice: Option<u32>,
+            draws: usize,
+        }
+
+        impl Sampler for RecordingNegInfSampler {
+            fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+                self.observed
+                    .push(logits.iter().map(|value| value.to_bits()).collect());
+                self.draws += 1;
+                if let Some(forced) = self.forced_choice {
+                    return Ok(forced);
+                }
+                let mut best_idx = 0_usize;
+                let mut best_val = f32::NEG_INFINITY;
+                for (idx, &val) in logits.iter().enumerate() {
+                    if val > best_val {
+                        best_val = val;
+                        best_idx = idx;
+                    }
+                }
+                Ok(u32::try_from(best_idx)?)
+            }
+        }
+
+        let vocab: Vec<&[u8]> = vec![b"a", b"b", b"c", b""];
+        let candidates: Arc<[Candidate]> = vocab
+            .iter()
+            .enumerate()
+            .map(|(idx, piece)| Candidate::from_piece(u32::try_from(idx)?, piece))
+            .collect::<Result<Vec<_>>>()?
+            .into();
+        let eog: Arc<[u32]> = Arc::from([3_u32]);
+        let grammar = GrammarState::from_grammar(Grammar::parse("root ::= \"ab\"")?, "root")?;
+
+        let mut masked_sampler = GrammarConstrainedSampler::new(
+            RecordingNegInfSampler {
+                observed: Vec::new(),
+                forced_choice: None,
+                draws: 0,
+            },
+            grammar.clone(),
+            Arc::clone(&candidates),
+            Arc::clone(&eog),
+        )?;
+
+        // Step 1: only token 0 ("a") is legal; EOG (3) has highest logit but must be masked to -inf.
+        assert!(!masked_sampler.grammar().is_accepting());
+        let first = masked_sampler.sample(&[1.0, 5.0, 4.0, 10.0])?;
+        assert_eq!(first, 0);
+        assert_eq!(
+            masked_sampler.inner().observed[0],
+            [
+                1.0_f32.to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+            ]
+        );
+        assert!(!masked_sampler.grammar().is_accepting());
+
+        // Step 2: only token 1 ("b") is legal.
+        let second = masked_sampler.sample(&[9.0, 2.0, 8.0, 10.0])?;
+        assert_eq!(second, 1);
+        assert!(masked_sampler.grammar().is_accepting());
+
+        // Step 3: grammar is accepting; only EOG (3) is legal and grammar stays accepting.
+        let third = masked_sampler.sample(&[9.0, 8.0, 7.0, -2.0])?;
+        assert_eq!(third, 3);
+        assert!(masked_sampler.grammar().is_accepting());
+        assert_eq!(masked_sampler.inner().draws, 3);
+
+        // Greedy and ReferenceSampler also work cleanly through finite-compaction fallback.
+        let mut greedy = GrammarConstrainedSampler::new(
+            Greedy,
+            grammar.clone(),
+            Arc::clone(&candidates),
+            Arc::clone(&eog),
+        )?;
+        assert_eq!(greedy.sample(&[1.0, 5.0, 4.0, 10.0])?, 0);
+        assert_eq!(greedy.sample(&[9.0, 2.0, 8.0, 10.0])?, 1);
+        assert_eq!(greedy.sample(&[9.0, 8.0, 7.0, -2.0])?, 3);
+
+        let ref_inner = ReferenceSampler::new(
+            Sampling {
+                temperature: 0.7,
+                top_k: 4,
+                top_p: 0.95,
+            },
+            77,
+        )?;
+        let mut reference = GrammarConstrainedSampler::new(
+            ref_inner,
+            grammar,
+            Arc::clone(&candidates),
+            Arc::clone(&eog),
+        )?;
+        let mut cloned = reference.clone();
+        assert_eq!(reference.sample(&[1.0, 5.0, 4.0, 10.0])?, 0);
+        assert_eq!(cloned.sample(&[1.0, 5.0, 4.0, 10.0])?, 0);
+        assert_eq!(reference.sample(&[9.0, 2.0, 8.0, 10.0])?, 1);
+        assert_eq!(cloned.sample(&[9.0, 2.0, 8.0, 10.0])?, 1);
+        assert_eq!(reference.sample(&[9.0, 8.0, 7.0, -2.0])?, 3);
+        assert_eq!(cloned.sample(&[9.0, 8.0, 7.0, -2.0])?, 3);
+
+        // Dead-end grammar (zero allowed tokens) fails BEFORE advancing inner sampler RNG.
+        let dead_grammar = GrammarState::from_grammar(Grammar::parse("root ::= \"z\"")?, "root")?;
+        let mut dead = GrammarConstrainedSampler::new(
+            RecordingNegInfSampler {
+                observed: Vec::new(),
+                forced_choice: None,
+                draws: 0,
+            },
+            dead_grammar,
+            Arc::clone(&candidates),
+            Arc::clone(&eog),
+        )?;
+        assert!(dead.sample(&[1.0, 2.0, 3.0, 4.0]).is_err());
+        assert_eq!(dead.inner().draws, 0);
+
+        // Disallowed choice from a misbehaving inner sampler does not mutate grammar state.
+        let strict_grammar = GrammarState::from_grammar(Grammar::parse("root ::= \"a\"")?, "root")?;
+        let mut strict = GrammarConstrainedSampler::new(
+            RecordingNegInfSampler {
+                observed: Vec::new(),
+                forced_choice: Some(2),
+                draws: 0,
+            },
+            strict_grammar,
+            candidates,
+            eog,
+        )?;
+        let before_stacks = strict.grammar().stacks().to_vec();
+        assert!(strict.sample(&[1.0, 2.0, 3.0, 4.0]).is_err());
+        assert_eq!(strict.grammar().stacks(), before_stacks.as_slice());
         Ok(())
     }
 }

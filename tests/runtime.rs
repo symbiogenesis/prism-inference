@@ -1860,3 +1860,603 @@ fn marconi_utility_and_lru_eviction_retains_reused_long_prefix_over_short_throwa
     );
     Ok(())
 }
+
+mod grammar_speculation {
+    use bonsai_prism_runtime::{
+        Decoder, Result,
+        grammar::{
+            Grammar,
+            runtime::{Candidate, GrammarConstrainedSampler, GrammarState},
+        },
+        runtime::{Cancellation, Finish, Generation, Limits, Prefill, Runtime},
+        sampling::{ReferenceSampler, Sampler, Sampling},
+        speculative::SuffixDraftConfig,
+    };
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    struct HybridState {
+        tokens: Vec<u32>,
+        recurrent: u64,
+        conv: [u32; 3],
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LogitMode {
+        FollowCycle,
+        FavorIllegalAtStart { illegal: u32, fallback: u32 },
+        StopAtStep { step: usize, stop: u32, normal: u32 },
+    }
+
+    struct GrammarBatchDecoder {
+        state: HybridState,
+        capacity: usize,
+        batches: usize,
+        restores: usize,
+        mode: LogitMode,
+        cancel_after_evals: Rc<Cell<Option<usize>>>,
+        cancellation: Cancellation,
+        evals: usize,
+    }
+
+    impl GrammarBatchDecoder {
+        fn new(capacity: usize, mode: LogitMode, cancellation: Cancellation) -> Self {
+            Self {
+                state: HybridState::default(),
+                capacity,
+                batches: 0,
+                restores: 0,
+                mode,
+                cancel_after_evals: Rc::new(Cell::new(None)),
+                cancellation,
+                evals: 0,
+            }
+        }
+
+        fn logits_for_state(&self) -> Vec<f32> {
+            let mut logits = vec![-6.0_f32; 8];
+            match self.mode {
+                LogitMode::FollowCycle => {
+                    // Tokens after prompt [0, 2, 3, 2, 1, 0]: repeat [2, 3, 2, 1], then EOG 7.
+                    let idx = self.state.tokens.len();
+                    let preferred = match idx {
+                        6 | 8 => 2,
+                        7 => 3,
+                        9 => 1,
+                        _ => 7,
+                    };
+                    logits[usize::try_from(preferred).unwrap_or(0)] = 6.0;
+                    logits[2] = logits[2].max(-1.0);
+                    logits[3] = logits[3].max(-1.2);
+                }
+                LogitMode::FavorIllegalAtStart { illegal, fallback } => {
+                    logits[7] = 25.0;
+                    logits[usize::try_from(illegal).unwrap_or(0)] = 20.0;
+                    logits[usize::try_from(fallback).unwrap_or(0)] = 5.0;
+                    logits[1] = -0.5;
+                }
+                LogitMode::StopAtStep { step, stop, normal } => {
+                    let chosen = if self.state.tokens.len() >= step {
+                        stop
+                    } else {
+                        normal
+                    };
+                    logits[usize::try_from(chosen).unwrap_or(0)] = 8.0;
+                    logits[usize::try_from(normal).unwrap_or(0)] =
+                        logits[usize::try_from(normal).unwrap_or(0)].max(1.0);
+                }
+            }
+            logits
+        }
+    }
+
+    impl Decoder for GrammarBatchDecoder {
+        type Checkpoint = HybridState;
+
+        fn identity(&self) -> &'static str {
+            "grammar-speculative-hybrid/v1"
+        }
+
+        fn vocab_size(&self) -> usize {
+            8
+        }
+
+        fn checkpoint_bytes(&self) -> usize {
+            256
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.state = HybridState::default();
+            self.batches = 0;
+            self.restores = 0;
+            self.evals = 0;
+            Ok(())
+        }
+
+        fn evaluate(&mut self, token: u32) -> Result<Vec<f32>> {
+            self.evals += 1;
+            if let Some(limit) = self.cancel_after_evals.get()
+                && self.evals >= limit
+            {
+                self.cancellation.cancel();
+            }
+            self.state.tokens.push(token);
+            self.state.recurrent = self
+                .state
+                .recurrent
+                .wrapping_mul(31)
+                .wrapping_add(u64::from(token) + 3);
+            self.state.conv.rotate_left(1);
+            self.state.conv[2] = token;
+            Ok(self.logits_for_state())
+        }
+
+        fn batched_evaluation_capacity(&self) -> usize {
+            self.capacity
+        }
+
+        fn evaluate_batch_into(
+            &mut self,
+            tokens: &[u32],
+            rows: &mut Vec<Vec<f32>>,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            self.batches += 1;
+            rows.clear();
+            for &token in tokens {
+                check()?;
+                rows.push(self.evaluate(token)?);
+                check()?;
+            }
+            Ok(())
+        }
+
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            Ok(self.state.clone())
+        }
+
+        fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+            self.restores += 1;
+            self.state = checkpoint.clone();
+            Ok(())
+        }
+    }
+
+    fn vocab_candidates() -> Result<Arc<[Candidate]>> {
+        let pieces: [&[u8]; 8] = [b"{", b"}", b"a", b"b", b":", b"\"", b"1", b""];
+        let vec = pieces
+            .iter()
+            .enumerate()
+            .map(|(id, piece)| Candidate::from_piece(u32::try_from(id)?, piece))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::from(vec))
+    }
+
+    fn runtime(
+        capacity: usize,
+        mode: LogitMode,
+        cancellation: Cancellation,
+    ) -> Result<Runtime<GrammarBatchDecoder>> {
+        Runtime::new(
+            GrammarBatchDecoder::new(capacity, mode, cancellation),
+            Limits {
+                context_tokens: 64,
+                checkpoints: 2,
+                checkpoint_bytes: 32_768,
+            },
+        )
+    }
+
+    fn constrained_ref(
+        grammar_src: &str,
+        seed: u64,
+        temperature: f32,
+        eog: &[u32],
+    ) -> Result<GrammarConstrainedSampler<ReferenceSampler>> {
+        let grammar = GrammarState::from_grammar(Grammar::parse(grammar_src)?, "root")?;
+        let inner = ReferenceSampler::new(
+            Sampling {
+                temperature,
+                top_k: 4,
+                top_p: 0.95,
+            },
+            seed,
+        )?;
+        GrammarConstrainedSampler::new(inner, grammar, vocab_candidates()?, Arc::from(eog))
+    }
+
+    fn assert_rng_continuation_matches(
+        left: &mut ReferenceSampler,
+        right: &mut ReferenceSampler,
+    ) -> Result<()> {
+        let probe = [0.2_f32, -0.4, 1.1, 0.0, -1.5, 0.7, 0.3, -0.9];
+        for _ in 0..8 {
+            assert_eq!(left.sample(&probe)?, right.sample(&probe)?);
+        }
+        Ok(())
+    }
+
+    struct ParityCase<'a> {
+        name: &'a str,
+        grammar: &'a str,
+        mode: LogitMode,
+        max_tokens: usize,
+        stop_tokens: &'a [u32],
+        eog_tokens: &'a [u32],
+        expect_finish: Finish,
+        expect_accepted: usize,
+        expect_full_accept: bool,
+        expect_rollback: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FailureKind {
+        CallbackDisconnect,
+        CancelInBatch,
+        DeadEndGrammar,
+    }
+
+    fn verify_parity_case(
+        case: &ParityCase<'_>,
+        seed: u64,
+        prompt: &[u32],
+        suffix: SuffixDraftConfig,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut ordinary = runtime(8, case.mode, Cancellation::default())?;
+        let mut speculative = runtime(8, case.mode, Cancellation::default())?;
+        let mut seq_sampler = constrained_ref(case.grammar, seed, 0.25, case.eog_tokens)?;
+        let mut spec_sampler = seq_sampler.clone();
+        let options = Generation {
+            max_tokens: case.max_tokens,
+            stop_tokens: case.stop_tokens.to_vec(),
+        };
+        let mut seq_out = Vec::new();
+        let mut spec_out = Vec::new();
+        let seq_completion = ordinary.generate_sampled_until(
+            prompt,
+            &options,
+            Prefill::default(),
+            &Cancellation::default(),
+            deadline,
+            &mut seq_sampler,
+            |token| {
+                seq_out.push(token);
+                Ok(())
+            },
+        )?;
+        let (spec_completion, stats) = speculative.generate_sampled_speculative_until(
+            prompt,
+            &options,
+            Prefill::default(),
+            suffix,
+            &Cancellation::default(),
+            deadline,
+            &mut spec_sampler,
+            |token| {
+                spec_out.push(token);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(spec_completion, seq_completion, "case {}", case.name);
+        assert_eq!(
+            spec_completion.finish, case.expect_finish,
+            "case {}",
+            case.name
+        );
+        assert_eq!(spec_out, seq_out, "case {}", case.name);
+        assert_eq!(
+            speculative.tokens(),
+            ordinary.tokens(),
+            "case {}",
+            case.name
+        );
+        assert_eq!(
+            speculative.decoder().state,
+            ordinary.decoder().state,
+            "case {}",
+            case.name
+        );
+        assert_eq!(
+            spec_sampler.grammar().stacks(),
+            seq_sampler.grammar().stacks(),
+            "case {}",
+            case.name
+        );
+        assert_eq!(
+            spec_sampler.grammar().partial_utf8(),
+            seq_sampler.grammar().partial_utf8(),
+            "case {}",
+            case.name
+        );
+        assert_eq!(
+            spec_sampler.grammar().is_accepting(),
+            seq_sampler.grammar().is_accepting(),
+            "case {}",
+            case.name
+        );
+        assert_rng_continuation_matches(spec_sampler.inner_mut(), seq_sampler.inner_mut())?;
+        assert!(stats.draft_rounds > 0, "case {}", case.name);
+        assert!(speculative.decoder().batches > 0, "case {}", case.name);
+        assert_eq!(
+            stats.draft_tokens_accepted, case.expect_accepted,
+            "case {}",
+            case.name
+        );
+        if case.expect_full_accept {
+            assert_eq!(
+                stats.draft_tokens_accepted, stats.draft_tokens_proposed,
+                "case {}",
+                case.name
+            );
+        } else {
+            assert!(
+                stats.draft_tokens_proposed > stats.draft_tokens_accepted,
+                "case {}",
+                case.name
+            );
+        }
+        if case.expect_rollback {
+            assert!(stats.rollback_restores > 0, "case {}", case.name);
+        } else {
+            assert_eq!(stats.rollback_restores, 0, "case {}", case.name);
+        }
+        Ok(())
+    }
+
+    fn assert_retry_matches_sequential(
+        runtime: &mut Runtime<GrammarBatchDecoder>,
+        retry_prompt: &[u32],
+        suffix: SuffixDraftConfig,
+        deadline: Instant,
+        mut retry_sampler: GrammarConstrainedSampler<ReferenceSampler>,
+    ) -> Result<()> {
+        let mut reference_runtime =
+            self::runtime(8, LogitMode::FollowCycle, Cancellation::default())?;
+        let mut reference_sampler =
+            constrained_ref("root ::= (\"a\" | \"b\")+ \"}\"", 123, 0.6, &[7])?;
+        let retry_options = Generation {
+            max_tokens: 5,
+            stop_tokens: vec![7],
+        };
+        let mut actual_out = Vec::new();
+        let mut expected_out = Vec::new();
+        let (actual_completion, _) = runtime.generate_sampled_speculative_until(
+            retry_prompt,
+            &retry_options,
+            Prefill::default(),
+            suffix,
+            &Cancellation::default(),
+            deadline,
+            &mut retry_sampler,
+            |token| {
+                actual_out.push(token);
+                Ok(())
+            },
+        )?;
+        let expected_completion = reference_runtime.generate_sampled_until(
+            retry_prompt,
+            &retry_options,
+            Prefill::default(),
+            &Cancellation::default(),
+            deadline,
+            &mut reference_sampler,
+            |token| {
+                expected_out.push(token);
+                Ok(())
+            },
+        )?;
+        assert_eq!(actual_completion, expected_completion);
+        assert_eq!(actual_out, expected_out);
+        assert_eq!(runtime.tokens(), reference_runtime.tokens());
+        assert_eq!(runtime.decoder().state, reference_runtime.decoder().state);
+        assert_eq!(
+            retry_sampler.grammar().stacks(),
+            reference_sampler.grammar().stacks()
+        );
+        assert_rng_continuation_matches(retry_sampler.inner_mut(), reference_sampler.inner_mut())
+    }
+
+    fn verify_rollback_case(
+        kind: FailureKind,
+        suffix: SuffixDraftConfig,
+        deadline: Instant,
+    ) -> Result<()> {
+        let initial_prompt = [0_u32, 2, 1];
+        let retry_prompt = [0_u32, 2, 3, 2, 1, 0];
+        let cancellation = Cancellation::default();
+        let mut runtime = runtime(8, LogitMode::FollowCycle, cancellation.clone())?;
+        let mut base_sampler = constrained_ref("root ::= \"a\" \"}\"", 99, 0.5, &[7])?;
+        runtime.generate_sampled_until(
+            &[0],
+            &Generation {
+                max_tokens: 2,
+                stop_tokens: vec![7],
+            },
+            Prefill::default(),
+            &Cancellation::default(),
+            deadline,
+            &mut base_sampler,
+            |_| Ok(()),
+        )?;
+        assert_eq!(runtime.tokens(), &initial_prompt);
+
+        let committed_tokens = runtime.tokens().to_vec();
+        let committed_state = runtime.decoder().state.clone();
+        let cancel_after = runtime.decoder().cancel_after_evals.clone();
+        if matches!(kind, FailureKind::CancelInBatch) {
+            // `prepare` resets the decoder (`evals = 0`), then `retry_prompt`
+            // evaluates 6 tokens (`evals = 1..=6`), and the 4-token batch
+            // evaluates tokens 7..=10, cancelling inside the batch.
+            cancel_after.set(Some(8));
+        }
+
+        let failing_grammar = match kind {
+            FailureKind::DeadEndGrammar => "root ::= \"a\" \"x\"",
+            FailureKind::CallbackDisconnect | FailureKind::CancelInBatch => {
+                "root ::= (\"a\" | \"b\")+ \"}\""
+            }
+        };
+        let mut sampler = constrained_ref(failing_grammar, 123, 0.6, &[7])?;
+        let sampler_snapshot = sampler.clone();
+
+        let mut delivered = 0_usize;
+        let err = runtime.generate_sampled_speculative_until(
+            &retry_prompt,
+            &Generation {
+                max_tokens: 4,
+                stop_tokens: vec![7],
+            },
+            Prefill::default(),
+            suffix,
+            &cancellation,
+            deadline,
+            &mut sampler,
+            |_| {
+                delivered += 1;
+                if matches!(kind, FailureKind::CallbackDisconnect) && delivered == 2 {
+                    return Err(std::io::Error::other("injected disconnect").into());
+                }
+                Ok(())
+            },
+        );
+        assert!(err.is_err());
+        assert!(runtime.decoder().batches > 0);
+        if matches!(kind, FailureKind::DeadEndGrammar) {
+            assert_eq!(delivered, 1);
+        }
+        assert!(!runtime.is_faulted());
+        assert_eq!(runtime.tokens(), committed_tokens.as_slice());
+        assert_eq!(runtime.decoder().state, committed_state);
+        assert_eq!(
+            sampler.grammar().stacks(),
+            sampler_snapshot.grammar().stacks()
+        );
+        assert_eq!(
+            sampler.grammar().partial_utf8(),
+            sampler_snapshot.grammar().partial_utf8()
+        );
+        let mut rng_probe_actual = sampler.inner().clone();
+        let mut rng_probe_expected = sampler_snapshot.inner().clone();
+        assert_rng_continuation_matches(&mut rng_probe_actual, &mut rng_probe_expected)?;
+
+        cancel_after.set(None);
+        let retry_sampler = if matches!(kind, FailureKind::DeadEndGrammar) {
+            constrained_ref("root ::= (\"a\" | \"b\")+ \"}\"", 123, 0.6, &[7])?
+        } else {
+            sampler
+        };
+        assert_retry_matches_sequential(
+            &mut runtime,
+            &retry_prompt,
+            suffix,
+            deadline,
+            retry_sampler,
+        )
+    }
+
+    #[test]
+    fn grammar_speculation_matches_sequential_across_accept_partial_full_reject_and_stop()
+    -> Result<()> {
+        let prompt = [0_u32, 2, 3, 2, 1, 0];
+        let suffix = SuffixDraftConfig::new(1, 16, 4)?;
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let cases = [
+            ParityCase {
+                name: "full-accept round followed by EOG stop on next round",
+                grammar: "root ::= (\"a\" | \"b\")+ \"}\"",
+                mode: LogitMode::FollowCycle,
+                max_tokens: 8,
+                stop_tokens: &[7],
+                eog_tokens: &[7],
+                expect_finish: Finish::Stop,
+                expect_accepted: 4,
+                expect_full_accept: false,
+                expect_rollback: true,
+            },
+            ParityCase {
+                name: "full-accept exact max_tokens boundary",
+                grammar: "root ::= (\"a\" | \"b\")+ \"}\"",
+                mode: LogitMode::FollowCycle,
+                max_tokens: 4,
+                stop_tokens: &[7],
+                eog_tokens: &[7],
+                expect_finish: Finish::Length,
+                expect_accepted: 4,
+                expect_full_accept: true,
+                expect_rollback: false,
+            },
+            ParityCase {
+                name: "partial-reject enforced by grammar mid-batch",
+                grammar: "root ::= \"a\" \"b\" \"b\" \"}\"",
+                mode: LogitMode::FollowCycle,
+                max_tokens: 5,
+                stop_tokens: &[7],
+                eog_tokens: &[7],
+                expect_finish: Finish::Stop,
+                expect_accepted: 2,
+                expect_full_accept: false,
+                expect_rollback: true,
+            },
+            ParityCase {
+                name: "full-reject with illegal draft and illegal EOG masked out",
+                grammar: "root ::= \"b\"+ \"}\"",
+                mode: LogitMode::FavorIllegalAtStart {
+                    illegal: 2,
+                    fallback: 3,
+                },
+                max_tokens: 2,
+                stop_tokens: &[7],
+                eog_tokens: &[7],
+                expect_finish: Finish::Length,
+                expect_accepted: 0,
+                expect_full_accept: false,
+                expect_rollback: true,
+            },
+            ParityCase {
+                name: "EOG stop sampled inside speculative batch",
+                grammar: "root ::= \"a\"+",
+                mode: LogitMode::StopAtStep {
+                    step: 7,
+                    stop: 7,
+                    normal: 2,
+                },
+                max_tokens: 6,
+                stop_tokens: &[7],
+                eog_tokens: &[7],
+                expect_finish: Finish::Stop,
+                expect_accepted: 1,
+                expect_full_accept: false,
+                expect_rollback: true,
+            },
+        ];
+
+        for case in &cases {
+            for seed in [7_u64, 4242] {
+                verify_parity_case(case, seed, &prompt, suffix, deadline)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grammar_speculation_rolls_back_state_grammar_and_rng_on_failures_and_retries_identically()
+    -> Result<()> {
+        let suffix = SuffixDraftConfig::new(1, 16, 4)?;
+        let deadline = Instant::now() + Duration::from_mins(1);
+        for kind in [
+            FailureKind::CallbackDisconnect,
+            FailureKind::CancelInBatch,
+            FailureKind::DeadEndGrammar,
+        ] {
+            verify_rollback_case(kind, suffix, deadline)?;
+        }
+        Ok(())
+    }
+}

@@ -8,7 +8,6 @@ use super::model_session::{Client, ModelSession, Reply};
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 use std::io::Read;
 use std::path::Path;
 
@@ -69,10 +68,7 @@ fn verify_artifact(path: &Path, length: u64, sha256: &str) -> Result<()> {
         verify(total <= length, "model artifact grew while hashing")?;
         hash.update(&buffer[..count]);
     }
-    let mut actual = String::with_capacity(64);
-    for byte in hash.finalize() {
-        write!(&mut actual, "{byte:02x}")?;
-    }
+    let actual = hex::encode(hash.finalize());
     verify(
         total == length && actual == sha256,
         "model artifact SHA-256 differs from its lock",

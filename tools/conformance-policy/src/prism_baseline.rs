@@ -178,17 +178,9 @@ impl<'a> Catalog<'a> {
         // Field order matches PowerShell's ordered ConvertTo-Json contract. Every
         // canonical string is validated ASCII, with no escapable characters.
         let canonical = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        Ok(hash_bytes(&canonical)
-            .map_err(|error| error.to_string())?
-            .iter()
-            .flat_map(|byte| {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                [
-                    char::from(HEX[usize::from(byte >> 4)]),
-                    char::from(HEX[usize::from(byte & 15)]),
-                ]
-            })
-            .collect())
+        Ok(hex::encode(
+            hash_bytes(&canonical).map_err(|error| error.to_string())?,
+        ))
     }
 
     fn source_inventory(&self, request: &Value) -> Result<()> {

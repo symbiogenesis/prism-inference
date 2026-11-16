@@ -272,32 +272,13 @@ impl<'a, 'b> Production<'a, 'b> {
 }
 
 pub(super) fn encode_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(DIGITS[usize::from(byte & 15)]));
-    }
-    text
+    hex::encode(bytes)
 }
 fn decode_hex(text: &str) -> Result<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return Err(invalid("production hex byte count differs"));
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let high = char::from(pair[0])
-                .to_digit(16)
-                .ok_or_else(|| invalid("production hex digit differs"))?;
-            let low = char::from(pair[1])
-                .to_digit(16)
-                .ok_or_else(|| invalid("production hex digit differs"))?;
-            Ok((high * 16 + low) as u8)
-        })
-        .collect()
+    hex::decode(text).map_err(|_| invalid("production hex digit differs"))
 }
 
 impl Host for Production<'_, '_> {

@@ -50,21 +50,13 @@ fn runtime_unhex(value: &Value) -> Result<Vec<u8>> {
     if !source.len().is_multiple_of(2) || source.len() > 16 * 1024 * 1024 {
         return Err(invalid("GGUF byte extent outside bound"));
     }
-    source
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            if pair
-                .iter()
-                .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte))
-            {
-                return Err(invalid("GGUF hex requires lowercase digits"));
-            }
-            Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?)
-        })
-        .collect()
+    if source
+        .bytes()
+        .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid("GGUF hex requires lowercase digits"));
+    }
+    Ok(hex::decode(source)?)
 }
 
 fn runtime_read(bytes: &[u8], mode: &str, load: bool) -> Result<RuntimeContext> {
@@ -986,13 +978,7 @@ fn random_context(seed: u32) -> Result<ContextInput> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(DIGITS[usize::from(byte & 15)]));
-    }
-    text
+    hex::encode(bytes)
 }
 
 fn fields(value: &Value, names: &[&str]) -> Result<()> {
@@ -1033,12 +1019,7 @@ fn unhex(value: &Value) -> Result<Vec<u8>> {
     {
         return Err(invalid("GGUF byte extent/digits invalid"));
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(text)?)
 }
 fn entry(value: &Value, index: usize) -> Result<Entry> {
     fields(

@@ -2605,11 +2605,7 @@ impl DriverArtifact {
             path: directory.join("fixture.gguf"),
             directory,
             bytes: u64::try_from(bytes.len())?,
-            digest: Sha256::digest(&bytes)
-                .into_iter()
-                .flat_map(|byte| [byte >> 4, byte & 15])
-                .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-                .collect(),
+            digest: hex::encode(Sha256::digest(&bytes)),
         };
         std::fs::write(&artifact.path, bytes)?;
         Ok(artifact)

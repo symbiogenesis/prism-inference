@@ -22,11 +22,7 @@ fn text<'a>(v: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| invalid(format!("LLG {name} must be text")))
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .flat_map(|b| [b >> 4, b & 15])
-        .map(|n| char::from(b"0123456789abcdef"[usize::from(n)]))
-        .collect()
+    hex::encode(bytes)
 }
 fn call(client: &Client, value: Value) -> Result<Value> {
     let reply = client.call(0, value, None)?;

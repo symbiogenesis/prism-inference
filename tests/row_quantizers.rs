@@ -16,13 +16,7 @@ fn unhex(value: &Value) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sy
     if !value.len().is_multiple_of(2) {
         return Err("hex fixture length must be even".into());
     }
-    value
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(value)?)
 }
 
 #[test]

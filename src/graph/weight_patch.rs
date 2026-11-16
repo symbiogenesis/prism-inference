@@ -17,6 +17,17 @@ pub use compensation::{
     FACTOR_APPLICATION_ARITHMETIC, FfnCompensation, GROUP_COMPENSATION_PROFILE,
 };
 
+pub(super) fn push_sha256_hex(hash: Hasher, target: &mut String) -> Result<()> {
+    let mut hex_bytes = [0_u8; 64];
+    hex::encode_to_slice(hash.finish()?, &mut hex_bytes)
+        .map_err(|_| invalid("sha256 hex digest length mismatch"))?;
+    target.try_reserve_exact(hex_bytes.len())?;
+    for byte in hex_bytes {
+        target.push(char::from(byte));
+    }
+    Ok(())
+}
+
 /// Numerical profile for the experimental original-basis FFN observation path.
 pub const EXECUTION_PROFILE: &str = "experimental-ffn-cpu-scalar-unfused-v1";
 /// Basis of the post-SwiGLU FFN activation supplied to a patch.
@@ -136,10 +147,7 @@ impl FfnPatch {
             hash.update(&value.to_bits().to_le_bytes())?;
         }
         let mut identity = String::new();
-        identity.try_reserve_exact(64)?;
-        for byte in hash.finish()? {
-            write!(identity, "{byte:02x}")?;
-        }
+        push_sha256_hex(hash, &mut identity)?;
         Ok(Self {
             a,
             b,
@@ -326,10 +334,7 @@ impl FfnProbe {
             }
         }
         let mut full_signs_sha256 = String::new();
-        full_signs_sha256.try_reserve_exact(64)?;
-        for byte in hash.finish()? {
-            write!(full_signs_sha256, "{byte:02x}")?;
-        }
+        push_sha256_hex(hash, &mut full_signs_sha256)?;
         self.graph.reset()?;
         write!(
             self.graph.identity,

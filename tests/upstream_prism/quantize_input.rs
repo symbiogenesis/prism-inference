@@ -24,12 +24,7 @@ fn digest(path: &Path) -> Result<String> {
         }
         hash.update(&block[..n]);
     }
-    Ok(hash
-        .finalize()
-        .iter()
-        .flat_map(|b| [b >> 4, b & 15])
-        .map(|n| char::from(b"0123456789abcdef"[usize::from(n)]))
-        .collect())
+    Ok(hex::encode(hash.finalize()))
 }
 struct Cursor<'a> {
     bytes: &'a [u8],

@@ -705,13 +705,8 @@ fn check_integers(metadata: &Metadata, key: &str, expected: &[u64]) -> Result<()
 }
 
 fn digest_matches(digest: [u8; 32], expected_hex: &str) -> bool {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut actual = [0_u8; 64];
-    for (index, byte) in digest.into_iter().enumerate() {
-        actual[index * 2] = HEX[usize::from(byte >> 4)];
-        actual[index * 2 + 1] = HEX[usize::from(byte & 15)];
-    }
-    actual == expected_hex.as_bytes()
+    hex::encode_to_slice(digest, &mut actual).is_ok() && actual == expected_hex.as_bytes()
 }
 
 fn expected_tensor_spec(

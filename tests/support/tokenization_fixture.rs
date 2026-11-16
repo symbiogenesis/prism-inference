@@ -88,11 +88,7 @@ pub(crate) fn model_bytes(vocab_size: u64, eos: u32, pre: &str) -> Result<Vec<u8
 }
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn u32_bytes(bytes: &mut Vec<u8>, value: u32) {

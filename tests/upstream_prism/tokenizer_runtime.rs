@@ -54,11 +54,7 @@ fn boolean(value: &Value, key: &str) -> Result<bool> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|value| char::from(b"0123456789abcdef"[usize::from(value)]))
-        .collect()
+    hex::encode(bytes)
 }
 
 fn unhex(value: &Value) -> Result<Vec<u8>> {
@@ -73,13 +69,7 @@ fn unhex(value: &Value) -> Result<Vec<u8>> {
     {
         return Err(invalid("vocabulary hex outside bounds"));
     }
-    input
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(input)?)
 }
 
 impl ModelSession {

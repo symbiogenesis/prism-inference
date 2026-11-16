@@ -225,17 +225,7 @@ impl Inputs {
             u64::try_from(bytes.len()).map_err(|error| error.to_string())? <= maximum,
             "Prism source artifact exceeds its byte bound.",
         )?;
-        let digest: String = hash_bytes(&bytes)
-            .map_err(|error| error.to_string())?
-            .iter()
-            .flat_map(|byte| {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                [
-                    char::from(HEX[usize::from(byte >> 4)]),
-                    char::from(HEX[usize::from(byte & 15)]),
-                ]
-            })
-            .collect();
+        let digest = hex::encode(hash_bytes(&bytes).map_err(|error| error.to_string())?);
         let text = decode_text(&bytes)?;
         let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
         bounded_depth(&value, 100)?;

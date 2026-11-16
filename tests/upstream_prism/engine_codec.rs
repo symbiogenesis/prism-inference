@@ -12,32 +12,17 @@ fn bytes(value: &Value) -> Result<Vec<u8>> {
     if text.len() > 2 * 1024 * 1024 || !text.len().is_multiple_of(2) {
         return Err(invalid("Rust codec byte extent exceeds bound"));
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let nibble = |byte| match byte {
-                b'0'..=b'9' => Ok(byte - b'0'),
-                b'a'..=b'f' => Ok(byte - b'a' + 10),
-                _ => Err(invalid("Rust codec requires lowercase hexadecimal")),
-            };
-            Ok(16 * nibble(pair[0])? + nibble(pair[1])?)
-        })
-        .collect()
+    if text
+        .bytes()
+        .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid("Rust codec requires lowercase hexadecimal"));
+    }
+    Ok(hex::decode(text)?)
 }
 
 fn byte_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    bytes
-        .iter()
-        .flat_map(|byte| {
-            [
-                char::from(DIGITS[usize::from(byte >> 4)]),
-                char::from(DIGITS[usize::from(byte & 15)]),
-            ]
-        })
-        .collect()
+    hex::encode(bytes)
 }
 
 fn header(operation: &Value) -> Result<(u32, usize)> {

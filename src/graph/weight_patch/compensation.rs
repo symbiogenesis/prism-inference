@@ -1,7 +1,5 @@
 //! Immutable, ordered binary32 recovery applied to the normalized FFN input.
 
-use std::fmt::Write as _;
-
 use bonsai_native_hash::Hasher;
 
 use crate::{Result, invalid};
@@ -54,10 +52,7 @@ impl FfnCompensation {
             hash.update(&value.to_le_bytes())?;
         }
         let mut identity = String::new();
-        identity.try_reserve_exact(64)?;
-        for byte in hash.finish()? {
-            write!(identity, "{byte:02x}")?;
-        }
+        super::push_sha256_hex(hash, &mut identity)?;
         Ok(Self { a, b, identity })
     }
 

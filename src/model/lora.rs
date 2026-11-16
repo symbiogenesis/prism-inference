@@ -4,7 +4,7 @@
 //! They do not establish that its authoring basis matches a particular model,
 //! and do not enable adapters in the private Swift HTTP service.
 
-use std::{collections::BTreeMap, fmt::Write as _, path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use bonsai_gguf::MetadataValue;
 
@@ -793,11 +793,7 @@ fn adapter_execution_identity(
         }
     }
     let digest = hasher.finish()?;
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(hex, "{byte:02x}")
-            .map_err(|_| invalid("rank-one adapter execution digest format error"))?;
-    }
+    let hex = hex::encode(digest);
     Ok(format!("{model_identity}:sha256={hex}"))
 }
 

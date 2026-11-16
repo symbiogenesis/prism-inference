@@ -161,19 +161,13 @@ fn bytes(value: &Value) -> Result<Vec<u8>> {
         text.len() % 2 == 0 && text.len() <= 2 * 1024 * 1024,
         "invalid hex byte extent",
     )?;
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let nibble = |b: u8| match b {
-                b'0'..=b'9' => Ok(b - b'0'),
-                b'a'..=b'f' => Ok(b - b'a' + 10),
-                _ => Err(invalid("invalid hex digit")),
-            };
-            Ok(nibble(pair[0])? * 16 + nibble(pair[1])?)
-        })
-        .collect()
+    if text
+        .bytes()
+        .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid("invalid hex digit"));
+    }
+    Ok(hex::decode(text)?)
 }
 #[derive(PartialEq, Debug)]
 struct Diff {

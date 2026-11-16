@@ -138,11 +138,7 @@ fn string_metadata(bytes: &mut Vec<u8>, key: &str, value: &str) -> Result<()> {
     text(bytes, value)
 }
 fn sha(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[test]

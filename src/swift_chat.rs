@@ -265,11 +265,7 @@ impl SwiftChatSession {
             .get("tokenizer.chat_template")
             .and_then(|value| value.as_str())
             .ok_or_else(|| invalid("Swift chat requires its embedded template"))?;
-        let template_digest: String = hash_bytes(source.as_bytes())?
-            .into_iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect();
+        let template_digest = hex::encode(hash_bytes(source.as_bytes())?);
         if template_digest != TEMPLATE_SHA256 {
             return Err(invalid("Swift embedded chat template identity mismatch"));
         }

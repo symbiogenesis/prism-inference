@@ -642,11 +642,7 @@ mod client {
         let result = (|| -> Result<()> {
             let bytes = tokenizer_fixture()?;
             fs::write(&path, &bytes)?;
-            let hash: String = Sha256::digest(&bytes)
-                .into_iter()
-                .flat_map(|byte| [byte >> 4, byte & 15])
-                .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-                .collect();
+            let hash = hex::encode(Sha256::digest(&bytes));
             let session =
                 TokenizationSession::load(&path, u64::try_from(bytes.len())?, &hash, 16 * 1024)?;
             fs::remove_file(&path)?;

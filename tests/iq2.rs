@@ -9,12 +9,7 @@ fn bytes(value: &Value) -> Result<Vec<u8>> {
     let text = value
         .as_str()
         .ok_or_else(|| std::io::Error::other("IQ2 fixture hex missing"))?;
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(text)?)
 }
 
 fn floats(value: &Value) -> Result<Vec<f32>> {

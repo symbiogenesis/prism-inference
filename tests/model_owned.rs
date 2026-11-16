@@ -55,11 +55,7 @@ impl Drop for Artifact {
 }
 
 fn hash(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|value| char::from(b"0123456789abcdef"[usize::from(value)]))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn metadata() -> Metadata {

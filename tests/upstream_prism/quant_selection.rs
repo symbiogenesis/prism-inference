@@ -271,11 +271,7 @@ fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| invalid(format!("quantization {name} must be text")))
 }
 fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|n| char::from(b"0123456789abcdef"[usize::from(n)]))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 fn input_summary(model: &Model) -> Value {
     let mut raw = Vec::new();

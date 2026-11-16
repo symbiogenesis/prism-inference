@@ -12,17 +12,11 @@ use super::{Result, invalid, result};
 const ID: &str = "tests/test-moe-weighted-reduce.cpp";
 
 fn hex(values: &[f32]) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    values
+    let bytes: Vec<u8> = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
-        .flat_map(|byte| {
-            [
-                char::from(DIGITS[usize::from(byte >> 4)]),
-                char::from(DIGITS[usize::from(byte & 15)]),
-            ]
-        })
-        .collect()
+        .collect();
+    hex::encode(bytes)
 }
 
 fn random_values(seed: &mut u32, count: usize) -> Result<Vec<f32>> {

@@ -6,15 +6,9 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 fn bytes(value: &Value) -> Result<Vec<u8>> {
-    value
-        .as_str()
-        .ok_or_else(|| std::io::Error::other("fixture hex missing"))?
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(value.as_str().ok_or_else(|| {
+        std::io::Error::other("fixture hex missing")
+    })?)?)
 }
 
 #[test]

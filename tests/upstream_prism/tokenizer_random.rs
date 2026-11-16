@@ -6,7 +6,6 @@ use super::tokenizer_session::VocabularySession;
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -81,12 +80,8 @@ const fn generator_name(kind: Kind) -> &'static str {
         Kind::RandomVocabWords => "generator_random_vocab_words",
     }
 }
-fn hex(bytes: &[u8]) -> Result<String> {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(output, "{byte:02x}")?;
-    }
-    Ok(output)
+fn hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
 }
 fn unhex(value: &Value) -> Result<Vec<u8>> {
     let text = value
@@ -95,12 +90,7 @@ fn unhex(value: &Value) -> Result<Vec<u8>> {
     if text.len() % 2 != 0 || text.len() > 2 * 1024 * 1024 {
         return Err(invalid("Tokenizer native text extent malformed"));
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|bytes| Ok(u8::from_str_radix(std::str::from_utf8(bytes)?, 16)?))
-        .collect()
+    Ok(hex::decode(text)?)
 }
 fn observations(value: &Value, count: usize) -> Result<Vec<Result<&Value>>> {
     let object = value
@@ -261,10 +251,8 @@ impl Comparison {
         }
         Ok(!self.stopped())
     }
-    fn report(&self, kind: Kind, elapsed_ns: u128) -> Result<Value> {
-        Ok(
-            json!({"Generator":generator_name(kind),"Compared":self.compared,"Prefetched":self.prefetched,"UncomparedPrefetch":self.prefetched-self.compared,"SourceEarlyStop":self.stopped(),"GeneratorExhausted":!self.stopped(),"SourceAssertions":0,"SourceEncodeErrors":self.encode_errors,"SourceDecodeErrors":self.decode_errors,"EncodeDifferences":self.encode_differences,"StrictDecodeDifferences":self.decode_differences,"StrictReferenceMatch":self.encode_differences==0&&self.decode_differences==0,"ComparedInputSha256":hex(&self.input_hash.clone().finalize())?,"DiagnosticTimingsNs":{"ReferenceEncode":self.reference_encode_ns.to_string(),"ProductionEncode":self.production_encode_ns.to_string(),"ReferenceDecode":self.reference_decode_ns.to_string(),"ProductionDecode":self.production_decode_ns.to_string(),"Total":elapsed_ns.to_string()},"Diagnostics":self.diagnostics}),
-        )
+    fn report(&self, kind: Kind, elapsed_ns: u128) -> Value {
+        json!({"Generator":generator_name(kind),"Compared":self.compared,"Prefetched":self.prefetched,"UncomparedPrefetch":self.prefetched-self.compared,"SourceEarlyStop":self.stopped(),"GeneratorExhausted":!self.stopped(),"SourceAssertions":0,"SourceEncodeErrors":self.encode_errors,"SourceDecodeErrors":self.decode_errors,"EncodeDifferences":self.encode_differences,"StrictDecodeDifferences":self.decode_differences,"StrictReferenceMatch":self.encode_differences==0&&self.decode_differences==0,"ComparedInputSha256":hex(&self.input_hash.clone().finalize()),"DiagnosticTimingsNs":{"ReferenceEncode":self.reference_encode_ns.to_string(),"ProductionEncode":self.production_encode_ns.to_string(),"ReferenceDecode":self.reference_decode_ns.to_string(),"ProductionDecode":self.production_decode_ns.to_string(),"Total":elapsed_ns.to_string()},"Diagnostics":self.diagnostics})
     }
 }
 fn compare(
@@ -289,7 +277,7 @@ fn compare(
     if !pending.is_empty() {
         comparison.batch(session, reference, vocab, &pending)?;
     }
-    comparison.report(kind, start.elapsed().as_nanos())
+    Ok(comparison.report(kind, start.elapsed().as_nanos()))
 }
 pub(super) fn run_case(
     engine: &Engine,

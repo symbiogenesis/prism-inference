@@ -42,13 +42,7 @@ fn handle(value: &Value, key: &str) -> Result<u64> {
         .ok_or_else(|| invalid(format!("Tokenizer production {key} handle missing")))
 }
 fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(DIGITS[usize::from(byte & 15)]));
-    }
-    text
+    hex::encode(bytes)
 }
 #[derive(Default)]
 struct ByteCount(usize);

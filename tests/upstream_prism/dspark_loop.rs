@@ -91,7 +91,7 @@ fn stage(client: &Client, speculative: u64, begin: i32, rows: usize, width: usiz
         .collect::<Vec<_>>();
     Ok(invoke(
         client,
-        json!({"Op":"speculative-stage","Speculative":speculative,"Sequence":0,"Rows":rows,"Width":width,"FeaturesHex":hex(&raw)?,"Positions":positions(begin,rows)?}),
+        json!({"Op":"speculative-stage","Speculative":speculative,"Sequence":0,"Rows":rows,"Width":width,"FeaturesHex":hex(&raw),"Positions":positions(begin,rows)?}),
     )?["Staged"]
         == true)
 }

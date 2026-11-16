@@ -75,19 +75,13 @@ fn unhex(text: &str) -> Result<Vec<u8>> {
     if text.len() % 2 != 0 || text.len() > 256 * 1024 {
         return Err(invalid("DSpark log extent outside bound"));
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let digit = |b| match b {
-                b'0'..=b'9' => Ok(b - b'0'),
-                b'a'..=b'f' => Ok(b - b'a' + 10),
-                _ => Err(invalid("DSpark log hex digit invalid")),
-            };
-            Ok(digit(pair[0])? * 16 + digit(pair[1])?)
-        })
-        .collect()
+    if text
+        .bytes()
+        .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid("DSpark log hex digit invalid"));
+    }
+    Ok(hex::decode(text)?)
 }
 fn verdict(variant: Variant, observed: &Value) -> Result<bool> {
     let loaded = observed["Loaded"]

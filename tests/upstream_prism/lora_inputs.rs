@@ -15,16 +15,7 @@ pub(super) fn hash_bytes(data: &[u8]) -> String {
     encoded_hash(&Sha256::digest(data))
 }
 fn encoded_hash(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    bytes
-        .iter()
-        .flat_map(|&v| {
-            [
-                char::from(DIGITS[usize::from(v >> 4)]),
-                char::from(DIGITS[usize::from(v & 15)]),
-            ]
-        })
-        .collect()
+    hex::encode(bytes)
 }
 pub(super) fn digest(path: &Path) -> Result<(u64, String)> {
     let mut input = File::open(path)?;

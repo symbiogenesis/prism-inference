@@ -1,6 +1,5 @@
 //! Focused ordinary source policy, provenance and retained-input regressions.
 
-use std::fmt::Write as _;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -152,10 +151,7 @@ fn fan_in_keeps_failures_order_extensions_and_exact_receipt_hashes() -> Result<(
     {
         let bytes = fs::read(root.join(format!("prism-ordinary-results-{index}/receipt.json")))
             .map_err(|error| error.to_string())?;
-        let mut digest = String::new();
-        for byte in hash_bytes(&bytes).map_err(|error| error.to_string())? {
-            write!(&mut digest, "{byte:02x}").map_err(|error| error.to_string())?;
-        }
+        let digest = hex::encode(hash_bytes(&bytes).map_err(|error| error.to_string())?);
         assert_eq!(partition["ReceiptSha256"], digest);
     }
     Ok(())
@@ -309,10 +305,7 @@ fn artifact_bom_encodings_preserve_valid_unicode_and_original_bytes() -> Result<
         fs::write(&path, &bytes).map_err(|error| error.to_string())?;
         let (value, digest) = Inputs::new().read(&path, 1024)?;
         assert_eq!(value["Detail"], "\u{4e2d}\u{1f600}");
-        let mut expected = String::new();
-        for byte in hash_bytes(&bytes).map_err(|error| error.to_string())? {
-            write!(&mut expected, "{byte:02x}").map_err(|error| error.to_string())?;
-        }
+        let expected = hex::encode(hash_bytes(&bytes).map_err(|error| error.to_string())?);
         assert_eq!(digest, expected);
     }
     for invalid in [

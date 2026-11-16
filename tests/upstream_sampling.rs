@@ -5,7 +5,6 @@ use bonsai_prism_runtime::sampling::upstream::{Candidate, Candidates, Config, St
 use bonsai_prism_runtime::sampling::{Sampler, SwiftSampler};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -97,10 +96,7 @@ fn assert_native_candidates(data: &Candidates, expected: &[Value]) -> TestResult
 fn swift_chain_matches_verified_pinned_arm64_candidates_and_seeded_draws() -> TestResult {
     // Canonical LF bytes retain their capture digest on CRLF Git checkouts.
     let bytes = include_str!("fixtures/swift-sampler.json").replace("\r\n", "\n");
-    let mut digest = String::new();
-    for byte in Sha256::digest(bytes.as_bytes()) {
-        write!(&mut digest, "{byte:02x}")?;
-    }
+    let digest = hex::encode(Sha256::digest(bytes.as_bytes()));
     assert_eq!(
         digest,
         "662e81fdd618b304b2bcc4933dc0fa6ec6a7808251253437b1d2a59bf3404242"
@@ -120,10 +116,7 @@ fn swift_chain_matches_verified_pinned_arm64_candidates_and_seeded_draws() -> Te
         for logit in &logits {
             input.extend_from_slice(&logit.to_le_bytes());
         }
-        let mut input_digest = String::new();
-        for byte in Sha256::digest(&input) {
-            write!(&mut input_digest, "{byte:02x}")?;
-        }
+        let input_digest = hex::encode(Sha256::digest(&input));
         assert_eq!(input_digest, case["LogitsSha256"]);
         let seed = u32::try_from(case["Seed"].as_u64().ok_or("missing seed")?)?;
         let mut distribution = State::new(Config::Distribution(seed))?;
@@ -189,10 +182,7 @@ fn swift_chain_matches_verified_pinned_arm64_candidates_and_seeded_draws() -> Te
 #[test]
 fn distribution_and_xtc_match_real_native_msvc_draws_and_reset() -> TestResult {
     let bytes = include_bytes!("fixtures/sampler-rng.json");
-    let mut digest = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        write!(&mut digest, "{byte:02x}")?;
-    }
+    let digest = hex::encode(Sha256::digest(bytes));
     assert_eq!(
         digest,
         "5e728e604357e474898180cfb866bdba62102d95048ff8bf79a8fcea12938310"

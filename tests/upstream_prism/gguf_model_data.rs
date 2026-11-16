@@ -654,11 +654,7 @@ impl<'a> Frozen<'a> {
             return Err(invalid("metadata artifact length mismatch"));
         }
         let hash = Sha256::digest(&bytes);
-        let actual = hash
-            .iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect::<String>();
+        let actual = hex::encode(hash);
         if actual != digest.to_ascii_lowercase() {
             return Err(invalid("metadata artifact SHA256 mismatch"));
         }

@@ -93,11 +93,7 @@ impl Artifact {
     }
 
     fn hash(&self) -> String {
-        Sha256::digest(&self.bytes)
-            .into_iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect()
+        hex::encode(Sha256::digest(&self.bytes))
     }
 
     fn load(&self) -> Result<TextOutputSession> {

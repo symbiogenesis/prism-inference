@@ -60,10 +60,7 @@ fn flag(v: &Value, k: &str) -> Result<bool> {
         .ok_or_else(|| invalid(format!("backend sampler {k} boolean required")))
 }
 fn hex(v: &[u8]) -> String {
-    v.iter()
-        .flat_map(|b| [b >> 4, b & 15])
-        .map(|n| char::from(b"0123456789abcdef"[usize::from(n)]))
-        .collect()
+    hex::encode(v)
 }
 fn f32s(bytes: &[u8]) -> Result<Vec<f32>> {
     verify(

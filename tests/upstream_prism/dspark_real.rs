@@ -594,7 +594,7 @@ pub(super) fn run_with_options(engine: &Engine, options: &Options) -> Result<Val
         } else {
             prompt.text.clone()
         };
-        let value=rt.call(json!({"Op":"vocab-tokenize","Context":rt.target,"InputsHex":[super::generated_inputs::hex(text.as_bytes())?],"AddSpecial":true,"ParseSpecial":true}))?;
+        let value=rt.call(json!({"Op":"vocab-tokenize","Context":rt.target,"InputsHex":[super::generated_inputs::hex(text.as_bytes())],"AddSpecial":true,"ParseSpecial":true}))?;
         require(value["Errors"][0].is_null(), "prompt tokenization failed")?;
         let inp = tokens(&json!({"Tokens":value["Values"][0]}), "Tokens")?;
         if inp.len() < 2 {

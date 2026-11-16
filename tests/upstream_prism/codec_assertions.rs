@@ -94,13 +94,7 @@ fn boolean(value: &Value) -> Result<bool> {
         .ok_or_else(|| invalid("codec capability must be boolean"))
 }
 fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(DIGITS[usize::from(byte & 15)]));
-    }
-    text
+    hex::encode(bytes)
 }
 fn unhex(value: &Value, expected: usize) -> Result<Vec<u8>> {
     let text = value
@@ -114,12 +108,7 @@ fn unhex(value: &Value, expected: usize) -> Result<Vec<u8>> {
     {
         return Err(invalid("codec DataHex extent or digits mismatch"));
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(text)?)
 }
 fn raw(value: &Value, expected: usize) -> Result<Vec<u8>> {
     fields(value, &["DataHex"])?;

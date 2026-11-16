@@ -425,11 +425,7 @@ fn emit(value: &Value) -> Result<()> {
 }
 
 fn digest(bytes: &[u8]) -> Result<String> {
-    Ok(hash_bytes(bytes)?
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|value| char::from(b"0123456789abcdef"[usize::from(value)]))
-        .collect())
+    Ok(hex::encode(hash_bytes(bytes)?))
 }
 
 fn hash_values(hash: &mut Hasher, values: &[f32]) -> Result<()> {
@@ -460,12 +456,7 @@ fn state_digest(graph: &Qwen35) -> Result<String> {
 }
 
 fn hex_digest(hash: Hasher) -> Result<String> {
-    Ok(hash
-        .finish()?
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|value| char::from(b"0123456789abcdef"[usize::from(value)]))
-        .collect())
+    Ok(hex::encode(hash.finish()?))
 }
 
 fn logits_digest(logits: &[f32]) -> Result<String> {

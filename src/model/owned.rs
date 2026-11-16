@@ -161,13 +161,7 @@ impl Model {
         }
         let mut output = HashWriter(Hasher::new()?);
         model.write_to(&mut output)?;
-        model.identity = output
-            .0
-            .finish()?
-            .into_iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect();
+        model.identity = hex::encode(output.0.finish()?);
         Ok(model)
     }
 

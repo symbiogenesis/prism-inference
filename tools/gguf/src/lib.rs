@@ -81,11 +81,7 @@ pub(crate) fn digest_hex(hash: bonsai_native_hash::Hasher) -> Result<String> {
 }
 
 fn bytes_hex(digest: [u8; 32]) -> String {
-    digest
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 0x0f])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect()
+    hex::encode(digest)
 }
 pub(crate) fn hash_range(file: &mut File, start: u64, length: u64) -> Result<String> {
     let restore = file.stream_position()?;

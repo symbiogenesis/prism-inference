@@ -113,12 +113,7 @@ fn recorded_file(path: &Path, values: usize) -> Result<CaptureFile> {
             .to_owned(),
         values,
         bytes,
-        sha256: digest
-            .finish()?
-            .iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect(),
+        sha256: hex::encode(digest.finish()?),
     })
 }
 

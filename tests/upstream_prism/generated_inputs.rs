@@ -4,7 +4,6 @@ use super::windows_random::{Normal, Random, hash_name64};
 use super::{Result, invalid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -100,34 +99,22 @@ pub(super) fn metadata(path: &Path, entries: &[Entry], hints: &[(String, u32)]) 
     file.write_all(&bytes)?;
     Ok(())
 }
-pub(super) fn hex(bytes: &[u8]) -> Result<String> {
-    let mut value = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut value, "{byte:02x}")?;
-    }
-    Ok(value)
+pub(super) fn hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
 }
 pub(super) fn floats(value: &Value) -> Result<Vec<f32>> {
     let text = value
         .as_str()
         .ok_or_else(|| invalid("missing float bytes"))?;
-    if text.len() % 8 != 0 || text.len() > 16 * 1024 * 1024 {
-        return Err(invalid("invalid float buffer extent"));
+    if text.len() % 8 != 0
+        || text.len() > 16 * 1024 * 1024
+        || text
+            .bytes()
+            .any(|v| !v.is_ascii_digit() && !(b'a'..=b'f').contains(&v))
+    {
+        return Err(invalid("invalid float byte digit"));
     }
-    let raw = text
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let digit = |v: u8| match v {
-                b'0'..=b'9' => Ok(v - b'0'),
-                b'a'..=b'f' => Ok(v - b'a' + 10),
-                _ => Err(invalid("invalid float byte digit")),
-            };
-            Ok(digit(pair[0])? * 16 + digit(pair[1])?)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let raw = hex::decode(text)?;
     Ok(raw
         .as_chunks::<4>()
         .0
@@ -225,7 +212,7 @@ pub(super) fn weights(
         hasher.update(&bytes);
         drop(file);
         state.bytes += length;
-        state.tensors.push(json!({"Spec":spec,"Seed32":seed32,"InputSHA256":hex(&hasher.finalize())?,"FloatInputBytes":length}));
+        state.tensors.push(json!({"Spec":spec,"Seed32":seed32,"InputSHA256":hex(&hasher.finalize()),"FloatInputBytes":length}));
         drop(state);
         Ok(json!({"DataFile":path,"Length":length,"Encoding":"float32-le"}))
     });

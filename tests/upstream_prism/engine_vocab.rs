@@ -5,7 +5,6 @@
 //! no inference-context claim. Metadata is never relabeled;
 //! unsupported declarations and API limits return failed operation metadata.
 
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -115,10 +114,7 @@ pub(super) fn metadata(path: &Path) -> Result<Metadata> {
         }
         hash.update(&buffer[..count]);
     }
-    let mut digest = String::with_capacity(64);
-    for byte in hash.finalize() {
-        write!(digest, "{byte:02x}")?;
-    }
+    let digest = hex::encode(hash.finalize());
     bonsai_gguf::read_vocabulary(path, bytes, &digest, 128 * 1024 * 1024)
 }
 
@@ -160,11 +156,7 @@ fn encode(objects: &Objects, input: &Value) -> Result<Vec<u32>> {
 
 fn detokenize(objects: &Objects, tokens: &[u32]) -> Result<String> {
     let bytes = objects.tokenizer.decode(tokens, false, true)?;
-    Ok(bytes
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect())
+    Ok(hex::encode(bytes))
 }
 fn worker(
     objects: &Objects,

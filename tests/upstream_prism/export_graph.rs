@@ -92,20 +92,13 @@ fn words(value: &Value) -> Result<Vec<i32>> {
         .as_str()
         .filter(|s| s.len() % 8 == 0 && s.len() <= 4096)
         .ok_or_else(|| invalid("invalid graph op parameter bytes"))?;
-    let raw = hex
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| -> Result<u8> {
-            let digit = |byte: u8| match byte {
-                b'0'..=b'9' => Ok(byte - b'0'),
-                b'a'..=b'f' => Ok(byte - b'a' + 10),
-                _ => Err(invalid("invalid op parameter hex")),
-            };
-            Ok(digit(pair[0])? * 16 + digit(pair[1])?)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    if hex
+        .bytes()
+        .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid("invalid op parameter hex"));
+    }
+    let raw = hex::decode(hex)?;
     Ok(raw
         .as_chunks::<4>()
         .0

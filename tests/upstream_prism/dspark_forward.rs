@@ -247,7 +247,7 @@ impl Harness {
         )?;
         invoke(
             &self.client,
-            json!({"Op":"dspark-stage","Context":context,"Rows":context_rows,"Width":input.width,"FeaturesHex":hex(&bytes(&input.features))?,"Positions":input.context_positions}),
+            json!({"Op":"dspark-stage","Context":context,"Rows":context_rows,"Width":input.width,"FeaturesHex":hex(&bytes(&input.features)),"Positions":input.context_positions}),
         )?;
         let batch = handle(
             &invoke(
@@ -807,7 +807,7 @@ fn spec(h: &mut Harness, context: u64, maximum: usize, sequences: usize) -> Resu
     Ok(value)
 }
 fn stage_spec(h: &mut Harness, id: u64, input: &Inputs) -> Result<()> {
-    h.check(invoke(&h.client,json!({"Op":"speculative-stage","Speculative":id,"Sequence":0,"Rows":input.context_positions.len(),"Width":input.width,"FeaturesHex":hex(&bytes(&input.features))?,"Positions":input.context_positions}))?["Staged"]==true,"common speculative staging failed")
+    h.check(invoke(&h.client,json!({"Op":"speculative-stage","Speculative":id,"Sequence":0,"Rows":input.context_positions.len(),"Width":input.width,"FeaturesHex":hex(&bytes(&input.features)),"Positions":input.context_positions}))?["Staged"]==true,"common speculative staging failed")
 }
 fn draft_operation(id: u64, maximum: i32) -> Value {
     json!({"Op":"speculative-draft","Speculative":id,"Sequence":0,"Drafting":true,"Max":maximum,"Past":6,"Last":0,"Prompt":null})

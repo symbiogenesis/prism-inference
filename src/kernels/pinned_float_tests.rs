@@ -96,11 +96,7 @@ fn aligned_pinned_float_projections_match_native_without_changing_generic_or_bf1
         "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab"
     );
     assert_eq!(bytes.len(), capture.fixture_bytes);
-    let hash: String = Sha256::digest(bytes)
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect();
+    let hash = hex::encode(Sha256::digest(bytes));
     assert_eq!(hash, capture.fixture_sha256);
     assert_eq!(
         hash,

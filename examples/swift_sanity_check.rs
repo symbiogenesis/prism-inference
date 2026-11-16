@@ -4,7 +4,6 @@
 //! An edited arm retains the adapter at the same scale and pins its new weights.
 
 use std::{
-    fmt::Write as _,
     fs::{File, OpenOptions},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
@@ -79,11 +78,7 @@ fn hash_file(path: &Path) -> Result<String> {
         }
         hash.update(&buffer[..count])?;
     }
-    let mut digest = String::with_capacity(64);
-    for byte in hash.finish()? {
-        write!(digest, "{byte:02x}")?;
-    }
-    Ok(digest)
+    Ok(hex::encode(hash.finish()?))
 }
 
 fn normalized(text: &str) -> String {

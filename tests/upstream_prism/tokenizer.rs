@@ -141,10 +141,7 @@ fn verify_file(path: &Path, identity: &Value) -> Result<()> {
         }
         hash.update(&buffer[..count]);
     }
-    let mut digest = String::with_capacity(64);
-    for byte in hash.finalize() {
-        write!(digest, "{byte:02x}")?;
-    }
+    let digest = hex::encode(hash.finalize());
     if digest != text(identity, "Sha256")? {
         return Err(invalid(format!(
             "tokenizer asset digest mismatch: {}",

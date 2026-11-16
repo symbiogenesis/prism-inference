@@ -4486,11 +4486,7 @@ mod tests {
         let fixture = include_bytes!("../tests/fixtures/swift-q8-parity.bin");
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/swift-q8-parity.json"))?;
-        let hash: String = Sha256::digest(fixture)
-            .into_iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect();
+        let hash = hex::encode(Sha256::digest(fixture));
         assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
         assert_eq!(fixture.len(), 420);
         assert_eq!(
@@ -4566,11 +4562,7 @@ mod tests {
         let fixture = include_bytes!("../tests/fixtures/swift-q8k-parity.bin");
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/swift-q8k-parity.json"))?;
-        let hash: String = Sha256::digest(fixture)
-            .into_iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect();
+        let hash = hex::encode(Sha256::digest(fixture));
         assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
         assert_eq!(fixture.len(), 584);
         assert_eq!(
@@ -4667,11 +4659,7 @@ mod tests {
         let fixture = include_bytes!("../tests/fixtures/swift-ptq1-dot-parity.bin");
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/swift-ptq1-dot-parity.json"))?;
-        let hash: String = Sha256::digest(fixture)
-            .into_iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect();
+        let hash = hex::encode(Sha256::digest(fixture));
         assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
         assert_eq!(fixture.len(), 508);
         assert_eq!(

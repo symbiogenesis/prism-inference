@@ -807,14 +807,8 @@ mod tests {
         }
 
         fn sha256_hex(&self) -> Result<String> {
-            const HEX: &[u8; 16] = b"0123456789abcdef";
             let digest = bonsai_native_hash::hash_bytes(&self.bytes)?;
-            let mut out = String::with_capacity(64);
-            for byte in digest {
-                out.push(char::from(HEX[usize::from(byte >> 4)]));
-                out.push(char::from(HEX[usize::from(byte & 15)]));
-            }
-            Ok(out)
+            Ok(hex::encode(digest))
         }
     }
 

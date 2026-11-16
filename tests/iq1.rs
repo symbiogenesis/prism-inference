@@ -8,15 +8,9 @@ use std::sync::Arc;
 const SCALES: [u16; 8] = [0, 0x8000, 1, 0x8001, 0x3c00, 0xbc00, 0x7bff, 0xfbff];
 
 fn bytes(value: &Value) -> Result<Vec<u8>> {
-    value
-        .as_str()
-        .ok_or_else(|| std::io::Error::other("IQ1 fixture hex missing"))?
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(value.as_str().ok_or_else(|| {
+        std::io::Error::other("IQ1 fixture hex missing")
+    })?)?)
 }
 
 fn floats(value: &Value) -> Result<Vec<f32>> {

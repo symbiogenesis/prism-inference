@@ -28,12 +28,7 @@ fn bytes(value: &Value) -> Result<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return Err(std::io::Error::other("IQ encoder fixture hex is truncated").into());
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(text)?)
 }
 
 fn floats(value: &Value) -> Result<Vec<f32>> {

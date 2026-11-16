@@ -11,16 +11,7 @@ fn check(ok: bool, message: &str) -> Result<()> {
     if ok { Ok(()) } else { Err(invalid(message)) }
 }
 fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    bytes
-        .iter()
-        .flat_map(|&b| {
-            [
-                char::from(DIGITS[usize::from(b >> 4)]),
-                char::from(DIGITS[usize::from(b & 15)]),
-            ]
-        })
-        .collect()
+    hex::encode(bytes)
 }
 fn string(bytes: &mut Vec<u8>, value: &str) -> Result<()> {
     bytes.extend_from_slice(&u64::try_from(value.len())?.to_le_bytes());

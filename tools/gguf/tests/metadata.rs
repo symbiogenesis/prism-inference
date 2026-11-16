@@ -47,11 +47,7 @@ impl Artifact {
             bytes.extend(value);
         }
         fs::write(&path, &bytes)?;
-        let hash = Sha256::digest(&bytes)
-            .into_iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect();
+        let hash = hex::encode(Sha256::digest(&bytes));
         Ok(Self {
             directory: Some(directory),
             path,

@@ -41,12 +41,11 @@ fn almost(a: f64, b: f64, tolerance: f64) -> bool {
     (a - b).abs() < tolerance
 }
 fn float_hex(values: &[f32]) -> String {
-    values
+    let bytes: Vec<u8> = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect()
+        .collect();
+    hex::encode(bytes)
 }
 fn floats(value: &Value) -> Result<Vec<f32>> {
     let hex = field(value, "DataHex")?
@@ -60,22 +59,7 @@ fn floats(value: &Value) -> Result<Vec<f32>> {
     {
         return Err(invalid("optimizer tensor byte encoding invalid"));
     }
-    let bytes = hex
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let digit = |byte: u8| {
-                if byte <= b'9' {
-                    byte - b'0'
-                } else {
-                    byte - b'a' + 10
-                }
-            };
-            (digit(pair[0]) << 4) | digit(pair[1])
-        })
-        .collect::<Vec<_>>();
+    let bytes = hex::decode(hex)?;
     bytes
         .as_chunks::<4>()
         .0

@@ -312,20 +312,13 @@ fn body(value: &Value) -> Result<Option<Vec<u8>>> {
         hex.len() % 2 == 0 && hex.len() <= 16 * 1024 * 1024,
         "invalid remote content hex length",
     )?;
-    let bytes = hex
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let nibble = |b: u8| match b {
-                b'0'..=b'9' => Ok(b - b'0'),
-                b'a'..=b'f' => Ok(b - b'a' + 10),
-                _ => Err(invalid("invalid remote content hex digit")),
-            };
-            Ok(nibble(pair[0])? * 16 + nibble(pair[1])?)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    if hex
+        .bytes()
+        .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid("invalid remote content hex digit"));
+    }
+    let bytes = hex::decode(hex)?;
     Ok(Some(bytes))
 }
 fn download_checks(results: &[Value], checks: &mut Checks) -> Result<()> {

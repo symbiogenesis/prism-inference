@@ -19,22 +19,17 @@ fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| invalid(format!("chat template {name} must be text")))
 }
 fn decoded(value: &Value) -> Result<Vec<u8>> {
-    let raw = text(value, "BufferHex")?.as_bytes();
+    let raw = text(value, "BufferHex")?;
     if raw.len() > 262_144 || !raw.len().is_multiple_of(2) {
         return Err(invalid("chat buffer byte extent exceeds bound"));
     }
-    raw.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let digit = |value| match value {
-                b'0'..=b'9' => Ok(value - b'0'),
-                b'a'..=b'f' => Ok(value - b'a' + 10),
-                _ => Err(invalid("chat buffer must be lowercase hex")),
-            };
-            Ok(16 * digit(pair[0])? + digit(pair[1])?)
-        })
-        .collect()
+    if raw
+        .bytes()
+        .any(|value| !value.is_ascii_digit() && !(b'a'..=b'f').contains(&value))
+    {
+        return Err(invalid("chat buffer must be lowercase hex"));
+    }
+    Ok(hex::decode(raw)?)
 }
 fn legacy(value: &Value, capacity: usize) -> Result<Option<Vec<u8>>> {
     let count = value["ReturnCode"]
@@ -130,12 +125,7 @@ pub(super) fn execute(request: &Value) -> Result<Option<Value>> {
                 }
                 Err(_) => -1,
             };
-            let mut buffer_hex = String::with_capacity(2 * capacity);
-            let digits = b"0123456789abcdef";
-            for byte in bytes {
-                buffer_hex.push(char::from(digits[usize::from(byte >> 4)]));
-                buffer_hex.push(char::from(digits[usize::from(byte & 15)]));
-            }
+            let buffer_hex = hex::encode(&bytes);
             results.push(json!({"ReturnCode":code,"BufferHex":buffer_hex}));
             continue;
         }

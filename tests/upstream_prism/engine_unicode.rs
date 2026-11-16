@@ -17,12 +17,7 @@ fn bytes(value: &Value) -> Result<Vec<u8>> {
     {
         return Err(invalid("invalid bounded Unicode byte input"));
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(text)?)
 }
 
 fn operation(operation: &Value) -> Result<Value> {
@@ -44,9 +39,9 @@ fn operation(operation: &Value) -> Result<Value> {
                     .as_u64()
                     .ok_or_else(|| invalid("Unicode point must be unsigned"))?,
             )?;
-            unicode::codepoint_to_utf8(point).and_then(|bytes| {
+            unicode::codepoint_to_utf8(point).map(|bytes| {
                 returned += bytes.len();
-                Ok(json!(hex(&bytes)?))
+                json!(hex(&bytes))
             })
         } else {
             let input = bytes(input)?;

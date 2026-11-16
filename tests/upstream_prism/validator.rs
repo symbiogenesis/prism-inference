@@ -7,7 +7,6 @@
 //! These are additional regressions, never described as original assertions.
 //! Upstream MIT attribution: tools/prism/upstream/LICENSE.
 
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -35,12 +34,8 @@ fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| invalid(format!("validator {name} must be text")))
 }
 
-fn hex(bytes: &[u8]) -> Result<String> {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(output, "{byte:02x}")?;
-    }
-    Ok(output)
+fn hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
 }
 
 fn sizes(value: &Value) -> Result<Vec<u64>> {
@@ -91,10 +86,7 @@ fn inspect(points: &[u32], initial: &Value, events: &[Value]) -> Result<Validati
 }
 
 fn decode(engine: &Engine, inputs: &[Vec<u8>]) -> Result<Option<Vec<Vec<u32>>>> {
-    let encoded = inputs
-        .iter()
-        .map(|input| hex(input))
-        .collect::<Result<Vec<_>>>()?;
+    let encoded = inputs.iter().map(|input| hex(input)).collect::<Vec<_>>();
     let operation = json!({"Kind":"unicode-decode","InputsHex":encoded});
     let Some(values) = exchange(engine, &[operation])? else {
         return Ok(None);
@@ -324,7 +316,7 @@ pub(super) fn diagnostic(engine: &Engine, config: &Value) -> Result<Value> {
     Ok(
         json!({"Source":ID,"Diagnostic":"two-file-gbnf-validator","Valid":values[0].valid,
         "ErrorPosition":values[0].error_position,"ErrorMessage":values[0].error_message,
-        "StdoutHex":hex(&output(&input,&values[0]))?,"OriginalExitCode":0}),
+        "StdoutHex":hex(&output(&input,&values[0])),"OriginalExitCode":0}),
     )
 }
 

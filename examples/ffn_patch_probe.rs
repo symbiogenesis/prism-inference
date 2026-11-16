@@ -138,11 +138,12 @@ fn hash_file(path: &Path, deadline: &Deadline) -> Result<String> {
 }
 
 fn hex(bytes: [u8; 32]) -> Result<String> {
-    use std::fmt::Write as _;
+    let mut hex_bytes = [0_u8; 64];
+    hex::encode_to_slice(bytes, &mut hex_bytes).map_err(|_| reject("sha256 digest length"))?;
     let mut result = String::new();
-    result.try_reserve_exact(64)?;
-    for byte in bytes {
-        write!(result, "{byte:02x}")?;
+    result.try_reserve_exact(hex_bytes.len())?;
+    for byte in hex_bytes {
+        result.push(char::from(byte));
     }
     Ok(result)
 }

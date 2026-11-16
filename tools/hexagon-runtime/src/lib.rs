@@ -32,3 +32,19 @@ type Result<T> = bonsai_prism_runtime::Result<T>;
 fn invalid(message: &str) -> bonsai_prism_runtime::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
 }
+
+pub(crate) fn finish_sha256_prefixed_hex(
+    digest: bonsai_native_hash::Hasher,
+    prefix: &str,
+) -> Result<String> {
+    let mut hex_bytes = [0_u8; 64];
+    hex::encode_to_slice(digest.finish()?, &mut hex_bytes)
+        .map_err(|_| invalid("sha256 hex digest length mismatch"))?;
+    let mut identity = String::new();
+    identity.try_reserve_exact(prefix.len() + hex_bytes.len())?;
+    identity.push_str(prefix);
+    for byte in hex_bytes {
+        identity.push(char::from(byte));
+    }
+    Ok(identity)
+}

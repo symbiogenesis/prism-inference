@@ -10,7 +10,6 @@
 //! Strict Rust validity checks reject only malformed raw pieces before encoding.
 //! Upstream MIT attribution: tools/prism/upstream/LICENSE.
 
-use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,10 +122,7 @@ fn verify_asset(engine: &Engine, asset: &Value) -> Result<std::path::PathBuf> {
         }
         hash.update(&buffer[..count]);
     }
-    let mut digest = String::with_capacity(64);
-    for byte in hash.finalize() {
-        write!(digest, "{byte:02x}")?;
-    }
+    let digest = hex::encode(hash.finalize());
     if digest != text(asset, "Sha256")? {
         return Err(invalid("roundtrip vocabulary digest mismatch"));
     }
@@ -291,22 +287,7 @@ fn restore_utf8_piece_skips(rows: &mut [Row]) -> Result<()> {
             .as_ref()
             .ok_or_else(|| invalid("BPE initial piece missing"))?;
         let encoded = hex(&json!(encoded))?;
-        let bytes = encoded
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                let digit = |value: u8| {
-                    if value <= b'9' {
-                        value - b'0'
-                    } else {
-                        value - b'a' + 10
-                    }
-                };
-                (digit(pair[0]) << 4) | digit(pair[1])
-            })
-            .collect::<Vec<_>>();
+        let bytes = ::hex::decode(&encoded)?;
         if std::str::from_utf8(&bytes).is_err() {
             row.skipped = true;
             row.restored_utf8_skip = true;

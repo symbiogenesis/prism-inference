@@ -174,7 +174,7 @@ fn write_bias(
                 .iter()
                 .flat_map(|value| value.to_bits().to_le_bytes())
                 .collect();
-            Ok(json!({"Index":index,"BiasHex":inputs::hex(&bytes)?}))
+            Ok(json!({"Index":index,"BiasHex":inputs::hex(&bytes)}))
         })
         .collect::<Result<Vec<_>>>()?;
     let value = invoke(

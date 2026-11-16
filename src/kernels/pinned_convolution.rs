@@ -1539,11 +1539,7 @@ mod tests {
         let capture: Capture = serde_json::from_str(include_str!(
             "../../tests/fixtures/swift-convolution-native.json"
         ))?;
-        let hash: String = Sha256::digest(bytes)
-            .into_iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect();
+        let hash = hex::encode(Sha256::digest(bytes));
         assert_eq!(bytes.len(), capture.fixture_bytes);
         assert_eq!(hash, capture.fixture_sha256);
         assert_eq!(

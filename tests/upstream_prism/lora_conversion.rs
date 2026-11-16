@@ -37,33 +37,17 @@ fn handle(value: &Value, key: &str) -> Result<u64> {
 fn decode_hex(value: &Value) -> Result<Vec<u8>> {
     let text = value
         .as_str()
-        .filter(|v| v.len() <= 2 * 1024 * 1024 && v.len() % 2 == 0)
-        .ok_or_else(|| invalid("LoRA token-piece extent differs"))?;
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let digit = |c: u8| match c {
-                b'0'..=b'9' => Ok(c - b'0'),
-                b'a'..=b'f' => Ok(c - b'a' + 10),
-                _ => Err(invalid("invalid token piece hex")),
-            };
-            Ok((digit(pair[0])? << 4) | digit(pair[1])?)
+        .filter(|v| {
+            v.len() <= 2 * 1024 * 1024
+                && v.len() % 2 == 0
+                && v.bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
         })
-        .collect()
+        .ok_or_else(|| invalid("LoRA token-piece extent differs"))?;
+    Ok(hex::decode(text)?)
 }
 fn encoded_bytes(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    bytes
-        .iter()
-        .flat_map(|&v| {
-            [
-                char::from(DIGITS[usize::from(v >> 4)]),
-                char::from(DIGITS[usize::from(v & 15)]),
-            ]
-        })
-        .collect()
+    hex::encode(bytes)
 }
 fn merged(
     engine: &Engine,

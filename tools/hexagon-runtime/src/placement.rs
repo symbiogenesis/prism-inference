@@ -1,7 +1,5 @@
 //! Immutable explicit placement for a bounded partial-graph experiment.
 
-use std::fmt::Write;
-
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
     kernels::{Pq2ProjectionExecutor, Q8Block},
@@ -133,12 +131,7 @@ impl<'a> PlacedProjectionExecutor<'a> {
             digest.update(&[u8::from(selection.operations.is_some())])?;
             digest.update(&selection.operations.unwrap_or(0).to_le_bytes())?;
         }
-        let mut identity = String::new();
-        identity.try_reserve_exact(96)?;
-        identity.push_str("hexagon-explicit-placement-v1:");
-        for byte in digest.finish()? {
-            write!(&mut identity, "{byte:02x}")?;
-        }
+        let identity = crate::finish_sha256_prefixed_hex(digest, "hexagon-explicit-placement-v1:")?;
         Ok(Self {
             executor,
             selected,
@@ -793,12 +786,7 @@ pub fn plan_three_processor_placement(
         });
     }
 
-    let mut identity = String::new();
-    identity.try_reserve_exact(103)?;
-    identity.push_str("heterogeneous-3proc-placement-v1:");
-    for byte in digest.finish()? {
-        write!(&mut identity, "{byte:02x}")?;
-    }
+    let identity = crate::finish_sha256_prefixed_hex(digest, "heterogeneous-3proc-placement-v1:")?;
 
     Ok(HeterogeneousPlacementPlan {
         identity,

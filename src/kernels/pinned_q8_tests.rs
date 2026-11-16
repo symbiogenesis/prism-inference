@@ -46,11 +46,7 @@ fn packed(block: &Q8Block) -> Vec<u8> {
 fn pinned_ptq1_scale_and_inverse_match_native_halfway_and_zero_controls() -> Result<()> {
     let capture = capture()?;
     let fixture = include_bytes!("../../tests/fixtures/swift-ptq1-q8-scale-parity.bin");
-    let hash: String = Sha256::digest(fixture)
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect();
+    let hash = hex::encode(Sha256::digest(fixture));
     assert_eq!(
         capture.runtime_commit,
         "73bfe6cc485554822f80c473a3c0c4f25e80f41b"

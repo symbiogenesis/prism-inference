@@ -1,7 +1,5 @@
 //! Composite NPU + GPU projection executor and hybrid prefill coordinator.
 
-use std::fmt::Write;
-
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
     kernels::{Pq2ProjectionExecutor, Q8Block},
@@ -86,12 +84,7 @@ impl<'a> CompositeProjectionExecutor<'a> {
             digest.update(&u64::try_from(component.len())?.to_le_bytes())?;
             digest.update(component.as_bytes())?;
         }
-        let mut identity = String::new();
-        identity.try_reserve_exact(88)?;
-        identity.push_str("composite-projection-v1:");
-        for byte in digest.finish()? {
-            write!(&mut identity, "{byte:02x}")?;
-        }
+        let identity = crate::finish_sha256_prefixed_hex(digest, "composite-projection-v1:")?;
         Ok(Self {
             npu,
             gpu,

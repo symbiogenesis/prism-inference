@@ -39,28 +39,14 @@ fn real(value: &Value) -> Result<f32> {
     Ok(value)
 }
 fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    bytes
-        .iter()
-        .flat_map(|&byte| {
-            [
-                char::from(DIGITS[usize::from(byte >> 4)]),
-                char::from(DIGITS[usize::from(byte & 15)]),
-            ]
-        })
-        .collect()
+    hex::encode(bytes)
 }
 fn unhex(value: &Value) -> Result<Vec<u8>> {
     let text = text(value)?;
     if text.len() > 128 * 1024 * 1024 || !text.len().is_multiple_of(2) {
         return Err(invalid("Rust graph hexadecimal extent differs"));
     }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
-        .collect()
+    Ok(hex::decode(text)?)
 }
 fn kind(value: &Value) -> Result<i32> {
     match text(value)? {

@@ -146,12 +146,8 @@ fn selection(arguments: &[String], started: Instant, now: SystemTime) -> Result<
     })
 }
 
-fn hex(digest: impl IntoIterator<Item = u8>) -> String {
-    digest
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect()
+fn hex(digest: impl AsRef<[u8]>) -> String {
+    hex::encode(digest)
 }
 
 fn read_input(path: &Path, deadline: Instant) -> Result<(Vec<u8>, String)> {

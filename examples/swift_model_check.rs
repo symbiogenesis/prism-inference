@@ -403,12 +403,7 @@ fn hash_f32_le(values: &[f32]) -> Result<(usize, String)> {
     for value in values {
         hash.update(&value.to_le_bytes())?;
     }
-    let sha256: String = hash
-        .finish()?
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect();
+    let sha256 = hex::encode(hash.finish()?);
     Ok((bytes, sha256))
 }
 
@@ -675,11 +670,7 @@ mod tests {
         assert_eq!(metadata["name"], "logits-7.f32le");
         assert_eq!(metadata["bytes"], 8);
         let expected_bytes = [0_u8, 0, 128, 63, 0, 0, 0, 191];
-        let expected_sha256: String = bonsai_native_hash::hash_bytes(&expected_bytes)?
-            .iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-            .collect();
+        let expected_sha256 = hex::encode(bonsai_native_hash::hash_bytes(&expected_bytes)?);
         assert_eq!(metadata["sha256"], expected_sha256);
         let serialized = serde_json::to_string(&metadata)?;
         assert!(!serialized.contains('\\'));

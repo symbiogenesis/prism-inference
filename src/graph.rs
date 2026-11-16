@@ -4174,21 +4174,17 @@ impl Evaluation<'_, '_> {
                 self.projection.matvec.row_parallelism(),
             );
         }
-        // Preserve KV-aligned Swift decode groups across 4-, 8-, and 12-worker
-        // allocations (6, 3, and 2 query heads per unit). Other geometries and
+        // Preserve KV-aligned Swift decode groups while minimizing worst-case
+        // worker rounds across any worker count (e.g. unit 2 on 6 X2 workers,
+        // unit 3 on 8 X1 workers, unit 6 on 4 workers). Other geometries and
         // source-order arithmetic keep their existing dispatch.
         let workers = self.projection.matvec.row_parallelism().workers();
-        let head_unit = if matches!(arithmetic, Arithmetic::PinnedSwift) && heads_per_kv == 6 {
-            if workers <= g.kv_heads {
-                6
-            } else if workers <= 2 * g.kv_heads {
-                3
-            } else {
-                2
-            }
-        } else {
-            1
-        };
+        let head_unit = decode_head_unit(
+            g.heads,
+            heads_per_kv,
+            workers,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
         if matches!(arithmetic, Arithmetic::PinnedSwift) {
             resize_attention_packed_probs(
                 g.heads,
@@ -5516,6 +5512,34 @@ fn resize_attention_buffer_with<T: Copy>(
     }
     output.resize(count, zero);
     Ok(())
+}
+
+// Select the largest divisor of 6 (6, 3, or 2) that minimizes the worst-case
+// per-worker attention head count across any row-worker pool.
+const fn decode_head_unit(
+    heads: usize,
+    heads_per_kv: usize,
+    workers: usize,
+    pinned_swift: bool,
+) -> usize {
+    if !pinned_swift || heads_per_kv != 6 {
+        return 1;
+    }
+    let worker_count = if workers == 0 { 1 } else { workers };
+    let mut best_unit = 6_usize;
+    let mut best_work = (heads / 6).div_ceil(worker_count) * 6;
+    let candidates = [3_usize, 2];
+    let mut idx = 0;
+    while idx < candidates.len() {
+        let unit = candidates[idx];
+        let work = (heads / unit).div_ceil(worker_count) * unit;
+        if work < best_work {
+            best_work = work;
+            best_unit = unit;
+        }
+        idx += 1;
+    }
+    best_unit
 }
 
 // Full attention projects [query_head, gate_head] pairs. Queries are normalized
@@ -7152,6 +7176,18 @@ mod tests {
         };
         assert!(crate::kernels::validate_tensor_dimensions(&bad_cols).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn decode_head_unit_balances_workers_across_x1_and_x2() {
+        // Verified X1 (8 workers -> 3) and X2 (6 workers -> 2) Swift head_unit selection.
+        assert_eq!(super::decode_head_unit(24, 6, 1, true), 6);
+        assert_eq!(super::decode_head_unit(24, 6, 4, true), 6);
+        assert_eq!(super::decode_head_unit(24, 6, 6, true), 2);
+        assert_eq!(super::decode_head_unit(24, 6, 8, true), 3);
+        assert_eq!(super::decode_head_unit(24, 6, 12, true), 2);
+        assert_eq!(super::decode_head_unit(24, 6, 6, false), 1);
+        assert_eq!(super::decode_head_unit(16, 4, 6, true), 1);
     }
 
     #[test]

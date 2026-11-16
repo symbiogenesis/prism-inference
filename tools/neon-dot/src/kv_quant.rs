@@ -60,6 +60,60 @@ impl<'a> PreparedQuery<'a> {
     }
 }
 
+/// An immutable group of `G` finite queries and shared codebook checked once for
+/// a grouped-query packed-key scan.
+///
+/// Unpacks each 4-bit or 3-bit packed KV code block once per group of `G` heads
+/// while preserving identical per-lane binary64 multiply/add rounding order.
+pub struct PreparedQueryGroup<'a, const G: usize> {
+    bits: u8,
+    centroids: &'a [f32; 16],
+    queries: [&'a [f32; DIMENSION]; G],
+    #[cfg(target_arch = "aarch64")]
+    neon: bool,
+}
+
+impl<'a, const G: usize> PreparedQueryGroup<'a, G> {
+    /// Checks `G` query rows and shared centroids without allocating or copying.
+    #[must_use]
+    pub fn new(
+        bits: u8,
+        centroids: &'a [f32; 16],
+        queries: [&'a [f32; DIMENSION]; G],
+    ) -> Option<Self> {
+        if G == 0
+            || !matches!(bits, 3 | 4)
+            || !centroids.iter().all(|value| value.is_finite())
+            || queries
+                .iter()
+                .any(|query| !query.iter().all(|value| value.is_finite()))
+        {
+            return None;
+        }
+        Some(Self {
+            bits,
+            centroids,
+            queries,
+            #[cfg(target_arch = "aarch64")]
+            neon: std::arch::is_aarch64_feature_detected!("neon"),
+        })
+    }
+
+    /// Computes code-only dots for all `G` query heads from a single key row scan.
+    #[must_use]
+    pub fn dot(&self, packed: &[u8]) -> [Option<f32>; G] {
+        if packed.len() != DIMENSION * usize::from(self.bits) / 8 {
+            return [None; G];
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.neon {
+            return native::dot_group(packed, self.bits, self.centroids, &self.queries)
+                .map(finite_binary32);
+        }
+        portable_dot_group(packed, self.bits, self.centroids, &self.queries).map(finite_binary32)
+    }
+}
+
 /// Computes a dot against one code-only rotated KV row, excluding its scale.
 ///
 /// Rejects unsupported widths, incorrect byte lengths, nonfinite centroids or
@@ -139,6 +193,106 @@ impl<'a> ValueAccumulator<'a> {
     #[must_use]
     pub const fn finish(self) -> Option<[f32; DIMENSION]> {
         if self.failed { None } else { Some(self.output) }
+    }
+}
+
+/// Exclusive running value sums for `G` grouped query heads sharing one packed KV head.
+///
+/// Unpacks each value row once and updates all `G` independent binary32 accumulators
+/// with exact per-head isolation and failure atomicity.
+pub struct ValueGroupAccumulator<'a, const G: usize> {
+    bits: u8,
+    centroids: &'a [f32; 16],
+    outputs: [[f32; DIMENSION]; G],
+    failed: [bool; G],
+    #[cfg(target_arch = "aarch64")]
+    neon: bool,
+}
+
+impl<'a, const G: usize> ValueGroupAccumulator<'a, G> {
+    /// Starts zeroed accumulators for `G` heads, rejecting unsupported width or nonfinite codebook.
+    #[must_use]
+    pub fn new(bits: u8, centroids: &'a [f32; 16]) -> Option<Self> {
+        if G == 0 || !matches!(bits, 3 | 4) || !centroids.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        Some(Self {
+            bits,
+            centroids,
+            outputs: [[0.0; DIMENSION]; G],
+            failed: [false; G],
+            #[cfg(target_arch = "aarch64")]
+            neon: std::arch::is_aarch64_feature_detected!("neon"),
+        })
+    }
+
+    /// Accumulates one packed value row across all `G` heads with per-head scales.
+    #[must_use]
+    pub fn accumulate(&mut self, packed: &[u8], scales: [f32; G]) -> [bool; G] {
+        if packed.len() != DIMENSION * usize::from(self.bits) / 8 {
+            self.failed = [true; G];
+            return [false; G];
+        }
+        let mut active = [false; G];
+        let mut any_active = false;
+        for (head, (&scale, failed)) in scales.iter().zip(self.failed.iter_mut()).enumerate() {
+            if !*failed && scale.is_finite() {
+                active[head] = true;
+                any_active = true;
+            } else {
+                *failed = true;
+            }
+        }
+        if !any_active {
+            return [false; G];
+        }
+        #[cfg(target_arch = "aarch64")]
+        let ok = if self.neon {
+            native::accumulate_group(
+                packed,
+                self.bits,
+                self.centroids,
+                scales,
+                active,
+                &mut self.outputs,
+            )
+        } else {
+            portable_accumulate_group(
+                packed,
+                self.bits,
+                self.centroids,
+                scales,
+                active,
+                &mut self.outputs,
+            )
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let ok = portable_accumulate_group(
+            packed,
+            self.bits,
+            self.centroids,
+            scales,
+            active,
+            &mut self.outputs,
+        );
+        for (head, &row_ok) in ok.iter().enumerate() {
+            if !active[head] || !row_ok {
+                self.failed[head] = true;
+            }
+        }
+        std::array::from_fn(|head| !self.failed[head])
+    }
+
+    /// Publishes per-head sums for every head whose appends remained valid and finite.
+    #[must_use]
+    pub fn finish(self) -> [Option<[f32; DIMENSION]>; G] {
+        std::array::from_fn(|head| {
+            if self.failed[head] {
+                None
+            } else {
+                Some(self.outputs[head])
+            }
+        })
     }
 }
 
@@ -316,6 +470,30 @@ fn portable_dot(packed: &[u8], bits: u8, centroids: &[f32; 16], query: &[f32; DI
     reduce(sums)
 }
 
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Separate multiplication and addition preserve the deterministic scalar/NEON arithmetic contract."
+)]
+fn portable_dot_group<const G: usize>(
+    packed: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    queries: &[&[f32; DIMENSION]; G],
+) -> [f64; G] {
+    let mut sums = [[0.0_f64; 4]; G];
+    for index in 0..(DIMENSION / 4) {
+        let base = index * 4;
+        let values = tile(packed, bits, centroids, base);
+        for head in 0..G {
+            let query = &queries[head][base..base + 4];
+            for ((sum, value), &query_val) in sums[head].iter_mut().zip(values).zip(query) {
+                *sum += f64::from(value) * f64::from(query_val);
+            }
+        }
+    }
+    sums.map(reduce)
+}
+
 fn reduce(sums: [f64; 4]) -> f64 {
     ((sums[0] + sums[1]) + sums[2]) + sums[3]
 }
@@ -335,6 +513,38 @@ fn portable_accumulate(
     for (index, output) in output.iter_mut().enumerate() {
         *output += scale * coordinate(packed, bits, centroids, index);
         finite &= output.is_finite();
+    }
+    finite
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Value accumulation intentionally retains separate binary32 multiply/add rounding."
+)]
+fn portable_accumulate_group<const G: usize>(
+    packed: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    scales: [f32; G],
+    active: [bool; G],
+    outputs: &mut [[f32; DIMENSION]; G],
+) -> [bool; G] {
+    let mut finite = active;
+    for tile_index in 0..(DIMENSION / 4) {
+        let base = tile_index * 4;
+        let values = tile(packed, bits, centroids, base);
+        for ((&is_active, &scale), (output, is_finite)) in active
+            .iter()
+            .zip(&scales)
+            .zip(outputs.iter_mut().zip(finite.iter_mut()))
+        {
+            if is_active {
+                for (target, value) in output[base..base + 4].iter_mut().zip(values) {
+                    *target += scale * value;
+                    *is_finite &= target.is_finite();
+                }
+            }
+        }
     }
     finite
 }
@@ -432,6 +642,64 @@ mod native {
         super::reduce([low[0], low[1], high[0], high[1]])
     }
 
+    pub(super) fn dot_group<const G: usize>(
+        packed: &[u8],
+        bits: u8,
+        centroids: &[f32; 16],
+        queries: &[&[f32; DIMENSION]; G],
+    ) -> [f64; G] {
+        if bits == 4 {
+            // SAFETY: the safe public caller proves baseline NEON at runtime and
+            // validates exactly 256 four-bit codes and finite fixed-array inputs.
+            unsafe { dot_group_neon::<4, G>(packed, centroids, queries) }
+        } else {
+            // SAFETY: the same caller admits only three- or four-bit codes;
+            // this branch has exactly 256 three-bit codes and detected NEON.
+            unsafe { dot_group_neon::<3, G>(packed, centroids, queries) }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn dot_group_neon<const BITS: u8, const G: usize>(
+        packed: &[u8],
+        centroids: &[f32; 16],
+        queries: &[&[f32; DIMENSION]; G],
+    ) -> [f64; G] {
+        let mut low_sums: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
+        let mut high_sums: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
+        let table = codebook_bytes(centroids);
+        for index in 0..(DIMENSION / 4) {
+            let base = index * 4;
+            let values = if BITS == 4 {
+                four_bit_tile(packed, index, table)
+            } else {
+                let values = super::tile(packed, BITS, centroids, base);
+                // SAFETY: values contains four initialized coordinates and NEON
+                // permits an unaligned load; the temporary outlives the load.
+                unsafe { vld1q_f32(values.as_ptr()) }
+            };
+            let values_low = vcvt_f64_f32(vget_low_f32(values));
+            let values_high = vcvt_high_f64_f32(values);
+            for head in 0..G {
+                // SAFETY: `base + 4 <= DIMENSION`, covering all four query coordinates.
+                let query = unsafe { vld1q_f32(queries[head][base..].as_ptr()) };
+                let low = vmulq_f64(values_low, vcvt_f64_f32(vget_low_f32(query)));
+                let high = vmulq_f64(values_high, vcvt_high_f64_f32(query));
+                low_sums[head] = vaddq_f64(low_sums[head], low);
+                high_sums[head] = vaddq_f64(high_sums[head], high);
+            }
+        }
+        std::array::from_fn(|head| {
+            let mut low = [0.0; 2];
+            let mut high = [0.0; 2];
+            // SAFETY: low is a unique initialized two-element output array.
+            unsafe { vst1q_f64(low.as_mut_ptr(), low_sums[head]) };
+            // SAFETY: high is a disjoint unique two-element output array.
+            unsafe { vst1q_f64(high.as_mut_ptr(), high_sums[head]) };
+            super::reduce([low[0], low[1], high[0], high[1]])
+        })
+    }
+
     pub(super) fn accumulate(
         packed: &[u8],
         bits: u8,
@@ -483,6 +751,83 @@ mod native {
             unsafe { vst1q_f32(output.as_mut_ptr(), result) };
         }
         vminvq_u32(finite) != 0
+    }
+
+    pub(super) fn accumulate_group<const G: usize>(
+        packed: &[u8],
+        bits: u8,
+        centroids: &[f32; 16],
+        scales: [f32; G],
+        active: [bool; G],
+        outputs: &mut [[f32; DIMENSION]; G],
+    ) -> [bool; G] {
+        if bits == 4 {
+            // SAFETY: caller detects NEON, validates 256 four-bit codes and
+            // finite inputs, and supplies disjoint 256-coordinate staging rows.
+            unsafe { accumulate_group_neon::<4, G>(packed, centroids, scales, active, outputs) }
+        } else {
+            // SAFETY: the same caller admits only three- or four-bit codes;
+            // this branch has exactly 256 three-bit codes and detected NEON.
+            unsafe { accumulate_group_neon::<3, G>(packed, centroids, scales, active, outputs) }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn accumulate_group_neon<const BITS: u8, const G: usize>(
+        packed: &[u8],
+        centroids: &[f32; 16],
+        scales: [f32; G],
+        active: [bool; G],
+        outputs: &mut [[f32; DIMENSION]; G],
+    ) -> [bool; G] {
+        let mut scale_vecs = [vdupq_n_f32(0.0); G];
+        for (dst, &scale) in scale_vecs.iter_mut().zip(&scales) {
+            *dst = vdupq_n_f32(scale);
+        }
+        let magnitude = vdupq_n_u32(0x7fff_ffff);
+        let infinity = vdupq_n_u32(0x7f80_0000);
+        let mut finite: [_; G] = std::array::from_fn(|_| vdupq_n_u32(u32::MAX));
+        let table = codebook_bytes(centroids);
+        let all_active = active.iter().all(|&flag| flag);
+        for index in 0..(DIMENSION / 4) {
+            let base = index * 4;
+            let values = if BITS == 4 {
+                four_bit_tile(packed, index, table)
+            } else {
+                let values = super::tile(packed, BITS, centroids, base);
+                // SAFETY: values is a valid initialized four-element array.
+                unsafe { vld1q_f32(values.as_ptr()) }
+            };
+            if all_active {
+                for head in 0..G {
+                    let chunk = &mut outputs[head][base..base + 4];
+                    // SAFETY: chunk has 4 initialized floats in the caller's row.
+                    let previous = unsafe { vld1q_f32(chunk.as_ptr()) };
+                    let product = vmulq_f32(scale_vecs[head], values);
+                    let result = vaddq_f32(previous, product);
+                    let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
+                    finite[head] = vandq_u32(finite[head], vcltq_u32(absolute, infinity));
+                    // SAFETY: chunk covers the same unique four-element destination.
+                    unsafe { vst1q_f32(chunk.as_mut_ptr(), result) };
+                }
+            } else {
+                for head in 0..G {
+                    if !active[head] {
+                        continue;
+                    }
+                    let chunk = &mut outputs[head][base..base + 4];
+                    // SAFETY: chunk has 4 initialized floats in the caller's row.
+                    let previous = unsafe { vld1q_f32(chunk.as_ptr()) };
+                    let product = vmulq_f32(scale_vecs[head], values);
+                    let result = vaddq_f32(previous, product);
+                    let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
+                    finite[head] = vandq_u32(finite[head], vcltq_u32(absolute, infinity));
+                    // SAFETY: chunk covers the same unique four-element destination.
+                    unsafe { vst1q_f32(chunk.as_mut_ptr(), result) };
+                }
+            }
+        }
+        std::array::from_fn(|head| active[head] && vminvq_u32(finite[head]) != 0)
     }
 
     #[inline]
@@ -1113,5 +1458,99 @@ mod tests {
         let mut overflow = [f32::MAX; DIMENSION];
         assert!(!hadamard(&mut overflow));
         assert_eq!(overflow.map(f32::to_bits), [f32::MAX.to_bits(); DIMENSION]);
+    }
+
+    fn verify_group_bit_exact<const G: usize>(bits: u8) -> Result<(), &'static str> {
+        use super::{PreparedQuery, PreparedQueryGroup, ValueAccumulator, ValueGroupAccumulator};
+
+        let centroids = codebook();
+        let queries: [[f32; DIMENSION]; G] = std::array::from_fn(|head| {
+            std::array::from_fn(|idx| {
+                let centered = f32::from(idx.wrapping_mul(head + 3).to_le_bytes()[0]) - 127.5;
+                if idx % 7 == 0 {
+                    -0.0
+                } else {
+                    centered * 0.03125
+                }
+            })
+        });
+        let query_refs: [&[f32; DIMENSION]; G] = std::array::from_fn(|head| &queries[head]);
+        let group_query =
+            PreparedQueryGroup::new(bits, &centroids, query_refs).ok_or("finite group query")?;
+        let mut per_head_queries = Vec::with_capacity(G);
+        for &query in &query_refs {
+            per_head_queries
+                .push(PreparedQuery::new(bits, &centroids, query).ok_or("finite query")?);
+        }
+
+        let mut group_values =
+            ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite group acc")?;
+        let mut per_head_values = Vec::with_capacity(G);
+        for _ in 0..G {
+            per_head_values.push(ValueAccumulator::new(bits, &centroids).ok_or("finite acc")?);
+        }
+
+        for step in 0..8_u8 {
+            let bytes = packed(&codes(bits, step), bits);
+            let actual_dots = group_query.dot(&bytes);
+            for (head, single) in per_head_queries.iter().enumerate() {
+                let expected = single.dot(&bytes);
+                assert_eq!(
+                    actual_dots[head].map(f32::to_bits),
+                    expected.map(f32::to_bits)
+                );
+            }
+            let scales: [f32; G] = std::array::from_fn(|head| {
+                if (usize::from(step) + head).is_multiple_of(4) {
+                    -0.0
+                } else {
+                    (f32::from(u8::try_from(head + 1).unwrap_or(1)) - 2.5) * 0.125
+                }
+            });
+            let ok_group = group_values.accumulate(&bytes, scales);
+            for (head, single) in per_head_values.iter_mut().enumerate() {
+                assert_eq!(ok_group[head], single.accumulate(&bytes, scales[head]));
+            }
+        }
+        let actual_out = group_values.finish();
+        for (head, single) in per_head_values.into_iter().enumerate() {
+            assert_eq!(
+                actual_out[head].map(|row| row.map(f32::to_bits)),
+                single.finish().map(|row| row.map(f32::to_bits)),
+            );
+        }
+
+        // Verify per-head isolation when one head in the group receives a nonfinite scale.
+        let bytes = packed(&codes(bits, 1), bits);
+        let mut isolated =
+            ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite iso acc")?;
+        let mut ref_single = Vec::with_capacity(G);
+        for _ in 0..G {
+            ref_single.push(ValueAccumulator::new(bits, &centroids).ok_or("finite single acc")?);
+        }
+        let mut scales = [0.25_f32; G];
+        scales[G - 1] = f32::NAN;
+        let ok = isolated.accumulate(&bytes, scales);
+        for (head, single) in ref_single.iter_mut().enumerate() {
+            assert_eq!(ok[head], single.accumulate(&bytes, scales[head]));
+        }
+        let actual_isolated = isolated.finish();
+        for (head, single) in ref_single.into_iter().enumerate() {
+            assert_eq!(
+                actual_isolated[head].map(|row| row.map(f32::to_bits)),
+                single.finish().map(|row| row.map(f32::to_bits)),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_query_and_value_match_single_head_bits_exactly() -> Result<(), &'static str> {
+        for bits in [3, 4] {
+            verify_group_bit_exact::<2>(bits)?;
+            verify_group_bit_exact::<3>(bits)?;
+            verify_group_bit_exact::<6>(bits)?;
+        }
+        Ok(())
     }
 }

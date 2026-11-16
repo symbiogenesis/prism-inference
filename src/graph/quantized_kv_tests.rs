@@ -1141,3 +1141,239 @@ fn packed_cache_copy_into_and_restore_in_place_preserve_capacities_and_reject_mi
     assert!(target_packed.restore_in_place(&unsealed_full).is_err());
     Ok(())
 }
+
+fn gqa_oracle_bits(
+    base_keys: &KvCache,
+    base_values: &KvCache,
+    queries: &[f32],
+    projected: &[f32],
+    current_key: &[f32],
+    current_value: &[f32],
+    heads: usize,
+) -> Result<Vec<u32>> {
+    let mut oracle_keys = base_keys.copy()?;
+    let mut oracle_values = base_values.copy()?;
+    let key_cache = oracle_keys
+        .packed
+        .as_mut()
+        .ok_or_else(|| invalid("missing oracle keys"))?;
+    let value_cache = oracle_values
+        .packed
+        .as_mut()
+        .ok_or_else(|| invalid("missing oracle values"))?;
+    let kv_heads = value_cache.heads;
+    prepare_current(key_cache, value_cache, current_key, current_value)?;
+    let mut expected = vec![0.0_f32; heads * HEAD_DIM];
+    for head in 0..heads {
+        let probs = defensive_probabilities(
+            key_cache,
+            &key_cache.prepared,
+            queries,
+            head,
+            heads / kv_heads,
+            super::super::Arithmetic::PinnedSwift,
+        )?;
+        let head_out = defensive_value_result(
+            &oracle_values,
+            current_value,
+            projected,
+            head,
+            head / (heads / kv_heads),
+            &probs,
+        )?;
+        expected[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(&head_out);
+    }
+    Ok(expected.into_iter().map(f32::to_bits).collect())
+}
+
+#[test]
+fn grouped_gqa_decode_preserves_exact_bits_across_worker_counts() -> Result<()> {
+    let heads = 24;
+    let kv_heads = 4;
+    let tokens = 19;
+    let stride = tokens + 1;
+    let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
+        &[1, 4, 6, 8, 12]
+    } else {
+        &[1]
+    };
+
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for scalar_only in [false, true] {
+            let (base_keys, base_values) = populated_caches(policy, kv_heads, tokens, scalar_only)?;
+            let queries = input(heads * HEAD_DIM, 29)?;
+            let projected = input(2 * heads * HEAD_DIM, 43)?;
+            let current_key = input(kv_heads * HEAD_DIM, 61)?;
+            let current_value = input(kv_heads * HEAD_DIM, 73)?;
+            let expected_bits = gqa_oracle_bits(
+                &base_keys,
+                &base_values,
+                &queries,
+                &projected,
+                &current_key,
+                &current_value,
+                heads,
+            )?;
+
+            for &workers in worker_counts {
+                let parallelism = RowParallelism::new(workers)?;
+                let mut keys = base_keys.copy()?;
+                let mut values = base_values.copy()?;
+                let mut attended = vec![0.0_f32; heads * HEAD_DIM];
+                let group_rows = group_score_rows(&keys, &values, heads, &parallelism);
+                let mut group_scores = vec![0.0_f32; group_rows * stride];
+                attend_with_group_scores(
+                    &mut keys,
+                    &mut values,
+                    &queries,
+                    &projected,
+                    &current_key,
+                    &current_value,
+                    &mut attended,
+                    &mut group_scores,
+                    heads,
+                    1.0 / 16.0,
+                    super::super::Arithmetic::PinnedSwift,
+                    &parallelism,
+                )?;
+                assert_eq!(
+                    attended
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected_bits,
+                    "attend_with_group_scores mismatch for policy {policy:?} scalar={scalar_only} workers={workers}"
+                );
+
+                let mut keys_legacy = base_keys.copy()?;
+                let mut values_legacy = base_values.copy()?;
+                let mut attended_legacy = vec![0.0_f32; heads * HEAD_DIM];
+                let rows = score_rows(heads, &parallelism);
+                let mut scores_legacy = vec![0.0_f32; rows * stride];
+                attend(
+                    &mut keys_legacy,
+                    &mut values_legacy,
+                    &queries,
+                    &projected,
+                    &current_key,
+                    &current_value,
+                    &mut attended_legacy,
+                    &mut scores_legacy,
+                    heads,
+                    1.0 / 16.0,
+                    super::super::Arithmetic::PinnedSwift,
+                    &parallelism,
+                )?;
+                assert_eq!(
+                    attended_legacy
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected_bits,
+                    "attend mismatch for policy {policy:?} scalar={scalar_only} workers={workers}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn grouped_gqa_tile_preserves_exact_bits_across_worker_counts() -> Result<()> {
+    let heads = 24;
+    let kv_heads = 4;
+    let tokens = 19;
+    let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
+        &[1, 4, 6, 8, 12]
+    } else {
+        &[1]
+    };
+
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for scalar_only in [false, true] {
+            let (base_keys, base_values) = populated_caches(policy, kv_heads, tokens, scalar_only)?;
+            let queries = input(heads * HEAD_DIM, 29)?;
+            let projected = input(2 * heads * HEAD_DIM, 43)?;
+            let current_key = input(kv_heads * HEAD_DIM, 61)?;
+            let current_value = input(kv_heads * HEAD_DIM, 73)?;
+            let expected_bits = gqa_oracle_bits(
+                &base_keys,
+                &base_values,
+                &queries,
+                &projected,
+                &current_key,
+                &current_value,
+                heads,
+            )?;
+
+            let mut tile_keys = base_keys.copy()?;
+            let mut tile_values = base_values.copy()?;
+            prepare_tile_append(
+                &mut tile_keys,
+                &mut tile_values,
+                &current_key,
+                &current_value,
+            )?;
+            tile_keys.append(&current_key);
+            tile_values.append(&current_value);
+            let tile_queries = vec![queries; 2];
+            let tile_projected = vec![projected; 2];
+            let base = tokens - 1;
+            let count = 2;
+            let mut ref_outputs = vec![vec![0.0_f32; heads * HEAD_DIM]; count];
+            let mut ref_scores = vec![0.0_f32; count * (base + count)];
+            attend_tile(
+                &tile_keys,
+                &tile_values,
+                &tile_queries,
+                &tile_projected,
+                &mut ref_outputs,
+                &mut ref_scores,
+                base,
+                heads,
+                1.0 / 16.0,
+                super::super::Arithmetic::PinnedSwift,
+                &RowParallelism::default(),
+            )?;
+            assert_eq!(
+                ref_outputs[1]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                expected_bits,
+                "attend_tile final token should match decode oracle exactly"
+            );
+            for &workers in worker_counts {
+                let parallelism = RowParallelism::new(workers)?;
+                let mut out = vec![vec![0.0_f32; heads * HEAD_DIM]; count];
+                let mut sc = vec![0.0_f32; count * (base + count)];
+                attend_tile(
+                    &tile_keys,
+                    &tile_values,
+                    &tile_queries,
+                    &tile_projected,
+                    &mut out,
+                    &mut sc,
+                    base,
+                    heads,
+                    1.0 / 16.0,
+                    super::super::Arithmetic::PinnedSwift,
+                    &parallelism,
+                )?;
+                assert_eq!(
+                    out.iter()
+                        .flatten()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    ref_outputs
+                        .iter()
+                        .flatten()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    "attend_tile worker mismatch for workers={workers}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

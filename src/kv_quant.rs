@@ -134,6 +134,182 @@ impl PreparedQuery<'_> {
     }
 }
 
+/// Finite rotated query group of `G` heads sharing one packed KV head.
+pub(crate) struct PreparedQueryGroup<'a, const G: usize> {
+    quantizer: &'a Quantizer,
+    queries: [&'a [f32; HEAD_DIM]; G],
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    native: Option<bonsai_neon_dot::kv_quant::PreparedQueryGroup<'a, G>>,
+}
+
+impl<const G: usize> PreparedQueryGroup<'_, G> {
+    /// Scores `G` heads from one packed key row while retaining exact per-head
+    /// validation and binary32 rounding.
+    pub(crate) fn score_group(&self, packed: &[u8]) -> Result<[f32; G]> {
+        let (scale, codes) = self.quantizer.record(packed)?;
+        if scale == 0.0 {
+            return Ok([0.0; G]);
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        let unscaled = if let Some(native) = &self.native {
+            let dots = native.dot(codes);
+            let mut out = [0.0; G];
+            for (dst, maybe) in out.iter_mut().zip(dots) {
+                *dst = maybe.ok_or_else(|| invalid("KV codec native dot rejected arithmetic"))?;
+            }
+            out
+        } else {
+            self.scalar_dots(codes)?
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
+        let unscaled = self.scalar_dots(codes)?;
+        let mut scores = [0.0; G];
+        for (dst, value) in scores.iter_mut().zip(unscaled) {
+            let scaled = value * scale;
+            if !scaled.is_finite() {
+                return Err(invalid("KV codec score overflow"));
+            }
+            *dst = scaled;
+        }
+        Ok(scores)
+    }
+
+    fn scalar_dots(&self, codes: &[u8]) -> Result<[f32; G]> {
+        let bits = self.quantizer.identity.bits.bit_width();
+        let centroids = self.quantizer.centroids();
+        let mut out = [0.0; G];
+        for (dst, query) in out.iter_mut().zip(self.queries) {
+            *dst = scalar::dot(codes, bits, centroids, query)?;
+        }
+        Ok(out)
+    }
+}
+
+enum GroupAccumulatorState<const G: usize> {
+    Scalar([[f32; HEAD_DIM]; G]),
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    Native(bonsai_neon_dot::kv_quant::ValueGroupAccumulator<'static, G>),
+}
+
+/// Exclusive grouped value sums for `G` query heads reading each packed value row once.
+pub(crate) struct ValueGroupAccumulator<'a, const G: usize> {
+    quantizer: &'a Quantizer,
+    state: GroupAccumulatorState<G>,
+    failed: bool,
+}
+
+impl<const G: usize> ValueGroupAccumulator<'_, G> {
+    /// Accumulates one packed value row with `G` per-head probability weights.
+    pub(crate) fn accumulate_group(&mut self, packed: &[u8], weights: [f32; G]) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result = self.append_group(packed, weights);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn append_group(&mut self, packed: &[u8], weights: [f32; G]) -> Result<()> {
+        if weights.iter().any(|weight| !weight.is_finite()) {
+            return Err(invalid("KV codec weight must be finite"));
+        }
+        let (scale, codes) = self.quantizer.record(packed)?;
+        let mut weighted_scales = [0.0; G];
+        let mut any_nonzero = false;
+        for (dst, weight) in weighted_scales.iter_mut().zip(weights) {
+            let weighted = weight * scale;
+            if !weighted.is_finite() {
+                return Err(invalid("KV codec weighted scale overflow"));
+            }
+            if weighted != 0.0 {
+                any_nonzero = true;
+            }
+            *dst = weighted;
+        }
+        if !any_nonzero {
+            return Ok(());
+        }
+        match &mut self.state {
+            GroupAccumulatorState::Scalar(outputs) => {
+                let bits = self.quantizer.identity.bits.bit_width();
+                let centroids = self.quantizer.centroids();
+                for (output, &weighted_scale) in outputs.iter_mut().zip(&weighted_scales) {
+                    if weighted_scale != 0.0 {
+                        scalar::accumulate_in_place(
+                            codes,
+                            bits,
+                            centroids,
+                            weighted_scale,
+                            output,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            GroupAccumulatorState::Native(acc) => {
+                let ok = acc.accumulate(codes, weighted_scales);
+                if ok.iter().all(|&head_ok| head_ok) {
+                    Ok(())
+                } else {
+                    Err(invalid("KV codec native accumulation rejected arithmetic"))
+                }
+            }
+        }
+    }
+
+    /// Publishes all `G` accumulated output rows if every append succeeded.
+    pub(crate) fn finish(self) -> Result<[[f32; HEAD_DIM]; G]> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        match self.state {
+            GroupAccumulatorState::Scalar(outputs) => Ok(outputs),
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            GroupAccumulatorState::Native(acc) => {
+                let finished = acc.finish();
+                let mut out = [[0.0; HEAD_DIM]; G];
+                for (dst, maybe) in out.iter_mut().zip(finished) {
+                    *dst = maybe.ok_or_else(|| {
+                        invalid("KV codec native accumulation rejected arithmetic")
+                    })?;
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
 enum AccumulatorState {
     Scalar([f32; HEAD_DIM]),
     #[cfg(all(
@@ -460,6 +636,57 @@ impl Quantizer {
         })
     }
 
+    /// Checks a group of `G` immutable rotated queries sharing one KV head.
+    pub(crate) fn prepare_query_group<'a, const G: usize>(
+        &'a self,
+        queries: [&'a [f32; HEAD_DIM]; G],
+    ) -> Result<PreparedQueryGroup<'a, G>> {
+        if G == 0 {
+            return Err(invalid("KV codec grouped query requires at least one head"));
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        let native = if self.scalar_only {
+            for query in &queries {
+                finite_values(*query)?;
+            }
+            None
+        } else {
+            Some(
+                bonsai_neon_dot::kv_quant::PreparedQueryGroup::new(
+                    self.identity.bits.bit_width(),
+                    self.centroids(),
+                    queries,
+                )
+                .ok_or_else(|| invalid("KV codec row must contain only finite values"))?,
+            )
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
+        for query in &queries {
+            finite_values(*query)?;
+        }
+        Ok(PreparedQueryGroup {
+            quantizer: self,
+            queries,
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            native,
+        })
+    }
+
     /// Add one weighted packed value row into a rotated-space accumulator.
     ///
     /// Products and additions are separate binary32 operations. The caller
@@ -531,6 +758,64 @@ impl Quantizer {
         Ok(ValueAccumulator {
             quantizer: self,
             state: AccumulatorState::Scalar([0.0; HEAD_DIM]),
+            failed: false,
+        })
+    }
+
+    /// Starts one exclusive grouped packed-value scan across `G` heads.
+    #[cfg_attr(
+        not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "The native branch validates its helper codebook before starting the scan; portable construction is infallible."
+        )
+    )]
+    #[cfg_attr(
+        not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "The shared native entry performs runtime ISA selection; portable construction keeps the same non-const API."
+        )
+    )]
+    pub(crate) fn value_group_accumulator<const G: usize>(
+        &self,
+    ) -> Result<ValueGroupAccumulator<'_, G>> {
+        if G == 0 {
+            return Err(invalid(
+                "KV codec grouped accumulator requires at least one head",
+            ));
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        if !self.scalar_only {
+            let state = bonsai_neon_dot::kv_quant::ValueGroupAccumulator::new(
+                self.identity.bits.bit_width(),
+                self.centroids(),
+            )
+            .ok_or_else(|| invalid("KV codec native accumulation rejected codebook"))?;
+            return Ok(ValueGroupAccumulator {
+                quantizer: self,
+                state: GroupAccumulatorState::Native(state),
+                failed: false,
+            });
+        }
+        Ok(ValueGroupAccumulator {
+            quantizer: self,
+            state: GroupAccumulatorState::Scalar([[0.0; HEAD_DIM]; G]),
             failed: false,
         })
     }

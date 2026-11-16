@@ -4143,7 +4143,7 @@ impl Evaluation<'_, '_> {
         resize_into(g.head * g.heads, attended)?;
         let score_len = self.position + 1;
         let score_rows = if keys.packed.is_some() || values.packed.is_some() {
-            quantized_kv::score_rows(g.heads, parallelism)
+            quantized_kv::group_score_rows(keys, values, g.heads, parallelism)
         } else {
             g.heads
         };
@@ -4159,7 +4159,7 @@ impl Evaluation<'_, '_> {
         let key_ref: &[f32] = key;
         let value_ref: &[f32] = value;
         if keys.packed.is_some() || values.packed.is_some() {
-            return quantized_kv::attend(
+            return quantized_kv::attend_with_group_scores(
                 keys,
                 values,
                 query_ref,

@@ -1230,7 +1230,7 @@ pub(super) fn append_half_bits(values: &[f32], output: &mut Vec<u16>) -> bool {
     for chunk in chunks {
         output.extend_from_slice(&bonsai_neon_dot::narrow_f32_eight(chunk));
     }
-    output.extend(tail.iter().copied().map(bonsai_neon_dot::scalar_half_bits));
+    output.extend(tail.iter().copied().map(super::half_bits));
     true
 }
 

@@ -1,4 +1,4 @@
-//! Exact binary16 widening with a baseline-NEON finite fast path.
+//! Exact binary16 widening and GGML-compatible narrowing with baseline-NEON fast paths.
 
 #![expect(
     clippy::redundant_pub_crate,
@@ -46,13 +46,8 @@ pub(super) fn portable_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
     std::array::from_fn(|group| std::array::from_fn(|lane| scalar(bits[group * 4 + lane])))
 }
 
-/// Converts one `f32` value to its IEEE binary16 bit pattern using GGML ties-to-even rounding.
-///
-/// Preserves signed zero, subnormals, overflows to infinity, and maps NaNs to canonical quiet NaNs
-/// with the original sign bit intact.
 #[inline]
-#[must_use]
-pub fn scalar_half_bits(value: f32) -> u16 {
+pub(super) fn scalar_half_bits(value: f32) -> u16 {
     let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
     let bits = value.to_bits();
     let doubled = bits.wrapping_add(bits);
@@ -74,19 +69,10 @@ pub fn scalar_half_bits(value: f32) -> u16 {
     }
 }
 
-/// Narrows one finite `f32` below the binary16 overflow threshold, returning `None` on overflow or NaN.
-#[inline]
-pub(super) fn scalar_narrow_f32_to_f16(value: f32) -> Option<u16> {
-    if (value.to_bits() & 0x7fff_ffff) >= 0x477f_f000 {
-        return None;
-    }
-    Some(scalar_half_bits(value))
-}
-
 /// Narrows four `f32` values to IEEE binary16 bit patterns matching GGML rounding.
 ///
 /// Native `AArch64` NEON uses hardware `FCVTN` when all four lanes are non-NaN, falling back per
-/// chunk when a NaN is present so canonical quiet NaN bits match [`scalar_half_bits`].
+/// chunk when a NaN is present so canonical quiet NaN bits match GGML scalar rounding.
 #[inline]
 #[must_use]
 pub fn narrow_f32_four(values: [f32; 4]) -> [u16; 4] {
@@ -117,36 +103,6 @@ pub fn narrow_f32_eight(values: &[f32; 8]) -> [u16; 8] {
 }
 
 #[inline]
-pub(super) fn portable_narrow_slice(src: &[f32], dst: &mut [u16]) -> bool {
-    for (&value, slot) in src.iter().zip(dst.iter_mut()) {
-        let Some(bits) = scalar_narrow_f32_to_f16(value) else {
-            return false;
-        };
-        *slot = bits;
-    }
-    true
-}
-
-/// Narrows finite `f32` elements into IEEE binary16 bits, rejecting nonfinite or overflowing lanes.
-///
-/// Native `AArch64` NEON processes 8-element chunks via `FCVTN`/`FCVTN2`. Returns `false` if
-/// slice lengths differ or any element is `NaN`, infinite, or `|value| >= 65520.0`.
-#[must_use]
-pub fn narrow_f32_slice_to_f16(src: &[f32], dst: &mut [u16]) -> bool {
-    if src.len() != dst.len() {
-        return false;
-    }
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    {
-        super::aarch64::narrow_f32_slice_to_f16(src, dst)
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-    {
-        portable_narrow_slice(src, dst)
-    }
-}
-
-#[inline]
 pub(super) fn scalar(bits: u16) -> f32 {
     let sign = u32::from(bits & 0x8000) << 16;
     let mut mantissa = u32::from(bits & 0x03ff);
@@ -172,8 +128,7 @@ pub(super) fn scalar(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        narrow_f32_eight, narrow_f32_four, narrow_f32_slice_to_f16, scalar_half_bits,
-        widen_f16_eight, widen_f16_four,
+        narrow_f32_eight, narrow_f32_four, scalar_half_bits, widen_f16_eight, widen_f16_four,
     };
 
     // Independent normalized-significand construction, including subnormals.
@@ -232,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn narrowing_matches_ggml_rounding_and_slice_checks_at_boundaries() {
+    fn narrowing_matches_ggml_rounding_at_boundaries() {
         let edges = [
             0.0_f32,
             -0.0_f32,
@@ -261,28 +216,6 @@ mod tests {
             assert_eq!(narrow_f32_four(four), four.map(scalar_half_bits));
             let eight = std::array::from_fn(|idx| edges[(start + idx) % edges.len()]);
             assert_eq!(narrow_f32_eight(&eight), eight.map(scalar_half_bits));
-        }
-
-        let mut dst = vec![0_u16; 19];
-        let src: Vec<f32> = (0..19)
-            .map(|idx| f32::from(u8::try_from(idx).unwrap_or(0)) - 9.5)
-            .collect();
-        assert!(narrow_f32_slice_to_f16(&src, &mut dst));
-        for (&s_val, &d_val) in src.iter().zip(&dst) {
-            assert_eq!(d_val, scalar_half_bits(s_val));
-        }
-        assert!(!narrow_f32_slice_to_f16(&src, &mut dst[..18]));
-        for bad_val in [
-            65_520.0_f32,
-            -65_520.0,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NAN,
-        ] {
-            let mut bad_src = src.clone();
-            bad_src[11] = bad_val;
-            assert!(!narrow_f32_slice_to_f16(&bad_src, &mut dst));
-            assert!(!narrow_f32_slice_to_f16(&[bad_val], &mut [0_u16; 1]));
         }
     }
 }

@@ -24,6 +24,11 @@ pub mod mmap;
     reason = "The private audited memory-map owner retains OS mapping handles and exposes checked immutable slices."
 )]
 mod mmap_windows;
+#[allow(
+    unsafe_code,
+    reason = "Persistent scoped worker pool erases short-lived Sync closure borrows across joined dispatch frames."
+)]
+pub mod row_pool;
 
 #[cfg(not(windows))]
 mod portable;

@@ -8,6 +8,9 @@
 #[cfg(feature = "parallel-rows")]
 use std::sync::Arc;
 
+#[cfg(feature = "parallel-rows")]
+use bonsai_native_hash::row_pool::NativeRowPool;
+
 use crate::{Result, invalid};
 
 #[path = "parallel_tile.rs"]
@@ -19,7 +22,7 @@ mod siblings;
 /// Largest explicit number of persistent projection workers.
 pub const MAX_ROW_WORKERS: usize = 18;
 
-/// Shared private row-worker pool, independent of Rayon global configuration.
+/// Shared private row-worker pool, independent of global thread-pool state.
 ///
 /// One worker retains serial execution and creates no threads. Larger budgets
 /// require `parallel-rows`; clones share the same persistent pool. Each thread
@@ -32,7 +35,7 @@ pub const MAX_ROW_WORKERS: usize = 18;
 pub struct RowParallelism {
     workers: usize,
     #[cfg(feature = "parallel-rows")]
-    pool: Option<Arc<rayon::ThreadPool>>,
+    pool: Option<Arc<NativeRowPool>>,
 }
 
 #[cfg(all(test, feature = "parallel-rows"))]
@@ -193,11 +196,7 @@ impl RowParallelism {
         }
         #[cfg(feature = "parallel-rows")]
         {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(workers)
-                .stack_size(512 * 1024)
-                .thread_name(|index| format!("prism-row-{index}"))
-                .build()?;
+            let pool = NativeRowPool::new(workers)?;
             Ok(Self {
                 workers,
                 pool: Some(Arc::new(pool)),
@@ -260,27 +259,27 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && units > 1
         {
-            use rayon::prelude::*;
-
             let task_units = units.div_ceil(self.workers);
             let task_elems = task_units * unit_size;
-            let tasks = units.div_ceil(task_units);
-            // There is at most one task per configured worker. Keep the cold
-            // failure slots on the caller's stack instead of allocating a
-            // transient vector for every normalization/transform dispatch.
-            let mut errors: [Option<crate::Error>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
-            pool.install(|| {
-                target
-                    .par_chunks_mut(task_elems)
-                    .zip(errors[..tasks].par_iter_mut())
-                    .enumerate()
-                    .for_each(|(task, (chunk, error))| {
-                        if let Err(failure) = update(task * task_units, chunk) {
-                            *error = Some(failure);
-                        }
-                    });
+            // There is at most one task per configured worker. Keep chunk borrows
+            // and cold failure slots on the calling thread's stack instead of
+            // allocating a transient vector for every normalization/transform dispatch.
+            let mut slots: [(&mut [T], Option<crate::Error>); MAX_ROW_WORKERS] =
+                std::array::from_fn(|_| (&mut [][..], None));
+            let mut count = 0;
+            for (slot, chunk) in slots.iter_mut().zip(target.chunks_mut(task_elems)) {
+                slot.0 = chunk;
+                count += 1;
+            }
+            pool.dispatch_mut(&mut slots[..count], |task, (chunk, error)| {
+                if let Err(failure) = update(task * task_units, chunk) {
+                    *error = Some(failure);
+                }
             });
-            if let Some(failure) = errors.into_iter().flatten().next() {
+            if let Some(failure) = slots[..count]
+                .iter_mut()
+                .find_map(|(_, error)| error.take())
+            {
                 return Err(failure);
             }
             return Ok(());
@@ -322,26 +321,33 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && units > 1
         {
-            use rayon::prelude::*;
-
             let task_units = units.div_ceil(self.workers);
             let first_task_elems = task_units * first_unit_size;
             let second_task_elems = task_units * second_unit_size;
-            let tasks = units.div_ceil(task_units);
-            let mut errors: [Option<crate::Error>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
-            pool.install(|| {
-                first
-                    .par_chunks_mut(first_task_elems)
-                    .zip(second.par_chunks_mut(second_task_elems))
-                    .zip(errors[..tasks].par_iter_mut())
-                    .enumerate()
-                    .for_each(|(task, ((first_chunk, second_chunk), error))| {
-                        if let Err(failure) = update(task * task_units, first_chunk, second_chunk) {
-                            *error = Some(failure);
-                        }
-                    });
+            let mut slots = std::array::from_fn::<_, MAX_ROW_WORKERS, _>(|_| {
+                ((&mut [][..], &mut [][..]), None::<crate::Error>)
             });
-            if let Some(failure) = errors.into_iter().flatten().next() {
+            let mut count = 0;
+            for (slot, (first_chunk, second_chunk)) in slots.iter_mut().zip(
+                first
+                    .chunks_mut(first_task_elems)
+                    .zip(second.chunks_mut(second_task_elems)),
+            ) {
+                slot.0 = (first_chunk, second_chunk);
+                count += 1;
+            }
+            pool.dispatch_mut(
+                &mut slots[..count],
+                |task, ((first_chunk, second_chunk), error)| {
+                    if let Err(failure) = update(task * task_units, first_chunk, second_chunk) {
+                        *error = Some(failure);
+                    }
+                },
+            );
+            if let Some(failure) = slots[..count]
+                .iter_mut()
+                .find_map(|(_, error)| error.take())
+            {
                 return Err(failure);
             }
             return Ok(());
@@ -386,32 +392,40 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && units > 1
         {
-            use rayon::prelude::*;
-
             let task_units = units.div_ceil(self.workers);
             let first_task_elems = task_units * first_unit_size;
             let second_task_elems = task_units * second_unit_size;
             let third_task_elems = task_units * third_unit_size;
-            let tasks = units.div_ceil(task_units);
-            let mut errors: [Option<crate::Error>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
-            pool.install(|| {
-                first
-                    .par_chunks_mut(first_task_elems)
-                    .zip(second.par_chunks_mut(second_task_elems))
-                    .zip(third.par_chunks_mut(third_task_elems))
-                    .zip(errors[..tasks].par_iter_mut())
-                    .enumerate()
-                    .for_each(
-                        |(task, (((first_chunk, second_chunk), third_chunk), error))| {
-                            if let Err(failure) =
-                                update(task * task_units, first_chunk, second_chunk, third_chunk)
-                            {
-                                *error = Some(failure);
-                            }
-                        },
-                    );
+            let mut slots = std::array::from_fn::<_, MAX_ROW_WORKERS, _>(|_| {
+                (
+                    (&mut [][..], &mut [][..], &mut [][..]),
+                    None::<crate::Error>,
+                )
             });
-            if let Some(failure) = errors.into_iter().flatten().next() {
+            let mut count = 0;
+            for (slot, ((first_chunk, second_chunk), third_chunk)) in slots.iter_mut().zip(
+                first
+                    .chunks_mut(first_task_elems)
+                    .zip(second.chunks_mut(second_task_elems))
+                    .zip(third.chunks_mut(third_task_elems)),
+            ) {
+                slot.0 = (first_chunk, second_chunk, third_chunk);
+                count += 1;
+            }
+            pool.dispatch_mut(
+                &mut slots[..count],
+                |task, ((first_chunk, second_chunk, third_chunk), error)| {
+                    if let Err(failure) =
+                        update(task * task_units, first_chunk, second_chunk, third_chunk)
+                    {
+                        *error = Some(failure);
+                    }
+                },
+            );
+            if let Some(failure) = slots[..count]
+                .iter_mut()
+                .find_map(|(_, error)| error.take())
+            {
                 return Err(failure);
             }
             return Ok(());
@@ -460,36 +474,24 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && rows > 1
         {
-            use rayon::prelude::*;
-
-            let task_rows = rows.div_ceil(self.workers);
-            let tasks = rows.div_ceil(task_rows);
-            errors.try_reserve_exact(tasks)?;
-            errors.resize_with(tasks, || None);
-            pool.install(|| {
-                output
-                    .par_chunks_mut(task_rows)
-                    .zip(errors.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(task, (chunk, error))| {
-                        let start = task * task_rows * row_bytes;
-                        let bytes = &data[start..start + chunk.len() * row_bytes];
-                        if let Err(failure) = fill_sixteen_batched_chunk(
-                            chunk,
-                            bytes,
-                            row_bytes,
-                            &dot_sixteen,
-                            &dot_eight,
-                            &dot_four,
-                            &dot,
-                        ) {
-                            *error = Some(failure);
-                        }
-                    });
-            });
-            let failure = errors.iter_mut().find_map(Option::take);
-            errors.clear();
-            return failure.map_or(Ok(()), Err);
+            return dispatch_output_chunks(
+                pool,
+                self.workers,
+                data,
+                row_bytes,
+                output,
+                |bytes, chunk| {
+                    fill_sixteen_batched_chunk(
+                        chunk,
+                        bytes,
+                        row_bytes,
+                        &dot_sixteen,
+                        &dot_eight,
+                        &dot_four,
+                        &dot,
+                    )
+                },
+            );
         }
         fill_sixteen_batched_chunk(
             output,
@@ -525,36 +527,19 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && rows > 1
         {
-            use rayon::prelude::*;
-
-            let task_rows = rows.div_ceil(self.workers);
-            let tasks = rows.div_ceil(task_rows);
-            errors.try_reserve_exact(tasks)?;
-            errors.resize_with(tasks, || None);
-            pool.install(|| {
-                output
-                    .par_chunks_mut(task_rows)
-                    .zip(errors.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(task, (chunk, error))| {
-                        let start = task * task_rows * row_bytes;
-                        let bytes = &data[start..start + chunk.len() * row_bytes];
-                        for (value, row) in chunk.iter_mut().zip(bytes.chunks_exact(row_bytes)) {
-                            match dot(row) {
-                                Ok(result) => *value = result,
-                                Err(failure) => {
-                                    *error = Some(failure);
-                                    break;
-                                }
-                            }
-                        }
-                    });
-            });
-            // Join all tasks, then return the earliest failing row chunk. The
-            // outer matvec transaction clears all provisional output on error.
-            let failure = errors.iter_mut().find_map(Option::take);
-            errors.clear();
-            return failure.map_or(Ok(()), Err);
+            return dispatch_output_chunks(
+                pool,
+                self.workers,
+                data,
+                row_bytes,
+                output,
+                |bytes, chunk| {
+                    for (value, row) in chunk.iter_mut().zip(bytes.chunks_exact(row_bytes)) {
+                        *value = dot(row)?;
+                    }
+                    Ok(())
+                },
+            );
         }
         for (value, bytes) in output.iter_mut().zip(data.chunks_exact(row_bytes)) {
             *value = dot(bytes)?;
@@ -598,33 +583,50 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && rows > 1
         {
-            use rayon::prelude::*;
-
-            let task_rows = rows.div_ceil(self.workers);
-            let tasks = rows.div_ceil(task_rows);
-            errors.try_reserve_exact(tasks)?;
-            errors.resize_with(tasks, || None);
-            pool.install(|| {
-                output
-                    .par_chunks_mut(task_rows)
-                    .zip(errors.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(task, (chunk, error))| {
-                        let start = task * task_rows * row_bytes;
-                        let bytes = &data[start..start + chunk.len() * row_bytes];
-                        if let Err(failure) =
-                            fill_batched_chunk(bytes, row_bytes, chunk, &dot_eight, &dot_four, &dot)
-                        {
-                            *error = Some(failure);
-                        }
-                    });
-            });
-            let failure = errors.iter_mut().find_map(Option::take);
-            errors.clear();
-            return failure.map_or(Ok(()), Err);
+            return dispatch_output_chunks(
+                pool,
+                self.workers,
+                data,
+                row_bytes,
+                output,
+                |bytes, chunk| {
+                    fill_batched_chunk(bytes, row_bytes, chunk, &dot_eight, &dot_four, &dot)
+                },
+            );
         }
         fill_batched_chunk(data, row_bytes, output, &dot_eight, &dot_four, &dot)
     }
+}
+
+#[cfg(feature = "parallel-rows")]
+fn dispatch_output_chunks(
+    pool: &NativeRowPool,
+    workers: usize,
+    data: &[u8],
+    row_bytes: usize,
+    output: &mut [f32],
+    run_chunk: impl Fn(&[u8], &mut [f32]) -> Result<()> + Sync,
+) -> Result<()> {
+    let rows = output.len();
+    let task_rows = rows.div_ceil(workers);
+    let mut slots: [(&mut [f32], Option<crate::Error>); MAX_ROW_WORKERS] =
+        std::array::from_fn(|_| (&mut [][..], None));
+    let mut count = 0;
+    for (slot, chunk) in slots.iter_mut().zip(output.chunks_mut(task_rows)) {
+        slot.0 = chunk;
+        count += 1;
+    }
+    pool.dispatch_mut(&mut slots[..count], |task, (chunk, error)| {
+        let start = task * task_rows * row_bytes;
+        let bytes = &data[start..start + chunk.len() * row_bytes];
+        if let Err(failure) = run_chunk(bytes, chunk) {
+            *error = Some(failure);
+        }
+    });
+    slots[..count]
+        .iter_mut()
+        .find_map(|(_, error)| error.take())
+        .map_or(Ok(()), Err)
 }
 
 #[cfg(all(

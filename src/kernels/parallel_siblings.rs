@@ -42,8 +42,6 @@ impl RowParallelism {
         }
         #[cfg(feature = "parallel-rows")]
         if let Some(pool) = &self.pool {
-            use rayon::prelude::*;
-
             // Four matrices times at most eighteen partitions. No payload,
             // expanded weights, error-vector allocation or nested pool exists.
             let mut tasks: [Task<'_>; 4 * MAX_ROW_WORKERS] = std::array::from_fn(|_| Task {
@@ -64,12 +62,10 @@ impl RowParallelism {
                     count += 1;
                 }
             }
-            pool.install(|| {
-                tasks[..count].par_iter_mut().for_each(|task| {
-                    if let Err(error) = fill(task.bytes, task.output) {
-                        task.error = Some(error);
-                    }
-                });
+            pool.dispatch_mut(&mut tasks[..count], |_, task| {
+                if let Err(error) = fill(task.bytes, task.output) {
+                    task.error = Some(error);
+                }
             });
             return tasks
                 .iter_mut()

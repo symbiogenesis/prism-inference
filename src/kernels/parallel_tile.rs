@@ -14,56 +14,6 @@ struct Task<'a, const TOKENS: usize> {
 }
 
 #[cfg(feature = "parallel-rows")]
-struct Completion<'a> {
-    remaining: &'a std::sync::atomic::AtomicUsize,
-    caller: &'a std::thread::Thread,
-}
-
-#[cfg(feature = "parallel-rows")]
-impl Drop for Completion<'_> {
-    fn drop(&mut self) {
-        if self
-            .remaining
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-        {
-            self.caller.unpark();
-        }
-    }
-}
-
-#[cfg(feature = "parallel-rows")]
-fn wait_for_tile_tasks(
-    remaining: &std::sync::atomic::AtomicUsize,
-    cancelled: &std::sync::atomic::AtomicBool,
-    cancellation: &mut Option<crate::Error>,
-    check: &dyn Fn() -> Result<()>,
-) {
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    const SPIN_ITERS: usize = 64;
-
-    while remaining.load(Ordering::Acquire) != 0 {
-        if cancellation.is_none()
-            && let Err(error) = check()
-        {
-            *cancellation = Some(error);
-            cancelled.store(true, Ordering::Release);
-        }
-        for _ in 0..SPIN_ITERS {
-            if remaining.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            std::hint::spin_loop();
-        }
-        if remaining.load(Ordering::Acquire) != 0 {
-            std::thread::park_timeout(Duration::from_millis(1));
-        }
-    }
-}
-
-#[cfg(feature = "parallel-rows")]
 #[expect(
     clippy::too_many_lines,
     reason = "Share the existing exact 8/4/1-row worker and ordered failure replay across single and sibling tiles."
@@ -225,7 +175,7 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && self.uses_pool(rows)
         {
-            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::sync::atomic::{AtomicBool, Ordering};
 
             let task_rows = rows.div_ceil(self.workers());
             let task_count = rows.div_ceil(task_rows);
@@ -243,46 +193,41 @@ impl RowParallelism {
                     task.outputs[token] = chunk;
                 }
             }
-            let caller = std::thread::current();
-            let remaining = AtomicUsize::new(task_count);
             let cancelled = AtomicBool::new(false);
             let mut cancellation = None;
-            // Unlike install/scope, in_place_scope keeps this closure on the
-            // caller. Only row kernels and disjoint output slices cross threads.
-            pool.in_place_scope(|scope| {
-                for (index, task) in tasks[..task_count].iter_mut().enumerate() {
+            pool.dispatch_mut_with_wait(
+                &mut tasks[..task_count],
+                |index, task| {
                     let start = index * task_rows * row_bytes;
                     let bytes = &data[start..start + task.outputs[0].len() * row_bytes];
-                    let dot = &dot;
-                    let remaining = &remaining;
-                    let cancelled = &cancelled;
-                    let caller = &caller;
-                    scope.spawn(move |_| {
-                        // Always notify on unwind too; the scope propagates a
-                        // worker panic after joining instead of stranding a wait.
-                        let _completion = Completion { remaining, caller };
-                        for (row, bytes) in bytes.chunks_exact(row_bytes).enumerate() {
-                            if cancelled.load(Ordering::Acquire) {
-                                break;
-                            }
-                            match dot(bytes, &mut task.decoded_blocks) {
-                                Ok(values) => {
-                                    for (output, value) in task.outputs.iter_mut().zip(values) {
-                                        if !output.is_empty() {
-                                            output[row] = value;
-                                        }
+                    for (row, bytes) in bytes.chunks_exact(row_bytes).enumerate() {
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        match dot(bytes, &mut task.decoded_blocks) {
+                            Ok(values) => {
+                                for (output, value) in task.outputs.iter_mut().zip(values) {
+                                    if !output.is_empty() {
+                                        output[row] = value;
                                     }
                                 }
-                                Err(error) => {
-                                    task.error = Some(error);
-                                    break;
-                                }
+                            }
+                            Err(error) => {
+                                task.error = Some(error);
+                                break;
                             }
                         }
-                    });
-                }
-                wait_for_tile_tasks(&remaining, &cancelled, &mut cancellation, check);
-            });
+                    }
+                },
+                || {
+                    if cancellation.is_none()
+                        && let Err(error) = check()
+                    {
+                        cancellation = Some(error);
+                        cancelled.store(true, Ordering::Release);
+                    }
+                },
+            );
             for task in &tasks[..task_count] {
                 *decoded_blocks = decoded_blocks.saturating_add(task.decoded_blocks);
             }
@@ -338,7 +283,7 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && self.uses_pool(rows)
         {
-            use std::sync::atomic::{AtomicBool, AtomicUsize};
+            use std::sync::atomic::{AtomicBool, Ordering};
 
             let task_rows = rows.div_ceil(self.workers());
             let task_count = rows.div_ceil(task_rows);
@@ -353,27 +298,26 @@ impl RowParallelism {
                     task.outputs[token] = chunk;
                 }
             }
-            let caller = std::thread::current();
-            let remaining = AtomicUsize::new(task_count);
             let cancelled = AtomicBool::new(false);
             let mut cancellation = None;
-            pool.in_place_scope(|scope| {
-                for (index, task) in tasks[..task_count].iter_mut().enumerate() {
+            pool.dispatch_mut_with_wait(
+                &mut tasks[..task_count],
+                |index, task| {
                     let start = index * task_rows * row_bytes;
                     let bytes = &data[start..start + task.outputs[0].len() * row_bytes];
-                    let dot_eight = &dot_eight;
-                    let dot_four = &dot_four;
-                    let dot = &dot;
-                    let remaining = &remaining;
-                    let cancelled = &cancelled;
-                    let caller = &caller;
-                    scope.spawn(move |_| {
-                        let _completion = Completion { remaining, caller };
-                        fill_tile_task(task, bytes, row_bytes, cancelled, dot_eight, dot_four, dot);
-                    });
-                }
-                wait_for_tile_tasks(&remaining, &cancelled, &mut cancellation, check);
-            });
+                    fill_tile_task(
+                        task, bytes, row_bytes, &cancelled, &dot_eight, &dot_four, &dot,
+                    );
+                },
+                || {
+                    if cancellation.is_none()
+                        && let Err(error) = check()
+                    {
+                        cancellation = Some(error);
+                        cancelled.store(true, Ordering::Release);
+                    }
+                },
+            );
             for task in &tasks[..task_count] {
                 *decoded_blocks = decoded_blocks.saturating_add(task.decoded_blocks);
             }

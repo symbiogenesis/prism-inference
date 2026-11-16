@@ -4,7 +4,7 @@ use super::RowParallelism;
 use crate::{Result, invalid};
 
 #[cfg(feature = "parallel-rows")]
-use super::{Completion, MAX_ROW_WORKERS, Task, fill_tile_task, wait_for_tile_tasks};
+use super::{MAX_ROW_WORKERS, Task, fill_tile_task};
 
 #[cfg(feature = "parallel-rows")]
 struct SiblingTask<'a, const TOKENS: usize> {
@@ -42,7 +42,7 @@ impl RowParallelism {
         }
         #[cfg(feature = "parallel-rows")]
         if let Some(pool) = &self.pool {
-            use std::sync::atomic::{AtomicBool, AtomicUsize};
+            use std::sync::atomic::{AtomicBool, Ordering};
 
             let total_rows = data.iter().try_fold(0_usize, |sum, bytes| {
                 sum.checked_add(bytes.len() / row_bytes)
@@ -79,33 +79,30 @@ impl RowParallelism {
                 }
                 task_count += count;
             }
-            let caller = std::thread::current();
-            let remaining = AtomicUsize::new(task_count);
             let cancelled = AtomicBool::new(false);
             let mut cancellation = None;
-            pool.in_place_scope(|scope| {
-                for task in &mut tasks[..task_count] {
-                    let dot_eight = &dot_eight;
-                    let dot_four = &dot_four;
-                    let dot = &dot;
-                    let remaining = &remaining;
-                    let cancelled = &cancelled;
-                    let caller = &caller;
-                    scope.spawn(move |_| {
-                        let _completion = Completion { remaining, caller };
-                        fill_tile_task(
-                            &mut task.rows,
-                            task.bytes,
-                            row_bytes,
-                            cancelled,
-                            dot_eight,
-                            dot_four,
-                            dot,
-                        );
-                    });
-                }
-                wait_for_tile_tasks(&remaining, &cancelled, &mut cancellation, check);
-            });
+            pool.dispatch_mut_with_wait(
+                &mut tasks[..task_count],
+                |_, task| {
+                    fill_tile_task(
+                        &mut task.rows,
+                        task.bytes,
+                        row_bytes,
+                        &cancelled,
+                        &dot_eight,
+                        &dot_four,
+                        &dot,
+                    );
+                },
+                || {
+                    if cancellation.is_none()
+                        && let Err(error) = check()
+                    {
+                        cancellation = Some(error);
+                        cancelled.store(true, Ordering::Release);
+                    }
+                },
+            );
             for task in &tasks[..task_count] {
                 *decoded_blocks = decoded_blocks.saturating_add(task.rows.decoded_blocks);
             }

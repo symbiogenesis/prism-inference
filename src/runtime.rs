@@ -1435,11 +1435,13 @@ impl<D: Decoder> Runtime<D> {
             }
             let slot = self.checkpoints.len();
             let epoch = self.next_cache_epoch();
-            let priority = self.cache_aging_floor.saturating_add(Self::marconi_base_utility(
-                snapshot.tokens.len(),
-                snapshot.bytes,
-                0,
-            ));
+            let priority = self
+                .cache_aging_floor
+                .saturating_add(Self::marconi_base_utility(
+                    snapshot.tokens.len(),
+                    snapshot.bytes,
+                    0,
+                ));
             self.checkpoints.push(snapshot);
             if slot < MAX_REUSABLE_CHECKPOINTS {
                 self.checkpoint_meta[slot] = CheckpointUtility {
@@ -1530,11 +1532,13 @@ impl<D: Decoder> Runtime<D> {
         if let Some(meta) = self.checkpoint_meta.get_mut(index) {
             meta.reuse_hits = meta.reuse_hits.saturating_add(1);
             meta.last_used_epoch = epoch;
-            meta.priority = self.cache_aging_floor.saturating_add(Self::marconi_base_utility(
-                tokens_len,
-                bytes,
-                meta.reuse_hits,
-            ));
+            meta.priority = self
+                .cache_aging_floor
+                .saturating_add(Self::marconi_base_utility(
+                    tokens_len,
+                    bytes,
+                    meta.reuse_hits,
+                ));
         }
     }
 

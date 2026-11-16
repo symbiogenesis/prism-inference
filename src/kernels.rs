@@ -183,6 +183,16 @@ fn ptq1_values(block: &[u8]) -> Result<[i16; 128]> {
     Ok(decode_ptq_trits(<&[u8; 28]>::try_from(block)?))
 }
 
+/// Validates tensor dimensions and byte extents without rescanning payload elements.
+///
+/// # Errors
+/// Rejects unsupported kinds, malformed dimensions, incomplete blocks, or byte
+/// extent mismatches.
+pub(crate) fn validate_tensor_dimensions(tensor: &Tensor) -> Result<()> {
+    dimensions(tensor)?;
+    Ok(())
+}
+
 /// Validates a supported tensor without retaining decoded rows or matrices.
 ///
 /// # Errors

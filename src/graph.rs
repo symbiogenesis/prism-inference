@@ -2739,21 +2739,28 @@ impl Qwen35 {
                 "KV and recurrent state exceed the native state budget",
             ));
         }
+        let verified_swift = matches!(
+            model.identity.as_str(),
+            crate::model::swift::MODEL_SHA256 | crate::model::swift::REPACKED_PTQ1_SHA256
+        );
         // Model owns immutable Arc payloads throughout construction. Validate
         // every payload once, including allowed unused MTP tensors, instead of
         // scanning each large projection again when binding its graph shape.
+        // Verified Swift full-state loads already validated finite payloads in
+        // `Model::load_verified`, so only dimension/byte-extent invariants remain.
         // Keep this pass after the cheap geometry and state-budget checks.
         for tensor in model.tensors.values() {
-            crate::kernels::validate_tensor(tensor)?;
+            if swift_full_state && verified_swift {
+                crate::kernels::validate_tensor_dimensions(tensor)?;
+            } else {
+                crate::kernels::validate_tensor(tensor)?;
+            }
         }
         // Verified loaders set identity to the complete file SHA256. Select the
         // compiled native contract only for the exact current-weight PQ2 and
         // lossless PTQ1 artifacts. Packing does not change the graph's native
         // arithmetic; generic artifacts retain source-order controls.
-        let arithmetic = if matches!(
-            model.identity.as_str(),
-            crate::model::swift::MODEL_SHA256 | crate::model::swift::REPACKED_PTQ1_SHA256
-        ) {
+        let arithmetic = if verified_swift {
             Arithmetic::PinnedSwift
         } else {
             Arithmetic::Source
@@ -7118,6 +7125,32 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_tensor_dimensions_checks_swift_payload_bounds() -> Result<()> {
+        let valid = Tensor {
+            name: "dim-check".to_owned(),
+            dimensions: vec![128, 2],
+            kind: 142,
+            data: Arc::from(vec![0_u8; 2 * 34]),
+        };
+        crate::kernels::validate_tensor_dimensions(&valid)?;
+
+        let bad_len = Tensor {
+            data: Arc::from(vec![0_u8; 2 * 34 - 1]),
+            ..valid
+        };
+        assert!(crate::kernels::validate_tensor_dimensions(&bad_len).is_err());
+
+        let bad_cols = Tensor {
+            name: "bad-cols".to_owned(),
+            dimensions: vec![127, 2],
+            kind: 142,
+            data: Arc::from(vec![0_u8; 68]),
+        };
+        assert!(crate::kernels::validate_tensor_dimensions(&bad_cols).is_err());
         Ok(())
     }
 

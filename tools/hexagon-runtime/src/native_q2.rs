@@ -3588,8 +3588,7 @@ impl NativeQ2ArenaCache {
                     "native Q2 arena cache requires an empty resident cache",
                 ));
             }
-            let fits_meta = cache.projections.capacity() - cache.projections.len()
-                >= tensors.len()
+            let fits_meta = cache.projections.capacity() - cache.projections.len() >= tensors.len()
                 && cache.by_storage.capacity() - cache.by_storage.len() >= tensors.len()
                 && cache.handles.capacity() - cache.handles.len() >= tensors.len();
             (fits_meta, executor.submitter.residency_capacity_bytes())
@@ -3631,10 +3630,12 @@ impl NativeQ2ArenaCache {
 
         // Verify the complete payload digest before invoking any submitter weight preparation.
         let mut digest_buf = vec![0_u8; NATIVE_Q2_ARENA_CACHE_DIGEST_CHUNK_BYTES];
-        let actual_payload_sha256 =
-            bonsai_native_hash::hash_reader(&mut reader, total_payload_u64, &mut digest_buf, &mut || {
-                Ok(())
-            })?;
+        let actual_payload_sha256 = bonsai_native_hash::hash_reader(
+            &mut reader,
+            total_payload_u64,
+            &mut digest_buf,
+            &mut || Ok(()),
+        )?;
         if actual_payload_sha256 != header.payload_sha256 {
             return Err(invalid("native Q2 arena cache payload SHA-256 mismatch"));
         }

@@ -173,10 +173,7 @@ fn paired_values_reject_malformed_and_late_second_token_failure_before_publicati
     assert_eq!(actual, retained);
 }
 
-fn build_softmax_rows(
-    count: usize,
-    round_f16: bool,
-) -> crate::Result<[Vec<Vec<f32>>; 2]> {
+fn build_softmax_rows(count: usize, round_f16: bool) -> crate::Result<[Vec<Vec<f32>>; 2]> {
     let raw_pattern = [-2.5_f32, -0.5, 0.0, 0.75, 1.5, -1.25, 0.375];
     let mut out = [Vec::with_capacity(6), Vec::with_capacity(6)];
     for (token, token_rows) in out.iter_mut().enumerate() {

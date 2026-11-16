@@ -974,38 +974,40 @@ pub(super) fn attend_tile(
         {
             return Err(invalid("invalid packed attention tile geometry"));
         }
-        let run_tile_chunk =
-            |base_token: usize, output_chunk: &mut [Vec<f32>], scores_chunk: &mut [f32]| -> Result<()> {
-                let unit = grouped_head_unit(heads / keys.heads, heads);
-                for (offset, (output, scores)) in output_chunk
-                    .iter_mut()
-                    .zip(scores_chunk.chunks_exact_mut(end))
-                    .enumerate()
-                {
-                    let token = base_token + offset;
-                    let position = base + token;
-                    let input = PackedAttention {
-                        keys,
-                        values,
-                        queries: &queries[token],
-                        projected: &projected[token],
-                        current_keys: keys.row(position)?,
-                        current_values: values.row(position)?,
-                        history_tokens: position,
-                        heads_per_kv: heads / keys.heads,
-                        scale,
-                        arithmetic,
-                    };
-                    input.attend_chunk_stack_buffered(
-                        0,
-                        output,
-                        &mut scores[..=position],
-                        position + 1,
-                        unit,
-                    )?;
-                }
-                Ok(())
-            };
+        let run_tile_chunk = |base_token: usize,
+                              output_chunk: &mut [Vec<f32>],
+                              scores_chunk: &mut [f32]|
+         -> Result<()> {
+            let unit = grouped_head_unit(heads / keys.heads, heads);
+            for (offset, (output, scores)) in output_chunk
+                .iter_mut()
+                .zip(scores_chunk.chunks_exact_mut(end))
+                .enumerate()
+            {
+                let token = base_token + offset;
+                let position = base + token;
+                let input = PackedAttention {
+                    keys,
+                    values,
+                    queries: &queries[token],
+                    projected: &projected[token],
+                    current_keys: keys.row(position)?,
+                    current_values: values.row(position)?,
+                    history_tokens: position,
+                    heads_per_kv: heads / keys.heads,
+                    scale,
+                    arithmetic,
+                };
+                input.attend_chunk_stack_buffered(
+                    0,
+                    output,
+                    &mut scores[..=position],
+                    position + 1,
+                    unit,
+                )?;
+            }
+            Ok(())
+        };
         let task_count = count.min(parallelism.workers().max(1)).min(MAX_ROW_WORKERS);
         if task_count == 1 {
             return run_tile_chunk(0, attended, scores);

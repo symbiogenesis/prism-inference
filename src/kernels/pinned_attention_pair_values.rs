@@ -85,7 +85,9 @@ pub(crate) fn value_pair_tile_packed_gated<'a>(
             .iter()
             .flat_map(|rows| rows.iter().flatten())
             .any(|&bits| (bits & 0x7c00) == 0x7c00)
-        || current.iter().any(|row| row.iter().any(|value| !value.is_finite()))
+        || current
+            .iter()
+            .any(|row| row.iter().any(|value| !value.is_finite()))
     {
         return Err(invalid("invalid pinned paired packed attention value tile"));
     }
@@ -137,7 +139,9 @@ pub(crate) fn value_pair_tile_from_scores_gated<'a>(
         || scores[1]
             .iter()
             .any(|row| row.len() != first_count + 1 || row.iter().any(|value| !value.is_finite()))
-        || current.iter().any(|row| row.iter().any(|value| !value.is_finite()))
+        || current
+            .iter()
+            .any(|row| row.iter().any(|value| !value.is_finite()))
     {
         return Err(invalid("invalid pinned paired score attention value tile"));
     }

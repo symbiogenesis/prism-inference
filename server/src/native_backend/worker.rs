@@ -396,10 +396,7 @@ impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for WorkerThreadHexago
         })
     }
 
-    fn supports_f32_ffn_chain(
-        &self,
-        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
-    ) -> bool {
+    fn supports_f32_ffn_chain(&self, tensors: [&bonsai_prism_runtime::model::Tensor; 3]) -> bool {
         WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
             slot.as_ref().is_some_and(|executor| {
                 bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_chain(

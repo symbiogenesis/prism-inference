@@ -316,9 +316,9 @@ pub(crate) fn value_tile_six_from_scores_gated<'a>(
         || count == 0
         || count > crate::model::swift::CONTEXT_TOKENS
         || outputs.iter().any(|output| output.len() != width)
-        || scores.iter().any(|row| {
-            row.len() != count || row.iter().any(|value| !value.is_finite())
-        })
+        || scores
+            .iter()
+            .any(|row| row.len() != count || row.iter().any(|value| !value.is_finite()))
         || gates.iter().any(|gate| gate.len() != width)
         || current.iter().any(|value| !value.is_finite())
     {
@@ -391,7 +391,9 @@ fn value_tile_six_from_scores_scalar<'a>(
     if last_bits.iter().any(|&bits| (bits & 0x7c00) == 0x7c00) {
         return Err(invalid("nonfinite packed binary16 attention weight"));
     }
-    finish_group_packed_scalar(past, current, last_bits, past_len, &mut sums, outputs, gates)
+    finish_group_packed_scalar(
+        past, current, last_bits, past_len, &mut sums, outputs, gates,
+    )
 }
 
 #[cfg(all(
@@ -448,9 +450,7 @@ fn decode_six_pair_neon(
         [
             lo_arr[0], lo_arr[1], lo_arr[2], lo_arr[3], hi_arr[0], hi_arr[1],
         ],
-        [
-            hi_arr[2], hi_arr[3], tail[0], tail[1], tail[2], tail[3],
-        ],
+        [hi_arr[2], hi_arr[3], tail[0], tail[1], tail[2], tail[3]],
     )
 }
 

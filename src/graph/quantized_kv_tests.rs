@@ -1603,7 +1603,10 @@ fn balanced_parallel_attention_preserves_earliest_error_across_24_heads() -> Res
             .ok_or_else(|| invalid("expected nonfinite error"))?
             .to_string();
             if let Some(expected) = &expected_error {
-                assert_eq!(&err, expected, "workers={workers}, early_head={early_head:?}");
+                assert_eq!(
+                    &err, expected,
+                    "workers={workers}, early_head={early_head:?}"
+                );
             } else {
                 expected_error = Some(err);
             }
@@ -1667,7 +1670,10 @@ fn balanced_parallel_tile_preserves_earliest_token_error_across_workers() -> Res
             .to_string();
             assert!(out.iter().all(Vec::is_empty));
             if let Some(expected) = &expected_error {
-                assert_eq!(&err, expected, "workers={workers}, early_token={early_token:?}");
+                assert_eq!(
+                    &err, expected,
+                    "workers={workers}, early_token={early_token:?}"
+                );
             } else {
                 expected_error = Some(err);
             }

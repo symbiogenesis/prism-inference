@@ -1017,8 +1017,7 @@ mod tests {
         let payload = vec![0x3c_u8; 1024];
         fs::write(&path, &payload)?;
         let file = fs::File::open(&path)?;
-        let maybe_mapped =
-            bonsai_native_hash::mmap::MappedReadOnlyFile::try_map(&file, 1024)?;
+        let maybe_mapped = bonsai_native_hash::mmap::MappedReadOnlyFile::try_map(&file, 1024)?;
         if let Some(mapped_file) = maybe_mapped {
             let slice = mapped_file.slice(128, 256)?;
             let mut mapped = TensorBytes::from(slice);

@@ -372,7 +372,11 @@ fn six_head_prefill_long_prefix_and_paired_chunks_match_causal_oracle() -> crate
             0.125,
         )?;
         assert_eq!(
-            actual.iter().flatten().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            actual
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
             expected
                 .iter()
                 .flatten()
@@ -412,7 +416,8 @@ fn six_head_prefill_24_head_gqa_matches_oracle_across_non_dividing_workers() -> 
         let score_stride = 6 * (base + count);
         for workers in worker_counts {
             let parallelism = RowParallelism::new(workers)?;
-            let mut actual = vec![vec![19.0; fixture.geometry.heads * fixture.geometry.head]; count];
+            let mut actual =
+                vec![vec![19.0; fixture.geometry.heads * fixture.geometry.head]; count];
             let mut scores = vec![19.0; count * score_stride];
             parallelism.update_paired_chunks(
                 &mut actual,
@@ -496,7 +501,10 @@ fn six_head_prefill_24_head_gqa_preserves_earliest_error_across_workers() -> cra
                 .ok_or_else(|| crate::invalid("expected nonfinite error"))?
                 .to_string();
             if let Some(expected) = &expected_error {
-                assert_eq!(&err, expected, "workers={workers}, early_token={early_token:?}");
+                assert_eq!(
+                    &err, expected,
+                    "workers={workers}, early_token={early_token:?}"
+                );
             } else {
                 expected_error = Some(err);
             }

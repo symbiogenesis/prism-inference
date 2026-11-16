@@ -2525,7 +2525,9 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
         let vtcm_limit = usize::try_from(profile.vtcm_bytes.min(NATIVE_Q2_VTCM_REQUEST_BYTES))
             .map_err(|_| Error::Contract)?;
         if lora_vtcm_bytes > vtcm_limit
-            || crate::htp_ops::requires_dma64_stride(u64::try_from(lora_a_bytes).map_err(|_| Error::Contract)?)
+            || crate::htp_ops::requires_dma64_stride(
+                u64::try_from(lora_a_bytes).map_err(|_| Error::Contract)?,
+            )
         {
             return Err(Error::Contract);
         }
@@ -2818,7 +2820,11 @@ fn image_ffn_full_chain_resident_batch<const B: usize>(
             )?;
             let lora_op_desc = ops_base + next_op * 232;
             let kp = lora_op_desc + 72;
-            put32(working, lora_op_desc, crate::htp_ops::HtpOpCode::MulMat.id());
+            put32(
+                working,
+                lora_op_desc,
+                crate::htp_ops::HtpOpCode::MulMat.id(),
+            );
             put32(
                 working,
                 lora_op_desc + 4,
@@ -4501,9 +4507,15 @@ mod tests {
     fn ffn_full_chain_lora_descriptors_avoid_vtcm_double_consume_and_poison_lora_out()
     -> Result<(), Error> {
         let mut reg = NativeQ2WeightRegistry::new(65_536)?;
-        let h_gate = reg.prepare_validated(128, 128, 4608)?.ok_or(Error::Contract)?;
-        let h_up = reg.prepare_validated(128, 128, 4608)?.ok_or(Error::Contract)?;
-        let h_down = reg.prepare_validated(128, 128, 4608)?.ok_or(Error::Contract)?;
+        let h_gate = reg
+            .prepare_validated(128, 128, 4608)?
+            .ok_or(Error::Contract)?;
+        let h_up = reg
+            .prepare_validated(128, 128, 4608)?
+            .ok_or(Error::Contract)?;
+        let h_down = reg
+            .prepare_validated(128, 128, 4608)?
+            .ok_or(Error::Contract)?;
         let activation = [1.5_f32; 128];
         let residual = [0.25_f32; 128];
         let lora_a: Vec<f32> = (0..128)
@@ -4549,7 +4561,8 @@ mod tests {
             ));
 
             let tensors_base = 24;
-            let ops_base = tensors_base + usize::try_from(expected_tensors).map_err(|_| Error::Contract)? * 56;
+            let ops_base =
+                tensors_base + usize::try_from(expected_tensors).map_err(|_| Error::Contract)? * 56;
             // Op 2 (GluSwiglu): reads src0/src1 from VTCM, MUST clear KEEP_DST_IN_VTCM.
             let glu_op = ops_base + 2 * 232;
             assert_eq!(
@@ -4565,13 +4578,19 @@ mod tests {
 
             // Op 3 (F32 MUL_MAT for lora_a): opcode=4, flags=0, kernel=4, n_threads=1, n_prefetch=4.
             let lora_op = ops_base + 3 * 232;
-            assert_eq!(read_u32(&arena, lora_op)?, crate::htp_ops::HtpOpCode::MulMat.id());
+            assert_eq!(
+                read_u32(&arena, lora_op)?,
+                crate::htp_ops::HtpOpCode::MulMat.id()
+            );
             assert_eq!(read_u32(&arena, lora_op + 4)?, 0);
             assert_eq!(arena[lora_op + 72], 4);
             assert_eq!(arena[lora_op + 76], 1);
             assert_eq!(arena[lora_op + 78], 4);
             assert_eq!(read_u32(&arena, lora_op + 72 + 24)?, 128 * 4);
-            assert_eq!(read_u32(&arena, lora_op + 72 + 28)?, 4 * 128 * 4 + 128 * 4 + 128);
+            assert_eq!(
+                read_u32(&arena, lora_op + 72 + 28)?,
+                4 * 128 * 4 + 128 * 4 + 128
+            );
             // Verify lora_a weight tensor (ti=9) has flags=1, ne=[128,32], row 0 populated and rows 1..32 zeroed.
             let lora_w_desc = tensors_base + 9 * 56;
             let lora_a_buf = usize::try_from(u64::from_le_bytes(
@@ -4600,7 +4619,10 @@ mod tests {
             // Consumer of swiglu_out (Op 4: Hadamard if present, else down) clears READ_SRC*.
             if hadamard.is_some() {
                 let had_op = ops_base + 4 * 232;
-                assert_eq!(read_u32(&arena, had_op)?, crate::htp_ops::HtpOpCode::Hadamard.id());
+                assert_eq!(
+                    read_u32(&arena, had_op)?,
+                    crate::htp_ops::HtpOpCode::Hadamard.id()
+                );
                 assert_eq!(
                     read_u32(&arena, had_op + 4)?,
                     crate::htp_ops::HtpOpPassFlags::KEEP_DST_IN_VTCM.bits()

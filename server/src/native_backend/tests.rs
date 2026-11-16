@@ -1208,10 +1208,10 @@ fn private_cpu_prefill_gdn_wy_f32_and_mixed_phase_hexagon_startup_bind_readiness
                     startup_projection: Some(startup),
                     ..Observation::default()
                 };
-                let mut worker =
-                    Worker::with_placement(FakeEngine(observed), 42, Placement::Auto)
-                        .map_err(|error| format!("{error:?}"))?;
-                let (result, reply) = perform(&mut worker, request("/v1/models", &[], true)).await?;
+                let mut worker = Worker::with_placement(FakeEngine(observed), 42, Placement::Auto)
+                    .map_err(|error| format!("{error:?}"))?;
+                let (result, reply) =
+                    perform(&mut worker, request("/v1/models", &[], true)).await?;
                 assert_eq!(result, Ok(()));
                 let end = reply
                     .array_windows()

@@ -42,9 +42,7 @@ fn decode_pair_six_neon(neon: Neon, first: [u16; 6], second: [u16; 6]) -> Decode
         [
             lo_arr[0], lo_arr[1], lo_arr[2], lo_arr[3], hi_arr[0], hi_arr[1],
         ],
-        [
-            hi_arr[2], hi_arr[3], tail[0], tail[1], tail[2], tail[3],
-        ],
+        [hi_arr[2], hi_arr[3], tail[0], tail[1], tail[2], tail[3]],
     )
 }
 
@@ -144,12 +142,10 @@ fn accumulate_pair_packed_past_neon<'a>(
             let v1 = crate::kernels::neon::f16_bits_to_f32_x4(neon, *vals1);
             let g = groups - 1;
             for h in 0..6 {
-                sums[0][h][lane0][g] =
-                    v0.mul_add_precise(first_weights_a[h], sums[0][h][lane0][g]);
+                sums[0][h][lane0][g] = v0.mul_add_precise(first_weights_a[h], sums[0][h][lane0][g]);
                 sums[1][h][lane0][g] =
                     v0.mul_add_precise(second_weights_a[h], sums[1][h][lane0][g]);
-                sums[0][h][lane1][g] =
-                    v1.mul_add_precise(first_weights_b[h], sums[0][h][lane1][g]);
+                sums[0][h][lane1][g] = v1.mul_add_precise(first_weights_b[h], sums[0][h][lane1][g]);
                 sums[1][h][lane1][g] =
                     v1.mul_add_precise(second_weights_b[h], sums[1][h][lane1][g]);
             }

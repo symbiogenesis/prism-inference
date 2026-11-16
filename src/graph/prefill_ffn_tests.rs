@@ -1053,7 +1053,10 @@ fn external_ffn_chain_lora_fuses_down_only_lora_at_scale_1_3_and_matches_rank_on
             &expected_no_res,
             "scale=1.3 fused ffn chain lora without residual",
         );
-        assert_eq!(actual_eval.projection.fusions.external_ffn_chain.completed, 1);
+        assert_eq!(
+            actual_eval.projection.fusions.external_ffn_chain.completed,
+            1
+        );
         assert_eq!(exec_no_res.chain_calls, 1);
 
         // 2. With residual via run_decode: completes external_ffn_chain with zero swiglu/separate down calls.
@@ -1092,16 +1095,11 @@ fn external_ffn_chain_lora_fuses_down_only_lora_at_scale_1_3_and_matches_rank_on
 
     // 3. Sparse LoRA A falls back cleanly without breaking chain fusion for dense adapters.
     let sparse_base = Model {
-        metadata: BTreeMap::from([(
-            "general.architecture".into(),
-            MetadataValue::from("qwen35"),
-        )]),
+        metadata: BTreeMap::from([("general.architecture".into(), MetadataValue::from("qwen35"))]),
         tensors: BTreeMap::from([(fixture.down.name.clone(), fixture.down.clone())]),
         identity: "pq2-sparse-adapter-base".into(),
     };
-    let sparse_in: Vec<f32> = (0..128)
-        .map(|i| if i < 8 { 0.125 } else { 0.0 })
-        .collect();
+    let sparse_in: Vec<f32> = (0..128).map(|i| if i < 8 { 0.125 } else { 0.0 }).collect();
     let sparse_out = vec![0.25_f32; 128];
     let mut sparse_down_adapter = RankOneAdapter::from_model(
         Model {
@@ -1114,11 +1112,19 @@ fn external_ffn_chain_lora_fuses_down_only_lora_at_scale_1_3_and_matches_rank_on
             tensors: BTreeMap::from([
                 (
                     format!("{}.lora_a", fixture.down.name),
-                    tensor(&format!("{}.lora_a", fixture.down.name), &[128, 1], &sparse_in),
+                    tensor(
+                        &format!("{}.lora_a", fixture.down.name),
+                        &[128, 1],
+                        &sparse_in,
+                    ),
                 ),
                 (
                     format!("{}.lora_b", fixture.down.name),
-                    tensor(&format!("{}.lora_b", fixture.down.name), &[1, 128], &sparse_out),
+                    tensor(
+                        &format!("{}.lora_b", fixture.down.name),
+                        &[1, 128],
+                        &sparse_out,
+                    ),
                 ),
             ]),
             identity: "pq2-sparse-adapter-factors".into(),
@@ -1209,17 +1215,17 @@ fn pq2_tiled_graph_fixture() -> Model {
         ("qwen35.attention.head_count", MetadataValue::from(1_u32)),
         ("qwen35.attention.head_count_kv", MetadataValue::from(1_u32)),
         ("qwen35.attention.key_length", MetadataValue::from(128_u32)),
-        ("qwen35.attention.value_length", MetadataValue::from(128_u32)),
+        (
+            "qwen35.attention.value_length",
+            MetadataValue::from(128_u32),
+        ),
         ("qwen35.rope.dimension_count", MetadataValue::from(64_u32)),
         ("qwen35.rope.freq_base", MetadataValue::from(10_000.0_f32)),
         (
             "qwen35.attention.layer_norm_rms_epsilon",
             MetadataValue::from(1e-6_f32),
         ),
-        (
-            "qwen35.full_attention_interval",
-            MetadataValue::from(1_u32),
-        ),
+        ("qwen35.full_attention_interval", MetadataValue::from(1_u32)),
         ("qwen35.ssm.state_size", MetadataValue::from(1_u32)),
         ("qwen35.ssm.group_count", MetadataValue::from(1_u32)),
         ("qwen35.ssm.time_step_rank", MetadataValue::from(1_u32)),
@@ -1369,9 +1375,14 @@ fn mixed_phase_tile_gate_skips_decode_executor_on_tiled_ingest_block_and_keeps_d
     })));
     tile_exec_check.ingest_block(&[0, 1], &|| Ok(()))?;
     assert!(tile_calls.load(Ordering::Relaxed) > 0);
-    assert_eq!(tile_exec_check.tiled_prefill_statistics().completed_tokens, 2);
     assert_eq!(
-        tile_exec_check.tiled_prefill_statistics().packed_projections,
+        tile_exec_check.tiled_prefill_statistics().completed_tokens,
+        2
+    );
+    assert_eq!(
+        tile_exec_check
+            .tiled_prefill_statistics()
+            .packed_projections,
         0
     );
     Ok(())

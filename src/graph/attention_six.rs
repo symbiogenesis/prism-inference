@@ -308,10 +308,11 @@ fn apply_values_pair(
 ) -> Result<()> {
     let width = geometry.head;
     let offset = head / 6 * width;
-    if current
-        .iter()
-        .any(|row| row[offset..offset + width].iter().any(|value| !value.is_finite()))
-    {
+    if current.iter().any(|row| {
+        row[offset..offset + width]
+            .iter()
+            .any(|value| !value.is_finite())
+    }) {
         return Err(invalid("nonfinite six-head paired attention current value"));
     }
     let gates =

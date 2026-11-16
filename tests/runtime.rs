@@ -1811,3 +1811,49 @@ fn bounded_prefill_final_prompt_logits_can_stop_without_evaluating_a_generated_t
     );
     Ok(())
 }
+
+#[test]
+fn marconi_utility_and_lru_eviction_retains_reused_long_prefix_over_short_throwaway_turns()
+-> Result<()> {
+    let mut runtime = Runtime::new(
+        decoder(),
+        Limits {
+            context_tokens: 64,
+            checkpoints: 2,
+            checkpoint_bytes: 32_768,
+        },
+    )?;
+    let cancel = Cancellation::default();
+    let base_prompt: Vec<u32> = (0_u32..15).map(|idx| idx % 7).collect();
+    runtime.generate(&base_prompt, &options(), &cancel, |_| Ok(()))?;
+    let c0_tokens = runtime.tokens().to_vec();
+    assert_eq!(c0_tokens.len(), 16);
+
+    // Branch A extends C0 and promotes C0 via an exact prefix-cache hit before committing C1.
+    let mut branch_a = c0_tokens.clone();
+    branch_a.push(5);
+    let hit_a = runtime.generate(&branch_a, &options(), &cancel, |_| Ok(()))?;
+    assert_eq!(hit_a.reused_tokens, c0_tokens.len());
+
+    // Two unrelated 1-token throwaway turns fill/rotate the 2-slot cache. Old FIFO eviction
+    // would discard C0 and leave only [throwaway_1, throwaway_2], yielding 0 reused tokens
+    // on a second fork from C0. Marconi FLOP/byte utility + LRU keeps C0 alive.
+    runtime.generate(&[6], &options(), &cancel, |_| Ok(()))?;
+    runtime.generate(&[5], &options(), &cancel, |_| Ok(()))?;
+
+    let stats_before_rebranch = runtime.prefix_cache_stats();
+    assert_eq!(stats_before_rebranch.evictions, 2);
+    assert_eq!(stats_before_rebranch.hits, 1);
+    assert_eq!(stats_before_rebranch.misses, 3);
+
+    let mut branch_b = c0_tokens.clone();
+    branch_b.push(4);
+    let hit_b = runtime.generate(&branch_b, &options(), &cancel, |_| Ok(()))?;
+    assert_eq!(hit_b.reused_tokens, c0_tokens.len());
+    assert_eq!(runtime.prefix_cache_stats().hits, 2);
+    assert_eq!(
+        runtime.prefix_cache_stats().reused_tokens,
+        u64::try_from(c0_tokens.len() * 2)?
+    );
+    Ok(())
+}

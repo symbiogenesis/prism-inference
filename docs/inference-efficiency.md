@@ -223,6 +223,16 @@ secondary fallback drafter without allocating redundant scratch.
 `AdaptiveSuffixDraft` gates low-confidence candidates, and `DraftTreeTopology`
 computes 64-bit ancestor masks for parallel tree verification.
 
+## Prefix-cache Marconi utility eviction
+
+`Runtime` (`src/runtime.rs`) replaces pure FIFO checkpoint eviction with
+Marconi/GDSF utility-driven selection using a monotonic aging floor and base
+utility scaled from saved prefill/decode work (`tokens * (tokens + 64)`), reuse
+frequency, and retained checkpoint bytes (`MARCONI_UTILITY_SCALE`), breaking ties
+by least-recent `last_used_epoch`. `Runtime::prefix_cache_stats` exposes
+cumulative `PrefixCacheStats` (`hits`, `misses`, `evictions`, `reused_tokens`)
+across live-prefix, reusable-checkpoint, and prompt-end restorations.
+
 ## Constrained-decoding GSS and radix mask cache
 
 Constrained decoding in `src/grammar/` pairs a Graph-Structured Stack

@@ -20,8 +20,10 @@ mod verification;
 use timing::measure;
 pub use timing::{GenerationPhase, GenerationTimings, PhaseTiming};
 
+const MAX_REUSABLE_CHECKPOINTS: usize = 8;
 const MAX_RECYCLED_CHECKPOINTS: usize = 2;
 const MAX_RECYCLED_BATCH_LOGITS: usize = MAX_SPECULATIVE_DRAFT_TOKENS;
+const MARCONI_UTILITY_SCALE: u128 = 1_000_000;
 
 struct GenerationEffects<'a, S, E> {
     sampler: &'a mut S,
@@ -289,6 +291,27 @@ pub struct ReallocationWitness {
     pub reused_preparations: u64,
 }
 
+/// Cumulative prefix-cache reuse, miss, and utility-driven eviction counters for [`Runtime`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrefixCacheStats {
+    /// Prompt preparations that reused at least one cached prefix token from live state,
+    /// reusable checkpoints, or the dedicated prompt-end checkpoint.
+    pub hits: u64,
+    /// Prompt preparations on non-empty prompts that found zero reusable cached prefix tokens.
+    pub misses: u64,
+    /// Reusable checkpoints evicted under byte or count pressure.
+    pub evictions: u64,
+    /// Cumulative prompt tokens skipped through prefix-cache reuse.
+    pub reused_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CheckpointUtility {
+    last_used_epoch: u64,
+    reuse_hits: u64,
+    priority: u128,
+}
+
 /// Single-owner native conversation with rollback on cancellation or failure.
 ///
 /// Edited prompts reuse only an exact saved token prefix. Recurrent state is
@@ -307,6 +330,10 @@ pub struct Runtime<D: Decoder> {
     // Captures/restores share immutable output. Mutation detaches without copying.
     logits: Arc<Vec<f32>>,
     checkpoints: Vec<Snapshot<D::Checkpoint>>,
+    checkpoint_meta: [CheckpointUtility; MAX_REUSABLE_CHECKPOINTS],
+    cache_epoch: u64,
+    cache_aging_floor: u128,
+    prefix_cache_stats: PrefixCacheStats,
     prompt_end_checkpoint: Option<Snapshot<D::Checkpoint>>,
     retain_prompt_end: bool,
     recycled_checkpoints: Vec<D::Checkpoint>,
@@ -398,6 +425,9 @@ impl Runtime<crate::graph::Qwen35> {
         self.faulted = true;
         self.decoder.reset_with_adapter_scale(scale)?;
         self.checkpoints.clear();
+        self.checkpoint_meta = [CheckpointUtility::default(); MAX_REUSABLE_CHECKPOINTS];
+        self.cache_epoch = 0;
+        self.cache_aging_floor = 0;
         self.prompt_end_checkpoint = None;
         self.recycled_checkpoints.clear();
         self.suffix_tree.clear();
@@ -418,7 +448,7 @@ impl<D: Decoder> Runtime<D> {
     pub fn new(mut decoder: D, limits: Limits) -> Result<Self> {
         if limits.context_tokens == 0
             || limits.context_tokens > 262_144
-            || limits.checkpoints > 8
+            || limits.checkpoints > MAX_REUSABLE_CHECKPOINTS
             || limits.checkpoint_bytes == 0
             || decoder.vocab_size() == 0
             || decoder.vocab_size() > 1_048_576
@@ -444,6 +474,10 @@ impl<D: Decoder> Runtime<D> {
             media_spans: Vec::new(),
             logits: Arc::new(Vec::new()),
             checkpoints,
+            checkpoint_meta: [CheckpointUtility::default(); MAX_REUSABLE_CHECKPOINTS],
+            cache_epoch: 0,
+            cache_aging_floor: 0,
+            prefix_cache_stats: PrefixCacheStats::default(),
             prompt_end_checkpoint: None,
             retain_prompt_end: false,
             recycled_checkpoints,
@@ -458,6 +492,12 @@ impl<D: Decoder> Runtime<D> {
     #[must_use]
     pub const fn reallocation_witness(&self) -> ReallocationWitness {
         self.reallocation_witness
+    }
+
+    /// Cumulative prefix-cache hits, misses, utility evictions, and reused tokens.
+    #[must_use]
+    pub const fn prefix_cache_stats(&self) -> PrefixCacheStats {
+        self.prefix_cache_stats
     }
 
     /// Committed prompt plus generated tokens; excludes sampled stop tokens.
@@ -582,6 +622,9 @@ impl<D: Decoder> Runtime<D> {
         while let Some(snapshot) = self.checkpoints.pop() {
             self.recycle_snapshot(snapshot);
         }
+        self.checkpoint_meta = [CheckpointUtility::default(); MAX_REUSABLE_CHECKPOINTS];
+        self.cache_epoch = 0;
+        self.cache_aging_floor = 0;
         if let Some(snapshot) = self.prompt_end_checkpoint.take() {
             self.recycle_snapshot(snapshot);
         }
@@ -1262,6 +1305,47 @@ impl<D: Decoder> Runtime<D> {
         self.finish_capture(bytes, check)
     }
 
+    const fn next_cache_epoch(&mut self) -> u64 {
+        self.cache_epoch = self.cache_epoch.saturating_add(1);
+        self.cache_epoch
+    }
+
+    fn marconi_base_utility(tokens_len: usize, bytes: usize, reuse_hits: u64) -> u128 {
+        let tokens = u128::try_from(tokens_len.max(1)).unwrap_or(1);
+        let saved_flops = tokens.saturating_mul(tokens.saturating_add(64));
+        let freq = u128::from(reuse_hits.min(63)) + 1;
+        let denom_bytes = u128::try_from(bytes.max(1)).unwrap_or(1);
+        saved_flops
+            .saturating_mul(freq)
+            .saturating_mul(MARCONI_UTILITY_SCALE)
+            / denom_bytes
+    }
+
+    fn checkpoint_utility_lt(&self, lhs: usize, rhs: usize) -> bool {
+        let lhs_meta = self.checkpoint_meta[lhs];
+        let rhs_meta = self.checkpoint_meta[rhs];
+        (lhs_meta.priority, lhs_meta.last_used_epoch)
+            < (rhs_meta.priority, rhs_meta.last_used_epoch)
+    }
+
+    fn evict_checkpoint_victim(&mut self) -> Snapshot<D::Checkpoint> {
+        let mut victim = 0_usize;
+        for candidate in 1..self.checkpoints.len() {
+            if self.checkpoint_utility_lt(candidate, victim) {
+                victim = candidate;
+            }
+        }
+        self.cache_aging_floor = self
+            .cache_aging_floor
+            .max(self.checkpoint_meta[victim].priority);
+        let evicted = self.checkpoints.remove(victim);
+        self.checkpoint_meta
+            .copy_within(victim + 1..MAX_REUSABLE_CHECKPOINTS, victim);
+        self.checkpoint_meta[MAX_REUSABLE_CHECKPOINTS - 1] = CheckpointUtility::default();
+        self.prefix_cache_stats.evictions = self.prefix_cache_stats.evictions.saturating_add(1);
+        evicted
+    }
+
     fn capture_reusable(
         &mut self,
         reserved: usize,
@@ -1288,7 +1372,7 @@ impl<D: Decoder> Runtime<D> {
             if self.checkpoints.is_empty() {
                 return Err(invalid("native checkpoint budget exhausted"));
             }
-            let evicted = self.checkpoints.remove(0);
+            let evicted = self.evict_checkpoint_victim();
             self.recycle_snapshot(evicted);
         }
         self.finish_capture(bytes, check)
@@ -1346,10 +1430,24 @@ impl<D: Decoder> Runtime<D> {
             // Count pressure alone must not discard a usable prefix
             // when its optional replacement could not be captured.
             if self.checkpoints.len() == self.limits.checkpoints {
-                let evicted = self.checkpoints.remove(0);
+                let evicted = self.evict_checkpoint_victim();
                 self.recycle_snapshot(evicted);
             }
+            let slot = self.checkpoints.len();
+            let epoch = self.next_cache_epoch();
+            let priority = self.cache_aging_floor.saturating_add(Self::marconi_base_utility(
+                snapshot.tokens.len(),
+                snapshot.bytes,
+                0,
+            ));
             self.checkpoints.push(snapshot);
+            if slot < MAX_REUSABLE_CHECKPOINTS {
+                self.checkpoint_meta[slot] = CheckpointUtility {
+                    last_used_epoch: epoch,
+                    reuse_hits: 0,
+                    priority,
+                };
+            }
         }
     }
 
@@ -1420,21 +1518,88 @@ impl<D: Decoder> Runtime<D> {
         self.prepare_with_spans(prompt, &[], check)
     }
 
+    fn record_checkpoint_hit(&mut self, index: usize) {
+        let Some((tokens_len, bytes)) = self
+            .checkpoints
+            .get(index)
+            .map(|snapshot| (snapshot.tokens.len(), snapshot.bytes))
+        else {
+            return;
+        };
+        let epoch = self.next_cache_epoch();
+        if let Some(meta) = self.checkpoint_meta.get_mut(index) {
+            meta.reuse_hits = meta.reuse_hits.saturating_add(1);
+            meta.last_used_epoch = epoch;
+            meta.priority = self.cache_aging_floor.saturating_add(Self::marconi_base_utility(
+                tokens_len,
+                bytes,
+                meta.reuse_hits,
+            ));
+        }
+    }
+
+    fn restore_prefix_snapshot(
+        &mut self,
+        snapshot_idx: Option<usize>,
+        from_prompt_end: bool,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        let Some(snapshot) = (match snapshot_idx {
+            Some(index) => self.checkpoints.get(index),
+            None if from_prompt_end => self.prompt_end_checkpoint.as_ref(),
+            None => None,
+        }) else {
+            return Ok(());
+        };
+        let tokens_cap_before = self.tokens.capacity();
+        self.tokens
+            .try_reserve_exact(snapshot.tokens.len().saturating_sub(self.tokens.len()))?;
+        if self.tokens.capacity() > tokens_cap_before {
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+        }
+        check()?;
+        self.decoder.restore(&snapshot.state)?;
+        check()?;
+        self.tokens.clear();
+        self.tokens.extend_from_slice(&snapshot.tokens);
+        self.media_spans.clear();
+        self.media_spans.extend_from_slice(&snapshot.media_spans);
+        let previous_logits = std::mem::replace(&mut self.logits, Arc::clone(&snapshot.logits));
+        self.recycle_logits(previous_logits);
+        if let Some(index) = snapshot_idx {
+            self.record_checkpoint_hit(index);
+        }
+        self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
+        self.prefix_cache_stats.reused_tokens = self
+            .prefix_cache_stats
+            .reused_tokens
+            .saturating_add(u64::try_from(self.tokens.len()).unwrap_or(u64::MAX));
+        Ok(())
+    }
+
     fn prepare_with_spans(
         &mut self,
         prompt: &[u32],
         incoming_spans: &[MediaSpan],
         check: &impl Fn() -> Result<()>,
     ) -> Result<usize> {
-        enum CandidateSlot {
-            Prefix(usize),
-            PromptEnd,
-        }
-
         if !self.tokens.is_empty()
             && prefix_matches_media(prompt, incoming_spans, &self.tokens, &self.media_spans)
             && !self.logits.is_empty()
         {
+            if let Some(index) = self.checkpoints.iter().position(|snapshot| {
+                snapshot.tokens == self.tokens && snapshot.media_spans == self.media_spans
+            }) {
+                self.record_checkpoint_hit(index);
+            }
+            self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
+            self.prefix_cache_stats.reused_tokens = self
+                .prefix_cache_stats
+                .reused_tokens
+                .saturating_add(u64::try_from(self.tokens.len()).unwrap_or(u64::MAX));
             return Ok(self.tokens.len());
         }
         let best_cached = self
@@ -1458,42 +1623,20 @@ impl<D: Decoder> Runtime<D> {
                 &snapshot.media_spans,
             )
         });
-        let best = match (best_cached, best_prompt_end) {
+        let (snapshot_idx, from_prompt_end) = match (best_cached, best_prompt_end) {
             (Some((index, cached)), Some(end)) => {
                 if cached.tokens.len() >= end.tokens.len() {
-                    Some(CandidateSlot::Prefix(index))
+                    (Some(index), false)
                 } else {
-                    Some(CandidateSlot::PromptEnd)
+                    (None, true)
                 }
             }
-            (Some((index, _)), None) => Some(CandidateSlot::Prefix(index)),
-            (None, Some(_)) => Some(CandidateSlot::PromptEnd),
-            (None, None) => None,
+            (Some((index, _)), None) => (Some(index), false),
+            (None, Some(_)) => (None, true),
+            (None, None) => (None, false),
         };
-        let snapshot = match best {
-            Some(CandidateSlot::Prefix(index)) => Some(&self.checkpoints[index]),
-            Some(CandidateSlot::PromptEnd) => self.prompt_end_checkpoint.as_ref(),
-            None => None,
-        };
-        if let Some(snapshot) = snapshot {
-            let tokens_cap_before = self.tokens.capacity();
-            self.tokens
-                .try_reserve_exact(snapshot.tokens.len().saturating_sub(self.tokens.len()))?;
-            if self.tokens.capacity() > tokens_cap_before {
-                self.reallocation_witness.growth_reallocations = self
-                    .reallocation_witness
-                    .growth_reallocations
-                    .saturating_add(1);
-            }
-            check()?;
-            self.decoder.restore(&snapshot.state)?;
-            check()?;
-            self.tokens.clear();
-            self.tokens.extend_from_slice(&snapshot.tokens);
-            self.media_spans.clear();
-            self.media_spans.extend_from_slice(&snapshot.media_spans);
-            let previous_logits = std::mem::replace(&mut self.logits, Arc::clone(&snapshot.logits));
-            self.recycle_logits(previous_logits);
+        if snapshot_idx.is_some() || from_prompt_end {
+            self.restore_prefix_snapshot(snapshot_idx, from_prompt_end, check)?;
         } else {
             check()?;
             self.decoder.reset()?;
@@ -1501,6 +1644,9 @@ impl<D: Decoder> Runtime<D> {
             self.tokens.clear();
             self.media_spans.clear();
             mutable_logits(&mut self.logits).clear();
+            if !prompt.is_empty() {
+                self.prefix_cache_stats.misses = self.prefix_cache_stats.misses.saturating_add(1);
+            }
         }
         Ok(self.tokens.len())
     }

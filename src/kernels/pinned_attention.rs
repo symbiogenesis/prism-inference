@@ -1167,7 +1167,6 @@ fn softmax_with_rounding<const ROUND_F16: bool>(
 ///
 /// # Errors
 /// Rejects empty, oversized or nonfinite input before mutation.
-#[cfg(test)]
 pub(crate) fn softmax(scores: &mut [f32]) -> Result<()> {
     softmax_with_rounding::<false>(scores, crate::model::swift::CONTEXT_TOKENS)
 }
@@ -1186,8 +1185,53 @@ pub(crate) fn softmax_rotated_kv(scores: &mut [f32]) -> Result<()> {
     softmax_with_rounding::<true>(scores, crate::model::swift::TRAINING_CONTEXT_TOKENS)
 }
 
-/// Normalizes `HEADS` score rows with pinned binary16 rounding and packs the
-/// resulting probabilities in `[token][head]` consumer order.
+fn pack_f16_rows_unchecked<const HEADS: usize>(
+    scores: [&[f32]; HEADS],
+    packed: &mut [[u16; HEADS]],
+) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        neon::pack_f16_rows(neon, scores, packed);
+        return;
+    }
+    for (token, slot) in packed.iter_mut().enumerate() {
+        for (head, dst) in slot.iter_mut().enumerate() {
+            *dst = super::half_bits(scores[head][token]);
+        }
+    }
+}
+
+/// Packs `HEADS` probability slices into `[token][head]` consumer-ordered binary16 storage.
+///
+/// # Errors
+/// Rejects empty, zero-head, oversized or mismatched slices and nonfinite inputs.
+pub(crate) fn pack_f16_rows<const HEADS: usize>(
+    scores: [&[f32]; HEADS],
+    packed: &mut [[u16; HEADS]],
+) -> Result<()> {
+    if HEADS == 0
+        || packed.is_empty()
+        || packed.len() > crate::model::swift::CONTEXT_TOKENS
+        || scores
+            .iter()
+            .any(|row| row.len() != packed.len() || row.iter().any(|value| !value.is_finite()))
+    {
+        return Err(invalid(
+            "invalid pinned packed probability geometry or nonfinite scores",
+        ));
+    }
+    pack_f16_rows_unchecked(scores, packed);
+    Ok(())
+}
+
+/// Normalizes `HEADS` score rows and packs the resulting binary16-rounded
+/// probabilities in `[token][head]` consumer order.
 ///
 /// # Errors
 /// Rejects empty, mismatched or oversized rows and nonfinite inputs before mutating.
@@ -1207,24 +1251,9 @@ pub(crate) fn softmax_pack_f16<const HEADS: usize>(
         ));
     }
     for row in &mut scores {
-        softmax_round_f16(row)?;
+        softmax(row)?;
     }
-    #[cfg(all(
-        feature = "experimental-neon",
-        target_arch = "aarch64",
-        target_os = "windows",
-        target_env = "msvc",
-        target_feature = "neon"
-    ))]
-    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
-        neon::pack_f16_rows(neon, scores.each_ref().map(|row| &**row), packed);
-        return Ok(());
-    }
-    for (token, slot) in packed.iter_mut().enumerate() {
-        for (head, dst) in slot.iter_mut().enumerate() {
-            *dst = super::half_bits(scores[head][token]);
-        }
-    }
+    pack_f16_rows_unchecked(scores.each_ref().map(|row| &**row), packed);
     Ok(())
 }
 

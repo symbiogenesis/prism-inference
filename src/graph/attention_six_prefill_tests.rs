@@ -21,14 +21,24 @@ fn sample(index: usize) -> f32 {
 }
 
 fn fixture(base: usize, count: usize) -> crate::Result<Fixture> {
-    // Include a partial channel tile and two independent KV groups. The
+    fixture_with_geometry(12, 2, 128, base, count)
+}
+
+fn fixture_with_geometry(
+    heads: usize,
+    kv_heads: usize,
+    context: usize,
+    base: usize,
+    count: usize,
+) -> crate::Result<Fixture> {
+    // Include a partial channel tile and independent KV groups. The
     // normalization/rotary stage is upstream of the selected attention helper.
     let width = 68;
     let geometry = Geometry {
         embedding: 4,
         feed_forward: 4,
-        heads: 12,
-        kv_heads: 2,
+        heads,
+        kv_heads,
         head: width,
         rope: 4,
         rope_sections: [1, 1, 0, 0],
@@ -39,8 +49,8 @@ fn fixture(base: usize, count: usize) -> crate::Result<Fixture> {
         ssm_values: 1,
         convolution: 4,
     };
-    let mut keys = KvCache::new(geometry.kv_heads * width, 128)?;
-    let mut values = KvCache::new(geometry.kv_heads * width, 128)?;
+    let mut keys = KvCache::new(geometry.kv_heads * width, context)?;
+    let mut values = KvCache::new(geometry.kv_heads * width, context)?;
     let mut current_keys = Vec::new();
     let mut current_values = Vec::new();
     for position in 0..base + count {
@@ -318,5 +328,71 @@ fn six_head_paired_prefill_excludes_future_rows_and_rejects_malformed_input() ->
             .flatten()
             .all(|value| value.to_bits() == 19.0_f32.to_bits())
     );
+    Ok(())
+}
+
+#[test]
+fn six_head_prefill_long_prefix_and_paired_chunks_match_causal_oracle() -> crate::Result<()> {
+    for (base, count) in [(254, 1), (255, 2), (256, 3), (257, 5)] {
+        let mut fixture = fixture_with_geometry(12, 2, 320, base, count)?;
+        let width = fixture.geometry.head;
+        let expected: Vec<_> = (0..count)
+            .map(|token| reference(&fixture, base + token, token))
+            .collect::<crate::Result<_>>()?;
+
+        // Check `attend_prefix` directly across the 256-token stack chunk boundary.
+        let mut prefix_out = vec![19.0_f32; 6 * width];
+        let mut prefix_scores = vec![19.0_f32; 6 * (base + 1)];
+        prefix(&fixture, base, &mut prefix_out, &mut prefix_scores)?;
+        assert_eq!(
+            prefix_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected[0][..6 * width]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "attend_prefix mismatch at base={base}"
+        );
+
+        // Check `attend_tile_chunk` (both paired and odd trailing prefix) across 256-token chunks.
+        let score_stride = 6 * (base + count);
+        let mut actual = vec![vec![19.0; fixture.geometry.heads * width]; count];
+        let mut scores = vec![19.0; count * score_stride];
+        attend_tile_chunk(
+            &fixture.geometry,
+            base,
+            &fixture.queries,
+            &fixture.projected,
+            &fixture.keys,
+            &fixture.values,
+            &fixture.current_keys,
+            &fixture.current_values,
+            &mut actual,
+            &mut scores,
+            score_stride,
+            0.125,
+        )?;
+        assert_eq!(
+            actual.iter().flatten().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "attend_tile_chunk mismatch at base={base}, count={count}"
+        );
+
+        // A late-tile NaN in current_values must fail atomically before writing tile 0.
+        if base == 256 && count == 3 {
+            prefix_out.fill(19.0);
+            prefix_scores.fill(19.0);
+            fixture.current_values[0][65] = f32::NAN;
+            assert!(prefix(&fixture, base, &mut prefix_out, &mut prefix_scores).is_err());
+            assert!(
+                prefix_out
+                    .iter()
+                    .all(|value| value.to_bits() == 19.0_f32.to_bits())
+            );
+        }
+    }
     Ok(())
 }

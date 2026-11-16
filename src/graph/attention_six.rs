@@ -101,7 +101,7 @@ fn attend_prefix(
     for (score, query) in scores.iter_mut().zip(query_rows) {
         score[score_len - 1] =
             pinned_attention::dot_f32(&current_key[offset..offset + width], query)? * scale;
-        pinned_attention::softmax_round_f16(score)?;
+        pinned_attention::softmax(score)?;
     }
     apply_values(
         geometry,
@@ -114,6 +114,8 @@ fn attend_prefix(
         past_tokens,
     )
 }
+
+const CAUSAL_PACK_CHUNK: usize = 256;
 
 #[expect(
     clippy::too_many_arguments,
@@ -131,30 +133,53 @@ fn apply_values(
 ) -> Result<()> {
     let width = geometry.head;
     let offset = head / 6 * width;
+    if current_value[offset..offset + width]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(invalid("nonfinite six-head attention current value"));
+    }
     let gates: [&[f32]; 6] =
         std::array::from_fn(|index| attention_gate(projected, head + index, width));
-    let [o0, o1, o2, o3, o4, o5] = rows(output, width)?;
-    for (tile, (((((o0, o1), o2), o3), o4), o5)) in o0
-        .chunks_mut(six::VALUE_TILE)
-        .zip(o1.chunks_mut(six::VALUE_TILE))
-        .zip(o2.chunks_mut(six::VALUE_TILE))
-        .zip(o3.chunks_mut(six::VALUE_TILE))
-        .zip(o4.chunks_mut(six::VALUE_TILE))
-        .zip(o5.chunks_mut(six::VALUE_TILE))
-        .enumerate()
-    {
-        let start = tile * six::VALUE_TILE;
-        let end = start + o0.len();
-        six::value_tile_gated(
-            values.tokens().take(past_tokens),
-            &current_value[offset + start..offset + end],
-            scores,
-            offset + start,
-            [o0, o1, o2, o3, o4, o5],
-            gates.map(|gate| &gate[start..end]),
-        )?;
+    let mut out_rows = rows(output, width)?.map(|row| row.chunks_mut(six::VALUE_TILE));
+    let score_len = past_tokens + 1;
+    let mut run_tiles = |packed: Option<&[[u16; 6]]>| -> Result<()> {
+        for start in (0..width).step_by(six::VALUE_TILE) {
+            let end = (start + six::VALUE_TILE).min(width);
+            let [o0, o1, o2, o3, o4, o5] = out_rows.each_mut().map(|row| {
+                row.next()
+                    .ok_or_else(|| invalid("short six-head value output tile"))
+            });
+            let tile_outputs = [o0?, o1?, o2?, o3?, o4?, o5?];
+            let tile_gates = gates.map(|gate| &gate[start..end]);
+            if let Some(weights) = packed {
+                six::value_tile_group_packed_gated::<6>(
+                    values.tokens().take(past_tokens),
+                    &current_value[offset + start..offset + end],
+                    weights,
+                    offset + start,
+                    tile_outputs,
+                    tile_gates,
+                )?;
+            } else {
+                six::value_tile_six_from_scores_gated(
+                    values.tokens().take(past_tokens),
+                    &current_value[offset + start..offset + end],
+                    scores,
+                    offset + start,
+                    tile_outputs,
+                    tile_gates,
+                )?;
+            }
+        }
+        Ok(())
+    };
+    if score_len <= CAUSAL_PACK_CHUNK {
+        let mut packed = [[0_u16; 6]; CAUSAL_PACK_CHUNK];
+        pinned_attention::pack_f16_rows(scores, &mut packed[..score_len])?;
+        return run_tiles(Some(&packed[..score_len]));
     }
-    Ok(())
+    run_tiles(None)
 }
 
 /// Evaluates `HEADS` (`HEADS` in `{2, 3, 6}`) contiguous query heads sharing a single
@@ -283,36 +308,66 @@ fn apply_values_pair(
 ) -> Result<()> {
     let width = geometry.head;
     let offset = head / 6 * width;
+    if current
+        .iter()
+        .any(|row| row[offset..offset + width].iter().any(|value| !value.is_finite()))
+    {
+        return Err(invalid("nonfinite six-head paired attention current value"));
+    }
     let gates =
         projected.map(|row| std::array::from_fn(|index| attention_gate(row, head + index, width)));
     let [first, second] = outputs;
     let mut first_rows = rows(first, width)?.map(|row| row.chunks_mut(six::PAIR_VALUE_TILE));
     let mut second_rows = rows(second, width)?.map(|row| row.chunks_mut(six::PAIR_VALUE_TILE));
-    for start in (0..width).step_by(six::PAIR_VALUE_TILE) {
-        let end = (start + six::PAIR_VALUE_TILE).min(width);
-        let first = first_rows.each_mut().map(|row| {
-            row.next()
-                .ok_or_else(|| invalid("short paired value output tile"))
-        });
-        let second = second_rows.each_mut().map(|row| {
-            row.next()
-                .ok_or_else(|| invalid("short paired value output tile"))
-        });
-        let [f0, f1, f2, f3, f4, f5] = first;
-        let [s0, s1, s2, s3, s4, s5] = second;
-        six::value_pair_tile_gated(
-            values.tokens().take(past_tokens + 1),
-            current.map(|row| &row[offset + start..offset + end]),
-            scores,
-            offset + start,
-            [
+    let first_len = past_tokens + 1;
+    let second_len = past_tokens + 2;
+    let mut run_tiles = |packed: Option<[&[[u16; 6]]; 2]>| -> Result<()> {
+        for start in (0..width).step_by(six::PAIR_VALUE_TILE) {
+            let end = (start + six::PAIR_VALUE_TILE).min(width);
+            let [f0, f1, f2, f3, f4, f5] = first_rows.each_mut().map(|row| {
+                row.next()
+                    .ok_or_else(|| invalid("short paired value output tile"))
+            });
+            let [s0, s1, s2, s3, s4, s5] = second_rows.each_mut().map(|row| {
+                row.next()
+                    .ok_or_else(|| invalid("short paired value output tile"))
+            });
+            let tile_outputs = [
                 [f0?, f1?, f2?, f3?, f4?, f5?],
                 [s0?, s1?, s2?, s3?, s4?, s5?],
-            ],
-            gates.map(|row| row.map(|gate| &gate[start..end])),
-        )?;
+            ];
+            let tile_current = current.map(|row| &row[offset + start..offset + end]);
+            let tile_gates = gates.map(|row| row.map(|gate| &gate[start..end]));
+            if let Some(weights) = packed {
+                six::value_pair_tile_packed_gated(
+                    values.tokens().take(past_tokens + 1),
+                    tile_current,
+                    weights,
+                    offset + start,
+                    tile_outputs,
+                    tile_gates,
+                )?;
+            } else {
+                six::value_pair_tile_from_scores_gated(
+                    values.tokens().take(past_tokens + 1),
+                    tile_current,
+                    scores,
+                    offset + start,
+                    tile_outputs,
+                    tile_gates,
+                )?;
+            }
+        }
+        Ok(())
+    };
+    if second_len <= CAUSAL_PACK_CHUNK {
+        let mut packed0 = [[0_u16; 6]; CAUSAL_PACK_CHUNK];
+        let mut packed1 = [[0_u16; 6]; CAUSAL_PACK_CHUNK];
+        pinned_attention::pack_f16_rows(scores[0], &mut packed0[..first_len])?;
+        pinned_attention::pack_f16_rows(scores[1], &mut packed1[..second_len])?;
+        return run_tiles(Some([&packed0[..first_len], &packed1[..second_len]]));
     }
-    Ok(())
+    run_tiles(None)
 }
 
 // Each caller worker owns complete token rows and its six-head score storage.
@@ -439,7 +494,7 @@ pub(super) fn attend_tile_chunk(
                         &current_keys[first + token][offset..offset + width],
                         query,
                     )? * scale;
-                    pinned_attention::softmax_round_f16(score)?;
+                    pinned_attention::softmax(score)?;
                 }
             }
             let [first_rows, second_rows] = score_rows;

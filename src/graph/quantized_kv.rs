@@ -1035,10 +1035,10 @@ impl PackedAttention<'_> {
             6 if 5 * stride <= STACK_GROUP_SCORES_LEN => {
                 self.attend_chunk_stack_fixed::<6>(base_head, attended, first_scores, stride)
             }
-            3 if 2 * stride <= STACK_GROUP_SCORES_LEN => {
+            6 | 3 if 2 * stride <= STACK_GROUP_SCORES_LEN => {
                 self.attend_chunk_stack_fixed::<3>(base_head, attended, first_scores, stride)
             }
-            2 if stride <= STACK_GROUP_SCORES_LEN => {
+            6 | 2 if stride <= STACK_GROUP_SCORES_LEN => {
                 self.attend_chunk_stack_fixed::<2>(base_head, attended, first_scores, stride)
             }
             _ => {
@@ -1107,6 +1107,7 @@ impl PackedAttention<'_> {
         results: &mut [&mut [f32]; G],
         score_rows: &mut [&mut [f32]; G],
     ) -> Result<()> {
+        const PROB_PACK_CHUNK: usize = 64;
         let kv_head = base_head / self.heads_per_kv;
         let mut rotated_queries = [[0.0; HEAD_DIM]; G];
         for (offset, rotated) in rotated_queries.iter_mut().enumerate() {
@@ -1139,16 +1140,33 @@ impl PackedAttention<'_> {
                 }
             }
         }
+        let total_tokens = self.history_tokens + 1;
+        if score_rows.iter().any(|row| row.len() != total_tokens) {
+            return Err(invalid("packed attention score row length mismatch"));
+        }
         let mut accumulator = self.values.quantizer.value_group_accumulator::<G>()?;
-        for (token, row) in self
+        let mut packed_weights = [[0.0_f32; G]; PROB_PACK_CHUNK];
+        let mut value_rows = self
             .values
             .rows()
             .take(self.history_tokens)
-            .chain(std::iter::once(self.current_values))
-            .enumerate()
-        {
-            let weights: [f32; G] = std::array::from_fn(|offset| score_rows[offset][token]);
-            accumulator.accumulate_group(self.values.record(row, kv_head), weights)?;
+            .chain(std::iter::once(self.current_values));
+        for chunk_start in (0..total_tokens).step_by(PROB_PACK_CHUNK) {
+            let chunk_len = (total_tokens - chunk_start).min(PROB_PACK_CHUNK);
+            for (head, probabilities) in score_rows.iter().enumerate() {
+                for (slot, &weight) in packed_weights[..chunk_len]
+                    .iter_mut()
+                    .zip(&probabilities[chunk_start..chunk_start + chunk_len])
+                {
+                    slot[head] = weight;
+                }
+            }
+            for &weights in &packed_weights[..chunk_len] {
+                let row = value_rows
+                    .next()
+                    .ok_or_else(|| invalid("packed value cache row is short"))?;
+                accumulator.accumulate_group(self.values.record(row, kv_head), weights)?;
+            }
         }
         let mut outputs = accumulator.finish()?;
         for (offset, (output, result)) in outputs.iter_mut().zip(results.iter_mut()).enumerate() {

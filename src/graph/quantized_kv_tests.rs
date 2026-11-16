@@ -1377,3 +1377,77 @@ fn grouped_gqa_tile_preserves_exact_bits_across_worker_counts() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn packed_group_chunked_probabilities_preserve_exact_bits_across_64_token_boundaries() -> Result<()>
+{
+    let heads = 12;
+    let kv_heads = 2;
+    let context = 136;
+    for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
+        for tokens in [63, 64, 65, 129] {
+            let mut keys = KvCache::with_policy(kv_heads * HEAD_DIM, context, policy, true, false)?;
+            let mut values =
+                KvCache::with_policy(kv_heads * HEAD_DIM, context, policy, false, false)?;
+            for position in 0..tokens {
+                let salt = u16::try_from(position)?;
+                let key = input(kv_heads * HEAD_DIM, salt)?;
+                let value = input(kv_heads * HEAD_DIM, salt + 17)?;
+                keys.prepare_append(&key)?;
+                values.prepare_append(&value)?;
+                keys.append(&key);
+                values.append(&value);
+            }
+            let queries = input(heads * HEAD_DIM, 29)?;
+            let projected = input(2 * heads * HEAD_DIM, 43)?;
+            let current_key = input(kv_heads * HEAD_DIM, 61)?;
+            let current_value = input(kv_heads * HEAD_DIM, 73)?;
+            let expected_bits = gqa_oracle_bits(
+                &keys,
+                &values,
+                &queries,
+                &projected,
+                &current_key,
+                &current_value,
+                heads,
+            )?;
+            let stride = tokens + 1;
+            let worker_counts: &[usize] = if cfg!(feature = "parallel-rows") {
+                &[1, 2, 4, 6]
+            } else {
+                &[1]
+            };
+            for &workers in worker_counts {
+                let parallelism = RowParallelism::new(workers)?;
+                let mut grouped_keys = keys.copy()?;
+                let mut grouped_values = values.copy()?;
+                let mut attended = vec![0.0_f32; heads * HEAD_DIM];
+                let rows = group_score_rows(&grouped_keys, &grouped_values, heads, &parallelism);
+                let mut group_scores = vec![0.0_f32; rows * stride];
+                attend_with_group_scores(
+                    &mut grouped_keys,
+                    &mut grouped_values,
+                    &queries,
+                    &projected,
+                    &current_key,
+                    &current_value,
+                    &mut attended,
+                    &mut group_scores,
+                    heads,
+                    1.0 / 16.0,
+                    super::super::Arithmetic::PinnedSwift,
+                    &parallelism,
+                )?;
+                assert_eq!(
+                    attended
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected_bits,
+                    "chunked group probabilities mismatch for policy={policy:?} tokens={tokens} workers={workers}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

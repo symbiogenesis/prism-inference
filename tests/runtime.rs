@@ -674,11 +674,14 @@ fn failed_optional_checkpoint_preserves_a_full_prefix_cache() -> Result<()> {
 fn oversized_optional_checkpoint_preserves_an_older_prefix() -> Result<()> {
     let decoder = decoder();
     let checkpoint_fail = decoder.checkpoint_fail.clone();
-    // Charge the state/token Vecs, shared-logits Vec and Arc pointer/counts,
-    // plus the snapshot byte count. Every snapshot still charges its full token
-    // and logits payload despite sharing. Allow the long rollback and small
-    // prefix together, but not the medium rollback and a long replacement.
-    let snapshot_metadata = 3 * size_of::<Vec<u32>>() + 4 * size_of::<usize>();
+    // Charge the state/token/media_spans Vecs, shared-logits Vec and Arc
+    // pointer/counts, plus the snapshot byte count. Every snapshot still charges
+    // its full token and logits payload despite sharing. Allow the long rollback
+    // and small prefix together, but not the medium rollback and a long
+    // replacement.
+    let snapshot_metadata = 3 * size_of::<Vec<u32>>()
+        + size_of::<Vec<bonsai_prism_runtime::runtime::MediaSpan>>()
+        + 4 * size_of::<usize>();
     let mut runtime = Runtime::new(
         decoder,
         Limits {

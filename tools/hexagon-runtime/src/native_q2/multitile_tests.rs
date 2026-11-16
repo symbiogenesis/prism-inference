@@ -181,7 +181,7 @@ fn tensor(rows: usize) -> Tensor {
         name: "blk.0.ffn_down.weight".to_owned(),
         dimensions: vec![columns, rows],
         kind: 142,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -424,7 +424,7 @@ fn native_q2_multitile_tokens_reject_invalid_input_before_submission() -> Result
             if fault == 1 || fault == 3 {
                 let mut data = tensor.data.to_vec();
                 data[..2].copy_from_slice(&0x7e00_u16.to_le_bytes());
-                tensor.data = Arc::from(data);
+                tensor.data = Arc::<[u8]>::from(data).into();
             }
             let mut executor = executor(&tensor, 256, resident)?;
             let mut outputs = vec![vec![91.0]; 3];

@@ -29,7 +29,7 @@ fn tensor(kind: u32, count: usize, bytes: Vec<u8>) -> Tensor {
         name: "iq3-native".into(),
         kind,
         dimensions: vec![count],
-        data: Arc::from(bytes),
+        data: Arc::<[u8]>::from(bytes).into(),
     }
 }
 
@@ -154,7 +154,7 @@ fn checked_rows_prepared_matvec_and_explicit_encoder_limits() -> Result<()> {
         let packed = bytes(&case["WeightsHex"])?;
         let mut weights = tensor(kind, 768, packed.clone());
         weights.dimensions.push(2);
-        weights.data = Arc::from([packed.as_slice(), packed.as_slice()].concat());
+        weights.data = Arc::<[u8]>::from([packed.as_slice(), packed.as_slice()].concat()).into();
         let input: Vec<f32> = (0_i16..768)
             .map(|index| f32::from(index % 29 - 14) / 7.0)
             .collect();

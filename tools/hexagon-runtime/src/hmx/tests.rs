@@ -126,7 +126,7 @@ fn fixture(columns: usize, rows: usize) -> Tensor {
         name: "hmx-control".into(),
         kind: 142,
         dimensions: vec![columns, rows],
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -221,7 +221,7 @@ fn hmx_executor_retains_independent_original_fma_golden() -> Result<()> {
         name: "fma-golden".into(),
         kind: 142,
         dimensions: vec![256, 1],
-        data: Arc::from(weights),
+        data: Arc::<[u8]>::from(weights).into(),
     };
     let mut codes = [3_i8; 256];
     codes[128..].fill(-13);
@@ -518,7 +518,7 @@ fn hmx_resident_source_identity_retains_arc_and_checks_geometry() -> Result<()> 
     compare(&tensor, &mut executor)?;
     // Cache retention forces copy-on-write; the original allocation cannot be
     // mutated or reused behind a resident handle.
-    Arc::make_mut(&mut changed_data.data)[2] ^= 0xff;
+    bonsai_prism_runtime::model::TensorBytes::make_mut(&mut changed_data.data)[2] ^= 0xff;
     compare(&changed_data, &mut executor)?;
     compare(&changed_geometry, &mut executor)?;
     assert_eq!(executor.residency_statistics().tensors_prepared, 3);

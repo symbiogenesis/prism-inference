@@ -660,7 +660,7 @@ fn lora_b_sharing_preserves_layout_bytes_and_owner_lifetime() {
         name: name.into(),
         dimensions,
         kind: 0,
-        data: Arc::from(vec![value; 8]),
+        data: Arc::<[u8]>::from(vec![value; 8]).into(),
     };
     let mut model = Model {
         metadata: BTreeMap::new(),
@@ -675,15 +675,15 @@ fn lora_b_sharing_preserves_layout_bytes_and_owner_lifetime() {
         .into(),
     };
     assert_eq!(model.share_lora_b(), 1);
-    assert!(Arc::ptr_eq(
+    assert!(bonsai_prism_runtime::model::TensorBytes::ptr_eq(
         &model.tensors["a.lora_b"].data,
         &model.tensors["b.lora_b"].data
     ));
-    assert!(!Arc::ptr_eq(
+    assert!(!bonsai_prism_runtime::model::TensorBytes::ptr_eq(
         &model.tensors["a.lora_b"].data,
         &model.tensors["c.lora_b"].data
     ));
-    let saved = Arc::clone(&model.tensors["b.lora_b"].data);
+    let saved = model.tensors["b.lora_b"].data.clone();
     drop(model);
     assert_eq!(&*saved, &[1; 8]);
 }

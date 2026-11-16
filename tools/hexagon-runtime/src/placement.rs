@@ -1,6 +1,6 @@
 //! Immutable explicit placement for a bounded partial-graph experiment.
 
-use std::{fmt::Write, sync::Arc};
+use std::fmt::Write;
 
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
@@ -106,7 +106,7 @@ impl<'a> PlacedProjectionExecutor<'a> {
                     name,
                     dimensions,
                     kind: tensor.kind,
-                    data: Arc::clone(&tensor.data),
+                    data: tensor.data.clone(),
                 },
                 route,
                 operations,
@@ -168,7 +168,7 @@ impl<'a> PlacedProjectionExecutor<'a> {
             .binary_search_by(|selection| selection.tensor.name.cmp(&tensor.name))
             .ok()?;
         let selection = &self.selected[index];
-        (Arc::ptr_eq(&selection.tensor.data, &tensor.data)
+        (bonsai_prism_runtime::model::TensorBytes::ptr_eq(&selection.tensor.data, &tensor.data)
             && selection.tensor.kind == tensor.kind
             && selection.tensor.dimensions == tensor.dimensions)
             .then_some(selection)

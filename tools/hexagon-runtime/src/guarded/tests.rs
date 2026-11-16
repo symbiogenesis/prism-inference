@@ -71,7 +71,7 @@ fn fixture(columns: usize, rows: usize) -> Tensor {
         name: "hexagon-control".into(),
         kind: 142,
         dimensions: vec![columns, rows],
-        data: Arc::from(bytes),
+        data: Arc::<[u8]>::from(bytes).into(),
     }
 }
 

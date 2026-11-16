@@ -29,7 +29,7 @@ fn weight(kind: u32, columns: usize, rows: usize) -> Result<Tensor> {
         name: "q8-sibling-control".to_owned(),
         dimensions: vec![columns, rows],
         kind,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     })
 }
 
@@ -113,7 +113,7 @@ fn q8_siblings_reject_late_geometry_and_nonfinite_scales_then_recover() -> Resul
         scratch.set_row_parallelism(RowParallelism::new(workers)?);
         let mut outputs: [Vec<f32>; 3] = std::array::from_fn(|_| vec![f32::NAN]);
         let mut malformed = tensors[2].clone();
-        malformed.data = Arc::from(&malformed.data[..malformed.data.len() - 1]);
+        malformed.data = Arc::<[u8]>::from(&malformed.data[..malformed.data.len() - 1]).into();
         let mut prepared = scratch.prepare(&tensors[0], &input)?;
         assert!(
             prepared
@@ -131,7 +131,7 @@ fn q8_siblings_reject_late_geometry_and_nonfinite_scales_then_recover() -> Resul
             let len = data.len();
             let scale = if kind == PTQ1 { len - 2 } else { len - 34 };
             data[scale..scale + 2].copy_from_slice(&invalid_scale.to_le_bytes());
-            failing.data = Arc::from(data);
+            failing.data = Arc::<[u8]>::from(data).into();
             assert!(
                 prepared
                     .matvec_q8_siblings_into(
@@ -164,7 +164,7 @@ fn q8_siblings_accept_native_ptq1_aliases_and_signed_zero_scales() -> Result<()>
                 block[24] = 2;
                 block[26..].copy_from_slice(&scale.to_le_bytes());
             }
-            tensor.data = Arc::from(data);
+            tensor.data = Arc::<[u8]>::from(data).into();
         }
         for pinned in [false, true] {
             for backend in [

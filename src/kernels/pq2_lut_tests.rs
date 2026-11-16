@@ -18,7 +18,7 @@ fn tensor(columns: usize, rows: usize) -> Result<Tensor> {
         name: "pq2-lut-control".into(),
         dimensions: vec![columns, rows],
         kind: PQ2,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     })
 }
 
@@ -96,7 +96,7 @@ fn lut_projection_checks_extents_scales_limits_and_late_row_failure() -> Result<
     assert!(executor.tables.is_empty());
     activation.scale = -0.125;
     let mut invalid = valid.clone();
-    let bytes = Arc::make_mut(&mut invalid.data);
+    let bytes = crate::model::TensorBytes::make_mut(&mut invalid.data);
     let row_bytes = 2 * 34;
     bytes[row_bytes * 2..row_bytes * 2 + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
     assert!(

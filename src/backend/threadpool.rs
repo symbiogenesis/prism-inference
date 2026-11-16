@@ -197,7 +197,9 @@ impl CpuThreadPool {
                         name: matrix.name.clone(),
                         dimensions: vec![right_shape[0], end - first],
                         kind: matrix.kind,
-                        data: Arc::from(&matrix.data[first * row_bytes..end * row_bytes]),
+                        data: crate::model::TensorBytes::from(
+                            &matrix.data[first * row_bytes..end * row_bytes],
+                        ),
                     };
                     let mut workspace = scratch[worker]
                         .lock()

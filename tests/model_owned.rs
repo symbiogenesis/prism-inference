@@ -329,7 +329,7 @@ fn decoded_q8k_overflow_is_rejected_by_generation_loading_and_saving() -> Result
         .tensors
         .get_mut("a")
         .ok_or("missing Q8_K tensor")?
-        .data = std::sync::Arc::from(overflowing);
+        .data = std::sync::Arc::<[u8]>::from(overflowing).into();
     let mut output = Vec::new();
     assert!(model.write_to(&mut output).is_err());
     assert_eq!(output, Vec::<u8>::new());

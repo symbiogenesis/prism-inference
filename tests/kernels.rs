@@ -20,7 +20,7 @@ fn tensor(kind: u32, dimensions: Vec<usize>, data: Vec<u8>) -> Tensor {
         name: "fixture".to_owned(),
         dimensions,
         kind,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -157,7 +157,7 @@ fn prepared_floating_precision_and_failures_preserve_output_contract() -> TestRe
         assert_matvec_bits(&output, &matvec(weight, &input)?);
     }
     let mut bad = f32_weights.clone();
-    bad.data = Arc::from(f32::NAN.to_le_bytes().repeat(2));
+    bad.data = Arc::<[u8]>::from(f32::NAN.to_le_bytes().repeat(2)).into();
     let mut prepared = scratch.prepare(&f32_weights, &input)?;
     assert!(prepared.matvec_into(&bad, &mut output).is_err());
     assert_eq!(output, Vec::<f32>::new());

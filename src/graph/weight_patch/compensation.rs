@@ -185,12 +185,13 @@ mod tests {
                     name: name.into(),
                     dimensions: shape,
                     kind: 0,
-                    data: Arc::from(
+                    data: Arc::<[u8]>::from(
                         values
                             .iter()
                             .flat_map(|value| value.to_le_bytes())
                             .collect::<Vec<_>>(),
-                    ),
+                    )
+                    .into(),
                 },
             );
         }

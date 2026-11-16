@@ -89,7 +89,7 @@ fn weights(kind: u32) -> Result<Tensor> {
         name: "prepared-contract-control".to_owned(),
         dimensions: vec![128, 1],
         kind,
-        data: Arc::from(quantize_row(kind, &[1.0; 128])?),
+        data: Arc::<[u8]>::from(quantize_row(kind, &[1.0; 128])?).into(),
     })
 }
 

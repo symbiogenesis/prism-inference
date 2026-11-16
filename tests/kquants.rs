@@ -53,7 +53,7 @@ fn native_k_blocks_decode_and_dot_without_requantizing_activations() -> Result<(
             name: case["Name"].to_string(),
             kind,
             dimensions: vec![count],
-            data: Arc::from(weights.clone()),
+            data: Arc::<[u8]>::from(weights.clone()).into(),
         };
         kernels::validate_tensor(&tensor)?;
         let decoded = kernels::row(&tensor, 0)?;

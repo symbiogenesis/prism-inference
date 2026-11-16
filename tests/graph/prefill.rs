@@ -334,7 +334,7 @@ fn tiled_prefill_batches_packed_attention_and_recurrent_projections() -> Result<
             name: name.to_owned(),
             dimensions: vec![cols, rows],
             kind,
-            data: Arc::from(bytes.repeat((cols / 128) * rows)),
+            data: Arc::<[u8]>::from(bytes.repeat((cols / 128) * rows)).into(),
         })
     };
     for recurrent in [false, true] {

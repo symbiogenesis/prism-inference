@@ -534,7 +534,7 @@ mod tests {
             name: "packed-consumption-control".to_owned(),
             dimensions: vec![columns, rows],
             kind: super::super::PQ2,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         }
     }
 
@@ -623,7 +623,10 @@ mod tests {
             assert_eq!(activation.sum, expected);
         }
         let mut weights = weights(256, 1);
-        for block in Arc::make_mut(&mut weights.data).as_chunks_mut::<34>().0 {
+        for block in crate::model::TensorBytes::make_mut(&mut weights.data)
+            .as_chunks_mut::<34>()
+            .0
+        {
             block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
         }
         let expected = super::super::dot_pq2::<false>(&weights.data, &input)?;
@@ -755,7 +758,7 @@ mod tests {
         let mut bad = tensor.clone();
         let mut bytes = bad.data.to_vec();
         bytes[68..70].copy_from_slice(&0x7c00_u16.to_le_bytes());
-        bad.data = Arc::from(bytes);
+        bad.data = Arc::<[u8]>::from(bytes).into();
         for backend in [MatvecBackend::Scalar, MatvecBackend::ExperimentalNeon] {
             scratch = MatvecScratch::with_backend(backend);
             assert!(matvec_into(&bad, &input, &mut output, &mut scratch).is_err());

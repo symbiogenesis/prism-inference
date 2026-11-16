@@ -39,7 +39,7 @@ fn native_ternary_rows_preserve_bytes_decoder_and_generic_dot() -> Result<()> {
             name: case["Name"].to_string(),
             kind,
             dimensions: vec![count],
-            data: Arc::from(packed.clone()),
+            data: Arc::<[u8]>::from(packed.clone()).into(),
         };
         kernels::validate_tensor(&tensor)?;
         assert_eq!(

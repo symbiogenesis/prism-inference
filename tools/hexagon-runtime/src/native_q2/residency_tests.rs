@@ -12,7 +12,7 @@ fn resident_cache_index_separates_shared_storage_shapes_and_keeps_handles_stable
             name: "shared-storage-control".into(),
             kind: 142,
             dimensions: vec![columns, rows],
-            data: Arc::clone(&source),
+            data: Arc::clone(&source).into(),
         });
     }
     let capacities = (cache.projections.capacity(), cache.by_storage.capacity());
@@ -26,7 +26,7 @@ fn resident_cache_index_separates_shared_storage_shapes_and_keeps_handles_stable
     }
     for tensor in tensors {
         let mut changed = tensor.clone();
-        changed.data = Arc::from(tensor.data.to_vec());
+        changed.data = Arc::<[u8]>::from(tensor.data.to_vec()).into();
         assert_eq!(cache.find(&changed), None);
         changed = tensor;
         changed.kind = 143;
@@ -53,7 +53,7 @@ fn resident_cache_index_native_metadata_reservation_covers_every_vector() -> Res
         name: "one-slot".into(),
         kind: 142,
         dimensions: vec![128, 32],
-        data: Arc::from(vec![0x55; 32 * 34]),
+        data: Arc::<[u8]>::from(vec![0x55; 32 * 34]).into(),
     };
     assert!(cache.has_metadata_capacity(1));
     cache.commit(&tensor, 0, false);

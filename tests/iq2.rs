@@ -31,7 +31,7 @@ fn tensor(kind: u32, count: usize, bytes: Vec<u8>) -> Tensor {
         name: "IQ2".to_owned(),
         kind,
         dimensions: vec![count],
-        data: Arc::from(bytes),
+        data: Arc::<[u8]>::from(bytes).into(),
     }
 }
 
@@ -83,7 +83,7 @@ fn native_iq2_decoders_packed_dots_and_prepared_matvec_preserve_bytes() -> Resul
         );
         let pair = Tensor {
             dimensions: vec![512, 2],
-            data: Arc::from([packed.as_slice(), packed.as_slice()].concat()),
+            data: Arc::<[u8]>::from([packed.as_slice(), packed.as_slice()].concat()).into(),
             ..weights
         };
         let mut scratch = kernels::MatvecScratch::default();
@@ -191,7 +191,7 @@ fn iq2_rejects_malformed_extents_nonfinite_scales_and_unavailable_encoders() -> 
             assert!(kernels::packed_dot(kind, 256, &packed, &activations).is_err());
             let pair = Tensor {
                 dimensions: vec![256, 2],
-                data: Arc::from([weights.data.as_ref(), packed.as_slice()].concat()),
+                data: Arc::<[u8]>::from([weights.data.as_ref(), packed.as_slice()].concat()).into(),
                 ..weights.clone()
             };
             let mut output = vec![1.0];

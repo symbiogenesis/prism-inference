@@ -65,7 +65,7 @@ mod tests {
                     name: "pinned-row-control".into(),
                     dimensions: vec![columns, 7],
                     kind,
-                    data: Arc::from(encoded.repeat(columns / 128 * 7)),
+                    data: Arc::<[u8]>::from(encoded.repeat(columns / 128 * 7)).into(),
                 };
                 let input: Vec<_> = (0..columns)
                     .map(|index| [1.5, -127.0, 0.0, -0.0, 63.5][index % 5])

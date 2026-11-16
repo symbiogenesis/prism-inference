@@ -1642,7 +1642,7 @@ fn fuse_temporal_patch_weights(
         name: "v.patch_embd.fused".to_owned(),
         dimensions: vec![patch_pixels, hidden_size],
         kind: 0,
-        data: Arc::from(fused_bytes),
+        data: crate::model::TensorBytes::from(fused_bytes),
     })
 }
 
@@ -1723,7 +1723,7 @@ mod tests {
             name: name.to_owned(),
             dimensions,
             kind: 0,
-            data: Arc::from(bytes),
+            data: Arc::<[u8]>::from(bytes).into(),
         }
     }
 
@@ -1737,7 +1737,7 @@ mod tests {
             name: name.to_owned(),
             dimensions: vec![cols, rows],
             kind: 8,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         })
     }
 
@@ -1751,7 +1751,7 @@ mod tests {
             name: name.to_owned(),
             dimensions: vec![cols, rows],
             kind: 1,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         })
     }
 

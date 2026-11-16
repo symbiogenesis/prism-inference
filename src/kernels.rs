@@ -4516,7 +4516,7 @@ mod tests {
                     name: "q8-rounding".to_owned(),
                     dimensions: vec![columns, 1],
                     kind,
-                    data: Arc::from(vec![0_u8; bytes]),
+                    data: Arc::<[u8]>::from(vec![0_u8; bytes]).into(),
                 };
                 let mut pinned = MatvecScratch::with_pinned_backend(backend);
                 let mut source = MatvecScratch::with_backend(backend);
@@ -4585,7 +4585,7 @@ mod tests {
             name: "q8k-boundary".to_owned(),
             dimensions: vec![256, 1],
             kind: super::PQ2,
-            data: Arc::from([0_u8; 68]),
+            data: Arc::<[u8]>::from([0_u8; 68]).into(),
         };
         for backend in [
             super::MatvecBackend::Scalar,
@@ -4838,7 +4838,7 @@ mod tests {
             name: "prepared".to_owned(),
             dimensions: vec![256, 2],
             kind: super::PQ2,
-            data: Arc::from(block.repeat(4)),
+            data: Arc::<[u8]>::from(block.repeat(4)).into(),
         };
         let mut scratch = MatvecScratch::default();
         let mut output = Vec::new();
@@ -4884,19 +4884,20 @@ mod tests {
             name: "scratch".to_owned(),
             dimensions: vec![2, 2],
             kind: super::F32,
-            data: Arc::from(
+            data: Arc::<[u8]>::from(
                 [1.0_f32, 2.0, 3.0, 4.0]
                     .into_iter()
                     .flat_map(f32::to_le_bytes)
                     .collect::<Vec<_>>(),
-            ),
+            )
+            .into(),
         };
         let mut output = Vec::new();
         matvec_into(&tensor, &[1.0; 2], &mut output, &mut scratch)?;
         let activation_pointer = scratch.activations.as_ptr();
         let row_pointer = scratch.row.as_ptr();
         tensor.dimensions = vec![1];
-        tensor.data = Arc::from(2.0_f32.to_le_bytes().as_slice());
+        tensor.data = Arc::<[u8]>::from(2.0_f32.to_le_bytes().as_slice()).into();
         matvec_into(&tensor, &[3.0], &mut output, &mut scratch)?;
         assert_eq!(scratch.activations.len(), 1);
         // The scalar-column projection does not touch decoded-row scratch.
@@ -4912,12 +4913,13 @@ mod tests {
             name: "rank-one-columns".to_owned(),
             dimensions: vec![1, weights.len()],
             kind: super::F32,
-            data: Arc::from(
+            data: Arc::<[u8]>::from(
                 weights
                     .iter()
                     .flat_map(|value| value.to_le_bytes())
                     .collect::<Vec<_>>(),
-            ),
+            )
+            .into(),
         }
     }
 
@@ -5002,12 +5004,13 @@ mod tests {
             name: "streaming-bf16-projection".to_owned(),
             dimensions: vec![columns, rows],
             kind: super::BF16,
-            data: Arc::from(
+            data: Arc::<[u8]>::from(
                 weights
                     .iter()
                     .flat_map(|value| value.to_le_bytes())
                     .collect::<Vec<_>>(),
-            ),
+            )
+            .into(),
         }
     }
 
@@ -5113,7 +5116,7 @@ mod tests {
             assert!(!scratch.diagnostics().dispatched);
         }
         let mut odd_payload = bf16_tensor(3, 1, &[0x3f80, 0x4000, 0x4040]);
-        odd_payload.data = Arc::from([0_u8; 5]);
+        odd_payload.data = Arc::<[u8]>::from([0_u8; 5]).into();
         for malformed in [
             bf16_tensor(3, 1, &[0x3f80, 0x4000]),
             bf16_tensor(2, 1, &[0x3f80, 0x4000, 0x4040]),
@@ -5378,7 +5381,7 @@ mod tests {
                 name: "pq2_256".to_owned(),
                 dimensions: vec![256, rows],
                 kind: super::PQ2,
-                data: Arc::from(pq2_256),
+                data: Arc::<[u8]>::from(pq2_256).into(),
             };
             let q8k_block = super::Q8KBlock {
                 scale: 0.25,
@@ -5470,7 +5473,7 @@ mod tests {
                 name: "pq2_128".to_owned(),
                 dimensions: vec![128, rows],
                 kind: super::PQ2,
-                data: Arc::from(pq2_128),
+                data: Arc::<[u8]>::from(pq2_128).into(),
             };
             let expected_pq2_128: Vec<f32> = pq2_128_tensor
                 .data
@@ -5558,7 +5561,7 @@ mod tests {
                 name: "ptq1_256".to_owned(),
                 dimensions: vec![256, rows],
                 kind: super::PTQ1,
-                data: Arc::from(ptq1_256),
+                data: Arc::<[u8]>::from(ptq1_256).into(),
             };
             let expected_ptq1: Vec<f32> = ptq1_tensor
                 .data
@@ -5646,7 +5649,7 @@ mod tests {
                     name: format!("ptq1_single_{columns}_{row}"),
                     dimensions: vec![columns, 1],
                     kind: super::PTQ1,
-                    data: Arc::from(encoded),
+                    data: Arc::<[u8]>::from(encoded).into(),
                 });
             }
 
@@ -5669,7 +5672,7 @@ mod tests {
                     name: format!("ptq1_multi_{columns}_{rows}"),
                     dimensions: vec![columns, rows],
                     kind: super::PTQ1,
-                    data: Arc::from(all_rows[..rows * row_bytes].to_vec()),
+                    data: Arc::<[u8]>::from(all_rows[..rows * row_bytes].to_vec()).into(),
                 };
                 for backend in [
                     super::MatvecBackend::Auto,

@@ -21,7 +21,7 @@ fn tensor(kind: u32, columns: usize, rows: usize, data: Vec<u8>) -> Tensor {
         name: "simd-differential".to_owned(),
         dimensions: vec![columns, rows],
         kind,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -299,7 +299,7 @@ fn simd_statistics_retain_mixed_dispatch_and_failed_work() -> TestResult {
     let mut invalid = weights.clone();
     let mut bytes = invalid.data.to_vec();
     bytes[..2].copy_from_slice(&0x7c00_u16.to_le_bytes());
-    invalid.data = Arc::from(bytes);
+    invalid.data = Arc::<[u8]>::from(bytes).into();
     let incompatible = ptq1_tensor(256, 2, &[0x3c00])?;
     let input = activations(256, false);
     for request in [MatvecBackend::Auto, MatvecBackend::Scalar] {

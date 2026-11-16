@@ -21,7 +21,7 @@ fn every_native_ptq_byte_is_accepted_by_tensor_validation() -> TestResult {
                 name: "native-ptq".to_owned(),
                 kind: 143,
                 dimensions: vec![128],
-                data: Arc::from(packed),
+                data: Arc::<[u8]>::from(packed).into(),
             };
             validate_tensor(&tensor)?;
         }

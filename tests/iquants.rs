@@ -44,7 +44,7 @@ fn native_nonlinear_blocks_preserve_reference_bytes_and_generic_dots() -> Result
             name: case["Name"].to_string(),
             kind,
             dimensions: vec![count],
-            data: Arc::from(packed.clone()),
+            data: Arc::<[u8]>::from(packed.clone()).into(),
         };
         kernels::validate_tensor(&tensor)?;
         let values = kernels::row(&tensor, 0)?;
@@ -78,7 +78,7 @@ fn native_nonlinear_blocks_preserve_reference_bytes_and_generic_dots() -> Result
                 }
                 assert!(values.iter().all(|value| *value == 0.0));
                 let canonical = Tensor {
-                    data: Arc::from(actual),
+                    data: Arc::<[u8]>::from(actual).into(),
                     ..tensor
                 };
                 assert!(

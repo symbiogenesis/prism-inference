@@ -33,7 +33,7 @@ fn tensor(kind: u32, count: usize, bytes: Vec<u8>) -> Tensor {
         name: "iq1-native".to_owned(),
         kind,
         dimensions: vec![count],
-        data: Arc::from(bytes),
+        data: Arc::<[u8]>::from(bytes).into(),
     }
 }
 
@@ -111,7 +111,7 @@ fn native_iq1_decoding_packed_dots_and_q8k_matvec_match() -> Result<()> {
             );
             let pair = Tensor {
                 dimensions: vec![count, 2],
-                data: Arc::from([packed.as_slice(), packed.as_slice()].concat()),
+                data: Arc::<[u8]>::from([packed.as_slice(), packed.as_slice()].concat()).into(),
                 ..weights
             };
             let mut scratch = kernels::MatvecScratch::default();

@@ -18,12 +18,13 @@ fn tensor(name: &str, dimensions: &[usize], values: &[f32]) -> Tensor {
         name: name.into(),
         dimensions: dimensions.to_vec(),
         kind: 0,
-        data: Arc::from(
+        data: Arc::<[u8]>::from(
             values
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>(),
-        ),
+        )
+        .into(),
     }
 }
 

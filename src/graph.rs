@@ -6230,7 +6230,7 @@ mod tests {
             name: name.to_owned(),
             dimensions: vec![width],
             kind,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         }
     }
 
@@ -6334,7 +6334,7 @@ mod tests {
         let geometry = projection_geometry(8);
         let first = projection_weight("first", 0, 8);
         let mut second = projection_weight("second", 0, 8);
-        second.data = Arc::from(f32::NAN.to_le_bytes().repeat(8));
+        second.data = Arc::<[u8]>::from(f32::NAN.to_le_bytes().repeat(8)).into();
         let transforms = Transforms::default();
         let mut scratch = ProjectionScratch::default();
         let mut output = [vec![1.0], vec![2.0]];
@@ -6433,7 +6433,7 @@ mod tests {
             name: name.to_owned(),
             dimensions: vec![width],
             kind: 30,
-            data: Arc::from(bits.to_le_bytes().repeat(width)),
+            data: Arc::<[u8]>::from(bits.to_le_bytes().repeat(width)).into(),
         };
         let (beta, alpha) = (
             bf16("blk.0.ssm_beta.weight", 0x3f80),
@@ -6519,7 +6519,7 @@ mod tests {
             name: name.to_owned(),
             dimensions: vec![width],
             kind: 30,
-            data: Arc::from(bits.to_le_bytes().repeat(width)),
+            data: Arc::<[u8]>::from(bits.to_le_bytes().repeat(width)).into(),
         };
         let (beta, alpha) = (
             bf16("blk.0.ssm_beta.weight", 0x3f80),
@@ -6593,11 +6593,12 @@ mod tests {
             name: "blk.0.ssm_beta.weight".to_owned(),
             dimensions: vec![width],
             kind: 30,
-            data: Arc::from(
+            data: Arc::<[u8]>::from(
                 (0..width)
                     .flat_map(|idx| [0x3f80_u16, 0xc000, 0x3e80, 0xbd00][idx % 4].to_le_bytes())
                     .collect::<Vec<u8>>(),
-            ),
+            )
+            .into(),
         };
         let ssm_out = projection_weight("blk.0.ssm_out.weight", 142, width);
         let beta_f32 = projection_weight("blk.0.post_beta.weight", 0, width);
@@ -7158,12 +7159,12 @@ mod tests {
             name: "dim-check".to_owned(),
             dimensions: vec![128, 2],
             kind: 142,
-            data: Arc::from(vec![0_u8; 2 * 34]),
+            data: Arc::<[u8]>::from(vec![0_u8; 2 * 34]).into(),
         };
         crate::kernels::validate_tensor_dimensions(&valid)?;
 
         let bad_len = Tensor {
-            data: Arc::from(vec![0_u8; 2 * 34 - 1]),
+            data: Arc::<[u8]>::from(vec![0_u8; 2 * 34 - 1]).into(),
             ..valid
         };
         assert!(crate::kernels::validate_tensor_dimensions(&bad_len).is_err());
@@ -7172,7 +7173,7 @@ mod tests {
             name: "bad-cols".to_owned(),
             dimensions: vec![127, 2],
             kind: 142,
-            data: Arc::from(vec![0_u8; 68]),
+            data: Arc::<[u8]>::from(vec![0_u8; 68]).into(),
         };
         assert!(crate::kernels::validate_tensor_dimensions(&bad_cols).is_err());
         Ok(())
@@ -8056,12 +8057,13 @@ mod tests {
                 name: name.to_owned(),
                 dimensions: dimensions.to_vec(),
                 kind: 0,
-                data: Arc::from(
+                data: Arc::<[u8]>::from(
                     values
                         .iter()
                         .flat_map(|value| value.to_le_bytes())
                         .collect::<Vec<_>>(),
-                ),
+                )
+                .into(),
             }
         }
 

@@ -1,8 +1,6 @@
 //! Bounded metadata for immutable, append-only native weight residency.
 
-use std::sync::Arc;
-
-use bonsai_prism_runtime::model::Tensor;
+use bonsai_prism_runtime::model::{Tensor, TensorBytes};
 use hexagon_native_rpc::HmxQ2WeightHandle;
 
 use crate::{Result, invalid};
@@ -21,7 +19,7 @@ pub struct HmxResidencyStatistics {
 }
 
 pub(super) struct Projection {
-    source: Arc<[u8]>,
+    source: TensorBytes,
     columns: usize,
     rows: usize,
     pub(super) first_handle: usize,
@@ -102,7 +100,7 @@ impl Cache {
         let index = self.by_storage[position];
         // Retained strong ownership prevents mutation and address reuse. Names
         // are presentation metadata, while geometry remains part of identity.
-        (tensor.kind == 142 && Arc::ptr_eq(&self.projections[index].source, &tensor.data))
+        (tensor.kind == 142 && TensorBytes::ptr_eq(&self.projections[index].source, &tensor.data))
             .then_some(index)
     }
 
@@ -131,7 +129,7 @@ impl Cache {
             .unwrap_or_else(|position| position);
         let index = self.projections.len();
         self.projections.push(Projection {
-            source: Arc::clone(&tensor.data),
+            source: tensor.data.clone(),
             columns: tensor.dimensions[0],
             rows: tensor.dimensions[1],
             first_handle,

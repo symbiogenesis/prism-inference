@@ -741,7 +741,7 @@ fn decode_shared_factor<'a>(
     if let Some((_, values)) = decoded.iter().find(|(other, _)| {
         other.kind == tensor.kind
             && other.dimensions == tensor.dimensions
-            && Arc::ptr_eq(&other.data, &tensor.data)
+            && crate::model::TensorBytes::ptr_eq(&other.data, &tensor.data)
     }) {
         return Ok(Arc::clone(values));
     }
@@ -819,12 +819,13 @@ mod tests {
             name: name.into(),
             dimensions: vec![1, values.len()],
             kind: 0,
-            data: Arc::from(
+            data: Arc::<[u8]>::from(
                 values
                     .iter()
                     .flat_map(|value| value.to_le_bytes())
                     .collect::<Vec<_>>(),
-            ),
+            )
+            .into(),
         }
     }
 
@@ -995,18 +996,19 @@ mod tests {
             name: target.into(),
             dimensions: vec![a_vals.len(), b_vals.len()],
             kind: 0,
-            data: Arc::from(vec![0_u8; a_vals.len() * b_vals.len() * 4]),
+            data: Arc::<[u8]>::from(vec![0_u8; a_vals.len() * b_vals.len() * 4]).into(),
         };
         let a_tensor = Tensor {
             name: format!("{target}.lora_a"),
             dimensions: vec![a_vals.len(), 1],
             kind: 0,
-            data: Arc::from(
+            data: Arc::<[u8]>::from(
                 a_vals
                     .iter()
                     .flat_map(|v| v.to_le_bytes())
                     .collect::<Vec<_>>(),
-            ),
+            )
+            .into(),
         };
         let b_tensor = tensor(&format!("{target}.lora_b"), &b_vals);
         let base = Model {
@@ -1102,7 +1104,7 @@ mod tests {
                         name: linear.into(),
                         dimensions: vec![1, 1],
                         kind: 0,
-                        data: Arc::from(vec![0_u8; 4]),
+                        data: Arc::<[u8]>::from(vec![0_u8; 4]).into(),
                     },
                 )]),
             };
@@ -1123,7 +1125,7 @@ mod tests {
                         name: emb.into(),
                         dimensions: vec![1, 1],
                         kind: 0,
-                        data: Arc::from(vec![0_u8; 4]),
+                        data: Arc::<[u8]>::from(vec![0_u8; 4]).into(),
                     },
                 );
                 tensors.insert(

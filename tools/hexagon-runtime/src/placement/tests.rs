@@ -1,6 +1,6 @@
 //! Model-free controls for immutable placement and actual prepared CPU routing.
 
-use std::{cell::Cell, collections::BTreeMap, rc::Rc};
+use std::{cell::Cell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use bonsai_prism_runtime::kernels::{MatvecBackend, MatvecScratch};
 
@@ -83,7 +83,7 @@ fn tensor(name: &str, kind: u32, columns: usize) -> Tensor {
         name: name.into(),
         kind,
         dimensions: vec![columns, 1],
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -162,7 +162,7 @@ fn placement_matches_immutable_storage_geometry_and_original_activation_route() 
         assert_eq!(placed.supports_q8(tensor), !q8k);
         assert_eq!(placed.supports(&tensor.clone()), q8k);
         let mut changed = tensor.clone();
-        changed.data = Arc::from(tensor.data.to_vec());
+        changed.data = Arc::<[u8]>::from(tensor.data.to_vec()).into();
         assert!(!placed.supports(&changed));
         assert!(!placed.supports_q8(&changed));
         changed = tensor.clone();
@@ -287,7 +287,7 @@ fn graph_model() -> Model {
         let tensor = Tensor {
             name: name.into(),
             kind: 0,
-            data: Arc::from(value.to_le_bytes().repeat(dimensions.iter().product())),
+            data: Arc::<[u8]>::from(value.to_le_bytes().repeat(dimensions.iter().product())).into(),
             dimensions,
         };
         model.tensors.insert(name.into(), tensor);
@@ -295,7 +295,7 @@ fn graph_model() -> Model {
     for name in ["blk.0.ffn_up.weight", "blk.0.ffn_gate.weight"] {
         let mut tensor = tensor(name, 142, 256);
         tensor.dimensions[1] = 2;
-        tensor.data = Arc::from(tensor.data.repeat(2));
+        tensor.data = Arc::<[u8]>::from(tensor.data.repeat(2)).into();
         model.tensors.insert(name.into(), tensor);
     }
     model

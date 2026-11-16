@@ -10,7 +10,8 @@
     reason = "Keep graph-consumed tile types crate scoped inside the private kernel module."
 )]
 
-use std::sync::{Arc, Weak};
+#[cfg(test)]
+use std::sync::Arc;
 
 use super::{
     ActivationContract, BF16, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0, Q5_1,
@@ -91,7 +92,7 @@ struct PreparedBatch {
     columns: usize,
     pinned: bool,
     contract: ActivationContract,
-    tensors: [Option<Weak<[u8]>>; 4],
+    tensors: [Option<crate::model::WeakTensorBytes>; 4],
 }
 
 #[derive(Default)]
@@ -245,8 +246,9 @@ impl ProjectionTile {
                                             == current_contract
                                 })
                                 && prepared.tensors.iter().flatten().any(|weak| {
-                                    weak.upgrade()
-                                        .is_some_and(|data| Arc::ptr_eq(&data, &prev.data))
+                                    weak.upgrade().is_some_and(|data| {
+                                        crate::model::TensorBytes::ptr_eq(&data, &prev.data)
+                                    })
                                 })
                         })
                 });
@@ -702,13 +704,14 @@ impl ProjectionTile {
         {
             let mut prepared_tensors = [None, None, None, None];
             for (slot, sibling) in prepared_tensors.iter_mut().zip(tensors) {
-                *slot = Some(Arc::downgrade(&sibling.data));
+                *slot = Some(crate::model::TensorBytes::downgrade(&sibling.data));
             }
             if reused_batch
                 && tensors.len() < prepared_tensors.len()
                 && let Some(prev) = previous
             {
-                prepared_tensors[tensors.len()] = Some(Arc::downgrade(&prev.data));
+                prepared_tensors[tensors.len()] =
+                    Some(crate::model::TensorBytes::downgrade(&prev.data));
             }
             self.last_preparation = Some(PreparedBatch {
                 tokens: inputs.len(),
@@ -753,7 +756,7 @@ mod tests {
                     name: "parallel-packed-tile".into(),
                     dimensions: vec![columns, 7],
                     kind,
-                    data: Arc::from(block.repeat(columns / 128 * 7)),
+                    data: Arc::<[u8]>::from(block.repeat(columns / 128 * 7)).into(),
                 };
                 for count in [8, 16, 32] {
                     let inputs: Vec<Vec<f32>> = (0..count)
@@ -804,7 +807,7 @@ mod tests {
                             let offset =
                                 bad.len() - block.len() + if kind == PTQ1 { 26 } else { 0 };
                             bad[offset..offset + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
-                            tensor.data = Arc::from(bad);
+                            tensor.data = Arc::<[u8]>::from(bad).into();
                             assert!(
                                 tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))
                                     .is_err()
@@ -836,7 +839,7 @@ mod tests {
                 name: "tile-packed-reference".into(),
                 dimensions: vec![columns, 3],
                 kind,
-                data: Arc::from(encoded.repeat(columns / 128 * 3)),
+                data: Arc::<[u8]>::from(encoded.repeat(columns / 128 * 3)).into(),
             };
             for count in [1, 8, 16, 32] {
                 let inputs: Vec<Vec<f32>> = (0..count)
@@ -890,7 +893,7 @@ mod tests {
             name: "reject".into(),
             dimensions: vec![128, 2],
             kind: 142,
-            data: Arc::from([0_u8; 68]),
+            data: Arc::<[u8]>::from([0_u8; 68]).into(),
         };
         let mut scratch = ProjectionTile::default();
         for count in [0, 8, 33] {
@@ -927,7 +930,7 @@ mod tests {
                     name: "late-tile-error".into(),
                     dimensions: vec![256, 2],
                     kind,
-                    data: Arc::from(block.repeat(4)),
+                    data: Arc::<[u8]>::from(block.repeat(4)).into(),
                 };
                 let inputs = vec![vec![1.5; 256]; 8];
                 let mut output = vec![vec![1.0]; 8];
@@ -952,7 +955,7 @@ mod tests {
                 let mut bad = tensor.data.to_vec();
                 let offset = block.len() * 3 + if kind == PTQ1 { 26 } else { 0 };
                 bad[offset..offset + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
-                tensor.data = Arc::from(bad);
+                tensor.data = Arc::<[u8]>::from(bad).into();
                 assert!(
                     tile.project(&tensor, &inputs, &mut output, false, &|| Ok(()))
                         .is_err()
@@ -996,7 +999,7 @@ mod tests {
                 name: "tile-four-row-gemm".into(),
                 dimensions: vec![columns, rows],
                 kind,
-                data: Arc::from(data),
+                data: Arc::<[u8]>::from(data).into(),
             };
             for count in [1, 4, 8, 16, 32] {
                 let inputs: Vec<Vec<f32>> = (0..count)
@@ -1082,7 +1085,7 @@ mod tests {
             let offset = (2 * blocks_per_row) * block_bytes + if kind == PTQ1 { 26 } else { 0 };
             bad[offset..offset + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
             let bad_tensor = Tensor {
-                data: Arc::from(bad),
+                data: Arc::<[u8]>::from(bad).into(),
                 ..tensor
             };
             let mut bad_tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
@@ -1112,7 +1115,7 @@ mod tests {
             name: "tile-bf16-gemm".into(),
             dimensions: vec![columns, rows],
             kind: BF16,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         };
         let inputs: Vec<Vec<f32>> = (0..8)
             .map(|token| {
@@ -1196,7 +1199,7 @@ mod tests {
                 name: format!("tile-quant-{kind}"),
                 dimensions: vec![columns, rows],
                 kind,
-                data: Arc::from(data),
+                data: Arc::<[u8]>::from(data).into(),
             };
             let expected: Vec<Vec<u32>> = inputs
                 .iter()
@@ -1272,7 +1275,7 @@ mod tests {
                 name: name.to_owned(),
                 dimensions: vec![columns, rows],
                 kind: PQ2,
-                data: Arc::from(data),
+                data: Arc::<[u8]>::from(data).into(),
             }
         };
         let t0 = make_pq2("t0", 0x1b);

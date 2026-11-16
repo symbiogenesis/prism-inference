@@ -81,7 +81,7 @@ fn weight(name: &str) -> Tensor {
         name: name.into(),
         dimensions: vec![128, 128],
         kind: 142,
-        data: Arc::from(block.repeat(128)),
+        data: Arc::<[u8]>::from(block.repeat(128)).into(),
     }
 }
 

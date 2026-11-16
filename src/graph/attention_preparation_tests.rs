@@ -41,7 +41,7 @@ impl Fixture {
             name: "unused-preparation-control".into(),
             dimensions: vec![256, 256],
             kind: 0,
-            data: Arc::from([]),
+            data: Arc::<[u8]>::from([]).into(),
         };
         let layer = FullAttention {
             query: unused.clone(),

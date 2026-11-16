@@ -1,5 +1,7 @@
 //! Independent identity and capacity controls for the resident lookup index.
 
+use std::sync::Arc;
+
 use super::*;
 
 fn tensor(columns: usize, rows: usize, data: Arc<[u8]>) -> Tensor {
@@ -7,7 +9,7 @@ fn tensor(columns: usize, rows: usize, data: Arc<[u8]>) -> Tensor {
         name: "resident-index-control".into(),
         dimensions: vec![columns, rows],
         kind: 142,
-        data,
+        data: data.into(),
     }
 }
 
@@ -38,7 +40,7 @@ fn resident_cache_index_matches_linear_identity_and_preserves_append_order() -> 
         assert_eq!(cache.commit(selected, expected * 3), expected);
         for control in &tensors[..=expected] {
             let oracle = cache.projections.iter().position(|projection| {
-                Arc::ptr_eq(&projection.source, &control.data)
+                TensorBytes::ptr_eq(&projection.source, &control.data)
                     && control.dimensions == [projection.columns, projection.rows]
             });
             assert_eq!(cache.find(control), oracle);
@@ -51,7 +53,7 @@ fn resident_cache_index_matches_linear_identity_and_preserves_append_order() -> 
         renamed.name.push_str("-renamed");
         assert_eq!(cache.find(&renamed), Some(index));
         let mut copied = selected.clone();
-        copied.data = Arc::from(selected.data.to_vec());
+        copied.data = Arc::<[u8]>::from(selected.data.to_vec()).into();
         assert_eq!(cache.find(&copied), None);
         let mut malformed = selected.clone();
         malformed.kind = 143;

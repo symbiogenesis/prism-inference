@@ -552,7 +552,7 @@ impl CpuBackend {
                     name: info.name.clone(),
                     kind: info.kind as u32,
                     dimensions: vec![info.shape[0]],
-                    data: std::sync::Arc::from(packed),
+                    data: crate::model::TensorBytes::from(packed),
                 };
                 values.extend(crate::kernels::row(&packed, 0)?);
                 continue;
@@ -668,7 +668,7 @@ impl CpuBackend {
             name: info.name.clone(),
             kind: u32::try_from(info.kind)?,
             dimensions: vec![info.shape[0], info.shape[1]],
-            data: std::sync::Arc::from(packed),
+            data: crate::model::TensorBytes::from(packed),
         })
     }
 

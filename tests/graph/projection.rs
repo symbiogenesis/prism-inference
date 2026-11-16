@@ -424,7 +424,7 @@ fn sibling_graph_weight(name: &str, rows: usize) -> Tensor {
         name: name.to_owned(),
         dimensions: vec![256, rows],
         kind: 142,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -448,13 +448,13 @@ fn sibling_graph_fixture(recurrent: bool) -> Result<Model> {
                     .iter()
                     .flat_map(|row| row.repeat(128))
                     .collect();
-                tensor.data = Arc::from(data);
+                tensor.data = Arc::<[u8]>::from(data).into();
             }
             "output_norm.weight"
             | "blk.0.attn_norm.weight"
             | "blk.0.post_attention_norm.weight" => {
                 tensor.dimensions[0] = 256;
-                tensor.data = Arc::from(tensor.data.repeat(128));
+                tensor.data = Arc::<[u8]>::from(tensor.data.repeat(128)).into();
             }
             "blk.0.ffn_up.weight"
             | "blk.0.ffn_gate.weight"
@@ -467,11 +467,11 @@ fn sibling_graph_fixture(recurrent: bool) -> Result<Model> {
             }
             "blk.0.ffn_down.weight" | "blk.0.attn_output.weight" | "blk.0.ssm_out.weight" => {
                 tensor.dimensions[1] = 256;
-                tensor.data = Arc::from(tensor.data.repeat(128));
+                tensor.data = Arc::<[u8]>::from(tensor.data.repeat(128)).into();
             }
             "blk.0.ssm_beta.weight" | "blk.0.ssm_alpha.weight" => {
                 tensor.dimensions[0] = 256;
-                tensor.data = Arc::from(vec![0; 256 * 4]);
+                tensor.data = Arc::<[u8]>::from(vec![0; 256 * 4]).into();
             }
             _ => {}
         }
@@ -554,7 +554,7 @@ fn q8_sibling_projection_preserves_complete_state_and_targeted_adapters() -> Res
                         data.extend_from_slice(&bonsai_ternary::pack_ptq(block)?);
                     }
                     tensor.kind = 143;
-                    tensor.data = Arc::from(data);
+                    tensor.data = Arc::<[u8]>::from(data).into();
                 }
                 let projection = if recurrent {
                     "blk.0.attn_qkv.weight"

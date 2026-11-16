@@ -16,7 +16,7 @@ fn placeholder() -> Tensor {
         name: "unused-direct-recurrent-projection".to_owned(),
         dimensions: vec![1, 1],
         kind: 0,
-        data: Arc::from(0.0_f32.to_le_bytes()),
+        data: Arc::<[u8]>::from(0.0_f32.to_le_bytes()).into(),
     }
 }
 

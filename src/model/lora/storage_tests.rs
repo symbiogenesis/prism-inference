@@ -15,7 +15,7 @@ fn tensor(name: &str, dimensions: &[usize], values: &[f32]) -> Tensor {
         name: name.into(),
         dimensions: dimensions.to_vec(),
         kind: 0,
-        data: Arc::from(
+        data: crate::model::TensorBytes::from(
             values
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
@@ -63,7 +63,7 @@ fn fixture() -> (Model, Model) {
                 name: b_name,
                 dimensions: vec![1, 2],
                 kind: 0,
-                data: Arc::clone(&shared_b),
+                data: shared_b.clone(),
             },
         );
     }
@@ -77,12 +77,12 @@ fn rank_one_storage_releases_linear_raw_a_and_preserves_decoded_b_sharing() -> R
         source
             .tensors
             .get(&format!("{target}.lora_a"))
-            .map(|tensor| Arc::downgrade(&tensor.data))
+            .map(|tensor| crate::model::TensorBytes::downgrade(&tensor.data))
     });
     let embedding_a = source
         .tensors
         .get("token_embd.weight.lora_a")
-        .map(|tensor| Arc::downgrade(&tensor.data))
+        .map(|tensor| crate::model::TensorBytes::downgrade(&tensor.data))
         .ok_or("missing embedding fixture")?;
     let adapter = RankOneAdapter::from_model(source, &base)?;
     for weak in linear_a {

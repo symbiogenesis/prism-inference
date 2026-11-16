@@ -34,11 +34,12 @@ fn tensor(name: &str, width: usize, shift: usize) -> Tensor {
         name: name.into(),
         dimensions: vec![width, width],
         kind: 0,
-        data: Arc::from(
+        data: Arc::<[u8]>::from(
             (0..width * width)
                 .flat_map(|index| pattern[(index + shift) % pattern.len()].to_le_bytes())
                 .collect::<Vec<_>>(),
-        ),
+        )
+        .into(),
     }
 }
 

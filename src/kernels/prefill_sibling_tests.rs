@@ -7,7 +7,7 @@ fn tensor(columns: usize, rows: usize, symbol: u8) -> Tensor {
         name: format!("sibling-{rows}"),
         dimensions: vec![columns, rows],
         kind: PQ2,
-        data: Arc::from(block.repeat(columns / 128 * rows)),
+        data: Arc::<[u8]>::from(block.repeat(columns / 128 * rows)).into(),
     }
 }
 
@@ -19,7 +19,7 @@ fn q8_tensor(kind: u32, columns: usize, rows: usize, symbol: u8) -> Result<Tenso
             data.extend_from_slice(&bonsai_ternary::pack_ptq(block)?);
         }
         tensor.kind = PTQ1;
-        tensor.data = Arc::from(data);
+        tensor.data = Arc::<[u8]>::from(data).into();
     }
     Ok(tensor)
 }
@@ -39,7 +39,7 @@ fn bf16_tensor(columns: usize, rows: usize) -> Tensor {
         name: format!("bf16-sibling-{rows}"),
         dimensions: vec![columns, rows],
         kind: BF16,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -107,7 +107,7 @@ fn tiled_bf16_siblings_match_scalar_reuse_and_clear_late_failure() -> Result<()>
                 let mut data = failing.data.to_vec();
                 let end = data.len();
                 data[end - 2..].copy_from_slice(&0x7f80_u16.to_le_bytes());
-                failing.data = Arc::from(data);
+                failing.data = Arc::<[u8]>::from(data).into();
                 let [a, b, c] = &mut outputs;
                 assert!(
                     tile.project_siblings_with_previous(
@@ -214,7 +214,7 @@ fn x1_tiled_cpu_siblings_match_independent_matvec_and_clear_late_failure() -> Re
                 let mut data = failing.data.to_vec();
                 let last_scale = data.len() - 34;
                 data[last_scale..last_scale + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
-                failing.data = Arc::from(data);
+                failing.data = Arc::<[u8]>::from(data).into();
                 let [a, b, c] = &mut outputs;
                 assert!(
                     tile.project_siblings_with_previous(
@@ -343,7 +343,7 @@ fn tiled_q8_siblings_preserve_pinned_lanes_reuse_and_failure_atomicity() -> Resu
                         data.len() - 34
                     };
                     data[scale..scale + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
-                    failing.data = Arc::from(data);
+                    failing.data = Arc::<[u8]>::from(data).into();
                     let [a, b, c] = &mut outputs;
                     assert!(
                         tile.project_siblings_with_previous(

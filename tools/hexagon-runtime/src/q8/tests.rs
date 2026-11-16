@@ -82,7 +82,7 @@ fn fixture(kind: u32, columns: usize, rows: usize) -> Tensor {
         name: "q8-hmx-control".into(),
         dimensions: vec![columns, rows],
         kind,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -140,7 +140,7 @@ fn q8_hmx_matches_independent_pinned_native_dotprod_capture() -> Result<()> {
             name: "retained-native-dotprod".into(),
             dimensions: vec![columns, 1],
             kind: PTQ1,
-            data: Arc::from(take(&mut capture, columns / 128 * 28)?),
+            data: Arc::<[u8]>::from(take(&mut capture, columns / 128 * 28)?).into(),
         };
         let activation = take(&mut capture, columns / 32 * 34)?
             .as_chunks::<34>()

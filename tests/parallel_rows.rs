@@ -56,7 +56,7 @@ mod enabled {
             name: "parallel-control".into(),
             dimensions: vec![columns, rows],
             kind,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         })
     }
 
@@ -85,7 +85,7 @@ mod enabled {
                 (142, 384, 11),
             ] {
                 let tensor = packed(kind, width, rows)?;
-                let owner = Arc::clone(&tensor.data);
+                let owner = tensor.data.clone();
                 let input: Vec<_> = (0..width)
                     .map(|index| [0.0, -0.0, 1.5, -2.5, 63.5, -127.0][index % 6])
                     .collect();
@@ -105,8 +105,14 @@ mod enabled {
                 assert_eq!(parallel.row_workers(), 3);
                 assert_eq!(parallel.statistics().parallel_row_operations, 2);
                 assert_eq!(parallel.selected_backend(), serial.selected_backend());
-                assert!(Arc::ptr_eq(&owner, &tensor.data));
-                assert_eq!(Arc::strong_count(&tensor.data), 2);
+                assert!(bonsai_prism_runtime::model::TensorBytes::ptr_eq(
+                    &owner,
+                    &tensor.data
+                ));
+                assert_eq!(
+                    bonsai_prism_runtime::model::TensorBytes::strong_count(&tensor.data),
+                    2
+                );
             }
         }
         Ok(())
@@ -122,7 +128,7 @@ mod enabled {
         let mut malformed = tensor.clone();
         let mut data = malformed.data.to_vec();
         data[5 * 28 + 24] = 255;
-        malformed.data = Arc::from(data.clone());
+        malformed.data = Arc::<[u8]>::from(data.clone()).into();
         // Native PTQ aliases are decodable; only the lossless wire exporter
         // requires canonical bytes. Scheduling preserves their current meaning.
         let mut alias_reference = Vec::new();
@@ -135,7 +141,7 @@ mod enabled {
         matvec_into(&malformed, &input, &mut output, &mut parallel)?;
         assert_bits(&output, &alias_reference);
         data[5 * 28 + 26..5 * 28 + 28].copy_from_slice(&0x7c00_u16.to_le_bytes());
-        malformed.data = Arc::from(data);
+        malformed.data = Arc::<[u8]>::from(data).into();
         assert!(matvec_into(&malformed, &input, &mut output, &mut parallel).is_err());
         assert_eq!(output, Vec::<f32>::new());
         assert!(!parallel.diagnostics().succeeded);
@@ -144,11 +150,11 @@ mod enabled {
         let mut invalid_scale = packed(142, 256, 9)?;
         let mut bytes = invalid_scale.data.to_vec();
         bytes[8 * 68..8 * 68 + 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
-        invalid_scale.data = Arc::from(bytes);
+        invalid_scale.data = Arc::<[u8]>::from(bytes).into();
         assert!(matvec_into(&invalid_scale, &[0.75; 256], &mut output, &mut parallel).is_err());
         assert_eq!(output, Vec::<f32>::new());
         let mut truncated = tensor.clone();
-        truncated.data = Arc::from(&tensor.data[..tensor.data.len() - 1]);
+        truncated.data = Arc::<[u8]>::from(&tensor.data[..tensor.data.len() - 1]).into();
         assert!(matvec_into(&truncated, &input, &mut output, &mut parallel).is_err());
         assert_eq!(output, Vec::<f32>::new());
         let dispatched = parallel.statistics().parallel_row_operations;
@@ -156,12 +162,13 @@ mod enabled {
             name: "floating-fallback".into(),
             dimensions: vec![2, 2],
             kind: 0,
-            data: Arc::from(
+            data: Arc::<[u8]>::from(
                 [1.0_f32, -0.0, -0.25, 0.75]
                     .into_iter()
                     .flat_map(f32::to_le_bytes)
                     .collect::<Vec<_>>(),
-            ),
+            )
+            .into(),
         };
         let mut expected = Vec::new();
         matvec_into(
@@ -203,7 +210,7 @@ mod enabled {
                 name: format!("parallel-quant-{kind}"),
                 dimensions: vec![width, rows],
                 kind,
-                data: Arc::from(data),
+                data: Arc::<[u8]>::from(data).into(),
             };
             for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
                 let mut serial = MatvecScratch::with_backend(backend);

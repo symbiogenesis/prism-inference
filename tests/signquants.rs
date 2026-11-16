@@ -31,7 +31,7 @@ fn tensor(kind: u32, count: usize, bytes: Vec<u8>) -> Tensor {
         name: "sign-quant".to_owned(),
         kind,
         dimensions: vec![count],
-        data: Arc::from(bytes),
+        data: Arc::<[u8]>::from(bytes).into(),
     }
 }
 
@@ -94,7 +94,7 @@ fn native_reference_encoders_decoders_dots_and_matvec_agree() -> Result<()> {
         // Multiple rows and shared preparation retain the same Q8_0 contract.
         let pair = Tensor {
             dimensions: vec![256, 2],
-            data: Arc::from([packed.as_slice(), packed.as_slice()].concat()),
+            data: Arc::<[u8]>::from([packed.as_slice(), packed.as_slice()].concat()).into(),
             ..weights
         };
         let mut scratch = kernels::MatvecScratch::default();

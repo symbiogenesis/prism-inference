@@ -445,7 +445,7 @@ mod tests {
             name: name.to_owned(),
             dimensions: vec![128, 128],
             kind: 142,
-            data: Arc::from([]),
+            data: Arc::<[u8]>::from([]).into(),
         }
     }
 

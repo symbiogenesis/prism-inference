@@ -1,13 +1,169 @@
 //! Verified, bounded GGUF storage for the native Rust runtime.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
-use bonsai_gguf::{Metadata, PRISM_DIALECT, VerifiedModel};
+use bonsai_gguf::{MappedSlice, Metadata, PRISM_DIALECT, VerifiedModel, WeakMappedSlice};
 use bonsai_prism::{Layout, Pool};
 
-use crate::{Result, invalid};
+use crate::{Error, Result, invalid};
+
+/// Immutable shareable byte storage for loaded model tensors.
+///
+/// Supports either heap-allocated `Arc<[u8]>` buffers or zero-copy slices backed
+/// by a verified read-only file mapping.
+#[derive(Clone, Debug)]
+pub enum TensorBytes {
+    /// Heap-allocated immutable bytes.
+    Shared(Arc<[u8]>),
+    /// Zero-copy slice into a verified read-only memory mapping.
+    Mapped(MappedSlice),
+}
+
+/// Weak non-owning reference to [`TensorBytes`].
+#[derive(Clone, Debug)]
+pub enum WeakTensorBytes {
+    /// Weak reference to heap-allocated tensor bytes.
+    Shared(Weak<[u8]>),
+    /// Weak reference to a mapped tensor slice.
+    Mapped(WeakMappedSlice),
+}
+
+impl TensorBytes {
+    /// Returns `true` when `this` and `other` point to the same underlying bytes.
+    #[must_use]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        match (this, other) {
+            (Self::Shared(left), Self::Shared(right)) => Arc::ptr_eq(left, right),
+            (Self::Mapped(left), Self::Mapped(right)) => MappedSlice::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    /// Returns the strong reference count of `this`'s backing storage owner.
+    #[must_use]
+    pub fn strong_count(this: &Self) -> usize {
+        match this {
+            Self::Shared(arc) => Arc::strong_count(arc),
+            Self::Mapped(mapped) => MappedSlice::strong_count(mapped),
+        }
+    }
+
+    /// Creates a weak non-owning handle to `this`.
+    #[must_use]
+    pub fn downgrade(this: &Self) -> WeakTensorBytes {
+        match this {
+            Self::Shared(arc) => WeakTensorBytes::Shared(Arc::downgrade(arc)),
+            Self::Mapped(mapped) => WeakTensorBytes::Mapped(mapped.downgrade()),
+        }
+    }
+
+    /// Ensures mutable access by detaching any shared or mapped storage into a
+    /// uniquely owned mutable byte slice.
+    pub fn make_mut(this: &mut Self) -> &mut [u8] {
+        if let Self::Mapped(mapped) = this {
+            *this = Self::Shared(Arc::from(mapped.as_slice()));
+        }
+        match this {
+            Self::Shared(arc) => Arc::make_mut(arc),
+            Self::Mapped(_) => &mut [],
+        }
+    }
+
+    /// Returns `true` when these bytes are backed by a read-only file mapping.
+    #[must_use]
+    pub const fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped(_))
+    }
+}
+
+impl WeakTensorBytes {
+    /// Attempts to upgrade this weak handle back into [`TensorBytes`].
+    #[must_use]
+    pub fn upgrade(&self) -> Option<TensorBytes> {
+        match self {
+            Self::Shared(weak) => weak.upgrade().map(TensorBytes::Shared),
+            Self::Mapped(weak) => weak.upgrade().map(TensorBytes::Mapped),
+        }
+    }
+}
+
+impl Default for TensorBytes {
+    fn default() -> Self {
+        Self::Shared(Arc::from([]))
+    }
+}
+
+impl Deref for TensorBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Shared(arc) => arc,
+            Self::Mapped(mapped) => mapped.as_slice(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for TensorBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl Borrow<[u8]> for TensorBytes {
+    fn borrow(&self) -> &[u8] {
+        self
+    }
+}
+
+impl PartialEq for TensorBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for TensorBytes {}
+
+impl From<Arc<[u8]>> for TensorBytes {
+    fn from(value: Arc<[u8]>) -> Self {
+        Self::Shared(value)
+    }
+}
+
+impl From<Vec<u8>> for TensorBytes {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Shared(Arc::from(value))
+    }
+}
+
+impl From<&[u8]> for TensorBytes {
+    fn from(value: &[u8]) -> Self {
+        Self::Shared(Arc::from(value))
+    }
+}
+
+impl From<Box<[u8]>> for TensorBytes {
+    fn from(value: Box<[u8]>) -> Self {
+        Self::Shared(Arc::from(value))
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for TensorBytes {
+    fn from(value: [u8; N]) -> Self {
+        Self::Shared(Arc::from(value))
+    }
+}
+
+impl From<MappedSlice> for TensorBytes {
+    fn from(value: MappedSlice) -> Self {
+        Self::Mapped(value)
+    }
+}
 
 /// An immutable serialized tensor in GGUF/ggml dimension order.
 #[derive(Clone, Debug)]
@@ -19,7 +175,7 @@ pub struct Tensor {
     /// Validated GGUF encoding ID.
     pub kind: u32,
     /// Exact serialized bytes, shareable without mutable aliases.
-    pub data: Arc<[u8]>,
+    pub data: TensorBytes,
 }
 
 /// A verified GGUF model with exact metadata and immutable tensor storage.
@@ -181,6 +337,15 @@ impl Model {
                 "model tensor payloads exceed remaining memory budget",
             ));
         }
+        if reader.is_mapped() {
+            return Self::load_verified_mapped(
+                reader,
+                expected_sha256,
+                remaining,
+                required,
+                progress,
+            );
+        }
         let mut tensors = BTreeMap::new();
         let mut completed = 0_usize;
         let mut staging = Vec::new();
@@ -201,7 +366,7 @@ impl Model {
             validate_payload(kind, &staging[..len])?;
             remaining -= len;
             completed += len;
-            let data = Arc::<[u8]>::from(&staging[..len]);
+            let data = TensorBytes::from(&staging[..len]);
             tensors.insert(
                 name.clone(),
                 Tensor {
@@ -223,6 +388,114 @@ impl Model {
         })
     }
 
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "The pinned loader reports byte-weighted progress as binary32."
+    )]
+    fn load_verified_mapped(
+        reader: VerifiedModel,
+        expected_sha256: &str,
+        mut remaining: usize,
+        required: usize,
+        progress: &mut impl FnMut(f32) -> Result<bool>,
+    ) -> Result<Self> {
+        const VALIDATION_BATCH_BYTES: usize = 64 * 1024 * 1024;
+        const PARALLEL_THRESHOLD_BYTES: usize = 512 * 1024;
+        const LARGE_TENSOR_SPLIT_BYTES: usize = 16 * 1024 * 1024;
+
+        let count = reader.tensors().len();
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count)?;
+        for index in 0..count {
+            let descriptor = &reader.tensors()[index];
+            let name = descriptor.name.clone();
+            let dimensions = descriptor
+                .dimensions
+                .iter()
+                .map(|value| usize::try_from(*value))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let kind = descriptor.type_id;
+            let Some(slice) = reader.mapped_tensor(index, remaining)? else {
+                return Err(invalid("expected mapped tensor slice"));
+            };
+            remaining -= slice.len();
+            entries.push((name, dimensions, kind, slice));
+        }
+
+        if !progress(0.0)? {
+            return Err(invalid("model loading cancelled"));
+        }
+
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .clamp(1, 8);
+
+        let mut completed = 0_usize;
+        let mut start = 0_usize;
+        while start < entries.len() {
+            let mut end = start;
+            let mut batch_bytes = 0_usize;
+            while end < entries.len() {
+                let len = entries[end].3.len();
+                if end > start && batch_bytes.saturating_add(len) > VALIDATION_BATCH_BYTES {
+                    break;
+                }
+                batch_bytes = batch_bytes.saturating_add(len);
+                end += 1;
+                if batch_bytes >= VALIDATION_BATCH_BYTES {
+                    break;
+                }
+            }
+
+            if end - start == 1 && workers > 1 && entries[start].3.len() >= LARGE_TENSOR_SPLIT_BYTES
+            {
+                validate_payload_parallel(entries[start].2, entries[start].3.as_slice(), workers)?;
+            } else if workers == 1 || end - start == 1 || batch_bytes < PARALLEL_THRESHOLD_BYTES {
+                for (_, _, kind, slice) in &entries[start..end] {
+                    validate_payload(*kind, slice.as_slice())?;
+                }
+            } else {
+                validate_mapped_batch_parallel(&entries[start..end], workers)?;
+            }
+
+            completed = completed.saturating_add(batch_bytes);
+            if end < entries.len() {
+                let fraction = if required == 0 {
+                    0.0
+                } else {
+                    completed as f32 / required as f32
+                };
+                if !progress(fraction)? {
+                    return Err(invalid("model loading cancelled"));
+                }
+            }
+            start = end;
+        }
+
+        if !progress(1.0)? {
+            return Err(invalid("model loading cancelled"));
+        }
+
+        let mut tensors = BTreeMap::new();
+        for (name, dimensions, kind, slice) in entries {
+            tensors.insert(
+                name.clone(),
+                Tensor {
+                    name,
+                    dimensions,
+                    kind,
+                    data: TensorBytes::Mapped(slice),
+                },
+            );
+        }
+        Ok(Self {
+            metadata: reader.into_metadata(),
+            tensors,
+            identity: expected_sha256.to_ascii_lowercase(),
+        })
+    }
+
     /// Shares identical immutable F32 rank-one `LoRA` B tensors within a model.
     ///
     /// Only names ending in `.lora_b` or `.lora_b.weight` enter the existing
@@ -232,7 +505,7 @@ impl Model {
     /// Returns the number of tensors whose payload allocation was shared.
     pub fn share_lora_b(&mut self) -> usize {
         let mut pool = Pool::new();
-        let mut owners: Vec<Arc<[u8]>> = Vec::new();
+        let mut owners: Vec<TensorBytes> = Vec::new();
         for tensor in self.tensors.values_mut() {
             if tensor.kind != 0
                 || !(tensor.name.ends_with(".lora_b") || tensor.name.ends_with(".lora_b.weight"))
@@ -244,10 +517,10 @@ impl Model {
             };
             if let Some(owner) = pool.find(&layout, &tensor.data) {
                 if let Some(storage) = owners.get(owner - 1) {
-                    tensor.data = Arc::clone(storage);
+                    tensor.data = TensorBytes::clone(storage);
                 }
             } else if pool.remember(&layout, &tensor.data, owners.len() + 1) {
-                owners.push(Arc::clone(&tensor.data));
+                owners.push(TensorBytes::clone(&tensor.data));
             }
         }
         pool.shared_tensors()
@@ -280,6 +553,101 @@ fn lora_layout(tensor: &Tensor) -> Option<Layout> {
     (layout.eligible()
         && strides[3].checked_mul(usize::try_from(dimensions[3]).ok()?)? == tensor.data.len())
     .then_some(layout)
+}
+
+fn payload_block_bytes(kind: u32) -> Result<usize> {
+    match kind {
+        0 => Ok(4),
+        1 | 30 => Ok(2),
+        2 => Ok(18),
+        8 | 142 => Ok(34),
+        143 => Ok(28),
+        _ if owned::supported_kind(kind) => {
+            let (_, width) = gguf_context::tensor_layout(kind)
+                .ok_or_else(|| invalid("unsupported executable tensor encoding"))?;
+            Ok(usize::try_from(width)?)
+        }
+        _ => Err(invalid("unsupported executable tensor encoding")),
+    }
+}
+
+fn validate_payload_parallel(kind: u32, bytes: &[u8], workers: usize) -> Result<()> {
+    let block_bytes = payload_block_bytes(kind)?;
+    if !bytes.len().is_multiple_of(block_bytes) {
+        return validate_payload(kind, bytes);
+    }
+    let total_blocks = bytes.len() / block_bytes;
+    let active = workers.min(total_blocks);
+    if active <= 1 {
+        return validate_payload(kind, bytes);
+    }
+    let mut results: Vec<Result<()>> = std::iter::repeat_with(|| Ok(())).take(active).collect();
+    std::thread::scope(|scope| {
+        for (worker, slot) in results.iter_mut().enumerate() {
+            let start_block = worker * total_blocks / active;
+            let end_block = (worker + 1) * total_blocks / active;
+            let chunk = &bytes[start_block * block_bytes..end_block * block_bytes];
+            scope.spawn(move || {
+                *slot = validate_payload(kind, chunk);
+            });
+        }
+    });
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+fn validate_mapped_batch_parallel(
+    entries: &[(String, Vec<usize>, u32, MappedSlice)],
+    workers: usize,
+) -> Result<()> {
+    let active = workers.min(entries.len());
+    if active <= 1 {
+        for (_, _, kind, slice) in entries {
+            validate_payload(*kind, slice.as_slice())?;
+        }
+        return Ok(());
+    }
+    let next = AtomicUsize::new(0);
+    let mut failures: Vec<Option<(usize, Error)>> = (0..active).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        for failure in &mut failures {
+            let next_ref = &next;
+            scope.spawn(move || {
+                let mut earliest: Option<(usize, Error)> = None;
+                loop {
+                    let index = next_ref.fetch_add(1, Ordering::Relaxed);
+                    if index >= entries.len() {
+                        break;
+                    }
+                    let (_, _, kind, slice) = &entries[index];
+                    if let Err(err) = validate_payload(*kind, slice.as_slice()) {
+                        let replace = earliest
+                            .as_ref()
+                            .is_none_or(|(best_idx, _)| index < *best_idx);
+                        if replace {
+                            earliest = Some((index, err));
+                        }
+                    }
+                }
+                *failure = earliest;
+            });
+        }
+    });
+    let mut best: Option<(usize, Error)> = None;
+    for candidate in failures.into_iter().flatten() {
+        let replace = best
+            .as_ref()
+            .is_none_or(|(best_idx, _)| candidate.0 < *best_idx);
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    if let Some((_, err)) = best {
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn validate_block_scale<const N: usize>(bytes: &[u8], scale_offset: usize) -> Result<()> {
@@ -383,7 +751,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     static NEXT_TEST_GGUF: AtomicU64 = AtomicU64::new(0);
 
@@ -518,8 +886,111 @@ mod tests {
         assert_eq!(&*model.tensors["a.q4"].data, &q4);
         assert_eq!(&*model.tensors["b.q8"].data, &q8_large);
         assert_eq!(&*model.tensors["c.f32"].data, &f32_small);
+        assert!(!model.tensors["a.q4"].data.is_mapped());
         assert_eq!(progress_steps.len(), 4);
         assert_eq!(progress_steps.last().copied(), Some(1.0));
+        Ok(())
+    }
+
+    #[test]
+    fn load_verified_mapped_model_validates_in_parallel_and_drops_lock() -> Result<()> {
+        let mut pq2_block = [0x5a_u8; 34];
+        pq2_block[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let pq2_rows = 4_096_usize;
+        let pq2_data = pq2_block.repeat((4_096 / 128) * pq2_rows);
+
+        let mut q8_block = [0x01_u8; 34];
+        q8_block[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let q8_rows = 512_usize;
+        let q8_data = q8_block.repeat((4_096 / 32) * q8_rows);
+
+        let mut q4_block = [0x12_u8; 18];
+        q4_block[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let q4_rows = 256_usize;
+        let q4_data = q4_block.repeat((4_096 / 32) * q4_rows);
+
+        let fixture = TempGguf::create(&[
+            ("a.pq2", &[4_096, u64::try_from(pq2_rows)?], 142, &pq2_data),
+            ("b.q8", &[4_096, u64::try_from(q8_rows)?], 8, &q8_data),
+            ("c.q4", &[4_096, u64::try_from(q4_rows)?], 2, &q4_data),
+        ])?;
+        assert!(fixture.bytes.len() >= 4 * 1024 * 1024);
+        let sha = fixture.sha256_hex()?;
+        let budget = fixture.bytes.len() + 1024 * 1024;
+
+        let mut progress_steps = Vec::new();
+        {
+            let reader = VerifiedModel::open(
+                &fixture.path,
+                PRISM_DIALECT,
+                u64::try_from(fixture.bytes.len())?,
+                &sha,
+                budget,
+            )?;
+            assert_eq!(reader.is_mapped(), cfg!(windows));
+            let model = Model::load_verified(reader, &sha, budget, &mut |fraction| {
+                progress_steps.push(fraction);
+                Ok(true)
+            })?;
+            assert_eq!(model.tensors["a.pq2"].data.is_mapped(), cfg!(windows));
+            assert_eq!(model.tensors["a.pq2"].data.len(), pq2_data.len());
+            assert_eq!(&model.tensors["a.pq2"].data[..68], &pq2_data[..68]);
+            assert_eq!(&model.tensors["b.q8"].data[..68], &q8_data[..68]);
+            assert_eq!(&model.tensors["c.q4"].data[..36], &q4_data[..36]);
+            assert_eq!(progress_steps.first().copied(), Some(0.0));
+            assert_eq!(progress_steps.last().copied(), Some(1.0));
+            drop(model);
+        }
+
+        // Cancellation returns error before completion and releases mapping handles.
+        {
+            let reader = VerifiedModel::open(
+                &fixture.path,
+                PRISM_DIALECT,
+                u64::try_from(fixture.bytes.len())?,
+                &sha,
+                budget,
+            )?;
+            assert!(Model::load_verified(reader, &sha, budget, &mut |_| Ok(false)).is_err());
+        }
+
+        // Corrupt a late scale block in the mapped GGUF and verify deterministic rejection.
+        let mut corrupted_q4 = q4_data;
+        let last_block_start = corrupted_q4.len() - 18;
+        corrupted_q4[last_block_start..last_block_start + 2]
+            .copy_from_slice(&0x7c00_u16.to_le_bytes());
+        let bad_fixture = TempGguf::create(&[
+            ("a.pq2", &[4_096, u64::try_from(pq2_rows)?], 142, &pq2_data),
+            ("c.q4", &[4_096, u64::try_from(q4_rows)?], 2, &corrupted_q4),
+        ])?;
+        assert!(bad_fixture.bytes.len() >= 4 * 1024 * 1024);
+        let bad_sha = bad_fixture.sha256_hex()?;
+        {
+            let reader = VerifiedModel::open(
+                &bad_fixture.path,
+                PRISM_DIALECT,
+                u64::try_from(bad_fixture.bytes.len())?,
+                &bad_sha,
+                bad_fixture.bytes.len() + 1024 * 1024,
+            )?;
+            assert!(
+                Model::load_verified(
+                    reader,
+                    &bad_sha,
+                    bad_fixture.bytes.len() + 1024 * 1024,
+                    &mut |_| Ok(true)
+                )
+                .is_err()
+            );
+        }
+        validate_payload_parallel(142, &pq2_data, 8)?;
+        let mut bad_pq2 = pq2_data;
+        let bad_pq2_offset = bad_pq2.len() - 34;
+        bad_pq2[bad_pq2_offset..bad_pq2_offset + 2].copy_from_slice(&0x7e01_u16.to_le_bytes());
+        assert!(validate_payload_parallel(142, &bad_pq2, 8).is_err());
+
+        drop(bad_fixture);
+        drop(fixture);
         Ok(())
     }
 }

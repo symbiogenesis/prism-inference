@@ -49,12 +49,13 @@ fn weight(name: &str, dimensions: &[usize], values: &[f32]) -> Tensor {
         name: name.to_owned(),
         dimensions: dimensions.to_vec(),
         kind: 0,
-        data: Arc::from(
+        data: Arc::<[u8]>::from(
             values
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>(),
-        ),
+        )
+        .into(),
     }
 }
 
@@ -371,7 +372,7 @@ fn rank_one_admission_rejects_factor_schema_and_base_drift() -> Result<()> {
             }
             6 => {
                 factors.tensors.get_mut(name).ok_or("missing factor")?.data =
-                    Arc::from(f32::INFINITY.to_le_bytes());
+                    Arc::<[u8]>::from(f32::INFINITY.to_le_bytes()).into();
             }
             7 => {
                 factors.tensors.get_mut(name).ok_or("missing factor")?.name = "alias".into();
@@ -811,7 +812,7 @@ fn backend_fixture(recurrent: bool, kind: u32, width: usize) -> Result<Model> {
             name: name.to_owned(),
             dimensions: vec![width, 2],
             kind,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         },
     );
     Ok(model)
@@ -2165,7 +2166,8 @@ fn graph_admission_validates_every_used_and_unused_mtp_payload() -> Result<()> {
                 .tensors
                 .get_mut(name)
                 .ok_or_else(|| std::io::Error::other("fixture tensor missing"))?;
-            Arc::make_mut(&mut tensor.data)[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+            bonsai_prism_runtime::model::TensorBytes::make_mut(&mut tensor.data)[..4]
+                .copy_from_slice(&f32::NAN.to_le_bytes());
             assert!(Qwen35::new(invalid, 1).is_err(), "accepted {name}");
         }
         for name in ["nextn.unused", "blk.1.unused"] {

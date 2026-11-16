@@ -24,6 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "report")]
 use serde_json::Value;
 
+use bonsai_native_hash::mmap::MappedReadOnlyFile;
+pub use bonsai_native_hash::mmap::{MappedSlice, WeakMappedSlice};
 pub use inspect::TensorDescriptor;
 pub use metadata::{Metadata, MetadataArray, MetadataValue, MetadataValueRef};
 
@@ -39,6 +41,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(windows)]
 const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 const HASH_BUFFER_BYTES: usize = 1_048_576;
+const MIN_MAPPED_MODEL_BYTES: u64 = 4 * 1024 * 1024;
 
 pub(crate) fn bad(message: impl Into<String>) -> Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()).into()
@@ -99,7 +102,11 @@ pub(crate) fn hash_range(file: &mut File, start: u64, length: u64) -> Result<Str
     result
 }
 
-fn verify(file: &mut File, expected_bytes: u64, expected_sha256: &str) -> Result<()> {
+fn verify_maybe_mapped(
+    file: &mut File,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<Option<MappedReadOnlyFile>> {
     if expected_bytes == 0
         || expected_sha256.len() != 64
         || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -111,9 +118,23 @@ fn verify(file: &mut File, expected_bytes: u64, expected_sha256: &str) -> Result
     if file.metadata()?.len() != expected_bytes {
         return Err(bad("GGUF: artifact size mismatch."));
     }
+    if expected_bytes >= MIN_MAPPED_MODEL_BYTES
+        && let Some(mapped) = MappedReadOnlyFile::try_map(file, expected_bytes)?
+    {
+        let actual_hex = bytes_hex(mapped.sha256()?);
+        if !actual_hex.eq_ignore_ascii_case(expected_sha256) {
+            return Err(bad("GGUF: artifact SHA-256 mismatch."));
+        }
+        return Ok(Some(mapped));
+    }
     if !hash_range(file, 0, expected_bytes)?.eq_ignore_ascii_case(expected_sha256) {
         return Err(bad("GGUF: artifact SHA-256 mismatch."));
     }
+    Ok(None)
+}
+
+fn verify(file: &mut File, expected_bytes: u64, expected_sha256: &str) -> Result<()> {
+    let _ = verify_maybe_mapped(file, expected_bytes, expected_sha256)?;
     Ok(())
 }
 
@@ -149,6 +170,7 @@ pub fn read_vocabulary(
 /// On Windows the handle denies concurrent writes and deletion for its lifetime.
 pub struct VerifiedModel {
     file: File,
+    mapped: Option<MappedReadOnlyFile>,
     inspection: inspect::Inspection,
 }
 
@@ -167,9 +189,19 @@ impl VerifiedModel {
         memory_limit: usize,
     ) -> Result<Self> {
         let mut file = open_read(path)?;
-        verify(&mut file, expected_bytes, expected_sha256)?;
+        let mapped = verify_maybe_mapped(&mut file, expected_bytes, expected_sha256)?;
         let inspection = inspect::inspect_retained(&mut file, path, dialect, Some(memory_limit))?;
-        Ok(Self { file, inspection })
+        Ok(Self {
+            file,
+            mapped,
+            inspection,
+        })
+    }
+
+    /// Returns `true` when tensor payloads are backed by a read-only file mapping.
+    #[must_use]
+    pub const fn is_mapped(&self) -> bool {
+        self.mapped.is_some()
     }
 
     /// Returns exact retained scalar, tokenizer, array and template metadata.
@@ -246,6 +278,35 @@ impl VerifiedModel {
             return Err(error.into());
         }
         Ok(())
+    }
+
+    /// Returns a zero-copy mapped slice for `index` when backed by a read-only mapping.
+    ///
+    /// Returns `Ok(None)` when the model was opened without a file mapping.
+    ///
+    /// # Errors
+    /// Rejects missing tensors, payloads exceeding `max_bytes`, overflow, or
+    /// ranges outside the verified mapped file.
+    pub fn mapped_tensor(&self, index: usize, max_bytes: usize) -> Result<Option<MappedSlice>> {
+        let Some(mapped) = &self.mapped else {
+            return Ok(None);
+        };
+        let tensor = self
+            .inspection
+            .tensors
+            .get(index)
+            .ok_or_else(|| bad("GGUF: tensor index is out of bounds."))?;
+        let length = usize::try_from(tensor.bytes)?;
+        if length > max_bytes {
+            return Err(bad("GGUF: tensor payload exceeds remaining memory budget."));
+        }
+        let offset = self
+            .inspection
+            .data_offset
+            .checked_add(tensor.offset)
+            .ok_or_else(|| bad("GGUF: tensor payload offset overflow."))?;
+        let offset = usize::try_from(offset)?;
+        Ok(Some(mapped.slice(offset, length)?))
     }
 
     /// Consumes the verified reader and transfers its retained metadata.

@@ -18,7 +18,7 @@ fn packed(name: &str, rows: usize) -> Tensor {
         name: name.into(),
         dimensions: vec![256, rows],
         kind: 142,
-        data: Arc::from(block.repeat(2 * rows)),
+        data: Arc::<[u8]>::from(block.repeat(2 * rows)).into(),
     }
 }
 
@@ -28,7 +28,7 @@ fn factor(name: String, dimensions: Vec<usize>, value: f32) -> Tensor {
         name,
         dimensions,
         kind: 0,
-        data: Arc::from(value.to_le_bytes().repeat(count)),
+        data: Arc::<[u8]>::from(value.to_le_bytes().repeat(count)).into(),
     }
 }
 
@@ -117,14 +117,15 @@ impl Fixture {
         for tensor in self.tensors.iter_mut().chain([&mut self.prior]) {
             let elements = tensor.dimensions.iter().product::<usize>();
             tensor.kind = 30;
-            tensor.data = Arc::from(
+            tensor.data = Arc::<[u8]>::from(
                 [0x3f80_u16, 0xc000, 0x8000, 0x0080, 0x3eaa, 0x0001]
                     .into_iter()
                     .cycle()
                     .take(elements)
                     .flat_map(u16::to_le_bytes)
                     .collect::<Vec<_>>(),
-            );
+            )
+            .into();
         }
         self
     }
@@ -135,7 +136,8 @@ impl Fixture {
             let mut block = [[0x66, 0x19, 0x44, 0x99][index]; 34];
             block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
             tensor.kind = 143;
-            tensor.data = Arc::from(bonsai_ternary::pack_ptq(&block)?.repeat(2 * rows));
+            tensor.data =
+                Arc::<[u8]>::from(bonsai_ternary::pack_ptq(&block)?.repeat(2 * rows)).into();
         }
         Ok(self)
     }

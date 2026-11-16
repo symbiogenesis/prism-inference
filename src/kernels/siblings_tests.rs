@@ -12,7 +12,7 @@ fn weight(rows: usize) -> Tensor {
         name: "sibling-control".to_owned(),
         dimensions: vec![256, rows],
         kind: 142,
-        data: Arc::from(block.repeat(2 * rows)),
+        data: Arc::<[u8]>::from(block.repeat(2 * rows)).into(),
     }
 }
 
@@ -21,7 +21,7 @@ fn cpu_sibling_projection_rejects_late_geometry_and_recovers() -> Result<()> {
     let first = weight(17);
     let second = weight(5);
     let mut malformed = weight(9);
-    malformed.data = Arc::from(&malformed.data[..malformed.data.len() - 1]);
+    malformed.data = Arc::<[u8]>::from(&malformed.data[..malformed.data.len() - 1]).into();
     let input = [1.0; 256];
     let mut scratch = MatvecScratch::with_pinned_backend(MatvecBackend::Auto);
     #[cfg(feature = "parallel-rows")]
@@ -44,7 +44,7 @@ fn cpu_sibling_projection_rejects_late_geometry_and_recovers() -> Result<()> {
     let mut invalid_scale = weight(5);
     let mut bytes = invalid_scale.data.to_vec();
     bytes[..2].copy_from_slice(&0x7c00_u16.to_le_bytes());
-    invalid_scale.data = Arc::from(bytes);
+    invalid_scale.data = Arc::<[u8]>::from(bytes).into();
     let mut prepared = scratch.prepare(&first, &input)?;
     assert!(
         prepared
@@ -98,7 +98,7 @@ fn bf16_weight(rows: usize) -> Tensor {
         name: "bf16-sibling-control".to_owned(),
         dimensions: vec![256, rows],
         kind: 30,
-        data: Arc::from(bytes),
+        data: Arc::<[u8]>::from(bytes).into(),
     }
 }
 
@@ -107,7 +107,7 @@ fn bf16_siblings_reject_geometry_and_arithmetic_atomically_then_recover() -> Res
     let first = bf16_weight(17);
     let second = bf16_weight(5);
     let mut malformed = bf16_weight(9);
-    malformed.data = Arc::from(&malformed.data[..malformed.data.len() - 1]);
+    malformed.data = Arc::<[u8]>::from(&malformed.data[..malformed.data.len() - 1]).into();
     let input = [1.0; 256];
     let mut scratch = MatvecScratch::with_pinned_backend(MatvecBackend::Auto);
     #[cfg(feature = "parallel-rows")]
@@ -132,7 +132,7 @@ fn bf16_siblings_reject_geometry_and_arithmetic_atomically_then_recover() -> Res
     // Late row and column: every preceding output is still provisional.
     let end = bytes.len();
     bytes[end - 2..].copy_from_slice(&0x7f80_u16.to_le_bytes());
-    invalid_value.data = Arc::from(bytes);
+    invalid_value.data = Arc::<[u8]>::from(bytes).into();
     let mut prepared = scratch.prepare(&first, &input)?;
     assert!(
         prepared
@@ -165,7 +165,7 @@ fn varied_pq2_weight(columns: usize, rows: usize, seed: usize) -> Tensor {
         name: "pq2-sibling-varied".to_owned(),
         dimensions: vec![columns, rows],
         kind: super::super::PQ2,
-        data: Arc::from(data),
+        data: Arc::<[u8]>::from(data).into(),
     }
 }
 
@@ -229,7 +229,7 @@ fn pq2_siblings_sixteen_row_batching_matches_scalar_and_clears_atomically() -> R
             let mut bytes = bad.data.to_vec();
             let bad_offset = 10 * row_bytes + 34;
             bytes[bad_offset..bad_offset + 2].copy_from_slice(&0x7c01_u16.to_le_bytes());
-            bad.data = Arc::from(bytes);
+            bad.data = Arc::<[u8]>::from(bytes).into();
             {
                 let mut prepared = scratch.prepare(&siblings[0], &input)?;
                 let [o0, o1, o2, _] = &mut outputs;

@@ -402,7 +402,7 @@ fn rust_operation(request: &Request) -> Output {
                 name: "upstream-pq2-weights".to_owned(),
                 kind: 142,
                 dimensions: vec![input.k, input.m],
-                data: Arc::from(input.packed.clone()),
+                data: Arc::<[u8]>::from(input.packed.clone()).into(),
             };
             // The runtime CPU API takes one activation column per call.
             // Preserve all upstream N columns and the original output order.
@@ -424,7 +424,7 @@ fn rust_operation(request: &Request) -> Output {
                             name: "upstream-ptq1-block".to_owned(),
                             kind: 143,
                             dimensions: vec![128],
-                            data: Arc::from(*packed),
+                            data: Arc::<[u8]>::from(*packed).into(),
                         },
                         0,
                     )

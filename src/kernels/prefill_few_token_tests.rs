@@ -116,7 +116,7 @@ fn few_token_projection_tails_preserve_scalar_bits_and_failure_recovery() -> Res
             name: "few-token-tails".into(),
             dimensions: vec![columns, rows],
             kind,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         };
         for count in [2, 3, 7, 9, 17, 24] {
             let inputs: Vec<Vec<f32>> = (0..count)
@@ -160,7 +160,7 @@ fn few_token_projection_tails_preserve_scalar_bits_and_failure_recovery() -> Res
                 let mut bad = valid.to_vec();
                 let scale = bad.len() - bytes + if kind == PTQ1 { 26 } else { 0 };
                 bad[scale..scale + 2].copy_from_slice(&0x7c00_u16.to_le_bytes());
-                tensor.data = Arc::from(bad);
+                tensor.data = Arc::<[u8]>::from(bad).into();
                 assert!(
                     tile.project(&tensor, &inputs, &mut actual, true, &|| Ok(()))
                         .is_err()
@@ -281,7 +281,7 @@ fn x1_pq2_two_token_prefill_matches_scalar_bits_across_token_and_row_counts() ->
                 name: format!("x1-pq2-{columns}x{rows}"),
                 dimensions: vec![columns, rows],
                 kind: PQ2,
-                data: Arc::from(data),
+                data: Arc::<[u8]>::from(data).into(),
             };
             for count in [2_usize, 3, 6, 7, 10, 14, 24] {
                 let inputs: Vec<Vec<f32>> = (0..count)

@@ -17,6 +17,14 @@ mod windows;
 #[cfg(windows)]
 use windows::Sha256;
 
+pub mod mmap;
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "The private audited memory-map owner retains OS mapping handles and exposes checked immutable slices."
+)]
+mod mmap_windows;
+
 #[cfg(not(windows))]
 mod portable;
 #[cfg(not(windows))]

@@ -20,7 +20,7 @@ fn weight(name: &str, rows: usize) -> Tensor {
         name: name.to_owned(),
         dimensions: vec![512, rows],
         kind: 142,
-        data: Arc::from(block.repeat(4 * rows)),
+        data: Arc::<[u8]>::from(block.repeat(4 * rows)).into(),
     }
 }
 
@@ -129,14 +129,15 @@ fn recurrent_bf16_siblings_keep_exact_dots_and_share_one_worker_submission() -> 
     ];
     for weight in &mut weights[2..] {
         weight.kind = 30;
-        weight.data = Arc::from(
+        weight.data = Arc::<[u8]>::from(
             [0x3f80_u16, 0xbfaa, 0x8000, 0x0080, 0x0001, 0x3e55, 0xc000]
                 .into_iter()
                 .cycle()
                 .take(weight.dimensions[0] * weight.dimensions[1])
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>(),
-        );
+        )
+        .into();
     }
     let input: Vec<_> = (0..512)
         .map(|index| [127.0, -127.0, 0.5001, -0.0, 63.5001, 1.5, -0.5001][index % 7])
@@ -223,7 +224,8 @@ fn q8_sibling_graph_consumer_joins_both_formats_with_exact_preparation() -> Resu
             };
             weight.kind = kind;
             weight.dimensions[0] = columns;
-            weight.data = Arc::from(encoded.repeat(columns / 128 * weight.dimensions[1]));
+            weight.data =
+                Arc::<[u8]>::from(encoded.repeat(columns / 128 * weight.dimensions[1])).into();
         }
         let input: Vec<_> = (0..columns)
             .map(|index| [127.0, -128.0, 0.5001, -0.0, 63.5001, 1.5][index % 6])
@@ -362,14 +364,15 @@ fn bf16_weight(name: &str, cols: usize, rows: usize) -> Tensor {
         name: name.to_owned(),
         dimensions: vec![cols, rows],
         kind: 30,
-        data: Arc::from(
+        data: Arc::<[u8]>::from(
             [0x3f80_u16, 0xbfaa, 0x8000, 0x0080, 0x0001, 0x3e55, 0xc000]
                 .into_iter()
                 .cycle()
                 .take(cols * rows)
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>(),
-        ),
+        )
+        .into(),
     }
 }
 

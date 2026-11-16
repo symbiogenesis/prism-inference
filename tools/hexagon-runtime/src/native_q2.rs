@@ -6,6 +6,7 @@
 //! executes the full `K <= 5120`, `M <= 17408` projection in a single DSP
 //! operation (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`).
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use bonsai_prism_runtime::{
@@ -212,7 +213,7 @@ pub const DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES: usize = 2_888_663_040;
 pub const DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 512 * 1024;
 
 struct ResidentProjection {
-    source: Arc<[u8]>,
+    source: bonsai_prism_runtime::model::TensorBytes,
     columns: usize,
     rows: usize,
     first_handle: usize,
@@ -300,7 +301,7 @@ impl ResidentCache {
             .ok()?;
         let index = self.by_storage[position];
         let projection = &self.projections[index];
-        (Arc::ptr_eq(&projection.source, &tensor.data)
+        (bonsai_prism_runtime::model::TensorBytes::ptr_eq(&projection.source, &tensor.data)
             && tensor.kind == 142
             && tensor.dimensions.as_slice() == [projection.columns, projection.rows])
         .then_some(index)
@@ -331,7 +332,7 @@ impl ResidentCache {
             .unwrap_or_else(|pos| pos);
         let index = self.projections.len();
         self.projections.push(ResidentProjection {
-            source: Arc::clone(&tensor.data),
+            source: tensor.data.clone(),
             columns: tensor.dimensions[0],
             rows: tensor.dimensions[1],
             first_handle,
@@ -2785,7 +2786,7 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
                 return false;
             };
             let candidate = &allowed[idx];
-            if !Arc::ptr_eq(&candidate.data, &tensor.data)
+            if !bonsai_prism_runtime::model::TensorBytes::ptr_eq(&candidate.data, &tensor.data)
                 || candidate.kind != tensor.kind
                 || candidate.dimensions != tensor.dimensions
                 || candidate.name != tensor.name
@@ -3252,7 +3253,7 @@ mod tests {
             name: name.to_owned(),
             dimensions: vec![columns, rows],
             kind: 142,
-            data: Arc::from(vec![0x55; columns / 128 * rows * 34]),
+            data: Arc::<[u8]>::from(vec![0x55; columns / 128 * rows * 34]).into(),
         }
     }
 
@@ -3435,7 +3436,7 @@ mod tests {
         let mut tensor = lazy_tensor("blk.0.ffn_up.weight", 128, 32);
         let mut data = tensor.data.to_vec();
         data[34..36].copy_from_slice(&0x7e00_u16.to_le_bytes());
-        tensor.data = Arc::from(data);
+        tensor.data = Arc::<[u8]>::from(data).into();
         let limits = NativeQ2ProjectionLimits::new(128, 32, 100, Duration::from_secs(10))
             .map_err(|_| invalid("limits"))?;
         let mut executor = NativeQ2Executor::new(arena_submitter(true)?, limits, 1024 * 1024)
@@ -3467,7 +3468,7 @@ mod tests {
             name: "blk.0.ffn_up.weight".to_owned(),
             dimensions: vec![256, 49],
             kind: 142,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         };
         let limits = NativeQ2ProjectionLimits::new(128, 32, 100, Duration::from_secs(10))
             .map_err(|_| invalid("limits"))?
@@ -3506,7 +3507,7 @@ mod tests {
             name: "blk.0.ffn_up.weight".to_owned(),
             dimensions: vec![128, 32],
             kind: 142,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         };
         let limits = NativeQ2ProjectionLimits::new(128, 32, 100, Duration::from_secs(10))
             .map_err(|_| invalid("limits"))?
@@ -3612,7 +3613,7 @@ mod tests {
             unselected.name.push_str("-unselected");
             assert!(!executor.supports_f32(&unselected));
             unselected = tensor.clone();
-            unselected.data = Arc::from(tensor.data.to_vec());
+            unselected.data = Arc::<[u8]>::from(tensor.data.to_vec()).into();
             assert!(!executor.supports_f32(&unselected));
         }
         assert_eq!(executor.residency_statistics().tensors_prepared, 3);
@@ -4510,7 +4511,7 @@ mod tests {
                 *byte = u8::try_from((index * 13 + lane * 7) % 256).unwrap_or(0);
             }
         }
-        tensor.data = Arc::from(data);
+        tensor.data = Arc::<[u8]>::from(data).into();
         tensor
     }
 
@@ -4639,7 +4640,7 @@ mod tests {
                     5 | 6 => {
                         let mut data = tensor.data.to_vec();
                         data[34..36].copy_from_slice(&0x7e00_u16.to_le_bytes());
-                        tensor.data = Arc::from(data);
+                        tensor.data = Arc::<[u8]>::from(data).into();
                         if failure == 6 {
                             activations[0][0] = f32::NAN;
                         }
@@ -4717,7 +4718,7 @@ mod tests {
             for block in data.as_chunks_mut::<34>().0 {
                 block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
             }
-            tensor.data = Arc::from(data);
+            tensor.data = Arc::<[u8]>::from(data).into();
             let limits =
                 NativeQ2ProjectionLimits::new(maximum_columns, 32, 100, Duration::from_secs(10))
                     .map_err(|_| invalid("limits"))?;
@@ -4783,7 +4784,7 @@ mod tests {
             name: "blk.0.ffn_up.weight".to_owned(),
             dimensions: vec![columns, rows],
             kind: 142,
-            data: Arc::from(data),
+            data: Arc::<[u8]>::from(data).into(),
         };
         let limits = NativeQ2ProjectionLimits::new(5120, 17_408, 100, Duration::from_secs(10))
             .map_err(|_| invalid("limits"))?
@@ -4952,7 +4953,7 @@ mod tests {
                 name: name.to_owned(),
                 dimensions: vec![columns, rows],
                 kind: 142,
-                data: Arc::from(data),
+                data: Arc::<[u8]>::from(data).into(),
             }
         };
         let qkv = make_tensor("blk.0.attn_qkv.weight", 64);
@@ -5233,7 +5234,7 @@ mod tests {
             name: name.to_owned(),
             dimensions: vec![128, 128],
             kind: 142,
-            data: Arc::from(vec![0_u8; 128 * 34]),
+            data: Arc::<[u8]>::from(vec![0_u8; 128 * 34]).into(),
         };
         let gate = tensor("blk.0.ffn_gate.weight");
         let up = tensor("blk.0.ffn_up.weight");
@@ -5348,7 +5349,7 @@ mod tests {
                 name: name.to_owned(),
                 dimensions: vec![columns, rows],
                 kind: 142,
-                data: Arc::from(data),
+                data: Arc::<[u8]>::from(data).into(),
             }
         };
         let first = make_tensor("blk.0.ffn_gate.weight", 32);

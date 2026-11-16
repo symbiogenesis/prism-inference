@@ -56,7 +56,7 @@ impl Harness {
             name: String::from("unused-prefill-projection"),
             dimensions: vec![256, 256],
             kind: 0,
-            data: Arc::from([]),
+            data: Arc::<[u8]>::from([]).into(),
         };
         let weights = FullAttention {
             query: unused.clone(),

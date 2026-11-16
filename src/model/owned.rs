@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::sync::Arc;
 
 use bonsai_gguf::{Metadata, MetadataArray, MetadataValue};
 use bonsai_native_hash::Hasher;
@@ -156,7 +155,7 @@ impl Model {
                     name: spec.name.clone(),
                     dimensions: spec.dimensions.clone(),
                     kind: spec.kind,
-                    data: Arc::from(data),
+                    data: crate::model::TensorBytes::from(data),
                 },
             );
         }

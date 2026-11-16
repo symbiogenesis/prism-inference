@@ -68,7 +68,7 @@ fn row_quantizers_match_native_production_bytes_for_zeros_ties_and_lcg_inputs() 
             name: "native-quantizer-reference".to_owned(),
             kind,
             dimensions: vec![values.len()],
-            data: Arc::from(output),
+            data: Arc::<[u8]>::from(output).into(),
         };
         validate_tensor(&tensor)?;
         assert_eq!(row(&tensor, 0)?.len(), values.len());
@@ -193,7 +193,7 @@ fn legacy_affine_and_five_bit_rows_match_native_bytes_decoders_and_packed_dots()
                 name: "native-legacy-reference".to_owned(),
                 kind,
                 dimensions: vec![256],
-                data: Arc::from(output),
+                data: Arc::<[u8]>::from(output).into(),
             };
             validate_tensor(&tensor)?;
             if kind == 9 {

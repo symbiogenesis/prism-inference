@@ -153,19 +153,20 @@ fn packed_output_fixture(recurrent: bool) -> Model {
             tensor.kind = 142;
             let mut block = [0x66; 34];
             block[..2].copy_from_slice(&0x2800_u16.to_le_bytes());
-            tensor.data = Arc::from(block.repeat(2 * tensor.dimensions[1]));
+            tensor.data = Arc::<[u8]>::from(block.repeat(2 * tensor.dimensions[1])).into();
         } else if matches!(
             name,
             "blk.0.attn_output.weight" | "blk.0.ssm_out.weight" | "blk.0.ffn_down.weight"
         ) {
             tensor.dimensions[1] = 256;
-            tensor.data = Arc::from(vec![0; tensor.dimensions.iter().product::<usize>() * 4]);
+            tensor.data =
+                Arc::<[u8]>::from(vec![0; tensor.dimensions.iter().product::<usize>() * 4]).into();
         } else if matches!(
             name,
             "output_norm.weight" | "blk.0.attn_norm.weight" | "blk.0.post_attention_norm.weight"
         ) {
             tensor.dimensions[0] = 256;
-            tensor.data = Arc::from(1.0_f32.to_le_bytes().repeat(256));
+            tensor.data = Arc::<[u8]>::from(1.0_f32.to_le_bytes().repeat(256)).into();
         }
     }
     model

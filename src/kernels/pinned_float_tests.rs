@@ -40,7 +40,7 @@ fn tensor(kind: u32, count: usize, bytes: Vec<u8>) -> Tensor {
         name: "native-floating-control".to_owned(),
         dimensions: vec![count, 1],
         kind,
-        data: Arc::from(bytes),
+        data: Arc::<[u8]>::from(bytes).into(),
     }
 }
 

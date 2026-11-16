@@ -14,7 +14,7 @@ fn tensor(kind: u32, columns: usize) -> Result<Tensor> {
         name: "finite-activation-proof".to_owned(),
         dimensions: vec![columns, 1],
         kind,
-        data: Arc::from(quantize_row(kind, &vec![1.0; columns])?),
+        data: Arc::<[u8]>::from(quantize_row(kind, &vec![1.0; columns])?).into(),
     })
 }
 

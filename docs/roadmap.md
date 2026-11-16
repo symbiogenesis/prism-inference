@@ -26,16 +26,22 @@ for performance by its availability alone.
 | Tokenization and chat | Broaden template-byte, tokenizer-ID and turn-boundary coverage |
 | Sampling | Broaden production sampler and RNG comparisons |
 | Adapters | Qualify native residual writers, scale-zero/nonzero behavior, grouped SSM basis, scale changes and service lifecycle under the [adapter contract](rank-one-adapter.md) |
-| CPU execution | Qualify packed prefill tiles, attention scoring, bounded score-scratch growth, parallel transforms and [work/storage reductions](inference-efficiency.md) with full-model parity and matched whole-request measurements |
-| Accelerators | Qualify the explicit Hexagon FFN chain and investigate Adreno after defining execution and ownership contracts |
+| CPU execution | Qualify zero-copy `MappedSlice` GGUF loading + parallel payload validation, spin-then-park `NativeRowPool`, bit-exact `G in {2, 3, 6}` grouped GQA packed-KV decode/tile attention, packed prefill tiles, attention scoring, bounded score-scratch growth, parallel transforms and [work/storage reductions](inference-efficiency.md) with full-model parity and matched whole-request measurements |
+| Accelerators | Qualify the explicit Hexagon FFN/SwiGLU chains (including `adapter_affects_any` per-layer LoRA gating), rank-1 `ffn_down` side-branches, and investigate Adreno after defining execution and ownership contracts |
 | Service ownership | Complete process/OS, cancellation, recovery, daily-service and device lifecycle acceptance |
 | Devices | Establish correctness, quality, throughput, memory and security on each intended target |
 
 Model weights and adapters follow their publishers' licenses. Code attribution
 and upstream source identities are recorded in [NOTICE](../NOTICE).
 
-Completed structural hardening (awaiting full-model parity and device runs)
-covers atomic checkpoint/restore identity checks, checkpoint buffer recycling,
+Completed structural and efficiency implementations in source (awaiting a
+reviewed Foundation bundle, Runner repin, full-model parity and X1/X2 device
+qualification) cover Windows zero-copy mapped GGUF loading (`MappedReadOnlyFile`
+/ `MappedSlice` with `PrefetchVirtualMemory`, chunked CNG SHA-256 and parallel
+payload validation), zero-alloc spin-then-park `NativeRowPool`, bit-exact
+`G in {2, 3, 6}` grouped GQA packed-KV decode and tiled-prefill attention,
+`adapter_affects_any` external FFN/SwiGLU unlocking under inactive or
+`ffn_down`-only rank-1 LoRA, atomic checkpoint/restore identity checks, checkpoint buffer recycling,
 transient vs `PromptEndAndLatest` checkpoints, `HybridCheckpointBoundary`,
 atomic conv shifts, mid-tile `state_consistent` and GDN decay/norm guards,
 bounded speculative verification telemetry (`SpeculativeStats`),

@@ -1,8 +1,9 @@
 # Packed-projection row workers
 
-The opt-in `parallel-rows` feature provides a private persistent Rayon pool for
-PQ2/PTQ1 matrix rows. Constructors remain serial until configured. Worker count
-does not establish target-device throughput or energy benefit.
+The opt-in `parallel-rows` feature provides a zero-allocation, fixed-worker
+spin-then-park pool (`bonsai_native_hash::NativeRowPool`) for PQ2/PTQ1 matrix
+rows and tiled/grouped graph kernels. Constructors remain serial until configured.
+Worker count does not establish target-device throughput or energy benefit.
 
 The scheduling design independently adapts borrowed-slice scheduling from
 [OxiBonsai parallel.rs](https://github.com/cool-japan/oxibonsai/blob/1d10c48e14754ff6999158f8fa13c7c92b40b0dc/crates/oxibonsai-kernels/src/parallel.rs)
@@ -11,10 +12,12 @@ The scheduling design independently adapts borrowed-slice scheduling from
 ## Resource and arithmetic contract
 
 - `RowParallelism::new(n)` accepts 1..16. One creates no threads; larger values
-  require the feature. Pool-creation failure rejects. Environment/global Rayon
-  settings do not select the count.
+  require the feature and instantiate an atomic-generation `NativeRowPool`
+  without per-dispatch heap allocation or a global thread pool. Pool-creation
+  failure rejects.
 - Policy clones share a pool. Each worker requests a separately charged 512 KiB
-  stack; independently created policies create independent pools.
+  stack; independently created policies create independent pools. Panic unwind
+  guards release waiting callers so worker panics cannot strand a submission.
 - A projection prepares activations once. At most the configured number of tasks
   borrow immutable packed weights and activations and write disjoint existing
   output slices. No per-worker matrix or activation copy is retained.
@@ -67,5 +70,3 @@ contracts, PTQ1, prepared siblings, backend/pinned arithmetic, malformed input,
 output clearing, borrowed storage, deterministic failure, graph continuation,
 checkpoint/reset and recovery. Feature-disabled builds retain rejection controls.
 See [building and validation](build-and-validation.md) for owning checks.
-
-Distributors retain the exact locked Rayon's Apache-2.0/MIT licenses and notices.

@@ -144,10 +144,12 @@ Multi-token packed-cache attention partitions tokens across that same worker
 pool. The common normalization/RoPE stage retains binary16 query/K/V rounding;
 each current row uses the ordinary interleaved key/value-head codec order before
 provisional append. A token reads only its preceding encoded rows and its own
-current row, including across sealed pages. Each token processes heads serially
-with one probability row, preserving query rotation, score/softmax, packed-value
-accumulation, inverse transform and output-gate arithmetic. Future tile rows
-cannot enter an earlier token's scores or value sum. There is no expanded K/V
+current row, including across sealed pages. Each token evaluates its KV-head
+query groups via bit-exact `PreparedQueryGroup` and `ValueGroupAccumulator`
+(`G in {2, 3, 6}`, decoding each shared packed K/V record once across all
+grouped query heads while preserving per-head query rotation, score/softmax,
+packed-value accumulation, inverse transform and output-gate arithmetic).
+Future tile rows cannot enter an earlier token's scores or value sum. There is no expanded K/V
 history, second pool or nested head-worker submission. A failed attention task
 joins workers and clears every tile output; Runtime retains whole-request
 state rollback. One-token tiles and a single worker keep ordinary attention.

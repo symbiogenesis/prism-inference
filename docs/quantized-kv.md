@@ -50,8 +50,14 @@ Runner's existing release pin remains the rollback until qualification and repin
 
 Independent query heads can share the [row-worker pool](parallel-rows.md).
 Tasks borrow packed records, own disjoint score/output slices and join before
-returning the earliest head-chunk error. No additional pool is created;
-cancellation remains at synchronous token boundaries.
+returning the earliest head-chunk error. In both decode and tiled prefill,
+`kv_quant` (`PreparedQueryGroup<'a, const G: usize>` and
+`ValueGroupAccumulator<'a, const G: usize>` for `G in {2, 3, 6}`, backed by
+`bonsai-neon-dot` and portable paths) decodes each shared packed K/V record once
+per KV head across all `G` query heads (`6:1` for Swift's 24 query / 4 KV heads)
+while preserving bit-exact `f32`/`f64` rounding and reduction order across worker
+counts. No additional pool is created; cancellation remains at synchronous
+token boundaries.
 
 ## Selection, identity and recovery
 

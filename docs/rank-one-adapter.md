@@ -35,6 +35,14 @@ then addition. Folded base Hadamard/grouped SSM permutations stay on the base
 branch; embedding correction follows inverse transformation. F32 rounding stages
 and pinned aligned-row accumulation are preserved.
 
+For external `Pq2ProjectionExecutor` sessions, per-layer active-target gating
+(`adapter_affects_any`) keeps `external_ffn_chain` enabled whenever
+`[ffn_gate, ffn_up, ffn_down]` have no active LoRA (`scale == 0.0` or untargeted
+layers) and unlocks `external_ffn_swiglu` (`ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU`)
+across all 64 Swift layers under active `RankOneAdapter` (since `ffn_gate` and
+`ffn_up` are never targeted, preserving original-basis `up` for CPU `ffn_down`
+plus its LoRA delta while binding `projection_plan_digest`).
+
 Identical immutable B payloads share storage only after kind/shape/byte equality.
 Correction scratch holds one rank value and one output-width vector, separate
 from base scratch. One-column B projections stream immutable F32 scalars with

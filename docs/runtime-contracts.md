@@ -24,7 +24,13 @@ owning launcher and authenticated prepared-input binding.
 
 - GGUF loading verifies length/SHA-256 before parsing and uses the same retained
   handle. Windows denies write/delete sharing; other platforms require
-  caller-enforced immutability.
+  caller-enforced immutability. On Windows, artifacts at or above 4 MiB use
+  read-only whole-file mapping (`bonsai_native_hash::mmap::MappedReadOnlyFile`
+  with 16 MiB `PrefetchVirtualMemory` windows during 4 MiB chunked CNG SHA-256
+  hashing), retaining zero-copy `TensorBytes::Mapped(MappedSlice)` storage and
+  validating executable tensor scales/extents in parallel across up to 8 workers
+  before publishing the immutable `Model` (falling back to buffered reads and
+  staging below 4 MiB or on non-Windows targets).
 - F32/F16/BF16/PQ2/PTQ1 tensors have checked dimensions/storage budgets. Optional
   identical rank-one B sharing is separate from
   [adapter execution](rank-one-adapter.md).
@@ -100,7 +106,10 @@ Position-zero checkpoints retain provenance/metadata instead of canonical empty
 KV and positive-zero recurrent payload. Restore validates complete geometry,
 position alignment, `KvCache::same_representation` /
 `PackedCache::same_representation`, packed page/tail partitions, and
-`ProjectedQwen35`'s SHA-256 `projection_plan_digest` before clearing or mutating
+`ProjectedQwen35`'s SHA-256 `projection_plan_digest` (including per-layer active
+LoRA FFN fusion via `adapter_affects_any`: keeping `external_ffn_chain` when
+`[ffn_gate, ffn_up, ffn_down]` have no active LoRA and `external_ffn_swiglu` when
+`[ffn_gate, ffn_up]` are untargeted or inactive) before clearing or mutating
 live state; `Qwen35::restore` clears `frequencies_ready` cleanly. Nonempty
 snapshots remain complete. `Qwen35` tracks `state_consistent` across
 `ingest_cpu_tile` and rejects subsequent decode/prefill/checkpoint calls after

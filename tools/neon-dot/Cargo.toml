@@ -1,6 +1,6 @@
 [package]
 name = "bonsai-neon-dot"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 rust-version.workspace = true
 publish = ["crates-io"]
@@ -11,7 +11,7 @@ keywords = ["neon", "dotprod", "i8mm", "simd", "quantization"]
 categories = ["hardware-support", "science"]
 
 [dependencies]
-bonsai-ternary = { version = "=0.1.3", path = "../ternary" }
+bonsai-ternary = { version = "=0.1.4", path = "../ternary" }
 
 [lints]
 workspace = true

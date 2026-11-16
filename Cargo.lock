@@ -41,6 +41,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -166,20 +172,27 @@ version = "0.1.4"
 
 [[package]]
 name = "bonsai-windows-credentials"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14f18330d2f8bdb427ea88266721c16057effbeb87b5c821481c62a553b767f5"
+checksum = "94da447b6f49bde8fcbcb4918c8a894f7f9c7d4be7d42e433a5c30a0ead4e2ff"
 dependencies = [
+ "bonsai-native-hash",
+ "hex",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
 name = "bonsai-windows-process"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e65228466d49d52d41458051876b42145a5d89f54a2b44f4cebc5b7b033bdd6"
+checksum = "1b3f69dfd8ff188ae1559467795523ebbbe83f3fef984c5d29515195c21aa4b4"
 dependencies = [
+ "ash",
+ "bonsai-neon-dot",
+ "bonsai-ternary",
  "flatbuffers",
+ "hex",
  "mxc-sdk",
  "windows-sys 0.61.2",
 ]
@@ -463,7 +476,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1060,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "aho-corasick",
  "base64ct",
@@ -1086,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "bonsai-hexagon-native",
  "bonsai-hexagon-runtime",
@@ -1256,7 +1269,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1495,7 +1508,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1821,7 +1834,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2122,6 +2135,12 @@ dependencies = [
  "syn 3.0.10",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zerotrie"

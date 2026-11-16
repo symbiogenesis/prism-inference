@@ -7,7 +7,8 @@
 use std::{ffi::c_void, io, ptr, ptr::NonNull};
 
 use windows_sys::Win32::Security::Cryptography::{
-    BCRYPT_SHA256_ALG_HANDLE, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptHashData,
+    BCRYPT_SHA256_ALG_HANDLE, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptHash,
+    BCryptHashData,
 };
 
 // NonNull prevents Send/Sync; no handle is transferred or used concurrently.
@@ -54,6 +55,36 @@ impl Sha256 {
         check(unsafe { BCryptFinishHash(self.0.as_ptr(), digest.as_mut_ptr(), 32, 0) })?;
         Ok(digest)
     }
+}
+
+pub(super) fn hash_bytes(bytes: &[u8]) -> io::Result<[u8; 32]> {
+    if let Ok(length) = u32::try_from(bytes.len()) {
+        let mut digest = [0_u8; 32];
+        let input = if bytes.is_empty() {
+            ptr::null()
+        } else {
+            bytes.as_ptr()
+        };
+        // SAFETY: the pseudo-handle is process-wide valid for SHA-256, `input`
+        // points to `length` readable bytes (or null when empty), and `digest`
+        // is writable for the 32-byte SHA-256 output.
+        check(unsafe {
+            BCryptHash(
+                BCRYPT_SHA256_ALG_HANDLE,
+                ptr::null(),
+                0,
+                input,
+                length,
+                digest.as_mut_ptr(),
+                32,
+            )
+        })?;
+        return Ok(digest);
+    }
+
+    let mut hasher = Sha256::new()?;
+    hasher.update(bytes)?;
+    hasher.finish()
 }
 
 impl Drop for Sha256 {

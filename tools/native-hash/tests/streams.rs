@@ -177,7 +177,20 @@ fn exact_length_empty_buffer_and_bounded_range_are_checked() -> io::Result<()> {
 fn buffered_incremental_hasher_matches_reference_across_chunk_boundaries() -> io::Result<()> {
     let input: Vec<u8> = (0..=255).cycle().take(200_000).collect();
     let expected: [u8; 32] = Sha256::digest(&input).into();
-    assert_eq!(hash_bytes(b"")?, <[u8; 32]>::from(Sha256::digest(b"")));
+    assert_eq!(
+        hex(hash_bytes(b"")?),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        hex(hash_bytes(b"abc")?),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        hex(hash_bytes(
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+        )?),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
     assert_eq!(hash_bytes(&input)?, expected);
 
     // Exercise empty updates, small fragments, exact 64 KiB buffer boundaries,

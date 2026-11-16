@@ -36,3 +36,11 @@ impl Sha256 {
         Ok(self.0.finalize().into())
     }
 }
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "The platform-independent owner shares the fallible CNG boundary's API."
+)]
+pub(super) fn hash_bytes(bytes: &[u8]) -> io::Result<[u8; 32]> {
+    Ok(sha2::Sha256::digest(bytes).into())
+}

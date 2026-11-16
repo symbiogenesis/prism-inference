@@ -75,14 +75,16 @@ pub fn hash_reader(
     hash.finish()
 }
 
+#[cfg(windows)]
 const HASH_BUFFER_BYTES: usize = 65_536;
 
 /// Incremental SHA-256 digest state backed by Windows CNG (`Win32_Security_Cryptography`).
 ///
 /// Uses hardware `ARMv8` SHA-2 instructions on Windows and the audited portable baseline elsewhere.
-/// Small updates are staged into a bounded buffer to reduce operating-system boundary calls.
+/// On Windows, small updates are staged into a bounded buffer to reduce OS boundary calls.
 pub struct Hasher {
     inner: Sha256,
+    #[cfg(windows)]
     buffer: Vec<u8>,
 }
 
@@ -94,6 +96,7 @@ impl Hasher {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             inner: Sha256::new()?,
+            #[cfg(windows)]
             buffer: Vec::new(),
         })
     }
@@ -107,39 +110,54 @@ impl Hasher {
         if bytes.is_empty() {
             return Ok(());
         }
-        if self.buffer.is_empty() && bytes.len() >= HASH_BUFFER_BYTES {
-            return self.inner.update(bytes);
+        #[cfg(not(windows))]
+        {
+            self.inner.update(bytes)
         }
-        let available = HASH_BUFFER_BYTES.saturating_sub(self.buffer.len());
-        if bytes.len() > available {
-            self.inner.update(&self.buffer)?;
-            self.buffer.clear();
-            if bytes.len() >= HASH_BUFFER_BYTES {
+        #[cfg(windows)]
+        {
+            if self.buffer.is_empty() && bytes.len() >= HASH_BUFFER_BYTES {
                 return self.inner.update(bytes);
             }
+            let available = HASH_BUFFER_BYTES.saturating_sub(self.buffer.len());
+            if bytes.len() > available {
+                self.inner.update(&self.buffer)?;
+                self.buffer.clear();
+                if bytes.len() >= HASH_BUFFER_BYTES {
+                    return self.inner.update(bytes);
+                }
+            }
+            if self.buffer.capacity() < HASH_BUFFER_BYTES {
+                self.buffer
+                    .try_reserve_exact(HASH_BUFFER_BYTES.saturating_sub(self.buffer.len()))?;
+            }
+            self.buffer.extend_from_slice(bytes);
+            if self.buffer.len() == HASH_BUFFER_BYTES {
+                self.inner.update(&self.buffer)?;
+                self.buffer.clear();
+            }
+            Ok(())
         }
-        if self.buffer.capacity() < HASH_BUFFER_BYTES {
-            self.buffer
-                .try_reserve_exact(HASH_BUFFER_BYTES.saturating_sub(self.buffer.len()))?;
-        }
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() == HASH_BUFFER_BYTES {
-            self.inner.update(&self.buffer)?;
-            self.buffer.clear();
-        }
-        Ok(())
     }
 
     /// Finalize the SHA-256 digest and return the 32-byte hash.
     ///
     /// # Errors
     /// Returns an I/O error if the cryptographic provider fails to flush or finalize.
-    pub fn finish(mut self) -> io::Result<[u8; 32]> {
-        if !self.buffer.is_empty() {
-            self.inner.update(&self.buffer)?;
-            self.buffer.clear();
+    pub fn finish(self) -> io::Result<[u8; 32]> {
+        #[cfg(windows)]
+        let Self {
+            mut inner,
+            mut buffer,
+        } = self;
+        #[cfg(not(windows))]
+        let Self { inner } = self;
+        #[cfg(windows)]
+        if !buffer.is_empty() {
+            inner.update(&buffer)?;
+            buffer.clear();
         }
-        self.inner.finish()
+        inner.finish()
     }
 }
 
@@ -148,7 +166,12 @@ impl Hasher {
 /// # Errors
 /// Returns an I/O error if the cryptographic provider fails.
 pub fn hash_bytes(bytes: &[u8]) -> io::Result<[u8; 32]> {
-    let mut hasher = Sha256::new()?;
-    hasher.update(bytes)?;
-    hasher.finish()
+    #[cfg(windows)]
+    {
+        windows::hash_bytes(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        portable::hash_bytes(bytes)
+    }
 }

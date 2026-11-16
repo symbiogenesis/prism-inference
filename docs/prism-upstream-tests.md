@@ -36,8 +36,8 @@ has no output-content assertions. MTMD's 29 tiling/temporal-grouping assertions
 use a separate exact nearest-lattice/run-partition Rust provider, preserving the
 ties-to-even boundary and independently counted surviving bitmap positions; its
 native header/include/dispatch is retired. Reports and retained case details identify the
-provider without claiming native replay. Native bridges provide bounded serialization and production calls;
-they contain no expected outputs, random generators or acceptance policy.
+provider without claiming native replay. Native bridges provide bounded serialization and production
+calls; they contain no expected outputs, random generators or acceptance policy.
 Upstream test executables and fixture exporters are not built.
 
 The PQ2/PTQ1 GGML bridge is Rust linked to pinned production ggml; its reference

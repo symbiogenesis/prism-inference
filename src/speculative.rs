@@ -257,21 +257,21 @@ impl SpeculativeStats {
 }
 
 /// Compute cumulative rejection complement `1.0 - prod_i (1.0 - r_i)` stably
-/// via `-sum_i(ln_1p(-r_i)).exp_m1()`.
+/// via the exact survival-complement recurrence `c <- c + r_i * (1.0 - c)`.
 ///
 /// # Errors
 /// Rejects any non-finite rejection probability or value outside `[0.0, 1.0]`.
 pub fn cumulative_rejection_complement(rejection_probs: &[f64]) -> Result<f64> {
-    let mut log_survival_sum = 0.0_f64;
+    let mut complement = 0.0_f64;
     for &prob in rejection_probs {
         if !prob.is_finite() || !(0.0..=1.0).contains(&prob) {
             return Err(invalid(
                 "cumulative rejection probabilities must be finite and within [0.0, 1.0]",
             ));
         }
-        log_survival_sum += (-prob).ln_1p();
+        complement = prob.mul_add(1.0 - complement, complement);
     }
-    Ok((-log_survival_sum.exp_m1()).clamp(0.0, 1.0))
+    Ok(complement.clamp(0.0, 1.0))
 }
 
 /// Propose continuation tokens from prompt/history suffix lookup first,

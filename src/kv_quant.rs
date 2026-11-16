@@ -770,18 +770,6 @@ impl Quantizer {
             target_os = "windows",
             target_env = "msvc"
         )),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "The native branch validates its helper codebook before starting the scan; portable construction is infallible."
-        )
-    )]
-    #[cfg_attr(
-        not(all(
-            feature = "experimental-neon",
-            target_arch = "aarch64",
-            target_os = "windows",
-            target_env = "msvc"
-        )),
         allow(
             clippy::missing_const_for_fn,
             reason = "The shared native entry performs runtime ISA selection; portable construction keeps the same non-const API."

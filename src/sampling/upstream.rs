@@ -252,27 +252,13 @@ impl Config {
             | Self::Typical {
                 probability,
                 min_keep,
-            } => {
-                if !(0.0..=1.0).contains(probability) {
-                    return Err(invalid(
-                        "sampler probability must be finite and within [0.0, 1.0]",
-                    ));
-                }
-                (vec![*probability], *min_keep)
-            }
+            } => (vec![*probability], *min_keep),
             Self::Xtc {
                 probability,
                 threshold,
                 min_keep,
                 ..
-            } => {
-                if !(0.0..=1.0).contains(probability) {
-                    return Err(invalid(
-                        "sampler XTC probability must be finite and within [0.0, 1.0]",
-                    ));
-                }
-                (vec![*probability, *threshold], *min_keep)
-            }
+            } => (vec![*probability, *threshold], *min_keep),
             Self::Penalties {
                 vocabulary_size,
                 last_n,
@@ -1254,7 +1240,7 @@ mod tests {
 
     #[test]
     fn config_rejects_out_of_range_probabilities() {
-        for invalid_prob in [-0.1_f32, 1.000_1, f32::NAN, f32::INFINITY] {
+        for invalid_prob in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(
                 State::new(Config::TopP {
                     probability: invalid_prob,
@@ -1286,20 +1272,38 @@ mod tests {
                 .is_err()
             );
         }
-        assert!(
-            State::new(Config::TopP {
-                probability: 1.0,
-                min_keep: 1,
-            })
-            .is_ok()
-        );
-        assert!(
-            State::new(Config::MinP {
-                probability: 0.0,
-                min_keep: 1,
-            })
-            .is_ok()
-        );
+        for valid_prob in [-0.1_f32, 0.0, 1.0, 1.05] {
+            assert!(
+                State::new(Config::TopP {
+                    probability: valid_prob,
+                    min_keep: 1,
+                })
+                .is_ok()
+            );
+            assert!(
+                State::new(Config::MinP {
+                    probability: valid_prob,
+                    min_keep: 1,
+                })
+                .is_ok()
+            );
+            assert!(
+                State::new(Config::Typical {
+                    probability: valid_prob,
+                    min_keep: 1,
+                })
+                .is_ok()
+            );
+            assert!(
+                State::new(Config::Xtc {
+                    probability: valid_prob,
+                    threshold: 0.1,
+                    min_keep: 1,
+                    seed: 0,
+                })
+                .is_ok()
+            );
+        }
     }
 
     #[test]

@@ -1823,7 +1823,7 @@ fn full_attention_checkpoint_bytes_charge_binary16_capacity_and_restore_prefix()
     decoder.restore(&checkpoint)?;
     assert_eq!(
         decoder.checkpoint_bytes() - empty_bytes,
-        4 * size_of::<u16>()
+        16 * size_of::<u16>()
     );
     assert_eq!(decoder.evaluate(1)?, expected);
     decoder.reset()?;

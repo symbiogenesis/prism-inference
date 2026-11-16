@@ -72,7 +72,7 @@ try {
     if ($configuration.Count -gt 1 -or ($configuration.Count -eq 1 -and $configuration[0] -cnotmatch '^[0-9]+ tree [0-9a-f]{40}(?:[0-9a-f]{24})?\t\.cargo$')) { throw 'Push blocked: unexpected committed Cargo configuration.' }
     $objects += if ($configuration.Count) { ($configuration[0] -split '\s+')[2] } else { 'absent:.cargo' }
     $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
-    if (-not $Prepare -and -not (Test-PushCheckerReceipt $receipt $tool $sourceId)) {
+    if (-not $Prepare -and -not (Test-PushCheckerReceipt -Path $receipt -Image $tool -SourceIdentity $sourceId)) {
         throw 'Push blocked: native checker is missing, stale or corrupt. Run .github/ci/Check-PushSanity.ps1 -Prepare in a declared source-build allowance under native process-tree supervision.'
     }
     $archive = Join-Path $scratch 'policy.zip'
@@ -94,7 +94,7 @@ try {
             cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package prism-source-sanity --bin prism-source-sanity --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
         } finally { Pop-Location }
         @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding utf8NoBOM
-        if (-not (Test-PushCheckerReceipt $receipt $tool $sourceId)) {
+        if (-not (Test-PushCheckerReceipt -Path $receipt -Image $tool -SourceIdentity $sourceId)) {
             [IO.File]::Delete($receipt)
             throw 'Preparation failed native checker receipt verification.'
         }

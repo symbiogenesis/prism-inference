@@ -22,8 +22,8 @@ graph transport. Request and response files are at most 16 MiB, and operations n
 Paths must be absolute and distinct.
 
 A zero process exit means completion and a written
-response (`{"SchemaVersion":1,"Results":[...]}`). Errors return a nonzero exit and a message on stderr. Discard any
-response from a failing process. The caller owns the timeout and file lifecycle.
+response (`{"SchemaVersion":1,"Results":[...]}`). Errors return a nonzero exit and a message on
+stderr. Discard any response from a failing process. The caller owns the timeout and file lifecycle.
 
 The former top-level `unicode-regex-split`, `unicode-encode` and `unicode-decode` file operations are
 retired. Those operations now belong to the independent Rust reference provider

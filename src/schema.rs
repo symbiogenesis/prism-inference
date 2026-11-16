@@ -1069,7 +1069,7 @@ mod tests {
     #[test]
     fn unrecognized_schema_diagnostic_caps_long_preview_on_utf8_boundary() -> Result<()> {
         let huge = serde_json::json!({ "type": "€".repeat(200) }).to_string();
-        let err = to_grammar(&huge, false)
+        let err = to_grammar(&huge, true)
             .err()
             .ok_or_else(|| invalid("expected unrecognized schema error"))?;
         let message = err.to_string();

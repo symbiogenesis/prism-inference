@@ -29,18 +29,18 @@ try {
         $candidate = Join-Path $scratch 'candidate'
         $paths = Join-Path $scratch 'paths.json'
         $checker = Join-Path $PSScriptRoot 'Check-SourceSnapshot.ps1'
-        Write-ControlSource $candidate 'scripts/file with spaces.ps1' "throw 'Candidate bodies must never execute.'`n"
+        Write-ControlSource -Directory $candidate -Path 'scripts/file with spaces.ps1' -Text "throw 'Candidate bodies must never execute.'`n"
         [IO.File]::WriteAllText($paths, '["scripts/file with spaces.ps1","scripts/deleted.ps1"]')
         & $checker -Root $candidate -PathsFile $paths
-        Write-ControlSource $candidate 'scripts/file with spaces.ps1' 'function Broken {'
+        Write-ControlSource -Directory $candidate -Path 'scripts/file with spaces.ps1' -Text 'function Broken {'
         Assert-ControlRejection { & $checker -Root $candidate -PathsFile $paths } 'PowerShell syntax failed'
         [IO.File]::WriteAllText($paths, '["../escaped.ps1"]')
         Assert-ControlRejection { & $checker -Root $candidate -PathsFile $paths } 'escaped its root'
         $policy = Join-Path $scratch 'policy/.github/ci'
         [void][IO.Directory]::CreateDirectory($policy)
         [IO.File]::Copy($checker, (Join-Path $policy 'Check-SourceSnapshot.ps1'))
-        Write-ControlSource $candidate '.github/ci/Test-Workflow.ps1' "throw 'Candidate checking policy must never execute.'`n"
-        Write-ControlSource $policy 'Test-Workflow.ps1' 'param([string]$Root); [IO.File]::WriteAllText((Join-Path $PSScriptRoot "observed-root.txt"), $Root); $global:LASTEXITCODE = 0'
+        Write-ControlSource -Directory $candidate -Path '.github/ci/Test-Workflow.ps1' -Text "throw 'Candidate checking policy must never execute.'`n"
+        Write-ControlSource -Directory $policy -Path 'Test-Workflow.ps1' -Text 'param([string]$Root); [IO.File]::WriteAllText((Join-Path $PSScriptRoot "observed-root.txt"), $Root); $global:LASTEXITCODE = 0'
         [IO.File]::WriteAllText($paths, '[".github/workflows/deleted.yml"]')
         $previousLinter = $env:PRISM_ACTIONLINT_PATH
         try {
@@ -56,7 +56,7 @@ try {
     if ($Case -in @('all', 'receipts')) {
         $repository = Join-Path $scratch 'repository'
         $target = Join-Path $scratch 'target'
-        foreach ($path in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'tools/source-sanity/fixture.txt')) { Write-ControlSource $repository $path 'Inert committed identity fixture; no compiler consumer.' }
+        foreach ($path in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'tools/source-sanity/fixture.txt')) { Write-ControlSource -Directory $repository -Path $path -Text 'Inert committed identity fixture; no compiler consumer.' }
         git -C $repository init --quiet
         git -C $repository add --all
         git -C $repository -c user.name=Fixture -c user.email=fixture@example.invalid -c core.hooksPath= -c commit.gpgsign=false commit --quiet -m fixture
@@ -65,7 +65,7 @@ try {
         $objects += 'absent:.cargo'
         $identity = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
         $image = Join-Path $target 'aarch64-pc-windows-msvc/debug/prism-source-sanity.exe'
-        Write-ControlSource $target 'aarch64-pc-windows-msvc/debug/prism-source-sanity.exe' 'Inert checker must never execute.'
+        Write-ControlSource -Directory $target -Path 'aarch64-pc-windows-msvc/debug/prism-source-sanity.exe' -Text 'Inert checker must never execute.'
         $digest = (Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant()
         $receipt = Join-Path $target 'push-checker.json'
         $adapter = Join-Path $PSScriptRoot 'Check-PushSanity.ps1'

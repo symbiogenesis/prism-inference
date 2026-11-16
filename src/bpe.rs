@@ -24,10 +24,170 @@ pub const MAX_BPE_INPUT_BYTES: usize = 1024 * 1024;
 /// Maximum pretokenized pieces admitted in one call, including empty pieces.
 pub const MAX_BPE_INPUT_PIECES: usize = 64 * 1024;
 
+const EMPTY_RANK: u32 = u32::MAX;
+
+const _: () = assert!(MAX_BPE_MERGES < 0xFFFF_FFFF);
+
 #[derive(Clone, Copy, Debug)]
 struct Merge {
-    rank: usize,
+    rank: u32,
     token: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    pair: u64,
+    rank: u32,
+    token: u32,
+}
+
+const _: () = assert!(size_of::<Slot>() == 16);
+
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
+            pair: 0,
+            rank: EMPTY_RANK,
+            token: 0,
+        }
+    }
+}
+
+fn pack_pair(left: u32, right: u32) -> u64 {
+    (u64::from(left) << 32) | u64::from(right)
+}
+
+const fn mix_pair(mut key: u64) -> u64 {
+    key = (key ^ (key >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    key = (key ^ (key >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    key ^ (key >> 31)
+}
+
+fn slot_index(hash: u64, mask: usize) -> usize {
+    u64::try_from(mask).map_or(0, |mask_u64| usize::try_from(hash & mask_u64).unwrap_or(0))
+}
+
+#[derive(Debug)]
+struct MergeTable {
+    slots: Vec<Slot>,
+    len: usize,
+}
+
+impl MergeTable {
+    fn with_capacity(merges: usize) -> Result<Self> {
+        if merges > MAX_BPE_MERGES {
+            return Err(invalid("BPE merge count exceeds supported bounds"));
+        }
+        if merges == 0 {
+            return Ok(Self {
+                slots: Vec::new(),
+                len: 0,
+            });
+        }
+        let capacity = merges
+            .checked_mul(2)
+            .ok_or_else(|| invalid("BPE merge table capacity overflow"))?
+            .max(8)
+            .next_power_of_two();
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(capacity)?;
+        slots.resize(capacity, Slot::default());
+        Ok(Self { slots, len: 0 })
+    }
+
+    fn rehash(&mut self, new_capacity: usize) -> Result<()> {
+        let mut new_slots = Vec::new();
+        new_slots.try_reserve_exact(new_capacity)?;
+        new_slots.resize(new_capacity, Slot::default());
+        let mask = new_capacity - 1;
+        for &slot in &self.slots {
+            if slot.rank == EMPTY_RANK {
+                continue;
+            }
+            let mut index = slot_index(mix_pair(slot.pair), mask);
+            while new_slots[index].rank != EMPTY_RANK {
+                index = (index + 1) & mask;
+            }
+            new_slots[index] = slot;
+        }
+        self.slots = new_slots;
+        Ok(())
+    }
+
+    fn insert(&mut self, left: u32, right: u32, rank: u32, token: u32) -> Result<Option<Merge>> {
+        if rank == EMPTY_RANK || usize::try_from(rank)? >= MAX_BPE_MERGES {
+            return Err(invalid("BPE merge rank exceeds supported bounds"));
+        }
+        let pair = pack_pair(left, right);
+        if !self.slots.is_empty() {
+            let slot_count = self.slots.len();
+            let mask = slot_count - 1;
+            let mut index = slot_index(mix_pair(pair), mask);
+            loop {
+                let slot = &mut self.slots[index];
+                if slot.rank == EMPTY_RANK {
+                    if self.len >= MAX_BPE_MERGES {
+                        return Err(invalid("BPE merge count exceeds supported bounds"));
+                    }
+                    if (self.len + 1) * 2 <= slot_count {
+                        *slot = Slot { pair, rank, token };
+                        self.len += 1;
+                        return Ok(None);
+                    }
+                    break;
+                }
+                if slot.pair == pair {
+                    let previous = Merge {
+                        rank: slot.rank,
+                        token: slot.token,
+                    };
+                    slot.rank = rank;
+                    slot.token = token;
+                    return Ok(Some(previous));
+                }
+                index = (index + 1) & mask;
+            }
+        } else if self.len >= MAX_BPE_MERGES {
+            return Err(invalid("BPE merge count exceeds supported bounds"));
+        }
+        let new_capacity = self
+            .slots
+            .len()
+            .max(4)
+            .checked_mul(2)
+            .ok_or_else(|| invalid("BPE merge table capacity overflow"))?;
+        self.rehash(new_capacity)?;
+        let mask = self.slots.len() - 1;
+        let mut index = slot_index(mix_pair(pair), mask);
+        while self.slots[index].rank != EMPTY_RANK {
+            index = (index + 1) & mask;
+        }
+        self.slots[index] = Slot { pair, rank, token };
+        self.len += 1;
+        Ok(None)
+    }
+
+    fn get(&self, left: u32, right: u32) -> Option<Merge> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let pair = pack_pair(left, right);
+        let mask = self.slots.len() - 1;
+        let mut index = slot_index(mix_pair(pair), mask);
+        loop {
+            let slot = self.slots[index];
+            if slot.rank == EMPTY_RANK {
+                return None;
+            }
+            if slot.pair == pair {
+                return Some(Merge {
+                    rank: slot.rank,
+                    token: slot.token,
+                });
+            }
+            index = (index + 1) & mask;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -40,7 +200,7 @@ struct Node {
 
 // Rank first, original left position second: equal-ranked overlapping pairs
 // deterministically merge at the leftmost surviving position.
-type Candidate = (usize, usize, usize, u32, u32, u32);
+type Candidate = (u32, usize, usize, u32, u32, u32);
 
 const PIECE_CACHE_SLOTS: usize = 16;
 const PIECE_CACHE_BYTES: usize = 32;
@@ -117,7 +277,7 @@ fn piece_slot(bytes: &[u8]) -> usize {
 #[derive(Debug)]
 pub struct Bpe {
     bytes: [Option<u32>; 256],
-    merges: HashMap<(u32, u32), Merge>,
+    merges: MergeTable,
 }
 
 impl Bpe {
@@ -188,8 +348,7 @@ impl Bpe {
                 bytes[usize::from(decode_character(character)?)] = Some(id);
             }
         }
-        let mut merges = HashMap::new();
-        merges.try_reserve(rules.len())?;
+        let mut merges = MergeTable::with_capacity(rules.len())?;
         let mut combined = String::new();
         for (rank, rule) in rules.iter().enumerate() {
             let Some((left, right)) = rule.split_once(' ') else {
@@ -211,10 +370,8 @@ impl Bpe {
             let token = *normal
                 .get(combined.as_str())
                 .ok_or_else(|| invalid("BPE merge result is not a normal token"))?;
-            if merges
-                .insert((left_id, right_id), Merge { rank, token })
-                .is_some()
-            {
+            let rank = u32::try_from(rank)?;
+            if merges.insert(left_id, right_id, rank, token)?.is_some() {
                 return Err(invalid("BPE has duplicate merge pairs"));
             }
         }
@@ -370,7 +527,7 @@ impl Bpe {
         }
         let mut pairs = [None; SHORT_PIECE_BYTES - 1];
         for (pair, adjacent) in pairs.iter_mut().zip(tokens[..bytes.len()].windows(2)) {
-            *pair = self.merges.get(&(adjacent[0], adjacent[1])).copied();
+            *pair = self.merges.get(adjacent[0], adjacent[1]);
         }
         let mut remaining = bytes.len();
         loop {
@@ -389,10 +546,10 @@ impl Bpe {
             }
             remaining -= 1;
             if left != 0 {
-                pairs[left - 1] = self.merges.get(&(tokens[left - 1], tokens[left])).copied();
+                pairs[left - 1] = self.merges.get(tokens[left - 1], tokens[left]);
             }
             if left + 1 < remaining {
-                pairs[left] = self.merges.get(&(tokens[left], tokens[left + 1])).copied();
+                pairs[left] = self.merges.get(tokens[left], tokens[left + 1]);
             }
         }
         if remaining > max_tokens {
@@ -444,7 +601,7 @@ impl Bpe {
         let right = nodes[left].next?;
         let left_token = nodes[left].token;
         let right_token = nodes[right].token;
-        let merge = self.merges.get(&(left_token, right_token))?;
+        let merge = self.merges.get(left_token, right_token)?;
         Some(Reverse((
             merge.rank,
             left,
@@ -458,3 +615,161 @@ impl Bpe {
 
 #[cfg(test)]
 mod piece_cache_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bonsai_gguf::MetadataValue;
+
+    #[test]
+    fn merge_table_handles_hash_collisions_growth_and_updates() -> Result<()> {
+        // Find three distinct packed pairs that map to the exact same slot mod 8.
+        let mut table = MergeTable::with_capacity(4)?;
+        assert_eq!(table.slots.len(), 8);
+        let mask = table.slots.len() - 1;
+        let target_slot = slot_index(mix_pair(pack_pair(10, 20)), mask);
+        let mut colliding = vec![(10_u32, 20_u32)];
+        for right in 0_u32..512 {
+            if right == 20 {
+                continue;
+            }
+            if slot_index(mix_pair(pack_pair(10, right)), mask) == target_slot {
+                colliding.push((10, right));
+                if colliding.len() == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(colliding.len(), 3);
+
+        for (rank, &(left, right)) in colliding.iter().enumerate() {
+            assert!(
+                table
+                    .insert(
+                        left,
+                        right,
+                        u32::try_from(rank)?,
+                        1000 + u32::try_from(rank)?
+                    )?
+                    .is_none()
+            );
+        }
+        // Add boundary pairs to ensure high/low 32-bit packing never aliases, forcing a rehash past 4 entries.
+        let extra = [
+            (0_u32, u32::MAX),
+            (u32::MAX, 0_u32),
+            (u32::MAX, u32::MAX),
+            (1_u32, 0_u32),
+            (0_u32, 1_u32),
+        ];
+        for (offset, &(left, right)) in extra.iter().enumerate() {
+            let rank = u32::try_from(colliding.len() + offset)?;
+            assert!(table.insert(left, right, rank, 2000 + rank)?.is_none());
+        }
+        assert_eq!(table.len, 8);
+        assert_eq!(table.slots.len(), 16);
+
+        for (rank, &(left, right)) in colliding.iter().enumerate() {
+            let found = table
+                .get(left, right)
+                .ok_or_else(|| invalid("missing colliding entry"))?;
+            assert_eq!(found.rank, u32::try_from(rank)?);
+            assert_eq!(found.token, 1000 + u32::try_from(rank)?);
+        }
+        for (offset, &(left, right)) in extra.iter().enumerate() {
+            let rank = u32::try_from(colliding.len() + offset)?;
+            let found = table
+                .get(left, right)
+                .ok_or_else(|| invalid("missing boundary entry"))?;
+            assert_eq!(found.rank, rank);
+            assert_eq!(found.token, 2000 + rank);
+        }
+        assert!(table.get(999, 999).is_none());
+
+        let replaced = table
+            .insert(colliding[1].0, colliding[1].1, 42, 7777)?
+            .ok_or_else(|| invalid("expected existing merge"))?;
+        assert_eq!(replaced.rank, 1);
+        assert_eq!(replaced.token, 1001);
+        let updated = table
+            .get(colliding[1].0, colliding[1].1)
+            .ok_or_else(|| invalid("missing updated entry"))?;
+        assert_eq!(updated.rank, 42);
+        assert_eq!(updated.token, 7777);
+        assert_eq!(table.len, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_table_enforces_capacity_and_rank_overflow_guards() -> Result<()> {
+        assert!(MergeTable::with_capacity(MAX_BPE_MERGES + 1).is_err());
+
+        let mut empty = MergeTable::with_capacity(0)?;
+        assert!(empty.get(1, 2).is_none());
+        assert!(empty.insert(1, 2, EMPTY_RANK, 3).is_err());
+        assert!(
+            empty
+                .insert(1, 2, u32::try_from(MAX_BPE_MERGES)?, 3)
+                .is_err()
+        );
+        assert!(empty.insert(1, 2, 0, 3)?.is_none());
+        assert_eq!(empty.get(1, 2).map(|m| (m.rank, m.token)), Some((0, 3)));
+
+        // Simulate saturated MAX_BPE_MERGES count without allocating a million entries:
+        // updating an existing entry still succeeds, while adding a new pair is rejected.
+        empty.len = MAX_BPE_MERGES;
+        assert!(empty.insert(1, 2, 1, 4)?.is_some());
+        assert!(empty.insert(9, 10, 1, 5).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bpe_open_addressed_merge_table_preserves_encoding_parity() -> Result<()> {
+        let tokens = [
+            ("a", 1),
+            ("b", 1),
+            ("c", 1),
+            ("ab", 1),
+            ("bc", 1),
+            ("aa", 1),
+            ("abc", 1),
+            ("abca", 1),
+        ];
+        let metadata = Metadata::from([
+            ("tokenizer.ggml.model".to_owned(), "gpt2".into()),
+            ("tokenizer.ggml.pre".to_owned(), "qwen35".into()),
+            (
+                "tokenizer.ggml.tokens".to_owned(),
+                tokens
+                    .iter()
+                    .map(|(text, _)| *text)
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_owned(),
+                tokens
+                    .iter()
+                    .map(|(_, kind)| *kind)
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            (
+                "tokenizer.ggml.merges".to_owned(),
+                MetadataValue::from(vec!["a b", "b c", "ab c", "a a", "abc a"]),
+            ),
+        ]);
+        let bpe = Bpe::from_metadata(&metadata, tokens.len())?;
+        // Short piece path (<= 16 bytes) and heap/node path (> 16 bytes) agree on merge order.
+        // At index 15..18 (`...abc a a a`), rank 3 ("a a") precedes rank 4 ("abc a").
+        assert_eq!(bpe.encode_piece(b"abca", 4)?, [7]);
+        assert_eq!(bpe.encode_piece(b"aaa", 3)?, [5, 0]);
+        let long_piece = b"abcaabcaabcaabcaaa";
+        assert_eq!(bpe.encode_piece(long_piece, 10)?, [7, 7, 7, 6, 5, 0]);
+        assert_eq!(
+            bpe.encode_pieces(&[b"abca", b"", b"aaa", long_piece], 20)?,
+            [7, 5, 0, 7, 7, 7, 6, 5, 0]
+        );
+        Ok(())
+    }
+}

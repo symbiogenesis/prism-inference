@@ -7,7 +7,7 @@ fn fixture() -> Result<Bpe> {
     for (index, token) in bytes.iter_mut().enumerate() {
         *token = Some(u32::try_from(index)?);
     }
-    let mut merges = HashMap::new();
+    let mut merges = MergeTable::with_capacity(5)?;
     for (rank, left, right, token) in [
         (0, 98, 99, 256),
         (1, 97, 97, 257),
@@ -15,7 +15,7 @@ fn fixture() -> Result<Bpe> {
         (3, 257, 97, 259),
         (4, 258, 99, 260),
     ] {
-        merges.insert((left, right), Merge { rank, token });
+        merges.insert(left, right, rank, token)?;
     }
     Ok(Bpe { bytes, merges })
 }
@@ -33,7 +33,7 @@ fn oracle(bpe: &Bpe, bytes: &[u8]) -> Result<Vec<u32>> {
             .enumerate()
             .filter_map(|(index, pair)| {
                 bpe.merges
-                    .get(&(pair[0], pair[1]))
+                    .get(pair[0], pair[1])
                     .map(|merge| (merge.rank, index, merge.token))
             })
             .min_by_key(|&(rank, index, _)| (rank, index));
@@ -73,13 +73,7 @@ fn x1_piece_cache_matches_independent_ranked_oracle_and_skips_repeated_merges() 
 fn piece_cache_collisions_owners_unicode_and_long_bypass_preserve_identity() -> Result<()> {
     let original = fixture()?;
     let mut changed = fixture()?;
-    changed.merges.insert(
-        (97, 97),
-        Merge {
-            rank: 1,
-            token: 999,
-        },
-    );
+    changed.merges.insert(97, 97, 1, 999)?;
     let mut scratch = BpeScratch::default();
     assert_eq!(piece_slot(b"aaa"), piece_slot(b"qqq"));
     for (bpe, piece) in [

@@ -156,28 +156,63 @@ impl Dynamic {
         if size == 0 {
             return Ok(());
         }
-        let chunk = &mut self.chunks[address.chunk];
-        chunk.free.push((address.offset, size));
-        chunk.free.sort_unstable_by_key(|block| block.0);
-        let mut merged: Vec<(usize, usize)> = Vec::new();
-        for &(offset, extent) in &chunk.free {
-            if let Some((previous, bytes)) = merged.last_mut() {
-                let end = previous
-                    .checked_add(*bytes)
-                    .ok_or_else(|| invalid("graph free extent overflow"))?;
-                if end == offset {
-                    *bytes = bytes
-                        .checked_add(extent)
-                        .ok_or_else(|| invalid("graph free merge overflow"))?;
-                    continue;
-                }
-                if end > offset {
-                    return Err(invalid("graph allocator double free"));
-                }
+        let end = address
+            .offset
+            .checked_add(size)
+            .ok_or_else(|| invalid("graph free extent overflow"))?;
+        let chunk = self
+            .chunks
+            .get_mut(address.chunk)
+            .ok_or_else(|| invalid("graph free chunk out of bounds"))?;
+        let idx = chunk
+            .free
+            .partition_point(|&(offset, _)| offset < address.offset);
+        let merge_prev = if let Some(prev_idx) = idx.checked_sub(1) {
+            let (prev_offset, prev_bytes) = chunk.free[prev_idx];
+            let prev_end = prev_offset
+                .checked_add(prev_bytes)
+                .ok_or_else(|| invalid("graph free extent overflow"))?;
+            if prev_end > address.offset {
+                return Err(invalid("graph allocator double free"));
             }
-            merged.push((offset, extent));
+            prev_end == address.offset
+        } else {
+            false
+        };
+        let merge_next = if let Some(&(next_offset, _)) = chunk.free.get(idx) {
+            if end > next_offset {
+                return Err(invalid("graph allocator double free"));
+            }
+            end == next_offset
+        } else {
+            false
+        };
+        match (merge_prev, merge_next) {
+            (true, true) => {
+                let merged = chunk.free[idx - 1]
+                    .1
+                    .checked_add(size)
+                    .and_then(|total| total.checked_add(chunk.free[idx].1))
+                    .ok_or_else(|| invalid("graph free merge overflow"))?;
+                chunk.free[idx - 1].1 = merged;
+                chunk.free.remove(idx);
+            }
+            (true, false) => {
+                chunk.free[idx - 1].1 = chunk.free[idx - 1]
+                    .1
+                    .checked_add(size)
+                    .ok_or_else(|| invalid("graph free merge overflow"))?;
+            }
+            (false, true) => {
+                let merged = size
+                    .checked_add(chunk.free[idx].1)
+                    .ok_or_else(|| invalid("graph free merge overflow"))?;
+                chunk.free[idx] = (address.offset, merged);
+            }
+            (false, false) => {
+                chunk.free.insert(idx, (address.offset, size));
+            }
         }
-        chunk.free = merged;
         Ok(())
     }
 }
@@ -713,6 +748,75 @@ mod tests {
             .map(f32::to_bits)
             .collect();
         assert_eq!(actual, [3.0_f32, -4.0, 6.5, 8.0].map(f32::to_bits));
+        Ok(())
+    }
+
+    #[test]
+    fn in_place_free_coalesces_adjacent_blocks_and_rejects_double_free() -> Result<()> {
+        let mut dynamic = super::Dynamic {
+            descriptor: BufferType {
+                alignment: 16,
+                maximum: Some(1024),
+            },
+            chunks: Vec::new(),
+        };
+        let first = dynamic.allocate(128, 0)?;
+        let second = dynamic.allocate(128, 0)?;
+        let third = dynamic.allocate(128, 0)?;
+        let fourth = dynamic.allocate(128, 0)?;
+        assert_eq!(dynamic.chunks[0].free, [(512, 512)]);
+
+        // Disjoint free neither merges left nor right.
+        dynamic.free(second, 128)?;
+        assert_eq!(dynamic.chunks[0].free, [(128, 128), (512, 512)]);
+        // Merge with following block only.
+        dynamic.free(first, 128)?;
+        assert_eq!(dynamic.chunks[0].free, [(0, 256), (512, 512)]);
+        // Merge with following tail block only.
+        dynamic.free(fourth, 128)?;
+        assert_eq!(dynamic.chunks[0].free, [(0, 256), (384, 640)]);
+        // Bridge preceding and following blocks in place.
+        dynamic.free(third, 128)?;
+        assert_eq!(dynamic.chunks[0].free, [(0, 1024)]);
+
+        // Re-allocate and verify merge with preceding block only, plus double-free errors.
+        let left = dynamic.allocate(128, 0)?;
+        let mid = dynamic.allocate(128, 0)?;
+        let _right = dynamic.allocate(128, 0)?;
+        dynamic.free(left, 128)?;
+        assert_eq!(dynamic.chunks[0].free, [(0, 128), (384, 640)]);
+        dynamic.free(mid, 128)?;
+        assert_eq!(dynamic.chunks[0].free, [(0, 256), (384, 640)]);
+
+        assert!(
+            dynamic
+                .free(left, 128)
+                .is_err_and(|err| err.to_string() == "graph allocator double free")
+        );
+        assert!(
+            dynamic
+                .free(
+                    super::Address {
+                        kind: 0,
+                        chunk: 0,
+                        offset: 240,
+                    },
+                    32,
+                )
+                .is_err_and(|err| err.to_string() == "graph allocator double free")
+        );
+        assert!(
+            dynamic
+                .free(
+                    super::Address {
+                        kind: 0,
+                        chunk: 0,
+                        offset: 368,
+                    },
+                    32,
+                )
+                .is_err_and(|err| err.to_string() == "graph allocator double free")
+        );
         Ok(())
     }
 }

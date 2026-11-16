@@ -3109,6 +3109,52 @@ impl Qwen35 {
             .map(|executor| executor.identity())
     }
 
+    /// Release file-mapped host backing bytes on layer weights already claimed
+    /// and resident on the installed projection executor.
+    ///
+    /// # Errors
+    /// Refuses when no projection executor is installed or when CPU tiled prefill
+    /// is configured, since tiled `ingest_block` still reads host weights.
+    pub fn release_executor_resident_host_weights(&mut self) -> Result<usize> {
+        if self.tiled_prefill.is_some() {
+            return Err(invalid(
+                "cannot release host weights while CPU tiled prefill is enabled",
+            ));
+        }
+        let Some(executor) = self.projection_executor.as_deref() else {
+            return Err(invalid(
+                "cannot release executor-resident host weights without an installed executor",
+            ));
+        };
+        let mut released = 0_usize;
+        let mut release_if_claimed = |tensor: &mut Tensor| {
+            if Transforms::executor_claims_weight(Some(executor), tensor) {
+                released = released.saturating_add(tensor.data.release_mapped());
+            }
+        };
+        for layer in &mut self.layers {
+            match &mut layer.attention {
+                Attention::Full(full) => {
+                    release_if_claimed(&mut full.query);
+                    release_if_claimed(&mut full.key);
+                    release_if_claimed(&mut full.value);
+                    release_if_claimed(&mut full.output);
+                }
+                Attention::Recurrent(recurrent) => {
+                    release_if_claimed(&mut recurrent.qkv);
+                    release_if_claimed(&mut recurrent.gate);
+                    release_if_claimed(&mut recurrent.beta);
+                    release_if_claimed(&mut recurrent.alpha);
+                    release_if_claimed(&mut recurrent.output);
+                }
+            }
+            release_if_claimed(&mut layer.up);
+            release_if_claimed(&mut layer.gate);
+            release_if_claimed(&mut layer.down);
+        }
+        Ok(released)
+    }
+
     /// Enable or disable last-layer (lk.N-1) state-only prefill row narrowing.
     ///
     /// Enabled by default for graphs with at least 4 layers (such as the 64-layer
@@ -8631,5 +8677,280 @@ mod tests {
             assert_eq!(decoder.evaluate(1)?, clean.evaluate(1)?);
             Ok(())
         }
+    }
+
+    struct ClaimFfnOnlyExecutor;
+
+    impl crate::kernels::Pq2ProjectionExecutor for ClaimFfnOnlyExecutor {
+        fn identity(&self) -> &'static str {
+            "claim-ffn-only-test"
+        }
+
+        fn supports(&self, _tensor: &Tensor) -> bool {
+            false
+        }
+
+        fn supports_f32(&self, tensor: &Tensor) -> bool {
+            tensor.kind == crate::kernels::PQ2 && tensor.name.contains(".ffn_")
+        }
+
+        fn project(
+            &mut self,
+            _tensor: &Tensor,
+            _activation: &[crate::kernels::Q8KBlock],
+            _fused: bool,
+            _output: &mut Vec<f32>,
+        ) -> Result<()> {
+            Err(crate::invalid("not invoked in host-weight release test"))
+        }
+    }
+
+    struct MappedWeightBinGuard {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for MappedWeightBinGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Build a complete 128-wide file-mapped PQ2 attention+FFN model fixture"
+    )]
+    fn build_mapped_pq2_release_fixture()
+    -> Result<(super::Model, Option<MappedWeightBinGuard>, usize)> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut metadata = BTreeMap::new();
+        for (key, value) in [
+            ("general.architecture", super::MetadataValue::from("qwen35")),
+            ("qwen35.block_count", super::MetadataValue::from(1_u32)),
+            ("qwen35.context_length", super::MetadataValue::from(32_u32)),
+            (
+                "qwen35.embedding_length",
+                super::MetadataValue::from(128_u32),
+            ),
+            (
+                "qwen35.feed_forward_length",
+                super::MetadataValue::from(128_u32),
+            ),
+            (
+                "qwen35.attention.head_count",
+                super::MetadataValue::from(1_u32),
+            ),
+            (
+                "qwen35.attention.head_count_kv",
+                super::MetadataValue::from(1_u32),
+            ),
+            (
+                "qwen35.attention.key_length",
+                super::MetadataValue::from(128_u32),
+            ),
+            (
+                "qwen35.attention.value_length",
+                super::MetadataValue::from(128_u32),
+            ),
+            (
+                "qwen35.rope.dimension_count",
+                super::MetadataValue::from(64_u32),
+            ),
+            (
+                "qwen35.rope.freq_base",
+                super::MetadataValue::from(10_000.0_f32),
+            ),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon",
+                super::MetadataValue::from(1e-6_f32),
+            ),
+            (
+                "qwen35.full_attention_interval",
+                super::MetadataValue::from(1_u32),
+            ),
+            ("qwen35.ssm.state_size", super::MetadataValue::from(1_u32)),
+            ("qwen35.ssm.group_count", super::MetadataValue::from(1_u32)),
+            (
+                "qwen35.ssm.time_step_rank",
+                super::MetadataValue::from(1_u32),
+            ),
+            ("qwen35.ssm.inner_size", super::MetadataValue::from(1_u32)),
+            ("qwen35.ssm.conv_kernel", super::MetadataValue::from(2_u32)),
+        ] {
+            metadata.insert(key.to_owned(), value);
+        }
+        metadata.insert(
+            "qwen35.rope.dimension_sections".to_owned(),
+            super::MetadataValue::from(vec![32_u32, 0, 0, 0]),
+        );
+        metadata.insert(
+            "qwen35.attention.recurrent_layers".to_owned(),
+            super::MetadataValue::from(vec![false]),
+        );
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "SwiftBonsai-GraphReleaseMapped-{}-{id}.bin",
+            std::process::id()
+        ));
+        let mut block = [0x55_u8; 34];
+        block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        let pq2_128x128 = block.repeat(128);
+        let pq2_128x256 = block.repeat(256);
+        let mut blob = Vec::with_capacity(pq2_128x256.len() + pq2_128x128.len() * 6);
+        blob.extend_from_slice(&pq2_128x256);
+        for _ in 0..6 {
+            blob.extend_from_slice(&pq2_128x128);
+        }
+        std::fs::write(&path, &blob)?;
+        let file = std::fs::File::open(&path)?;
+        let mapped = bonsai_native_hash::mmap::MappedReadOnlyFile::try_map(
+            &file,
+            u64::try_from(blob.len())?,
+        )?;
+        drop(file);
+        let guard = Some(MappedWeightBinGuard { path });
+        let mut offset = 0_usize;
+        let mut pq2_tensor = |name: &str, dims: &[usize]| -> Result<Tensor> {
+            let cols = dims[0];
+            let rows = dims[1];
+            let len = (cols / 128) * rows * 34;
+            let data = if let Some(file_map) = &mapped {
+                crate::model::TensorBytes::from(file_map.slice(offset, len)?)
+            } else {
+                crate::model::TensorBytes::from(Arc::<[u8]>::from(&blob[offset..offset + len]))
+            };
+            offset += len;
+            Ok(Tensor {
+                name: name.to_owned(),
+                dimensions: dims.to_vec(),
+                kind: crate::kernels::PQ2,
+                data,
+            })
+        };
+        let f32_vec = |name: &str, dims: &[usize], val: f32| -> Tensor {
+            let len: usize = dims.iter().product();
+            let bytes: Vec<u8> = vec![val; len]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            Tensor {
+                name: name.to_owned(),
+                dimensions: dims.to_vec(),
+                kind: 0,
+                data: Arc::<[u8]>::from(bytes).into(),
+            }
+        };
+        let tensors = BTreeMap::from([
+            (
+                "token_embd.weight".to_owned(),
+                f32_vec("token_embd.weight", &[128, 2], 0.25),
+            ),
+            (
+                "output.weight".to_owned(),
+                f32_vec("output.weight", &[128, 2], -0.25),
+            ),
+            (
+                "output_norm.weight".to_owned(),
+                f32_vec("output_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.attn_norm.weight".to_owned(),
+                f32_vec("blk.0.attn_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.post_attention_norm.weight".to_owned(),
+                f32_vec("blk.0.post_attention_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.attn_q_norm.weight".to_owned(),
+                f32_vec("blk.0.attn_q_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.attn_k_norm.weight".to_owned(),
+                f32_vec("blk.0.attn_k_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.attn_q.weight".to_owned(),
+                pq2_tensor("blk.0.attn_q.weight", &[128, 256])?,
+            ),
+            (
+                "blk.0.attn_k.weight".to_owned(),
+                pq2_tensor("blk.0.attn_k.weight", &[128, 128])?,
+            ),
+            (
+                "blk.0.attn_v.weight".to_owned(),
+                pq2_tensor("blk.0.attn_v.weight", &[128, 128])?,
+            ),
+            (
+                "blk.0.attn_output.weight".to_owned(),
+                pq2_tensor("blk.0.attn_output.weight", &[128, 128])?,
+            ),
+            (
+                "blk.0.ffn_up.weight".to_owned(),
+                pq2_tensor("blk.0.ffn_up.weight", &[128, 128])?,
+            ),
+            (
+                "blk.0.ffn_gate.weight".to_owned(),
+                pq2_tensor("blk.0.ffn_gate.weight", &[128, 128])?,
+            ),
+            (
+                "blk.0.ffn_down.weight".to_owned(),
+                pq2_tensor("blk.0.ffn_down.weight", &[128, 128])?,
+            ),
+        ]);
+        let expected_ffn_bytes = if mapped.is_some() {
+            3 * pq2_128x128.len()
+        } else {
+            0
+        };
+        Ok((
+            super::Model {
+                metadata,
+                tensors,
+                identity: "graph-mapped-release-fixture".to_owned(),
+            },
+            guard,
+            expected_ffn_bytes,
+        ))
+    }
+
+    #[test]
+    fn release_executor_resident_host_weights_deduplicates_mapped_and_refuses_tiled_or_absent()
+    -> Result<()> {
+        let (model, guard, expected_ffn_bytes) = build_mapped_pq2_release_fixture()?;
+        let mut decoder = super::Qwen35::new(model, 32)?;
+        // Drop order: decoder must drop before guard removes the backing file on Windows.
+        let _guard = guard;
+
+        // 1. Refuses without an installed projection executor.
+        assert!(decoder.release_executor_resident_host_weights().is_err());
+
+        // 2. Refuses when CPU tiled prefill is enabled, leaving mapped slices untouched.
+        let (tiled_model, tiled_guard, _) = build_mapped_pq2_release_fixture()?;
+        let _tiled_guard = tiled_guard;
+        let mut tiled = super::Qwen35::new(tiled_model, 32)?;
+        let scratch = tiled.tiled_prefill_scratch_bytes(8)?;
+        tiled = tiled.with_tiled_prefill(8, scratch)?;
+        tiled.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor)));
+        assert!(tiled.release_executor_resident_host_weights().is_err());
+        assert_eq!(tiled.layers[0].up.data.is_mapped(), cfg!(windows));
+        drop(tiled);
+
+        // 3. Releases only mapped weights claimed by the installed executor.
+        decoder.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor)));
+        let released = decoder.release_executor_resident_host_weights()?;
+        assert_eq!(released, expected_ffn_bytes);
+        assert!(!decoder.layers[0].up.data.is_mapped());
+        assert!(decoder.layers[0].up.data.is_empty());
+        assert!(!decoder.layers[0].gate.data.is_mapped());
+        assert!(!decoder.layers[0].down.data.is_mapped());
+        if let super::Attention::Full(full) = &decoder.layers[0].attention {
+            assert_eq!(full.query.data.is_mapped(), cfg!(windows));
+            assert!(!full.query.data.is_empty());
+        } else {
+            return Err(crate::invalid("expected full attention layer"));
+        }
+        assert_eq!(decoder.release_executor_resident_host_weights()?, 0);
+        drop(decoder);
+        Ok(())
     }
 }

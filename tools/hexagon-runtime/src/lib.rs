@@ -13,7 +13,8 @@ pub use hmx::{HmxQ2Executor, HmxResidencyStatistics};
 mod native_q2;
 pub use native_q2::{
     DEFAULT_NATIVE_Q2_PROJECTIONS, DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES,
-    DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES, NativeQ2Executor, NativeQ2ResidencyStatistics,
+    DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES, NativeQ2ArenaCache, NativeQ2ArenaCacheEntry,
+    NativeQ2Executor, NativeQ2ResidencyStatistics,
 };
 mod q8;
 pub use q8::HmxQ8Executor;

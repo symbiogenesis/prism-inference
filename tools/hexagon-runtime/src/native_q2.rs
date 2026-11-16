@@ -6,15 +6,23 @@
 //! executes the full `K <= 5120`, `M <= 17408` projection in a single DSP
 //! operation (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`).
 
+use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bonsai_prism_runtime::{
     kernels::{Pq2ProjectionExecutor, RowParallelism, is_finite_slice},
     model::Tensor,
 };
 use bonsai_ternary::Q8KBlock;
-use hexagon_native_rpc::{NativeQ2ProjectionLimits, NativeQ2Submitter, NativeQ2WeightHandle};
+use hexagon_native_rpc::{
+    NATIVE_Q2_MAX_COLUMNS, NATIVE_Q2_MAX_ROWS, NativeQ2ProjectionLimits, NativeQ2Submitter,
+    NativeQ2WeightHandle,
+};
 
 use crate::guarded::{finite, scale, zeroed};
 use crate::{HmxResidencyStatistics, ProjectionStatistics, Result, invalid};
@@ -693,15 +701,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             }
             selected.push(tensor.clone());
         }
-        selected.sort_by(|left, right| selected_tensor_key(left).cmp(&selected_tensor_key(right)));
-        let min_addr = selected
-            .first()
-            .map_or(0, |tensor| tensor.data.as_ptr().addr());
-        let max_addr = selected
-            .last()
-            .map_or(0, |tensor| tensor.data.as_ptr().addr());
-        self.allowed_addr_range = (min_addr, max_addr);
-        self.allowed_tensors = Some(selected);
+        self.bind_allowed_tensors(selected);
         if self.residency.is_some() {
             let mut weights = std::mem::take(&mut self.scratch_weights);
             for tensor in tensors {
@@ -769,6 +769,11 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 "native Q2 resident arena exhausted before preparing any tensor",
             ));
         }
+        self.bind_allowed_tensors(selected);
+        Ok(prepared)
+    }
+
+    fn bind_allowed_tensors(&mut self, mut selected: Vec<Tensor>) {
         selected.sort_by(|left, right| selected_tensor_key(left).cmp(&selected_tensor_key(right)));
         let min_addr = selected
             .first()
@@ -778,7 +783,6 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             .map_or(0, |tensor| tensor.data.as_ptr().addr());
         self.allowed_addr_range = (min_addr, max_addr);
         self.allowed_tensors = Some(selected);
-        Ok(prepared)
     }
 
     fn project_single_op(
@@ -3256,6 +3260,465 @@ fn pack_native_chunk(
     Ok(())
 }
 
+const NATIVE_Q2_ARENA_CACHE_MAGIC: &[u8; 8] = b"SB2HQ2C1";
+const NATIVE_Q2_ARENA_CACHE_HEADER_BYTES: usize = 8 + 4 + 32 + 4 + 32;
+const NATIVE_Q2_ARENA_CACHE_PAYLOAD_SHA_OFFSET: u64 = 48;
+const NATIVE_Q2_ARENA_CACHE_MAX_TENSORS: usize = 1024;
+const NATIVE_Q2_ARENA_CACHE_MAX_NAME_BYTES: usize = 512;
+const NATIVE_Q2_ARENA_CACHE_DIGEST_CHUNK_BYTES: usize = 65_536;
+static NEXT_CACHE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Canonical index entry inside a [`NativeQ2ArenaCache`] binary file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeQ2ArenaCacheEntry {
+    /// Original model tensor name, matching `Tensor::name`.
+    pub name: String,
+    /// Original active input-column extent (`K`), always a positive multiple of `128`.
+    pub columns: usize,
+    /// Original active output-row extent (`M`).
+    pub rows: usize,
+    /// Byte offset from the start of the contiguous payload region.
+    pub offset: u64,
+    /// Exact packed `HTP_TYPE_Q2_0` payload byte length (`rows.next_multiple_of(32) * 36 * (columns / 128)`).
+    pub byte_len: usize,
+}
+
+/// Digest-verified persistent binary cache of pre-transcoded native `HTP_TYPE_Q2_0` weights.
+///
+/// Format (`"SB2HQ2C1"`):
+/// - `0..8`: magic `"SB2HQ2C1"`
+/// - `8..12`: HTP architecture (`u32` LE: `73` or `81`)
+/// - `12..44`: bound model SHA-256 (`[u8; 32]`)
+/// - `44..48`: tensor entry count (`u32` LE)
+/// - `48..80`: full SHA-256 digest over the contiguous payload region
+/// - `80..`: `tensor_count` entries of `(name_len u32 LE, name utf8, columns u64 LE, rows u64 LE, offset u64 LE, byte_len u64 LE)`
+/// - contiguous packed `HTP_TYPE_Q2_0` tensor payloads
+pub struct NativeQ2ArenaCache;
+
+struct TempCacheFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempCacheFileGuard {
+    const fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempCacheFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn cache_temp_path(dest: &Path) -> PathBuf {
+    let seq = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut os = dest.as_os_str().to_os_string();
+    os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(os)
+}
+
+fn cache_tensor_geometry(
+    tensor: &Tensor,
+    max_columns: usize,
+    max_rows: usize,
+) -> Result<(usize, usize, usize, usize)> {
+    let (columns, rows) = native_dimensions(tensor)?;
+    let mapped_rows = rows.next_multiple_of(32);
+    if columns > max_columns || mapped_rows > max_rows {
+        return Err(invalid(
+            "native Q2 arena cache tensor exceeds single-op native geometry",
+        ));
+    }
+    let blocks = columns / 128;
+    let packed_bytes = mapped_rows
+        .checked_mul(36)
+        .and_then(|bytes| bytes.checked_mul(blocks))
+        .ok_or_else(|| invalid("native Q2 arena cache packed size overflow"))?;
+    Ok((columns, rows, mapped_rows, packed_bytes))
+}
+
+fn read_exact_bytes<const N: usize>(reader: &mut impl Read) -> Result<[u8; N]> {
+    let mut buf = [0_u8; N];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_u32_le(reader: &mut impl Read) -> Result<u32> {
+    Ok(u32::from_le_bytes(read_exact_bytes::<4>(reader)?))
+}
+
+fn read_u64_le(reader: &mut impl Read) -> Result<u64> {
+    Ok(u64::from_le_bytes(read_exact_bytes::<8>(reader)?))
+}
+
+struct CacheHeader {
+    architecture: u32,
+    model_sha256: [u8; 32],
+    tensor_count: usize,
+    payload_sha256: [u8; 32],
+}
+
+fn read_cache_header(reader: &mut impl Read) -> Result<CacheHeader> {
+    let magic = read_exact_bytes::<8>(reader)?;
+    if &magic != NATIVE_Q2_ARENA_CACHE_MAGIC {
+        return Err(invalid("native Q2 arena cache magic mismatch"));
+    }
+    let architecture = read_u32_le(reader)?;
+    if !matches!(architecture, 73 | 81) {
+        return Err(invalid("unsupported native Q2 arena cache architecture"));
+    }
+    let model_sha256 = read_exact_bytes::<32>(reader)?;
+    let count_u32 = read_u32_le(reader)?;
+    let tensor_count = usize::try_from(count_u32)
+        .map_err(|_| invalid("native Q2 arena cache tensor count overflow"))?;
+    if tensor_count == 0 || tensor_count > NATIVE_Q2_ARENA_CACHE_MAX_TENSORS {
+        return Err(invalid("invalid native Q2 arena cache tensor count"));
+    }
+    let payload_sha256 = read_exact_bytes::<32>(reader)?;
+    Ok(CacheHeader {
+        architecture,
+        model_sha256,
+        tensor_count,
+        payload_sha256,
+    })
+}
+
+fn read_and_validate_cache_entries<S: NativeQ2Submitter>(
+    reader: &mut impl Read,
+    executor: &NativeQ2Executor<S>,
+    tensors: &[Tensor],
+) -> Result<(Vec<NativeQ2ArenaCacheEntry>, Vec<usize>, usize)> {
+    let mut entries = Vec::with_capacity(tensors.len());
+    let mut mapped_rows_list = Vec::with_capacity(tensors.len());
+    let mut seen_names = BTreeSet::new();
+    let mut running_offset = 0_u64;
+    let mut total_payload_bytes = 0_usize;
+    for tensor in tensors {
+        if !executor.supports_f32(tensor) {
+            return Err(invalid("unsupported native Q2 tensor in arena cache load"));
+        }
+        let (expected_cols, expected_rows, mapped_rows, expected_len) =
+            cache_tensor_geometry(tensor, executor.maximum_columns, executor.maximum_rows)?;
+        let name_len_u32 = read_u32_le(reader)?;
+        let name_len = usize::try_from(name_len_u32)
+            .map_err(|_| invalid("native Q2 arena cache tensor name length overflow"))?;
+        if name_len == 0 || name_len > NATIVE_Q2_ARENA_CACHE_MAX_NAME_BYTES {
+            return Err(invalid("invalid native Q2 arena cache tensor name length"));
+        }
+        let mut name_bytes = vec![0_u8; name_len];
+        reader.read_exact(&mut name_bytes)?;
+        let name = String::from_utf8(name_bytes)
+            .map_err(|_| invalid("non-UTF8 tensor name in native Q2 arena cache"))?;
+        let cols_u64 = read_u64_le(reader)?;
+        let rows_u64 = read_u64_le(reader)?;
+        let offset = read_u64_le(reader)?;
+        let byte_len_u64 = read_u64_le(reader)?;
+        let columns = usize::try_from(cols_u64)
+            .map_err(|_| invalid("native Q2 arena cache columns overflow"))?;
+        let rows = usize::try_from(rows_u64)
+            .map_err(|_| invalid("native Q2 arena cache rows overflow"))?;
+        let byte_len = usize::try_from(byte_len_u64)
+            .map_err(|_| invalid("native Q2 arena cache byte length overflow"))?;
+        if name != tensor.name
+            || !seen_names.insert(name.clone())
+            || columns != expected_cols
+            || rows != expected_rows
+            || offset != running_offset
+            || byte_len != expected_len
+        {
+            return Err(invalid("native Q2 arena cache entry mismatch"));
+        }
+        running_offset = running_offset
+            .checked_add(byte_len_u64)
+            .ok_or_else(|| invalid("native Q2 arena cache offset overflow"))?;
+        total_payload_bytes = total_payload_bytes
+            .checked_add(byte_len)
+            .ok_or_else(|| invalid("native Q2 arena cache total payload overflow"))?;
+        entries.push(NativeQ2ArenaCacheEntry {
+            name,
+            columns,
+            rows,
+            offset,
+            byte_len,
+        });
+        mapped_rows_list.push(mapped_rows);
+    }
+    Ok((entries, mapped_rows_list, total_payload_bytes))
+}
+
+impl NativeQ2ArenaCache {
+    /// Transcode `tensors` into native `HTP_TYPE_Q2_0` tile order and atomically
+    /// write a digest-verified binary cache at `path`.
+    ///
+    /// # Errors
+    /// Rejects invalid architectures (`73 | 81`), empty/duplicate/over-limit
+    /// tensor lists, unsupported tensor shapes, invalid PQ2 scales, or I/O and
+    /// hashing failures, cleaning up any temporary file on failure.
+    pub fn save_verified_cache(
+        path: &Path,
+        architecture: u32,
+        model_sha256: [u8; 32],
+        tensors: &[Tensor],
+        row_parallelism: Option<&RowParallelism>,
+    ) -> Result<Vec<NativeQ2ArenaCacheEntry>> {
+        if !matches!(architecture, 73 | 81)
+            || tensors.is_empty()
+            || tensors.len() > NATIVE_Q2_ARENA_CACHE_MAX_TENSORS
+        {
+            return Err(invalid("invalid native Q2 arena cache save configuration"));
+        }
+        let mut seen_names = BTreeSet::new();
+        let mut entries = Vec::with_capacity(tensors.len());
+        let mut running_offset = 0_u64;
+        for tensor in tensors {
+            if tensor.name.is_empty()
+                || tensor.name.len() > NATIVE_Q2_ARENA_CACHE_MAX_NAME_BYTES
+                || !seen_names.insert(tensor.name.as_str())
+            {
+                return Err(invalid("invalid or duplicate tensor name for arena cache"));
+            }
+            let (columns, rows, _mapped_rows, packed_bytes) =
+                cache_tensor_geometry(tensor, NATIVE_Q2_MAX_COLUMNS, NATIVE_Q2_MAX_ROWS)?;
+            let byte_len_u64 = u64::try_from(packed_bytes)?;
+            entries.push(NativeQ2ArenaCacheEntry {
+                name: tensor.name.clone(),
+                columns,
+                rows,
+                offset: running_offset,
+                byte_len: packed_bytes,
+            });
+            running_offset = running_offset
+                .checked_add(byte_len_u64)
+                .ok_or_else(|| invalid("native Q2 arena cache total offset overflow"))?;
+        }
+
+        let temp_path = cache_temp_path(path);
+        let mut guard = TempCacheFileGuard::new(temp_path.clone());
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(NATIVE_Q2_ARENA_CACHE_MAGIC)?;
+        writer.write_all(&architecture.to_le_bytes())?;
+        writer.write_all(&model_sha256)?;
+        writer.write_all(&u32::try_from(tensors.len())?.to_le_bytes())?;
+        writer.write_all(&[0_u8; 32])?;
+        for entry in &entries {
+            writer.write_all(&u32::try_from(entry.name.len())?.to_le_bytes())?;
+            writer.write_all(entry.name.as_bytes())?;
+            writer.write_all(&u64::try_from(entry.columns)?.to_le_bytes())?;
+            writer.write_all(&u64::try_from(entry.rows)?.to_le_bytes())?;
+            writer.write_all(&entry.offset.to_le_bytes())?;
+            writer.write_all(&u64::try_from(entry.byte_len)?.to_le_bytes())?;
+        }
+
+        let mut hasher = bonsai_native_hash::Hasher::new()?;
+        let mut scratch = Vec::new();
+        for (tensor, entry) in tensors.iter().zip(&entries) {
+            let geometry = ChunkGeometry {
+                total_blocks: entry.columns / 128,
+                row_start: 0,
+                active_rows: entry.rows,
+                block_start: 0,
+                chunk_blocks: entry.columns / 128,
+            };
+            resize_packed_scratch(&mut scratch, entry.byte_len)?;
+            let chunk = &mut scratch[..entry.byte_len];
+            pack_native_chunk(&tensor.data, geometry, chunk, row_parallelism)?;
+            hasher.update(chunk)?;
+            writer.write_all(chunk)?;
+        }
+        let payload_sha256 = hasher.finish()?;
+        let mut file = writer
+            .into_inner()
+            .map_err(|err| invalid(&format!("native Q2 arena cache flush failed: {err}")))?;
+        file.seek(SeekFrom::Start(NATIVE_Q2_ARENA_CACHE_PAYLOAD_SHA_OFFSET))?;
+        file.write_all(&payload_sha256)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp_path, path)?;
+        guard.disarm();
+        Ok(entries)
+    }
+
+    /// Verify every header field and the full SHA-256 payload digest of `path`
+    /// before preparing any weights, then load all cached `HTP_TYPE_Q2_0`
+    /// tensors directly into `executor`'s resident arena and bind `allowed_tensors`.
+    ///
+    /// # Errors
+    /// Rejects faulted/used/already-bound executors, missing residency support,
+    /// magic/architecture/model-SHA256/entry mismatches, truncated or oversized
+    /// files, digest corruption (before calling `prepare_weights`), insufficient
+    /// arena capacity, or native preparation failures.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep strict pre-prepare SHA-256 verification and transactional resident arena loading in one cohesive entrypoint"
+    )]
+    pub fn load_and_prewarm_from_verified_cache<S: NativeQ2Submitter>(
+        executor: &mut NativeQ2Executor<S>,
+        path: &Path,
+        expected_model_sha256: [u8; 32],
+        tensors: &[Tensor],
+    ) -> Result<Vec<NativeQ2ArenaCacheEntry>> {
+        if executor.failed
+            || executor.allowed_tensors.is_some()
+            || executor.statistics.operations_attempted != 0
+            || tensors.is_empty()
+            || tensors.len() > NATIVE_Q2_ARENA_CACHE_MAX_TENSORS
+        {
+            return Err(invalid("invalid executor state for native Q2 arena cache"));
+        }
+        let (has_metadata_capacity, remaining_arena_bytes) = {
+            let Some(cache) = &executor.residency else {
+                return Err(invalid(
+                    "native Q2 arena cache requires an executor with residency enabled",
+                ));
+            };
+            if !cache.projections.is_empty() || !cache.handles.is_empty() {
+                return Err(invalid(
+                    "native Q2 arena cache requires an empty resident cache",
+                ));
+            }
+            let fits_meta = cache.projections.capacity() - cache.projections.len()
+                >= tensors.len()
+                && cache.by_storage.capacity() - cache.by_storage.len() >= tensors.len()
+                && cache.handles.capacity() - cache.handles.len() >= tensors.len();
+            (fits_meta, executor.submitter.residency_capacity_bytes())
+        };
+        if !has_metadata_capacity {
+            return Err(invalid(
+                "native Q2 resident metadata capacity insufficient for arena cache",
+            ));
+        }
+
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < u64::try_from(NATIVE_Q2_ARENA_CACHE_HEADER_BYTES)? {
+            return Err(invalid("native Q2 arena cache file is truncated"));
+        }
+        let mut reader = BufReader::new(file);
+        let header = read_cache_header(&mut reader)?;
+        if header.architecture != executor.htp_architecture()
+            || header.model_sha256 != expected_model_sha256
+            || header.tensor_count != tensors.len()
+        {
+            return Err(invalid("native Q2 arena cache identity mismatch"));
+        }
+        let (entries, mapped_rows_list, total_payload_bytes) =
+            read_and_validate_cache_entries(&mut reader, executor, tensors)?;
+        let payload_start = reader.stream_position()?;
+        let total_payload_u64 = u64::try_from(total_payload_bytes)?;
+        let expected_end = payload_start
+            .checked_add(total_payload_u64)
+            .ok_or_else(|| invalid("native Q2 arena cache file length overflow"))?;
+        if expected_end != file_len {
+            return Err(invalid("native Q2 arena cache file length mismatch"));
+        }
+        if total_payload_bytes > remaining_arena_bytes {
+            return Err(invalid(
+                "native Q2 resident arena capacity insufficient for arena cache",
+            ));
+        }
+
+        // Verify the complete payload digest before invoking any submitter weight preparation.
+        let mut digest_buf = vec![0_u8; NATIVE_Q2_ARENA_CACHE_DIGEST_CHUNK_BYTES];
+        let actual_payload_sha256 =
+            bonsai_native_hash::hash_reader(&mut reader, total_payload_u64, &mut digest_buf, &mut || {
+                Ok(())
+            })?;
+        if actual_payload_sha256 != header.payload_sha256 {
+            return Err(invalid("native Q2 arena cache payload SHA-256 mismatch"));
+        }
+
+        reader.seek(SeekFrom::Start(payload_start))?;
+        let mut scratch = std::mem::take(&mut executor.scratch_weights);
+        let load_result = (|| -> Result<Vec<Tensor>> {
+            let mut selected = Vec::with_capacity(tensors.len());
+            for ((tensor, entry), &mapped_rows) in
+                tensors.iter().zip(&entries).zip(&mapped_rows_list)
+            {
+                let already_cached = executor
+                    .residency
+                    .as_ref()
+                    .and_then(|cache| cache.find(tensor))
+                    .is_some();
+                if already_cached {
+                    let skip_i64 = i64::try_from(entry.byte_len)?;
+                    reader.seek_relative(skip_i64)?;
+                    selected.push(tensor.clone());
+                    continue;
+                }
+                let prepared = if executor.submitter.supports_in_place_weight_preparation() {
+                    executor.submitter.prepare_weights_in_place(
+                        entry.columns,
+                        mapped_rows,
+                        &mut |destination| {
+                            if destination.len() != entry.byte_len {
+                                return Err(hexagon_native_rpc::Error::Contract);
+                            }
+                            reader
+                                .read_exact(destination)
+                                .map_err(hexagon_native_rpc::Error::File)
+                        },
+                    )?
+                } else {
+                    resize_packed_scratch(&mut scratch, entry.byte_len)?;
+                    let chunk = scratch
+                        .get_mut(..entry.byte_len)
+                        .ok_or_else(|| invalid("native Q2 cache scratch extent mismatch"))?;
+                    reader.read_exact(chunk)?;
+                    executor
+                        .submitter
+                        .prepare_weights(entry.columns, mapped_rows, chunk)?
+                };
+                let handle = prepared.ok_or_else(|| {
+                    invalid("native Q2 resident preparation contradicted arena cache capacity")
+                })?;
+                if handle.columns() != entry.columns
+                    || handle.rows() != mapped_rows
+                    || handle.packed_bytes() != entry.byte_len
+                {
+                    return Err(invalid(
+                        "native Q2 arena cache preparation returned mismatched handle geometry",
+                    ));
+                }
+                let Some(cache) = &mut executor.residency else {
+                    return Err(invalid("native Q2 resident cache missing during load"));
+                };
+                let first_handle = cache.handles.len();
+                cache.handles.push(handle);
+                cache.statistics.weight_payload_bytes_prepared = cache
+                    .statistics
+                    .weight_payload_bytes_prepared
+                    .saturating_add(u64::try_from(entry.byte_len)?);
+                let _ = cache.commit(tensor, first_handle, false);
+                selected.push(tensor.clone());
+            }
+            Ok(selected)
+        })();
+        match load_result {
+            Ok(selected) => {
+                executor.scratch_weights = scratch;
+                executor.bind_allowed_tensors(selected);
+                Ok(entries)
+            }
+            Err(err) => {
+                executor.failed = true;
+                Err(err)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "native_q2/multitile_tests.rs"]
 mod multitile_tests;
@@ -5542,6 +6005,368 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    struct TempArenaCacheGuard {
+        path: PathBuf,
+    }
+
+    impl Drop for TempArenaCacheGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn temp_arena_cache_path(tag: &str) -> TempArenaCacheGuard {
+        static NEXT_TEST_CACHE: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_TEST_CACHE.fetch_add(1, Ordering::Relaxed);
+        TempArenaCacheGuard {
+            path: std::env::temp_dir().join(format!(
+                "SwiftBonsai-{tag}-{}-{id}.hq2c",
+                std::process::id()
+            )),
+        }
+    }
+
+    struct ArchArenaSubmitter {
+        inner: ArenaSubmitter,
+        arch: u32,
+    }
+
+    impl NativeQ2Submitter for ArchArenaSubmitter {
+        fn htp_architecture(&self) -> u32 {
+            self.arch
+        }
+
+        fn residency_capacity_bytes(&self) -> usize {
+            self.inner.residency_capacity_bytes()
+        }
+
+        fn supports_in_place_weight_preparation(&self) -> bool {
+            self.inner.supports_in_place_weight_preparation()
+        }
+
+        fn prepare_weights(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+        ) -> std::result::Result<Option<NativeQ2WeightHandle>, hexagon_native_rpc::Error> {
+            self.inner.prepare_weights(columns, rows, weights)
+        }
+
+        fn prepare_weights_in_place(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            initialize: &mut dyn FnMut(
+                &mut [u8],
+            )
+                -> std::result::Result<(), hexagon_native_rpc::Error>,
+        ) -> std::result::Result<Option<NativeQ2WeightHandle>, hexagon_native_rpc::Error> {
+            self.inner
+                .prepare_weights_in_place(columns, rows, initialize)
+        }
+
+        fn submit(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.inner
+                .submit(columns, rows, weights, activation, output)
+        }
+    }
+
+    fn cache_fixture_tensors() -> Vec<Tensor> {
+        let mut t0 = lazy_tensor("blk.0.ffn_gate.weight", 256, 32);
+        let mut t1 = lazy_tensor("blk.0.ffn_up.weight", 256, 49);
+        let mut t2 = lazy_tensor("blk.0.ffn_down.weight", 256, 32);
+        let stamp = |tensor: &mut Tensor, seed: u8| {
+            let mut buf = tensor.data.to_vec();
+            for (idx, block) in buf.as_chunks_mut::<34>().0.iter_mut().enumerate() {
+                block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+                block[2] = u8::try_from((idx + usize::from(seed)) % 256).unwrap_or(0);
+            }
+            tensor.data = Arc::<[u8]>::from(buf).into();
+        };
+        stamp(&mut t0, 1);
+        stamp(&mut t1, 7);
+        stamp(&mut t2, 19);
+        vec![t0, t1, t2]
+    }
+
+    #[test]
+    fn native_q2_arena_cache_round_trip_prewarms_copied_and_in_place_and_projects() -> Result<()> {
+        let tensors = cache_fixture_tensors();
+        let guard = temp_arena_cache_path("cache-roundtrip");
+        let model_sha = [0x42_u8; 32];
+        let entries =
+            NativeQ2ArenaCache::save_verified_cache(&guard.path, 81, model_sha, &tensors, None)?;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].offset, 0);
+        assert_eq!(entries[0].byte_len, 2304);
+        assert_eq!(entries[1].rows, 49);
+        assert_eq!(entries[1].offset, 2304);
+        assert_eq!(entries[1].byte_len, 4608);
+        assert_eq!(entries[2].offset, 6912);
+        assert_eq!(entries[2].byte_len, 2304);
+        let saved_bytes = std::fs::read(&guard.path)?;
+        assert_eq!(&saved_bytes[..8], b"SB2HQ2C1");
+
+        let limits = NativeQ2ProjectionLimits::new(256, 64, 16, Duration::from_secs(4))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(16_384)
+            .map_err(|_| invalid("residency"))?;
+
+        let mut reference = NativeQ2Executor::new(
+            arena_submitter_at_capacity(true, 16_384)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        reference.select_and_prewarm_tensors(&tensors)?;
+
+        // 1. In-place load matches reference arena bytes exactly without temporary scratch copies.
+        let mut direct_cached = NativeQ2Executor::new(
+            arena_submitter_at_capacity(true, 16_384)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        let loaded_direct = NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+            &mut direct_cached,
+            &guard.path,
+            model_sha,
+            &tensors,
+        )?;
+        assert_eq!(loaded_direct, entries);
+        assert_eq!(direct_cached.submitter.initializations, 3);
+        assert_eq!(direct_cached.submitter.copies, 0);
+        assert_eq!(direct_cached.residency_statistics().tensors_prepared, 3);
+        assert_eq!(
+            direct_cached
+                .residency_statistics()
+                .weight_payload_bytes_prepared,
+            9216
+        );
+        assert_eq!(direct_cached.statistics().operations_attempted, 0);
+        assert_eq!(direct_cached.submitter.memory, reference.submitter.memory);
+
+        // 2. Copied load prepares via prepare_weights and matches arena bytes too.
+        let mut copied_cached = NativeQ2Executor::new(
+            arena_submitter_at_capacity(false, 16_384)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+            &mut copied_cached,
+            &guard.path,
+            model_sha,
+            &tensors,
+        )?;
+        assert_eq!(copied_cached.submitter.copies, 3);
+        assert_eq!(copied_cached.submitter.initializations, 0);
+        assert_eq!(copied_cached.submitter.memory, reference.submitter.memory);
+
+        // 3. Cached resident handles execute live resident projections cleanly.
+        let mut mock_exec = NativeQ2Executor::new(
+            MockNativeSubmitter {
+                batch_ffn: false,
+                ffn_pair_calls: 0,
+                calls: 0,
+                resident_calls: 0,
+                remaining: 16,
+                residency_bytes: 16_384,
+            },
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+            &mut mock_exec,
+            &guard.path,
+            model_sha,
+            &tensors,
+        )?;
+        let activation = vec![1.0_f32; 256];
+        let mut output = Vec::new();
+        Pq2ProjectionExecutor::project_f32(
+            &mut mock_exec,
+            &tensors[0],
+            &activation,
+            true,
+            &mut output,
+        )?;
+        assert_eq!(output.len(), 32);
+        assert_eq!(mock_exec.submitter.resident_calls, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_arena_cache_rejects_corrupted_payload_before_prepare_weights() -> Result<()> {
+        let tensors = cache_fixture_tensors();
+        let guard = temp_arena_cache_path("cache-corrupt");
+        let model_sha = [0x99_u8; 32];
+        NativeQ2ArenaCache::save_verified_cache(&guard.path, 81, model_sha, &tensors, None)?;
+
+        let mut corrupted = std::fs::read(&guard.path)?;
+        let last_idx = corrupted.len() - 1;
+        corrupted[last_idx] ^= 0x01;
+        std::fs::write(&guard.path, &corrupted)?;
+
+        let limits = NativeQ2ProjectionLimits::new(256, 64, 16, Duration::from_secs(4))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(16_384)
+            .map_err(|_| invalid("residency"))?;
+        for direct in [false, true] {
+            let mut exec = NativeQ2Executor::new(
+                arena_submitter_at_capacity(direct, 16_384)?,
+                limits,
+                1024 * 1024,
+            )
+            .with_resident_weights(4096)?;
+            assert!(
+                NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                    &mut exec,
+                    &guard.path,
+                    model_sha,
+                    &tensors,
+                )
+                .is_err()
+            );
+            assert_eq!(exec.submitter.copies, 0);
+            assert_eq!(exec.submitter.initializations, 0);
+            assert_eq!(exec.submitter.registry.used_bytes(), 0);
+            assert_eq!(exec.residency_statistics().tensors_prepared, 0);
+            assert!(exec.allowed_tensors.is_none());
+        }
+
+        // Truncated or oversized payload lengths also reject before touching submitter.
+        corrupted.pop();
+        std::fs::write(&guard.path, &corrupted)?;
+        let mut trunc_exec = NativeQ2Executor::new(
+            arena_submitter_at_capacity(false, 16_384)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        assert!(
+            NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                &mut trunc_exec,
+                &guard.path,
+                model_sha,
+                &tensors,
+            )
+            .is_err()
+        );
+        assert_eq!(trunc_exec.submitter.copies, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_arena_cache_rejects_architecture_model_hash_and_magic_mismatches() -> Result<()> {
+        let tensors = cache_fixture_tensors();
+        let guard = temp_arena_cache_path("cache-mismatch");
+        let model_sha = [0x11_u8; 32];
+        NativeQ2ArenaCache::save_verified_cache(&guard.path, 73, model_sha, &tensors, None)?;
+
+        let limits = NativeQ2ProjectionLimits::new(256, 64, 16, Duration::from_secs(4))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(16_384)
+            .map_err(|_| invalid("residency"))?;
+
+        // 1. Architecture 73 cache rejects 81 executor before prepare_weights.
+        let mut exec_v81 = NativeQ2Executor::new(
+            ArchArenaSubmitter {
+                inner: arena_submitter_at_capacity(false, 16_384)?,
+                arch: 81,
+            },
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        assert!(
+            NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                &mut exec_v81,
+                &guard.path,
+                model_sha,
+                &tensors,
+            )
+            .is_err()
+        );
+        assert_eq!(exec_v81.submitter.inner.copies, 0);
+
+        // 2. Wrong model SHA-256 rejects on matching arch 73 executor.
+        let mut exec_v73 = NativeQ2Executor::new(
+            ArchArenaSubmitter {
+                inner: arena_submitter_at_capacity(false, 16_384)?,
+                arch: 73,
+            },
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        assert!(
+            NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                &mut exec_v73,
+                &guard.path,
+                [0x22_u8; 32],
+                &tensors,
+            )
+            .is_err()
+        );
+        assert_eq!(exec_v73.submitter.inner.copies, 0);
+
+        // 3. Reordered / wrong tensor list rejects before prepare_weights.
+        assert!(
+            NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                &mut exec_v73,
+                &guard.path,
+                model_sha,
+                &[tensors[1].clone(), tensors[0].clone(), tensors[2].clone()],
+            )
+            .is_err()
+        );
+        assert_eq!(exec_v73.submitter.inner.copies, 0);
+
+        // 4. Matching arch 73 + model SHA succeeds.
+        NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+            &mut exec_v73,
+            &guard.path,
+            model_sha,
+            &tensors,
+        )?;
+        assert_eq!(exec_v73.submitter.inner.copies, 3);
+
+        // 5. Wrong magic rejects cleanly.
+        let mut bad_magic = std::fs::read(&guard.path)?;
+        bad_magic[7] = b'0';
+        std::fs::write(&guard.path, &bad_magic)?;
+        let mut exec_v73_b = NativeQ2Executor::new(
+            ArchArenaSubmitter {
+                inner: arena_submitter_at_capacity(false, 16_384)?,
+                arch: 73,
+            },
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        assert!(
+            NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                &mut exec_v73_b,
+                &guard.path,
+                model_sha,
+                &tensors,
+            )
+            .is_err()
+        );
+        assert_eq!(exec_v73_b.submitter.inner.copies, 0);
         Ok(())
     }
 }

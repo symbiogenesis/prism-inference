@@ -79,6 +79,20 @@ impl TensorBytes {
     pub const fn is_mapped(&self) -> bool {
         matches!(self, Self::Mapped(_))
     }
+
+    /// Releases file-mapped host backing bytes, replacing them with an empty slice.
+    ///
+    /// Returns the number of mapped bytes released (`0` for `Shared` buffers).
+    pub fn release_mapped(&mut self) -> usize {
+        match self {
+            Self::Mapped(slice) => {
+                let bytes = slice.len();
+                *self = Self::default();
+                bytes
+            }
+            Self::Shared(_) => 0,
+        }
+    }
 }
 
 impl WeakTensorBytes {
@@ -985,6 +999,38 @@ mod tests {
 
         drop(bad_fixture);
         drop(fixture);
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_bytes_release_mapped_drops_file_mapping_and_leaves_shared_intact() -> Result<()> {
+        let mut shared = TensorBytes::from(Arc::<[u8]>::from(vec![7_u8; 64]));
+        assert!(!shared.is_mapped());
+        assert_eq!(shared.release_mapped(), 0);
+        assert_eq!(shared.len(), 64);
+
+        let id = NEXT_TEST_GGUF.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "SwiftBonsai-ReleaseMapped-{}-{id}.bin",
+            std::process::id()
+        ));
+        let payload = vec![0x3c_u8; 1024];
+        fs::write(&path, &payload)?;
+        let file = fs::File::open(&path)?;
+        let maybe_mapped =
+            bonsai_native_hash::mmap::MappedReadOnlyFile::try_map(&file, 1024)?;
+        if let Some(mapped_file) = maybe_mapped {
+            let slice = mapped_file.slice(128, 256)?;
+            let mut mapped = TensorBytes::from(slice);
+            assert!(mapped.is_mapped());
+            assert_eq!(mapped.len(), 256);
+            assert_eq!(mapped.release_mapped(), 256);
+            assert!(!mapped.is_mapped());
+            assert!(mapped.is_empty());
+            assert_eq!(mapped.release_mapped(), 0);
+        }
+        drop(file);
+        let _ = fs::remove_file(&path);
         Ok(())
     }
 }

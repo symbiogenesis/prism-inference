@@ -10,8 +10,11 @@ pub const Q4_K_BLOCK_BYTES: usize = 144;
 /// Encoded byte length of one GGML `Q6_K` weight superblock.
 pub const Q6_K_BLOCK_BYTES: usize = 210;
 
+/// Unpacks the 6-bit sub-block scale and minimum `(scale, min)` pair for `group` (`0..8`)
+/// from a 12-byte GGML `Q4_K` scales array.
 #[inline]
-pub(super) const fn unpack_q4_k_scale_min(group: usize, scales: &[u8; 12]) -> (u8, u8) {
+#[must_use]
+pub const fn unpack_q4_k_scale_min(group: usize, scales: &[u8; 12]) -> (u8, u8) {
     if group < 4 {
         (scales[group] & 63, scales[group + 4] & 63)
     } else {

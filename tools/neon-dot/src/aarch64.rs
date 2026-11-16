@@ -41,7 +41,7 @@ fn widen_f16_four_neon(bits: [u16; 4]) -> [f32; 4] {
     // compiled only when baseline NEON is enabled for its AArch64 target.
     let raw = unsafe { vld1_u16(bits.as_ptr()) };
     if vmaxv_u16(vand_u16(raw, vdup_n_u16(0x7fff))) >= 0x7c00 {
-        return bits.map(super::half::scalar);
+        return bits.map(bonsai_ternary::half_to_float);
     }
     let value = vcvt_f32_f16(vreinterpret_f16_u16(raw));
     let mut output = [0.0; 4];
@@ -3201,7 +3201,7 @@ fn narrow_f32_four_neon(values: [f32; 4]) -> [u16; 4] {
     let raw = load_f32x4(&values);
     let abs_bits = vandq_u32(vreinterpretq_u32_f32(raw), vdupq_n_u32(0x7fff_ffff));
     if vmaxvq_u32(abs_bits) > 0x7f80_0000 {
-        return values.map(super::half::scalar_half_bits);
+        return values.map(bonsai_ternary::float_to_half);
     }
     let mut out = [0_u16; 4];
     store_u16x4(vreinterpret_u16_f16(vcvt_f16_f32(raw)), &mut out);
@@ -3230,13 +3230,65 @@ fn narrow_f32_eight_neon(values: &[f32; 8]) -> [u16; 8] {
     let abs_lo = vandq_u32(vreinterpretq_u32_f32(lo), mask);
     let abs_hi = vandq_u32(vreinterpretq_u32_f32(hi), mask);
     if vmaxvq_u32(vmaxq_u32(abs_lo, abs_hi)) > 0x7f80_0000 {
-        return values.map(super::half::scalar_half_bits);
+        return values.map(bonsai_ternary::float_to_half);
     }
     let half_lo = vcvt_f16_f32(lo);
     let half = vcvt_high_f16_f32(half_lo, hi);
     let mut out = [0_u16; 8];
     store_u16x8(vreinterpretq_u16_f16(half), &mut out);
     out
+}
+
+#[cfg(target_feature = "neon")]
+#[inline]
+pub(super) fn narrow_f32_slice_checked(src: &[f32], dst: &mut [u16]) -> bool {
+    // SAFETY: compiled only with baseline AArch64 NEON; `as_chunks` bounds all array accesses.
+    unsafe { narrow_f32_slice_checked_neon(src, dst) }
+}
+
+#[cfg(target_feature = "neon")]
+#[target_feature(enable = "neon")]
+fn narrow_f32_slice_checked_neon(src: &[f32], dst: &mut [u16]) -> bool {
+    use core::arch::aarch64::{
+        vandq_u32, vcvt_f16_f32, vcvt_high_f16_f32, vdupq_n_u32, vmaxq_u32, vmaxvq_u32,
+        vreinterpret_u16_f16, vreinterpretq_u16_f16, vreinterpretq_u32_f32,
+    };
+    const OVERFLOW_BOUND: u32 = 0x477f_f000;
+    if src.len() != dst.len() {
+        return false;
+    }
+    let abs_mask = vdupq_n_u32(0x7fff_ffff);
+    let (src_chunks, src_tail) = src.as_chunks::<8>();
+    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<8>();
+    for (s, d) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+        let (halves, _) = s.as_chunks::<4>();
+        let lo = load_f32x4(&halves[0]);
+        let hi = load_f32x4(&halves[1]);
+        let abs_lo = vandq_u32(vreinterpretq_u32_f32(lo), abs_mask);
+        let abs_hi = vandq_u32(vreinterpretq_u32_f32(hi), abs_mask);
+        if vmaxvq_u32(vmaxq_u32(abs_lo, abs_hi)) >= OVERFLOW_BOUND {
+            return false;
+        }
+        let half = vcvt_high_f16_f32(vcvt_f16_f32(lo), hi);
+        store_u16x8(vreinterpretq_u16_f16(half), d);
+    }
+    let (src_four, src_rem) = src_tail.as_chunks::<4>();
+    let (dst_four, dst_rem) = dst_tail.as_chunks_mut::<4>();
+    if let (Some(s), Some(d)) = (src_four.first(), dst_four.first_mut()) {
+        let v = load_f32x4(s);
+        let abs = vandq_u32(vreinterpretq_u32_f32(v), abs_mask);
+        if vmaxvq_u32(abs) >= OVERFLOW_BOUND {
+            return false;
+        }
+        store_u16x4(vreinterpret_u16_f16(vcvt_f16_f32(v)), d);
+    }
+    for (&value, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
+        let Some(bits) = bonsai_ternary::checked_float_to_half(value) else {
+            return false;
+        };
+        *slot = bits;
+    }
+    true
 }
 
 #[cfg(target_feature = "neon")]

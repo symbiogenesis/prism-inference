@@ -2,8 +2,12 @@
 
 #![expect(
     clippy::redundant_pub_crate,
-    reason = "Parent-only fallback helpers remain inside the safe binary16 boundary."
+    reason = "Parent-only fallback helper remains inside the safe binary16 boundary."
 )]
+
+#[cfg(any(not(all(target_arch = "aarch64", target_feature = "neon")), test))]
+use bonsai_ternary::checked_float_to_half;
+use bonsai_ternary::{float_to_half, half_to_float};
 
 /// Widens four IEEE binary16 bit patterns without changing NaN payload bits.
 ///
@@ -20,7 +24,7 @@ pub fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {
-        bits.map(scalar)
+        bits.map(half_to_float)
     }
 }
 
@@ -43,29 +47,28 @@ pub fn widen_f16_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
 
 #[inline]
 pub(super) fn portable_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
-    std::array::from_fn(|group| std::array::from_fn(|lane| scalar(bits[group * 4 + lane])))
+    std::array::from_fn(|group| std::array::from_fn(|lane| half_to_float(bits[group * 4 + lane])))
 }
 
+/// Widens `src.len().min(dst.len())` IEEE binary16 words into `dst`, using baseline `FCVTL`/`FCVTL2`
+/// chunks when NEON is enabled and preserving exceptional/NaN bit patterns via `bonsai_ternary`.
 #[inline]
-pub(super) fn scalar_half_bits(value: f32) -> u16 {
-    let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
-    let bits = value.to_bits();
-    let doubled = bits.wrapping_add(bits);
-    let exponent_bias = (doubled & 0xff00_0000).max(0x7100_0000);
-    base += f32::from_bits((exponent_bias >> 1) + 0x0780_0000);
-    let rounded = base.to_bits();
-    let magnitude = if doubled > 0xff00_0000 {
-        0x7e00
-    } else {
-        ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff)
-    };
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::as_conversions,
-        reason = "The converted binary16 sign and magnitude fit in sixteen bits."
-    )]
-    {
-        (((bits >> 16) & 0x8000) | magnitude) as u16
+pub fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
+    let count = src.len().min(dst.len());
+    let (src_chunks, src_tail) = src[..count].as_chunks::<8>();
+    let (dst_chunks, dst_tail) = dst[..count].as_chunks_mut::<8>();
+    for (chunk, out_chunk) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+        let [lo, hi] = widen_f16_eight(chunk);
+        out_chunk[..4].copy_from_slice(&lo);
+        out_chunk[4..].copy_from_slice(&hi);
+    }
+    let (src_four, src_rem) = src_tail.as_chunks::<4>();
+    let (dst_four, dst_rem) = dst_tail.as_chunks_mut::<4>();
+    if let (Some(chunk), Some(out_chunk)) = (src_four.first(), dst_four.first_mut()) {
+        *out_chunk = widen_f16_four(chunk);
+    }
+    for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
+        *slot = half_to_float(bits);
     }
 }
 
@@ -82,7 +85,7 @@ pub fn narrow_f32_four(values: [f32; 4]) -> [u16; 4] {
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {
-        values.map(scalar_half_bits)
+        values.map(float_to_half)
     }
 }
 
@@ -98,37 +101,59 @@ pub fn narrow_f32_eight(values: &[f32; 8]) -> [u16; 8] {
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {
-        values.map(scalar_half_bits)
+        values.map(float_to_half)
     }
 }
 
+/// Narrows `src.len().min(dst.len())` `f32` values into `dst` matching GGML rounding.
 #[inline]
-pub(super) fn scalar(bits: u16) -> f32 {
-    let sign = u32::from(bits & 0x8000) << 16;
-    let mut mantissa = u32::from(bits & 0x03ff);
-    let mut exponent = u32::from((bits >> 10) & 0x1f);
-    if exponent == 0 {
-        if mantissa == 0 {
-            return f32::from_bits(sign);
-        }
-        exponent = 113;
-        while mantissa & 0x0400 == 0 {
-            mantissa <<= 1;
-            exponent -= 1;
-        }
-        mantissa &= 0x03ff;
-    } else if exponent == 31 {
-        exponent = 255;
-    } else {
-        exponent += 112;
+pub fn narrow_f32_slice(src: &[f32], dst: &mut [u16]) {
+    let count = src.len().min(dst.len());
+    let (src_chunks, src_tail) = src[..count].as_chunks::<8>();
+    let (dst_chunks, dst_tail) = dst[..count].as_chunks_mut::<8>();
+    for (chunk, out_chunk) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+        *out_chunk = narrow_f32_eight(chunk);
     }
-    f32::from_bits(sign | (exponent << 23) | (mantissa << 13))
+    let (src_four, src_rem) = src_tail.as_chunks::<4>();
+    let (dst_four, dst_rem) = dst_tail.as_chunks_mut::<4>();
+    if let (Some(chunk), Some(out_chunk)) = (src_four.first(), dst_four.first_mut()) {
+        *out_chunk = narrow_f32_four(*chunk);
+    }
+    for (&value, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
+        *slot = float_to_half(value);
+    }
+}
+
+/// Narrows finite `f32` values into IEEE binary16 bits (`dst.len() == src.len()`), rejecting
+/// length mismatches, nonfinite inputs, and magnitudes that round to infinity (`|x| >= 65520.0`).
+#[inline]
+#[must_use]
+pub fn narrow_f32_slice_checked(src: &[f32], dst: &mut [u16]) -> bool {
+    if src.len() != dst.len() {
+        return false;
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        super::aarch64::narrow_f32_slice_checked(src, dst)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        for (&value, slot) in src.iter().zip(dst.iter_mut()) {
+            let Some(bits) = checked_float_to_half(value) else {
+                return false;
+            };
+            *slot = bits;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        narrow_f32_eight, narrow_f32_four, scalar_half_bits, widen_f16_eight, widen_f16_four,
+        checked_float_to_half, float_to_half, half_to_float, narrow_f32_eight, narrow_f32_four,
+        narrow_f32_slice, narrow_f32_slice_checked, widen_f16_eight, widen_f16_four,
+        widen_f16_slice,
     };
 
     // Independent normalized-significand construction, including subnormals.
@@ -164,7 +189,7 @@ mod tests {
             );
             if (bits & 0x7fff) < 0x7c00 {
                 let four_vals = widen_f16_four(&four);
-                assert_eq!(narrow_f32_four(four_vals), four_vals.map(scalar_half_bits));
+                assert_eq!(narrow_f32_four(four_vals), four_vals.map(float_to_half));
                 let [low, high] = widen_f16_eight(&[
                     bits,
                     bits ^ 0x8000,
@@ -178,10 +203,7 @@ mod tests {
                 let eight_vals = [
                     low[0], low[1], low[2], low[3], high[0], high[1], high[2], high[3],
                 ];
-                assert_eq!(
-                    narrow_f32_eight(&eight_vals),
-                    eight_vals.map(scalar_half_bits)
-                );
+                assert_eq!(narrow_f32_eight(&eight_vals), eight_vals.map(float_to_half));
             }
         }
     }
@@ -213,9 +235,70 @@ mod tests {
         ];
         for start in 0..edges.len() {
             let four = std::array::from_fn(|idx| edges[(start + idx) % edges.len()]);
-            assert_eq!(narrow_f32_four(four), four.map(scalar_half_bits));
+            assert_eq!(narrow_f32_four(four), four.map(float_to_half));
             let eight = std::array::from_fn(|idx| edges[(start + idx) % edges.len()]);
-            assert_eq!(narrow_f32_eight(&eight), eight.map(scalar_half_bits));
+            assert_eq!(narrow_f32_eight(&eight), eight.map(float_to_half));
         }
+    }
+
+    #[test]
+    fn slice_helpers_cover_all_remainders_and_checked_overflow() {
+        let mut odd = [0_u16; 1];
+        assert!(!narrow_f32_slice_checked(&[1.0, 2.0], &mut odd));
+        for len in 0..=23_usize {
+            let src: Vec<f32> = (0..len)
+                .map(|i| half_to_float(u16::try_from((i * 199 + 1) & 0x7bff).unwrap_or(0)))
+                .collect();
+            let mut narrowed = vec![0_u16; len];
+            narrow_f32_slice(&src, &mut narrowed);
+            assert_eq!(
+                narrowed,
+                src.iter().copied().map(float_to_half).collect::<Vec<_>>()
+            );
+
+            let mut checked = vec![0_u16; len];
+            assert!(narrow_f32_slice_checked(&src, &mut checked));
+            assert_eq!(checked, narrowed);
+
+            let mut widened = vec![0.0_f32; len];
+            widen_f16_slice(&checked, &mut widened);
+            assert_eq!(
+                widened
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+                src.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+            );
+
+            for bad in [65_520.0_f32, -65_520.0, f32::INFINITY, f32::NAN] {
+                for bad_idx in 0..len {
+                    let mut with_bad = src.clone();
+                    with_bad[bad_idx] = bad;
+                    assert_eq!(checked_float_to_half(bad), None);
+                    assert!(!narrow_f32_slice_checked(&with_bad, &mut checked));
+                }
+            }
+            if len > 0 {
+                let mut edge = src;
+                edge[len - 1] = f32::from_bits(0x477f_efff);
+                assert!(narrow_f32_slice_checked(&edge, &mut checked));
+                assert_eq!(checked[len - 1], 0x7bff);
+            }
+        }
+        // Preserve signaling NaN payload bits across widen_f16_slice.
+        let special = [
+            0x7c01_u16, 0xfc01, 0x7e00, 0x0001, 0x8000, 0x3c00, 0xbc00, 0x7bff, 0x7c01,
+        ];
+        let mut widened = vec![0.0_f32; special.len()];
+        widen_f16_slice(&special, &mut widened);
+        assert_eq!(
+            widened
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            special.map(reference)
+        );
     }
 }

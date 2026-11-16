@@ -54,7 +54,7 @@ pub(super) fn portable_validated<const ROWS: usize, const FUSED: bool>(
     let mut output = [0.0_f32; ROWS];
     for (row, output) in rows.into_iter().zip(&mut output) {
         for (bytes, activation) in row.as_chunks::<34>().0.iter().zip(activation) {
-            let scale = super::half::scalar(u16::from_le_bytes([bytes[0], bytes[1]]));
+            let scale = bonsai_ternary::half_to_float(u16::from_le_bytes([bytes[0], bytes[1]]));
             if !scale.is_finite() {
                 return None;
             }

@@ -1226,11 +1226,9 @@ pub(super) fn append_half_bits(values: &[f32], output: &mut Vec<u16>) -> bool {
     if fearless_simd::Level::baseline().as_neon().is_none() {
         return false;
     }
-    let (chunks, tail) = values.as_chunks::<8>();
-    for chunk in chunks {
-        output.extend_from_slice(&bonsai_neon_dot::narrow_f32_eight(chunk));
-    }
-    output.extend(tail.iter().copied().map(super::half_bits));
+    let start = output.len();
+    output.resize(start + values.len(), 0);
+    bonsai_neon_dot::narrow_f32_slice(values, &mut output[start..]);
     true
 }
 

@@ -89,6 +89,37 @@ pub fn half_to_float(value: u16) -> f32 {
     f32::from_bits(sign | (exponent << 23) | (mantissa << 13))
 }
 
+/// Converts `binary32` to IEEE 754 `binary16` bits using round-ties-to-even,
+/// preserving signed zero, subnormals, infinities, and canonical GGML quiet `NaN`s.
+#[inline]
+#[must_use]
+pub fn float_to_half(value: f32) -> u16 {
+    // Port of ggml_compute_fp32_to_fp16; the shift/add path rounds ties to
+    // even via native f32 arithmetic and includes subnormals and signed zero.
+    let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
+    let bits = value.to_bits();
+    let doubled = bits.wrapping_add(bits);
+    let exponent_bias = (doubled & 0xff00_0000).max(0x7100_0000);
+    base += f32::from_bits((exponent_bias >> 1) + 0x0780_0000);
+    let rounded = base.to_bits();
+    let magnitude = if doubled > 0xff00_0000 {
+        0x7e00_u32
+    } else {
+        ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff)
+    };
+    let word = ((bits >> 16) & 0x8000) | magnitude;
+    let [lo, hi, _, _] = word.to_le_bytes();
+    u16::from_le_bytes([lo, hi])
+}
+
+/// Narrows a finite `binary32` value to IEEE 754 `binary16` bits using round-ties-to-even,
+/// returning `None` for nonfinite inputs or magnitudes that round to infinity (`|value| >= 65520.0`).
+#[inline]
+#[must_use]
+pub fn checked_float_to_half(value: f32) -> Option<u16> {
+    ((value.to_bits() & 0x7fff_ffff) < 0x477f_f000).then(|| float_to_half(value))
+}
+
 const fn check_scale(bytes: &[u8]) -> Result<(), Error> {
     let scale = u16::from_le_bytes([bytes[0], bytes[1]]);
     if matches!(scale, 0 | 0x8000) || scale & 0x7c00 == 0x7c00 {

@@ -137,6 +137,9 @@ dependencies = [
 [[package]]
 name = "bonsai-neon-dot"
 version = "0.1.5"
+dependencies = [
+ "bonsai-ternary",
+]
 
 [[package]]
 name = "bonsai-prism"

@@ -5,7 +5,10 @@
     reason = "test construction and successful-operation assertions must fail visibly"
 )]
 
-use bonsai_ternary::{Error, Pq2Block, Q8KBlock, pack_ptq, unpack_ptq};
+use bonsai_ternary::{
+    Error, Pq2Block, Q8KBlock, checked_float_to_half, float_to_half, half_to_float, pack_ptq,
+    unpack_ptq,
+};
 
 fn zeros(scale: u16) -> Pq2Block {
     let mut block = [0x55; 34];
@@ -151,4 +154,41 @@ fn every_native_lane_word_has_independent_base_three_symbols() {
     // These two counts cover every byte at every position, including aliases
     // such as byte 1 that decode like a canonical encoding but must be rejected.
     assert_eq!((checked, rejected), (5994, 662));
+}
+
+#[test]
+fn half_to_float_and_float_to_half_preserve_ggml_round_trip_and_bounds() {
+    for bits in 0..=u16::MAX {
+        let widened = half_to_float(bits);
+        if (bits & 0x7c00) < 0x7c00 {
+            assert_eq!(float_to_half(widened), bits, "round-trip bits {bits:#06x}");
+            assert_eq!(checked_float_to_half(widened), Some(bits));
+        } else {
+            assert_eq!(
+                checked_float_to_half(widened),
+                None,
+                "exceptional {bits:#06x}"
+            );
+        }
+    }
+    assert_eq!(float_to_half(0.0), 0x0000);
+    assert_eq!(float_to_half(-0.0), 0x8000);
+    assert_eq!(
+        checked_float_to_half(f32::from_bits(0x477f_efff)),
+        Some(0x7bff)
+    );
+    assert_eq!(
+        checked_float_to_half(f32::from_bits(0xc77f_efff)),
+        Some(0xfbff)
+    );
+    assert_eq!(checked_float_to_half(65_520.0), None);
+    assert_eq!(checked_float_to_half(-65_520.0), None);
+    assert_eq!(float_to_half(65_520.0), 0x7c00);
+    assert_eq!(float_to_half(-65_520.0), 0xfc00);
+    assert_eq!(float_to_half(f32::INFINITY), 0x7c00);
+    assert_eq!(float_to_half(f32::NEG_INFINITY), 0xfc00);
+    assert_eq!(float_to_half(f32::from_bits(0x7f80_0001)), 0x7e00);
+    assert_eq!(float_to_half(f32::from_bits(0xffff_ffff)), 0xfe00);
+    assert_eq!(checked_float_to_half(f32::from_bits(0x7f80_0001)), None);
+    assert_eq!(checked_float_to_half(f32::from_bits(0xffff_ffff)), None);
 }

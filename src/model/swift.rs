@@ -4,14 +4,14 @@
 //! permits correctness captures; it does not qualify the service or adapters.
 //! Full-model numerical and process-memory qualification remain separate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use bonsai_gguf::{
     Metadata, MetadataArray, MetadataValue, MetadataValueRef, PRISM_DIALECT, TensorDescriptor,
     VerifiedModel,
 };
-use bonsai_native_hash::Hasher;
+use bonsai_native_hash::{Hasher, hash_bytes};
 
 use super::Model;
 use crate::{Result, invalid};
@@ -48,6 +48,8 @@ pub const MMPROJ_SHA256: &str = "6807ede61d570bb86ba34b756a0fa109edc33668604de86
 pub const MMPROJ_TENSOR_PAYLOAD_BYTES: usize = 629_227_328;
 
 const SIGN_SHA256: &str = "3d1ea9136a6044cd680cc1e92cde65e9dd7238e1288fe2effabec5d201c48bed";
+const EXPECTED_MMPROJ_TENSORS: usize = 334;
+const EXPECTED_SWIFT_TENSORS: usize = 851;
 
 /// Exact current-weight artifact selected for an offline correctness capture.
 ///
@@ -392,6 +394,45 @@ pub fn expected_mmproj_tensors() -> BTreeMap<String, (u32, Vec<u64>)> {
     expected
 }
 
+fn parse_block_index(segment: &str, limit: usize) -> Option<usize> {
+    if segment.is_empty()
+        || (segment.len() > 1 && segment.starts_with('0'))
+        || !segment.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let index = segment.parse::<usize>().ok()?;
+    (index < limit).then_some(index)
+}
+
+fn expected_mmproj_spec(name: &str) -> Option<(u32, &'static [u64])> {
+    match name {
+        "v.patch_embd.weight" | "v.patch_embd.weight.1" => Some((0, &[16, 16, 3, 1_152])),
+        "v.patch_embd.bias" | "v.post_ln.weight" | "v.post_ln.bias" => Some((0, &[1_152])),
+        "v.position_embd.weight" => Some((0, &[1_152, 2_304])),
+        "mm.0.weight" => Some((8, &[4_608, 4_608])),
+        "mm.0.bias" => Some((0, &[4_608])),
+        "mm.2.weight" => Some((8, &[4_608, 5_120])),
+        "mm.2.bias" => Some((0, &[5_120])),
+        _ => {
+            let rest = name.strip_prefix("v.blk.")?;
+            let (block, suffix) = rest.split_once('.')?;
+            parse_block_index(block, 27)?;
+            match suffix {
+                "ln1.weight" | "ln1.bias" | "ln2.weight" | "ln2.bias" | "attn_out.bias"
+                | "ffn_down.bias" => Some((0, &[1_152])),
+                "attn_qkv.weight" => Some((8, &[1_152, 3_456])),
+                "attn_qkv.bias" => Some((0, &[3_456])),
+                "attn_out.weight" => Some((8, &[1_152, 1_152])),
+                "ffn_up.weight" => Some((8, &[1_152, 4_304])),
+                "ffn_up.bias" => Some((0, &[4_304])),
+                "ffn_down.weight" => Some((1, &[4_304, 1_152])),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// Validates tensor names, dimensions, encodings, and total byte size for the pinned `mmproj`.
 ///
 /// # Errors
@@ -400,21 +441,19 @@ pub fn validate_mmproj_layouts<'a>(
     count: usize,
     tensors: impl IntoIterator<Item = (&'a str, &'a [u64], u32, u64)>,
 ) -> Result<([usize; 3], usize, usize)> {
-    let expected = expected_mmproj_tensors();
-    if count != expected.len() {
+    if count != EXPECTED_MMPROJ_TENSORS {
         return Err(invalid("Swift mmproj tensor inventory count mismatch"));
     }
     let mut counts = [0; 3];
     let mut bytes = 0_usize;
     let mut largest = 0_usize;
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = HashSet::new();
+    seen.try_reserve(EXPECTED_MMPROJ_TENSORS)?;
     for (name, dimensions, kind, payload_bytes) in tensors {
         if !seen.insert(name)
-            || expected
-                .get(name)
-                .is_none_or(|(expected_kind, expected_dimensions)| {
-                    *expected_kind != kind || expected_dimensions != dimensions
-                })
+            || expected_mmproj_spec(name).is_none_or(|(expected_kind, expected_dimensions)| {
+                expected_kind != kind || expected_dimensions != dimensions
+            })
         {
             return Err(invalid(format!(
                 "Swift mmproj tensor layout mismatch: {name}"
@@ -570,7 +609,8 @@ fn validate_metadata_for(metadata: &Metadata, representation: Representation) ->
         .get("tokenizer.chat_template")
         .and_then(MetadataValue::as_str)
         .ok_or_else(|| invalid("Swift embedded template is missing"))?;
-    if template.len() != 8_952 || digest([template.as_bytes()])? != TEMPLATE_SHA256 {
+    if template.len() != 8_952 || !digest_matches(hash_bytes(template.as_bytes())?, TEMPLATE_SHA256)
+    {
         return Err(invalid("Swift embedded template identity mismatch"));
     }
     check_integers(metadata, "qwen35.rope.dimension_sections", &[11, 11, 10, 0])?;
@@ -596,23 +636,22 @@ fn validate_metadata_for(metadata: &Metadata, representation: Representation) ->
         }
         sign_hash.update(&i32::try_from(value)?.to_le_bytes())?;
     }
-    if hex(sign_hash)? != SIGN_SHA256 {
+    if !digest_matches(sign_hash.finish()?, SIGN_SHA256) {
         return Err(invalid("Swift Hadamard sign identity mismatch"));
     }
-    let expected = expected_tensors(representation);
     let transformed = metadata
         .get("prism.hadamard.weight_names")
         .and_then(MetadataValue::as_array)
         .ok_or_else(|| invalid("Swift Hadamard weight inventory missing"))?;
-    let mut names = std::collections::BTreeSet::new();
+    let mut names = HashSet::new();
+    names.try_reserve(401)?;
     for value in transformed.iter() {
         let name = value
             .as_str()
             .ok_or_else(|| invalid("Swift transform names must be strings"))?;
         if name == "token_embd.weight"
-            || expected
-                .get(name)
-                .is_none_or(|spec| spec.0 != representation.tensor_kind())
+            || expected_tensor_spec(name, representation)
+                .is_none_or(|(kind, _)| kind != representation.tensor_kind())
             || !names.insert(name)
         {
             return Err(invalid("Swift Hadamard weight inventory mismatch"));
@@ -665,23 +704,55 @@ fn check_integers(metadata: &Metadata, key: &str, expected: &[u64]) -> Result<()
     Ok(())
 }
 
-fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> Result<String> {
-    let mut hash = Hasher::new()?;
-    for part in parts {
-        hash.update(part)?;
+fn digest_matches(digest: [u8; 32], expected_hex: &str) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut actual = [0_u8; 64];
+    for (index, byte) in digest.into_iter().enumerate() {
+        actual[index * 2] = HEX[usize::from(byte >> 4)];
+        actual[index * 2 + 1] = HEX[usize::from(byte & 15)];
     }
-    hex(hash)
+    actual == expected_hex.as_bytes()
 }
 
-fn hex(hash: Hasher) -> Result<String> {
-    Ok(hash
-        .finish()?
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect())
+fn expected_tensor_spec(
+    name: &str,
+    representation: Representation,
+) -> Option<(u32, &'static [u64])> {
+    let packed = representation.tensor_kind();
+    match name {
+        "token_embd.weight" | "output.weight" => Some((packed, &[5_120, 248_320])),
+        "output_norm.weight" => Some((0, &[5_120])),
+        _ => {
+            let rest = name.strip_prefix("blk.")?;
+            let (layer_str, suffix) = rest.split_once('.')?;
+            let layer = parse_block_index(layer_str, 64)?;
+            match suffix {
+                "attn_norm.weight" | "post_attention_norm.weight" => Some((0, &[5_120])),
+                "ffn_up.weight" | "ffn_gate.weight" => Some((packed, &[5_120, 17_408])),
+                "ffn_down.weight" => Some((packed, &[17_408, 5_120])),
+                _ if (layer + 1).is_multiple_of(4) => match suffix {
+                    "attn_q.weight" => Some((packed, &[5_120, 12_288])),
+                    "attn_k.weight" | "attn_v.weight" => Some((packed, &[5_120, 1_024])),
+                    "attn_output.weight" => Some((packed, &[6_144, 5_120])),
+                    "attn_q_norm.weight" | "attn_k_norm.weight" => Some((0, &[256])),
+                    _ => None,
+                },
+                _ => match suffix {
+                    "attn_qkv.weight" => Some((packed, &[5_120, 10_240])),
+                    "attn_gate.weight" => Some((packed, &[5_120, 6_144])),
+                    "ssm_out.weight" => Some((packed, &[6_144, 5_120])),
+                    "ssm_alpha.weight" | "ssm_beta.weight" => Some((30, &[5_120, 48])),
+                    "ssm_conv1d.weight" => Some((0, &[4, 10_240])),
+                    "ssm_norm.weight" => Some((0, &[128])),
+                    "ssm_a" | "ssm_dt.bias" => Some((0, &[48])),
+                    _ => None,
+                },
+            }
+        }
+    }
 }
 
+#[cfg(test)]
 fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Vec<u64>)> {
     let mut tensors = BTreeMap::new();
     let packed = representation.tensor_kind();
@@ -749,19 +820,21 @@ fn validate_layouts<'a>(
     count: usize,
     tensors: impl IntoIterator<Item = (&'a str, &'a [u64], u32, u64)>,
 ) -> Result<([usize; 3], usize, usize)> {
-    let expected = expected_tensors(representation);
-    if count != expected.len() {
+    if count != EXPECTED_SWIFT_TENSORS {
         return Err(invalid("Swift tensor inventory count mismatch"));
     }
     let mut counts = [0; 3];
     let mut bytes = 0_usize;
     let mut largest = 0;
+    let mut seen = HashSet::new();
+    seen.try_reserve(EXPECTED_SWIFT_TENSORS)?;
     for (name, dimensions, kind, payload_bytes) in tensors {
-        if expected
-            .get(name)
-            .is_none_or(|(expected_kind, expected_dimensions)| {
-                *expected_kind != kind || expected_dimensions != dimensions
-            })
+        if !seen.insert(name)
+            || expected_tensor_spec(name, representation).is_none_or(
+                |(expected_kind, expected_dimensions)| {
+                    expected_kind != kind || expected_dimensions != dimensions
+                },
+            )
         {
             return Err(invalid(format!("Swift tensor layout mismatch: {name}")));
         }
@@ -993,6 +1066,62 @@ mod tests {
             MetadataValue::from("qwen2vl_merger"),
         );
         assert!(validate_mmproj_metadata(&drifted).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn zero_alloc_tensor_specs_match_full_inventories_and_reject_duplicates_and_bad_indices()
+    -> Result<()> {
+        for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {
+            let map = expected_tensors(representation);
+            assert_eq!(map.len(), EXPECTED_SWIFT_TENSORS);
+            for (name, (kind, dims)) in &map {
+                let spec = expected_tensor_spec(name, representation)
+                    .ok_or_else(|| invalid("missing spec"))?;
+                assert_eq!(spec.0, *kind);
+                assert_eq!(spec.1, dims.as_slice());
+            }
+            for bad_name in [
+                "blk.00.attn_norm.weight",
+                "blk.+0.attn_norm.weight",
+                "blk.64.attn_norm.weight",
+                "blk.3.attn_qkv.weight",
+                "blk.0.attn_q.weight",
+                "blk.0.unknown",
+            ] {
+                assert!(expected_tensor_spec(bad_name, representation).is_none());
+            }
+
+            let mut dup = descriptors(representation);
+            let dupe_entry = dup[0].clone();
+            let last = dup.len() - 1;
+            dup[last] = dupe_entry;
+            assert!(
+                validate_layouts(
+                    representation,
+                    dup.len(),
+                    dup.iter()
+                        .map(|(n, d, k, b)| (n.as_str(), d.as_slice(), *k, *b)),
+                )
+                .is_err()
+            );
+        }
+
+        let mmproj_map = expected_mmproj_tensors();
+        assert_eq!(mmproj_map.len(), EXPECTED_MMPROJ_TENSORS);
+        for (name, (kind, dims)) in &mmproj_map {
+            let spec = expected_mmproj_spec(name).ok_or_else(|| invalid("missing mmproj spec"))?;
+            assert_eq!(spec.0, *kind);
+            assert_eq!(spec.1, dims.as_slice());
+        }
+        for bad_name in [
+            "v.blk.00.ln1.weight",
+            "v.blk.+1.ln1.weight",
+            "v.blk.27.ln1.weight",
+            "v.blk.0.unknown",
+        ] {
+            assert!(expected_mmproj_spec(bad_name).is_none());
+        }
         Ok(())
     }
 }

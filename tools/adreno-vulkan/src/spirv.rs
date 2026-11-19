@@ -1,9 +1,9 @@
-//! Pure-Rust SPIR-V 1.3 compute shader emitter for Qualcomm Adreno Vulkan kernels.
+//! Pure-Rust SPIR-V 1.6 compute shader emitter for Qualcomm Adreno Vulkan kernels.
 //!
-//! Emits validated SPIR-V 1.3 binary modules without external shader compilers (`glslang`,
+//! Emits validated SPIR-V 1.6 binary modules without external shader compilers (`glslang`,
 //! `naga`, or `shaderc`), covering both `#39` (`PQ2_0`/`PTQ1_0` integer matrix-vector
-//! projections with optional `SPV_KHR_integer_dot_product` `OpSDot`) and `#40` (fused and
-//! 3-stage decomposed attention with explicit IEEE-754 binary16 probability rounding).
+//! projections with optional core SPIR-V 1.6 `OpSDot` integer dot product) and `#40` (fused
+//! and 3-stage decomposed attention with explicit IEEE-754 binary16 probability rounding).
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -13,10 +13,9 @@ use bonsai_native_hash::Hasher;
 use crate::{Error, ProjectionKernelPath};
 
 const SPIRV_MAGIC: u32 = 0x0723_0203;
-const SPIRV_VERSION_1_3: u32 = 0x0001_0300;
+const SPIRV_VERSION_1_6: u32 = 0x0001_0600;
 const WORKGROUP_X: u32 = 64;
 
-const OP_EXTENSION: u16 = 10;
 const OP_EXT_INST_IMPORT: u16 = 11;
 const OP_EXT_INST: u16 = 12;
 const OP_MEMORY_MODEL: u16 = 14;
@@ -42,7 +41,6 @@ const OP_STORE: u16 = 62;
 const OP_ACCESS_CHAIN: u16 = 65;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
-const OP_COMPOSITE_CONSTRUCT: u16 = 80;
 const OP_COMPOSITE_EXTRACT: u16 = 81;
 const OP_CONVERT_S_TO_F: u16 = 111;
 const OP_BITCAST: u16 = 124;
@@ -81,8 +79,7 @@ const CAPABILITY_DOT_PRODUCT: u32 = 6019;
 const GLSL_EXP: u32 = 27;
 const GLSL_FMAX: u32 = 40;
 const GLSL_FMA: u32 = 50;
-const GLSL_PACK_HALF_2X16: u32 = 58;
-const GLSL_UNPACK_HALF_2X16: u32 = 60;
+const GLSL_UNPACK_HALF_2X16: u32 = 62;
 
 const EXEC_MODEL_GL_COMPUTE: u32 = 5;
 const EXEC_MODE_LOCAL_SIZE: u32 = 17;
@@ -127,7 +124,6 @@ enum AccessMode {
 struct ShaderBuilder {
     next_id: u32,
     capabilities: Vec<u32>,
-    extensions: Vec<u32>,
     ext_inst_imports: Vec<u32>,
     memory_model: Vec<u32>,
     entry_points: Vec<u32>,
@@ -166,7 +162,7 @@ struct ShaderBuilder {
 
     main_fn_id: u32,
     current_label: u32,
-    entry_inputs: Vec<u32>,
+    entry_interface: Vec<u32>,
     gid_var: Option<u32>,
     lid_var: Option<u32>,
     wid_var: Option<u32>,
@@ -195,7 +191,6 @@ impl ShaderBuilder {
         let mut this = Self {
             next_id: 1,
             capabilities: Vec::new(),
-            extensions: Vec::new(),
             ext_inst_imports: Vec::new(),
             memory_model: Vec::new(),
             entry_points: Vec::new(),
@@ -229,7 +224,7 @@ impl ShaderBuilder {
             f32_consts: BTreeMap::new(),
             main_fn_id: 0,
             current_label: 0,
-            entry_inputs: Vec::new(),
+            entry_interface: Vec::new(),
             gid_var: None,
             lid_var: None,
             wid_var: None,
@@ -247,8 +242,6 @@ impl ShaderBuilder {
                 OP_CAPABILITY,
                 &[CAPABILITY_DOT_PRODUCT_INPUT_4X8_BIT_PACKED],
             );
-            let ext_words = encode_string("SPV_KHR_integer_dot_product");
-            push_inst(&mut this.extensions, OP_EXTENSION, &ext_words);
         }
 
         let glsl_id = this.alloc_id();
@@ -377,7 +370,14 @@ impl ShaderBuilder {
             OP_VARIABLE,
             &[ptr_push_struct, var_id, STORAGE_PUSH_CONSTANT],
         );
+        self.record_entry_interface(var_id);
         Some(var_id)
+    }
+
+    fn record_entry_interface(&mut self, var_id: u32) {
+        if !self.entry_interface.contains(&var_id) {
+            self.entry_interface.push(var_id);
+        }
     }
 
     const fn alloc_id(&mut self) -> u32 {
@@ -389,7 +389,7 @@ impl ShaderBuilder {
     fn finish(mut self) -> Vec<u32> {
         let mut ep = vec![EXEC_MODEL_GL_COMPUTE, self.main_fn_id];
         ep.extend(encode_string("main"));
-        ep.extend(self.entry_inputs.iter().copied());
+        ep.extend(self.entry_interface.iter().copied());
         push_inst(&mut self.entry_points, OP_ENTRY_POINT, &ep);
         push_inst(
             &mut self.execution_modes,
@@ -401,7 +401,6 @@ impl ShaderBuilder {
 
         let mut words = Vec::with_capacity(
             5 + self.capabilities.len()
-                + self.extensions.len()
                 + self.ext_inst_imports.len()
                 + self.memory_model.len()
                 + self.entry_points.len()
@@ -412,12 +411,11 @@ impl ShaderBuilder {
                 + self.fn_body.len(),
         );
         words.push(SPIRV_MAGIC);
-        words.push(SPIRV_VERSION_1_3);
+        words.push(SPIRV_VERSION_1_6);
         words.push(0);
         words.push(self.next_id);
         words.push(0);
         words.extend(self.capabilities);
-        words.extend(self.extensions);
         words.extend(self.ext_inst_imports);
         words.extend(self.memory_model);
         words.extend(self.entry_points);
@@ -488,7 +486,7 @@ impl ShaderBuilder {
             OP_DECORATE,
             &[var, DECORATION_BUILT_IN, BUILTIN_GLOBAL_INVOCATION_ID],
         );
-        self.entry_inputs.push(var);
+        self.record_entry_interface(var);
         self.gid_var = Some(var);
         var
     }
@@ -508,7 +506,7 @@ impl ShaderBuilder {
             OP_DECORATE,
             &[var, DECORATION_BUILT_IN, BUILTIN_LOCAL_INVOCATION_ID],
         );
-        self.entry_inputs.push(var);
+        self.record_entry_interface(var);
         self.lid_var = Some(var);
         var
     }
@@ -528,7 +526,7 @@ impl ShaderBuilder {
             OP_DECORATE,
             &[var, DECORATION_BUILT_IN, BUILTIN_WORKGROUP_ID],
         );
-        self.entry_inputs.push(var);
+        self.record_entry_interface(var);
         self.wid_var = Some(var);
         var
     }
@@ -641,6 +639,7 @@ impl ShaderBuilder {
             OP_DECORATE,
             &[var, DECORATION_BINDING, binding],
         );
+        self.record_entry_interface(var);
         var
     }
 
@@ -719,6 +718,7 @@ impl ShaderBuilder {
             OP_VARIABLE,
             &[ptr_arr, var, STORAGE_WORKGROUP],
         );
+        self.record_entry_interface(var);
         var
     }
 
@@ -995,6 +995,11 @@ impl ShaderBuilder {
             OP_EXT_INST,
             &[self.f32_t, id, self.glsl_id, GLSL_FMA, a, b, c],
         );
+        push_inst(
+            &mut self.annotations,
+            OP_DECORATE,
+            &[id, DECORATION_NO_CONTRACTION],
+        );
         id
     }
 
@@ -1010,15 +1015,47 @@ impl ShaderBuilder {
     }
 
     fn round_f16(&mut self, val: u32) -> u32 {
-        let zero = self.const_f32(0.0);
-        let pair = self.alloc_id();
-        push_inst(
-            &mut self.fn_body,
-            OP_COMPOSITE_CONSTRUCT,
-            &[self.vec2f32_t, pair, val, zero],
-        );
-        let packed = self.glsl1(self.u32_t, GLSL_PACK_HALF_2X16, pair);
-        self.unpack_half_low(packed)
+        let bits = self.bitcast(self.u32_t, val);
+        let mask_abs = self.const_u32(0x7FFF_FFFF);
+        let abs_bits = self.uand(bits, mask_abs);
+        let abs_val = self.bitcast(self.f32_t, abs_bits);
+        let c_up = self.const_f32(f32::from_bits(0x7780_0000));
+        let c_down = self.const_f32(f32::from_bits(0x0880_0000));
+        let t1 = self.fmul_nc(abs_val, c_up);
+        let base0 = self.fmul_nc(t1, c_down);
+
+        let doubled = self.uadd(bits, bits);
+        let mask_exp = self.const_u32(0xFF00_0000);
+        let min_exp = self.const_u32(0x7100_0000);
+        let exp_masked = self.uand(doubled, mask_exp);
+        let exp_lt = self.u_lt(exp_masked, min_exp);
+        let exp_bias = self.select(self.u32_t, exp_lt, min_exp, exp_masked);
+        let c1 = self.const_u32(1);
+        let bias_half = self.ushr(exp_bias, c1);
+        let c_add_bias = self.const_u32(0x0780_0000);
+        let bias_bits = self.uadd(bias_half, c_add_bias);
+        let bias_f = self.bitcast(self.f32_t, bias_bits);
+
+        let base = self.fadd_nc(base0, bias_f);
+        let rounded = self.bitcast(self.u32_t, base);
+        let c13 = self.const_u32(13);
+        let mask_7c00 = self.const_u32(0x7C00);
+        let mask_0fff = self.const_u32(0x0FFF);
+        let r_shr13 = self.ushr(rounded, c13);
+        let hi_part = self.uand(r_shr13, mask_7c00);
+        let lo_part = self.uand(rounded, mask_0fff);
+        let mag_norm = self.uadd(hi_part, lo_part);
+
+        let is_nan = self.u_lt(mask_exp, doubled);
+        let c_nan = self.const_u32(0x7E00);
+        let magnitude = self.select(self.u32_t, is_nan, c_nan, mag_norm);
+
+        let c16 = self.const_u32(16);
+        let mask_sign = self.const_u32(0x8000);
+        let sign_shr = self.ushr(bits, c16);
+        let sign_bit = self.uand(sign_shr, mask_sign);
+        let half_u16 = self.uor(sign_bit, magnitude);
+        self.unpack_half_low(half_u16)
     }
 
     fn sdot_packed(&mut self, a_u32: u32, b_u32: u32) -> u32 {
@@ -1322,7 +1359,12 @@ fn pq2_block_int_dot(
     sum
 }
 
-/// Emits `#39` `PQ2_0` × `Q8_K` GEMV SPIR-V 1.3 words.
+/// Emits `#39` `PQ2_0` × `Q8_K` GEMV SPIR-V 1.6 words.
+///
+/// `fused = false` emits `NoContraction` `fmul` + `fadd` matching CPU `dot_pq2::<false>` bit-for-bit
+/// (`0 ULP`). `fused = true` emits `GLSL.std.450` `Fma` (`NoContraction`), whose Vulkan precision
+/// inherits `a * b + c` and can differ by `1 ULP` from single-rounded CPU `f32::mul_add` on Adreno
+/// drivers lowering to `mad.f32`, requiring a separate numerical profile gate.
 ///
 /// Bindings: `0` read-only `weights` (`u32` words, padded +1 trailing word), `1` read-only
 /// packed `Q8KBlock`s (`65` `u32` words per block: `[scale_bits, values[64]]`), `2` writable
@@ -1405,7 +1447,7 @@ pub fn pq2_q8k_gemv(use_sdot: bool, fused: bool) -> Vec<u32> {
     b.finish()
 }
 
-/// Emits `#39` `PQ2_0` × `Q8_0` GEMV SPIR-V 1.3 words (supports odd `128`-column multiples).
+/// Emits `#39` `PQ2_0` × `Q8_0` GEMV SPIR-V 1.6 words (supports odd `128`-column multiples).
 ///
 /// Bindings: `0` read-only `weights` (`u32`, +1 pad word), `1` read-only packed `Q8Block`s
 /// (`9` `u32` words per 32-element block: `[scale_bits, values[8]]`), `2` writable `output`
@@ -1646,7 +1688,7 @@ fn dot_trit_lanes_with_act(b: &mut ShaderBuilder, lanes: u32, act_w: u32, use_sd
     }
 }
 
-/// Emits `#39` `PTQ1_0` × `Q8_0` GEMV SPIR-V 1.3 words (`pinned_4lane` or standard).
+/// Emits `#39` `PTQ1_0` × `Q8_0` GEMV SPIR-V 1.6 words (`pinned_4lane` or standard).
 ///
 /// Bindings: `0` read-only `weights` (`7` `u32` words per 128-element `PTQ1_0` block),
 /// `1` read-only packed `Q8Block`s (`9` `u32` words per 32-element block), `2` writable `output`
@@ -1768,7 +1810,7 @@ pub fn ptq1_q8_0_gemv(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
     b.finish()
 }
 
-/// Emits `#39` `PTQ1_0` × `Q8_K` direct GEMV SPIR-V 1.3 words (supports odd `128`-col multiples).
+/// Emits `#39` `PTQ1_0` × `Q8_K` direct GEMV SPIR-V 1.6 words (supports odd `128`-col multiples).
 ///
 /// Bindings: `0` read-only `PTQ1_0` weights (`7` `u32`/block), `1` read-only `Q8KBlock` (`65`
 /// `u32`/block), `2` writable `output` (`f32`).
@@ -1866,7 +1908,7 @@ fn attn_valid_len(
     b.select(b.u32_t, is_causal, clamped, total_seq)
 }
 
-/// Emits `#40` Stage 1 (`QK^T` scaled causal scores) SPIR-V 1.3 words.
+/// Emits `#40` Stage 1 (`QK^T` scaled causal scores) SPIR-V 1.6 words.
 ///
 /// Bindings: `0` read-only `Q` (`f32`), `1` read-only `K` (`f32`), `2` writable `scores` (`f32`).
 /// Push constants (`8 × u32`): `[query_len, total_seq, past_len, num_heads, num_kv_heads, head_dim, scale_bits, causal]`.
@@ -1948,7 +1990,7 @@ pub fn attn_qk_scores() -> Vec<u32> {
     b.finish()
 }
 
-/// Emits `#40` Stage 2 (global row softmax with IEEE binary16 rounding) SPIR-V 1.3 words.
+/// Emits `#40` Stage 2 (global row softmax with IEEE binary16 rounding) SPIR-V 1.6 words.
 ///
 /// Bindings: `0` read-only `scores` (`f32`), `1` writable `probs` (`f32`).
 /// Push constants (`8 × u32`): `[query_len, total_seq, past_len, num_heads, num_kv_heads, head_dim, scale_bits, causal]`.
@@ -2058,7 +2100,7 @@ pub fn attn_softmax_f16() -> Vec<u32> {
     b.finish()
 }
 
-/// Emits `#40` Stage 3 (`probs × V` accumulation) SPIR-V 1.3 words.
+/// Emits `#40` Stage 3 (`probs × V` accumulation) SPIR-V 1.6 words.
 ///
 /// Bindings: `0` read-only `probs` (`f32`), `1` read-only `V` (`f32`), `2` writable `out` (`f32`).
 /// Push constants (`8 × u32`): `[query_len, total_seq, past_len, num_heads, num_kv_heads, head_dim, scale_bits, causal]`.
@@ -2302,15 +2344,20 @@ mod tests {
     use super::*;
 
     fn assert_valid_spirv_structure(words: &[u32]) {
+        const OP_EXTENSION_OPCODE: u16 = 10;
+
         assert!(words.len() >= 5);
         assert_eq!(words[0], SPIRV_MAGIC);
-        assert_eq!(words[1], SPIRV_VERSION_1_3);
+        assert_eq!(words[1], SPIRV_VERSION_1_6);
         let bound = words[3];
         assert!(bound > 1);
         assert_eq!(words[4], 0);
 
         let mut offset = 5;
         let mut opcodes = Vec::new();
+        let mut entry_interface = Vec::new();
+        let mut global_vars = Vec::new();
+        let mut function_vars = Vec::new();
         while offset < words.len() {
             let header = words[offset];
             let wc = usize::try_from(header >> 16).unwrap_or(0);
@@ -2320,14 +2367,55 @@ mod tests {
                 offset + wc <= words.len(),
                 "truncated instruction at word {offset}"
             );
+            let operands = &words[offset + 1..offset + wc];
+            if op == OP_ENTRY_POINT && operands.len() >= 3 {
+                let mut idx = 2;
+                while idx < operands.len() {
+                    let word = operands[idx];
+                    idx += 1;
+                    if word.to_le_bytes().contains(&0) {
+                        break;
+                    }
+                }
+                entry_interface.extend_from_slice(&operands[idx..]);
+            } else if op == OP_VARIABLE && operands.len() >= 3 {
+                let var_id = operands[1];
+                let storage_class = operands[2];
+                if storage_class == STORAGE_FUNCTION {
+                    function_vars.push(var_id);
+                } else {
+                    global_vars.push(var_id);
+                }
+            }
             opcodes.push(op);
             offset += wc;
         }
         assert_eq!(offset, words.len());
         assert_eq!(opcodes.last().copied(), Some(OP_FUNCTION_END));
+        assert!(!opcodes.contains(&OP_EXTENSION_OPCODE));
         assert!(opcodes.contains(&OP_MEMORY_MODEL));
         assert!(opcodes.contains(&OP_ENTRY_POINT));
         assert!(opcodes.contains(&OP_EXECUTION_MODE));
+
+        let unique_iface: std::collections::BTreeSet<u32> =
+            entry_interface.iter().copied().collect();
+        assert_eq!(
+            unique_iface.len(),
+            entry_interface.len(),
+            "duplicate IDs in OpEntryPoint interface"
+        );
+        for var_id in &global_vars {
+            assert!(
+                unique_iface.contains(var_id),
+                "missing global variable {var_id} from SPIR-V 1.6 OpEntryPoint interface"
+            );
+        }
+        for var_id in &function_vars {
+            assert!(
+                !unique_iface.contains(var_id),
+                "function-scoped variable {var_id} must not appear in OpEntryPoint interface"
+            );
+        }
     }
 
     #[test]

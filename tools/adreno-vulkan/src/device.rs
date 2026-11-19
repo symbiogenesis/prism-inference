@@ -198,13 +198,16 @@ impl AdrenoVulkanDevice {
         // SAFETY: Querying instance version with no external state.
         let instance_api = unsafe { entry.try_enumerate_instance_version() }
             .map_err(|err| Error::Vulkan(format!("vkEnumerateInstanceVersion failed: {err:?}")))?
-            .unwrap_or(vk::API_VERSION_1_1);
+            .unwrap_or(vk::API_VERSION_1_0);
+        if instance_api < vk::API_VERSION_1_3 {
+            return Err(Error::Unsupported);
+        }
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"bonsai-adreno-vulkan")
             .application_version(1)
             .engine_name(c"prism")
             .engine_version(1)
-            .api_version(instance_api.min(vk::API_VERSION_1_3));
+            .api_version(vk::API_VERSION_1_3);
         let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
         // SAFETY: `create_info` points to stack structs valid for this call.
         let instance =
@@ -231,7 +234,7 @@ impl AdrenoVulkanDevice {
             }
         };
 
-        let Some((phys, queue_family, caps, ext_set, mem_properties)) =
+        let Some((phys, queue_family, caps, _ext_set, mem_properties)) =
             select_native_adreno(&entry, &instance, &physical_devices)
         else {
             // SAFETY: No suitable Adreno adapter found; clean up instance.
@@ -240,7 +243,7 @@ impl AdrenoVulkanDevice {
         };
 
         let (device, sdot_enabled) =
-            match create_compute_device(&instance, phys, queue_family, &caps, &ext_set) {
+            match create_compute_device(&instance, phys, queue_family, &caps) {
                 Ok(pair) => pair,
                 Err(err) => {
                     // SAFETY: Clean up instance after device creation failure.
@@ -601,7 +604,7 @@ impl AdrenoVulkanDevice {
         }
     }
 
-    /// Compiles one SPIR-V 1.3 compute shader module into a reusable pipeline handle.
+    /// Compiles one SPIR-V 1.6 compute shader module into a reusable pipeline handle.
     ///
     /// # Errors
     /// Returns [`Error::InvalidInput`] on empty SPIR-V or invalid descriptor/push counts,
@@ -1212,6 +1215,7 @@ fn inspect_adreno_candidate(
 
     if props.vendor_id != QUALCOMM_VENDOR_ID
         || props.device_type != vk::PhysicalDeviceType::INTEGRATED_GPU
+        || props.api_version < vk::API_VERSION_1_3
     {
         return None;
     }
@@ -1252,8 +1256,7 @@ fn inspect_adreno_candidate(
         api_version: props.api_version,
         subgroup_size: subgroup.subgroup_size,
         shader_float16: f16_feats.shader_float16 == vk::TRUE,
-        shader_integer_dot_product: ext_set.contains("VK_KHR_shader_integer_dot_product")
-            && sdot_feats.shader_integer_dot_product == vk::TRUE,
+        shader_integer_dot_product: sdot_feats.shader_integer_dot_product == vk::TRUE,
         integer_dot_4x8_packed_signed_accelerated: sdot_props
             .integer_dot_product4x8_bit_packed_signed_accelerated
             == vk::TRUE,
@@ -1368,25 +1371,16 @@ fn create_compute_device(
     phys: vk::PhysicalDevice,
     queue_family: u32,
     caps: &VulkanDeviceCapabilities,
-    ext_set: &BTreeSet<String>,
 ) -> Result<(ash::Device, bool), Error> {
     let priorities = [1.0_f32];
     let queue_info = [vk::DeviceQueueCreateInfo::default()
         .queue_family_index(queue_family)
         .queue_priorities(&priorities)];
 
-    let mut ext_names: Vec<*const std::ffi::c_char> = Vec::new();
-    let enable_sdot =
-        caps.shader_integer_dot_product && ext_set.contains("VK_KHR_shader_integer_dot_product");
-    if enable_sdot {
-        ext_names.push(c"VK_KHR_shader_integer_dot_product".as_ptr());
-    }
-
+    let enable_sdot = caps.shader_integer_dot_product;
     let mut sdot_feats = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
         .shader_integer_dot_product(enable_sdot);
-    let mut create_info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(&queue_info)
-        .enabled_extension_names(&ext_names);
+    let mut create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
     if enable_sdot {
         create_info = create_info.push_next(&mut sdot_feats);
     }

@@ -101,6 +101,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bonsai-adreno-vulkan"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "bonsai-gguf",
+ "bonsai-hexagon-runtime",
+ "bonsai-native-hash",
+ "bonsai-ternary",
+ "hex",
+ "prism-inference",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "bonsai-codec-probe"
 version = "0.1.0"
 dependencies = [

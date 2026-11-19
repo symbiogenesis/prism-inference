@@ -1,0 +1,32 @@
+[package]
+name = "bonsai-adreno-vulkan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+repository.workspace = true
+description = "Native Rust SPIR-V Vulkan compute backend for Adreno PQ2/PTQ1 projections and attention"
+keywords = ["adreno", "vulkan", "spirv", "prism", "inference"]
+categories = ["hardware-support"]
+
+[dependencies]
+prism-inference = { path = "../..", default-features = false }
+bonsai-ternary = { version = "=0.1.4", path = "../ternary" }
+bonsai-native-hash = { version = "=0.1.4", path = "../native-hash" }
+hex.workspace = true
+ash = { version = "=0.38.0", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+] }
+
+[dev-dependencies]
+bonsai-hexagon-runtime = { path = "../hexagon-runtime" }
+bonsai-gguf = { path = "../gguf", default-features = false }
+
+[lints]
+workspace = true

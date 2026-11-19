@@ -2,7 +2,7 @@
 //!
 //! Targets Windows ARM64 Snapdragon X Elite (`X1`) and Snapdragon X2 Elite Extreme
 //! (`X2`) Adreno GPUs via dynamic loading of `%SystemRoot%\System32\vulkan-1.dll`,
-//! runtime-emitted SPIR-V 1.3 compute kernels, `PQ2_0`/`PTQ1_0` integer projection
+//! runtime-emitted SPIR-V 1.6 compute kernels, `PQ2_0`/`PTQ1_0` integer projection
 //! execution, and resource-pressure-selected fused vs. 3-stage decomposed attention
 //! preserving Prism binary16 probability rounding.
 
@@ -16,7 +16,15 @@ pub mod attention;
     reason = "Isolates System32 vulkan-1.dll dynamic loading and ash Vulkan FFI."
 )]
 pub mod device;
+pub mod executor;
 pub mod spirv;
+
+pub use attention::{
+    AttentionDescriptor, AttentionExecutionWitness, AttentionOutput, AttentionStageOutputs,
+    AttentionTilePlan, attention_cache_key, cpu_attention_reference, select_attention_plan,
+};
+pub use device::AdrenoVulkanDevice;
+pub use executor::{VulkanAttentionExecutor, VulkanPq2Executor};
 
 /// Error returned by native Adreno Vulkan initialization, planning, or execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -274,9 +282,9 @@ impl VulkanDeviceCapabilities {
 /// Selected SPIR-V integer dot-product execution path for `#39` projections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ProjectionKernelPath {
-    /// Hardware-accelerated `OpSDot` (`SPV_KHR_integer_dot_product`, `PackedVectorFormat4x8Bit`).
+    /// Hardware-accelerated SPIR-V 1.6 core `OpSDot` (`PackedVectorFormat4x8Bit`).
     IntegerDotPacked4x8,
-    /// Portable SPIR-V core integer arithmetic fallback without `SPV_KHR_integer_dot_product`.
+    /// Portable SPIR-V core integer arithmetic fallback without core `OpSDot`.
     PortableIntegerFallback,
 }
 

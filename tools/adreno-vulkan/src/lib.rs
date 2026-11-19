@@ -10,6 +10,7 @@ use std::fmt;
 
 use bonsai_native_hash::Hasher;
 
+pub mod attention;
 pub mod spirv;
 
 /// Error returned by native Adreno Vulkan initialization, planning, or execution.

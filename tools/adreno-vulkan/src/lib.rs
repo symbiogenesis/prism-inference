@@ -11,6 +11,11 @@ use std::fmt;
 use bonsai_native_hash::Hasher;
 
 pub mod attention;
+#[expect(
+    unsafe_code,
+    reason = "Isolates System32 vulkan-1.dll dynamic loading and ash Vulkan FFI."
+)]
+pub mod device;
 pub mod spirv;
 
 /// Error returned by native Adreno Vulkan initialization, planning, or execution.

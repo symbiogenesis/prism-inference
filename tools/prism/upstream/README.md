@@ -363,3 +363,46 @@ common bridge.
 build edges, are removed (leaving 25 checked-in C++ files and 2 checked-in C
 files, 27 native files total, across the bridge snapshot). Selecting those cases
 needs no native common bridge.
+
+## Retired public C ABI, DSpark metadata, argument parser, optimizer, codec and Jinja native providers
+
+`--target rust-reference` and the ordinary `cpp` reference selector now route
+seven additional source contracts through independent clean-room safe Rust
+providers (disclosing `NativeReferenceReplay: false` without importing
+`bonsai_prism_runtime`, calling native bridges, or reading precomputed expected
+answer fixtures):
+
+- `test-c` (`tests/test-c.c`, SHA-256
+  `c973865e5e86263a71a1210003e80cffa6269572de31cfa647cc3d01b4bea99e`) via
+  `tests/upstream_prism/reference_public_c_abi.rs`
+- `test-dspark-logsnr-meta` (`tests/test-dspark-logsnr-meta.cpp`, SHA-256
+  `2fef2521dbc0985a3aed6bbe50de5a54b7a75dc6c3c5933e04fc8ceb4c7e3112`) via
+  `tests/upstream_prism/reference_dspark_logsnr.rs`
+- `test-arg-parser` (`tests/test-arg-parser.cpp`, SHA-256
+  `935b2cd08b63799a26fb804991380c541a45406c76dceb38589d78c8b28befc1`) via
+  `tests/upstream_prism/reference_arg_parser.rs`
+- `test-opt` (`tests/test-opt.cpp`, SHA-256
+  `24af6c26293d328ad42820cc817ab891869c93ec744950e6505018cfd33d04bb`) via
+  `tests/upstream_prism/reference_optimizer.rs`
+- `test-quantize-fns` (`tests/test-quantize-fns.cpp`, SHA-256
+  `830e197b34efc57030cef3b83449264f8b2d4db76121796ae962602cdf675d6b`) and
+  `test-ptq1_0-cuda-dot` (`tests/test-ptq1_0-cuda-dot.cpp`, SHA-256
+  `17d72e91495a7ffe4e726e90ebe99bf9d7b9acbe1d451a38c865352c3559092a`) via
+  `tests/upstream_prism/reference_codec.rs` (with `tests/upstream_prism/engine.rs`
+  routing `Target::RustReference` codec calls to `reference_provider`)
+- `test-jinja` (`tests/test-jinja.cpp`, SHA-256
+  `ef2da16176a8e914cbd54341e4b77f675a8f3b5b15a8bfd0c9a7a2305c30c8ab`) via
+  `tests/upstream_prism/reference_jinja.rs`
+
+All seven sources bind pinned upstream commit
+`b87ca7225456b06b0975b8239c66b5aecf07e37c` (MIT terms retained in [LICENSE](LICENSE)).
+`common/public_c_abi.c`, `common/public_c_abi.h`, `common/dspark.hpp`,
+`common/arg_parser.hpp`, `common/optimizer.hpp`, `common/codec.hpp`, and
+`common/jinja.hpp`, together with their bridge includes, dispatch branches and
+CMake build edges, are removed (with `require`, `keys` and `integer` helpers
+inlined into `common/codec_buffers.hpp`), leaving 20 checked-in C++ files and
+zero checked-in C files (20 native files total) across the common bridge snapshot
+and placing all 19 `RequiredReferencePassedIds` in `baseline.json` off
+checked-in C++. Direct native requests for those retired operations reject;
+complete Prism suite execution, native bridge compilation and owning hosted
+acceptance remain pending.

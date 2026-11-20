@@ -38,7 +38,14 @@ native executable rejects this operation as unknown.
 
 ## Generic Jinja operations
 
-Jinja operations call the production lexer, parser, runtime and value APIs. A
+`common/jinja.hpp` is retired from the native bridge and direct native requests
+for `jinja-*` reject. `--target rust-reference` and the ordinary `cpp` reference
+selector route `tests/test-jinja.cpp` through
+`tests/upstream_prism/reference_jinja.rs` (`nativeReferenceReplay=false`) using an
+independent safe Rust Jinja2 lexer, parser, evaluator, stats/caps/string-parts
+engine and 64-bit hasher. Production Rust retains its separate runtime implementation.
+
+Jinja operations execute the pinned Jinja APIs. A
 template is at most 65,536 UTF-8 bytes. Variable-bearing operations accept exactly
 one of `Variables` (an object) or `VariablesJson` (a string containing an object).
 `VariablesJson` preserves object insertion order and numeric types such as `1.0`
@@ -218,6 +225,14 @@ Saved stacks copy only the production stack collection and are invalidated when
 their owning grammar is freed. Grammar handles are freed on every exit path.
 
 ## Generic production codecs
+
+`common/codec.hpp` is retired from the native bridge and direct native requests
+for `codec-inventory`, `codec-quantize`, `codec-dequantize`, and `codec-vec-dot`
+reject (persistent `qb-*` buffer operations in `common/codec_buffers.hpp` remain
+unchanged). `--target rust-reference` and the ordinary `cpp` reference selector
+route `tests/test-quantize-fns.cpp` and `tests/test-ptq1_0-cuda-dot.cpp` through
+`tests/upstream_prism/reference_codec.rs` (`nativeReferenceReplay=false`). Production
+Rust retains its separate `engine_codec` transport.
 
 Codec byte transport uses lowercase hex containing little-endian packed blocks
 or IEEE binary32 values. Type IDs are the pinned production ggml enum values.
@@ -421,10 +436,13 @@ native calls.
 `json-schema-convert` and `json-schema-info` return production grammar/exception
 metadata and ordered schema-information traces.
 
-`public-c-abi` returns raw size/alignment observations from a separate C17 translation unit
-including production `llama.h`: model/context parameters, batch, token/position/sequence scalar
-widths and the C standard macro. The C file contains no expected sizes, assertions or constant
-compilation-success response.
+`public-c-abi` (`common/public_c_abi.c`, `common/public_c_abi.h`) is retired from
+the native bridge and direct native requests reject; `--target rust-reference` and
+the ordinary `cpp` reference selector route `tests/test-c.c` through
+`tests/upstream_prism/reference_public_c_abi.rs` (`nativeReferenceReplay=false`),
+observing `#[repr(C)]` ABI mirror sizes/alignments, token/position/sequence-ID
+scalar widths and the C17 standard constant without invoking native code or
+asserting pass verdicts outside Rust.
 
 `chat-template-trace` exposes supplied production template capabilities, direct applies, diffs and undefined-variable
 statistics. Rust supplies action order, the shared timestamp and structural comparisons; returned
@@ -436,9 +454,12 @@ acceptance. Top-level file-mode `unicode-encode` and `unicode-decode` are retire
 `unicode-regex-split` (handled by `reference_unicode.rs`); session-mode `vocab_session.hpp`
 primitives remain only on `--model-session`.
 
-`argument-enums`, `argument-parser-trace` and `remote-get-content` expose bounded production
-argument parsing and remote-file observations. The session-only resolution operations expose
-caller-supplied model-resolution plans and handler actions.
+`common/arg_parser.hpp` is retired from the native bridge and direct native requests
+for `argument-enums`, `argument-parser-trace` and `remote-get-content` reject.
+`--target rust-reference` and the ordinary `cpp` reference selector route
+`tests/test-arg-parser.cpp` through `tests/upstream_prism/reference_arg_parser.rs`
+(`nativeReferenceReplay=false`). The session-only resolution operations remain in
+`model_resolution.hpp` and expose caller-supplied model-resolution plans and handler actions.
 
 `chat-trace`, `chat-value`, `chat-server-params`, `chat-generic-parse` and `chat-regex` expose
 production chat/response conversions, parsers and raw regex observations. The build links the
@@ -453,7 +474,12 @@ after the C API returns, without unwinding
 across the C callback. Context options and raw KV-center/logit observations expose production
 behavior without a native training or generation policy.
 
-`optimizer-info` returns production backend inventory, hardware concurrency, optimizer defaults and
+`common/optimizer.hpp` is retired from the native bridge and direct native requests
+for `optimizer-info` and `optimizer-trace` reject. `--target rust-reference` and the
+ordinary `cpp` reference selector route `tests/test-opt.cpp` through
+`tests/upstream_prism/reference_optimizer.rs` (`nativeReferenceReplay=false`) using an
+independent CPU training graph, autodiff, AdamW/SGD updater and MT19937 shuffler.
+`optimizer-info` returns backend inventory, hardware concurrency, optimizer defaults and
 context-overhead metadata. `optimizer-trace` accepts caller-supplied devices/scheduler order,
 bounded F32 graph and dataset descriptors, and explicit production allocator, optimizer, result,
 epoch and fit actions. Tensor values and result doubles use raw little-endian bytes/bits, retaining
@@ -505,7 +531,11 @@ continuation, including source gradient and timing stop conditions. This transpo
 generates actions nor decides numerical results. Full source matrices and benchmark execution remain
 CI-only.
 
-`model-load-observe` and the persistent DSpark operations expose production model loading/logging, context
+`model-load-observe` (`common/dspark.hpp`) is retired from the native bridge and direct
+native requests reject; `--target rust-reference` and the ordinary `cpp` reference selector
+route `tests/test-dspark-logsnr-meta.cpp` through `tests/upstream_prism/reference_dspark_logsnr.rs`
+(`nativeReferenceReplay=false`) with an independent bounded GGUF v2/v3 parser and log-SNR guard.
+The persistent DSpark operations (`common/dspark_runtime.hpp`) remain unchanged and expose model loading/logging, context
 staging/capture, tensor observations, samplers and speculation primitives. The provider
 retains production owners and callback data for their required lifetimes.
 

@@ -102,6 +102,7 @@ mod reference_json_schema;
 mod reference_logging;
 mod reference_mtmd;
 mod reference_mtmd_chunks;
+mod reference_optimizer;
 mod reference_provider;
 mod reference_public_c_abi;
 mod reference_quantization;
@@ -281,7 +282,7 @@ const CASES: &[Case] = &[
     register(
         "test-opt",
         "tests/test-opt.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         optimizer::run,
     ),
     register(

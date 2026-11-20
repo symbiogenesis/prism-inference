@@ -17,7 +17,6 @@
 #include "model_runtime.hpp"
 #include "chat_analysis.hpp"
 #include "chat.hpp"
-#include "optimizer.hpp"
 #include "backend_ops.hpp"
 #include "backend_session.hpp"
 #include <nlohmann/json.hpp>
@@ -116,8 +115,6 @@ void validate_operation(const wire_json & operation) {
         prism_chat_analysis::validate(operation);
     } else if (prism_chat::handles(kind)) {
         prism_chat::validate(operation);
-    } else if (prism_optimizer::handles(kind)) {
-        prism_optimizer::validate(operation);
     } else if (prism_backend_ops::handles(kind)) {
         prism_backend_ops::validate(operation);
     } else {
@@ -153,9 +150,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_chat::handles(kind)) {
         return prism_chat::execute(operation);
-    }
-    if (prism_optimizer::handles(kind)) {
-        return prism_optimizer::execute(operation);
     }
     if (prism_backend_ops::handles(kind)) {
         return prism_backend_ops::execute(operation);

@@ -359,21 +359,50 @@ impl Runtime<crate::graph::Qwen35> {
         scale: Option<f32>,
         reuse: PromptReuse,
     ) -> Result<()> {
-        let current = self.decoder.adapter_scale();
-        match (current, scale) {
+        let multi_rank_scale = self.decoder.multi_rank_adapter_scale();
+        self.prepare_profile_request_with_adapters(scale, multi_rank_scale, reuse)
+    }
+
+    /// Validates active rank-one and multi-rank scales and reuses or resets runtime state accordingly.
+    ///
+    /// # Errors
+    /// Rejects scale/loaded-adapter mismatches, out-of-range scales, faulted
+    /// admission, and decoder reset failures.
+    pub fn prepare_profile_request_with_adapters(
+        &mut self,
+        rank_one_scale: Option<f32>,
+        multi_rank_scale: Option<f32>,
+        reuse: PromptReuse,
+    ) -> Result<()> {
+        let current_r1 = self.decoder.adapter_scale();
+        let current_mr = self.decoder.multi_rank_adapter_scale();
+        match (current_r1, rank_one_scale) {
             (None, None) => {}
             (Some(_), Some(scale)) => {
                 crate::model::lora::RankOneAdapter::validate_scale(scale)?;
             }
             _ => return Err(invalid("request scale does not match the loaded adapter")),
         }
+        let normalized_mr = match (current_mr, multi_rank_scale) {
+            (None, None) => None,
+            (Some(_), Some(scale)) => {
+                crate::model::lora::MultiRankAdapter::validate_scale(scale)?;
+                Some(crate::model::lora::MultiRankAdapter::normalize_scale(scale))
+            }
+            _ => {
+                return Err(invalid(
+                    "multi-rank request scale does not match the loaded adapter",
+                ));
+            }
+        };
         if self.faulted {
             return Err(invalid(
                 "native runtime requires reset after failed restoration",
             ));
         }
         if matches!(reuse, PromptReuse::Latest | PromptReuse::PromptEndAndLatest)
-            && current.map(f32::to_bits) == scale.map(f32::to_bits)
+            && current_r1.map(f32::to_bits) == rank_one_scale.map(f32::to_bits)
+            && current_mr.map(f32::to_bits) == normalized_mr.map(f32::to_bits)
         {
             if reuse == PromptReuse::PromptEndAndLatest {
                 self.retain_prompt_end = true;
@@ -383,8 +412,8 @@ impl Runtime<crate::graph::Qwen35> {
         if reuse == PromptReuse::PromptEndAndLatest {
             self.retain_prompt_end = true;
         }
-        if let Some(scale) = scale {
-            self.reset_with_adapter_scale(scale)
+        if rank_one_scale.is_some() || normalized_mr.is_some() {
+            self.reset_with_adapter_scales(rank_one_scale, normalized_mr)
         } else {
             self.reset()
         }
@@ -418,12 +447,45 @@ impl Runtime<crate::graph::Qwen35> {
     /// Invalid/nonfinite scales and graphs without an adapter reject before any
     /// mutation. Later failure closes admission until successful explicit reset.
     pub fn reset_with_adapter_scale(&mut self, scale: f32) -> Result<()> {
-        crate::model::lora::RankOneAdapter::validate_scale(scale)?;
         if self.decoder.adapter_scale().is_none() {
             return Err(invalid("adapter scale requires a loaded rank-one adapter"));
         }
+        let multi_rank_scale = self.decoder.multi_rank_adapter_scale();
+        self.reset_with_adapter_scales(Some(scale), multi_rank_scale)
+    }
+
+    /// Clear complete conversation state and atomically update both loaded adapter scales.
+    ///
+    /// # Errors
+    /// Rejects scale/adapter presence mismatches, invalid scales, and decoder
+    /// reset failures; closes admission on reset failure until explicit reset.
+    pub fn reset_with_adapter_scales(
+        &mut self,
+        rank_one_scale: Option<f32>,
+        multi_rank_scale: Option<f32>,
+    ) -> Result<()> {
+        let current_r1 = self.decoder.adapter_scale();
+        let current_mr = self.decoder.multi_rank_adapter_scale();
+        if current_r1.is_none() && current_mr.is_none() {
+            return Err(invalid("adapter scale requires at least one loaded adapter"));
+        }
+        if let Some(scale) = rank_one_scale {
+            crate::model::lora::RankOneAdapter::validate_scale(scale)?;
+        }
+        let normalized_mr = multi_rank_scale
+            .map(|scale| -> Result<f32> {
+                crate::model::lora::MultiRankAdapter::validate_scale(scale)?;
+                Ok(crate::model::lora::MultiRankAdapter::normalize_scale(scale))
+            })
+            .transpose()?;
+        if current_r1.is_some() != rank_one_scale.is_some()
+            || current_mr.is_some() != normalized_mr.is_some()
+        {
+            return Err(invalid("adapter scale does not match loaded adapters"));
+        }
         self.faulted = true;
-        self.decoder.reset_with_adapter_scale(scale)?;
+        self.decoder
+            .reset_with_adapter_scales(rank_one_scale, normalized_mr)?;
         self.checkpoints.clear();
         self.checkpoint_meta = [CheckpointUtility::default(); MAX_REUSABLE_CHECKPOINTS];
         self.cache_epoch = 0;

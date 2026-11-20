@@ -13,7 +13,7 @@ use crate::{
     invalid,
     kernels::{MatvecBackend, RowParallelism},
     model::{
-        lora::{AdapterStorage, EditedAdapter, RankOneAdapter},
+        lora::{AdapterStorage, EditedAdapter, MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
         swift::{self, LoadReceipt, MmprojLoadReceipt, Representation},
     },
     runtime::{
@@ -801,10 +801,22 @@ struct PreparedMediaChunk {
     encoded: EncodedImage,
 }
 
+/// Verified stackable multi-rank `LoRA` artifact identity bound to a Swift session.
+#[derive(Clone, Copy, Debug)]
+pub struct MultiRankAdapterSpec<'a> {
+    /// Absolute filesystem path to the adapter GGUF.
+    pub path: &'a Path,
+    /// Exact verified byte length.
+    pub bytes: u64,
+    /// Exact lowercase 64-digit hex SHA-256 digest.
+    pub sha256: &'a str,
+}
+
 /// Exact rendered and counted input, sealed by its originating verified session.
 pub struct PreparedChat {
     owner: Arc<()>,
     adapter_scale: Option<f32>,
+    multi_rank_scale: Option<f32>,
     tokens: Vec<u32>,
     media_chunks: Vec<PreparedMediaChunk>,
     output_tokens: usize,
@@ -816,6 +828,12 @@ impl PreparedChat {
     #[must_use]
     pub const fn adapter_scale(&self) -> Option<f32> {
         self.adapter_scale
+    }
+
+    /// Exact multi-rank correction scale reserved by this request, when a secondary adapter is loaded.
+    #[must_use]
+    pub const fn multi_rank_scale(&self) -> Option<f32> {
+        self.multi_rank_scale
     }
 
     /// Exact number of tokens in the complete rendered prompt.
@@ -867,6 +885,9 @@ pub struct SwiftSession {
     cpu_speculation: Option<CpuSpeculation>,
     adapter_identity: Option<String>,
     adapter_storage: Option<AdapterStorage>,
+    secondary_adapter_identity: Option<String>,
+    secondary_adapter_max_rank: Option<usize>,
+    secondary_adapter_storage_bytes: Option<usize>,
     runtime: Runtime<Qwen35>,
     chat: SwiftChatSession,
     vocabulary: Vocabulary,
@@ -1139,6 +1160,48 @@ impl SwiftSession {
             path,
             representation,
             AdapterSelection::Approved(adapter_path),
+            None,
+            backend,
+            seed,
+            parallelism,
+            kv_cache,
+            context_tokens,
+            cpu_prefill,
+            cpu_speculation,
+            prompt_reuse,
+            branch_checkpoints,
+        )
+    }
+
+    /// Load an immutable profile with an optional stackable NPU-friendly multi-rank adapter.
+    ///
+    /// # Errors
+    /// Rejects invalid secondary adapter identities/envelopes, representation
+    /// mismatches, capacity errors, and standard loading failures.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Stackable multi-rank adapter extends the immutable execution/reuse profile loader."
+    )]
+    pub fn load_profile_with_adapters(
+        path: &Path,
+        representation: Representation,
+        adapter_path: Option<&Path>,
+        multi_rank_adapter: Option<MultiRankAdapterSpec<'_>>,
+        backend: MatvecBackend,
+        seed: u32,
+        parallelism: RowParallelism,
+        kv_cache: KvCachePolicy,
+        context_tokens: usize,
+        cpu_prefill: Option<CpuPrefill>,
+        cpu_speculation: Option<CpuSpeculation>,
+        prompt_reuse: PromptReuse,
+        branch_checkpoints: BranchCheckpoints,
+    ) -> Result<Self> {
+        Self::load_selected_profile(
+            path,
+            representation,
+            AdapterSelection::Approved(adapter_path),
+            multi_rank_adapter,
             backend,
             seed,
             parallelism,
@@ -1180,6 +1243,7 @@ impl SwiftSession {
             path,
             representation,
             AdapterSelection::Edited(adapter),
+            None,
             backend,
             seed,
             parallelism,
@@ -1194,12 +1258,14 @@ impl SwiftSession {
 
     #[expect(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "Both explicit adapter selections share one immutable execution loader."
     )]
     fn load_selected_profile(
         path: &Path,
         representation: Representation,
         adapter_selection: AdapterSelection<'_>,
+        multi_rank_adapter: Option<MultiRankAdapterSpec<'_>>,
         backend: MatvecBackend,
         seed: u32,
         parallelism: RowParallelism,
@@ -1250,13 +1316,19 @@ impl SwiftSession {
             .as_ref()
             .map(|adapter| adapter.identity().to_owned());
         let adapter_storage = adapter.as_ref().map(RankOneAdapter::storage);
-        let mut decoder = Qwen35::with_swift_state_budget_and_kv(
+        let secondary = load_secondary_adapter(&model, multi_rank_adapter)?;
+        let secondary_adapter = secondary.adapter;
+        let secondary_adapter_identity = secondary.identity;
+        let secondary_adapter_max_rank = secondary.max_rank;
+        let secondary_adapter_storage_bytes = secondary.storage_bytes;
+        let mut decoder = Qwen35::with_state_budget_and_adapters_scope(
             model,
             context_tokens,
             state_budget,
             backend,
             kv_cache,
-            adapter,
+            adapter.map(|item| (item, 1.3)),
+            secondary_adapter.map(|item| (item, 0.0)),
         )?;
         decoder.set_row_parallelism(parallelism);
         if let Some(prefill) = cpu_prefill {
@@ -1290,6 +1362,9 @@ impl SwiftSession {
             cpu_speculation,
             adapter_identity,
             adapter_storage,
+            secondary_adapter_identity,
+            secondary_adapter_max_rank,
+            secondary_adapter_storage_bytes,
             runtime,
             chat,
             vocabulary,
@@ -1364,6 +1439,24 @@ impl SwiftSession {
     #[must_use]
     pub const fn adapter_storage(&self) -> Option<AdapterStorage> {
         self.adapter_storage
+    }
+
+    /// Exact verified secondary multi-rank adapter SHA-256, when explicitly loaded.
+    #[must_use]
+    pub fn secondary_adapter_identity(&self) -> Option<&str> {
+        self.secondary_adapter_identity.as_deref()
+    }
+
+    /// Maximum `LoRA` rank across the loaded secondary multi-rank adapter, when present.
+    #[must_use]
+    pub const fn secondary_adapter_max_rank(&self) -> Option<usize> {
+        self.secondary_adapter_max_rank
+    }
+
+    /// Retained host payload bytes for the secondary multi-rank adapter, when present.
+    #[must_use]
+    pub const fn secondary_adapter_storage_bytes(&self) -> Option<usize> {
+        self.secondary_adapter_storage_bytes
     }
 
     /// Verified loading and bounded storage accounting for this model.
@@ -1590,15 +1683,45 @@ impl SwiftSession {
         enable_thinking: bool,
         adapter_scale: Option<f32>,
     ) -> Result<PreparedChat> {
+        let multi_rank_scale = self.secondary_adapter_identity.as_ref().map(|_| 0.0);
+        self.prepare_with_adapter_scales(
+            messages,
+            output_tokens,
+            enable_thinking,
+            adapter_scale,
+            multi_rank_scale,
+        )
+    }
+
+    /// Seal exact prompt tokens, thinking mode, rank-one scale, and secondary multi-rank scale.
+    ///
+    /// A loaded primary or secondary adapter requires `Some` finite scale in
+    /// `0..=2`; an omitted adapter requires `None`.
+    ///
+    /// # Errors
+    /// Rejects closed admission, mismatched settings, invalid scales, and prompt bounds.
+    pub fn prepare_with_adapter_scales(
+        &self,
+        messages: &Value,
+        output_tokens: usize,
+        enable_thinking: bool,
+        adapter_scale: Option<f32>,
+        multi_rank_scale: Option<f32>,
+    ) -> Result<PreparedChat> {
         if messages_have_array_content(messages) {
-            return self.prepare_multimodal_with_settings(
+            return self.prepare_multimodal_with_adapter_scales(
                 messages,
                 output_tokens,
                 enable_thinking,
                 adapter_scale,
+                multi_rank_scale,
             );
         }
         validate_adapter_scale(self.adapter_identity.is_some(), adapter_scale)?;
+        validate_multi_rank_scale(
+            self.secondary_adapter_identity.is_some(),
+            multi_rank_scale,
+        )?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }
@@ -1608,6 +1731,7 @@ impl SwiftSession {
         Ok(PreparedChat {
             owner: self.owner.clone(),
             adapter_scale,
+            multi_rank_scale: multi_rank_scale.map(MultiRankAdapter::normalize_scale),
             tokens: prompt.tokenization.token_ids,
             media_chunks: Vec::new(),
             output_tokens,
@@ -1627,7 +1751,34 @@ impl SwiftSession {
         enable_thinking: bool,
         adapter_scale: Option<f32>,
     ) -> Result<PreparedChat> {
+        let multi_rank_scale = self.secondary_adapter_identity.as_ref().map(|_| 0.0);
+        self.prepare_multimodal_with_adapter_scales(
+            messages,
+            output_tokens,
+            enable_thinking,
+            adapter_scale,
+            multi_rank_scale,
+        )
+    }
+
+    /// Encode image attachments, splice vision patch spans, and seal dual-adapter scales.
+    ///
+    /// # Errors
+    /// Rejects closed admission, missing vision projector, malformed parts/URLs,
+    /// image decode errors, mismatched settings/scales, and context overflow.
+    pub fn prepare_multimodal_with_adapter_scales(
+        &self,
+        messages: &Value,
+        output_tokens: usize,
+        enable_thinking: bool,
+        adapter_scale: Option<f32>,
+        multi_rank_scale: Option<f32>,
+    ) -> Result<PreparedChat> {
         validate_adapter_scale(self.adapter_identity.is_some(), adapter_scale)?;
+        validate_multi_rank_scale(
+            self.secondary_adapter_identity.is_some(),
+            multi_rank_scale,
+        )?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }
@@ -1694,6 +1845,7 @@ impl SwiftSession {
         Ok(PreparedChat {
             owner: self.owner.clone(),
             adapter_scale,
+            multi_rank_scale: multi_rank_scale.map(MultiRankAdapter::normalize_scale),
             tokens: prepared.tokenization.token_ids,
             media_chunks,
             output_tokens,
@@ -1781,14 +1933,7 @@ impl SwiftSession {
                 "CPU suffix speculation does not support multimodal image prompts",
             ));
         }
-        if self.is_faulted() {
-            return Err(invalid("Swift session requires reset"));
-        }
-        validate_prompt_owner(&self.owner, prompt)?;
-        validate_adapter_scale(self.adapter_identity.is_some(), prompt.adapter_scale)?;
-        check_request(cancellation, deadline)?;
-        self.runtime
-            .prepare_profile_request(prompt.adapter_scale, self.prompt_reuse)?;
+        self.prepare_completion_prompt(prompt, cancellation, deadline)?;
         let options = self.chat.generation(prompt.output_tokens)?;
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
@@ -1824,6 +1969,31 @@ impl SwiftSession {
         Ok((completion, stats))
     }
 
+    fn prepare_completion_prompt(
+        &mut self,
+        prompt: &PreparedChat,
+        cancellation: &Cancellation,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        if self.is_faulted() {
+            return Err(invalid("Swift session requires reset"));
+        }
+        validate_prompt_owner(&self.owner, prompt)?;
+        validate_adapter_scale(self.adapter_identity.is_some(), prompt.adapter_scale)?;
+        validate_multi_rank_scale(
+            self.secondary_adapter_identity.is_some(),
+            prompt.multi_rank_scale,
+        )?;
+        check_request(cancellation, deadline)?;
+        // Exact reuse is opt-in and never crosses a bitwise scale change.
+        // The runtime recomputes unmatched histories under whole-request rollback.
+        self.runtime.prepare_profile_request_with_adapters(
+            prompt.adapter_scale,
+            prompt.multi_rank_scale,
+            self.prompt_reuse,
+        )
+    }
+
     fn complete_observed(
         &mut self,
         prompt: &PreparedChat,
@@ -1839,16 +2009,7 @@ impl SwiftSession {
             ));
         }
         self.last_speculative_stats = None;
-        if self.is_faulted() {
-            return Err(invalid("Swift session requires reset"));
-        }
-        validate_prompt_owner(&self.owner, prompt)?;
-        validate_adapter_scale(self.adapter_identity.is_some(), prompt.adapter_scale)?;
-        check_request(cancellation, deadline)?;
-        // Exact reuse is opt-in and never crosses a bitwise scale change.
-        // The runtime recomputes unmatched histories under whole-request rollback.
-        self.runtime
-            .prepare_profile_request(prompt.adapter_scale, self.prompt_reuse)?;
+        self.prepare_completion_prompt(prompt, cancellation, deadline)?;
         let options = self.chat.generation(prompt.output_tokens)?;
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
@@ -2243,6 +2404,50 @@ fn validate_adapter_scale(loaded: bool, scale: Option<f32>) -> Result<()> {
     }
 }
 
+struct LoadedSecondaryAdapter {
+    adapter: Option<MultiRankAdapter>,
+    identity: Option<String>,
+    max_rank: Option<usize>,
+    storage_bytes: Option<usize>,
+}
+
+fn load_secondary_adapter(
+    model: &crate::model::Model,
+    spec: Option<MultiRankAdapterSpec<'_>>,
+) -> Result<LoadedSecondaryAdapter> {
+    let adapter = spec
+        .map(|entry| {
+            MultiRankAdapter::load_verified(
+                model,
+                entry.path,
+                entry.bytes,
+                entry.sha256,
+                MultiRankAdapter::DEFAULT_MEMORY_LIMIT,
+                MultiRankPolicy::NpuFriendly,
+            )
+        })
+        .transpose()?;
+    let identity = adapter.as_ref().map(|item| item.identity().to_owned());
+    let max_rank = adapter.as_ref().map(MultiRankAdapter::max_rank);
+    let storage_bytes = adapter.as_ref().map(MultiRankAdapter::storage_bytes);
+    Ok(LoadedSecondaryAdapter {
+        adapter,
+        identity,
+        max_rank,
+        storage_bytes,
+    })
+}
+
+fn validate_multi_rank_scale(loaded: bool, scale: Option<f32>) -> Result<()> {
+    match (loaded, scale) {
+        (false, None) => Ok(()),
+        (true, Some(scale)) => MultiRankAdapter::validate_scale(scale),
+        _ => Err(invalid(
+            "Swift secondary adapter scale does not match the loaded profile",
+        )),
+    }
+}
+
 fn charge_output(total: &mut usize, bytes: usize) -> Result<()> {
     *total = total
         .checked_add(bytes)
@@ -2276,7 +2481,7 @@ mod tests {
         kv_token_memory_bytes, max_context_tokens, selected_state_budget, state_limit_bytes,
         validate_adapter_scale, validate_context_capacity, validate_context_capacity_with_kv,
         validate_execution_capacity, validate_execution_capacity_with_kv,
-        validate_prefill_capacity, validate_prompt_owner,
+        validate_multi_rank_scale, validate_prefill_capacity, validate_prompt_owner,
     };
     use crate::{
         Result,
@@ -2491,6 +2696,7 @@ mod tests {
         let prompt = PreparedChat {
             owner: owner.clone(),
             adapter_scale: Some(-0.0),
+            multi_rank_scale: Some(0.5),
             tokens: vec![1, 2],
             media_chunks: Vec::new(),
             output_tokens: 3,
@@ -2506,14 +2712,23 @@ mod tests {
             prompt.adapter_scale().map(f32::to_bits),
             Some((-0.0_f32).to_bits())
         );
+        assert_eq!(
+            prompt.multi_rank_scale().map(f32::to_bits),
+            Some(0.5_f32.to_bits())
+        );
         assert!(validate_adapter_scale(false, None).is_ok());
         assert!(validate_adapter_scale(true, None).is_err());
+        assert!(validate_multi_rank_scale(false, None).is_ok());
+        assert!(validate_multi_rank_scale(true, None).is_err());
         for scale in [0.0, -0.0, 1.3, 2.0] {
             validate_adapter_scale(true, Some(scale))?;
+            validate_multi_rank_scale(true, Some(scale))?;
             assert!(validate_adapter_scale(false, Some(scale)).is_err());
+            assert!(validate_multi_rank_scale(false, Some(scale)).is_err());
         }
         for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 2.01] {
             assert!(validate_adapter_scale(true, Some(scale)).is_err());
+            assert!(validate_multi_rank_scale(true, Some(scale)).is_err());
         }
         Ok(())
     }

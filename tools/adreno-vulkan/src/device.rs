@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::CStr;
-use std::ptr::null_mut;
+use std::ptr::{NonNull, null_mut};
 use std::slice;
 
 use ash::vk;
@@ -19,6 +19,10 @@ use crate::{
 
 const FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 const QUALCOMM_VENDOR_ID: u32 = 0x5143;
+const MAX_STAGE_BINDINGS: usize = 12;
+const MAX_PUSH_BYTES: usize = 128;
+const MAX_DESCRIPTOR_SETS_PER_SUBMIT: usize = 256;
+const ARENA_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
 const FORBIDDEN_VK_ENV_PREFIXES: [&str; 10] = [
     "VK_ICD_FILENAMES",
@@ -37,6 +41,29 @@ const FORBIDDEN_VK_ENV_PREFIXES: [&str; 10] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct BufferId(usize);
 
+/// Sub-allocated span within a GPU buffer bound cleanly to a descriptor slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct BufferSpan {
+    /// Backing storage buffer handle.
+    pub buffer: BufferId,
+    /// Byte offset inside `buffer` (aligned to `minStorageBufferOffsetAlignment`).
+    pub offset: u64,
+    /// Valid byte extent starting at `offset` (or `vk::WHOLE_SIZE` when binding whole).
+    pub range: u64,
+}
+
+impl BufferSpan {
+    /// Creates a span covering the full extent of `buffer` starting at byte offset `0`.
+    #[must_use]
+    pub const fn whole(buffer: BufferId) -> Self {
+        Self {
+            buffer,
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        }
+    }
+}
+
 /// Opaque handle to a compiled compute pipeline owned by [`AdrenoVulkanDevice`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct PipelineId(usize);
@@ -52,6 +79,107 @@ pub struct ComputeStage<'a> {
     pub push_u32s: &'a [u32],
     /// Workgroup grid `[x, y, z]`.
     pub workgroups: [u32; 3],
+}
+
+/// One compute dispatch stage binding explicit [`BufferSpan`] sub-ranges.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputeSpanStage<'a> {
+    /// Compiled compute pipeline handle.
+    pub pipeline: PipelineId,
+    /// Storage buffer spans bound sequentially to set `0`, bindings `0..n`.
+    pub buffers: &'a [BufferSpan],
+    /// Push constant `u32` words starting at byte offset `0`.
+    pub push_u32s: &'a [u32],
+    /// Workgroup grid `[x, y, z]`.
+    pub workgroups: [u32; 3],
+}
+
+#[derive(Clone, Copy)]
+struct ArenaChunk {
+    buffer: BufferId,
+    capacity: u64,
+    used: u64,
+}
+
+/// Bump-allocated GPU resident weight arena backed by `256 MiB` mapped storage buffers.
+#[derive(Default)]
+pub struct WeightArena {
+    align: u64,
+    max_range: u64,
+    chunks: Vec<ArenaChunk>,
+}
+
+impl WeightArena {
+    /// Constructs a weight arena aligned cleanly to `device` storage buffer offset limits.
+    #[must_use]
+    pub fn new(device: &AdrenoVulkanDevice) -> Self {
+        let hw_align = device.min_storage_buffer_offset_alignment().max(1);
+        let align = if hw_align <= 256 && 256_u64.is_multiple_of(hw_align) {
+            256
+        } else {
+            hw_align
+        };
+        let max_range = u64::from(device.capabilities().compute_limits.max_storage_buffer_range);
+        Self {
+            align,
+            max_range,
+            chunks: Vec::new(),
+        }
+    }
+
+    /// Sub-allocates `byte_len` (`>= 4`) bytes from resident arena chunks, creating a new chunk when full.
+    ///
+    /// # Errors
+    /// Returns [`Error::ResourceLimit`] if a single tensor exceeds `maxStorageBufferRange`, or
+    /// propagates Vulkan allocation failures from `device`.
+    pub fn alloc(
+        &mut self,
+        device: &mut AdrenoVulkanDevice,
+        byte_len: u64,
+    ) -> Result<BufferSpan, Error> {
+        let size = byte_len.max(4);
+        let step = size
+            .checked_add(self.align - 1)
+            .map(|v| (v / self.align) * self.align)
+            .ok_or_else(|| Error::ResourceLimit("weight arena size overflow".to_owned()))?;
+        if size > self.max_range || step > self.max_range {
+            return Err(Error::ResourceLimit(format!(
+                "weight tensor ({size} B) exceeds maxStorageBufferRange ({} B)",
+                self.max_range
+            )));
+        }
+        if let Some(last) = self.chunks.last_mut()
+            && last.capacity.saturating_sub(last.used) >= step
+        {
+            let span = BufferSpan {
+                buffer: last.buffer,
+                offset: last.used,
+                range: size,
+            };
+            last.used += step;
+            return Ok(span);
+        }
+        let chunk_capacity = ARENA_CHUNK_BYTES.max(step).min(self.max_range);
+        let buffer = device.create_storage_buffer(chunk_capacity)?;
+        let span = BufferSpan {
+            buffer,
+            offset: 0,
+            range: size,
+        };
+        self.chunks.push(ArenaChunk {
+            buffer,
+            capacity: chunk_capacity,
+            used: step,
+        });
+        Ok(span)
+    }
+
+    /// Frees every backing GPU chunk owned by this arena back to `device`.
+    pub fn free_all(&mut self, device: &mut AdrenoVulkanDevice) {
+        for chunk in self.chunks.drain(..) {
+            device.free_buffer(chunk.buffer);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -71,6 +199,9 @@ mod win_loader {
     pub(super) struct VulkanLibrary {
         handle: HMODULE,
     }
+
+    // SAFETY: `HMODULE` is a process-wide Win32 library handle freed once on Drop after all Vulkan handles are destroyed.
+    unsafe impl Send for VulkanLibrary {}
 
     impl VulkanLibrary {
         pub(super) fn load_system32() -> Result<Self, Error> {
@@ -120,11 +251,28 @@ mod win_loader {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MappedPtr(NonNull<u8>);
+
+// SAFETY: Persistent host-visible mappings are synchronized exclusively under `&self`/`&mut self`
+// on `AdrenoVulkanDevice` while no GPU command buffer is in flight.
+unsafe impl Send for MappedPtr {}
+
 struct OwnedBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size_bytes: u64,
     host_coherent: bool,
+    mapped: MappedPtr,
+}
+
+fn destroy_owned_buffer(device: &ash::Device, buf: &OwnedBuffer) {
+    // SAFETY: `buf.memory` remains persistently mapped until immediately before destruction.
+    unsafe { device.unmap_memory(buf.memory) };
+    // SAFETY: Device is idle or tearing down cleanly; destroying owned `vk::Buffer`.
+    unsafe { device.destroy_buffer(buf.buffer, None) };
+    // SAFETY: Freeing owned `DeviceMemory` after unmapping and destroying its buffer.
+    unsafe { device.free_memory(buf.memory, None) };
 }
 
 struct OwnedPipeline {
@@ -138,13 +286,16 @@ struct OwnedPipeline {
 /// Self-contained native Qualcomm Adreno Vulkan compute device and resource owner.
 pub struct AdrenoVulkanDevice {
     capabilities: VulkanDeviceCapabilities,
+    min_storage_buffer_offset_alignment: u64,
     sdot_enabled: bool,
     buffers: Vec<Option<OwnedBuffer>>,
     uncertain_buffers: Vec<OwnedBuffer>,
     pipelines: Vec<OwnedPipeline>,
+    scratch_sets: Vec<vk::DescriptorSet>,
     faulted: bool,
     fence: vk::Fence,
     command_buffer: vk::CommandBuffer,
+    pipeline_cache: vk::PipelineCache,
     descriptor_pool: vk::DescriptorPool,
     command_pool: vk::CommandPool,
     compute_queue: vk::Queue,
@@ -234,7 +385,8 @@ impl AdrenoVulkanDevice {
             }
         };
 
-        let Some((phys, queue_family, caps, _ext_set, mem_properties)) =
+        // SAFETY: Querying initial adapter selection handles.
+        let Some((phys, queue_family, caps, _ext_set, mem_properties, min_offset_align)) =
             select_native_adreno(&entry, &instance, &physical_devices)
         else {
             // SAFETY: No suitable Adreno adapter found; clean up instance.
@@ -261,6 +413,7 @@ impl AdrenoVulkanDevice {
             caps,
             sdot_enabled,
             &mem_properties,
+            min_offset_align,
         )
     }
 
@@ -278,6 +431,7 @@ impl AdrenoVulkanDevice {
         capabilities: VulkanDeviceCapabilities,
         sdot_enabled: bool,
         mem_properties: &vk::PhysicalDeviceMemoryProperties,
+        min_storage_buffer_offset_alignment: u64,
     ) -> Result<Self, Error> {
         // SAFETY: `queue_family` and queue index 0 were requested in `DeviceQueueCreateInfo`.
         let compute_queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -312,13 +466,14 @@ impl AdrenoVulkanDevice {
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 1024,
+            descriptor_count: 2048,
         }];
+        let max_sets_u32 = u32::try_from(MAX_DESCRIPTOR_SETS_PER_SUBMIT).unwrap_or(256);
         let desc_info = vk::DescriptorPoolCreateInfo::default()
-            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(256)
+            .flags(vk::DescriptorPoolCreateFlags::empty())
+            .max_sets(max_sets_u32)
             .pool_sizes(&pool_sizes);
-        // SAFETY: Creating descriptor pool on live device.
+        // SAFETY: Creating resettable transient descriptor pool on live device.
         let descriptor_pool = match unsafe { device.create_descriptor_pool(&desc_info, None) } {
             Ok(pool) => pool,
             Err(err) => {
@@ -332,11 +487,30 @@ impl AdrenoVulkanDevice {
             }
         };
 
+        let cache_info = vk::PipelineCacheCreateInfo::default();
+        // SAFETY: Creating pipeline cache on live device.
+        let pipeline_cache = match unsafe { device.create_pipeline_cache(&cache_info, None) } {
+            Ok(cache) => cache,
+            Err(err) => {
+                // SAFETY: Rollback descriptor pool.
+                unsafe { device.destroy_descriptor_pool(descriptor_pool, None) };
+                // SAFETY: Rollback command pool.
+                unsafe { device.destroy_command_pool(command_pool, None) };
+                return Err(destroy_dev_inst_err(
+                    &device,
+                    &instance,
+                    format!("create_pipeline_cache: {err:?}"),
+                ));
+            }
+        };
+
         let fence_info = vk::FenceCreateInfo::default();
         // SAFETY: Creating fence on live device.
         let fence = match unsafe { device.create_fence(&fence_info, None) } {
             Ok(f) => f,
             Err(err) => {
+                // SAFETY: Rollback pipeline cache.
+                unsafe { device.destroy_pipeline_cache(pipeline_cache, None) };
                 // SAFETY: Rollback descriptor pool.
                 unsafe { device.destroy_descriptor_pool(descriptor_pool, None) };
                 // SAFETY: Rollback command pool.
@@ -351,13 +525,16 @@ impl AdrenoVulkanDevice {
 
         Ok(Self {
             capabilities,
+            min_storage_buffer_offset_alignment,
             sdot_enabled,
             buffers: Vec::new(),
             uncertain_buffers: Vec::new(),
             pipelines: Vec::new(),
+            scratch_sets: Vec::new(),
             faulted: false,
             fence,
             command_buffer,
+            pipeline_cache,
             descriptor_pool,
             command_pool,
             compute_queue,
@@ -373,6 +550,12 @@ impl AdrenoVulkanDevice {
     #[must_use]
     pub const fn capabilities(&self) -> &VulkanDeviceCapabilities {
         &self.capabilities
+    }
+
+    /// Returns the hardware `minStorageBufferOffsetAlignment` in bytes.
+    #[must_use]
+    pub const fn min_storage_buffer_offset_alignment(&self) -> u64 {
+        self.min_storage_buffer_offset_alignment
     }
 
     /// Returns `true` if `VK_KHR_shader_integer_dot_product` was enabled on the logical device.
@@ -442,12 +625,39 @@ impl AdrenoVulkanDevice {
             unsafe { self.device.destroy_buffer(buffer, None) };
             return Err(Error::Vulkan(format!("bind_buffer_memory: {err:?}")));
         }
+        // SAFETY: `memory` is host-visible and at least `size` bytes; keep persistently mapped until teardown.
+        let mapped_raw = unsafe {
+            self.device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        };
+        let mapped = match mapped_raw {
+            Ok(ptr) => {
+                let Some(nn) = NonNull::new(ptr.cast::<u8>()) else {
+                    // SAFETY: Unmapping unexpected null mapping before freeing resources.
+                    unsafe { self.device.unmap_memory(memory) };
+                    // SAFETY: Free `memory` on null map failure.
+                    unsafe { self.device.free_memory(memory, None) };
+                    // SAFETY: Destroy `buffer` on null map failure.
+                    unsafe { self.device.destroy_buffer(buffer, None) };
+                    return Err(Error::Vulkan("map_memory returned null pointer".to_owned()));
+                };
+                MappedPtr(nn)
+            }
+            Err(err) => {
+                // SAFETY: Free `memory` on map failure.
+                unsafe { self.device.free_memory(memory, None) };
+                // SAFETY: Destroy `buffer` on map failure.
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(Error::Vulkan(format!("map_memory: {err:?}")));
+            }
+        };
 
         let slot = OwnedBuffer {
             buffer,
             memory,
             size_bytes: size,
             host_coherent,
+            mapped,
         };
         if let Some(empty_idx) = self.buffers.iter().position(Option::is_none) {
             self.buffers[empty_idx] = Some(slot);
@@ -459,131 +669,190 @@ impl AdrenoVulkanDevice {
         }
     }
 
-    /// Uploads raw bytes into a host-visible storage buffer starting at byte offset `0`.
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidInput`] if `data.len()` exceeds buffer size or [`Error::Vulkan`] on map failure.
-    pub fn write_buffer_bytes(&self, id: BufferId, data: &[u8]) -> Result<(), Error> {
+    fn with_mapped_slice_mut<F>(
+        &self,
+        id: BufferId,
+        byte_offset: u64,
+        byte_len: usize,
+        flush_after: bool,
+        invalidate_before: bool,
+        visit: F,
+    ) -> Result<(), Error>
+    where
+        F: FnOnce(&mut [u8]),
+    {
         self.ensure_healthy()?;
         let entry = self
             .buffers
             .get(id.0)
             .and_then(Option::as_ref)
             .ok_or_else(|| Error::InvalidInput("invalid buffer handle".to_owned()))?;
-        let data_len_u64 = u64::try_from(data.len())
-            .map_err(|_| Error::InvalidInput("upload byte length overflow".to_owned()))?;
-        if data_len_u64 > entry.size_bytes {
+        let byte_len_u64 = u64::try_from(byte_len)
+            .map_err(|_| Error::InvalidInput("byte length overflow".to_owned()))?;
+        let end = byte_offset
+            .checked_add(byte_len_u64)
+            .ok_or_else(|| Error::InvalidInput("buffer byte range overflow".to_owned()))?;
+        if end > entry.size_bytes {
             return Err(Error::InvalidInput(format!(
-                "upload ({data_len_u64} B) exceeds buffer size ({} B)",
+                "transfer range ({byte_offset}..{end} B) exceeds buffer size ({} B)",
                 entry.size_bytes
             )));
         }
-        if data.is_empty() {
+        if byte_len == 0 {
             return Ok(());
         }
-        // SAFETY: Mapping non-empty host-visible `entry.memory` for `data_len_u64` bytes.
-        let ptr = unsafe {
-            self.device
-                .map_memory(entry.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        }
-        .map_err(|err| Error::Vulkan(format!("map_memory: {err:?}")))?;
-        // SAFETY: Both `data.as_ptr()` and mapped `ptr` are valid, non-overlapping for `data.len()` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), data.len()) };
-        if !entry.host_coherent {
+        let off_usize = usize::try_from(byte_offset)
+            .map_err(|_| Error::InvalidInput("buffer offset overflow".to_owned()))?;
+        let total_usize = usize::try_from(entry.size_bytes)
+            .map_err(|_| Error::InvalidInput("buffer size overflow".to_owned()))?;
+        if invalidate_before && !entry.host_coherent {
             let range = [vk::MappedMemoryRange::default()
                 .memory(entry.memory)
                 .offset(0)
                 .size(vk::WHOLE_SIZE)];
-            // SAFETY: Flushing mapped memory range when heap is non-coherent.
+            // SAFETY: Invalidating persistently mapped non-coherent range before host readback.
+            let _ = unsafe { self.device.invalidate_mapped_memory_ranges(&range) };
+        }
+        // SAFETY: `entry.mapped` stays persistently valid for `total_usize` bytes while no GPU queue uses `self`.
+        let whole = unsafe { slice::from_raw_parts_mut(entry.mapped.0.as_ptr(), total_usize) };
+        visit(&mut whole[off_usize..off_usize + byte_len]);
+        if flush_after && !entry.host_coherent {
+            let range = [vk::MappedMemoryRange::default()
+                .memory(entry.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)];
+            // SAFETY: Flushing persistently mapped non-coherent range after host write.
             let _ = unsafe { self.device.flush_mapped_memory_ranges(&range) };
         }
-        // SAFETY: Unmapping `entry.memory` cleanly.
-        unsafe { self.device.unmap_memory(entry.memory) };
         Ok(())
     }
 
-    /// Uploads a slice of `u32` words into a storage buffer.
+    /// Writes raw bytes into a persistently mapped storage buffer starting at `byte_offset`.
     ///
     /// # Errors
-    /// Propagates [`Self::write_buffer_bytes`] errors.
-    pub fn write_buffer_u32(&self, id: BufferId, words: &[u32]) -> Result<(), Error> {
+    /// Returns [`Error::InvalidInput`] if `byte_offset + data.len()` exceeds buffer size.
+    pub fn write_buffer_bytes_at(
+        &self,
+        id: BufferId,
+        byte_offset: u64,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        self.with_mapped_slice_mut(id, byte_offset, data.len(), true, false, |dst| {
+            dst.copy_from_slice(data);
+        })
+    }
+
+    /// Uploads raw bytes into a host-visible storage buffer starting at byte offset `0`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if `data.len()` exceeds buffer size or [`Error::Vulkan`] if faulted.
+    pub fn write_buffer_bytes(&self, id: BufferId, data: &[u8]) -> Result<(), Error> {
+        self.write_buffer_bytes_at(id, 0, data)
+    }
+
+    /// Writes `words` into a persistently mapped storage buffer starting at `byte_offset`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::write_buffer_bytes_at`] bounds and overflow errors.
+    pub fn write_buffer_u32_at(
+        &self,
+        id: BufferId,
+        byte_offset: u64,
+        words: &[u32],
+    ) -> Result<(), Error> {
         let byte_len = words
             .len()
             .checked_mul(4)
             .ok_or_else(|| Error::InvalidInput("u32 byte count overflow".to_owned()))?;
-        let mut bytes = Vec::with_capacity(byte_len);
-        for &word in words {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        self.write_buffer_bytes(id, &bytes)
+        self.with_mapped_slice_mut(id, byte_offset, byte_len, true, false, |dst| {
+            #[cfg(target_endian = "little")]
+            // SAFETY: `words` is a valid initialized `u32` slice of `byte_len` bytes, non-overlapping with `dst`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), dst.as_mut_ptr(), byte_len);
+            }
+            #[cfg(not(target_endian = "little"))]
+            for (slot, &word) in dst.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                *slot = word.to_le_bytes();
+            }
+        })
     }
 
-    /// Uploads a slice of `f32` scalars into a storage buffer.
+    /// Uploads a slice of `u32` words into a storage buffer starting at byte offset `0`.
     ///
     /// # Errors
-    /// Propagates [`Self::write_buffer_bytes`] errors.
-    pub fn write_buffer_f32(&self, id: BufferId, values: &[f32]) -> Result<(), Error> {
+    /// Propagates [`Self::write_buffer_u32_at`] errors.
+    pub fn write_buffer_u32(&self, id: BufferId, words: &[u32]) -> Result<(), Error> {
+        self.write_buffer_u32_at(id, 0, words)
+    }
+
+    /// Writes `values` into a persistently mapped storage buffer starting at `byte_offset`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::write_buffer_bytes_at`] bounds and overflow errors.
+    pub fn write_buffer_f32_at(
+        &self,
+        id: BufferId,
+        byte_offset: u64,
+        values: &[f32],
+    ) -> Result<(), Error> {
         let byte_len = values
             .len()
             .checked_mul(4)
             .ok_or_else(|| Error::InvalidInput("f32 byte count overflow".to_owned()))?;
-        let mut bytes = Vec::with_capacity(byte_len);
-        for &val in values {
-            bytes.extend_from_slice(&val.to_le_bytes());
-        }
-        self.write_buffer_bytes(id, &bytes)
+        self.with_mapped_slice_mut(id, byte_offset, byte_len, true, false, |dst| {
+            #[cfg(target_endian = "little")]
+            // SAFETY: `values` is a valid initialized `f32` slice of `byte_len` bytes, non-overlapping with `dst`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), dst.as_mut_ptr(), byte_len);
+            }
+            #[cfg(not(target_endian = "little"))]
+            for (slot, &val) in dst.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+                *slot = val.to_le_bytes();
+            }
+        })
+    }
+
+    /// Uploads a slice of `f32` scalars into a storage buffer starting at byte offset `0`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::write_buffer_f32_at`] errors.
+    pub fn write_buffer_f32(&self, id: BufferId, values: &[f32]) -> Result<(), Error> {
+        self.write_buffer_f32_at(id, 0, values)
+    }
+
+    /// Downloads `dst.len()` `f32` values from a persistently mapped buffer starting at `byte_offset`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if `dst` exceeds buffer bounds or [`Error::DeviceFault`] if faulted.
+    pub fn read_buffer_f32_at(
+        &self,
+        id: BufferId,
+        byte_offset: u64,
+        dst: &mut [f32],
+    ) -> Result<(), Error> {
+        let byte_len = dst
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidInput("download byte length overflow".to_owned()))?;
+        self.with_mapped_slice_mut(id, byte_offset, byte_len, false, true, |src| {
+            #[cfg(target_endian = "little")]
+            // SAFETY: `src` and `dst` are non-overlapping for `byte_len` bytes and aligned for byte copy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), byte_len);
+            }
+            #[cfg(not(target_endian = "little"))]
+            for (out_slot, chunk) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
+                *out_slot = f32::from_le_bytes(*chunk);
+            }
+        })
     }
 
     /// Downloads `dst.len()` `f32` values from a storage buffer starting at byte offset `0`.
     ///
     /// # Errors
-    /// Returns [`Error::InvalidInput`] if `dst` exceeds buffer bounds or [`Error::Vulkan`] on map failure.
+    /// Returns [`Error::InvalidInput`] if `dst` exceeds buffer bounds or [`Error::DeviceFault`] if faulted.
     pub fn read_buffer_f32(&self, id: BufferId, dst: &mut [f32]) -> Result<(), Error> {
-        self.ensure_healthy()?;
-        let entry = self
-            .buffers
-            .get(id.0)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| Error::InvalidInput("invalid buffer handle".to_owned()))?;
-        let byte_len = dst
-            .len()
-            .checked_mul(4)
-            .ok_or_else(|| Error::InvalidInput("download byte length overflow".to_owned()))?;
-        let byte_len_u64 = u64::try_from(byte_len)
-            .map_err(|_| Error::InvalidInput("download byte length overflow".to_owned()))?;
-        if byte_len_u64 > entry.size_bytes {
-            return Err(Error::InvalidInput(format!(
-                "download ({byte_len_u64} B) exceeds buffer size ({} B)",
-                entry.size_bytes
-            )));
-        }
-        if dst.is_empty() {
-            return Ok(());
-        }
-        // SAFETY: Mapping host-visible `entry.memory` for readback.
-        let ptr = unsafe {
-            self.device
-                .map_memory(entry.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        }
-        .map_err(|err| Error::Vulkan(format!("map_memory: {err:?}")))?;
-        if !entry.host_coherent {
-            let range = [vk::MappedMemoryRange::default()
-                .memory(entry.memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE)];
-            // SAFETY: Invalidating mapped range before CPU readback when non-coherent.
-            let _ = unsafe { self.device.invalidate_mapped_memory_ranges(&range) };
-        }
-        let mut raw = vec![0_u8; byte_len];
-        // SAFETY: `ptr` is valid for at least `byte_len` bytes and does not overlap `raw`.
-        unsafe { std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), raw.as_mut_ptr(), byte_len) };
-        // SAFETY: Unmapping `entry.memory` after copy.
-        unsafe { self.device.unmap_memory(entry.memory) };
-
-        for (out_slot, chunk) in dst.iter_mut().zip(raw.as_chunks::<4>().0) {
-            *out_slot = f32::from_le_bytes(*chunk);
-        }
-        Ok(())
+        self.read_buffer_f32_at(id, 0, dst)
     }
 
     /// Releases a buffer immediately when healthy, or retains it in uncertain storage when faulted.
@@ -597,11 +866,38 @@ impl AdrenoVulkanDevice {
         if self.faulted {
             self.uncertain_buffers.push(buf);
         } else {
-            // SAFETY: Device is idle between submissions and healthy; safe to destroy buffer.
-            unsafe { self.device.destroy_buffer(buf.buffer, None) };
-            // SAFETY: Safe to free backing `DeviceMemory` after destroying bound `vk::Buffer`.
-            unsafe { self.device.free_memory(buf.memory, None) };
+            destroy_owned_buffer(&self.device, &buf);
         }
+    }
+
+    fn create_descriptor_layout(
+        &self,
+        binding_count: usize,
+        shader_module: vk::ShaderModule,
+    ) -> Result<vk::DescriptorSetLayout, Error> {
+        let mut bindings = [vk::DescriptorSetLayoutBinding::default(); MAX_STAGE_BINDINGS];
+        for (idx, dst) in bindings.iter_mut().take(binding_count).enumerate() {
+            *dst = vk::DescriptorSetLayoutBinding {
+                binding: u32::try_from(idx).unwrap_or(0),
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                p_immutable_samplers: null_mut(),
+                _marker: std::marker::PhantomData,
+            };
+        }
+        let set_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings[..binding_count]);
+        // SAFETY: Creating descriptor set layout on live device.
+        unsafe {
+            self.device
+                .create_descriptor_set_layout(&set_layout_info, None)
+        }
+        .map_err(|err| {
+            // SAFETY: Clean up `shader_module` on error.
+            unsafe { self.device.destroy_shader_module(shader_module, None) };
+            Error::Vulkan(format!("create_descriptor_set_layout: {err:?}"))
+        })
     }
 
     /// Compiles one SPIR-V 1.6 compute shader module into a reusable pipeline handle.
@@ -619,14 +915,23 @@ impl AdrenoVulkanDevice {
         if spirv_words.len() < 5 {
             return Err(Error::InvalidInput("empty SPIR-V shader module".to_owned()));
         }
+        if binding_count > MAX_STAGE_BINDINGS {
+            return Err(Error::ResourceLimit(format!(
+                "binding count ({binding_count}) exceeds device fast-path ceiling ({MAX_STAGE_BINDINGS})"
+            )));
+        }
         let push_bytes = u32::try_from(push_u32_count)
             .ok()
             .and_then(|c| c.checked_mul(4))
             .ok_or_else(|| Error::InvalidInput("push constant size overflow".to_owned()))?;
-        if push_bytes > self.capabilities.compute_limits.max_push_constants_size {
+        let max_push = self
+            .capabilities
+            .compute_limits
+            .max_push_constants_size
+            .min(u32::try_from(MAX_PUSH_BYTES).unwrap_or(128));
+        if push_bytes > max_push {
             return Err(Error::ResourceLimit(format!(
-                "push constants ({push_bytes} B) exceed maxPushConstantsSize ({} B)",
-                self.capabilities.compute_limits.max_push_constants_size
+                "push constants ({push_bytes} B) exceed limit ({max_push} B)"
             )));
         }
 
@@ -634,46 +939,18 @@ impl AdrenoVulkanDevice {
         // SAFETY: `spirv_words` slice is valid for `shader_info` duration.
         let shader_module = unsafe { self.device.create_shader_module(&shader_info, None) }
             .map_err(|err| Error::Vulkan(format!("create_shader_module: {err:?}")))?;
+        let set_layout = self.create_descriptor_layout(binding_count, shader_module)?;
 
-        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = (0..binding_count)
-            .map(|idx| vk::DescriptorSetLayoutBinding {
-                binding: u32::try_from(idx).unwrap_or(0),
-                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                p_immutable_samplers: null_mut(),
-                _marker: std::marker::PhantomData,
-            })
-            .collect();
-        let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        // SAFETY: Creating descriptor set layout on live device.
-        let set_layout = match unsafe {
-            self.device
-                .create_descriptor_set_layout(&set_layout_info, None)
-        } {
-            Ok(layout) => layout,
-            Err(err) => {
-                // SAFETY: Clean up `shader_module` on error.
-                unsafe { self.device.destroy_shader_module(shader_module, None) };
-                return Err(Error::Vulkan(format!(
-                    "create_descriptor_set_layout: {err:?}"
-                )));
-            }
-        };
-
-        let push_ranges = if push_bytes > 0 {
-            vec![vk::PushConstantRange {
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                offset: 0,
-                size: push_bytes,
-            }]
-        } else {
-            Vec::new()
-        };
+        let push_range = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size: push_bytes,
+        }];
+        let push_slice = if push_bytes > 0 { &push_range[..] } else { &[] };
         let set_layouts = [set_layout];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
-            .push_constant_ranges(&push_ranges);
+            .push_constant_ranges(push_slice);
         // SAFETY: Creating pipeline layout on live device.
         let layout = match unsafe { self.device.create_pipeline_layout(&layout_info, None) } {
             Ok(pl) => pl,
@@ -693,10 +970,10 @@ impl AdrenoVulkanDevice {
         let cp_info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(layout)];
-        // SAFETY: Creating compute pipeline; shader module destroyed immediately afterwards.
+        // SAFETY: Creating compute pipeline with persistent `pipeline_cache`; shader module destroyed afterwards.
         let pipelines = unsafe {
             self.device
-                .create_compute_pipelines(vk::PipelineCache::null(), &cp_info, None)
+                .create_compute_pipelines(self.pipeline_cache, &cp_info, None)
         };
         // SAFETY: Shader module is no longer needed once pipeline creation returns.
         unsafe { self.device.destroy_shader_module(shader_module, None) };
@@ -748,51 +1025,68 @@ impl AdrenoVulkanDevice {
         self.submit_compute_stages(&[stage])
     }
 
-    fn validate_stages(&self, stages: &[ComputeStage<'_>]) -> Result<(), Error> {
+    fn validate_span_stage(
+        &self,
+        pipeline: PipelineId,
+        buffer_count: usize,
+        push_len: usize,
+        workgroups: [u32; 3],
+    ) -> Result<(), Error> {
+        let pipe = self
+            .pipelines
+            .get(pipeline.0)
+            .ok_or_else(|| Error::InvalidInput("invalid pipeline handle".to_owned()))?;
+        if buffer_count != pipe.binding_count {
+            return Err(Error::InvalidInput(format!(
+                "pipeline expects {} buffers, got {buffer_count}",
+                pipe.binding_count
+            )));
+        }
+        let push_bytes = u32::try_from(push_len)
+            .ok()
+            .and_then(|c| c.checked_mul(4))
+            .ok_or_else(|| Error::InvalidInput("push constants overflow".to_owned()))?;
+        if push_bytes != pipe.push_bytes {
+            return Err(Error::InvalidInput(format!(
+                "pipeline expects {} push constant bytes, got {push_bytes}",
+                pipe.push_bytes
+            )));
+        }
+        if workgroups.contains(&0) {
+            return Err(Error::InvalidInput(
+                "workgroup dispatch extents must be >= 1".to_owned(),
+            ));
+        }
+        let limits = &self
+            .capabilities
+            .compute_limits
+            .max_compute_work_group_count;
+        if workgroups[0] > limits[0] || workgroups[1] > limits[1] || workgroups[2] > limits[2] {
+            return Err(Error::ResourceLimit(
+                "workgroup count exceeds maxComputeWorkGroupCount".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_whole_stages(&self, stages: &[ComputeStage<'_>]) -> Result<(), Error> {
         if stages.is_empty() {
             return Err(Error::InvalidInput(
                 "at least one compute stage is required".to_owned(),
             ));
         }
+        if stages.len() > MAX_DESCRIPTOR_SETS_PER_SUBMIT {
+            return Err(Error::ResourceLimit(
+                "stage count exceeds descriptor pool capacity".to_owned(),
+            ));
+        }
         for stage in stages {
-            let pipe = self
-                .pipelines
-                .get(stage.pipeline.0)
-                .ok_or_else(|| Error::InvalidInput("invalid pipeline handle".to_owned()))?;
-            if stage.buffers.len() != pipe.binding_count {
-                return Err(Error::InvalidInput(format!(
-                    "pipeline expects {} buffers, got {}",
-                    pipe.binding_count,
-                    stage.buffers.len()
-                )));
-            }
-            let push_bytes = u32::try_from(stage.push_u32s.len())
-                .ok()
-                .and_then(|c| c.checked_mul(4))
-                .ok_or_else(|| Error::InvalidInput("push constants overflow".to_owned()))?;
-            if push_bytes != pipe.push_bytes {
-                return Err(Error::InvalidInput(format!(
-                    "pipeline expects {} push constant bytes, got {push_bytes}",
-                    pipe.push_bytes
-                )));
-            }
-            if stage.workgroups.contains(&0) {
-                return Err(Error::InvalidInput(
-                    "workgroup dispatch extents must be >= 1".to_owned(),
-                ));
-            }
-            let limits = &self
-                .capabilities
-                .compute_limits
-                .max_compute_work_group_count;
-            if stage.workgroups[0] > limits[0]
-                || stage.workgroups[1] > limits[1]
-                || stage.workgroups[2] > limits[2]
-            {
-                return Err(Error::ResourceLimit(
-                    "workgroup count exceeds maxComputeWorkGroupCount".to_owned(),
-                ));
-            }
+            self.validate_span_stage(
+                stage.pipeline,
+                stage.buffers.len(),
+                stage.push_u32s.len(),
+                stage.workgroups,
+            )?;
             for &buf_id in stage.buffers {
                 if self
                     .buffers
@@ -809,39 +1103,155 @@ impl AdrenoVulkanDevice {
         Ok(())
     }
 
-    /// Records and executes one or more compute stages in sequence inside one command buffer,
-    /// inserting explicit `COMPUTE_SHADER -> COMPUTE_SHADER` (`SHADER_WRITE -> SHADER_READ`)
-    /// pipeline barriers between consecutive stages and waiting with a bounded `5s` fence.
+    fn validate_span_stages(&self, stages: &[ComputeSpanStage<'_>]) -> Result<(), Error> {
+        if stages.is_empty() {
+            return Err(Error::InvalidInput(
+                "at least one compute stage is required".to_owned(),
+            ));
+        }
+        if stages.len() > MAX_DESCRIPTOR_SETS_PER_SUBMIT {
+            return Err(Error::ResourceLimit(
+                "stage count exceeds descriptor pool capacity".to_owned(),
+            ));
+        }
+        let align = self.min_storage_buffer_offset_alignment.max(1);
+        for stage in stages {
+            self.validate_span_stage(
+                stage.pipeline,
+                stage.buffers.len(),
+                stage.push_u32s.len(),
+                stage.workgroups,
+            )?;
+            for span in stage.buffers {
+                let entry = self
+                    .buffers
+                    .get(span.buffer.0)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| Error::InvalidInput("invalid buffer span handle".to_owned()))?;
+                if span.offset % align != 0 {
+                    return Err(Error::InvalidInput(
+                        "unaligned buffer span offset".to_owned(),
+                    ));
+                }
+                if span.range != vk::WHOLE_SIZE {
+                    let end = span
+                        .offset
+                        .checked_add(span.range)
+                        .ok_or_else(|| Error::InvalidInput("buffer span overflow".to_owned()))?;
+                    if span.range == 0 || end > entry.size_bytes {
+                        return Err(Error::InvalidInput(
+                            "buffer span exceeds backing buffer size".to_owned(),
+                        ));
+                    }
+                } else if span.offset >= entry.size_bytes {
+                    return Err(Error::InvalidInput(
+                        "buffer span offset exceeds backing buffer size".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Records and executes one or more whole-buffer compute stages inside one command buffer.
     ///
     /// # Errors
     /// Returns [`Error::InvalidInput`] on malformed stages, [`Error::DeviceFault`] on timeout or
-    /// `ERROR_DEVICE_LOST` (latching terminal teardown), or [`Error::Vulkan`] on other driver failures.
+    /// `ERROR_DEVICE_LOST`, or [`Error::Vulkan`] on driver errors.
     pub fn submit_compute_stages(&mut self, stages: &[ComputeStage<'_>]) -> Result<(), Error> {
         self.ensure_healthy()?;
-        self.validate_stages(stages)?;
+        self.validate_whole_stages(stages)?;
+        self.prepare_and_submit_whole(stages)
+    }
 
-        let mut allocated_sets = Vec::with_capacity(stages.len());
-        for stage in stages {
-            let set_layout = self.pipelines[stage.pipeline.0].set_layout;
-            let set_layouts = [set_layout];
+    /// Records and executes one or more span-bound compute stages inside one command buffer.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] on malformed spans/stages, [`Error::DeviceFault`] on
+    /// timeout or `ERROR_DEVICE_LOST`, or [`Error::Vulkan`] on driver errors.
+    pub fn submit_compute_span_stages(
+        &mut self,
+        stages: &[ComputeSpanStage<'_>],
+    ) -> Result<(), Error> {
+        self.ensure_healthy()?;
+        self.validate_span_stages(stages)?;
+        self.prepare_and_submit_spans(stages)
+    }
+
+    fn allocate_stage_sets(&mut self, pipelines: impl Iterator<Item = PipelineId>) -> Result<(), Error> {
+        // SAFETY: Pool is idle after prior synchronous submission completed; reset all transient sets in one call.
+        if let Err(err) = unsafe {
+            self.device
+                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
+        } {
+            return Err(Error::Vulkan(format!("reset_descriptor_pool: {err:?}")));
+        }
+        self.scratch_sets.clear();
+        let mut set_layouts = [vk::DescriptorSetLayout::null(); 32];
+        let mut batch_len = 0_usize;
+        for pipe_id in pipelines {
+            set_layouts[batch_len] = self.pipelines[pipe_id.0].set_layout;
+            batch_len += 1;
+            if batch_len == set_layouts.len() {
+                let alloc = vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&set_layouts[..batch_len]);
+                // SAFETY: Allocating a batch of descriptor sets from cleanly reset `descriptor_pool`.
+                let sets = unsafe { self.device.allocate_descriptor_sets(&alloc) }
+                    .map_err(|err| Error::Vulkan(format!("allocate_descriptor_sets: {err:?}")))?;
+                self.scratch_sets.extend_from_slice(&sets);
+                batch_len = 0;
+            }
+        }
+        if batch_len > 0 {
             let alloc = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(self.descriptor_pool)
-                .set_layouts(&set_layouts);
-            // SAFETY: Allocating 1 descriptor set from `descriptor_pool`.
-            let sets = match unsafe { self.device.allocate_descriptor_sets(&alloc) } {
-                Ok(s) => s,
-                Err(err) => {
-                    self.free_descriptor_sets(&allocated_sets);
-                    return Err(Error::Vulkan(format!("allocate_descriptor_sets: {err:?}")));
-                }
-            };
-            let set = sets[0];
-            allocated_sets.push(set);
+                .set_layouts(&set_layouts[..batch_len]);
+            // SAFETY: Allocating remaining descriptor sets from cleanly reset `descriptor_pool`.
+            let sets = unsafe { self.device.allocate_descriptor_sets(&alloc) }
+                .map_err(|err| Error::Vulkan(format!("allocate_descriptor_sets: {err:?}")))?;
+            self.scratch_sets.extend_from_slice(&sets);
+        }
+        Ok(())
+    }
 
-            let infos: Vec<vk::DescriptorBufferInfo> = stage
-                .buffers
-                .iter()
-                .filter_map(|&id| {
+    fn bind_stage_descriptors(
+        &self,
+        set: vk::DescriptorSet,
+        count: usize,
+        spans: impl Iterator<Item = vk::DescriptorBufferInfo>,
+    ) {
+        let mut infos = [vk::DescriptorBufferInfo::default(); MAX_STAGE_BINDINGS];
+        let mut writes = [vk::WriteDescriptorSet::default(); MAX_STAGE_BINDINGS];
+        for (idx, info) in spans.take(count).enumerate() {
+            infos[idx] = info;
+        }
+        for (binding, (info, write)) in infos[..count]
+            .iter()
+            .zip(writes[..count].iter_mut())
+            .enumerate()
+        {
+            *write = vk::WriteDescriptorSet {
+                dst_set: set,
+                dst_binding: u32::try_from(binding).unwrap_or(0),
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                p_buffer_info: info,
+                ..Default::default()
+            };
+        }
+        // SAFETY: `set` and stack arrays `infos`/`writes` stay valid across `update_descriptor_sets`.
+        unsafe { self.device.update_descriptor_sets(&writes[..count], &[]) };
+    }
+
+    fn prepare_and_submit_whole(&mut self, stages: &[ComputeStage<'_>]) -> Result<(), Error> {
+        self.allocate_stage_sets(stages.iter().map(|s| s.pipeline))?;
+        for (stage, &set) in stages.iter().zip(&self.scratch_sets) {
+            self.bind_stage_descriptors(
+                set,
+                stage.buffers.len(),
+                stage.buffers.iter().filter_map(|&id| {
                     self.buffers.get(id.0).and_then(Option::as_ref).map(|b| {
                         vk::DescriptorBufferInfo {
                             buffer: b.buffer,
@@ -849,43 +1259,44 @@ impl AdrenoVulkanDevice {
                             range: vk::WHOLE_SIZE,
                         }
                     })
-                })
-                .collect();
-            let writes: Vec<vk::WriteDescriptorSet<'_>> = infos
+                }),
+            );
+        }
+        self.record_and_submit(
+            stages
                 .iter()
-                .enumerate()
-                .map(|(binding, info)| vk::WriteDescriptorSet {
-                    dst_set: set,
-                    dst_binding: u32::try_from(binding).unwrap_or(0),
-                    dst_array_element: 0,
-                    descriptor_count: 1,
-                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                    p_buffer_info: info,
-                    ..Default::default()
-                })
-                .collect();
-            // SAFETY: Descriptor set `set` and `infos` remain valid across `update_descriptor_sets`.
-            unsafe { self.device.update_descriptor_sets(&writes, &[]) };
-        }
-
-        let record_result = self.record_and_submit_stages(stages, &allocated_sets);
-        if !self.faulted {
-            self.free_descriptor_sets(&allocated_sets);
-        }
-        record_result
+                .map(|s| (s.pipeline, s.push_u32s, s.workgroups)),
+        )
     }
 
-    fn free_descriptor_sets(&self, sets: &[vk::DescriptorSet]) {
-        if !sets.is_empty() {
-            // SAFETY: Command buffer finished executing before freeing transient descriptor sets.
-            let _ = unsafe { self.device.free_descriptor_sets(self.descriptor_pool, sets) };
+    fn prepare_and_submit_spans(&mut self, stages: &[ComputeSpanStage<'_>]) -> Result<(), Error> {
+        self.allocate_stage_sets(stages.iter().map(|s| s.pipeline))?;
+        for (stage, &set) in stages.iter().zip(&self.scratch_sets) {
+            self.bind_stage_descriptors(
+                set,
+                stage.buffers.len(),
+                stage.buffers.iter().filter_map(|span| {
+                    self.buffers
+                        .get(span.buffer.0)
+                        .and_then(Option::as_ref)
+                        .map(|b| vk::DescriptorBufferInfo {
+                            buffer: b.buffer,
+                            offset: span.offset,
+                            range: span.range,
+                        })
+                }),
+            );
         }
+        self.record_and_submit(
+            stages
+                .iter()
+                .map(|s| (s.pipeline, s.push_u32s, s.workgroups)),
+        )
     }
 
-    fn record_and_submit_stages(
+    fn record_and_submit<'a>(
         &mut self,
-        stages: &[ComputeStage<'_>],
-        sets: &[vk::DescriptorSet],
+        stages: impl Iterator<Item = (PipelineId, &'a [u32], [u32; 3])>,
     ) -> Result<(), Error> {
         let fences = [self.fence];
         // SAFETY: Fence is unsignaled after creation or prior completion.
@@ -909,7 +1320,9 @@ impl AdrenoVulkanDevice {
             return Err(Error::Vulkan(format!("begin_command_buffer: {err:?}")));
         }
 
-        for (stage_idx, (stage, &set)) in stages.iter().zip(sets).enumerate() {
+        for (stage_idx, ((pipe_id, push_u32s, workgroups), &set)) in
+            stages.zip(&self.scratch_sets).enumerate()
+        {
             if stage_idx > 0 {
                 let barrier = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -927,7 +1340,7 @@ impl AdrenoVulkanDevice {
                     );
                 }
             }
-            self.record_stage_dispatch(stage, set);
+            self.record_stage_dispatch(pipe_id, set, push_u32s, workgroups);
         }
 
         let host_barrier = [vk::MemoryBarrier::default()
@@ -954,8 +1367,14 @@ impl AdrenoVulkanDevice {
         self.submit_recorded_and_wait()
     }
 
-    fn record_stage_dispatch(&self, stage: &ComputeStage<'_>, set: vk::DescriptorSet) {
-        let pipe = &self.pipelines[stage.pipeline.0];
+    fn record_stage_dispatch(
+        &self,
+        pipe_id: PipelineId,
+        set: vk::DescriptorSet,
+        push_u32s: &[u32],
+        workgroups: [u32; 3],
+    ) {
+        let pipe = &self.pipelines[pipe_id.0];
         // SAFETY: Binding compute pipeline for stage dispatch.
         unsafe {
             self.device.cmd_bind_pipeline(
@@ -976,10 +1395,16 @@ impl AdrenoVulkanDevice {
                 &[],
             );
         }
-        if !stage.push_u32s.is_empty() {
-            let mut push_bytes = Vec::with_capacity(stage.push_u32s.len() * 4);
-            for &word in stage.push_u32s {
-                push_bytes.extend_from_slice(&word.to_le_bytes());
+        if !push_u32s.is_empty() {
+            let mut push_buf = [0_u8; MAX_PUSH_BYTES];
+            let byte_len = push_u32s.len() * 4;
+            for (dst, &word) in push_buf[..byte_len]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(push_u32s)
+            {
+                *dst = word.to_le_bytes();
             }
             // SAFETY: Pushing validated push constants matching pipeline layout.
             unsafe {
@@ -988,7 +1413,7 @@ impl AdrenoVulkanDevice {
                     pipe.layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    &push_bytes,
+                    &push_buf[..byte_len],
                 );
             }
         }
@@ -996,9 +1421,9 @@ impl AdrenoVulkanDevice {
         unsafe {
             self.device.cmd_dispatch(
                 self.command_buffer,
-                stage.workgroups[0],
-                stage.workgroups[1],
-                stage.workgroups[2],
+                workgroups[0],
+                workgroups[1],
+                workgroups[2],
             );
         }
     }
@@ -1054,17 +1479,11 @@ impl Drop for AdrenoVulkanDevice {
 
         for slot in &mut self.buffers {
             if let Some(buf) = slot.take() {
-                // SAFETY: Device is idle; destroying owned `vk::Buffer`.
-                unsafe { self.device.destroy_buffer(buf.buffer, None) };
-                // SAFETY: Freeing owned `DeviceMemory`.
-                unsafe { self.device.free_memory(buf.memory, None) };
+                destroy_owned_buffer(&self.device, &buf);
             }
         }
         for buf in self.uncertain_buffers.drain(..) {
-            // SAFETY: Device is idle or dropped on teardown; destroying retained uncertain buffer.
-            unsafe { self.device.destroy_buffer(buf.buffer, None) };
-            // SAFETY: Freeing retained uncertain memory.
-            unsafe { self.device.free_memory(buf.memory, None) };
+            destroy_owned_buffer(&self.device, &buf);
         }
         for pipe in self.pipelines.drain(..) {
             // SAFETY: Destroying owned `vk::Pipeline`.
@@ -1077,6 +1496,8 @@ impl Drop for AdrenoVulkanDevice {
                     .destroy_descriptor_set_layout(pipe.set_layout, None);
             }
         }
+        // SAFETY: Destroying owned pipeline cache.
+        unsafe { self.device.destroy_pipeline_cache(self.pipeline_cache, None) };
         // SAFETY: Destroying owned fence.
         unsafe { self.device.destroy_fence(self.fence, None) };
         // SAFETY: Destroying owned descriptor pool.
@@ -1170,6 +1591,7 @@ type SelectedAdapter = (
     VulkanDeviceCapabilities,
     BTreeSet<String>,
     vk::PhysicalDeviceMemoryProperties,
+    u64,
 );
 
 #[cfg(windows)]
@@ -1275,7 +1697,14 @@ fn inspect_adreno_candidate(
         identity_sha256: String::new(),
     };
     caps.recompute_identity_sha256().ok()?;
-    Some((phys, compute_family, caps, ext_set, mem_properties))
+    Some((
+        phys,
+        compute_family,
+        caps,
+        ext_set,
+        mem_properties,
+        props.limits.min_storage_buffer_offset_alignment.max(1),
+    ))
 }
 
 #[cfg(windows)]
@@ -1397,6 +1826,8 @@ mod tests {
 
     #[test]
     fn forbidden_vk_env_names_are_rejected_case_insensitively() {
+        fn assert_send<T: Send>() {}
+        assert_send::<AdrenoVulkanDevice>();
         assert!(is_forbidden_vk_env("vk_icd_filenames"));
         assert!(is_forbidden_vk_env("VK_LAYER_PATH"));
         assert!(!is_forbidden_vk_env("SYSTEMROOT"));

@@ -92,6 +92,7 @@ mod reasoning_budget;
 mod recurrent_rollback;
 mod reference_allocation;
 mod reference_arena_graph;
+mod reference_arg_parser;
 mod reference_batch_allocator;
 mod reference_dspark_logsnr;
 mod reference_gguf;
@@ -298,7 +299,7 @@ const CASES: &[Case] = &[
     register(
         "test-arg-parser",
         "tests/test-arg-parser.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         arg_parser::run,
     ),
     register(

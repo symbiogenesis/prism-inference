@@ -101,6 +101,9 @@ pub(super) fn execute(value: &Value) -> Result<Value> {
     if super::reference_public_c_abi::handles(value) {
         return super::reference_public_c_abi::execute(value);
     }
+    if super::reference_arg_parser::handles(value) {
+        return super::reference_arg_parser::execute(value);
+    }
     if !value["Operations"]
         .as_array()
         .is_some_and(|operations| (1..=128).contains(&operations.len()))
@@ -147,6 +150,7 @@ pub(super) fn supports(id: &str) -> bool {
         || id == super::reference_arena_graph::ID
         || super::reference_tensor_graph::IDS.contains(&id)
         || id == super::reference_public_c_abi::ID
+        || id == super::reference_arg_parser::ID
 }
 
 pub(super) fn handles(value: &Value) -> bool {
@@ -168,6 +172,7 @@ pub(super) fn handles(value: &Value) -> bool {
         || super::reference_arena_graph::handles(value)
         || super::reference_tensor_graph::handles(value)
         || super::reference_public_c_abi::handles(value)
+        || super::reference_arg_parser::handles(value)
         || value["Operations"].as_array().is_some_and(|operations| {
             !operations.is_empty()
                 && operations
@@ -177,12 +182,12 @@ pub(super) fn handles(value: &Value) -> bool {
 }
 
 pub(super) fn identity() -> Value {
-    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_sampling::ID, super::reference_logging::ID, super::reference_mtmd::ID, super::reference_mtmd_chunks::ID, super::reference_dspark_logsnr::ID, super::reference_gguf::ID, super::reference_grammar_parser::ID, super::reference_grammar::IDS[0], super::reference_grammar::IDS[1], super::reference_json_schema::IDS[0], super::reference_json_schema::IDS[1], super::reference_threadpool::ID, super::reference_batch_allocator::ID, super::reference_allocation::ID, super::reference_quantization::ID, super::reference_unicode::ID, super::reference_arena_graph::ID, super::reference_tensor_graph::IDS[0], super::reference_tensor_graph::IDS[1], super::reference_tensor_graph::IDS[2], super::reference_public_c_abi::ID],
+    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_sampling::ID, super::reference_logging::ID, super::reference_mtmd::ID, super::reference_mtmd_chunks::ID, super::reference_dspark_logsnr::ID, super::reference_gguf::ID, super::reference_grammar_parser::ID, super::reference_grammar::IDS[0], super::reference_grammar::IDS[1], super::reference_json_schema::IDS[0], super::reference_json_schema::IDS[1], super::reference_threadpool::ID, super::reference_batch_allocator::ID, super::reference_allocation::ID, super::reference_quantization::ID, super::reference_unicode::ID, super::reference_arena_graph::ID, super::reference_tensor_graph::IDS[0], super::reference_tensor_graph::IDS[1], super::reference_tensor_graph::IDS[2], super::reference_public_c_abi::ID, super::reference_arg_parser::ID],
         "UpstreamCommit": super::UPSTREAM,
         "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183_232, "Sha256": SOURCE_SHA256},
         "AssertionSource": {"Path": MTP_ID, "Bytes": 812, "Sha256": TEST_SHA256},
         "Arithmetic": "nonnegative-capacity-minus-reserved-anchors-v1",
-        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_sampling::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity(), super::reference_dspark_logsnr::identity(), super::reference_gguf::identity(), super::reference_grammar_parser::identity(), super::reference_grammar::identity(), super::reference_json_schema::identity(), super::reference_threadpool::identity(), super::reference_batch_allocator::identity(), super::reference_allocation::identity(), super::reference_quantization::identity(), super::reference_unicode::identity(), super::reference_arena_graph::identity(), super::reference_tensor_graph::identity(), super::reference_public_c_abi::identity()],
+        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_sampling::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity(), super::reference_dspark_logsnr::identity(), super::reference_gguf::identity(), super::reference_grammar_parser::identity(), super::reference_grammar::identity(), super::reference_json_schema::identity(), super::reference_threadpool::identity(), super::reference_batch_allocator::identity(), super::reference_allocation::identity(), super::reference_quantization::identity(), super::reference_unicode::identity(), super::reference_arena_graph::identity(), super::reference_tensor_graph::identity(), super::reference_public_c_abi::identity(), super::reference_arg_parser::identity()],
         "NativeReferenceReplay": false, "ProductionRuntimeCalled": false,
         "CompleteSourceGate": false, "NativeRetirementQualified": false})
 }

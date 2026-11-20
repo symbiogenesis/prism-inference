@@ -16,7 +16,6 @@
 #include "vocab.hpp"
 #include "model_runtime.hpp"
 #include "chat_analysis.hpp"
-#include "arg_parser.hpp"
 #include "chat.hpp"
 #include "optimizer.hpp"
 #include "backend_ops.hpp"
@@ -115,8 +114,6 @@ void validate_operation(const wire_json & operation) {
         prism_vocab::validate(operation);
     } else if (prism_chat_analysis::handles(kind)) {
         prism_chat_analysis::validate(operation);
-    } else if (prism_arg_parser::handles(kind)) {
-        prism_arg_parser::validate(operation);
     } else if (prism_chat::handles(kind)) {
         prism_chat::validate(operation);
     } else if (prism_optimizer::handles(kind)) {
@@ -153,9 +150,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_chat_analysis::handles(kind)) {
         return prism_chat_analysis::execute(operation);
-    }
-    if (prism_arg_parser::handles(kind)) {
-        return prism_arg_parser::execute(operation);
     }
     if (prism_chat::handles(kind)) {
         return prism_chat::execute(operation);

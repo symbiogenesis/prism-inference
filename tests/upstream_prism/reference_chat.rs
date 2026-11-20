@@ -3205,7 +3205,6 @@ fn convert_gemma4_object_to_json(raw: &str, partial: bool) -> Option<String> {
     clippy::too_many_lines,
     reason = "PEG grammar definition for upstream chat format"
 )]
-#[expect(clippy::too_many_lines, reason = "PEG grammar definition for upstream chat format")]
 fn build_dsml_parser(
     mut builder: ChatPegBuilder,
     v4: bool,
@@ -3340,7 +3339,6 @@ fn build_dsml_parser(
     clippy::too_many_lines,
     reason = "PEG grammar definition for upstream chat format"
 )]
-#[expect(clippy::too_many_lines, reason = "PEG grammar definition for upstream chat format")]
 fn build_deepseek_v31_r1_parser(
     mut builder: ChatPegBuilder,
     template_src: &str,
@@ -3484,7 +3482,6 @@ fn build_deepseek_v31_r1_parser(
     clippy::too_many_lines,
     reason = "PEG grammar definition for upstream chat format"
 )]
-#[expect(clippy::too_many_lines, reason = "PEG grammar definition for upstream chat format")]
 fn build_kimi_k2_parser(
     mut builder: ChatPegBuilder,
     tools: Option<&JsonVal>,
@@ -3803,7 +3800,6 @@ fn build_kimi_k3_parser(
     clippy::too_many_lines,
     reason = "PEG grammar definition for upstream chat format"
 )]
-#[expect(clippy::too_many_lines, reason = "PEG grammar definition for upstream chat format")]
 fn build_lfm2_parser(
     mut builder: ChatPegBuilder,
     tools: Option<&JsonVal>,
@@ -3951,7 +3947,6 @@ fn schema_is_pure_scalar(schema: &JsonVal) -> bool {
     clippy::too_many_lines,
     reason = "PEG grammar definition for upstream chat format"
 )]
-#[expect(clippy::too_many_lines, reason = "PEG grammar definition for upstream chat format")]
 fn build_minimax_m3_parser(
     mut builder: ChatPegBuilder,
     tools: Option<&JsonVal>,
@@ -4194,7 +4189,6 @@ fn build_minicpm5_parser(
     clippy::too_many_lines,
     reason = "PEG grammar definition for upstream chat format"
 )]
-#[expect(clippy::too_many_lines, reason = "PEG grammar definition for upstream chat format")]
 fn build_muse_glimmer_parser(
     mut builder: ChatPegBuilder,
     tools: Option<&JsonVal>,
@@ -5008,7 +5002,6 @@ fn build_apriel15_parser(
     clippy::too_many_lines,
     reason = "PEG grammar definition for upstream chat format"
 )]
-#[expect(clippy::too_many_lines, reason = "PEG grammar definition for upstream chat format")]
 fn build_simple_tagged_json_tools(
     mut builder: ChatPegBuilder,
     spec: &TaggedJsonSpec<'_>,

@@ -2853,7 +2853,6 @@ impl Qwen35 {
 
     // Only the verified Swift session can request the larger packed-state scope.
     // Public/generic graph constructors retain their existing 4 GiB ceiling.
-    #[cfg(any(feature = "cli", test))]
     #[cfg(test)]
     pub(crate) fn with_swift_state_budget_and_kv(
         model: Model,
@@ -2874,6 +2873,7 @@ impl Qwen35 {
         )
     }
 
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn with_state_budget_and_adapters_scope(
         model: Model,
         context_limit: usize,

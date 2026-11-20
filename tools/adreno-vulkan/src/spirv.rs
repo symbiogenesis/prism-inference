@@ -52,10 +52,14 @@ const OP_I_MUL: u16 = 132;
 const OP_F_MUL: u16 = 133;
 const OP_U_DIV: u16 = 134;
 const OP_F_DIV: u16 = 136;
+const OP_LOGICAL_OR: u16 = 166;
 const OP_LOGICAL_AND: u16 = 167;
 const OP_SELECT: u16 = 169;
+const OP_I_EQUAL: u16 = 170;
 const OP_I_NOT_EQUAL: u16 = 171;
 const OP_U_LESS_THAN: u16 = 176;
+const OP_F_ORD_EQUAL: u16 = 180;
+const OP_F_ORD_GREATER_THAN: u16 = 186;
 const OP_SHIFT_RIGHT_LOGICAL: u16 = 194;
 const OP_SHIFT_RIGHT_ARITHMETIC: u16 = 195;
 const OP_SHIFT_LEFT_LOGICAL: u16 = 196;
@@ -76,8 +80,11 @@ const CAPABILITY_SHADER: u32 = 1;
 const CAPABILITY_DOT_PRODUCT_INPUT_4X8_BIT_PACKED: u32 = 6018;
 const CAPABILITY_DOT_PRODUCT: u32 = 6019;
 
+const GLSL_FABS: u32 = 4;
 const GLSL_EXP: u32 = 27;
+const GLSL_SMIN: u32 = 39;
 const GLSL_FMAX: u32 = 40;
+const GLSL_SMAX: u32 = 42;
 const GLSL_FMA: u32 = 50;
 const GLSL_UNPACK_HALF_2X16: u32 = 62;
 
@@ -145,14 +152,17 @@ struct ShaderBuilder {
     ptr_input_vec3u32_t: u32,
     ptr_input_u32_t: u32,
     ptr_fn_f32_t: Option<u32>,
+    ptr_fn_u32_t: Option<u32>,
     ptr_push_u32_t: Option<u32>,
     ptr_sb_u32_t: Option<u32>,
     ptr_sb_f32_t: Option<u32>,
     ptr_wg_f32_t: Option<u32>,
+    ptr_wg_u32_t: Option<u32>,
 
     rt_u32_t: Option<u32>,
     rt_f32_t: Option<u32>,
     ro_u32_buf_t: Option<u32>,
+    rw_u32_buf_t: Option<u32>,
     ro_f32_buf_t: Option<u32>,
     rw_f32_buf_t: Option<u32>,
 
@@ -210,13 +220,16 @@ impl ShaderBuilder {
             ptr_input_vec3u32_t: 0,
             ptr_input_u32_t: 0,
             ptr_fn_f32_t: None,
+            ptr_fn_u32_t: None,
             ptr_push_u32_t: None,
             ptr_sb_u32_t: None,
             ptr_sb_f32_t: None,
             ptr_wg_f32_t: None,
+            ptr_wg_u32_t: None,
             rt_u32_t: None,
             rt_f32_t: None,
             ro_u32_buf_t: None,
+            rw_u32_buf_t: None,
             ro_f32_buf_t: None,
             rw_f32_buf_t: None,
             u32_consts: BTreeMap::new(),
@@ -544,77 +557,50 @@ impl ShaderBuilder {
         val
     }
 
-    fn storage_buffer(&mut self, binding: u32, elem: ElemType, access: AccessMode) -> u32 {
-        let rt_t = match elem {
+    fn runtime_array_type(&mut self, elem: ElemType) -> u32 {
+        match elem {
             ElemType::U32 => {
                 if let Some(id) = self.rt_u32_t {
-                    id
-                } else {
-                    let rt = self.alloc_id();
-                    push_inst(
-                        &mut self.types_consts_globals,
-                        OP_TYPE_RUNTIME_ARRAY,
-                        &[rt, self.u32_t],
-                    );
-                    push_inst(
-                        &mut self.annotations,
-                        OP_DECORATE,
-                        &[rt, DECORATION_ARRAY_STRIDE, 4],
-                    );
-                    self.rt_u32_t = Some(rt);
-                    rt
+                    return id;
                 }
+                let rt = self.alloc_id();
+                push_inst(&mut self.types_consts_globals, OP_TYPE_RUNTIME_ARRAY, &[rt, self.u32_t]);
+                push_inst(&mut self.annotations, OP_DECORATE, &[rt, DECORATION_ARRAY_STRIDE, 4]);
+                self.rt_u32_t = Some(rt);
+                rt
             }
             ElemType::F32 => {
                 if let Some(id) = self.rt_f32_t {
-                    id
-                } else {
-                    let rt = self.alloc_id();
-                    push_inst(
-                        &mut self.types_consts_globals,
-                        OP_TYPE_RUNTIME_ARRAY,
-                        &[rt, self.f32_t],
-                    );
-                    push_inst(
-                        &mut self.annotations,
-                        OP_DECORATE,
-                        &[rt, DECORATION_ARRAY_STRIDE, 4],
-                    );
-                    self.rt_f32_t = Some(rt);
-                    rt
+                    return id;
                 }
+                let rt = self.alloc_id();
+                push_inst(&mut self.types_consts_globals, OP_TYPE_RUNTIME_ARRAY, &[rt, self.f32_t]);
+                push_inst(&mut self.annotations, OP_DECORATE, &[rt, DECORATION_ARRAY_STRIDE, 4]);
+                self.rt_f32_t = Some(rt);
+                rt
             }
-        };
+        }
+    }
 
-        let struct_t = match (elem, access) {
-            (ElemType::U32, AccessMode::ReadOnly) => {
-                if let Some(id) = self.ro_u32_buf_t {
-                    id
-                } else {
-                    let s = self.make_sb_struct(rt_t, true);
-                    self.ro_u32_buf_t = Some(s);
-                    s
-                }
-            }
-            (ElemType::F32, AccessMode::ReadOnly) => {
-                if let Some(id) = self.ro_f32_buf_t {
-                    id
-                } else {
-                    let s = self.make_sb_struct(rt_t, true);
-                    self.ro_f32_buf_t = Some(s);
-                    s
-                }
-            }
-            (ElemType::F32, AccessMode::ReadWrite) => {
-                if let Some(id) = self.rw_f32_buf_t {
-                    id
-                } else {
-                    let s = self.make_sb_struct(rt_t, false);
-                    self.rw_f32_buf_t = Some(s);
-                    s
-                }
-            }
-            (ElemType::U32, AccessMode::ReadWrite) => self.make_sb_struct(rt_t, false),
+    fn storage_buffer(&mut self, binding: u32, elem: ElemType, access: AccessMode) -> u32 {
+        let rt_t = self.runtime_array_type(elem);
+        let cache = match (elem, access) {
+            (ElemType::U32, AccessMode::ReadOnly) => &mut self.ro_u32_buf_t,
+            (ElemType::F32, AccessMode::ReadOnly) => &mut self.ro_f32_buf_t,
+            (ElemType::F32, AccessMode::ReadWrite) => &mut self.rw_f32_buf_t,
+            (ElemType::U32, AccessMode::ReadWrite) => &mut self.rw_u32_buf_t,
+        };
+        let struct_t = if let Some(id) = *cache {
+            id
+        } else {
+            let s = self.make_sb_struct(rt_t, matches!(access, AccessMode::ReadOnly));
+            *match (elem, access) {
+                (ElemType::U32, AccessMode::ReadOnly) => &mut self.ro_u32_buf_t,
+                (ElemType::F32, AccessMode::ReadOnly) => &mut self.ro_f32_buf_t,
+                (ElemType::F32, AccessMode::ReadWrite) => &mut self.rw_f32_buf_t,
+                (ElemType::U32, AccessMode::ReadWrite) => &mut self.rw_u32_buf_t,
+            } = Some(s);
+            s
         };
 
         let ptr_struct = self.alloc_id();
@@ -720,6 +706,108 @@ impl ShaderBuilder {
         );
         self.record_entry_interface(var);
         var
+    }
+
+    fn workgroup_u32_array(&mut self, len: u32) -> u32 {
+        let len_c = self.const_u32(len);
+        let arr_t = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_ARRAY,
+            &[arr_t, self.u32_t, len_c],
+        );
+        let ptr_arr = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_POINTER,
+            &[ptr_arr, STORAGE_WORKGROUP, arr_t],
+        );
+        let var = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_VARIABLE,
+            &[ptr_arr, var, STORAGE_WORKGROUP],
+        );
+        self.record_entry_interface(var);
+        var
+    }
+
+    fn ptr_wg_u32(&mut self) -> u32 {
+        if let Some(id) = self.ptr_wg_u32_t {
+            return id;
+        }
+        let id = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_POINTER,
+            &[id, STORAGE_WORKGROUP, self.u32_t],
+        );
+        self.ptr_wg_u32_t = Some(id);
+        id
+    }
+
+    fn load_wg_u32(&mut self, arr_var: u32, idx: u32) -> u32 {
+        let ptr_t = self.ptr_wg_u32();
+        let ptr = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_ACCESS_CHAIN,
+            &[ptr_t, ptr, arr_var, idx],
+        );
+        let val = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_LOAD, &[self.u32_t, val, ptr]);
+        val
+    }
+
+    fn store_wg_u32(&mut self, arr_var: u32, idx: u32, val: u32) {
+        let ptr_t = self.ptr_wg_u32();
+        let ptr = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_ACCESS_CHAIN,
+            &[ptr_t, ptr, arr_var, idx],
+        );
+        push_inst(&mut self.fn_body, OP_STORE, &[ptr, val]);
+    }
+
+    fn store_sb_u32(&mut self, buf_var: u32, idx: u32, val: u32) {
+        let ptr_t = self.ptr_sb_u32();
+        let zero = self.const_u32(0);
+        let ptr = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_ACCESS_CHAIN,
+            &[ptr_t, ptr, buf_var, zero, idx],
+        );
+        push_inst(&mut self.fn_body, OP_STORE, &[ptr, val]);
+    }
+
+    fn local_u32_var(&mut self) -> u32 {
+        let ptr_t = if let Some(id) = self.ptr_fn_u32_t {
+            id
+        } else {
+            let id = self.alloc_id();
+            push_inst(
+                &mut self.types_consts_globals,
+                OP_TYPE_POINTER,
+                &[id, STORAGE_FUNCTION, self.u32_t],
+            );
+            self.ptr_fn_u32_t = Some(id);
+            id
+        };
+        let var = self.alloc_id();
+        push_inst(
+            &mut self.fn_header,
+            OP_VARIABLE,
+            &[ptr_t, var, STORAGE_FUNCTION],
+        );
+        var
+    }
+
+    fn load_var_u32(&mut self, var: u32) -> u32 {
+        let val = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_LOAD, &[self.u32_t, val, var]);
+        val
     }
 
     fn ptr_wg_f32(&mut self) -> u32 {
@@ -908,12 +996,28 @@ impl ShaderBuilder {
         self.binop(OP_U_LESS_THAN, self.bool_t, a, b)
     }
 
+    fn u_eq(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_I_EQUAL, self.bool_t, a, b)
+    }
+
+    fn f_eq(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_F_ORD_EQUAL, self.bool_t, a, b)
+    }
+
+    fn f_gt(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_F_ORD_GREATER_THAN, self.bool_t, a, b)
+    }
+
     fn u_ne(&mut self, a: u32, b: u32) -> u32 {
         self.binop(OP_I_NOT_EQUAL, self.bool_t, a, b)
     }
 
     fn logical_and(&mut self, a: u32, b: u32) -> u32 {
         self.binop(OP_LOGICAL_AND, self.bool_t, a, b)
+    }
+
+    fn logical_or(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_LOGICAL_OR, self.bool_t, a, b)
     }
 
     fn select(&mut self, ty: u32, cond: u32, t: u32, f: u32) -> u32 {
@@ -1003,15 +1107,37 @@ impl ShaderBuilder {
         id
     }
 
-    fn unpack_half_low(&mut self, u32_val: u32) -> u32 {
+    fn f_abs(&mut self, a: u32) -> u32 {
+        self.glsl1(self.f32_t, GLSL_FABS, a)
+    }
+
+    fn s_min(&mut self, a: u32, b: u32) -> u32 {
+        self.glsl2(self.i32_t, GLSL_SMIN, a, b)
+    }
+
+    fn s_max(&mut self, a: u32, b: u32) -> u32 {
+        self.glsl2(self.i32_t, GLSL_SMAX, a, b)
+    }
+
+    fn unpack_half_pair(&mut self, u32_val: u32) -> (u32, u32) {
         let vec2 = self.glsl1(self.vec2f32_t, GLSL_UNPACK_HALF_2X16, u32_val);
-        let out = self.alloc_id();
+        let lo = self.alloc_id();
         push_inst(
             &mut self.fn_body,
             OP_COMPOSITE_EXTRACT,
-            &[self.f32_t, out, vec2, 0],
+            &[self.f32_t, lo, vec2, 0],
         );
-        out
+        let hi = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_COMPOSITE_EXTRACT,
+            &[self.f32_t, hi, vec2, 1],
+        );
+        (lo, hi)
+    }
+
+    fn unpack_half_low(&mut self, u32_val: u32) -> u32 {
+        self.unpack_half_pair(u32_val).0
     }
 
     fn round_f16(&mut self, val: u32) -> u32 {
@@ -1158,6 +1284,36 @@ impl ShaderBuilder {
             OP_I_ADD,
             &[self.u32_t, next_idx, idx, step],
         );
+        push_inst(&mut self.fn_body, OP_BRANCH, &[header]);
+        push_inst(&mut self.fn_body, OP_LABEL, &[merge]);
+        self.current_label = merge;
+    }
+
+    fn emit_while<C, F>(&mut self, cond_fn: C, body_fn: F)
+    where
+        C: FnOnce(&mut Self) -> u32,
+        F: FnOnce(&mut Self),
+    {
+        let header = self.alloc_id();
+        let body = self.alloc_id();
+        let cont_lbl = self.alloc_id();
+        let merge = self.alloc_id();
+
+        push_inst(&mut self.fn_body, OP_BRANCH, &[header]);
+        push_inst(&mut self.fn_body, OP_LABEL, &[header]);
+        self.current_label = header;
+        let cond = cond_fn(self);
+        push_inst(&mut self.fn_body, OP_LOOP_MERGE, &[merge, cont_lbl, 0]);
+        push_inst(
+            &mut self.fn_body,
+            OP_BRANCH_CONDITIONAL,
+            &[cond, body, merge],
+        );
+        push_inst(&mut self.fn_body, OP_LABEL, &[body]);
+        self.current_label = body;
+        body_fn(self);
+        push_inst(&mut self.fn_body, OP_BRANCH, &[cont_lbl]);
+        push_inst(&mut self.fn_body, OP_LABEL, &[cont_lbl]);
         push_inst(&mut self.fn_body, OP_BRANCH, &[header]);
         push_inst(&mut self.fn_body, OP_LABEL, &[merge]);
         self.current_label = merge;
@@ -1568,6 +1724,15 @@ struct PtqDecodedBlock {
 }
 
 fn decode_ptq1_block_lanes(b: &mut ShaderBuilder, weights_buf: u32, wbase: u32) -> PtqDecodedBlock {
+    decode_ptq1_block_lanes_strided(b, weights_buf, wbase, 1)
+}
+
+fn decode_ptq1_block_lanes_strided(
+    b: &mut ShaderBuilder,
+    weights_buf: u32,
+    wbase: u32,
+    word_stride: u32,
+) -> PtqDecodedBlock {
     let m00ff = b.const_u32(0x00FF_00FF);
     let mask_low_byte = b.const_u32(0xFF);
     let mask_hi_byte = b.const_u32(0xFF00);
@@ -1580,7 +1745,7 @@ fn decode_ptq1_block_lanes(b: &mut ShaderBuilder, weights_buf: u32, wbase: u32) 
     let mut lanes = [0_u32; 32];
 
     for g in 0_u32..4 {
-        let g_c = b.const_u32(g);
+        let g_c = b.const_u32(g * word_stride);
         let wg_idx = b.uadd(wbase, g_c);
         let wg = b.load_sb_u32(weights_buf, wg_idx);
         let mut lo = b.uand(wg, m00ff);
@@ -1611,7 +1776,7 @@ fn decode_ptq1_block_lanes(b: &mut ShaderBuilder, weights_buf: u32, wbase: u32) 
     }
 
     for g2 in 0_u32..2 {
-        let g2_c = b.const_u32(4 + g2);
+        let g2_c = b.const_u32((4 + g2) * word_stride);
         let wg_idx = b.uadd(wbase, g2_c);
         let wg = b.load_sb_u32(weights_buf, wg_idx);
         let mut lo = b.uand(wg, m00ff);
@@ -1641,7 +1806,7 @@ fn decode_ptq1_block_lanes(b: &mut ShaderBuilder, weights_buf: u32, wbase: u32) 
         }
     }
 
-    let c6 = b.const_u32(6);
+    let c6 = b.const_u32(6 * word_stride);
     let w6_idx = b.uadd(wbase, c6);
     let w6 = b.load_sb_u32(weights_buf, w6_idx);
     let w_scale_u16 = b.ushr(w6, c16);
@@ -1906,6 +2071,1184 @@ fn attn_valid_len(
     let exceeds = b.u_lt(total_seq, past_q1);
     let clamped = b.select(b.u32_t, exceeds, total_seq, past_q1);
     b.select(b.u32_t, is_causal, clamped, total_seq)
+}
+
+fn portable_dot4_u8_packed4_s8(b: &mut ShaderBuilder, u4: u32, act_s4: u32) -> u32 {
+    let m_ff = b.const_u32(0xFF);
+    let c8 = b.const_u32(8);
+    let c16 = b.const_u32(16);
+    let c24 = b.const_u32(24);
+    let u0 = b.uand(u4, m_ff);
+    let u1s = b.ushr(u4, c8);
+    let u1 = b.uand(u1s, m_ff);
+    let u2s = b.ushr(u4, c16);
+    let u2 = b.uand(u2s, m_ff);
+    let u3 = b.ushr(u4, c24);
+    let weights = [
+        b.bitcast(b.i32_t, u0),
+        b.bitcast(b.i32_t, u1),
+        b.bitcast(b.i32_t, u2),
+        b.bitcast(b.i32_t, u3),
+    ];
+    portable_dot4_i32_weights(b, weights, act_s4)
+}
+
+fn coalesced_pq2_scale(b: &mut ShaderBuilder, weights_buf: u32, tile_base: u32, lane: u32) -> u32 {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let pair_off = b.ushr(lane, c1);
+    let idx = b.uadd(tile_base, pair_off);
+    let raw_pair = b.load_sb_u32(weights_buf, idx);
+    let (s_ev, s_od) = b.unpack_half_pair(raw_pair);
+    let odd_bit = b.uand(lane, c1);
+    let is_odd = b.u_ne(odd_bit, c0);
+    b.select(b.f32_t, is_odd, s_od, s_ev)
+}
+
+fn coalesced_pq2_unpack_4digits(b: &mut ShaderBuilder, pq_word: u32) -> [u32; 4] {
+    let m03 = b.const_u32(0x0303_0303);
+    let c2 = b.const_u32(2);
+    let c4 = b.const_u32(4);
+    let c6 = b.const_u32(6);
+    let q0 = b.uand(pq_word, m03);
+    let s2 = b.ushr(pq_word, c2);
+    let q1 = b.uand(s2, m03);
+    let s4 = b.ushr(pq_word, c4);
+    let q2 = b.uand(s4, m03);
+    let s6 = b.ushr(pq_word, c6);
+    let q3 = b.uand(s6, m03);
+    [q0, q1, q2, q3]
+}
+
+fn dot_pq2_4digits_with_act(
+    b: &mut ShaderBuilder,
+    q: [u32; 4],
+    act_buf: u32,
+    act_words_base: u32,
+    use_sdot: bool,
+) -> u32 {
+    let mut sum = b.const_i32(0);
+    for (digit, &q_word) in q.iter().enumerate() {
+        let d_off = b.const_u32(u32::try_from(digit).unwrap_or(0));
+        let act_idx = b.uadd(act_words_base, d_off);
+        let plane = b.load_sb_u32(act_buf, act_idx);
+        let dot = if use_sdot {
+            b.sdot_packed(q_word, plane)
+        } else {
+            portable_dot4_u8_packed4_s8(b, q_word, plane)
+        };
+        sum = b.iadd(sum, dot);
+    }
+    sum
+}
+
+fn store_maybe_residual_f32(
+    b: &mut ShaderBuilder,
+    out_buf: u32,
+    res_buf: Option<u32>,
+    out_idx: u32,
+    final_acc: u32,
+) {
+    let out_val = res_buf.map_or(final_acc, |res_var| {
+        let r_val = b.load_sb_f32(res_var, out_idx);
+        b.fadd_nc(final_acc, r_val)
+    });
+    b.store_sb_f32(out_buf, out_idx, out_val);
+}
+
+fn clamp_four_token_act_bases(
+    b: &mut ShaderBuilder,
+    tok_base: u32,
+    tokens: u32,
+    act_words_per_token: u32,
+) -> ([u32; 4], [u32; 4]) {
+    let c1 = b.const_u32(1);
+    let last_tok = b.binop(OP_I_SUB, b.u32_t, tokens, c1);
+    let mut tok_clamped = [0_u32; 4];
+    let mut tok_act_bases = [0_u32; 4];
+    for k in 0_u32..4 {
+        let k_c = b.const_u32(k);
+        let tk = b.uadd(tok_base, k_c);
+        let is_valid = b.u_lt(tk, tokens);
+        let clamped = b.select(b.u32_t, is_valid, tk, last_tok);
+        let ki = usize::try_from(k).unwrap_or(0);
+        tok_clamped[ki] = tk;
+        tok_act_bases[ki] = b.umul(clamped, act_words_per_token);
+    }
+    (tok_clamped, tok_act_bases)
+}
+
+/// Emits coalesced 64-row `PQ2_0` Ã— 4-plane `Q8_K` GEMV SPIR-V 1.6 words (`0%` weight overhead).
+///
+/// Bindings: `0` read-only coalesced `weights` (`544` `u32` words per `(row_group_64, k_block_128)`),
+/// `1` read-only 4-plane `Q8_K` (`34` `u32` words per 128 elements: `[scale_bits, half_sum_i32, 32 plane words]`),
+/// `2` writable `output` (`f32`), optional `3` read-only `residual` (`f32`).
+/// Push constants (`4 Ã— u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn pq2_q8k_gemv_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let res_buf = has_residual.then(|| b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly));
+
+    let gid = b.global_invocation_id();
+    let row = b.load_input_component(gid, 0);
+    let token = b.load_input_component(gid, 1);
+
+    let rows = b.load_push(push_var, 0);
+    let blocks_per_row = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let act_words_per_token = b.load_push(push_var, 3);
+
+    let row_ok = b.u_lt(row, rows);
+    let tok_ok = b.u_lt(token, tokens);
+    let in_bounds = b.logical_and(row_ok, tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let acc_var = b.local_f32_var();
+        let f_zero = b.const_f32(0.0);
+        b.store_var(acc_var, f_zero);
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c6 = b.const_u32(6);
+        let c34 = b.const_u32(34);
+        let c63 = b.const_u32(63);
+        let c544 = b.const_u32(544);
+
+        let rg = b.ushr(row, c6);
+        let lane = b.uand(row, c63);
+        let rg_tiles = b.umul(rg, blocks_per_row);
+        let rg_base = b.umul(rg_tiles, c544);
+        let tok_act_base = b.umul(token, act_words_per_token);
+
+        b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
+            let blk_off = b.umul(blk, c544);
+            let tile_base = b.uadd(rg_base, blk_off);
+            let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, lane);
+
+            let act_off = b.umul(blk, c34);
+            let act_blk_base = b.uadd(tok_act_base, act_off);
+            let act_scale_u32 = b.load_sb_u32(act_buf, act_blk_base);
+            let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+            let hsum_idx = b.uadd(act_blk_base, c1);
+            let hsum_u32 = b.load_sb_u32(act_buf, hsum_idx);
+            let half_sum = b.bitcast(b.i32_t, hsum_u32);
+
+            let mut int_sum = b.const_i32(0);
+            for word_j in 0_u32..8 {
+                let w_off = b.const_u32(32 + word_j * 64);
+                let w_lane_off = b.uadd(w_off, lane);
+                let w_idx = b.uadd(tile_base, w_lane_off);
+                let pq_word = b.load_sb_u32(weights_buf, w_idx);
+                let q = coalesced_pq2_unpack_4digits(b, pq_word);
+
+                let plane_off = b.const_u32(2 + word_j * 4);
+                let plane_base = b.uadd(act_blk_base, plane_off);
+                let part = dot_pq2_4digits_with_act(b, q, act_buf, plane_base, use_sdot);
+                int_sum = b.iadd(int_sum, part);
+            }
+
+            let corrected = b.isub(int_sum, half_sum);
+            let float_dot = b.i32_to_f32(corrected);
+            let d = b.fmul_nc(w_scale, act_scale);
+            let prev = b.load_var_f32(acc_var);
+            let next = if fused {
+                b.fma(d, float_dot, prev)
+            } else {
+                let prod = b.fmul_nc(d, float_dot);
+                b.fadd_nc(prev, prod)
+            };
+            b.store_var(acc_var, next);
+        });
+
+        let tok_out = b.umul(token, rows);
+        let out_idx = b.uadd(tok_out, row);
+        let final_acc = b.load_var_f32(acc_var);
+        store_maybe_residual_f32(b, out_buf, res_buf, out_idx, final_acc);
+    });
+
+    b.finish()
+}
+
+/// Emits coalesced 64-row Ã— 4-token `PQ2_0` Ã— 4-plane `Q8_K` GEMM SPIR-V 1.6 words.
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(4), 1)`. Each weight word is loaded and
+/// unpacked once per K-block and reused across up to 4 consecutive tokens cleanly.
+/// Push constants (`4 Ã— u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn pq2_q8k_gemm_4tok_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let res_buf = has_residual.then(|| b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly));
+
+    let gid = b.global_invocation_id();
+    let row = b.load_input_component(gid, 0);
+    let tok_tile = b.load_input_component(gid, 1);
+
+    let rows = b.load_push(push_var, 0);
+    let blocks_per_row = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let act_words_per_token = b.load_push(push_var, 3);
+
+    let c4 = b.const_u32(4);
+    let tok_base = b.umul(tok_tile, c4);
+    let row_ok = b.u_lt(row, rows);
+    let tok_ok = b.u_lt(tok_base, tokens);
+    let in_bounds = b.logical_and(row_ok, tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let f_zero = b.const_f32(0.0);
+        let acc_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        for v in acc_vars {
+            b.store_var(v, f_zero);
+        }
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c6 = b.const_u32(6);
+        let c34 = b.const_u32(34);
+        let c63 = b.const_u32(63);
+        let c544 = b.const_u32(544);
+
+        let (tok_clamped, tok_act_bases) =
+            clamp_four_token_act_bases(b, tok_base, tokens, act_words_per_token);
+
+        let rg = b.ushr(row, c6);
+        let lane = b.uand(row, c63);
+        let rg_tiles = b.umul(rg, blocks_per_row);
+        let rg_base = b.umul(rg_tiles, c544);
+
+        b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
+            let blk_off = b.umul(blk, c544);
+            let tile_base = b.uadd(rg_base, blk_off);
+            let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, lane);
+            let act_off = b.umul(blk, c34);
+            let act_bases = tok_act_bases.map(|base| b.uadd(base, act_off));
+            let mut int_sums = [b.const_i32(0); 4];
+
+            for word_j in 0_u32..8 {
+                let w_off = b.const_u32(32 + word_j * 64);
+                let w_lane_off = b.uadd(w_off, lane);
+                let w_idx = b.uadd(tile_base, w_lane_off);
+                let pq_word = b.load_sb_u32(weights_buf, w_idx);
+                let q = coalesced_pq2_unpack_4digits(b, pq_word);
+                let plane_off = b.const_u32(2 + word_j * 4);
+                for (t_idx, &a_base) in act_bases.iter().enumerate() {
+                    let plane_base = b.uadd(a_base, plane_off);
+                    let part = dot_pq2_4digits_with_act(b, q, act_buf, plane_base, use_sdot);
+                    int_sums[t_idx] = b.iadd(int_sums[t_idx], part);
+                }
+            }
+
+            for ((&a_base, &int_sum), &acc_var) in
+                act_bases.iter().zip(&int_sums).zip(&acc_vars)
+            {
+                let act_scale_u32 = b.load_sb_u32(act_buf, a_base);
+                let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+                let hsum_idx = b.uadd(a_base, c1);
+                let hsum_u32 = b.load_sb_u32(act_buf, hsum_idx);
+                let half_sum = b.bitcast(b.i32_t, hsum_u32);
+                let corrected = b.isub(int_sum, half_sum);
+                let float_dot = b.i32_to_f32(corrected);
+                let d = b.fmul_nc(w_scale, act_scale);
+                let prev = b.load_var_f32(acc_var);
+                let next = if fused {
+                    b.fma(d, float_dot, prev)
+                } else {
+                    let prod = b.fmul_nc(d, float_dot);
+                    b.fadd_nc(prev, prod)
+                };
+                b.store_var(acc_var, next);
+            }
+        });
+
+        for (&tk, &acc_var) in tok_clamped.iter().zip(&acc_vars) {
+            let valid = b.u_lt(tk, tokens);
+            b.emit_if(valid, |b| {
+                let tok_out = b.umul(tk, rows);
+                let out_idx = b.uadd(tok_out, row);
+                let final_acc = b.load_var_f32(acc_var);
+                store_maybe_residual_f32(b, out_buf, res_buf, out_idx, final_acc);
+            });
+        }
+    });
+
+    b.finish()
+}
+
+/// Emits coalesced 64-row `PQ2_0` Ã— `Q8_0` GEMV SPIR-V 1.6 words (odd `128`-col support).
+///
+/// Bindings: `0` read-only coalesced `PQ2` weights (`544` `u32`/block-tile), `1` read-only
+/// `Q8Block` (`9` `u32`/32-elem block), `2` writable `output` (`f32`).
+/// Push constants (`4 Ã— u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn pq2_q8_0_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let row = b.load_input_component(gid, 0);
+    let token = b.load_input_component(gid, 1);
+
+    let rows = b.load_push(push_var, 0);
+    let blocks_per_row = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let act_words_per_token = b.load_push(push_var, 3);
+
+    let row_ok = b.u_lt(row, rows);
+    let tok_ok = b.u_lt(token, tokens);
+    let in_bounds = b.logical_and(row_ok, tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let acc_var = b.local_f32_var();
+        let f_zero = b.const_f32(0.0);
+        b.store_var(acc_var, f_zero);
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c2 = b.const_u32(2);
+        let c3 = b.const_u32(3);
+        let c6 = b.const_u32(6);
+        let c8 = b.const_u32(8);
+        let c16 = b.const_u32(16);
+        let c24 = b.const_u32(24);
+        let c36 = b.const_u32(36);
+        let c63 = b.const_u32(63);
+        let c544 = b.const_u32(544);
+
+        let rg = b.ushr(row, c6);
+        let lane = b.uand(row, c63);
+        let rg_tiles = b.umul(rg, blocks_per_row);
+        let rg_base = b.umul(rg_tiles, c544);
+        let tok_act_base = b.umul(token, act_words_per_token);
+
+        b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
+            let blk_off = b.umul(blk, c544);
+            let tile_base = b.uadd(rg_base, blk_off);
+            let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, lane);
+
+            let blk_act_off = b.umul(blk, c36);
+            let blk_act_base = b.uadd(tok_act_base, blk_act_off);
+
+            let mut block_sum = f_zero;
+            for grp in 0_u32..4 {
+                let grp_off_c = b.const_u32(grp * 9);
+                let grp_base = b.uadd(blk_act_base, grp_off_c);
+                let act_scale_u32 = b.load_sb_u32(act_buf, grp_base);
+                let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+
+                let mut grp_int = b.const_i32(0);
+                for pair_idx in 0_u32..2 {
+                    let word_j = grp * 2 + pair_idx;
+                    let w_off = b.const_u32(32 + word_j * 64);
+                    let w_lane_off = b.uadd(w_off, lane);
+                    let w_idx = b.uadd(tile_base, w_lane_off);
+                    let pq_word = b.load_sb_u32(weights_buf, w_idx);
+
+                    let act_w_off = b.const_u32(1 + pair_idx * 4);
+                    let act_w_start = b.uadd(grp_base, act_w_off);
+                    let aw0 = b.load_sb_u32(act_buf, act_w_start);
+                    let a_i1 = b.uadd(act_w_start, c1);
+                    let aw1 = b.load_sb_u32(act_buf, a_i1);
+                    let a_i2 = b.uadd(act_w_start, c2);
+                    let aw2 = b.load_sb_u32(act_buf, a_i2);
+                    let a_i3 = b.uadd(act_w_start, c3);
+                    let aw3 = b.load_sb_u32(act_buf, a_i3);
+
+                    let b0 = pq_word;
+                    let b1 = b.ushr(pq_word, c8);
+                    let b2 = b.ushr(pq_word, c16);
+                    let b3 = b.ushr(pq_word, c24);
+
+                    for (raw_byte, act_w) in [(b0, aw0), (b1, aw1), (b2, aw2), (b3, aw3)] {
+                        let dot = if use_sdot {
+                            let packed = swar_pack_4x2bit_to_4xi8(b, raw_byte);
+                            b.sdot_packed(packed, act_w)
+                        } else {
+                            portable_dot4_from_2bit_byte(b, raw_byte, act_w)
+                        };
+                        grp_int = b.iadd(grp_int, dot);
+                    }
+                }
+                let grp_f32 = b.i32_to_f32(grp_int);
+                let scaled = b.fmul_nc(act_scale, grp_f32);
+                block_sum = b.fadd_nc(block_sum, scaled);
+            }
+
+            let prev = b.load_var_f32(acc_var);
+            let contrib = b.fmul_nc(w_scale, block_sum);
+            let next = b.fadd_nc(prev, contrib);
+            b.store_var(acc_var, next);
+        });
+
+        let tok_out = b.umul(token, rows);
+        let out_idx = b.uadd(tok_out, row);
+        let final_acc = b.load_var_f32(acc_var);
+        b.store_sb_f32(out_buf, out_idx, final_acc);
+    });
+
+    b.finish()
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Maintains clean SPIR-V emission decomposition for 32-element PTQ1xQ8_0 groups."
+)]
+fn ptq1_q8_0_group_step(
+    b: &mut ShaderBuilder,
+    decoded: &PtqDecodedBlock,
+    act_buf: u32,
+    grp_base: u32,
+    grp: usize,
+    use_sdot: bool,
+    pinned_4lane: bool,
+    lane_vars: [u32; 4],
+    block_sum: &mut u32,
+) {
+    let act_scale_u32 = b.load_sb_u32(act_buf, grp_base);
+    let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+    let mut lane_sums = [b.const_i32(0); 4];
+    for half in 0_usize..2 {
+        for (l, lane_slot) in lane_sums.iter_mut().enumerate() {
+            let act_within_grp = u32::try_from(half * 4 + l).unwrap_or(0);
+            let act_off_c = b.const_u32(1 + act_within_grp);
+            let act_w_idx = b.uadd(grp_base, act_off_c);
+            let act_w = b.load_sb_u32(act_buf, act_w_idx);
+            let word_idx = grp * 8 + half * 4 + l;
+            let dot = dot_trit_lanes_with_act(b, decoded.lanes[word_idx], act_w, use_sdot);
+            *lane_slot = b.iadd(*lane_slot, dot);
+        }
+    }
+    if pinned_4lane {
+        let d = b.fmul_nc(decoded.w_scale, act_scale);
+        for (&lane_var, &sum_val) in lane_vars.iter().zip(&lane_sums) {
+            let lane_f32 = b.i32_to_f32(sum_val);
+            let prev = b.load_var_f32(lane_var);
+            let next = b.fma(lane_f32, d, prev);
+            b.store_var(lane_var, next);
+        }
+    } else {
+        let s01 = b.iadd(lane_sums[0], lane_sums[1]);
+        let s23 = b.iadd(lane_sums[2], lane_sums[3]);
+        let grp_int = b.iadd(s01, s23);
+        let grp_sum_f32 = b.i32_to_f32(grp_int);
+        let scaled = b.fmul_nc(act_scale, grp_sum_f32);
+        *block_sum = b.fadd_nc(*block_sum, scaled);
+    }
+}
+
+/// Emits coalesced 64-row `PTQ1_0` Ã— `Q8_0` GEMV SPIR-V 1.6 words (`0%` weight overhead).
+///
+/// Bindings: `0` read-only coalesced `PTQ1_0` (`448` `u32`/block-tile), `1` read-only `Q8Block`
+/// (`9` `u32`/32-elem block), `2` writable `output` (`f32`).
+/// Push constants (`4 Ã— u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn ptq1_q8_0_gemv_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let row = b.load_input_component(gid, 0);
+    let token = b.load_input_component(gid, 1);
+
+    let rows = b.load_push(push_var, 0);
+    let blocks_per_row = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let act_words_per_token = b.load_push(push_var, 3);
+
+    let row_ok = b.u_lt(row, rows);
+    let tok_ok = b.u_lt(token, tokens);
+    let in_bounds = b.logical_and(row_ok, tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let f_zero = b.const_f32(0.0);
+        let lane_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        for var in lane_vars {
+            b.store_var(var, f_zero);
+        }
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c6 = b.const_u32(6);
+        let c36 = b.const_u32(36);
+        let c63 = b.const_u32(63);
+        let c448 = b.const_u32(448);
+
+        let rg = b.ushr(row, c6);
+        let lane = b.uand(row, c63);
+        let rg_tiles = b.umul(rg, blocks_per_row);
+        let rg_base = b.umul(rg_tiles, c448);
+        let tok_act_base = b.umul(token, act_words_per_token);
+
+        b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
+            let blk_off = b.umul(blk, c448);
+            let tile_base = b.uadd(rg_base, blk_off);
+            let wbase = b.uadd(tile_base, lane);
+            let decoded = decode_ptq1_block_lanes_strided(b, weights_buf, wbase, 64);
+
+            let blk_act_off = b.umul(blk, c36);
+            let blk_act_base = b.uadd(tok_act_base, blk_act_off);
+            let mut block_sum = f_zero;
+
+            for grp in 0_usize..4 {
+                let grp_index = u32::try_from(grp).unwrap_or(0);
+                let grp_off_c = b.const_u32(grp_index * 9);
+                let grp_base = b.uadd(blk_act_base, grp_off_c);
+                ptq1_q8_0_group_step(
+                    b,
+                    &decoded,
+                    act_buf,
+                    grp_base,
+                    grp,
+                    use_sdot,
+                    pinned_4lane,
+                    lane_vars,
+                    &mut block_sum,
+                );
+            }
+
+            if !pinned_4lane {
+                let prev = b.load_var_f32(lane_vars[0]);
+                let contrib = b.fmul_nc(decoded.w_scale, block_sum);
+                let next = b.fadd_nc(prev, contrib);
+                b.store_var(lane_vars[0], next);
+            }
+        });
+
+        let final_val = if pinned_4lane {
+            let l0 = b.load_var_f32(lane_vars[0]);
+            let l1 = b.load_var_f32(lane_vars[1]);
+            let l2 = b.load_var_f32(lane_vars[2]);
+            let l3 = b.load_var_f32(lane_vars[3]);
+            let s01 = b.fadd_nc(l0, l1);
+            let s23 = b.fadd_nc(l2, l3);
+            b.fadd_nc(s01, s23)
+        } else {
+            b.load_var_f32(lane_vars[0])
+        };
+        let tok_out = b.umul(token, rows);
+        let out_idx = b.uadd(tok_out, row);
+        b.store_sb_f32(out_buf, out_idx, final_val);
+    });
+
+    b.finish()
+}
+
+/// Emits coalesced 64-row `PTQ1_0` Ã— `Q8_K` GEMV SPIR-V 1.6 words (`0%` weight overhead).
+///
+/// Bindings: `0` read-only coalesced `PTQ1_0` (`448` `u32`/block-tile), `1` read-only `Q8KBlock`
+/// (`65` `u32`/block), `2` writable `output` (`f32`).
+/// Push constants (`4 Ã— u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn ptq1_q8k_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let row = b.load_input_component(gid, 0);
+    let token = b.load_input_component(gid, 1);
+
+    let rows = b.load_push(push_var, 0);
+    let blocks_per_row = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let act_words_per_token = b.load_push(push_var, 3);
+
+    let row_ok = b.u_lt(row, rows);
+    let tok_ok = b.u_lt(token, tokens);
+    let in_bounds = b.logical_and(row_ok, tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let acc_var = b.local_f32_var();
+        let f_zero = b.const_f32(0.0);
+        b.store_var(acc_var, f_zero);
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c6 = b.const_u32(6);
+        let c32 = b.const_u32(32);
+        let c63 = b.const_u32(63);
+        let c65 = b.const_u32(65);
+        let c448 = b.const_u32(448);
+
+        let rg = b.ushr(row, c6);
+        let lane = b.uand(row, c63);
+        let rg_tiles = b.umul(rg, blocks_per_row);
+        let rg_base = b.umul(rg_tiles, c448);
+        let tok_act_base = b.umul(token, act_words_per_token);
+
+        b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
+            let blk_off = b.umul(blk, c448);
+            let tile_base = b.uadd(rg_base, blk_off);
+            let wbase = b.uadd(tile_base, lane);
+            let decoded = decode_ptq1_block_lanes_strided(b, weights_buf, wbase, 64);
+
+            let q8k_idx = b.ushr(blk, c1);
+            let q8k_off = b.umul(q8k_idx, c65);
+            let q8k_base = b.uadd(tok_act_base, q8k_off);
+            let act_scale_u32 = b.load_sb_u32(act_buf, q8k_base);
+            let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+
+            let half = b.uand(blk, c1);
+            let half_off = b.umul(half, c32);
+            let q8k_vals_start = b.uadd(q8k_base, c1);
+            let act_vals_base = b.uadd(q8k_vals_start, half_off);
+
+            let mut sum_int = b.const_i32(0);
+            for (word_idx, &lanes) in decoded.lanes.iter().enumerate() {
+                let off_c = b.const_u32(u32::try_from(word_idx).unwrap_or(0));
+                let act_idx = b.uadd(act_vals_base, off_c);
+                let act_w = b.load_sb_u32(act_buf, act_idx);
+                let dot = dot_trit_lanes_with_act(b, lanes, act_w, use_sdot);
+                sum_int = b.iadd(sum_int, dot);
+            }
+
+            let sum_f32 = b.i32_to_f32(sum_int);
+            let d = b.fmul_nc(decoded.w_scale, act_scale);
+            let prev = b.load_var_f32(acc_var);
+            let prod = b.fmul_nc(d, sum_f32);
+            let next = b.fadd_nc(prev, prod);
+            b.store_var(acc_var, next);
+        });
+
+        let tok_out = b.umul(token, rows);
+        let out_idx = b.uadd(tok_out, row);
+        let final_acc = b.load_var_f32(acc_var);
+        b.store_sb_f32(out_buf, out_idx, final_acc);
+    });
+
+    b.finish()
+}
+
+fn q8k_signed_abs_max_shared(
+    b: &mut ShaderBuilder,
+    smem_val: u32,
+    smem_idx: u32,
+    lid: u32,
+    local_best: u32,
+    local_idx: u32,
+) -> u32 {
+    let c0 = b.const_u32(0);
+    let best_bits = b.bitcast(b.u32_t, local_best);
+    b.store_wg_u32(smem_val, lid, best_bits);
+    b.store_wg_u32(smem_idx, lid, local_idx);
+    b.workgroup_barrier();
+
+    for stride in [32_u32, 16, 8, 4, 2, 1] {
+        let sc = b.const_u32(stride);
+        let active = b.u_lt(lid, sc);
+        b.emit_if(active, |b| {
+            let oth_slot = b.uadd(lid, sc);
+            let cur_bits = b.load_wg_u32(smem_val, lid);
+            let oth_bits = b.load_wg_u32(smem_val, oth_slot);
+            let cur_idx = b.load_wg_u32(smem_idx, lid);
+            let oth_idx = b.load_wg_u32(smem_idx, oth_slot);
+            let cur_f = b.bitcast(b.f32_t, cur_bits);
+            let oth_f = b.bitcast(b.f32_t, oth_bits);
+            let abs_c = b.f_abs(cur_f);
+            let abs_o = b.f_abs(oth_f);
+            let abs_gt = b.f_gt(abs_o, abs_c);
+            let abs_eq = b.f_eq(abs_o, abs_c);
+            let idx_lt = b.u_lt(oth_idx, cur_idx);
+            let eq_earlier = b.logical_and(abs_eq, idx_lt);
+            let take_oth = b.logical_or(abs_gt, eq_earlier);
+            let chosen_val = b.select(b.u32_t, take_oth, oth_bits, cur_bits);
+            let chosen_idx = b.select(b.u32_t, take_oth, oth_idx, cur_idx);
+            b.store_wg_u32(smem_val, lid, chosen_val);
+            b.store_wg_u32(smem_idx, lid, chosen_idx);
+        });
+        b.workgroup_barrier();
+    }
+
+    let max_u32 = b.load_wg_u32(smem_val, c0);
+    b.workgroup_barrier();
+    b.bitcast(b.f32_t, max_u32)
+}
+
+fn veltkamp_split(b: &mut ShaderBuilder, x: u32) -> (u32, u32) {
+    let split_c = b.const_f32(4097.0);
+    let t = b.fmul_nc(x, split_c);
+    let hi_diff = b.fsub_nc(t, x);
+    let hi = b.fsub_nc(t, hi_diff);
+    let lo = b.fsub_nc(x, hi);
+    (hi, lo)
+}
+
+fn exact_fdiv_dekker(b: &mut ShaderBuilder, numer: u32, denom: u32) -> u32 {
+    let q0 = b.fdiv(numer, denom);
+    let (d_hi, d_lo) = veltkamp_split(b, denom);
+    let (q_hi, q_lo) = veltkamp_split(b, q0);
+    let p_sum = b.fmul_nc(denom, q0);
+    let term_hh = b.fmul_nc(d_hi, q_hi);
+    let diag_dhi_qlo = b.fmul_nc(d_hi, q_lo);
+    let diag_dlo_qhi = b.fmul_nc(d_lo, q_hi);
+    let tail_ll = b.fmul_nc(d_lo, q_lo);
+    let e0 = b.fsub_nc(term_hh, p_sum);
+    let e1 = b.fadd_nc(e0, diag_dhi_qlo);
+    let e2 = b.fadd_nc(e1, diag_dlo_qhi);
+    let err = b.fadd_nc(e2, tail_ll);
+    let diff = b.fsub_nc(numer, p_sum);
+    let rem = b.fsub_nc(diff, err);
+    let delta = b.fdiv(rem, denom);
+    b.fadd_nc(q0, delta)
+}
+
+fn q8k_scale_from_max(b: &mut ShaderBuilder, maximum: u32) -> (u32, u32, u32) {
+    let abs_max = b.f_abs(maximum);
+    let f_zero = b.const_f32(0.0);
+    let f_one = b.const_f32(1.0);
+    let neg_127 = b.const_f32(-127.0);
+    let is_zero = b.f_eq(abs_max, f_zero);
+    let safe_max = b.select(b.f32_t, is_zero, f_one, maximum);
+    let inv_candidate = exact_fdiv_dekker(b, neg_127, safe_max);
+    let iscale = b.select(b.f32_t, is_zero, f_zero, inv_candidate);
+    let safe_iscale = b.select(b.f32_t, is_zero, f_one, iscale);
+    let unit_scale = exact_fdiv_dekker(b, f_one, safe_iscale);
+    let scale = b.select(b.f32_t, is_zero, f_zero, unit_scale);
+    (is_zero, iscale, scale)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Maintains clean SPIR-V emission separation for 128-element half-sum header reduction."
+)]
+fn reduce_and_store_q8k_header(
+    b: &mut ShaderBuilder,
+    smem: u32,
+    lid: u32,
+    word_in_sub: u32,
+    qs: [u32; 4],
+    out_buf: u32,
+    out_blk_base: u32,
+    scale: u32,
+) {
+    let q01 = b.iadd(qs[0], qs[1]);
+    let q23 = b.iadd(qs[2], qs[3]);
+    let sum4 = b.iadd(q01, q23);
+    let sum4_u32 = b.bitcast(b.u32_t, sum4);
+    b.store_wg_u32(smem, lid, sum4_u32);
+    b.workgroup_barrier();
+
+    for stride in [16_u32, 8, 4, 2, 1] {
+        let sc = b.const_u32(stride);
+        let active = b.u_lt(word_in_sub, sc);
+        b.emit_if(active, |b| {
+            let oth_slot = b.uadd(lid, sc);
+            let cur_u = b.load_wg_u32(smem, lid);
+            let oth_u = b.load_wg_u32(smem, oth_slot);
+            let cur_i = b.bitcast(b.i32_t, cur_u);
+            let oth_i = b.bitcast(b.i32_t, oth_u);
+            let sum_i = b.iadd(cur_i, oth_i);
+            let sum_u = b.bitcast(b.u32_t, sum_i);
+            b.store_wg_u32(smem, lid, sum_u);
+        });
+        b.workgroup_barrier();
+    }
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let is_sub_head = b.u_eq(word_in_sub, c0);
+    b.emit_if(is_sub_head, |b| {
+        let scale_bits = b.bitcast(b.u32_t, scale);
+        b.store_sb_u32(out_buf, out_blk_base, scale_bits);
+        let hsum_u = b.load_wg_u32(smem, lid);
+        let hsum_dst = b.uadd(out_blk_base, c1);
+        b.store_sb_u32(out_buf, hsum_dst, hsum_u);
+    });
+}
+
+fn quantize_one_q8k_lane(
+    b: &mut ShaderBuilder,
+    val: u32,
+    iscale: u32,
+    is_zero: u32,
+    pinned: bool,
+) -> u32 {
+    let magic = b.const_f32(12_582_912.0);
+    let mask_mant = b.const_u32(0x007F_FFFF);
+    let bias = b.const_i32(0x0040_0000);
+    let max_code = b.const_i32(127);
+    let min_code = b.const_i32(if pinned { -128 } else { -127 });
+    let zero_i = b.const_i32(0);
+
+    let rounded = if pinned {
+        b.fma(iscale, val, magic)
+    } else {
+        let prod = b.fmul_nc(val, iscale);
+        b.fadd_nc(prod, magic)
+    };
+    let r_bits = b.bitcast(b.u32_t, rounded);
+    let mant = b.uand(r_bits, mask_mant);
+    let mant_i = b.bitcast(b.i32_t, mant);
+    let raw_q = b.isub(mant_i, bias);
+    let q_lo = b.s_max(raw_q, min_code);
+    let q_clamped = b.s_min(q_lo, max_code);
+    b.select(b.i32_t, is_zero, zero_i, q_clamped)
+}
+
+fn pack_four_i8_to_u32(b: &mut ShaderBuilder, qs: [u32; 4]) -> u32 {
+    let m_ff = b.const_u32(0xFF);
+    let c8 = b.const_u32(8);
+    let c16 = b.const_u32(16);
+    let c24 = b.const_u32(24);
+    let mut bytes = [0_u32; 4];
+    for (i, &q) in qs.iter().enumerate() {
+        let bits = b.bitcast(b.u32_t, q);
+        bytes[i] = b.uand(bits, m_ff);
+    }
+    let s1 = b.ushl(bytes[1], c8);
+    let s2 = b.ushl(bytes[2], c16);
+    let s3 = b.ushl(bytes[3], c24);
+    let p01 = b.uor(bytes[0], s1);
+    let p23 = b.uor(s2, s3);
+    b.uor(p01, p23)
+}
+
+/// Emits pure SPIR-V 1.6 `F32 -> 4-plane Q8_K` quantizer matching CPU `q8k_block` bit-for-bit.
+///
+/// Bindings: `0` read-only `input` (`f32`, `tokens * cols`), `1` writable `q8k_4plane` (`u32`,
+/// `tokens * (cols / 128) * 34`).
+/// Push constants (`2 Ã— u32`): `[cols, tokens]`. Dispatch: `(cols / 256, tokens, 1)`.
+#[must_use]
+pub fn quantize_f32_to_q8k_4plane(pinned: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadWrite);
+    let smem = b.workgroup_u32_array(WORKGROUP_X);
+    let smem_idx = b.workgroup_u32_array(WORKGROUP_X);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let blk256 = b.load_input_component(wid_vec, 0);
+    let tok = b.load_input_component(wid_vec, 1);
+    let cols = b.load_push(push_var, 0);
+
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let c4 = b.const_u32(4);
+    let c5 = b.const_u32(5);
+    let c7 = b.const_u32(7);
+    let c8 = b.const_u32(8);
+    let c12 = b.const_u32(12);
+    let c31 = b.const_u32(31);
+    let c34 = b.const_u32(34);
+    let sub_blk = b.ushr(lid, c5);
+    let word_in_sub = b.uand(lid, c31);
+    let word_j = b.ushr(word_in_sub, c2);
+    let digit = b.uand(word_in_sub, c3);
+    let sub_off = b.ushl(sub_blk, c7);
+    let word_off = b.ushl(word_j, c4);
+    let base_sw = b.uadd(sub_off, word_off);
+    let elem_local = b.uadd(base_sw, digit);
+
+    let tok_in_base = b.umul(tok, cols);
+    let blk_in_off = b.const_u32(256);
+    let blk_in_base = b.umul(blk256, blk_in_off);
+    let in_blk_base = b.uadd(tok_in_base, blk_in_base);
+    let e0 = b.uadd(in_blk_base, elem_local);
+    let e1 = b.uadd(e0, c4);
+    let e2 = b.uadd(e0, c8);
+    let e3 = b.uadd(e0, c12);
+
+    let v0 = b.load_sb_f32(in_buf, e0);
+    let v1 = b.load_sb_f32(in_buf, e1);
+    let v2 = b.load_sb_f32(in_buf, e2);
+    let v3 = b.load_sb_f32(in_buf, e3);
+
+    let mut best_val = v0;
+    let mut best_idx = elem_local;
+    for (candidate, cand_off) in [(v1, c4), (v2, c8), (v3, c12)] {
+        let abs_b = b.f_abs(best_val);
+        let abs_c = b.f_abs(candidate);
+        let gt = b.f_gt(abs_c, abs_b);
+        best_val = b.select(b.f32_t, gt, candidate, best_val);
+        let cand_idx = b.uadd(elem_local, cand_off);
+        best_idx = b.select(b.u32_t, gt, cand_idx, best_idx);
+    }
+
+    let maximum = q8k_signed_abs_max_shared(&mut b, smem, smem_idx, lid, best_val, best_idx);
+    let (is_zero, iscale, scale) = q8k_scale_from_max(&mut b, maximum);
+
+    let q0 = quantize_one_q8k_lane(&mut b, v0, iscale, is_zero, pinned);
+    let q1 = quantize_one_q8k_lane(&mut b, v1, iscale, is_zero, pinned);
+    let q2 = quantize_one_q8k_lane(&mut b, v2, iscale, is_zero, pinned);
+    let q3 = quantize_one_q8k_lane(&mut b, v3, iscale, is_zero, pinned);
+
+    let packed = pack_four_i8_to_u32(&mut b, [q0, q1, q2, q3]);
+
+    let blocks128_per_tok = b.ushr(cols, c7);
+    let tok_blk128_off = b.umul(tok, blocks128_per_tok);
+    let blk128_hi = b.ushl(blk256, c1);
+    let blk128_in_tok = b.uadd(blk128_hi, sub_blk);
+    let blk128_idx = b.uadd(tok_blk128_off, blk128_in_tok);
+    let out_blk_base = b.umul(blk128_idx, c34);
+    let plane_dst_off = b.uadd(c2, word_in_sub);
+    let plane_dst = b.uadd(out_blk_base, plane_dst_off);
+    b.store_sb_u32(out_buf, plane_dst, packed);
+
+    reduce_and_store_q8k_header(
+        &mut b,
+        smem,
+        lid,
+        word_in_sub,
+        [q0, q1, q2, q3],
+        out_buf,
+        out_blk_base,
+        scale,
+    );
+
+    b.finish()
+}
+
+fn vector_exp_spirv(b: &mut ShaderBuilder, value: u32) -> u32 {
+    let f_zero = b.const_f32(0.0);
+    let magic = b.const_f32(12_582_912.0);
+    let c_log2e = b.const_f32(f32::from_bits(0x3fb8_aa3b));
+    let c_ln2_hi = b.const_f32(f32::from_bits(0x3f31_7200));
+    let c_ln2_lo = b.const_f32(f32::from_bits(0x35bf_be8e));
+    let c_p0 = b.const_f32(f32::from_bits(0x3c07_2010));
+    let c_p1 = b.const_f32(f32::from_bits(0x3d2b_9f17));
+    let c_p2 = b.const_f32(f32::from_bits(0x3e2a_af33));
+    let c_p3 = b.const_f32(f32::from_bits(0x3eff_fedb));
+    let c_p4 = b.const_f32(f32::from_bits(0x3f7f_fff6));
+    let c23 = b.const_u32(23);
+    let c_one_bits = b.const_u32(1.0_f32.to_bits());
+    let c_126 = b.const_f32(126.0);
+    let c_192 = b.const_f32(192.0);
+    let c0_u32 = b.const_u32(0);
+    let c_shift = b.const_u32(0x8200_0000);
+    let c_7f = b.const_u32(0x7f00_0000);
+
+    let z = b.fma(value, c_log2e, magic);
+    let n = b.fsub_nc(z, magic);
+    let neg_n = b.fsub_nc(f_zero, n);
+    let rem1 = b.fma(neg_n, c_ln2_hi, value);
+    let rem = b.fma(neg_n, c_ln2_lo, rem1);
+    let z_bits = b.bitcast(b.u32_t, z);
+    let exponent = b.ushl(z_bits, c23);
+    let k_bits = b.uadd(exponent, c_one_bits);
+    let k = b.bitcast(b.f32_t, k_bits);
+    let sq = b.fmul_nc(rem, rem);
+    let p_a = b.fma(c_p0, rem, c_p1);
+    let p_b = b.fma(c_p2, rem, c_p3);
+    let inner = b.fma(p_a, sq, p_b);
+    let p_tail = b.fmul_nc(c_p4, rem);
+    let poly = b.fma(inner, sq, p_tail);
+    let normal = b.fma(poly, k, k);
+
+    let abs_n = b.f_abs(n);
+    let gt_126 = b.f_gt(abs_n, c_126);
+    let gt_192 = b.f_gt(abs_n, c_192);
+    let n_gt_zero = b.f_gt(n, f_zero);
+    let shift = b.select(b.u32_t, n_gt_zero, c0_u32, c_shift);
+    let s1_bits = b.uadd(shift, c_7f);
+    let s1 = b.bitcast(b.f32_t, s1_bits);
+    let s1_sq = b.fmul_nc(s1, s1);
+    let s2_bits = b.binop(OP_I_SUB, b.u32_t, exponent, shift);
+    let s2 = b.bitcast(b.f32_t, s2_bits);
+    let s2_poly = b.fma(s2, poly, s2);
+    let scaled = b.fmul_nc(s2_poly, s1);
+    let over = b.select(b.f32_t, gt_192, s1_sq, scaled);
+    b.select(b.f32_t, gt_126, over, normal)
+}
+
+/// Emits GPU `SwiGLU` activation (`u * silu(g)` / `(g * u) / (1 + exp(-g))`) SPIR-V 1.6 words.
+///
+/// Bindings: `0` read-only `gate` (`f32`), `1` read-only `up` (`f32`), `2` writable `out` (`f32`).
+/// Push constants (`1 Ã— u32`): `[count]`. Dispatch: `(count.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn ffn_swiglu_f32(pinned: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let gate_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let up_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let count = b.load_push(push_var, 0);
+
+    let in_bounds = b.u_lt(idx, count);
+    b.emit_if(in_bounds, |b| {
+        let f_zero = b.const_f32(0.0);
+        let f_one = b.const_f32(1.0);
+        let g = b.load_sb_f32(gate_buf, idx);
+        let u = b.load_sb_f32(up_buf, idx);
+        let neg_g = b.fsub_nc(f_zero, g);
+        let exp_neg_g = if pinned {
+            vector_exp_spirv(b, neg_g)
+        } else {
+            b.glsl1(b.f32_t, GLSL_EXP, neg_g)
+        };
+        let denom = b.fadd_nc(f_one, exp_neg_g);
+        let res = if pinned {
+            let num = b.fmul_nc(g, u);
+            b.fdiv(num, denom)
+        } else {
+            let silu = b.fdiv(g, denom);
+            b.fmul_nc(u, silu)
+        };
+        b.store_sb_f32(out_buf, idx, res);
+    });
+
+    b.finish()
+}
+
+/// Emits normalized Sylvester Hadamard transform SPIR-V 1.6 words for power-of-two blocks `2..=1024`.
+///
+/// Bindings: `0` read-only `input` (`f32`), `1` writable `output` (`f32`).
+/// Push constants (`2 Ã— u32`): `[block_size, norm_bits]`. Dispatch: `(total_elems / block_size, 1, 1)`.
+#[must_use]
+pub fn ffn_hadamard_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
+    let smem = b.workgroup_f32_array(1024);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let blk_idx = b.load_input_component(wid_vec, 0);
+    let block_size = b.load_push(push_var, 0);
+    let norm_bits = b.load_push(push_var, 1);
+    let norm = b.bitcast(b.f32_t, norm_bits);
+
+    let c1 = b.const_u32(1);
+    let c64 = b.const_u32(WORKGROUP_X);
+    let blk_base = b.umul(blk_idx, block_size);
+
+    b.emit_for_range(lid, block_size, c64, |b, i| {
+        let src_idx = b.uadd(blk_base, i);
+        let val = b.load_sb_f32(in_buf, src_idx);
+        b.store_wg_f32(smem, i, val);
+    });
+    b.workgroup_barrier();
+
+    let half_var = b.local_u32_var();
+    b.store_var(half_var, c1);
+    let pairs = b.ushr(block_size, c1);
+
+    b.emit_while(
+        |b| {
+            let h = b.load_var_u32(half_var);
+            b.u_lt(h, block_size)
+        },
+        |b| {
+            let half = b.load_var_u32(half_var);
+            let mask = b.binop(OP_I_SUB, b.u32_t, half, c1);
+            b.emit_for_range(lid, pairs, c64, |b, p| {
+                let lo = b.uand(p, mask);
+                let base_p = b.binop(OP_I_SUB, b.u32_t, p, lo);
+                let hi = b.ushl(base_p, c1);
+                let left = b.uor(hi, lo);
+                let right = b.uor(left, half);
+                let l_val = b.load_wg_f32(smem, left);
+                let r_val = b.load_wg_f32(smem, right);
+                let sum = b.fadd_nc(l_val, r_val);
+                let diff = b.fsub_nc(l_val, r_val);
+                b.store_wg_f32(smem, left, sum);
+                b.store_wg_f32(smem, right, diff);
+            });
+            b.workgroup_barrier();
+            let next_half = b.ushl(half, c1);
+            b.store_var(half_var, next_half);
+        },
+    );
+
+    b.emit_for_range(lid, block_size, c64, |b, i| {
+        let v = b.load_wg_f32(smem, i);
+        let scaled = b.fmul_nc(v, norm);
+        let dst_idx = b.uadd(blk_base, i);
+        b.store_sb_f32(out_buf, dst_idx, scaled);
+    });
+
+    b.finish()
+}
+
+/// Emits rank-1 `dot(a, b)` reduction SPIR-V 1.6 words writing scalar sum into `out[0]`.
+///
+/// Bindings: `0` read-only `a` (`f32`), `1` read-only `b` (`f32`), `2` writable `out` (`f32`).
+/// Push constants (`1 Ã— u32`): `[count]`. Dispatch: `(1, 1, 1)`.
+#[must_use]
+pub fn dot_f32_scalar() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let a_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let b_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let smem = b.workgroup_f32_array(WORKGROUP_X);
+
+    let lid_vec = b.local_invocation_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let count = b.load_push(push_var, 0);
+
+    let c0 = b.const_u32(0);
+    let c64 = b.const_u32(WORKGROUP_X);
+    let f_zero = b.const_f32(0.0);
+    let acc_var = b.local_f32_var();
+    b.store_var(acc_var, f_zero);
+
+    b.emit_for_range(lid, count, c64, |b, i| {
+        let av = b.load_sb_f32(a_buf, i);
+        let bv = b.load_sb_f32(b_buf, i);
+        let prod = b.fmul_nc(av, bv);
+        let prev = b.load_var_f32(acc_var);
+        let next = b.fadd_nc(prev, prod);
+        b.store_var(acc_var, next);
+    });
+
+    let partial = b.load_var_f32(acc_var);
+    b.store_wg_f32(smem, lid, partial);
+    b.workgroup_barrier();
+
+    for stride in [32_u32, 16, 8, 4, 2, 1] {
+        let sc = b.const_u32(stride);
+        let active = b.u_lt(lid, sc);
+        b.emit_if(active, |b| {
+            let oth_idx = b.uadd(lid, sc);
+            let cur = b.load_wg_f32(smem, lid);
+            let oth = b.load_wg_f32(smem, oth_idx);
+            let sm = b.fadd_nc(cur, oth);
+            b.store_wg_f32(smem, lid, sm);
+        });
+        b.workgroup_barrier();
+    }
+
+    let is_head = b.u_eq(lid, c0);
+    b.emit_if(is_head, |b| {
+        let res = b.load_wg_f32(smem, c0);
+        b.store_sb_f32(out_buf, c0, res);
+    });
+
+    b.finish()
 }
 
 /// Emits `#40` Stage 1 (`QK^T` scaled causal scores) SPIR-V 1.6 words.
@@ -2430,14 +3773,33 @@ mod tests {
             pq2_q8k_gemv(true, false),
             pq2_q8k_gemv(false, true),
             pq2_q8k_gemv(false, false),
+            pq2_q8k_gemv_coalesced(true, true, false),
+            pq2_q8k_gemv_coalesced(true, false, true),
+            pq2_q8k_gemv_coalesced(false, true, false),
+            pq2_q8k_gemv_coalesced(false, false, true),
+            pq2_q8k_gemm_4tok_coalesced(true, true, false),
+            pq2_q8k_gemm_4tok_coalesced(true, false, true),
+            pq2_q8k_gemm_4tok_coalesced(false, false, false),
             pq2_q8_0_gemv(true),
             pq2_q8_0_gemv(false),
+            pq2_q8_0_gemv_coalesced(true),
+            pq2_q8_0_gemv_coalesced(false),
             ptq1_q8_0_gemv(true, true),
             ptq1_q8_0_gemv(true, false),
             ptq1_q8_0_gemv(false, true),
             ptq1_q8_0_gemv(false, false),
+            ptq1_q8_0_gemv_coalesced(true, true),
+            ptq1_q8_0_gemv_coalesced(false, false),
             ptq1_q8k_gemv(true),
             ptq1_q8k_gemv(false),
+            ptq1_q8k_gemv_coalesced(true),
+            ptq1_q8k_gemv_coalesced(false),
+            quantize_f32_to_q8k_4plane(true),
+            quantize_f32_to_q8k_4plane(false),
+            ffn_swiglu_f32(false),
+            ffn_swiglu_f32(true),
+            ffn_hadamard_f32(),
+            dot_f32_scalar(),
             attn_qk_scores(),
             attn_softmax_f16(),
             attn_pv_accum(),

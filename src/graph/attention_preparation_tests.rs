@@ -96,8 +96,7 @@ impl Fixture {
             mrope_positions: [2, 2, 2, 0],
             frequencies_ready: false,
             projection: &mut projection,
-            adapter: None,
-            adapter_scale: 0.0,
+            adapters: super::ActiveAdapters::default(),
             adapter_scratch: &mut adapter,
             executor: None,
         };

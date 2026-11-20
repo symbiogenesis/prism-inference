@@ -56,7 +56,7 @@ fn projection_plan_digest(
     hasher.update(placement.as_bytes())?;
     hasher.update(&[
         u8::from(work.is_some()),
-        u8::from(decoder.adapter.is_none()),
+        u8::from(!decoder.adapters().is_any_loaded()),
     ])?;
     hash_u64(&mut hasher, work.map_or(0, |plan| plan.hidden))?;
     hash_u64(&mut hasher, work.map_or(0, |plan| plan.output))?;
@@ -98,16 +98,9 @@ fn projection_plan_digest(
             Some(Some(block)) => (2_u8, block),
         };
         let chain_tensors = [&layer.gate, &layer.up, &layer.down];
-        let can_chain = !super::adapter_affects_any(
-            decoder.adapter.as_ref(),
-            decoder.adapter_scale,
-            &chain_tensors,
-        );
-        let can_swiglu = !super::adapter_affects_any(
-            decoder.adapter.as_ref(),
-            decoder.adapter_scale,
-            &[&layer.gate, &layer.up],
-        );
+        let adapters = decoder.adapters();
+        let can_chain = !adapters.affects_any(&chain_tensors);
+        let can_swiglu = !adapters.affects_any(&[&layer.gate, &layer.up]);
         hasher.update(&[
             hadamard_tag,
             u8::from(can_chain && executor.supports_f32_ffn_chain(chain_tensors)),
@@ -183,16 +176,9 @@ impl Work {
             }
             if decoder.transforms.basis(&layer.gate) == decoder.transforms.basis(&layer.up) {
                 let chain_tensors = [&layer.gate, &layer.up, &layer.down];
-                let can_chain = !super::adapter_affects_any(
-                    decoder.adapter.as_ref(),
-                    decoder.adapter_scale,
-                    &chain_tensors,
-                );
-                let can_swiglu = !super::adapter_affects_any(
-                    decoder.adapter.as_ref(),
-                    decoder.adapter_scale,
-                    &[&layer.gate, &layer.up],
-                );
+                let adapters = decoder.adapters();
+                let can_chain = !adapters.affects_any(&chain_tensors);
+                let can_swiglu = !adapters.affects_any(&[&layer.gate, &layer.up]);
                 if let Some(hadamard_block) =
                     decoder.transforms.ffn_chain_hadamard_block_for(&layer.down)
                     && can_chain
@@ -514,6 +500,8 @@ mod tests {
             transforms: super::super::Transforms::default(),
             adapter: None,
             adapter_scale: 0.0,
+            multi_rank_adapter: None,
+            multi_rank_adapter_scale: 0.0,
             layers: vec![super::super::Layer {
                 norm: vec![1.0; 128],
                 post_norm: vec![1.0; 128],

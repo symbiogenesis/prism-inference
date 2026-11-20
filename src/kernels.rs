@@ -4461,6 +4461,741 @@ pub(crate) fn softmax_round_f16(values: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+trait MultiLoraScalarWeight: Copy + Sync {
+    fn widen_f32(self) -> f32;
+}
+
+impl MultiLoraScalarWeight for u16 {
+    #[inline]
+    fn widen_f32(self) -> f32 {
+        half_to_float(self)
+    }
+}
+
+impl MultiLoraScalarWeight for f32 {
+    #[inline]
+    fn widen_f32(self) -> f32 {
+        self
+    }
+}
+
+#[inline]
+fn dot_multi_scalar<W: MultiLoraScalarWeight>(weights: &[W], input: &[f32]) -> f32 {
+    let mut acc0 = [0.0_f32; 4];
+    let mut acc1 = [0.0_f32; 4];
+    let (w_chunks8, w_rem8) = weights.as_chunks::<8>();
+    let (x_chunks8, x_rem8) = input.as_chunks::<8>();
+    for (w8, x8) in w_chunks8.iter().zip(x_chunks8) {
+        acc0[0] = w8[0].widen_f32().mul_add(x8[0], acc0[0]);
+        acc0[1] = w8[1].widen_f32().mul_add(x8[1], acc0[1]);
+        acc0[2] = w8[2].widen_f32().mul_add(x8[2], acc0[2]);
+        acc0[3] = w8[3].widen_f32().mul_add(x8[3], acc0[3]);
+        acc1[0] = w8[4].widen_f32().mul_add(x8[4], acc1[0]);
+        acc1[1] = w8[5].widen_f32().mul_add(x8[5], acc1[1]);
+        acc1[2] = w8[6].widen_f32().mul_add(x8[6], acc1[2]);
+        acc1[3] = w8[7].widen_f32().mul_add(x8[7], acc1[3]);
+    }
+    let (w_chunks4, w_tail) = w_rem8.as_chunks::<4>();
+    let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
+    if let (Some(w4), Some(x4)) = (w_chunks4.first(), x_chunks4.first()) {
+        acc0[0] = w4[0].widen_f32().mul_add(x4[0], acc0[0]);
+        acc0[1] = w4[1].widen_f32().mul_add(x4[1], acc0[1]);
+        acc0[2] = w4[2].widen_f32().mul_add(x4[2], acc0[2]);
+        acc0[3] = w4[3].widen_f32().mul_add(x4[3], acc0[3]);
+    }
+    let combined = [
+        acc0[0] + acc1[0],
+        acc0[1] + acc1[1],
+        acc0[2] + acc1[2],
+        acc0[3] + acc1[3],
+    ];
+    let mut sum = (combined[0] + combined[1]) + (combined[2] + combined[3]);
+    for (&w, &x) in w_tail.iter().zip(x_tail) {
+        sum = w.widen_f32().mul_add(x, sum);
+    }
+    sum
+}
+
+fn reserve_f32_scratch(scratch: &mut Vec<f32>, needed: usize) -> Result<()> {
+    scratch.clear();
+    if scratch.capacity() < needed {
+        scratch.try_reserve(needed - scratch.capacity())?;
+    }
+    scratch.resize(needed, 0.0);
+    Ok(())
+}
+
+fn check_lora_multi_a_dims(
+    weights_len: usize,
+    in_features: usize,
+    input_len: usize,
+) -> Result<usize> {
+    if in_features == 0 || input_len != in_features {
+        return Err(invalid("multi-rank LoRA A input dimension mismatch"));
+    }
+    if weights_len == 0 || !weights_len.is_multiple_of(in_features) {
+        return Err(invalid("multi-rank LoRA A weight dimension mismatch"));
+    }
+    Ok(weights_len / in_features)
+}
+
+fn check_lora_multi_b_dims(
+    weights_len: usize,
+    rank: usize,
+    out_features: usize,
+    scale: f32,
+) -> Result<()> {
+    if !scale.is_finite() {
+        return Err(invalid("multi-rank LoRA scale must be finite"));
+    }
+    if rank == 0
+        || out_features == 0
+        || weights_len != out_features.checked_mul(rank).ok_or_else(|| invalid("multi-rank LoRA B size overflow"))?
+    {
+        return Err(invalid("multi-rank LoRA B weight dimension mismatch"));
+    }
+    Ok(())
+}
+
+const MULTI_A_PARALLEL_ELEM_THRESHOLD: usize = 262_144;
+const MULTI_B_PARALLEL_ROW_THRESHOLD: usize = 1024;
+
+type NeonMultiAChunkFn<W> = fn(&[W], usize, &[f32], &mut [f32]) -> Option<bool>;
+type NeonMultiATokensFn<W> = fn(&[W], usize, usize, &[&[f32]], &mut [f32]) -> Option<bool>;
+type NeonMultiBChunkFn<W> = fn(&[W], &[f32], f32, &[f32], &mut [f32]) -> Option<bool>;
+type NeonMultiBTokensFn<W> =
+    fn(&[W], &[f32], usize, f32, &[&[f32]], usize, &mut [f32]) -> Option<bool>;
+
+fn lora_multi_a_impl<W: MultiLoraScalarWeight>(
+    a_weights: &[W],
+    in_features: usize,
+    input: &[f32],
+    ranks_out: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+    neon_chunk: NeonMultiAChunkFn<W>,
+) -> Result<()> {
+    let rank = check_lora_multi_a_dims(a_weights.len(), in_features, input.len())?;
+    reserve_f32_scratch(ranks_out, rank)?;
+    let run_chunk = |start_row: usize, rank_chunk: &mut [f32]| -> Result<()> {
+        let weight_start = start_row * in_features;
+        let weight_end = weight_start + rank_chunk.len() * in_features;
+        let a_chunk = &a_weights[weight_start..weight_end];
+        if let Some(finite) = neon_chunk(a_chunk, in_features, input, rank_chunk) {
+            return if finite {
+                Ok(())
+            } else {
+                Err(invalid("non-finite multi-rank LoRA A activation"))
+            };
+        }
+        for (a_row, dst) in a_chunk.chunks_exact(in_features).zip(rank_chunk.iter_mut()) {
+            let dot = dot_multi_scalar(a_row, input);
+            if !dot.is_finite() {
+                return Err(invalid("non-finite multi-rank LoRA A activation"));
+            }
+            *dst = dot;
+        }
+        Ok(())
+    };
+    let result = if a_weights.len() >= MULTI_A_PARALLEL_ELEM_THRESHOLD && parallelism.workers() > 1 {
+        parallelism.update_chunks(&mut ranks_out[..rank], 1, run_chunk)
+    } else {
+        run_chunk(0, &mut ranks_out[..rank])
+    };
+    if result.is_err() {
+        ranks_out.clear();
+    }
+    result
+}
+
+fn lora_multi_a_tokens_impl<W: MultiLoraScalarWeight>(
+    a_weights: &[W],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+    neon_tokens: NeonMultiATokensFn<W>,
+) -> Result<()> {
+    if rank == 0
+        || inputs.is_empty()
+        || in_features == 0
+        || a_weights.len() != rank.checked_mul(in_features).ok_or_else(|| invalid("multi-rank LoRA A size overflow"))?
+        || inputs.iter().any(|input| input.len() != in_features)
+    {
+        return Err(invalid("multi-rank LoRA A batch dimension mismatch"));
+    }
+    let needed = inputs
+        .len()
+        .checked_mul(rank)
+        .ok_or_else(|| invalid("multi-rank LoRA rank buffer overflow"))?;
+    reserve_f32_scratch(ranks_out, needed)?;
+    let run_token_chunk = |start_token: usize, rank_chunk: &mut [f32]| -> Result<()> {
+        let count = rank_chunk.len() / rank;
+        let token_inputs = &inputs[start_token..start_token + count];
+        if let Some(finite) = neon_tokens(a_weights, in_features, rank, token_inputs, rank_chunk) {
+            return if finite {
+                Ok(())
+            } else {
+                Err(invalid("non-finite multi-rank LoRA A activation"))
+            };
+        }
+        for (r, a_row) in a_weights.chunks_exact(in_features).enumerate() {
+            for (t, &input) in token_inputs.iter().enumerate() {
+                let dot = dot_multi_scalar(a_row, input);
+                if !dot.is_finite() {
+                    return Err(invalid("non-finite multi-rank LoRA A activation"));
+                }
+                rank_chunk[t * rank + r] = dot;
+            }
+        }
+        Ok(())
+    };
+    let work = a_weights.len().saturating_mul(inputs.len());
+    let result = if inputs.len() >= 4 && work >= MULTI_A_PARALLEL_ELEM_THRESHOLD && parallelism.workers() > 1 {
+        parallelism.update_chunks(&mut ranks_out[..needed], rank, run_token_chunk)
+    } else {
+        run_token_chunk(0, &mut ranks_out[..needed])
+    };
+    if result.is_err() {
+        ranks_out.clear();
+    }
+    result
+}
+
+fn lora_multi_b_impl<W: MultiLoraScalarWeight>(
+    b_weights: &[W],
+    ranks: &[f32],
+    scale: f32,
+    output: &mut [f32],
+    correction: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+    neon_chunk: NeonMultiBChunkFn<W>,
+) -> Result<()> {
+    let rank = ranks.len();
+    let out_features = output.len();
+    check_lora_multi_b_dims(b_weights.len(), rank, out_features, scale)?;
+    reserve_f32_scratch(correction, out_features)?;
+    let base: &[f32] = &*output;
+    let run_chunk = |start_row: usize, corr_chunk: &mut [f32]| -> Result<()> {
+        let end_row = start_row + corr_chunk.len();
+        let b_chunk = &b_weights[start_row * rank..end_row * rank];
+        let base_chunk = &base[start_row..end_row];
+        if let Some(finite) = neon_chunk(b_chunk, ranks, scale, base_chunk, corr_chunk) {
+            return if finite {
+                Ok(())
+            } else {
+                Err(invalid("non-finite multi-rank LoRA output"))
+            };
+        }
+        for ((b_row, &base_val), dst) in b_chunk
+            .chunks_exact(rank)
+            .zip(base_chunk)
+            .zip(corr_chunk.iter_mut())
+        {
+            let dot = dot_multi_scalar(b_row, ranks);
+            let updated = dot.mul_add(scale, base_val);
+            if !updated.is_finite() {
+                return Err(invalid("non-finite multi-rank LoRA output"));
+            }
+            *dst = updated;
+        }
+        Ok(())
+    };
+    let result = if out_features >= MULTI_B_PARALLEL_ROW_THRESHOLD && parallelism.workers() > 1 {
+        parallelism.update_chunks(&mut correction[..out_features], 1, run_chunk)
+    } else {
+        run_chunk(0, &mut correction[..out_features])
+    };
+    if result.is_ok() {
+        output.copy_from_slice(&correction[..out_features]);
+    }
+    correction.clear();
+    result
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Batched LoRA B kernel keeps weight slice, scratch, parallelism and NEON dispatch explicit."
+)]
+fn lora_multi_b_tokens_impl<W: MultiLoraScalarWeight>(
+    b_weights: &[W],
+    ranks: &[f32],
+    rank: usize,
+    scale: f32,
+    outputs: &mut [Vec<f32>],
+    correction: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+    neon_chunk: NeonMultiBTokensFn<W>,
+) -> Result<()> {
+    let n_tokens = outputs.len();
+    if n_tokens == 0 {
+        return Err(invalid("multi-rank LoRA B token batch must not be empty"));
+    }
+    let out_features = outputs[0].len();
+    check_lora_multi_b_dims(b_weights.len(), rank, out_features, scale)?;
+    if ranks.len() != n_tokens.checked_mul(rank).ok_or_else(|| invalid("multi-rank LoRA rank slice overflow"))?
+        || outputs.iter().any(|out| out.len() != out_features)
+    {
+        return Err(invalid("multi-rank LoRA B token batch dimension mismatch"));
+    }
+    let needed = out_features
+        .checked_mul(n_tokens)
+        .ok_or_else(|| invalid("multi-rank LoRA correction buffer overflow"))?;
+    reserve_f32_scratch(correction, needed)?;
+
+    let result = {
+        let mut stack_slices: [&[f32]; prefill::MAX_TILE_TOKENS] =
+            [&[]; prefill::MAX_TILE_TOKENS];
+        let mut heap_slices = Vec::new();
+        let base_outputs: &[&[f32]] = if n_tokens <= prefill::MAX_TILE_TOKENS {
+            for (slot, out) in stack_slices[..n_tokens].iter_mut().zip(outputs.iter()) {
+                *slot = out.as_slice();
+            }
+            &stack_slices[..n_tokens]
+        } else {
+            heap_slices.try_reserve(n_tokens)?;
+            for out in outputs.iter() {
+                heap_slices.push(out.as_slice());
+            }
+            &heap_slices
+        };
+
+        let run_chunk = |start_row: usize, corr_chunk: &mut [f32]| -> Result<()> {
+            let rows = corr_chunk.len() / n_tokens;
+            let b_chunk = &b_weights[start_row * rank..(start_row + rows) * rank];
+            if let Some(finite) = neon_chunk(
+                b_chunk,
+                ranks,
+                rank,
+                scale,
+                base_outputs,
+                start_row,
+                corr_chunk,
+            ) {
+                return if finite {
+                    Ok(())
+                } else {
+                    Err(invalid("non-finite multi-rank LoRA output"))
+                };
+            }
+            for (local_row, (b_row, corr_slots)) in b_chunk
+                .chunks_exact(rank)
+                .zip(corr_chunk.chunks_exact_mut(n_tokens))
+                .enumerate()
+            {
+                let global_row = start_row + local_row;
+                for (t, (&base_slice, corr_slot)) in
+                    base_outputs.iter().zip(corr_slots.iter_mut()).enumerate()
+                {
+                    let tok_ranks = &ranks[t * rank..(t + 1) * rank];
+                    let dot = dot_multi_scalar(b_row, tok_ranks);
+                    let updated = dot.mul_add(scale, base_slice[global_row]);
+                    if !updated.is_finite() {
+                        return Err(invalid("non-finite multi-rank LoRA output"));
+                    }
+                    *corr_slot = updated;
+                }
+            }
+            Ok(())
+        };
+
+        if out_features >= MULTI_B_PARALLEL_ROW_THRESHOLD && parallelism.workers() > 1 {
+            parallelism.update_chunks(&mut correction[..needed], n_tokens, run_chunk)
+        } else {
+            run_chunk(0, &mut correction[..needed])
+        }
+    };
+    if result.is_ok() {
+        for (row, corr_row) in correction[..needed].chunks_exact(n_tokens).enumerate() {
+            for (out, &value) in outputs.iter_mut().zip(corr_row) {
+                out[row] = value;
+            }
+        }
+    }
+    correction.clear();
+    result
+}
+
+#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+fn neon_multi_a_f16(
+    a_weights: &[u16],
+    in_features: usize,
+    input: &[f32],
+    ranks: &mut [f32],
+) -> Option<bool> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_multi_a_f16(a_weights, in_features, input, ranks)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    None
+}
+
+#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+fn neon_multi_a_f32(
+    a_weights: &[f32],
+    in_features: usize,
+    input: &[f32],
+    ranks: &mut [f32],
+) -> Option<bool> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_multi_a_f32(a_weights, in_features, input, ranks)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    None
+}
+
+#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+fn neon_multi_a_tokens_f16(
+    a_weights: &[u16],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+) -> Option<bool> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_multi_a_tokens_f16(a_weights, in_features, rank, inputs, ranks_out)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    None
+}
+
+#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+fn neon_multi_a_tokens_f32(
+    a_weights: &[f32],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+) -> Option<bool> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_multi_a_tokens_f32(a_weights, in_features, rank, inputs, ranks_out)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    None
+}
+
+#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+fn neon_multi_b_f16(
+    b_weights: &[u16],
+    ranks: &[f32],
+    scale: f32,
+    base_output: &[f32],
+    correction: &mut [f32],
+) -> Option<bool> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_multi_b_scale_and_finish_f16(b_weights, ranks, scale, base_output, correction)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    None
+}
+
+#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+fn neon_multi_b_f32(
+    b_weights: &[f32],
+    ranks: &[f32],
+    scale: f32,
+    base_output: &[f32],
+    correction: &mut [f32],
+) -> Option<bool> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_multi_b_scale_and_finish_f32(b_weights, ranks, scale, base_output, correction)
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    None
+}
+
+#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+fn neon_multi_b_tokens_f16(
+    b_weights: &[u16],
+    ranks: &[f32],
+    rank: usize,
+    scale: f32,
+    base_outputs: &[&[f32]],
+    start_row: usize,
+    correction: &mut [f32],
+) -> Option<bool> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_multi_b_scale_and_finish_tokens_f16(
+            b_weights,
+            ranks,
+            rank,
+            scale,
+            base_outputs,
+            start_row,
+            correction,
+        )
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    None
+}
+
+#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+fn neon_multi_b_tokens_f32(
+    b_weights: &[f32],
+    ranks: &[f32],
+    rank: usize,
+    scale: f32,
+    base_outputs: &[&[f32]],
+    start_row: usize,
+    correction: &mut [f32],
+) -> Option<bool> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    {
+        neon::lora_multi_b_scale_and_finish_tokens_f32(
+            b_weights,
+            ranks,
+            rank,
+            scale,
+            base_outputs,
+            start_row,
+            correction,
+        )
+    }
+    #[cfg(not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )))]
+    None
+}
+
+pub(crate) fn lora_multi_a_f16(
+    a_weights: &[u16],
+    in_features: usize,
+    input: &[f32],
+    ranks_out: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    lora_multi_a_impl(a_weights, in_features, input, ranks_out, parallelism, neon_multi_a_f16)
+}
+
+pub(crate) fn lora_multi_a_f32(
+    a_weights: &[f32],
+    in_features: usize,
+    input: &[f32],
+    ranks_out: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    lora_multi_a_impl(a_weights, in_features, input, ranks_out, parallelism, neon_multi_a_f32)
+}
+
+pub(crate) fn lora_multi_a_tokens_f16(
+    a_weights: &[u16],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    lora_multi_a_tokens_impl(
+        a_weights,
+        in_features,
+        rank,
+        inputs,
+        ranks_out,
+        parallelism,
+        neon_multi_a_tokens_f16,
+    )
+}
+
+pub(crate) fn lora_multi_a_tokens_f32(
+    a_weights: &[f32],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    lora_multi_a_tokens_impl(
+        a_weights,
+        in_features,
+        rank,
+        inputs,
+        ranks_out,
+        parallelism,
+        neon_multi_a_tokens_f32,
+    )
+}
+
+pub(crate) fn lora_multi_b_scale_and_finish_f16(
+    b_weights: &[u16],
+    ranks: &[f32],
+    scale: f32,
+    output: &mut [f32],
+    correction: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    lora_multi_b_impl(
+        b_weights,
+        ranks,
+        scale,
+        output,
+        correction,
+        parallelism,
+        neon_multi_b_f16,
+    )
+}
+
+pub(crate) fn lora_multi_b_scale_and_finish_f32(
+    b_weights: &[f32],
+    ranks: &[f32],
+    scale: f32,
+    output: &mut [f32],
+    correction: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    lora_multi_b_impl(
+        b_weights,
+        ranks,
+        scale,
+        output,
+        correction,
+        parallelism,
+        neon_multi_b_f32,
+    )
+}
+
+pub(crate) fn lora_multi_b_scale_and_finish_tokens_f16(
+    b_weights: &[u16],
+    ranks: &[f32],
+    rank: usize,
+    scale: f32,
+    outputs: &mut [Vec<f32>],
+    correction: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    lora_multi_b_tokens_impl(
+        b_weights,
+        ranks,
+        rank,
+        scale,
+        outputs,
+        correction,
+        parallelism,
+        neon_multi_b_tokens_f16,
+    )
+}
+
+pub(crate) fn lora_multi_b_scale_and_finish_tokens_f32(
+    b_weights: &[f32],
+    ranks: &[f32],
+    rank: usize,
+    scale: f32,
+    outputs: &mut [Vec<f32>],
+    correction: &mut Vec<f32>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    lora_multi_b_tokens_impl(
+        b_weights,
+        ranks,
+        rank,
+        scale,
+        outputs,
+        correction,
+        parallelism,
+        neon_multi_b_tokens_f32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -5679,6 +6414,325 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::similar_names,
+        clippy::too_many_lines,
+        reason = "NEON bypass stubs mirror the underlying F16/F32 kernel parameterizations across all matrix shapes."
+    )]
+    #[test]
+    fn multi_rank_lora_f16_and_f32_neon_match_scalar_and_batched_bits() -> crate::Result<()> {
+        let no_neon_a_f16 = |_: &[u16], _: usize, _: &[f32], _: &mut [f32]| None;
+        let no_neon_a_f32 = |_: &[f32], _: usize, _: &[f32], _: &mut [f32]| None;
+        let no_neon_a_tok_f16 =
+            |_: &[u16], _: usize, _: usize, _: &[&[f32]], _: &mut [f32]| None;
+        let no_neon_a_tok_f32 =
+            |_: &[f32], _: usize, _: usize, _: &[&[f32]], _: &mut [f32]| None;
+        let no_neon_b_f16 = |_: &[u16], _: &[f32], _: f32, _: &[f32], _: &mut [f32]| None;
+        let no_neon_b_f32 = |_: &[f32], _: &[f32], _: f32, _: &[f32], _: &mut [f32]| None;
+        let no_neon_b_tok_f16 =
+            |_: &[u16], _: &[f32], _: usize, _: f32, _: &[&[f32]], _: usize, _: &mut [f32]| None;
+        let no_neon_b_tok_f32 =
+            |_: &[f32], _: &[f32], _: usize, _: f32, _: &[&[f32]], _: usize, _: &mut [f32]| None;
+
+        for workers in [1_usize, 4] {
+            let parallelism = super::RowParallelism::new(workers)?;
+            for (in_features, rank, out_features) in [
+                (1_usize, 1_usize, 1_usize),
+                (3, 3, 5),
+                (4, 4, 4),
+                (7, 5, 9),
+                (8, 8, 8),
+                (9, 12, 17),
+                (16, 16, 31),
+                (32, 16, 64),
+                (128, 32, 1100),
+            ] {
+                let a_f16: Vec<u16> = (0..rank * in_features)
+                    .map(|idx| {
+                        let v = i16::try_from((idx * 7) % 13).unwrap_or(0) - 6;
+                        super::half_bits(f32::from(v) * 0.0625)
+                    })
+                    .collect();
+                let a_f32: Vec<f32> = a_f16.iter().map(|&b| super::half_to_float(b)).collect();
+                let b_f16: Vec<u16> = (0..out_features * rank)
+                    .map(|idx| {
+                        let v = i16::try_from((idx * 5) % 11).unwrap_or(0) - 5;
+                        super::half_bits(f32::from(v) * 0.03125)
+                    })
+                    .collect();
+                let b_f32: Vec<f32> = b_f16.iter().map(|&b| super::half_to_float(b)).collect();
+
+                for token_count in [1_usize, 4, 32] {
+                    let owned_inputs: Vec<Vec<f32>> = (0..token_count)
+                        .map(|t| {
+                            (0..in_features)
+                                .map(|c| {
+                                    let num = i16::try_from((c * 11 + t * 17) % 19).unwrap_or(0) - 9;
+                                    f32::from(num) * 0.125
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let input_refs: Vec<&[f32]> =
+                        owned_inputs.iter().map(Vec::as_slice).collect();
+                    let base_outputs: Vec<Vec<f32>> = (0..token_count)
+                        .map(|t| {
+                            (0..out_features)
+                                .map(|r| {
+                                    let num = i16::try_from((r * 3 + t * 5) % 15).unwrap_or(0) - 7;
+                                    f32::from(num) * 0.25
+                                })
+                                .collect()
+                        })
+                        .collect();
+
+                    let mut scalar_ranks_f16 = Vec::new();
+                    let mut neon_ranks_f16 = Vec::new();
+                    super::lora_multi_a_tokens_impl(
+                        &a_f16,
+                        in_features,
+                        rank,
+                        &input_refs,
+                        &mut scalar_ranks_f16,
+                        &parallelism,
+                        no_neon_a_tok_f16,
+                    )?;
+                    super::lora_multi_a_tokens_f16(
+                        &a_f16,
+                        in_features,
+                        rank,
+                        &input_refs,
+                        &mut neon_ranks_f16,
+                        &parallelism,
+                    )?;
+                    assert_eq!(
+                        neon_ranks_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        scalar_ranks_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                    );
+
+                    let mut scalar_ranks_f32 = Vec::new();
+                    let mut neon_ranks_f32 = Vec::new();
+                    super::lora_multi_a_tokens_impl(
+                        &a_f32,
+                        in_features,
+                        rank,
+                        &input_refs,
+                        &mut scalar_ranks_f32,
+                        &parallelism,
+                        no_neon_a_tok_f32,
+                    )?;
+                    super::lora_multi_a_tokens_f32(
+                        &a_f32,
+                        in_features,
+                        rank,
+                        &input_refs,
+                        &mut neon_ranks_f32,
+                        &parallelism,
+                    )?;
+                    assert_eq!(
+                        neon_ranks_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        scalar_ranks_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        neon_ranks_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        neon_ranks_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                    );
+
+                    let mut single_corr = Vec::new();
+                    let mut single_ranks = Vec::new();
+                    let mut scalar_single_ranks = Vec::new();
+                    let mut single_f16_outs = base_outputs.clone();
+                    let mut scalar_f16_outs = base_outputs.clone();
+                    for (t, input) in input_refs.iter().enumerate() {
+                        super::lora_multi_a_f16(
+                            &a_f16,
+                            in_features,
+                            input,
+                            &mut single_ranks,
+                            &parallelism,
+                        )?;
+                        super::lora_multi_a_impl(
+                            &a_f16,
+                            in_features,
+                            input,
+                            &mut scalar_single_ranks,
+                            &parallelism,
+                            no_neon_a_f16,
+                        )?;
+                        assert_eq!(
+                            single_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            scalar_single_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            single_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            neon_ranks_f16[t * rank..(t + 1) * rank]
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>()
+                        );
+
+                        super::lora_multi_b_scale_and_finish_f16(
+                            &b_f16,
+                            &single_ranks,
+                            0.5,
+                            &mut single_f16_outs[t],
+                            &mut single_corr,
+                            &parallelism,
+                        )?;
+                        super::lora_multi_b_impl(
+                            &b_f16,
+                            &single_ranks,
+                            0.5,
+                            &mut scalar_f16_outs[t],
+                            &mut single_corr,
+                            &parallelism,
+                            no_neon_b_f16,
+                        )?;
+                        assert_eq!(
+                            single_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            scalar_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        );
+
+                        let mut single_f32_out = base_outputs[t].clone();
+                        let mut scalar_f32_out = base_outputs[t].clone();
+                        let mut single_f32_ranks = Vec::new();
+                        super::lora_multi_a_f32(
+                            &a_f32,
+                            in_features,
+                            input,
+                            &mut single_f32_ranks,
+                            &parallelism,
+                        )?;
+                        super::lora_multi_a_impl(
+                            &a_f32,
+                            in_features,
+                            input,
+                            &mut scalar_single_ranks,
+                            &parallelism,
+                            no_neon_a_f32,
+                        )?;
+                        assert_eq!(
+                            single_f32_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            scalar_single_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        );
+                        super::lora_multi_b_scale_and_finish_f32(
+                            &b_f32,
+                            &single_f32_ranks,
+                            0.5,
+                            &mut single_f32_out,
+                            &mut single_corr,
+                            &parallelism,
+                        )?;
+                        super::lora_multi_b_impl(
+                            &b_f32,
+                            &single_f32_ranks,
+                            0.5,
+                            &mut scalar_f32_out,
+                            &mut single_corr,
+                            &parallelism,
+                            no_neon_b_f32,
+                        )?;
+                        assert_eq!(
+                            single_f32_out.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            scalar_f32_out.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            single_f32_out.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            single_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        );
+                    }
+
+                    let mut batched_corr = Vec::new();
+                    let mut batched_f16_outs = base_outputs.clone();
+                    let mut scalar_batched_f16_outs = base_outputs.clone();
+                    super::lora_multi_b_scale_and_finish_tokens_f16(
+                        &b_f16,
+                        &neon_ranks_f16,
+                        rank,
+                        0.5,
+                        &mut batched_f16_outs,
+                        &mut batched_corr,
+                        &parallelism,
+                    )?;
+                    super::lora_multi_b_tokens_impl(
+                        &b_f16,
+                        &neon_ranks_f16,
+                        rank,
+                        0.5,
+                        &mut scalar_batched_f16_outs,
+                        &mut batched_corr,
+                        &parallelism,
+                        no_neon_b_tok_f16,
+                    )?;
+
+                    let mut batched_f32_outs = base_outputs.clone();
+                    let mut scalar_batched_f32_outs = base_outputs;
+                    super::lora_multi_b_scale_and_finish_tokens_f32(
+                        &b_f32,
+                        &neon_ranks_f32,
+                        rank,
+                        0.5,
+                        &mut batched_f32_outs,
+                        &mut batched_corr,
+                        &parallelism,
+                    )?;
+                    super::lora_multi_b_tokens_impl(
+                        &b_f32,
+                        &neon_ranks_f32,
+                        rank,
+                        0.5,
+                        &mut scalar_batched_f32_outs,
+                        &mut batched_corr,
+                        &parallelism,
+                        no_neon_b_tok_f32,
+                    )?;
+
+                    for t in 0..token_count {
+                        let expected: Vec<u32> = single_f16_outs[t].iter().copied().map(f32::to_bits).collect();
+                        assert_eq!(
+                            batched_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert_eq!(
+                            scalar_batched_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert_eq!(
+                            batched_f32_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert_eq!(
+                            scalar_batched_f32_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+
+        // Non-finite intermediate overflow leaves caller output completely untouched.
+        let parallelism = super::RowParallelism::new(1)?;
+        let mut output = vec![1.25_f32, -2.5, 3.75, 0.5];
+        let before = output.clone();
+        let b_weights = vec![0.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, f32::MAX];
+        let ranks = vec![1.0_f32, 1.0];
+        let mut corr = Vec::new();
+        assert!(
+            super::lora_multi_b_scale_and_finish_f32(
+                &b_weights,
+                &ranks,
+                f32::MAX,
+                &mut output,
+                &mut corr,
+                &parallelism,
+            )
+            .is_err()
+        );
+        assert_eq!(output, before);
         Ok(())
     }
 }

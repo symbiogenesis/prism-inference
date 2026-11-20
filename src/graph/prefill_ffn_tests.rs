@@ -7,11 +7,17 @@ use bonsai_gguf::MetadataValue;
 
 use super::super::ProjectionScratch;
 use super::{
-    AdapterScratch, Arithmetic, Evaluation, Geometry, MatvecBackend, ProjectionTile,
-    RankOneAdapter, RowParallelism, Tensor, TileReuse, Transforms, project_tile,
+    ActiveAdapters, AdapterScratch, Arithmetic, Evaluation, Geometry, MatvecBackend,
+    ProjectionTile, RowParallelism, Tensor, TileReuse, Transforms, project_tile,
     project_tile_ffn_swiglu, try_project_tile_ffn_chain,
 };
-use crate::{Result, model::Model};
+use crate::{
+    Result,
+    model::{
+        Model,
+        lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
+    },
+};
 
 fn tensor(name: &str, dimensions: &[usize], values: &[f32]) -> Tensor {
     Tensor {
@@ -142,8 +148,7 @@ impl Fixture {
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
-            adapter: Some(&self.adapter),
-            adapter_scale: scale,
+            adapters: ActiveAdapters::rank_one(Some(&self.adapter), scale),
             adapter_scratch: &mut adapter_scratch,
             executor: None,
         };
@@ -206,8 +211,7 @@ impl Fixture {
             &self.transforms,
             &self.geometry,
             arithmetic,
-            Some(&self.adapter),
-            scale,
+            ActiveAdapters::rank_one(Some(&self.adapter), scale),
             &mut adapter_scratch,
             &mut projection_scratch,
             TileReuse::default(),
@@ -232,8 +236,7 @@ impl Fixture {
             &self.transforms,
             &self.geometry,
             arithmetic,
-            Some(&self.adapter),
-            scale,
+            ActiveAdapters::rank_one(Some(&self.adapter), scale),
             &mut adapter_scratch,
             &mut projection_scratch,
             reuse,
@@ -695,8 +698,7 @@ impl Pq2FfnFixture {
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
-            adapter,
-            adapter_scale: scale,
+            adapters: ActiveAdapters::rank_one(adapter, scale),
             adapter_scratch: &mut adapter_scratch,
             executor: executor.map(as_executor),
         };
@@ -752,8 +754,7 @@ impl Pq2FfnFixture {
             &self.transforms,
             &self.geometry,
             arithmetic,
-            adapter,
-            scale,
+            ActiveAdapters::rank_one(adapter, scale),
             TileReuse::default(),
             [&self.gate, &self.up, &self.down],
             inputs,
@@ -768,8 +769,7 @@ impl Pq2FfnFixture {
                 &self.transforms,
                 &self.geometry,
                 arithmetic,
-                adapter,
-                scale,
+                ActiveAdapters::rank_one(adapter, scale),
                 &mut adapter_scratch,
                 &mut projection_scratch,
                 TileReuse::default(),
@@ -788,8 +788,7 @@ impl Pq2FfnFixture {
                 &self.transforms,
                 &self.geometry,
                 arithmetic,
-                adapter,
-                scale,
+                ActiveAdapters::rank_one(adapter, scale),
                 &mut adapter_scratch,
                 &mut projection_scratch,
                 reuse,
@@ -948,8 +947,7 @@ fn external_ffn_chain_and_swiglu_unlock_for_inactive_and_down_only_lora() -> Res
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut proj,
-            adapter: Some(&fixture.down_adapter),
-            adapter_scale: 1.3,
+            adapters: ActiveAdapters::rank_one(Some(&fixture.down_adapter), 1.3),
             adapter_scratch: &mut adapter_scratch,
             executor: Some(&mut untargeted_exec),
         };
@@ -998,8 +996,7 @@ fn external_ffn_chain_lora_fuses_down_only_lora_at_scale_1_3_and_matches_rank_on
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut expected_proj,
-            adapter: Some(&fixture.down_adapter),
-            adapter_scale: 1.3,
+            adapters: ActiveAdapters::rank_one(Some(&fixture.down_adapter), 1.3),
             adapter_scratch: &mut expected_adapter_scratch,
             executor: None,
         };
@@ -1034,8 +1031,7 @@ fn external_ffn_chain_lora_fuses_down_only_lora_at_scale_1_3_and_matches_rank_on
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut actual_proj,
-            adapter: Some(&fixture.down_adapter),
-            adapter_scale: 1.3,
+            adapters: ActiveAdapters::rank_one(Some(&fixture.down_adapter), 1.3),
             adapter_scratch: &mut actual_adapter_scratch,
             executor: Some(&mut exec_no_res),
         };
@@ -1385,5 +1381,257 @@ fn mixed_phase_tile_gate_skips_decode_executor_on_tiled_ingest_block_and_keeps_d
             .packed_projections,
         0
     );
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Verifies zero-scale bypass, nonzero SwiGLU retention, CPU fallback parity, and tiled prefill parity together."
+)]
+fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches_stacked_orca_bits()
+-> Result<()> {
+    let fixture = Pq2FfnFixture::new()?;
+    let base = Model {
+        metadata: BTreeMap::from([(
+            "general.architecture".into(),
+            MetadataValue::from("qwen35"),
+        )]),
+        tensors: BTreeMap::from([(fixture.down.name.clone(), fixture.down.clone())]),
+        identity: "pq2-multi-rank-base".into(),
+    };
+    let a_vals: Vec<f32> = (0..128 * 2)
+        .map(|i| match i % 5 {
+            0 => 0.125,
+            1 => -0.0625,
+            2 => 0.03125,
+            3 => -0.125,
+            _ => 0.0625,
+        })
+        .collect();
+    let b_vals: Vec<f32> = (0..2 * 128)
+        .map(|i| match i % 4 {
+            0 => 0.25,
+            1 => -0.125,
+            2 => 0.0625,
+            _ => -0.03125,
+        })
+        .collect();
+    let f16_bytes = |vals: &[f32]| -> crate::model::TensorBytes {
+        vals.iter()
+            .flat_map(|v| crate::kernels::half_bits(*v).to_le_bytes())
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let mr_model = Model {
+        metadata: BTreeMap::from([
+            ("general.architecture".into(), MetadataValue::from("qwen35")),
+            ("general.type".into(), MetadataValue::from("adapter")),
+            ("adapter.type".into(), MetadataValue::from("lora")),
+            ("adapter.lora.alpha".into(), MetadataValue::from(4.0_f32)),
+            ("adapter.lora_alpha".into(), MetadataValue::from(4.0_f32)),
+        ]),
+        tensors: BTreeMap::from([
+            (
+                format!("{}.lora_a", fixture.down.name),
+                Tensor {
+                    name: format!("{}.lora_a", fixture.down.name),
+                    dimensions: vec![128, 2],
+                    kind: 1,
+                    data: f16_bytes(&a_vals),
+                },
+            ),
+            (
+                format!("{}.lora_b", fixture.down.name),
+                Tensor {
+                    name: format!("{}.lora_b", fixture.down.name),
+                    dimensions: vec![2, 128],
+                    kind: 1,
+                    data: f16_bytes(&b_vals),
+                },
+            ),
+        ]),
+        identity: "f".repeat(64),
+    };
+    let multi_rank = MultiRankAdapter::from_model(&base, &mr_model, MultiRankPolicy::NpuFriendly)?;
+
+    let inputs: Vec<Vec<f32>> = vec![
+        (0..128)
+            .map(|i| if i % 2 == 0 { 0.375 } else { -0.25 })
+            .collect(),
+        (0..128)
+            .map(|i| if i % 3 == 0 { -0.5 } else { 0.125 })
+            .collect(),
+    ];
+    let residuals: Vec<Vec<f32>> = vec![vec![0.125; 128], vec![-0.25; 128]];
+
+    let run_decode_stacked = |arithmetic: Arithmetic,
+                              mr_scale: f32,
+                              mut executor: Option<&mut RecordingFfnExecutor>|
+     -> Result<(Vec<f32>, crate::graph::fusion::FusionStatistics)> {
+        let mut projection = ProjectionScratch {
+            matvec: arithmetic.scratch(MatvecBackend::Scalar),
+            ..ProjectionScratch::default()
+        };
+        let mut adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
+        let mut evaluation = Evaluation {
+            geometry: &fixture.geometry,
+            arithmetic,
+            transforms: &fixture.transforms,
+            position: 0,
+            mrope_positions: [0; 4],
+            frequencies_ready: false,
+            projection: &mut projection,
+            adapters: ActiveAdapters {
+                rank_one: Some(&fixture.down_adapter),
+                rank_one_scale: 1.3,
+                multi_rank: Some(&multi_rank),
+                multi_rank_scale: mr_scale,
+            },
+            adapter_scratch: &mut adapter_scratch,
+            executor: executor.as_deref_mut().map(as_executor),
+        };
+        let mut output = Vec::new();
+        if !evaluation.try_project_ffn_chain_into(
+            &fixture.gate,
+            &fixture.up,
+            &fixture.down,
+            &inputs[0],
+            Some(&residuals[0]),
+            &mut output,
+        )? {
+            let mut gate_out = Vec::new();
+            let mut up_out = Vec::new();
+            evaluation.project_ffn_swiglu_into(
+                &fixture.gate,
+                &fixture.up,
+                &fixture.down,
+                &inputs[0],
+                &mut gate_out,
+                &mut up_out,
+            )?;
+            evaluation.project_into(&fixture.down, &up_out, &mut output)?;
+            output
+                .iter_mut()
+                .zip(&residuals[0])
+                .for_each(|(out, res)| *out += *res);
+        }
+        Ok((output, evaluation.projection.fusions))
+    };
+
+    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+        // 1. At DaisyRose scale 0.0, external_ffn_chain_lora stays fused and matches Orca-only bit-for-bit.
+        let mut orca_exec = fixture.executor(arithmetic);
+        orca_exec.allow_chain_lora = true;
+        let (orca_only, orca_stats) =
+            fixture.run_decode(arithmetic, Some(&fixture.down_adapter), 1.3, &inputs[0], &residuals[0], Some(&mut orca_exec))?;
+        let mut zero_exec = fixture.executor(arithmetic);
+        zero_exec.allow_chain_lora = true;
+        let (stacked_zero, zero_stats) = run_decode_stacked(arithmetic, 0.0, Some(&mut zero_exec))?;
+        assert_eq!(orca_stats.external_ffn_chain.completed, 1);
+        assert_eq!(zero_stats.external_ffn_chain.completed, 1);
+        assert_eq!(zero_stats.external_ffn_swiglu.completed, 0);
+        assert_eq!(zero_exec.chain_calls, 1);
+        assert_eq!(zero_exec.swiglu_calls, 0);
+        same_bits(&stacked_zero, &orca_only, "stacked DaisyRose=0 bypass");
+
+        // 2. At DaisyRose scale 0.5, chain falls back while external_ffn_swiglu remains fused,
+        //    and matches CPU fallback + tiled prefill bit-for-bit.
+        let mut active_exec = fixture.executor(arithmetic);
+        active_exec.allow_chain_lora = true;
+        let (stacked_active, active_stats) = run_decode_stacked(arithmetic, 0.5, Some(&mut active_exec))?;
+        assert_eq!(active_stats.external_ffn_chain.completed, 0);
+        assert_eq!(active_stats.external_ffn_swiglu.completed, 1);
+        assert_eq!(active_exec.chain_calls, 0);
+        assert_eq!(active_exec.swiglu_calls, 1);
+        assert_ne!(
+            stacked_active.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+            orca_only.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+        );
+
+        let (cpu_active, _) = run_decode_stacked(arithmetic, 0.5, None)?;
+        same_bits(&stacked_active, &cpu_active, "stacked DaisyRose=0.5 decode vs CPU");
+
+        // Tiled prefill parity against single-token decode.
+        let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
+        let mut projection_scratch = arithmetic.scratch(MatvecBackend::Scalar);
+        let mut adapter_scratch = AdapterScratch::new(
+            MatvecBackend::Scalar,
+            matches!(arithmetic, Arithmetic::PinnedSwift),
+        );
+        let mut tiled_exec = fixture.executor(arithmetic);
+        let adapters = ActiveAdapters {
+            rank_one: Some(&fixture.down_adapter),
+            rank_one_scale: 1.3,
+            multi_rank: Some(&multi_rank),
+            multi_rank_scale: 0.5,
+        };
+        let mut outputs = vec![Vec::new(); inputs.len()];
+        let mut transformed = vec![Vec::new(); inputs.len()];
+        let mut gate_out = vec![Vec::new(); inputs.len()];
+        let mut up_out = vec![Vec::new(); inputs.len()];
+        assert!(!try_project_tile_ffn_chain(
+            &fixture.transforms,
+            &fixture.geometry,
+            arithmetic,
+            adapters,
+            TileReuse::default(),
+            [&fixture.gate, &fixture.up, &fixture.down],
+            &inputs,
+            Some(&residuals),
+            &mut outputs,
+            &mut transformed,
+            &projector,
+            Some(as_executor(&mut tiled_exec)),
+            &|| Ok(()),
+        )?);
+        let reuse = project_tile_ffn_swiglu(
+            &fixture.transforms,
+            &fixture.geometry,
+            arithmetic,
+            adapters,
+            &mut adapter_scratch,
+            &mut projection_scratch,
+            TileReuse::default(),
+            &fixture.gate,
+            &fixture.up,
+            &fixture.down,
+            &inputs,
+            &mut gate_out,
+            &mut up_out,
+            &mut transformed,
+            &mut projector,
+            Some(as_executor(&mut tiled_exec)),
+            &|| Ok(()),
+        )?;
+        assert_eq!(tiled_exec.chain_calls, 0);
+        assert_eq!(tiled_exec.swiglu_calls, inputs.len());
+        let _ = project_tile(
+            &fixture.transforms,
+            &fixture.geometry,
+            arithmetic,
+            adapters,
+            &mut adapter_scratch,
+            &mut projection_scratch,
+            reuse,
+            &fixture.down,
+            &up_out,
+            &mut outputs,
+            &mut transformed,
+            &mut projector,
+            Some(as_executor(&mut tiled_exec)),
+            &|| Ok(()),
+        )?;
+        for (out_row, res_row) in outputs.iter_mut().zip(&residuals) {
+            out_row
+                .iter_mut()
+                .zip(res_row)
+                .for_each(|(out, res)| *out += *res);
+        }
+        same_bits(&outputs[0], &stacked_active, "stacked DaisyRose=0.5 tiled[0] vs decode");
+    }
     Ok(())
 }

@@ -2,15 +2,15 @@
 
 use super::{TileReuse, TiledPrefill, project_tile, project_tile_pair, reborrow_executor};
 use crate::graph::{
-    Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms, copy_into,
-    finite, l2_norm, resize_into, sigmoid, small_float,
+    ActiveAdapters, Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms,
+    copy_into, finite, l2_norm, resize_into, sigmoid, small_float,
 };
 use crate::kernels::pinned_gdn::ChunkInput as Input;
 use crate::kernels::{
     RmsNormWeights, add_scaled_slice_in_place, gdn_wy_update_eight_rows, gdn_wy_update_four_rows,
     scale_slice_into,
 };
-use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
+use crate::model::lora::Scratch as AdapterScratch;
 use crate::{Result, invalid};
 
 #[cfg(test)]
@@ -468,8 +468,7 @@ pub(super) fn recurrent_tile<'a>(
     geometry: &Geometry,
     arithmetic: Arithmetic,
     transforms: &Transforms,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'_>,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
     previous_norm: TileReuse<'a>,
@@ -496,8 +495,7 @@ pub(super) fn recurrent_tile<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         previous_norm,
@@ -515,8 +513,7 @@ pub(super) fn recurrent_tile<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         previous_weight,
@@ -914,7 +911,9 @@ pub(super) fn recurrent_tile<'a>(
                 Ok(())
             },
         )?;
-        if transforms.can_grouped_block_hadamard(&layer.output, geometry) && adapter.is_none() {
+        if transforms.can_grouped_block_hadamard(&layer.output, geometry)
+            && !adapters.has_target(&layer.output.name)
+        {
             let head_outputs = &tile.gdn_head_outputs;
             let parallelism = tile.projector.row_parallelism();
             if count > 1 {
@@ -1069,8 +1068,7 @@ pub(super) fn recurrent_tile<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         output_reuse,

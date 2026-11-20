@@ -17,6 +17,9 @@ use crate::{
     },
 };
 
+mod multi_rank;
+pub use multi_rank::{MultiRankAdapter, MultiRankPolicy};
+
 /// Exact approved Orca adapter file length.
 pub const SWIFT_ADAPTER_BYTES: u64 = 9_682_464;
 /// Exact approved Orca adapter file SHA-256.
@@ -143,6 +146,7 @@ pub struct RankOneAdapter {
 #[derive(Default)]
 pub(crate) struct Scratch {
     rank: Vec<f32>,
+    multi_ranks: Vec<f32>,
     correction: Vec<f32>,
     matvec: MatvecScratch,
 }
@@ -151,6 +155,7 @@ impl Scratch {
     pub(crate) fn new(backend: MatvecBackend, pinned: bool) -> Self {
         Self {
             rank: Vec::new(),
+            multi_ranks: Vec::new(),
             correction: Vec::new(),
             matvec: if pinned {
                 MatvecScratch::with_pinned_backend(backend)

@@ -115,8 +115,7 @@ fn fusion_verification_counts_real_norm_paths_and_separate_arithmetic() -> Resul
                         mrope_positions: [0; 4],
                         frequencies_ready: false,
                         projection: &mut projection,
-                        adapter: None,
-                        adapter_scale: 0.0,
+                        adapters: super::ActiveAdapters::default(),
                         adapter_scratch: &mut adapter_scratch,
                         executor: None,
                     };
@@ -229,8 +228,7 @@ fn fusion_verification_swiglu_counts_execution_against_separate_operations() -> 
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
-            adapter: None,
-            adapter_scale: 0.0,
+            adapters: super::ActiveAdapters::default(),
             adapter_scratch: &mut adapter_scratch,
             executor: None,
         };
@@ -286,8 +284,7 @@ fn fusion_verification_rejects_successful_fallback_as_completed_fusion() -> Resu
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
-            adapter: None,
-            adapter_scale: 0.0,
+            adapters: super::ActiveAdapters::default(),
             adapter_scratch: &mut adapter_scratch,
             executor: None,
         };

@@ -1121,6 +1121,307 @@ pub(super) fn lora_b_scale_and_finish_tokens<const TOKENS: usize>(
 }
 
 #[inline]
+fn dot_f16_f32_row(neon: Neon, weights_f16: &[u16], input: &[f32]) -> f32 {
+    let mut acc0 = f32x4::splat(neon, 0.0);
+    let mut acc1 = f32x4::splat(neon, 0.0);
+    let (w_chunks8, w_rem8) = weights_f16.as_chunks::<8>();
+    let (x_chunks8, x_rem8) = input.as_chunks::<8>();
+    for (w8, x8) in w_chunks8.iter().zip(x_chunks8) {
+        let (w_lo, w_hi) = f16_bits_to_f32_x8(neon, w8);
+        let x_lo = f32x4::from_slice(neon, &x8[..4]);
+        let x_hi = f32x4::from_slice(neon, &x8[4..]);
+        acc0 = w_lo.mul_add_precise(x_lo, acc0);
+        acc1 = w_hi.mul_add_precise(x_hi, acc1);
+    }
+    let (w_chunks4, w_tail) = w_rem8.as_chunks::<4>();
+    let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
+    if let (Some(w4), Some(x4)) = (w_chunks4.first(), x_chunks4.first()) {
+        let w = f16_bits_to_f32_x4(neon, *w4);
+        let x = f32x4::from_slice(neon, x4);
+        acc0 = w.mul_add_precise(x, acc0);
+    }
+    let mut lanes = [0.0_f32; 4];
+    (acc0 + acc1).store_slice(&mut lanes);
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for (&w_bits, &x) in w_tail.iter().zip(x_tail) {
+        sum = bonsai_ternary::half_to_float(w_bits).mul_add(x, sum);
+    }
+    sum
+}
+
+#[inline]
+fn dot_f32_f32_row(neon: Neon, weights: &[f32], input: &[f32]) -> f32 {
+    let mut acc0 = f32x4::splat(neon, 0.0);
+    let mut acc1 = f32x4::splat(neon, 0.0);
+    let (w_chunks8, w_rem8) = weights.as_chunks::<8>();
+    let (x_chunks8, x_rem8) = input.as_chunks::<8>();
+    for (w8, x8) in w_chunks8.iter().zip(x_chunks8) {
+        let w_lo = f32x4::from_slice(neon, &w8[..4]);
+        let w_hi = f32x4::from_slice(neon, &w8[4..]);
+        let x_lo = f32x4::from_slice(neon, &x8[..4]);
+        let x_hi = f32x4::from_slice(neon, &x8[4..]);
+        acc0 = w_lo.mul_add_precise(x_lo, acc0);
+        acc1 = w_hi.mul_add_precise(x_hi, acc1);
+    }
+    let (w_chunks4, w_tail) = w_rem8.as_chunks::<4>();
+    let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
+    if let (Some(w4), Some(x4)) = (w_chunks4.first(), x_chunks4.first()) {
+        let w = f32x4::from_slice(neon, w4);
+        let x = f32x4::from_slice(neon, x4);
+        acc0 = w.mul_add_precise(x, acc0);
+    }
+    let mut lanes = [0.0_f32; 4];
+    (acc0 + acc1).store_slice(&mut lanes);
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for (&w, &x) in w_tail.iter().zip(x_tail) {
+        sum = w.mul_add(x, sum);
+    }
+    sum
+}
+
+pub(super) fn lora_multi_a_f16(
+    a_weights: &[u16],
+    in_features: usize,
+    input: &[f32],
+    ranks: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if in_features == 0
+        || input.len() != in_features
+        || a_weights.len() != ranks.len().saturating_mul(in_features)
+    {
+        return Some(false);
+    }
+    for (a_row, dst) in a_weights.chunks_exact(in_features).zip(ranks.iter_mut()) {
+        let dot = dot_f16_f32_row(neon, a_row, input);
+        if !dot.is_finite() {
+            return Some(false);
+        }
+        *dst = dot;
+    }
+    Some(true)
+}
+
+pub(super) fn lora_multi_a_f32(
+    a_weights: &[f32],
+    in_features: usize,
+    input: &[f32],
+    ranks: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if in_features == 0
+        || input.len() != in_features
+        || a_weights.len() != ranks.len().saturating_mul(in_features)
+    {
+        return Some(false);
+    }
+    for (a_row, dst) in a_weights.chunks_exact(in_features).zip(ranks.iter_mut()) {
+        let dot = dot_f32_f32_row(neon, a_row, input);
+        if !dot.is_finite() {
+            return Some(false);
+        }
+        *dst = dot;
+    }
+    Some(true)
+}
+
+pub(super) fn lora_multi_a_tokens_f16(
+    a_weights: &[u16],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if in_features == 0
+        || rank == 0
+        || a_weights.len() != rank.saturating_mul(in_features)
+        || ranks_out.len() != inputs.len().saturating_mul(rank)
+        || inputs.iter().any(|input| input.len() != in_features)
+    {
+        return Some(false);
+    }
+    for (r, a_row) in a_weights.chunks_exact(in_features).enumerate() {
+        for (t, &input) in inputs.iter().enumerate() {
+            let dot = dot_f16_f32_row(neon, a_row, input);
+            if !dot.is_finite() {
+                return Some(false);
+            }
+            ranks_out[t * rank + r] = dot;
+        }
+    }
+    Some(true)
+}
+
+pub(super) fn lora_multi_a_tokens_f32(
+    a_weights: &[f32],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if in_features == 0
+        || rank == 0
+        || a_weights.len() != rank.saturating_mul(in_features)
+        || ranks_out.len() != inputs.len().saturating_mul(rank)
+        || inputs.iter().any(|input| input.len() != in_features)
+    {
+        return Some(false);
+    }
+    for (r, a_row) in a_weights.chunks_exact(in_features).enumerate() {
+        for (t, &input) in inputs.iter().enumerate() {
+            let dot = dot_f32_f32_row(neon, a_row, input);
+            if !dot.is_finite() {
+                return Some(false);
+            }
+            ranks_out[t * rank + r] = dot;
+        }
+    }
+    Some(true)
+}
+
+pub(super) fn lora_multi_b_scale_and_finish_f16(
+    b_weights: &[u16],
+    ranks: &[f32],
+    scale: f32,
+    base_output: &[f32],
+    correction: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let rank = ranks.len();
+    if rank == 0
+        || b_weights.len() != base_output.len().saturating_mul(rank)
+        || correction.len() != base_output.len()
+    {
+        return Some(false);
+    }
+    for ((b_row, &base), dst) in b_weights
+        .chunks_exact(rank)
+        .zip(base_output)
+        .zip(correction.iter_mut())
+    {
+        let dot = dot_f16_f32_row(neon, b_row, ranks);
+        let updated = dot.mul_add(scale, base);
+        if !updated.is_finite() {
+            return Some(false);
+        }
+        *dst = updated;
+    }
+    Some(true)
+}
+
+pub(super) fn lora_multi_b_scale_and_finish_f32(
+    b_weights: &[f32],
+    ranks: &[f32],
+    scale: f32,
+    base_output: &[f32],
+    correction: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let rank = ranks.len();
+    if rank == 0
+        || b_weights.len() != base_output.len().saturating_mul(rank)
+        || correction.len() != base_output.len()
+    {
+        return Some(false);
+    }
+    for ((b_row, &base), dst) in b_weights
+        .chunks_exact(rank)
+        .zip(base_output)
+        .zip(correction.iter_mut())
+    {
+        let dot = dot_f32_f32_row(neon, b_row, ranks);
+        let updated = dot.mul_add(scale, base);
+        if !updated.is_finite() {
+            return Some(false);
+        }
+        *dst = updated;
+    }
+    Some(true)
+}
+
+pub(super) fn lora_multi_b_scale_and_finish_tokens_f16(
+    b_weights: &[u16],
+    ranks: &[f32],
+    rank: usize,
+    scale: f32,
+    base_outputs: &[&[f32]],
+    start_row: usize,
+    correction: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let n_tokens = base_outputs.len();
+    if rank == 0
+        || n_tokens == 0
+        || ranks.len() != n_tokens.saturating_mul(rank)
+        || !correction.len().is_multiple_of(n_tokens)
+        || b_weights.len() != (correction.len() / n_tokens).saturating_mul(rank)
+    {
+        return Some(false);
+    }
+    for (local_row, (b_row, corr_slots)) in b_weights
+        .chunks_exact(rank)
+        .zip(correction.chunks_exact_mut(n_tokens))
+        .enumerate()
+    {
+        let global_row = start_row + local_row;
+        for (t, (&base_slice, corr_slot)) in
+            base_outputs.iter().zip(corr_slots.iter_mut()).enumerate()
+        {
+            let tok_ranks = &ranks[t * rank..(t + 1) * rank];
+            let dot = dot_f16_f32_row(neon, b_row, tok_ranks);
+            let updated = dot.mul_add(scale, base_slice[global_row]);
+            if !updated.is_finite() {
+                return Some(false);
+            }
+            *corr_slot = updated;
+        }
+    }
+    Some(true)
+}
+
+pub(super) fn lora_multi_b_scale_and_finish_tokens_f32(
+    b_weights: &[f32],
+    ranks: &[f32],
+    rank: usize,
+    scale: f32,
+    base_outputs: &[&[f32]],
+    start_row: usize,
+    correction: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let n_tokens = base_outputs.len();
+    if rank == 0
+        || n_tokens == 0
+        || ranks.len() != n_tokens.saturating_mul(rank)
+        || !correction.len().is_multiple_of(n_tokens)
+        || b_weights.len() != (correction.len() / n_tokens).saturating_mul(rank)
+    {
+        return Some(false);
+    }
+    for (local_row, (b_row, corr_slots)) in b_weights
+        .chunks_exact(rank)
+        .zip(correction.chunks_exact_mut(n_tokens))
+        .enumerate()
+    {
+        let global_row = start_row + local_row;
+        for (t, (&base_slice, corr_slot)) in
+            base_outputs.iter().zip(corr_slots.iter_mut()).enumerate()
+        {
+            let tok_ranks = &ranks[t * rank..(t + 1) * rank];
+            let dot = dot_f32_f32_row(neon, b_row, tok_ranks);
+            let updated = dot.mul_add(scale, base_slice[global_row]);
+            if !updated.is_finite() {
+                return Some(false);
+            }
+            *corr_slot = updated;
+        }
+    }
+    Some(true)
+}
+
+#[inline]
 pub(super) fn round_f16_slice(values: &mut [f32]) -> Option<bool> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
     let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();

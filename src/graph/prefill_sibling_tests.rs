@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bonsai_gguf::MetadataValue;
 
 use super::*;
-use crate::model::Model;
+use crate::model::{Model, lora::RankOneAdapter};
 
 fn packed(name: &str, rows: usize) -> Tensor {
     let symbol = name.bytes().fold(rows.to_le_bytes()[0], |sum, byte| {
@@ -174,8 +174,7 @@ impl Fixture {
                 &self.transforms,
                 &self.geometry,
                 arithmetic,
-                Some(&self.adapter),
-                1.3,
+                ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
                 &mut adapter_scratch,
                 &mut projection,
                 previous,
@@ -199,8 +198,7 @@ impl Fixture {
                     &self.transforms,
                     &self.geometry,
                     arithmetic,
-                    Some(&self.adapter),
-                    1.3,
+                    ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
                     &mut adapter_scratch,
                     &mut projection,
                     previous,
@@ -218,8 +216,7 @@ impl Fixture {
                     &self.transforms,
                     &self.geometry,
                     arithmetic,
-                    Some(&self.adapter),
-                    1.3,
+                    ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
                     &mut adapter_scratch,
                     &mut projection,
                     previous,
@@ -240,8 +237,7 @@ impl Fixture {
                     &self.transforms,
                     &self.geometry,
                     arithmetic,
-                    Some(&self.adapter),
-                    1.3,
+                    ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
                     &mut adapter_scratch,
                     &mut projection,
                     previous,
@@ -271,8 +267,7 @@ impl Fixture {
             &self.transforms,
             &self.geometry,
             arithmetic,
-            Some(&self.adapter),
-            1.3,
+            ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
             &mut adapter_scratch,
             &mut projection,
             previous,

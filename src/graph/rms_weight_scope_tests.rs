@@ -156,8 +156,7 @@ fn recurrent_rms_weight_scope_integrates_worker_heads_and_recovers_failed_layer_
                 mrope_positions: [0; 4],
                 frequencies_ready: false,
                 projection: &mut projection,
-                adapter: None,
-                adapter_scale: 0.0,
+                adapters: super::ActiveAdapters::default(),
                 adapter_scratch: &mut adapter,
                 executor: None,
             };

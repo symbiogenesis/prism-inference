@@ -21,7 +21,7 @@ use crate::kernels::{
     rms_norm_into, rms_norm_pinned_into, round_f16_slice, row, row_into, scale_slice_into, silu,
     softmax_round_f16,
 };
-use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
+use crate::model::lora::{MultiRankAdapter, RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
 use crate::{Decoder, Result, invalid};
 
@@ -1514,6 +1514,93 @@ struct Workspace {
     deltas: Vec<LayerDelta>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct ActiveAdapters<'a> {
+    pub(super) rank_one: Option<&'a RankOneAdapter>,
+    pub(super) rank_one_scale: f32,
+    pub(super) multi_rank: Option<&'a MultiRankAdapter>,
+    pub(super) multi_rank_scale: f32,
+}
+
+impl ActiveAdapters<'_> {
+    #[cfg(test)]
+    pub(super) const fn rank_one(
+        adapter: Option<&RankOneAdapter>,
+        scale: f32,
+    ) -> ActiveAdapters<'_> {
+        ActiveAdapters {
+            rank_one: adapter,
+            rank_one_scale: scale,
+            multi_rank: None,
+            multi_rank_scale: 0.0,
+        }
+    }
+
+    pub(super) const fn is_any_loaded(self) -> bool {
+        self.rank_one.is_some() || self.multi_rank.is_some()
+    }
+
+    pub(super) fn has_target(self, target: &str) -> bool {
+        self.rank_one
+            .is_some_and(|adapter| adapter.targets().any(|name| name == target))
+            || self
+                .multi_rank
+                .is_some_and(|adapter| adapter.has_target(target))
+    }
+
+    pub(super) fn affects_rank_one_any(self, tensors: &[&Tensor]) -> bool {
+        self.rank_one.is_some_and(|adapter| {
+            tensors
+                .iter()
+                .any(|tensor| adapter.affects_linear(&tensor.name, self.rank_one_scale))
+        })
+    }
+
+    pub(super) fn affects_multi_rank_any(self, tensors: &[&Tensor]) -> bool {
+        self.multi_rank.is_some_and(|adapter| {
+            tensors
+                .iter()
+                .any(|tensor| adapter.affects_linear(&tensor.name, self.multi_rank_scale))
+        })
+    }
+
+    pub(super) fn affects_any(self, tensors: &[&Tensor]) -> bool {
+        self.affects_rank_one_any(tensors) || self.affects_multi_rank_any(tensors)
+    }
+
+    pub(super) fn apply_linear(
+        self,
+        target: &str,
+        input: &[f32],
+        output: &mut [f32],
+        scratch: &mut AdapterScratch,
+    ) -> Result<()> {
+        if let Some(adapter) = self.rank_one {
+            adapter.linear(target, input, self.rank_one_scale, output, scratch)?;
+        }
+        if let Some(adapter) = self.multi_rank {
+            adapter.linear(target, input, self.multi_rank_scale, output, scratch)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_linear_tokens(
+        self,
+        target: &str,
+        inputs: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+        scratch: &mut AdapterScratch,
+    ) -> Result<()> {
+        if let Some(adapter) = self.rank_one {
+            adapter.linear_tokens(target, inputs, self.rank_one_scale, outputs, scratch)?;
+        }
+        if let Some(adapter) = self.multi_rank {
+            adapter.linear_tokens(target, inputs, self.multi_rank_scale, outputs, scratch)?;
+        }
+        Ok(())
+    }
+}
+
 struct Evaluation<'a, 'executor> {
     geometry: &'a Geometry,
     arithmetic: Arithmetic,
@@ -1522,8 +1609,7 @@ struct Evaluation<'a, 'executor> {
     mrope_positions: [usize; 4],
     frequencies_ready: bool,
     projection: &'a mut ProjectionScratch,
-    adapter: Option<&'a RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'a>,
     adapter_scratch: &'a mut AdapterScratch,
     executor: Option<&'executor mut dyn crate::kernels::Pq2ProjectionExecutor>,
 }
@@ -2216,6 +2302,8 @@ pub struct Qwen35 {
     transforms: Transforms,
     adapter: Option<RankOneAdapter>,
     adapter_scale: f32,
+    multi_rank_adapter: Option<MultiRankAdapter>,
+    multi_rank_adapter_scale: f32,
     layers: Vec<Layer>,
     state: Vec<LayerState>,
     workspace: Workspace,
@@ -2433,11 +2521,159 @@ impl Qwen35 {
         Ok(graph)
     }
 
+    /// Constructs a decoder with optional stacked rank-one and multi-rank adapters and an explicit KV cache policy.
+    ///
+    /// # Errors
+    /// Rejects invalid scales, mismatched adapter base identities, disallowed or
+    /// out-of-graph adapter targets, invalid KV policies, and model loading errors.
+    pub fn with_adapters_and_kv(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        rank_one_adapter: Option<(RankOneAdapter, f32)>,
+        multi_rank_adapter: Option<(MultiRankAdapter, f32)>,
+        kv_cache_policy: KvCachePolicy,
+    ) -> Result<Self> {
+        Self::with_adapters_and_kv_scope(
+            model,
+            context_limit,
+            state_budget_bytes,
+            backend,
+            rank_one_adapter,
+            multi_rank_adapter,
+            kv_cache_policy,
+            false,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Private construction preserves explicit dual-adapter contracts and full-state scope."
+    )]
+    fn with_adapters_and_kv_scope(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        rank_one_adapter: Option<(RankOneAdapter, f32)>,
+        multi_rank_adapter: Option<(MultiRankAdapter, f32)>,
+        kv_cache_policy: KvCachePolicy,
+        swift_full_state: bool,
+    ) -> Result<Self> {
+        if let Some((adapter, scale)) = &rank_one_adapter {
+            RankOneAdapter::validate_scale(*scale)?;
+            if adapter.base_identity() != model.identity {
+                return Err(invalid("rank-one adapter belongs to another base model"));
+            }
+        }
+        if let Some((adapter, scale)) = &multi_rank_adapter {
+            MultiRankAdapter::validate_scale(*scale)?;
+            if adapter.base_identity() != model.identity {
+                return Err(invalid("multi-rank adapter belongs to another base model"));
+            }
+        }
+        let mut graph = Self::with_state_budget_and_kv_scope(
+            model,
+            context_limit,
+            state_budget_bytes,
+            backend,
+            kv_cache_policy,
+            swift_full_state,
+        )?;
+        if let Some((adapter, scale)) = rank_one_adapter {
+            for target in adapter.targets() {
+                if target == graph.embedding.name && graph.output.name == graph.embedding.name {
+                    return Err(invalid(
+                        "rank-one embedding adapter requires a separate output head",
+                    ));
+                }
+                if target != graph.embedding.name
+                    && !graph.layers.iter().any(|layer| {
+                        target == layer.down.name
+                            || target
+                                == match &layer.attention {
+                                    Attention::Full(weights) => &weights.output.name,
+                                    Attention::Recurrent(weights) => &weights.output.name,
+                                }
+                    })
+                {
+                    return Err(invalid("rank-one adapter target is outside the live graph"));
+                }
+            }
+            write!(
+                graph.identity,
+                ":rank-one-lora-v1:{}:{:08x}",
+                adapter.execution_identity(),
+                scale.to_bits()
+            )?;
+            graph.adapter = Some(adapter);
+            graph.adapter_scale = scale;
+        }
+        if let Some((adapter, scale)) = multi_rank_adapter {
+            let normalized = MultiRankAdapter::normalize_scale(scale);
+            for target in adapter.targets() {
+                let in_graph = graph.layers.iter().any(|layer| {
+                    target == layer.down.name
+                        || target == layer.gate.name
+                        || target == layer.up.name
+                        || match &layer.attention {
+                            Attention::Full(weights) => {
+                                target == weights.query.name
+                                    || target == weights.key.name
+                                    || target == weights.value.name
+                                    || target == weights.output.name
+                            }
+                            Attention::Recurrent(weights) => {
+                                target == weights.qkv.name
+                                    || target == weights.gate.name
+                                    || target == weights.beta.name
+                                    || target == weights.alpha.name
+                            }
+                        }
+                });
+                if !in_graph {
+                    return Err(invalid(
+                        "multi-rank adapter target is outside the supported live graph",
+                    ));
+                }
+            }
+            write!(
+                graph.identity,
+                ":multi-rank-lora-v1:{}:{:08x}",
+                adapter.execution_identity(),
+                normalized.to_bits()
+            )?;
+            graph.multi_rank_adapter = Some(adapter);
+            graph.multi_rank_adapter_scale = normalized;
+        }
+        Ok(graph)
+    }
+
+    const fn adapters(&self) -> ActiveAdapters<'_> {
+        ActiveAdapters {
+            rank_one: self.adapter.as_ref(),
+            rank_one_scale: self.adapter_scale,
+            multi_rank: self.multi_rank_adapter.as_ref(),
+            multi_rank_scale: self.multi_rank_adapter_scale,
+        }
+    }
+
     /// Current rank-one correction scale, or `None` when no adapter is loaded.
     #[must_use]
     pub const fn adapter_scale(&self) -> Option<f32> {
         if self.adapter.is_some() {
             Some(self.adapter_scale)
+        } else {
+            None
+        }
+    }
+
+    /// Current multi-rank correction scale, or `None` when no multi-rank adapter is loaded.
+    #[must_use]
+    pub const fn multi_rank_adapter_scale(&self) -> Option<f32> {
+        if self.multi_rank_adapter.is_some() {
+            Some(self.multi_rank_adapter_scale)
         } else {
             None
         }
@@ -2454,29 +2690,107 @@ impl Qwen35 {
     /// Rejects a graph without an adapter, scales outside finite 0..2, malformed
     /// graph identity and allocation failure while preparing the new identity.
     pub fn reset_with_adapter_scale(&mut self, scale: f32) -> Result<()> {
-        RankOneAdapter::validate_scale(scale)?;
-        let adapter = self
+        if self.adapter.is_none() {
+            return Err(invalid("adapter scale requires a loaded rank-one adapter"));
+        }
+        let multi_rank_scale = self
+            .multi_rank_adapter
+            .is_some()
+            .then_some(self.multi_rank_adapter_scale);
+        self.reset_with_adapter_scales(Some(scale), multi_rank_scale)
+    }
+
+    /// Clears all live state and atomically updates active rank-one and multi-rank adapter scales.
+    ///
+    /// Preserves loaded weights/factors and renews checkpoint provenance so prior
+    /// checkpoints cannot be restored across any adapter-scale transition.
+    ///
+    /// # Errors
+    /// Rejects scale arguments that do not match the loaded adapter set, scales
+    /// outside finite `0..=2`, malformed graph identity, or allocation failures.
+    pub fn reset_with_adapter_scales(
+        &mut self,
+        rank_one_scale: Option<f32>,
+        multi_rank_scale: Option<f32>,
+    ) -> Result<()> {
+        if self.adapter.is_none() && self.multi_rank_adapter.is_none() {
+            return Err(invalid("adapter scale requires at least one loaded adapter"));
+        }
+        let resolved_r1 = match (&self.adapter, rank_one_scale) {
+            (Some(_), Some(scale)) => {
+                RankOneAdapter::validate_scale(scale)?;
+                Some(scale)
+            }
+            (Some(_), None) => {
+                return Err(invalid("rank-one adapter requires a rank-one scale"));
+            }
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(invalid("rank-one scale provided without a rank-one adapter"));
+            }
+        };
+        let resolved_mr = match (&self.multi_rank_adapter, multi_rank_scale) {
+            (Some(_), Some(scale)) => {
+                MultiRankAdapter::validate_scale(scale)?;
+                Some(MultiRankAdapter::normalize_scale(scale))
+            }
+            (Some(_), None) => {
+                return Err(invalid("multi-rank adapter requires a multi-rank scale"));
+            }
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(invalid("multi-rank scale provided without a multi-rank adapter"));
+            }
+        };
+
+        let base_identity = if self.adapter.is_some() {
+            self.identity
+                .split_once(":rank-one-lora-v1:")
+                .ok_or_else(|| invalid("rank-one graph identity is missing its adapter contract"))?
+                .0
+        } else {
+            self.identity
+                .split_once(":multi-rank-lora-v1:")
+                .ok_or_else(|| invalid("multi-rank graph identity is missing its adapter contract"))?
+                .0
+        };
+        let r1_extra = self
             .adapter
             .as_ref()
-            .ok_or_else(|| invalid("adapter scale requires a loaded rank-one adapter"))?;
-        let (base_identity, _) = self
-            .identity
-            .rsplit_once(":rank-one-lora-v1:")
-            .ok_or_else(|| invalid("rank-one graph identity is missing its adapter contract"))?;
+            .map_or(0, |adapter| adapter.execution_identity().len() + 32);
+        let mr_extra = self
+            .multi_rank_adapter
+            .as_ref()
+            .map_or(0, |adapter| adapter.execution_identity().len() + 32);
         let mut identity = String::new();
-        identity
-            .try_reserve_exact(base_identity.len() + adapter.execution_identity().len() + 32)?;
-        write!(
-            identity,
-            "{base_identity}:rank-one-lora-v1:{}:{:08x}",
-            adapter.execution_identity(),
-            scale.to_bits()
-        )?;
+        identity.try_reserve_exact(base_identity.len() + r1_extra + mr_extra)?;
+        identity.push_str(base_identity);
+        if let (Some(adapter), Some(scale)) = (&self.adapter, resolved_r1) {
+            write!(
+                identity,
+                ":rank-one-lora-v1:{}:{:08x}",
+                adapter.execution_identity(),
+                scale.to_bits()
+            )?;
+        }
+        if let (Some(adapter), Some(scale)) = (&self.multi_rank_adapter, resolved_mr) {
+            write!(
+                identity,
+                ":multi-rank-lora-v1:{}:{:08x}",
+                adapter.execution_identity(),
+                scale.to_bits()
+            )?;
+        }
         self.append_tiled_prefill_identity(&mut identity)?;
         let provenance = Arc::new(());
         self.reset()?;
         self.identity = identity;
-        self.adapter_scale = scale;
+        if let Some(scale) = resolved_r1 {
+            self.adapter_scale = scale;
+        }
+        if let Some(scale) = resolved_mr {
+            self.multi_rank_adapter_scale = scale;
+        }
         self.provenance = provenance;
         Ok(())
     }
@@ -2548,14 +2862,34 @@ impl Qwen35 {
         kv_cache_policy: KvCachePolicy,
         adapter: Option<RankOneAdapter>,
     ) -> Result<Self> {
-        if let Some(adapter) = adapter {
-            Self::with_rank_one_adapter_and_kv_scope(
+        Self::with_state_budget_and_adapters_scope(
+            model,
+            context_limit,
+            state_budget_bytes,
+            backend,
+            kv_cache_policy,
+            adapter.map(|item| (item, 1.3)),
+            None,
+        )
+    }
+
+    pub(crate) fn with_state_budget_and_adapters_scope(
+        model: Model,
+        context_limit: usize,
+        state_budget_bytes: usize,
+        backend: MatvecBackend,
+        kv_cache_policy: KvCachePolicy,
+        rank_one_adapter: Option<(RankOneAdapter, f32)>,
+        multi_rank_adapter: Option<(MultiRankAdapter, f32)>,
+    ) -> Result<Self> {
+        if rank_one_adapter.is_some() || multi_rank_adapter.is_some() {
+            Self::with_adapters_and_kv_scope(
                 model,
                 context_limit,
                 state_budget_bytes,
                 backend,
-                adapter,
-                1.3,
+                rank_one_adapter,
+                multi_rank_adapter,
                 kv_cache_policy,
                 true,
             )
@@ -2957,6 +3291,8 @@ impl Qwen35 {
             transforms,
             adapter: None,
             adapter_scale: 0.0,
+            multi_rank_adapter: None,
+            multi_rank_adapter_scale: 0.0,
             layers,
             state,
             workspace: Workspace {
@@ -3447,6 +3783,12 @@ impl Qwen35 {
         mrope_positions: [usize; 4],
         mrope_advance: usize,
     ) -> Result<()> {
+        let adapters = ActiveAdapters {
+            rank_one: self.adapter.as_ref(),
+            rank_one_scale: self.adapter_scale,
+            multi_rank: self.multi_rank_adapter.as_ref(),
+            multi_rank_scale: self.multi_rank_adapter_scale,
+        };
         let Workspace {
             hidden,
             normalized,
@@ -3464,8 +3806,7 @@ impl Qwen35 {
             mrope_positions,
             frequencies_ready: false,
             projection,
-            adapter: self.adapter.as_ref(),
-            adapter_scale: self.adapter_scale,
+            adapters,
             adapter_scratch,
             executor,
         };
@@ -3680,21 +4021,9 @@ impl Qwen35 {
     }
 }
 
-pub(super) fn adapter_affects_any(
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
-    tensors: &[&Tensor],
-) -> bool {
-    adapter.is_some_and(|adapter| {
-        tensors
-            .iter()
-            .any(|tensor| adapter.affects_linear(&tensor.name, adapter_scale))
-    })
-}
-
 impl Evaluation<'_, '_> {
     fn adapter_affects_any(&self, tensors: &[&Tensor]) -> bool {
-        adapter_affects_any(self.adapter, self.adapter_scale, tensors)
+        self.adapters.affects_any(tensors)
     }
 
     fn project_group_into<const N: usize>(
@@ -3712,12 +4041,11 @@ impl Evaluation<'_, '_> {
                 self.projection,
                 &mut self.executor,
             )?;
-            if let Some(adapter) = self.adapter {
+            if self.adapters.is_any_loaded() {
                 for (tensor, output) in tensors.into_iter().zip(&mut outputs) {
-                    adapter.linear(
+                    self.adapters.apply_linear(
                         &tensor.name,
                         input,
-                        self.adapter_scale,
                         output,
                         self.adapter_scratch,
                     )?;
@@ -3839,13 +4167,14 @@ impl Evaluation<'_, '_> {
         };
         let tensors = [gate_weight, up_weight, down_weight];
         if self.adapter_affects_any(&[gate_weight, up_weight])
+            || self.adapters.affects_multi_rank_any(&[down_weight])
             || self.transforms.basis(gate_weight) != self.transforms.basis(up_weight)
         {
             return Ok(false);
         }
-        let down_lora = if self.adapter_affects_any(&[down_weight]) {
-            let Some(factor) = self.adapter.and_then(|adapter| {
-                adapter.dense_rank_one_factor(&down_weight.name, Some(self.adapter_scale))
+        let down_lora = if self.adapters.affects_rank_one_any(&[down_weight]) {
+            let Some(factor) = self.adapters.rank_one.and_then(|adapter| {
+                adapter.dense_rank_one_factor(&down_weight.name, Some(self.adapters.rank_one_scale))
             }) else {
                 return Ok(false);
             };
@@ -3984,7 +4313,7 @@ impl Evaluation<'_, '_> {
             }
         }
         self.project_group_into([up_weight, gate_weight], input, [up, gate])?;
-        if self.adapter.is_some()
+        if self.adapters.is_any_loaded()
             && self.transforms.basis(down_weight) == (true, false)
             && self.transforms.can_block_hadamard(up.len())
             && down_weight.dimensions.first().copied() == Some(up.len())
@@ -4003,7 +4332,7 @@ impl Evaluation<'_, '_> {
             self.projection.pre_transformed_len = Some(up.len());
             return Ok(());
         }
-        if self.adapter.is_none()
+        if !self.adapters.is_any_loaded()
             && self.transforms.basis(down_weight) == (true, false)
             && self.transforms.can_block_hadamard(up.len())
             && down_weight.dimensions.first().copied() == Some(up.len())
@@ -6908,8 +7237,7 @@ mod tests {
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
-            adapter: None,
-            adapter_scale: 0.0,
+            adapters: super::ActiveAdapters::default(),
             adapter_scratch: &mut adapter,
             executor: None,
         };
@@ -7090,8 +7418,7 @@ mod tests {
                     mrope_positions: [history_tokens, history_tokens, history_tokens, 0],
                     frequencies_ready: false,
                     projection: &mut projection,
-                    adapter: None,
-                    adapter_scale: 0.0,
+                    adapters: super::ActiveAdapters::default(),
                     adapter_scratch: &mut adapter,
                     executor: None,
                 };

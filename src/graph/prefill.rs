@@ -3,10 +3,10 @@
 use std::fmt::Write as _;
 
 use super::{
-    Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, LayerDelta, LayerState,
-    Qwen35, RecurrentAttention, Transforms, adapter_affects_any, add, add_finite, attention_gate,
-    checked_product, finite, l2_norm, recurrent_decay, resize_attention_scores, resize_into,
-    rope_frequencies, row_into, sigmoid, small_float,
+    ActiveAdapters, Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache,
+    LayerDelta, LayerState, Qwen35, RecurrentAttention, Transforms, add, add_finite,
+    attention_gate, checked_product, finite, l2_norm, recurrent_decay, resize_attention_scores,
+    resize_into, rope_frequencies, row_into, sigmoid, small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
@@ -14,7 +14,7 @@ use crate::kernels::{
     round_f16_slice,
 };
 use crate::model::Tensor;
-use crate::model::lora::{RankOneAdapter, Scratch as AdapterScratch};
+use crate::model::lora::Scratch as AdapterScratch;
 use crate::{MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
 
 #[path = "prefill_gdn.rs"]
@@ -612,6 +612,12 @@ impl Qwen35 {
         // Mark live state inconsistent before any layer-major mutation so any
         // mid-tile error or cancellation leaves state unavailable until explicit
         // reset or restore, and keep `position` at the last committed prefix.
+        let adapters = ActiveAdapters {
+            rank_one: self.adapter.as_ref(),
+            rank_one_scale: self.adapter_scale,
+            multi_rank: self.multi_rank_adapter.as_ref(),
+            multi_rank_scale: self.multi_rank_adapter_scale,
+        };
         self.state_consistent = false;
         let mut frequencies_ready = false;
         let total_layers = self.layers.len();
@@ -651,8 +657,7 @@ impl Qwen35 {
                             &self.geometry,
                             self.arithmetic,
                             &self.transforms,
-                            self.adapter.as_ref(),
-                            self.adapter_scale,
+                            adapters,
                             &mut self.workspace.adapter,
                             &mut self.workspace.projection.matvec,
                             norm_reuse,
@@ -668,8 +673,7 @@ impl Qwen35 {
                             &self.transforms,
                             &self.geometry,
                             self.arithmetic,
-                            self.adapter.as_ref(),
-                            self.adapter_scale,
+                            adapters,
                             &mut self.workspace.adapter,
                             &mut self.workspace.projection.matvec,
                             norm_reuse,
@@ -709,8 +713,7 @@ impl Qwen35 {
                         &self.geometry,
                         self.arithmetic,
                         &self.transforms,
-                        self.adapter.as_ref(),
-                        self.adapter_scale,
+                        adapters,
                         &mut self.workspace.adapter,
                         &mut self.workspace.projection.matvec,
                         norm_reuse,
@@ -726,8 +729,7 @@ impl Qwen35 {
                         &self.transforms,
                         &self.geometry,
                         self.arithmetic,
-                        self.adapter.as_ref(),
-                        self.adapter_scale,
+                        adapters,
                         &mut self.workspace.adapter,
                         &mut self.workspace.projection.matvec,
                         norm_reuse,
@@ -753,8 +755,7 @@ impl Qwen35 {
                         keys,
                         values,
                         &mut self.workspace.projection,
-                        self.adapter.as_ref(),
-                        self.adapter_scale,
+                        adapters,
                         &mut self.workspace.adapter,
                         &mut self.workspace.attention_scratch,
                         tile,
@@ -765,8 +766,7 @@ impl Qwen35 {
                         &self.transforms,
                         &self.geometry,
                         self.arithmetic,
-                        self.adapter.as_ref(),
-                        self.adapter_scale,
+                        adapters,
                         &mut self.workspace.adapter,
                         &mut self.workspace.projection.matvec,
                         TileReuse::default(),
@@ -801,8 +801,7 @@ impl Qwen35 {
                 &self.transforms,
                 &self.geometry,
                 self.arithmetic,
-                self.adapter.as_ref(),
-                self.adapter_scale,
+                adapters,
                 post_norm_reuse,
                 [&layer.gate, &layer.up, &layer.down],
                 &tile.normalized[..count],
@@ -825,8 +824,7 @@ impl Qwen35 {
                     &self.transforms,
                     &self.geometry,
                     self.arithmetic,
-                    self.adapter.as_ref(),
-                    self.adapter_scale,
+                    adapters,
                     &mut self.workspace.adapter,
                     &mut self.workspace.projection.matvec,
                     post_norm_reuse,
@@ -846,8 +844,7 @@ impl Qwen35 {
                     &self.transforms,
                     &self.geometry,
                     self.arithmetic,
-                    self.adapter.as_ref(),
-                    self.adapter_scale,
+                    adapters,
                     &mut self.workspace.adapter,
                     &mut self.workspace.projection.matvec,
                     ffn_reuse,
@@ -885,8 +882,7 @@ impl Qwen35 {
                 &self.transforms,
                 &self.geometry,
                 self.arithmetic,
-                self.adapter.as_ref(),
-                self.adapter_scale,
+                adapters,
                 &mut self.workspace.adapter,
                 &mut self.workspace.projection.matvec,
                 reuse,
@@ -984,8 +980,7 @@ fn recurrent_state_only_tile<'a>(
     geometry: &Geometry,
     arithmetic: Arithmetic,
     transforms: &Transforms,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'_>,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
     previous_norm: TileReuse<'a>,
@@ -1012,8 +1007,7 @@ fn recurrent_state_only_tile<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         previous_norm,
@@ -1030,8 +1024,7 @@ fn recurrent_state_only_tile<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         previous_qkv,
@@ -1214,8 +1207,7 @@ fn full_attention_tile(
     keys: &mut KvCache,
     values: &mut KvCache,
     projection: &mut super::ProjectionScratch,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'_>,
     adapter_scratch: &mut AdapterScratch,
     attention_scratch: &mut super::AttentionScratch,
     tile: &mut TiledPrefill,
@@ -1253,8 +1245,7 @@ fn full_attention_tile(
                 ],
                 frequencies_ready: true,
                 projection,
-                adapter,
-                adapter_scale,
+                adapters,
                 adapter_scratch,
                 executor: None,
             };
@@ -2280,8 +2271,7 @@ fn project_tile_pair<'a>(
     transforms: &Transforms,
     geometry: &Geometry,
     arithmetic: Arithmetic,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'_>,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
     previous: TileReuse<'a>,
@@ -2335,18 +2325,16 @@ fn project_tile_pair<'a>(
             finite(out_a, "projection executor output")?;
             finite(out_b, "projection executor output")?;
         }
-        if let Some(adapter) = adapter {
-            adapter.linear_tokens(
+        if adapters.is_any_loaded() {
+            adapters.apply_linear_tokens(
                 &tensors[0].name,
                 inputs,
-                adapter_scale,
                 outputs_a,
                 adapter_scratch,
             )?;
-            adapter.linear_tokens(
+            adapters.apply_linear_tokens(
                 &tensors[1].name,
                 inputs,
-                adapter_scale,
                 outputs_b,
                 adapter_scratch,
             )?;
@@ -2359,7 +2347,7 @@ fn project_tile_pair<'a>(
     // Untargeted adapter calls are guaranteed no-ops. Targeted siblings keep
     // sequential base/adapter order, including their original error precedence.
     if executor.is_none()
-        && !adapter_affects_any(adapter, adapter_scale, &tensors)
+        && !adapters.affects_any(&tensors)
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && ProjectionTile::supports_siblings(&tensors)
     {
@@ -2395,8 +2383,7 @@ fn project_tile_pair<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         previous,
@@ -2413,8 +2400,7 @@ fn project_tile_pair<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         reuse,
@@ -2436,8 +2422,7 @@ fn try_project_tile_ffn_chain(
     transforms: &Transforms,
     geometry: &Geometry,
     arithmetic: Arithmetic,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'_>,
     previous: TileReuse<'_>,
     tensors: [&Tensor; 3],
     inputs: &[Vec<f32>],
@@ -2452,7 +2437,7 @@ fn try_project_tile_ffn_chain(
     let Some(hadamard_block) = transforms.ffn_chain_hadamard_block_for(down) else {
         return Ok(false);
     };
-    if adapter_affects_any(adapter, adapter_scale, &tensors)
+    if adapters.affects_any(&tensors)
         || gate.kind != 142
         || up.kind != 142
         || down.kind != 142
@@ -2509,8 +2494,7 @@ fn project_tile_ffn_swiglu<'a>(
     transforms: &Transforms,
     geometry: &Geometry,
     arithmetic: Arithmetic,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'_>,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
     previous: TileReuse<'a>,
@@ -2525,7 +2509,7 @@ fn project_tile_ffn_swiglu<'a>(
     mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
-    if !adapter_affects_any(adapter, adapter_scale, &[gate, up])
+    if !adapters.affects_any(&[gate, up])
         && let Some(exec) = reborrow_executor(&mut executor)
         && gate.kind == 142
         && up.kind == 142
@@ -2568,8 +2552,7 @@ fn project_tile_ffn_swiglu<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         previous,
@@ -2584,7 +2567,7 @@ fn project_tile_ffn_swiglu<'a>(
     )?;
     let count = inputs.len();
     let up_len = up_outputs.first().map_or(0, Vec::len);
-    if adapter.is_some()
+    if adapters.is_any_loaded()
         && up_len > 0
         && transforms.basis(down) == (true, false)
         && transforms.can_block_hadamard(up_len)
@@ -2635,7 +2618,7 @@ fn project_tile_ffn_swiglu<'a>(
             prepared: None,
         });
     }
-    if adapter.is_none()
+    if !adapters.is_any_loaded()
         && up_len > 0
         && transforms.basis(down) == (true, false)
         && transforms.can_block_hadamard(up_len)
@@ -2729,8 +2712,7 @@ fn project_tile_triple<'a>(
     transforms: &Transforms,
     geometry: &Geometry,
     arithmetic: Arithmetic,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'_>,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
     previous: TileReuse<'a>,
@@ -2794,16 +2776,15 @@ fn project_tile_triple<'a>(
             finite(out_b, "projection executor output")?;
             finite(out_c, "projection executor output")?;
         }
-        if let Some(adapter) = adapter {
+        if adapters.is_any_loaded() {
             for (tensor, outputs) in [
                 (tensors[0], &mut *outputs_a),
                 (tensors[1], &mut *outputs_b),
                 (tensors[2], &mut *outputs_c),
             ] {
-                adapter.linear_tokens(
+                adapters.apply_linear_tokens(
                     &tensor.name,
                     inputs,
-                    adapter_scale,
                     outputs,
                     adapter_scratch,
                 )?;
@@ -2817,7 +2798,7 @@ fn project_tile_triple<'a>(
     // Untargeted adapter calls are guaranteed no-ops. Targeted siblings keep
     // sequential base/adapter order, including their original error precedence.
     if executor.is_none()
-        && !adapter_affects_any(adapter, adapter_scale, &tensors)
+        && !adapters.affects_any(&tensors)
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && transforms.basis(tensors[0]) == transforms.basis(tensors[2])
         && ProjectionTile::supports_siblings(&tensors)
@@ -2854,8 +2835,7 @@ fn project_tile_triple<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         previous,
@@ -2873,8 +2853,7 @@ fn project_tile_triple<'a>(
         transforms,
         geometry,
         arithmetic,
-        adapter,
-        adapter_scale,
+        adapters,
         adapter_scratch,
         projection_scratch,
         reuse,
@@ -2896,8 +2875,7 @@ fn project_tile<'a>(
     transforms: &Transforms,
     geometry: &Geometry,
     arithmetic: Arithmetic,
-    adapter: Option<&RankOneAdapter>,
-    adapter_scale: f32,
+    adapters: ActiveAdapters<'_>,
     adapter_scratch: &mut AdapterScratch,
     projection_scratch: &mut crate::kernels::MatvecScratch,
     previous: TileReuse<'a>,
@@ -2980,11 +2958,10 @@ fn project_tile<'a>(
         )?;
         Some(tensor)
     };
-    if let Some(adapter) = adapter {
-        adapter.linear_tokens(
+    if adapters.is_any_loaded() {
+        adapters.apply_linear_tokens(
             &tensor.name,
             inputs,
-            adapter_scale,
             outputs,
             adapter_scratch,
         )?;

@@ -4550,7 +4550,10 @@ fn check_lora_multi_b_dims(
     }
     if rank == 0
         || out_features == 0
-        || weights_len != out_features.checked_mul(rank).ok_or_else(|| invalid("multi-rank LoRA B size overflow"))?
+        || weights_len
+            != out_features
+                .checked_mul(rank)
+                .ok_or_else(|| invalid("multi-rank LoRA B size overflow"))?
     {
         return Err(invalid("multi-rank LoRA B weight dimension mismatch"));
     }
@@ -4596,7 +4599,8 @@ fn lora_multi_a_impl<W: MultiLoraScalarWeight>(
         }
         Ok(())
     };
-    let result = if a_weights.len() >= MULTI_A_PARALLEL_ELEM_THRESHOLD && parallelism.workers() > 1 {
+    let result = if a_weights.len() >= MULTI_A_PARALLEL_ELEM_THRESHOLD && parallelism.workers() > 1
+    {
         parallelism.update_chunks(&mut ranks_out[..rank], 1, run_chunk)
     } else {
         run_chunk(0, &mut ranks_out[..rank])
@@ -4619,7 +4623,10 @@ fn lora_multi_a_tokens_impl<W: MultiLoraScalarWeight>(
     if rank == 0
         || inputs.is_empty()
         || in_features == 0
-        || a_weights.len() != rank.checked_mul(in_features).ok_or_else(|| invalid("multi-rank LoRA A size overflow"))?
+        || a_weights.len()
+            != rank
+                .checked_mul(in_features)
+                .ok_or_else(|| invalid("multi-rank LoRA A size overflow"))?
         || inputs.iter().any(|input| input.len() != in_features)
     {
         return Err(invalid("multi-rank LoRA A batch dimension mismatch"));
@@ -4651,7 +4658,10 @@ fn lora_multi_a_tokens_impl<W: MultiLoraScalarWeight>(
         Ok(())
     };
     let work = a_weights.len().saturating_mul(inputs.len());
-    let result = if inputs.len() >= 4 && work >= MULTI_A_PARALLEL_ELEM_THRESHOLD && parallelism.workers() > 1 {
+    let result = if inputs.len() >= 4
+        && work >= MULTI_A_PARALLEL_ELEM_THRESHOLD
+        && parallelism.workers() > 1
+    {
         parallelism.update_chunks(&mut ranks_out[..needed], rank, run_token_chunk)
     } else {
         run_token_chunk(0, &mut ranks_out[..needed])
@@ -4733,7 +4743,10 @@ fn lora_multi_b_tokens_impl<W: MultiLoraScalarWeight>(
     }
     let out_features = outputs[0].len();
     check_lora_multi_b_dims(b_weights.len(), rank, out_features, scale)?;
-    if ranks.len() != n_tokens.checked_mul(rank).ok_or_else(|| invalid("multi-rank LoRA rank slice overflow"))?
+    if ranks.len()
+        != n_tokens
+            .checked_mul(rank)
+            .ok_or_else(|| invalid("multi-rank LoRA rank slice overflow"))?
         || outputs.iter().any(|out| out.len() != out_features)
     {
         return Err(invalid("multi-rank LoRA B token batch dimension mismatch"));
@@ -4744,8 +4757,7 @@ fn lora_multi_b_tokens_impl<W: MultiLoraScalarWeight>(
     reserve_f32_scratch(correction, needed)?;
 
     let result = {
-        let mut stack_slices: [&[f32]; prefill::MAX_TILE_TOKENS] =
-            [&[]; prefill::MAX_TILE_TOKENS];
+        let mut stack_slices: [&[f32]; prefill::MAX_TILE_TOKENS] = [&[]; prefill::MAX_TILE_TOKENS];
         let mut heap_slices = Vec::new();
         let base_outputs: &[&[f32]] = if n_tokens <= prefill::MAX_TILE_TOKENS {
             for (slot, out) in stack_slices[..n_tokens].iter_mut().zip(outputs.iter()) {
@@ -4816,7 +4828,10 @@ fn lora_multi_b_tokens_impl<W: MultiLoraScalarWeight>(
     result
 }
 
-#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+#[allow(
+    unused_variables,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+)]
 fn neon_multi_a_f16(
     a_weights: &[u16],
     in_features: usize,
@@ -4843,7 +4858,10 @@ fn neon_multi_a_f16(
     None
 }
 
-#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+#[allow(
+    unused_variables,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+)]
 fn neon_multi_a_f32(
     a_weights: &[f32],
     in_features: usize,
@@ -4870,7 +4888,10 @@ fn neon_multi_a_f32(
     None
 }
 
-#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+#[allow(
+    unused_variables,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+)]
 fn neon_multi_a_tokens_f16(
     a_weights: &[u16],
     in_features: usize,
@@ -4898,7 +4919,10 @@ fn neon_multi_a_tokens_f16(
     None
 }
 
-#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+#[allow(
+    unused_variables,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+)]
 fn neon_multi_a_tokens_f32(
     a_weights: &[f32],
     in_features: usize,
@@ -4926,7 +4950,10 @@ fn neon_multi_a_tokens_f32(
     None
 }
 
-#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+#[allow(
+    unused_variables,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+)]
 fn neon_multi_b_f16(
     b_weights: &[u16],
     ranks: &[f32],
@@ -4954,7 +4981,10 @@ fn neon_multi_b_f16(
     None
 }
 
-#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+#[allow(
+    unused_variables,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+)]
 fn neon_multi_b_f32(
     b_weights: &[f32],
     ranks: &[f32],
@@ -4982,7 +5012,10 @@ fn neon_multi_b_f32(
     None
 }
 
-#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+#[allow(
+    unused_variables,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+)]
 fn neon_multi_b_tokens_f16(
     b_weights: &[u16],
     ranks: &[f32],
@@ -5020,7 +5053,10 @@ fn neon_multi_b_tokens_f16(
     None
 }
 
-#[allow(unused_variables, reason = "Parameters are consumed only on AArch64 Windows MSVC NEON.")]
+#[allow(
+    unused_variables,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+)]
 fn neon_multi_b_tokens_f32(
     b_weights: &[f32],
     ranks: &[f32],
@@ -5065,7 +5101,14 @@ pub(crate) fn lora_multi_a_f16(
     ranks_out: &mut Vec<f32>,
     parallelism: &RowParallelism,
 ) -> Result<()> {
-    lora_multi_a_impl(a_weights, in_features, input, ranks_out, parallelism, neon_multi_a_f16)
+    lora_multi_a_impl(
+        a_weights,
+        in_features,
+        input,
+        ranks_out,
+        parallelism,
+        neon_multi_a_f16,
+    )
 }
 
 pub(crate) fn lora_multi_a_f32(
@@ -5075,7 +5118,14 @@ pub(crate) fn lora_multi_a_f32(
     ranks_out: &mut Vec<f32>,
     parallelism: &RowParallelism,
 ) -> Result<()> {
-    lora_multi_a_impl(a_weights, in_features, input, ranks_out, parallelism, neon_multi_a_f32)
+    lora_multi_a_impl(
+        a_weights,
+        in_features,
+        input,
+        ranks_out,
+        parallelism,
+        neon_multi_a_f32,
+    )
 }
 
 pub(crate) fn lora_multi_a_tokens_f16(
@@ -6426,10 +6476,8 @@ mod tests {
     fn multi_rank_lora_f16_and_f32_neon_match_scalar_and_batched_bits() -> crate::Result<()> {
         let no_neon_a_f16 = |_: &[u16], _: usize, _: &[f32], _: &mut [f32]| None;
         let no_neon_a_f32 = |_: &[f32], _: usize, _: &[f32], _: &mut [f32]| None;
-        let no_neon_a_tok_f16 =
-            |_: &[u16], _: usize, _: usize, _: &[&[f32]], _: &mut [f32]| None;
-        let no_neon_a_tok_f32 =
-            |_: &[f32], _: usize, _: usize, _: &[&[f32]], _: &mut [f32]| None;
+        let no_neon_a_tok_f16 = |_: &[u16], _: usize, _: usize, _: &[&[f32]], _: &mut [f32]| None;
+        let no_neon_a_tok_f32 = |_: &[f32], _: usize, _: usize, _: &[&[f32]], _: &mut [f32]| None;
         let no_neon_b_f16 = |_: &[u16], _: &[f32], _: f32, _: &[f32], _: &mut [f32]| None;
         let no_neon_b_f32 = |_: &[f32], _: &[f32], _: f32, _: &[f32], _: &mut [f32]| None;
         let no_neon_b_tok_f16 =
@@ -6470,14 +6518,14 @@ mod tests {
                         .map(|t| {
                             (0..in_features)
                                 .map(|c| {
-                                    let num = i16::try_from((c * 11 + t * 17) % 19).unwrap_or(0) - 9;
+                                    let num =
+                                        i16::try_from((c * 11 + t * 17) % 19).unwrap_or(0) - 9;
                                     f32::from(num) * 0.125
                                 })
                                 .collect()
                         })
                         .collect();
-                    let input_refs: Vec<&[f32]> =
-                        owned_inputs.iter().map(Vec::as_slice).collect();
+                    let input_refs: Vec<&[f32]> = owned_inputs.iter().map(Vec::as_slice).collect();
                     let base_outputs: Vec<Vec<f32>> = (0..token_count)
                         .map(|t| {
                             (0..out_features)
@@ -6509,8 +6557,16 @@ mod tests {
                         &parallelism,
                     )?;
                     assert_eq!(
-                        neon_ranks_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                        scalar_ranks_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        neon_ranks_f16
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        scalar_ranks_f16
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
                     );
 
                     let mut scalar_ranks_f32 = Vec::new();
@@ -6533,12 +6589,28 @@ mod tests {
                         &parallelism,
                     )?;
                     assert_eq!(
-                        neon_ranks_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                        scalar_ranks_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        neon_ranks_f32
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        scalar_ranks_f32
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
                     );
                     assert_eq!(
-                        neon_ranks_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                        neon_ranks_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        neon_ranks_f16
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        neon_ranks_f32
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
                     );
 
                     let mut single_corr = Vec::new();
@@ -6563,11 +6635,23 @@ mod tests {
                             no_neon_a_f16,
                         )?;
                         assert_eq!(
-                            single_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                            scalar_single_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                            single_ranks
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
+                            scalar_single_ranks
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>()
                         );
                         assert_eq!(
-                            single_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            single_ranks
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
                             neon_ranks_f16[t * rank..(t + 1) * rank]
                                 .iter()
                                 .copied()
@@ -6593,8 +6677,16 @@ mod tests {
                             no_neon_b_f16,
                         )?;
                         assert_eq!(
-                            single_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                            scalar_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                            single_f16_outs[t]
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
+                            scalar_f16_outs[t]
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>()
                         );
 
                         let mut single_f32_out = base_outputs[t].clone();
@@ -6616,8 +6708,16 @@ mod tests {
                             no_neon_a_f32,
                         )?;
                         assert_eq!(
-                            single_f32_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                            scalar_single_ranks.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                            single_f32_ranks
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
+                            scalar_single_ranks
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>()
                         );
                         super::lora_multi_b_scale_and_finish_f32(
                             &b_f32,
@@ -6637,12 +6737,28 @@ mod tests {
                             no_neon_b_f32,
                         )?;
                         assert_eq!(
-                            single_f32_out.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                            scalar_f32_out.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                            single_f32_out
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
+                            scalar_f32_out
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>()
                         );
                         assert_eq!(
-                            single_f32_out.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                            single_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                            single_f32_out
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
+                            single_f16_outs[t]
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>()
                         );
                     }
 
@@ -6692,21 +6808,41 @@ mod tests {
                     )?;
 
                     for t in 0..token_count {
-                        let expected: Vec<u32> = single_f16_outs[t].iter().copied().map(f32::to_bits).collect();
+                        let expected: Vec<u32> = single_f16_outs[t]
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect();
                         assert_eq!(
-                            batched_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            batched_f16_outs[t]
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
                             expected
                         );
                         assert_eq!(
-                            scalar_batched_f16_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            scalar_batched_f16_outs[t]
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
                             expected
                         );
                         assert_eq!(
-                            batched_f32_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            batched_f32_outs[t]
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
                             expected
                         );
                         assert_eq!(
-                            scalar_batched_f32_outs[t].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                            scalar_batched_f32_outs[t]
+                                .iter()
+                                .copied()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
                             expected
                         );
                     }

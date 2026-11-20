@@ -2345,18 +2345,8 @@ fn project_tile_pair<'a>(
             finite(out_b, "projection executor output")?;
         }
         if adapters.is_any_loaded() {
-            adapters.apply_linear_tokens(
-                &tensors[0].name,
-                inputs,
-                outputs_a,
-                adapter_scratch,
-            )?;
-            adapters.apply_linear_tokens(
-                &tensors[1].name,
-                inputs,
-                outputs_b,
-                adapter_scratch,
-            )?;
+            adapters.apply_linear_tokens(&tensors[0].name, inputs, outputs_a, adapter_scratch)?;
+            adapters.apply_linear_tokens(&tensors[1].name, inputs, outputs_b, adapter_scratch)?;
         }
         return Ok(TileReuse {
             basis: Some(tensors[1]),
@@ -2801,12 +2791,7 @@ fn project_tile_triple<'a>(
                 (tensors[1], &mut *outputs_b),
                 (tensors[2], &mut *outputs_c),
             ] {
-                adapters.apply_linear_tokens(
-                    &tensor.name,
-                    inputs,
-                    outputs,
-                    adapter_scratch,
-                )?;
+                adapters.apply_linear_tokens(&tensor.name, inputs, outputs, adapter_scratch)?;
             }
         }
         return Ok(TileReuse {
@@ -2978,12 +2963,7 @@ fn project_tile<'a>(
         Some(tensor)
     };
     if adapters.is_any_loaded() {
-        adapters.apply_linear_tokens(
-            &tensor.name,
-            inputs,
-            outputs,
-            adapter_scratch,
-        )?;
+        adapters.apply_linear_tokens(&tensor.name, inputs, outputs, adapter_scratch)?;
     }
     Ok(TileReuse {
         basis: Some(tensor),

@@ -564,8 +564,16 @@ impl ShaderBuilder {
                     return id;
                 }
                 let rt = self.alloc_id();
-                push_inst(&mut self.types_consts_globals, OP_TYPE_RUNTIME_ARRAY, &[rt, self.u32_t]);
-                push_inst(&mut self.annotations, OP_DECORATE, &[rt, DECORATION_ARRAY_STRIDE, 4]);
+                push_inst(
+                    &mut self.types_consts_globals,
+                    OP_TYPE_RUNTIME_ARRAY,
+                    &[rt, self.u32_t],
+                );
+                push_inst(
+                    &mut self.annotations,
+                    OP_DECORATE,
+                    &[rt, DECORATION_ARRAY_STRIDE, 4],
+                );
                 self.rt_u32_t = Some(rt);
                 rt
             }
@@ -574,8 +582,16 @@ impl ShaderBuilder {
                     return id;
                 }
                 let rt = self.alloc_id();
-                push_inst(&mut self.types_consts_globals, OP_TYPE_RUNTIME_ARRAY, &[rt, self.f32_t]);
-                push_inst(&mut self.annotations, OP_DECORATE, &[rt, DECORATION_ARRAY_STRIDE, 4]);
+                push_inst(
+                    &mut self.types_consts_globals,
+                    OP_TYPE_RUNTIME_ARRAY,
+                    &[rt, self.f32_t],
+                );
+                push_inst(
+                    &mut self.annotations,
+                    OP_DECORATE,
+                    &[rt, DECORATION_ARRAY_STRIDE, 4],
+                );
                 self.rt_f32_t = Some(rt);
                 rt
             }
@@ -2351,9 +2367,7 @@ pub fn pq2_q8k_gemm_4tok_coalesced(use_sdot: bool, fused: bool, has_residual: bo
                 }
             }
 
-            for ((&a_base, &int_sum), &acc_var) in
-                act_bases.iter().zip(&int_sums).zip(&acc_vars)
-            {
+            for ((&a_base, &int_sum), &acc_var) in act_bases.iter().zip(&int_sums).zip(&acc_vars) {
                 let act_scale_u32 = b.load_sb_u32(act_buf, a_base);
                 let act_scale = b.bitcast(b.f32_t, act_scale_u32);
                 let hsum_idx = b.uadd(a_base, c1);

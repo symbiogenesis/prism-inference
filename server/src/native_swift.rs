@@ -214,7 +214,10 @@ mod tests {
 
     #[test]
     fn parse_adapter_scales_maps_stacked_ids_and_defaults_daisyrose_to_zero() {
-        assert_eq!(parse_adapter_scales(&json!({}), false, false), Ok((None, None)));
+        assert_eq!(
+            parse_adapter_scales(&json!({}), false, false),
+            Ok((None, None))
+        );
         assert_eq!(
             parse_adapter_scales(&json!({}), false, true),
             Ok((None, Some(0.0)))
@@ -245,8 +248,16 @@ mod tests {
         );
         for (body, r1, mr) in [
             (json!({"lora": [{"id": 1, "scale": 0.5}]}), true, true),
-            (json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 0, "scale": 0.5}]}), true, true),
-            (json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}]}), true, false),
+            (
+                json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 0, "scale": 0.5}]}),
+                true,
+                true,
+            ),
+            (
+                json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}]}),
+                true,
+                false,
+            ),
             (json!({"lora": [{"id": 0, "scale": 0.5}]}), false, false),
         ] {
             assert_eq!(

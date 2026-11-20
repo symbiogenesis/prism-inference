@@ -307,11 +307,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let resolved_kv_cache =
         kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE);
     let resolved_policy = admission_policy.unwrap_or_default();
-    let daisyrose_lora = resolve_daisyrose_config(
-        daisyrose_path,
-        daisyrose_bytes,
-        daisyrose_sha256,
-    )?;
+    let daisyrose_lora =
+        resolve_daisyrose_config(daisyrose_path, daisyrose_bytes, daisyrose_sha256)?;
     let config = Config {
         placement: placement.unwrap_or_default(),
         model: model.ok_or_else(invalid)?,
@@ -874,11 +871,14 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         &config.model,
         config.representation,
         config.adapter.as_deref(),
-        config.daisyrose_lora.as_ref().map(|item| MultiRankAdapterSpec {
-            path: &item.path,
-            bytes: item.bytes,
-            sha256: &item.sha256,
-        }),
+        config
+            .daisyrose_lora
+            .as_ref()
+            .map(|item| MultiRankAdapterSpec {
+                path: &item.path,
+                bytes: item.bytes,
+                sha256: &item.sha256,
+            }),
         MatvecBackend::Auto,
         config.seed,
         parallelism,

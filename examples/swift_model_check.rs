@@ -386,14 +386,8 @@ fn load_graph(
     selection: Option<&AdapterSelection>,
     row_workers: usize,
 ) -> Result<Qwen35> {
-    let (graph, _) = load_graph_with_adapters(
-        path,
-        backend,
-        representation,
-        selection,
-        None,
-        row_workers,
-    )?;
+    let (graph, _) =
+        load_graph_with_adapters(path, backend, representation, selection, None, row_workers)?;
     Ok(graph)
 }
 

@@ -236,9 +236,7 @@ impl MultiRankAdapter {
     /// Returns `true` if `target` will be modified when run at `scale`.
     #[must_use]
     pub(crate) fn affects_linear(&self, target: &str, scale: f32) -> bool {
-        Self::validate_scale(scale).is_ok()
-            && scale != 0.0
-            && self.targets.contains_key(target)
+        Self::validate_scale(scale).is_ok() && scale != 0.0 && self.targets.contains_key(target)
     }
 
     /// Applies this adapter in place onto a single token's projection `output`.
@@ -338,7 +336,9 @@ impl MultiRankAdapter {
             return Ok(());
         };
         if inputs.iter().any(|input| input.len() != entry.in_features)
-            || outputs.iter().any(|output| output.len() != entry.out_features)
+            || outputs
+                .iter()
+                .any(|output| output.len() != entry.out_features)
         {
             return Err(invalid(format!(
                 "multi-rank adapter batched dimension mismatch for {target}"
@@ -445,10 +445,14 @@ fn collect_lora_pairs(adapter: &Model) -> Result<BTreeMap<&str, (&Tensor, &Tenso
     let mut pairs = BTreeMap::new();
     for (target_name, (a_opt, b_opt)) in partial {
         let a_tensor = a_opt.ok_or_else(|| {
-            invalid(format!("multi-rank adapter target {target_name} missing lora_a"))
+            invalid(format!(
+                "multi-rank adapter target {target_name} missing lora_a"
+            ))
         })?;
         let b_tensor = b_opt.ok_or_else(|| {
-            invalid(format!("multi-rank adapter target {target_name} missing lora_b"))
+            invalid(format!(
+                "multi-rank adapter target {target_name} missing lora_b"
+            ))
         })?;
         pairs.insert(target_name, (a_tensor, b_tensor));
     }
@@ -545,7 +549,11 @@ fn parse_target_pair(
 fn validate_metadata(base: &Model, adapter: &Model) -> Result<()> {
     match adapter.metadata.get("general.type") {
         Some(MetadataValue::String(kind)) if kind == "adapter" => {}
-        _ => return Err(invalid("multi-rank adapter requires general.type = adapter")),
+        _ => {
+            return Err(invalid(
+                "multi-rank adapter requires general.type = adapter",
+            ));
+        }
     }
     match adapter.metadata.get("adapter.type") {
         Some(MetadataValue::String(kind)) if kind == "lora" => {}
@@ -575,8 +583,16 @@ fn resolve_lora_alpha(adapter: &Model) -> Result<f32> {
             _ => Err(invalid("adapter LoRA alpha must be finite and positive")),
         }
     };
-    let primary = adapter.metadata.get("adapter.lora.alpha").map(parse_alpha).transpose()?;
-    let legacy = adapter.metadata.get("adapter.lora_alpha").map(parse_alpha).transpose()?;
+    let primary = adapter
+        .metadata
+        .get("adapter.lora.alpha")
+        .map(parse_alpha)
+        .transpose()?;
+    let legacy = adapter
+        .metadata
+        .get("adapter.lora_alpha")
+        .map(parse_alpha)
+        .transpose()?;
     match (primary, legacy) {
         (Some(a), Some(b)) => {
             if a.to_bits() != b.to_bits() {
@@ -750,11 +766,17 @@ mod tests {
     fn base_model(targets: &[(&str, [usize; 2])]) -> Model {
         let mut tensors = BTreeMap::new();
         for &(name, dims) in targets {
-            tensors.insert(name.to_owned(), f32_tensor(name, &dims, &vec![0.0; dims[0] * dims[1]]));
+            tensors.insert(
+                name.to_owned(),
+                f32_tensor(name, &dims, &vec![0.0; dims[0] * dims[1]]),
+            );
         }
         Model {
             identity: "base-id".into(),
-            metadata: BTreeMap::from([("general.architecture".into(), MetadataValue::from("qwen35"))]),
+            metadata: BTreeMap::from([(
+                "general.architecture".into(),
+                MetadataValue::from("qwen35"),
+            )]),
             tensors,
         }
     }
@@ -822,13 +844,7 @@ mod tests {
         // B * r = [2*6 - 1.5 = 10.5, 4*1.5 = 6.0, 6 + 1.5 = 7.5]
         // At scale 0.5, effective_scale = 0.5 * (4.0 / 2) = 1.0
         let mut out = [10.0_f32, -2.0, 5.0];
-        adapter.linear(
-            "blk.0.ffn_down.weight",
-            &input,
-            0.5,
-            &mut out,
-            &mut scratch,
-        )?;
+        adapter.linear("blk.0.ffn_down.weight", &input, 0.5, &mut out, &mut scratch)?;
         assert_eq!(out, [20.5, 4.0, 12.5]);
 
         // Batched matches single-token bits identically.
@@ -842,7 +858,11 @@ mod tests {
             &mut scratch,
         )?;
         assert_eq!(
-            batched[0].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+            batched[0]
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
             out.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
         );
         let mut second_single = vec![0.0_f32, 1.0, -1.0];
@@ -854,7 +874,11 @@ mod tests {
             &mut scratch,
         )?;
         assert_eq!(
-            batched[1].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+            batched[1]
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
             second_single
                 .iter()
                 .copied()
@@ -874,28 +898,29 @@ mod tests {
             ("blk.0.ffn_up.weight", [4, 4]),
             ("blk.0.ffn_down.weight", [4, 4]),
         ]);
-        let pair_model = |target: &str, mut meta: BTreeMap<String, MetadataValue>, b_f32: bool| Model {
-            identity: "b".repeat(64),
-            metadata: {
-                meta.entry("general.architecture".into())
-                    .or_insert_with(|| MetadataValue::from("qwen35"));
-                meta
-            },
-            tensors: BTreeMap::from([
-                (
-                    format!("{target}.lora_a"),
-                    f16_tensor(&format!("{target}.lora_a"), &[4, 2], &[0.1; 8]),
-                ),
-                (
-                    format!("{target}.lora_b"),
-                    if b_f32 {
-                        f32_tensor(&format!("{target}.lora_b"), &[2, 4], &[0.1; 8])
-                    } else {
-                        f16_tensor(&format!("{target}.lora_b"), &[2, 4], &[0.1; 8])
-                    },
-                ),
-            ]),
-        };
+        let pair_model =
+            |target: &str, mut meta: BTreeMap<String, MetadataValue>, b_f32: bool| Model {
+                identity: "b".repeat(64),
+                metadata: {
+                    meta.entry("general.architecture".into())
+                        .or_insert_with(|| MetadataValue::from("qwen35"));
+                    meta
+                },
+                tensors: BTreeMap::from([
+                    (
+                        format!("{target}.lora_a"),
+                        f16_tensor(&format!("{target}.lora_a"), &[4, 2], &[0.1; 8]),
+                    ),
+                    (
+                        format!("{target}.lora_b"),
+                        if b_f32 {
+                            f32_tensor(&format!("{target}.lora_b"), &[2, 4], &[0.1; 8])
+                        } else {
+                            f16_tensor(&format!("{target}.lora_b"), &[2, 4], &[0.1; 8])
+                        },
+                    ),
+                ]),
+            };
 
         for forbidden in [
             "token_embd.weight",

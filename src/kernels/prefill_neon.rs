@@ -814,8 +814,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
         for (batch_idx, batch) in chunks8.chunks(4).enumerate() {
             let mut arg_chunks: [[&[bonsai_neon_dot::Pq2Activation]; 8]; 4] = [[&[]; 8]; 4];
             for (c, chunk) in batch.iter().enumerate() {
-                arg_chunks[c] =
-                    std::array::from_fn(|t| &chunk[t].pq2_consumption[..block_count]);
+                arg_chunks[c] = std::array::from_fn(|t| &chunk[t].pq2_consumption[..block_count]);
             }
             let out_slice = &mut out_buf[..batch.len()];
             let result = if pinned {

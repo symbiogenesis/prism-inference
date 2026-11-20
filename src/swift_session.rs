@@ -1718,10 +1718,7 @@ impl SwiftSession {
             );
         }
         validate_adapter_scale(self.adapter_identity.is_some(), adapter_scale)?;
-        validate_multi_rank_scale(
-            self.secondary_adapter_identity.is_some(),
-            multi_rank_scale,
-        )?;
+        validate_multi_rank_scale(self.secondary_adapter_identity.is_some(), multi_rank_scale)?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }
@@ -1775,10 +1772,7 @@ impl SwiftSession {
         multi_rank_scale: Option<f32>,
     ) -> Result<PreparedChat> {
         validate_adapter_scale(self.adapter_identity.is_some(), adapter_scale)?;
-        validate_multi_rank_scale(
-            self.secondary_adapter_identity.is_some(),
-            multi_rank_scale,
-        )?;
+        validate_multi_rank_scale(self.secondary_adapter_identity.is_some(), multi_rank_scale)?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }

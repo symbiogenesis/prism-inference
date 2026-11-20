@@ -502,7 +502,9 @@ impl CompositeCore {
     ) -> Result<()> {
         clear_vec_slice(outputs);
         if activations.len() != outputs.len() {
-            return Err(invalid("mismatched F32 FFN SwiGLU token projection outputs"));
+            return Err(invalid(
+                "mismatched F32 FFN SwiGLU token projection outputs",
+            ));
         }
         if !self.query_group(npu, gpu, &[gate, up], |exec| {
             exec.supports_f32_ffn_swiglu(gate, up)
@@ -545,7 +547,9 @@ impl CompositeCore {
         output: &mut Vec<f32>,
     ) -> Result<()> {
         output.clear();
-        if !self.query_group(npu, gpu, &tensors, |exec| exec.supports_f32_ffn_chain(tensors)) {
+        if !self.query_group(npu, gpu, &tensors, |exec| {
+            exec.supports_f32_ffn_chain(tensors)
+        }) {
             return Err(invalid("unavailable composite F32 FFN chain placement"));
         }
         let target = self
@@ -596,7 +600,9 @@ impl CompositeCore {
         {
             return Err(invalid("mismatched F32 FFN chain token projection outputs"));
         }
-        if !self.query_group(npu, gpu, &tensors, |exec| exec.supports_f32_ffn_chain(tensors)) {
+        if !self.query_group(npu, gpu, &tensors, |exec| {
+            exec.supports_f32_ffn_chain(tensors)
+        }) {
             return Err(invalid(
                 "unavailable composite F32 FFN chain token placement",
             ));
@@ -850,7 +856,13 @@ impl Pq2ProjectionExecutor for CompositeProjectionExecutor<'_> {
         outputs_b: &mut [Vec<f32>],
     ) -> Result<()> {
         self.core.project_f32_pair_tokens(
-            self.npu, self.gpu, tensors, activations, pinned, outputs_a, outputs_b,
+            self.npu,
+            self.gpu,
+            tensors,
+            activations,
+            pinned,
+            outputs_a,
+            outputs_b,
         )
     }
 
@@ -914,10 +926,9 @@ impl Pq2ProjectionExecutor for CompositeProjectionExecutor<'_> {
     }
 
     fn supports_f32_ffn_chain(&self, tensors: [&Tensor; 3]) -> bool {
-        self.core
-            .query_group(self.npu, self.gpu, &tensors, |exec| {
-                exec.supports_f32_ffn_chain(tensors)
-            })
+        self.core.query_group(self.npu, self.gpu, &tensors, |exec| {
+            exec.supports_f32_ffn_chain(tensors)
+        })
     }
 
     fn supports_tile_tokens(&self) -> bool {
@@ -946,10 +957,9 @@ impl Pq2ProjectionExecutor for CompositeProjectionExecutor<'_> {
     }
 
     fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
-        self.core
-            .query_group(self.npu, self.gpu, &tensors, |exec| {
-                exec.supports_f32_ffn_chain_lora(tensors)
-            })
+        self.core.query_group(self.npu, self.gpu, &tensors, |exec| {
+            exec.supports_f32_ffn_chain_lora(tensors)
+        })
     }
 
     fn project_f32_ffn_chain_lora(
@@ -1032,9 +1042,10 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
     }
 
     fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
-        self.core.query_group(&self.npu, &self.gpu, tensors, |exec| {
-            exec.supports_f32_group(tensors)
-        })
+        self.core
+            .query_group(&self.npu, &self.gpu, tensors, |exec| {
+                exec.supports_f32_group(tensors)
+            })
     }
 
     fn project(

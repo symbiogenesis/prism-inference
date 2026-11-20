@@ -834,7 +834,10 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
     .readiness(19);
     assert_eq!(stacked["data"][0]["supports_daisyrose_scale"], json!(true));
     assert_eq!(stacked["data"][0]["daisyrose_scale_range"], json!([0, 2]));
-    assert_eq!(stacked["data"][0]["daisyrose_adapter_sha256"], json!(daisy_sha));
+    assert_eq!(
+        stacked["data"][0]["daisyrose_adapter_sha256"],
+        json!(daisy_sha)
+    );
     assert_eq!(stacked["data"][0]["daisyrose_adapter_max_rank"], json!(16));
 }
 

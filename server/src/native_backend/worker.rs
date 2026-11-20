@@ -837,12 +837,11 @@ fn install_vulkan_executor(
         let warmed = executor
             .prewarm_tensors(&tensors)
             .map_err(|_| NativeBackendError::Configuration)?;
-        let identity: Arc<str> = Arc::from(
-            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::identity(&executor),
-        );
+        let identity: Arc<str> =
+            Arc::from(bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::identity(&executor));
         let resident_tensors = u64::try_from(warmed).map_err(|_| NativeBackendError::Engine)?;
-        let resident_weight_bytes =
-            u64::try_from(executor.cached_weight_bytes()).map_err(|_| NativeBackendError::Engine)?;
+        let resident_weight_bytes = u64::try_from(executor.cached_weight_bytes())
+            .map_err(|_| NativeBackendError::Engine)?;
         let startup = ProjectionStartup::AdrenoVulkan {
             identity,
             resident_tensors,
@@ -909,11 +908,11 @@ fn install_composite_executor(
             .map_err(|_| NativeBackendError::Configuration)?;
         let gpu_bytes =
             u64::try_from(gpu.cached_weight_bytes()).map_err(|_| NativeBackendError::Engine)?;
-        let composite = bonsai_hexagon_runtime::OwnedCompositeProjectionExecutor::new(&plan, npu, gpu)
-            .map_err(|_| NativeBackendError::Configuration)?;
-        let identity: Arc<str> = Arc::from(
-            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::identity(&composite),
-        );
+        let composite =
+            bonsai_hexagon_runtime::OwnedCompositeProjectionExecutor::new(&plan, npu, gpu)
+                .map_err(|_| NativeBackendError::Configuration)?;
+        let identity: Arc<str> =
+            Arc::from(bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::identity(&composite));
         let startup = ProjectionStartup::Composite {
             identity: Arc::clone(&identity),
             npu_resident_tensors: npu_residency.tensors_prepared,

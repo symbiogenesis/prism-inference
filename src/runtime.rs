@@ -467,7 +467,9 @@ impl Runtime<crate::graph::Qwen35> {
         let current_r1 = self.decoder.adapter_scale();
         let current_mr = self.decoder.multi_rank_adapter_scale();
         if current_r1.is_none() && current_mr.is_none() {
-            return Err(invalid("adapter scale requires at least one loaded adapter"));
+            return Err(invalid(
+                "adapter scale requires at least one loaded adapter",
+            ));
         }
         if let Some(scale) = rank_one_scale {
             crate::model::lora::RankOneAdapter::validate_scale(scale)?;

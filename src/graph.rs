@@ -2714,7 +2714,9 @@ impl Qwen35 {
         multi_rank_scale: Option<f32>,
     ) -> Result<()> {
         if self.adapter.is_none() && self.multi_rank_adapter.is_none() {
-            return Err(invalid("adapter scale requires at least one loaded adapter"));
+            return Err(invalid(
+                "adapter scale requires at least one loaded adapter",
+            ));
         }
         let resolved_r1 = match (&self.adapter, rank_one_scale) {
             (Some(_), Some(scale)) => {
@@ -2726,7 +2728,9 @@ impl Qwen35 {
             }
             (None, None) => None,
             (None, Some(_)) => {
-                return Err(invalid("rank-one scale provided without a rank-one adapter"));
+                return Err(invalid(
+                    "rank-one scale provided without a rank-one adapter",
+                ));
             }
         };
         let resolved_mr = match (&self.multi_rank_adapter, multi_rank_scale) {
@@ -2739,7 +2743,9 @@ impl Qwen35 {
             }
             (None, None) => None,
             (None, Some(_)) => {
-                return Err(invalid("multi-rank scale provided without a multi-rank adapter"));
+                return Err(invalid(
+                    "multi-rank scale provided without a multi-rank adapter",
+                ));
             }
         };
 
@@ -2751,7 +2757,9 @@ impl Qwen35 {
         } else {
             self.identity
                 .split_once(":multi-rank-lora-v1:")
-                .ok_or_else(|| invalid("multi-rank graph identity is missing its adapter contract"))?
+                .ok_or_else(|| {
+                    invalid("multi-rank graph identity is missing its adapter contract")
+                })?
                 .0
         };
         let r1_extra = self

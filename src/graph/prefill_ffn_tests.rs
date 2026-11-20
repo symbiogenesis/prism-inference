@@ -1393,10 +1393,7 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
 -> Result<()> {
     let fixture = Pq2FfnFixture::new()?;
     let base = Model {
-        metadata: BTreeMap::from([(
-            "general.architecture".into(),
-            MetadataValue::from("qwen35"),
-        )]),
+        metadata: BTreeMap::from([("general.architecture".into(), MetadataValue::from("qwen35"))]),
         tensors: BTreeMap::from([(fixture.down.name.clone(), fixture.down.clone())]),
         identity: "pq2-multi-rank-base".into(),
     };
@@ -1526,8 +1523,14 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
         // 1. At DaisyRose scale 0.0, external_ffn_chain_lora stays fused and matches Orca-only bit-for-bit.
         let mut orca_exec = fixture.executor(arithmetic);
         orca_exec.allow_chain_lora = true;
-        let (orca_only, orca_stats) =
-            fixture.run_decode(arithmetic, Some(&fixture.down_adapter), 1.3, &inputs[0], &residuals[0], Some(&mut orca_exec))?;
+        let (orca_only, orca_stats) = fixture.run_decode(
+            arithmetic,
+            Some(&fixture.down_adapter),
+            1.3,
+            &inputs[0],
+            &residuals[0],
+            Some(&mut orca_exec),
+        )?;
         let mut zero_exec = fixture.executor(arithmetic);
         zero_exec.allow_chain_lora = true;
         let (stacked_zero, zero_stats) = run_decode_stacked(arithmetic, 0.0, Some(&mut zero_exec))?;
@@ -1542,18 +1545,31 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
         //    and matches CPU fallback + tiled prefill bit-for-bit.
         let mut active_exec = fixture.executor(arithmetic);
         active_exec.allow_chain_lora = true;
-        let (stacked_active, active_stats) = run_decode_stacked(arithmetic, 0.5, Some(&mut active_exec))?;
+        let (stacked_active, active_stats) =
+            run_decode_stacked(arithmetic, 0.5, Some(&mut active_exec))?;
         assert_eq!(active_stats.external_ffn_chain.completed, 0);
         assert_eq!(active_stats.external_ffn_swiglu.completed, 1);
         assert_eq!(active_exec.chain_calls, 0);
         assert_eq!(active_exec.swiglu_calls, 1);
         assert_ne!(
-            stacked_active.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-            orca_only.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+            stacked_active
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            orca_only
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
         );
 
         let (cpu_active, _) = run_decode_stacked(arithmetic, 0.5, None)?;
-        same_bits(&stacked_active, &cpu_active, "stacked DaisyRose=0.5 decode vs CPU");
+        same_bits(
+            &stacked_active,
+            &cpu_active,
+            "stacked DaisyRose=0.5 decode vs CPU",
+        );
 
         // Tiled prefill parity against single-token decode.
         let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
@@ -1631,7 +1647,11 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
                 .zip(res_row)
                 .for_each(|(out, res)| *out += *res);
         }
-        same_bits(&outputs[0], &stacked_active, "stacked DaisyRose=0.5 tiled[0] vs decode");
+        same_bits(
+            &outputs[0],
+            &stacked_active,
+            "stacked DaisyRose=0.5 tiled[0] vs decode",
+        );
     }
     Ok(())
 }

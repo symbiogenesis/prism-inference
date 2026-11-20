@@ -102,7 +102,13 @@ pub async fn serve(
     session: SwiftSession,
     key: String,
 ) -> Result<(), NativeBackendError> {
-    Box::pin(serve_with_placement(listener, session, key, Placement::Auto)).await
+    Box::pin(serve_with_placement(
+        listener,
+        session,
+        key,
+        Placement::Auto,
+    ))
+    .await
 }
 
 /// Serve a verified session with one immutable trusted projection placement.
@@ -608,7 +614,8 @@ fn validate_canonical_lora(
     raw: Option<Vec<Object<PinnedLora>>>,
     profile: &ModelProfile,
 ) -> Result<Option<Vec<PinnedLora>>, NativeBackendError> {
-    let entries: Option<Vec<PinnedLora>> = raw.map(|items| items.into_iter().map(|Object(item)| item).collect());
+    let entries: Option<Vec<PinnedLora>> =
+        raw.map(|items| items.into_iter().map(|Object(item)| item).collect());
     if let Some(items) = &entries {
         if !(1..=2).contains(&items.len()) {
             return Err(NativeBackendError::Schema);

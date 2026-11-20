@@ -119,7 +119,12 @@ impl WeightArena {
         } else {
             hw_align
         };
-        let max_range = u64::from(device.capabilities().compute_limits.max_storage_buffer_range);
+        let max_range = u64::from(
+            device
+                .capabilities()
+                .compute_limits
+                .max_storage_buffer_range,
+        );
         Self {
             align,
             max_range,
@@ -768,7 +773,11 @@ impl AdrenoVulkanDevice {
             #[cfg(target_endian = "little")]
             // SAFETY: `words` is a valid initialized `u32` slice of `byte_len` bytes, non-overlapping with `dst`.
             unsafe {
-                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), dst.as_mut_ptr(), byte_len);
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr().cast::<u8>(),
+                    dst.as_mut_ptr(),
+                    byte_len,
+                );
             }
             #[cfg(not(target_endian = "little"))]
             for (slot, &word) in dst.as_chunks_mut::<4>().0.iter_mut().zip(words) {
@@ -803,7 +812,11 @@ impl AdrenoVulkanDevice {
             #[cfg(target_endian = "little")]
             // SAFETY: `values` is a valid initialized `f32` slice of `byte_len` bytes, non-overlapping with `dst`.
             unsafe {
-                std::ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), dst.as_mut_ptr(), byte_len);
+                std::ptr::copy_nonoverlapping(
+                    values.as_ptr().cast::<u8>(),
+                    dst.as_mut_ptr(),
+                    byte_len,
+                );
             }
             #[cfg(not(target_endian = "little"))]
             for (slot, &val) in dst.as_chunks_mut::<4>().0.iter_mut().zip(values) {
@@ -838,7 +851,11 @@ impl AdrenoVulkanDevice {
             #[cfg(target_endian = "little")]
             // SAFETY: `src` and `dst` are non-overlapping for `byte_len` bytes and aligned for byte copy.
             unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), byte_len);
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    dst.as_mut_ptr().cast::<u8>(),
+                    byte_len,
+                );
             }
             #[cfg(not(target_endian = "little"))]
             for (out_slot, chunk) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
@@ -1178,7 +1195,10 @@ impl AdrenoVulkanDevice {
         self.prepare_and_submit_spans(stages)
     }
 
-    fn allocate_stage_sets(&mut self, pipelines: impl Iterator<Item = PipelineId>) -> Result<(), Error> {
+    fn allocate_stage_sets(
+        &mut self,
+        pipelines: impl Iterator<Item = PipelineId>,
+    ) -> Result<(), Error> {
         // SAFETY: Pool is idle after prior synchronous submission completed; reset all transient sets in one call.
         if let Err(err) = unsafe {
             self.device
@@ -1497,7 +1517,10 @@ impl Drop for AdrenoVulkanDevice {
             }
         }
         // SAFETY: Destroying owned pipeline cache.
-        unsafe { self.device.destroy_pipeline_cache(self.pipeline_cache, None) };
+        unsafe {
+            self.device
+                .destroy_pipeline_cache(self.pipeline_cache, None)
+        };
         // SAFETY: Destroying owned fence.
         unsafe { self.device.destroy_fence(self.fence, None) };
         // SAFETY: Destroying owned descriptor pool.

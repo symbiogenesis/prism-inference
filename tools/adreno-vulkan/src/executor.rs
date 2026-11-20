@@ -192,14 +192,26 @@ struct ProjectionPipelines {
 impl ProjectionPipelines {
     fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         Ok(Self {
-            pq2_q8k_fused: device
-                .create_compute_pipeline(&spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false), 3, 4)?,
-            pq2_q8k_unfused: device
-                .create_compute_pipeline(&spirv::pq2_q8k_gemv_coalesced(use_sdot, false, false), 3, 4)?,
-            pq2_q8k_fused_res: device
-                .create_compute_pipeline(&spirv::pq2_q8k_gemv_coalesced(use_sdot, true, true), 4, 4)?,
-            pq2_q8k_unfused_res: device
-                .create_compute_pipeline(&spirv::pq2_q8k_gemv_coalesced(use_sdot, false, true), 4, 4)?,
+            pq2_q8k_fused: device.create_compute_pipeline(
+                &spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
+                3,
+                4,
+            )?,
+            pq2_q8k_unfused: device.create_compute_pipeline(
+                &spirv::pq2_q8k_gemv_coalesced(use_sdot, false, false),
+                3,
+                4,
+            )?,
+            pq2_q8k_fused_res: device.create_compute_pipeline(
+                &spirv::pq2_q8k_gemv_coalesced(use_sdot, true, true),
+                4,
+                4,
+            )?,
+            pq2_q8k_unfused_res: device.create_compute_pipeline(
+                &spirv::pq2_q8k_gemv_coalesced(use_sdot, false, true),
+                4,
+                4,
+            )?,
             pq2_q8k_4tok_fused: device.create_compute_pipeline(
                 &spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, false),
                 3,
@@ -220,16 +232,36 @@ impl ProjectionPipelines {
                 4,
                 4,
             )?,
-            pq2_q8_0: device.create_compute_pipeline(&spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?,
-            ptq1_q8_0: device
-                .create_compute_pipeline(&spirv::ptq1_q8_0_gemv_coalesced(use_sdot, false), 3, 4)?,
-            ptq1_q8_0_pinned: device
-                .create_compute_pipeline(&spirv::ptq1_q8_0_gemv_coalesced(use_sdot, true), 3, 4)?,
-            ptq1_q8k: device.create_compute_pipeline(&spirv::ptq1_q8k_gemv_coalesced(use_sdot), 3, 4)?,
-            quant_q8k_pinned: device
-                .create_compute_pipeline(&spirv::quantize_f32_to_q8k_4plane(true), 2, 2)?,
-            quant_q8k_unpinned: device
-                .create_compute_pipeline(&spirv::quantize_f32_to_q8k_4plane(false), 2, 2)?,
+            pq2_q8_0: device.create_compute_pipeline(
+                &spirv::pq2_q8_0_gemv_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            ptq1_q8_0: device.create_compute_pipeline(
+                &spirv::ptq1_q8_0_gemv_coalesced(use_sdot, false),
+                3,
+                4,
+            )?,
+            ptq1_q8_0_pinned: device.create_compute_pipeline(
+                &spirv::ptq1_q8_0_gemv_coalesced(use_sdot, true),
+                3,
+                4,
+            )?,
+            ptq1_q8k: device.create_compute_pipeline(
+                &spirv::ptq1_q8k_gemv_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            quant_q8k_pinned: device.create_compute_pipeline(
+                &spirv::quantize_f32_to_q8k_4plane(true),
+                2,
+                2,
+            )?,
+            quant_q8k_unpinned: device.create_compute_pipeline(
+                &spirv::quantize_f32_to_q8k_4plane(false),
+                2,
+                2,
+            )?,
             swiglu_pinned: device.create_compute_pipeline(&spirv::ffn_swiglu_f32(true), 3, 1)?,
             swiglu_unpinned: device.create_compute_pipeline(&spirv::ffn_swiglu_f32(false), 3, 1)?,
             hadamard: device.create_compute_pipeline(&spirv::ffn_hadamard_f32(), 2, 2)?,
@@ -624,7 +656,13 @@ impl VulkanPq2Executor {
         }
 
         validate_weight_scales(tensor.kind, &tensor.data)?;
-        repack_coalesced_into(tensor.kind, &tensor.data, cols, rows, &mut self.repack_scratch)?;
+        repack_coalesced_into(
+            tensor.kind,
+            &tensor.data,
+            cols,
+            rows,
+            &mut self.repack_scratch,
+        )?;
         let upload_bytes = u32_slice_bytes_usize(self.repack_scratch.len())?;
         let upload_u64 = u64::try_from(upload_bytes)
             .map_err(|_| Error::ResourceLimit("weight byte length overflow".to_owned()))?;
@@ -651,7 +689,12 @@ impl VulkanPq2Executor {
             let span = self.weight_arena.alloc(&mut self.device, upload_u64)?;
             self.device
                 .write_buffer_u32_at(span.buffer, span.offset, &self.repack_scratch)?;
-            self.record_cached(key, ResidentStorage::Arena(span), upload_bytes, &tensor.data);
+            self.record_cached(
+                key,
+                ResidentStorage::Arena(span),
+                upload_bytes,
+                &tensor.data,
+            );
             return Ok(WeightLease::Cached(span));
         }
 
@@ -681,7 +724,12 @@ impl VulkanPq2Executor {
             self.device.free_buffer(buf);
             return Err(err);
         }
-        self.record_cached(key, ResidentStorage::Standalone(buf), upload_bytes, &tensor.data);
+        self.record_cached(
+            key,
+            ResidentStorage::Standalone(buf),
+            upload_bytes,
+            &tensor.data,
+        );
         Ok(WeightLease::Cached(BufferSpan::whole(buf)))
     }
 
@@ -767,7 +815,10 @@ impl VulkanPq2Executor {
         read_into: &mut [&mut Vec<f32>],
     ) -> Result<(), Error> {
         self.ensure_healthy()?;
-        ensure_finite_f32(flat_activations, "GPU F32 projection input contains non-finite value")?;
+        ensure_finite_f32(
+            flat_activations,
+            "GPU F32 projection input contains non-finite value",
+        )?;
         let t_u32 = u32::try_from(tokens)
             .map_err(|_| Error::ResourceLimit("token count exceeds u32".to_owned()))?;
         let cols_u32 = u32::try_from(cols)
@@ -788,8 +839,12 @@ impl VulkanPq2Executor {
         let mut out_bufs = [BufferSpan::whole(f32_in_buf); 3];
         let out_slots = [
             f32_slice_bytes(tensors[0].dimensions[1] * tokens)?,
-            tensors.get(1).map_or(Ok(0), |t| f32_slice_bytes(t.dimensions[1] * tokens))?,
-            tensors.get(2).map_or(Ok(0), |t| f32_slice_bytes(t.dimensions[1] * tokens))?,
+            tensors
+                .get(1)
+                .map_or(Ok(0), |t| f32_slice_bytes(t.dimensions[1] * tokens))?,
+            tensors
+                .get(2)
+                .map_or(Ok(0), |t| f32_slice_bytes(t.dimensions[1] * tokens))?,
         ];
         let b0 = ensure_scratch(&mut self.device, &mut self.scratch.out_a, out_slots[0])?;
         out_bufs[0] = BufferSpan::whole(b0);
@@ -802,7 +857,11 @@ impl VulkanPq2Executor {
             out_bufs[2] = BufferSpan::whole(b2);
         }
 
-        let leases = self.acquire_three_weights(tensors[0], tensors.get(1).copied(), tensors.get(2).copied())?;
+        let leases = self.acquire_three_weights(
+            tensors[0],
+            tensors.get(1).copied(),
+            tensors.get(2).copied(),
+        )?;
         let run_result = (|| -> Result<(), Error> {
             let quant_pipe = if pinned {
                 self.pipes.quant_q8k_pinned
@@ -825,7 +884,8 @@ impl VulkanPq2Executor {
                 rows_list[idx] = rows;
                 let rows_u32 = u32::try_from(rows)
                     .map_err(|_| Error::ResourceLimit("row count exceeds u32".to_owned()))?;
-                let lease = leases[idx].ok_or_else(|| Error::InvalidInput("missing weight lease".to_owned()))?;
+                let lease = leases[idx]
+                    .ok_or_else(|| Error::InvalidInput("missing weight lease".to_owned()))?;
                 gemm_pipes[idx] = gemm_pipe;
                 gemm_bufs[idx] = [lease.span(), BufferSpan::whole(q8k_buf), out_bufs[idx]];
                 gemm_pushes[idx] = [rows_u32, blocks_u32, t_u32, act_words_per_token];
@@ -846,7 +906,8 @@ impl VulkanPq2Executor {
                     workgroups: gemm_grids[idx],
                 };
             }
-            self.device.submit_compute_span_stages(&stages[..=tensors.len()])?;
+            self.device
+                .submit_compute_span_stages(&stages[..=tensors.len()])?;
 
             for (idx, dst) in read_into.iter_mut().enumerate() {
                 let count = tokens * rows_list[idx];
@@ -873,7 +934,10 @@ impl VulkanPq2Executor {
         flat_output: &mut Vec<f32>,
     ) -> Result<(), Error> {
         self.ensure_healthy()?;
-        ensure_finite_f32(flat_activations, "GPU FFN SwiGLU input contains non-finite value")?;
+        ensure_finite_f32(
+            flat_activations,
+            "GPU FFN SwiGLU input contains non-finite value",
+        )?;
         let (cols, inter_rows) = validate_matrix(gate, KIND_PQ2, 256)?;
         let t_u32 = u32::try_from(tokens)
             .map_err(|_| Error::ResourceLimit("token count exceeds u32".to_owned()))?;
@@ -890,20 +954,36 @@ impl VulkanPq2Executor {
         let mid_elems_u32 = u32::try_from(mid_elems)
             .map_err(|_| Error::ResourceLimit("SwiGLU count exceeds u32".to_owned()))?;
 
-        let f32_in_buf =
-            ensure_scratch(&mut self.device, &mut self.scratch.f32_in, f32_slice_bytes(flat_activations.len())?)?;
+        let f32_in_buf = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.f32_in,
+            f32_slice_bytes(flat_activations.len())?,
+        )?;
         let q8k_buf = ensure_scratch(
             &mut self.device,
             &mut self.scratch.q8k_4p,
             u32_slice_bytes(tokens * blocks_per_row * Q8K_4PLANE_WORDS_PER_HALF)?,
         )?;
-        let out_a = ensure_scratch(&mut self.device, &mut self.scratch.out_a, f32_slice_bytes(mid_elems)?)?;
-        let out_b = ensure_scratch(&mut self.device, &mut self.scratch.out_b, f32_slice_bytes(mid_elems)?)?;
-        let mid_buf = ensure_scratch(&mut self.device, &mut self.scratch.mid, f32_slice_bytes(mid_elems)?)?;
+        let out_a = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.out_a,
+            f32_slice_bytes(mid_elems)?,
+        )?;
+        let out_b = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.out_b,
+            f32_slice_bytes(mid_elems)?,
+        )?;
+        let mid_buf = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.mid,
+            f32_slice_bytes(mid_elems)?,
+        )?;
         self.device.write_buffer_f32(f32_in_buf, flat_activations)?;
 
         let leases = self.acquire_three_weights(gate, Some(up), None)?;
-        let w_gate = leases[0].ok_or_else(|| Error::InvalidInput("missing gate lease".to_owned()))?;
+        let w_gate =
+            leases[0].ok_or_else(|| Error::InvalidInput("missing gate lease".to_owned()))?;
         let w_up = leases[1].ok_or_else(|| Error::InvalidInput("missing up lease".to_owned()))?;
         let run_result = (|| -> Result<(), Error> {
             let quant_pipe = if pinned {
@@ -919,8 +999,16 @@ impl VulkanPq2Executor {
             let gemm_pipe = self.pipes.select_pq2_q8k(pinned, tokens > 1, false);
             let grid_y = if tokens > 1 { t_u32.div_ceil(4) } else { 1 };
             let quant_spans = [BufferSpan::whole(f32_in_buf), BufferSpan::whole(q8k_buf)];
-            let gate_spans = [w_gate.span(), BufferSpan::whole(q8k_buf), BufferSpan::whole(out_a)];
-            let up_spans = [w_up.span(), BufferSpan::whole(q8k_buf), BufferSpan::whole(out_b)];
+            let gate_spans = [
+                w_gate.span(),
+                BufferSpan::whole(q8k_buf),
+                BufferSpan::whole(out_a),
+            ];
+            let up_spans = [
+                w_up.span(),
+                BufferSpan::whole(q8k_buf),
+                BufferSpan::whole(out_b),
+            ];
             let swiglu_spans = [
                 BufferSpan::whole(out_a),
                 BufferSpan::whole(out_b),
@@ -981,7 +1069,10 @@ impl VulkanPq2Executor {
         flat_output: &mut Vec<f32>,
     ) -> Result<f32, Error> {
         self.ensure_healthy()?;
-        ensure_finite_f32(flat_activations, "GPU FFN chain input contains non-finite value")?;
+        ensure_finite_f32(
+            flat_activations,
+            "GPU FFN chain input contains non-finite value",
+        )?;
         if let Some(res) = flat_residuals {
             ensure_finite_f32(res, "GPU FFN chain residual contains non-finite value")?;
         }
@@ -996,34 +1087,65 @@ impl VulkanPq2Executor {
         let in_blocks = in_cols / 128;
         let mid_blocks = inter_rows / 128;
 
-        let f32_in_buf =
-            ensure_scratch(&mut self.device, &mut self.scratch.f32_in, f32_slice_bytes(flat_activations.len())?)?;
+        let f32_in_buf = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.f32_in,
+            f32_slice_bytes(flat_activations.len())?,
+        )?;
         let q8k_in_buf = ensure_scratch(
             &mut self.device,
             &mut self.scratch.q8k_4p,
             u32_slice_bytes(tokens * in_blocks * Q8K_4PLANE_WORDS_PER_HALF)?,
         )?;
-        let out_a = ensure_scratch(&mut self.device, &mut self.scratch.out_a, f32_slice_bytes(mid_total)?)?;
-        let out_b = ensure_scratch(&mut self.device, &mut self.scratch.out_b, f32_slice_bytes(mid_total)?)?;
-        let mid_buf = ensure_scratch(&mut self.device, &mut self.scratch.mid, f32_slice_bytes(mid_total)?)?;
-        let mid_rot_buf = ensure_scratch(&mut self.device, &mut self.scratch.mid_rot, f32_slice_bytes(mid_total)?)?;
+        let out_a = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.out_a,
+            f32_slice_bytes(mid_total)?,
+        )?;
+        let out_b = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.out_b,
+            f32_slice_bytes(mid_total)?,
+        )?;
+        let mid_buf = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.mid,
+            f32_slice_bytes(mid_total)?,
+        )?;
+        let mid_rot_buf = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.mid_rot,
+            f32_slice_bytes(mid_total)?,
+        )?;
         let q8k_mid_buf = ensure_scratch(
             &mut self.device,
             &mut self.scratch.q8k_mid,
             u32_slice_bytes(tokens * mid_blocks * Q8K_4PLANE_WORDS_PER_HALF)?,
         )?;
-        let out_c = ensure_scratch(&mut self.device, &mut self.scratch.out_c, f32_slice_bytes(out_total)?)?;
+        let out_c = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.out_c,
+            f32_slice_bytes(out_total)?,
+        )?;
         self.device.write_buffer_f32(f32_in_buf, flat_activations)?;
 
         let res_buf = if let Some(res) = flat_residuals {
-            let b = ensure_scratch(&mut self.device, &mut self.scratch.residual, f32_slice_bytes(out_total)?)?;
+            let b = ensure_scratch(
+                &mut self.device,
+                &mut self.scratch.residual,
+                f32_slice_bytes(out_total)?,
+            )?;
             self.device.write_buffer_f32(b, res)?;
             Some(b)
         } else {
             None
         };
         let lora_bufs = if let Some(la) = lora_a {
-            let b = ensure_scratch(&mut self.device, &mut self.scratch.lora_a, f32_slice_bytes(inter_rows)?)?;
+            let b = ensure_scratch(
+                &mut self.device,
+                &mut self.scratch.lora_a,
+                f32_slice_bytes(inter_rows)?,
+            )?;
             let s = ensure_scratch(&mut self.device, &mut self.scratch.lora_scalar, 4)?;
             self.device.write_buffer_f32(b, la)?;
             Some((b, s))
@@ -1032,9 +1154,11 @@ impl VulkanPq2Executor {
         };
 
         let leases = self.acquire_three_weights(gate, Some(up), Some(down))?;
-        let w_gate = leases[0].ok_or_else(|| Error::InvalidInput("missing gate lease".to_owned()))?;
+        let w_gate =
+            leases[0].ok_or_else(|| Error::InvalidInput("missing gate lease".to_owned()))?;
         let w_up = leases[1].ok_or_else(|| Error::InvalidInput("missing up lease".to_owned()))?;
-        let w_down = leases[2].ok_or_else(|| Error::InvalidInput("missing down lease".to_owned()))?;
+        let w_down =
+            leases[2].ok_or_else(|| Error::InvalidInput("missing down lease".to_owned()))?;
 
         let bufs = FfnChainScratchIds {
             f32_in: f32_in_buf,
@@ -1463,9 +1587,9 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
             return false;
         }
         let first_cols = tensors[0].dimensions.first().copied();
-        tensors.iter().all(|t| {
-            self.supports_f32(t) && t.dimensions.first().copied() == first_cols
-        })
+        tensors
+            .iter()
+            .all(|t| self.supports_f32(t) && t.dimensions.first().copied() == first_cols)
     }
 
     fn project_f32_group(
@@ -1504,10 +1628,10 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
         outputs: &mut [Vec<f32>],
     ) -> bonsai_prism_runtime::Result<()> {
         if activations.len() != outputs.len() {
-            return Err(Error::InvalidInput(
-                "mismatched F32 token output count".to_owned(),
-            )
-            .into_runtime_error());
+            return Err(
+                Error::InvalidInput("mismatched F32 token output count".to_owned())
+                    .into_runtime_error(),
+            );
         }
         for out in outputs.iter_mut() {
             out.clear();
@@ -1548,10 +1672,10 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
             || activations.len() != outputs_b.len()
             || !self.supports_f32_group(&tensors)
         {
-            return Err(Error::InvalidInput(
-                "invalid F32 pair token projection inputs".to_owned(),
-            )
-            .into_runtime_error());
+            return Err(
+                Error::InvalidInput("invalid F32 pair token projection inputs".to_owned())
+                    .into_runtime_error(),
+            );
         }
         for out in outputs_a.iter_mut().chain(outputs_b.iter_mut()) {
             out.clear();
@@ -1648,10 +1772,10 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
     ) -> bonsai_prism_runtime::Result<()> {
         output.clear();
         if !self.supports_f32_ffn_swiglu(gate, up) || activation.len() != gate.dimensions[0] {
-            return Err(Error::InvalidInput(
-                "unsupported FFN SwiGLU inputs".to_owned(),
-            )
-            .into_runtime_error());
+            return Err(
+                Error::InvalidInput("unsupported FFN SwiGLU inputs".to_owned())
+                    .into_runtime_error(),
+            );
         }
         self.execute_ffn_swiglu_batched(gate, up, activation, 1, pinned, output)
             .map_err(Error::into_runtime_error)
@@ -1716,10 +1840,10 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
         let (in_cols, _) =
             validate_ffn_chain_tensors(gate, up, down, 256).map_err(Error::into_runtime_error)?;
         if activation.len() != in_cols || residual.is_some_and(|r| r.len() != in_cols) {
-            return Err(Error::InvalidInput(
-                "FFN chain input/residual length mismatch".to_owned(),
-            )
-            .into_runtime_error());
+            return Err(
+                Error::InvalidInput("FFN chain input/residual length mismatch".to_owned())
+                    .into_runtime_error(),
+            );
         }
         let _ = self
             .execute_ffn_chain_batched(
@@ -1748,10 +1872,10 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
         if activations.len() != outputs.len()
             || residuals.is_some_and(|r| r.len() != activations.len())
         {
-            return Err(Error::InvalidInput(
-                "mismatched FFN chain token slices".to_owned(),
-            )
-            .into_runtime_error());
+            return Err(
+                Error::InvalidInput("mismatched FFN chain token slices".to_owned())
+                    .into_runtime_error(),
+            );
         }
         for out in outputs.iter_mut() {
             out.clear();
@@ -1941,9 +2065,9 @@ impl VulkanAttentionExecutor {
         let push = attention_push_constants(desc);
 
         match plan.path {
-            AdrenoAttentionPath::Fused => {
-                self.execute_fused(plan, cache_key, q_buf, k_buf, v_buf, out_buf, &push, q_elems)
-            }
+            AdrenoAttentionPath::Fused => self.execute_fused(
+                plan, cache_key, q_buf, k_buf, v_buf, out_buf, &push, q_elems,
+            ),
             AdrenoAttentionPath::Decomposed3Stage => self.execute_decomposed_staged(
                 plan,
                 cache_key,
@@ -1991,11 +2115,21 @@ impl VulkanAttentionExecutor {
         let q_buf = upload_f32_scratch(&mut self.device, &mut self.scratch.q, q)?;
         let k_buf = upload_f32_scratch(&mut self.device, &mut self.scratch.k, k)?;
         let v_buf = upload_f32_scratch(&mut self.device, &mut self.scratch.v, v)?;
-        let scores_buf =
-            ensure_scratch(&mut self.device, &mut self.scratch.scores, f32_slice_bytes(score_elems)?)?;
-        let probs_buf =
-            ensure_scratch(&mut self.device, &mut self.scratch.probs, f32_slice_bytes(score_elems)?)?;
-        let out_buf = ensure_scratch(&mut self.device, &mut self.scratch.out, f32_slice_bytes(q_elems)?)?;
+        let scores_buf = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.scores,
+            f32_slice_bytes(score_elems)?,
+        )?;
+        let probs_buf = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.probs,
+            f32_slice_bytes(score_elems)?,
+        )?;
+        let out_buf = ensure_scratch(
+            &mut self.device,
+            &mut self.scratch.out,
+            f32_slice_bytes(q_elems)?,
+        )?;
 
         let push = attention_push_constants(desc);
         let qk_spans = [
@@ -2033,7 +2167,10 @@ impl VulkanAttentionExecutor {
         self.device.submit_compute_span_stages(&stages)?;
         let mut output = vec![0.0_f32; q_elems];
         self.device.read_buffer_f32(out_buf, &mut output)?;
-        ensure_finite_f32(&output, "GPU pipelined attention produced non-finite output")?;
+        ensure_finite_f32(
+            &output,
+            "GPU pipelined attention produced non-finite output",
+        )?;
         Ok(AttentionOutput {
             output,
             witness: self.witness(plan, cache_key, 3),
@@ -2097,8 +2234,12 @@ impl VulkanAttentionExecutor {
         let scores_buf = ensure_scratch(&mut self.device, &mut self.scratch.scores, scratch_bytes)?;
         let probs_buf = ensure_scratch(&mut self.device, &mut self.scratch.probs, scratch_bytes)?;
 
-        self.device
-            .submit_compute(self.pipe_qk, &[q_buf, k_buf, scores_buf], push, plan.qk_workgroups)?;
+        self.device.submit_compute(
+            self.pipe_qk,
+            &[q_buf, k_buf, scores_buf],
+            push,
+            plan.qk_workgroups,
+        )?;
         if check_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -2113,12 +2254,19 @@ impl VulkanAttentionExecutor {
             return Err(Error::Cancelled);
         }
 
-        self.device
-            .submit_compute(self.pipe_pv, &[probs_buf, v_buf, out_buf], push, plan.pv_workgroups)?;
+        self.device.submit_compute(
+            self.pipe_pv,
+            &[probs_buf, v_buf, out_buf],
+            push,
+            plan.pv_workgroups,
+        )?;
 
         let mut output = vec![0.0_f32; q_elems];
         self.device.read_buffer_f32(out_buf, &mut output)?;
-        ensure_finite_f32(&output, "GPU decomposed attention produced non-finite output")?;
+        ensure_finite_f32(
+            &output,
+            "GPU decomposed attention produced non-finite output",
+        )?;
 
         let stages = if capture_stages {
             let mut scores = vec![0.0_f32; score_elems];
@@ -2126,7 +2274,10 @@ impl VulkanAttentionExecutor {
             self.device.read_buffer_f32(scores_buf, &mut scores)?;
             self.device.read_buffer_f32(probs_buf, &mut rounded_probs)?;
             ensure_finite_f32(&scores, "GPU attention scores produced non-finite values")?;
-            ensure_finite_f32(&rounded_probs, "GPU attention probs produced non-finite values")?;
+            ensure_finite_f32(
+                &rounded_probs,
+                "GPU attention probs produced non-finite values",
+            )?;
             Some(AttentionStageOutputs {
                 scores,
                 rounded_probs,
@@ -2179,7 +2330,12 @@ fn ensure_scratch(
     needed_bytes: u64,
 ) -> Result<BufferId, Error> {
     let req = needed_bytes.max(MIN_SCRATCH_BYTES);
-    let max_range = u64::from(device.capabilities().compute_limits.max_storage_buffer_range);
+    let max_range = u64::from(
+        device
+            .capabilities()
+            .compute_limits
+            .max_storage_buffer_range,
+    );
     if req > max_range {
         return Err(Error::ResourceLimit(format!(
             "scratch buffer ({req} B) exceeds maxStorageBufferRange ({max_range} B)"
@@ -2229,11 +2385,7 @@ fn checked_grid(device: &AdrenoVulkanDevice, grid: [u32; 3]) -> Result<[u32; 3],
         .capabilities()
         .compute_limits
         .max_compute_work_group_count;
-    if grid.contains(&0)
-        || grid[0] > max_wg[0]
-        || grid[1] > max_wg[1]
-        || grid[2] > max_wg[2]
-    {
+    if grid.contains(&0) || grid[0] > max_wg[0] || grid[1] > max_wg[1] || grid[2] > max_wg[2] {
         return Err(Error::ResourceLimit(
             "projection workgroup count out of maxComputeWorkGroupCount bounds".to_owned(),
         ));

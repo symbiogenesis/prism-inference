@@ -1978,7 +1978,10 @@ fn finish_i8mm_4x4(
 ) -> [[i32; 4]; 4] {
     let mut out = [[0_i32; 4]; 4];
     store_s32x4(
-        vsubq_s32(vcombine_s32(vget_low_s32(acc00), vget_low_s32(acc01)), sums_vec),
+        vsubq_s32(
+            vcombine_s32(vget_low_s32(acc00), vget_low_s32(acc01)),
+            sums_vec,
+        ),
         &mut out[0],
     );
     store_s32x4(
@@ -1989,7 +1992,10 @@ fn finish_i8mm_4x4(
         &mut out[1],
     );
     store_s32x4(
-        vsubq_s32(vcombine_s32(vget_low_s32(acc10), vget_low_s32(acc11)), sums_vec),
+        vsubq_s32(
+            vcombine_s32(vget_low_s32(acc10), vget_low_s32(acc11)),
+            sums_vec,
+        ),
         &mut out[2],
     );
     store_s32x4(
@@ -2172,8 +2178,16 @@ fn dot_pq2_eight_rows_four_tokens_precomputed_i8mm(
     activation_sums: [i32; 4],
 ) -> [[i32; 4]; 8] {
     let sums_vec = load_s32x4(&activation_sums);
-    let q0 = dot_pq2_4x4_stream_i8mm([packed[0], packed[1], packed[2], packed[3]], planes, sums_vec);
-    let q1 = dot_pq2_4x4_stream_i8mm([packed[4], packed[5], packed[6], packed[7]], planes, sums_vec);
+    let q0 = dot_pq2_4x4_stream_i8mm(
+        [packed[0], packed[1], packed[2], packed[3]],
+        planes,
+        sums_vec,
+    );
+    let q1 = dot_pq2_4x4_stream_i8mm(
+        [packed[4], packed[5], packed[6], packed[7]],
+        planes,
+        sums_vec,
+    );
     [q0[0], q0[1], q0[2], q0[3], q1[0], q1[1], q1[2], q1[3]]
 }
 
@@ -2184,10 +2198,16 @@ fn dot_pq2_eight_rows_four_tokens_precomputed_dotprod(
     activation_sums: [i32; 4],
 ) -> [[i32; 4]; 8] {
     let sums_vec = load_s32x4(&activation_sums);
-    let q0 =
-        dot_pq2_4x4_stream_dotprod([packed[0], packed[1], packed[2], packed[3]], planes, sums_vec);
-    let q1 =
-        dot_pq2_4x4_stream_dotprod([packed[4], packed[5], packed[6], packed[7]], planes, sums_vec);
+    let q0 = dot_pq2_4x4_stream_dotprod(
+        [packed[0], packed[1], packed[2], packed[3]],
+        planes,
+        sums_vec,
+    );
+    let q1 = dot_pq2_4x4_stream_dotprod(
+        [packed[4], packed[5], packed[6], packed[7]],
+        planes,
+        sums_vec,
+    );
     [q0[0], q0[1], q0[2], q0[3], q1[0], q1[1], q1[2], q1[3]]
 }
 
@@ -2562,12 +2582,18 @@ fn finish_scaled_chunk_4x4_i8mm<const FUSED: bool>(
     out_rows: &mut [[f32; 8]; 4],
     hi_quad: usize,
 ) {
-    let d0 = vsubq_s32(vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1])), sums_vec);
+    let d0 = vsubq_s32(
+        vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1])),
+        sums_vec,
+    );
     let d1 = vsubq_s32(
         vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1])),
         sums_vec,
     );
-    let d2 = vsubq_s32(vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3])), sums_vec);
+    let d2 = vsubq_s32(
+        vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3])),
+        sums_vec,
+    );
     let d3 = vsubq_s32(
         vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3])),
         sums_vec,
@@ -2701,12 +2727,16 @@ fn dot_scaled_8x8_chunks_dotprod<const FUSED: bool>(
                     &chunk[7][block_idx],
                 ];
                 let quads = [
-                    ([&a[0].values, &a[1].values, &a[2].values, &a[3].values],
-                     load_s32x4(&[a[0].sum, a[1].sum, a[2].sum, a[3].sum]),
-                     [a[0].scale, a[1].scale, a[2].scale, a[3].scale]),
-                    ([&a[4].values, &a[5].values, &a[6].values, &a[7].values],
-                     load_s32x4(&[a[4].sum, a[5].sum, a[6].sum, a[7].sum]),
-                     [a[4].scale, a[5].scale, a[6].scale, a[7].scale]),
+                    (
+                        [&a[0].values, &a[1].values, &a[2].values, &a[3].values],
+                        load_s32x4(&[a[0].sum, a[1].sum, a[2].sum, a[3].sum]),
+                        [a[0].scale, a[1].scale, a[2].scale, a[3].scale],
+                    ),
+                    (
+                        [&a[4].values, &a[5].values, &a[6].values, &a[7].values],
+                        load_s32x4(&[a[4].sum, a[5].sum, a[6].sum, a[7].sum]),
+                        [a[4].scale, a[5].scale, a[6].scale, a[7].scale],
+                    ),
                 ];
                 let out_halves = out_chunk.as_chunks_mut::<4>().0;
                 for (tok_quad, (planes, sums_vec, scales_arr)) in quads.into_iter().enumerate() {

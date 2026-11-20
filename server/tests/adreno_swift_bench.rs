@@ -154,18 +154,13 @@ mod live {
         let mut timings = bonsai_prism_runtime::runtime::GenerationTimings::default();
         let mut text = String::new();
         let gen_started = Instant::now();
-        let completion = session.complete_with_timings(
-            &prompt,
-            &cancellation,
-            None,
-            &mut timings,
-            |event| {
+        let completion =
+            session.complete_with_timings(&prompt, &cancellation, None, &mut timings, |event| {
                 if let TextEvent::Delta(chunk) = event {
                     text.push_str(chunk);
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         let total_ms = gen_started.elapsed().as_secs_f64() * 1000.0;
 
         let ingestion = timings.phase(GenerationPhase::PrefillIngestion);
@@ -234,18 +229,13 @@ mod live {
         let suffix_config = SuffixDraftConfig::new(2, 8, SPEC_DRAFT_TOKENS)?;
         let mut text = String::new();
         let gen_started = Instant::now();
-        let (completion, stats) = session.complete_speculative(
-            &prompt,
-            suffix_config,
-            &cancellation,
-            None,
-            |event| {
+        let (completion, stats) =
+            session.complete_speculative(&prompt, suffix_config, &cancellation, None, |event| {
                 if let TextEvent::Delta(chunk) = event {
                     text.push_str(chunk);
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         let total_dur = gen_started.elapsed();
         let total_ms = total_dur.as_secs_f64() * 1000.0;
 

@@ -439,7 +439,11 @@ mod tests {
     fn sample_scaled_8x8_fixture() -> ([[u8; 68]; 8], [[Pq2Activation; 2]; 32]) {
         let make_row = |row_idx: usize| -> [u8; 68] {
             let mut row = [0_u8; 68];
-            let s0: u16 = if row_idx.is_multiple_of(2) { 0x3c00 } else { 0xbc00 };
+            let s0: u16 = if row_idx.is_multiple_of(2) {
+                0x3c00
+            } else {
+                0xbc00
+            };
             let s1: u16 = 0x3800_u16.wrapping_add(u16::try_from(row_idx * 17).unwrap_or(0));
             row[..2].copy_from_slice(&s0.to_le_bytes());
             row[34..36].copy_from_slice(&s1.to_le_bytes());
@@ -478,9 +482,8 @@ mod tests {
 
         let (owned_rows, act_storage) = sample_scaled_8x8_fixture();
         let row_refs: [&[u8]; 8] = std::array::from_fn(|r| owned_rows[r].as_slice());
-        let chunk_slices: [[&[Pq2Activation]; 8]; 4] = std::array::from_fn(|c| {
-            std::array::from_fn(|t| act_storage[c * 8 + t].as_slice())
-        });
+        let chunk_slices: [[&[Pq2Activation]; 8]; 4] =
+            std::array::from_fn(|c| std::array::from_fn(|t| act_storage[c * 8 + t].as_slice()));
 
         #[cfg(target_arch = "aarch64")]
         let Some(detected) = crate::Pq2Dotprod::detect() else {
@@ -526,7 +529,11 @@ mod tests {
             }
         }
 
-        assert!(detected.dot_scaled_8x8_chunks::<true>(row_refs, &[], &mut []).is_none());
+        assert!(
+            detected
+                .dot_scaled_8x8_chunks::<true>(row_refs, &[], &mut [])
+                .is_none()
+        );
         let mut wrong_len = vec![[[0.0_f32; 8]; 8]; 2];
         assert!(
             detected

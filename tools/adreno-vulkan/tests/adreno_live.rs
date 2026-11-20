@@ -19,8 +19,7 @@ use bonsai_prism_runtime::{
     Decoder as _,
     graph::Qwen35,
     kernels::{
-        MatvecBackend, MatvecScratch, Pq2ProjectionExecutor, Q8Block, dot_ptq1_q8k, hadamard,
-        silu,
+        MatvecBackend, MatvecScratch, Pq2ProjectionExecutor, Q8Block, dot_ptq1_q8k, hadamard, silu,
     },
     model::{Model, Tensor},
 };
@@ -670,7 +669,12 @@ fn gpu_quantize_q8k_4plane_matches_cpu_bit_for_bit() -> TestResult {
     device.write_buffer_f32(in_buf, &act)?;
     let words_out = (cols / 128) * 34;
     let out_buf = device.create_storage_buffer(u64::try_from(words_out * 4)?)?;
-    device.submit_compute(pipe, &[in_buf, out_buf], &[u32::try_from(cols)?, 1], [u32::try_from(cols / 256)?, 1, 1])?;
+    device.submit_compute(
+        pipe,
+        &[in_buf, out_buf],
+        &[u32::try_from(cols)?, 1],
+        [u32::try_from(cols / 256)?, 1, 1],
+    )?;
 
     let mut raw_f32 = vec![0.0_f32; words_out];
     device.read_buffer_f32(out_buf, &mut raw_f32)?;
@@ -724,9 +728,11 @@ fn gpu_quantize_q8k_4plane_matches_cpu_bit_for_bit() -> TestResult {
     device.free_buffer(in_buf);
     for (idx, (&g, &e)) in gpu_u32.iter().zip(&expected).enumerate() {
         assert_eq!(
-            g, e,
+            g,
+            e,
             "q8k_4plane word {idx} (blk={}, w={}): gpu=0x{g:08x} cpu=0x{e:08x}",
-            idx / 34, idx % 34
+            idx / 34,
+            idx % 34
         );
     }
     Ok(())
@@ -782,7 +788,9 @@ fn f32_direct_and_group_tokens_match_cpu() -> TestResult {
     act_tie[32] = -3.5;
 
     let mut cpu_gate = Vec::new();
-    scratch.prepare(&gate, &act_tie)?.matvec_into(&gate, &mut cpu_gate)?;
+    scratch
+        .prepare(&gate, &act_tie)?
+        .matvec_into(&gate, &mut cpu_gate)?;
     let mut gpu_gate = Vec::new();
     exec.project_f32(&gate, &act_tie, false, &mut gpu_gate)?;
     assert_zero_ulp(&gpu_gate, &cpu_gate, "project_f32 with +/- tie");
@@ -825,7 +833,9 @@ fn f32_direct_and_group_tokens_match_cpu() -> TestResult {
     for (t, act) in tok_acts.iter().enumerate() {
         let mut ref_g = Vec::new();
         let mut ref_u = Vec::new();
-        scratch.prepare(&gate, act)?.matvec_into(&gate, &mut ref_g)?;
+        scratch
+            .prepare(&gate, act)?
+            .matvec_into(&gate, &mut ref_g)?;
         scratch.prepare(&up, act)?.matvec_into(&up, &mut ref_u)?;
         assert_zero_ulp(&gpu_toks[t], &ref_g, &format!("project_f32_tokens[{t}]"));
         assert_zero_ulp(&pair_a[t], &ref_g, &format!("pair_a[{t}]"));
@@ -849,7 +859,9 @@ fn f32_ffn_chain_hadamard_and_lora_match_cpu() -> TestResult {
     let act = fill_f32_pattern(cols, 0.125);
     let mut cpu_gate = Vec::new();
     let mut cpu_up = Vec::new();
-    scratch.prepare(&gate, &act)?.matvec_into(&gate, &mut cpu_gate)?;
+    scratch
+        .prepare(&gate, &act)?
+        .matvec_into(&gate, &mut cpu_gate)?;
     scratch.prepare(&up, &act)?.matvec_into(&up, &mut cpu_up)?;
 
     for pinned in [false, true] {
@@ -860,7 +872,12 @@ fn f32_ffn_chain_hadamard_and_lora_match_cpu() -> TestResult {
             .zip(&cpu_up)
             .map(|(&g, &u)| u * silu(g))
             .collect();
-        assert_close(&sw_out, &cpu_mid, 1e-4, &format!("ffn_swiglu pinned={pinned}"));
+        assert_close(
+            &sw_out,
+            &cpu_mid,
+            1e-4,
+            &format!("ffn_swiglu pinned={pinned}"),
+        );
     }
 
     let mut lora_a = vec![0.0_f32; inter];
@@ -881,14 +898,21 @@ fn f32_ffn_chain_hadamard_and_lora_match_cpu() -> TestResult {
         &mut chain_out,
     )?;
     let expected_dot: f32 = sw_out.iter().zip(&lora_a).map(|(&m, &a)| m * a).sum();
-    assert_close(&[gpu_lora_dot], &[expected_dot], 1e-4, "lora_dot pre-hadamard");
+    assert_close(
+        &[gpu_lora_dot],
+        &[expected_dot],
+        1e-4,
+        "lora_dot pre-hadamard",
+    );
 
     let mut rotated = sw_out;
     for chunk in rotated.as_chunks_mut::<256>().0 {
         hadamard(chunk)?;
     }
     let mut cpu_down = Vec::new();
-    scratch.prepare(&down, &rotated)?.matvec_into(&down, &mut cpu_down)?;
+    scratch
+        .prepare(&down, &rotated)?
+        .matvec_into(&down, &mut cpu_down)?;
     for (slot, &r) in cpu_down.iter_mut().zip(&residual) {
         *slot += r;
     }
@@ -1373,8 +1397,10 @@ fn bench_arm4_coalesced_and_ffn_chain() -> TestResult {
 
     let (g1_min, g1_med, g1_max) =
         time_ms_stats(|| exec.project_f32(&gate, &act1, true, &mut out1), 5)?;
-    let (g4_min, g4_med, g4_max) =
-        time_ms_stats(|| exec.project_f32_tokens(&gate, &acts4, true, &mut outs4), 5)?;
+    let (g4_min, g4_med, g4_max) = time_ms_stats(
+        || exec.project_f32_tokens(&gate, &acts4, true, &mut outs4),
+        5,
+    )?;
     let (c1_min, c1_med, c1_max) = time_ms_stats(
         || {
             exec.project_f32_ffn_chain(

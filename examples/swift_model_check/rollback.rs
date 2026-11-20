@@ -1,6 +1,9 @@
 //! Source-graph cancellation evidence; never private HTTP service qualification.
 
-use super::{AdapterSelection, Representation, evidence_backend, load_graph, reject, valid_tokens};
+use super::{
+    AdapterSelection, MultiRankAdapterSelection, Representation, evidence_backend,
+    load_graph_with_adapters, reject, valid_tokens,
+};
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
     Decoder, Result,
@@ -224,6 +227,7 @@ pub(super) fn run(
     arguments: &[String],
     representation: Representation,
     adapter: Option<&AdapterSelection>,
+    multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
     if arguments.len() != 3 {
@@ -245,11 +249,27 @@ pub(super) fn run(
             "modelSha256":representation.model_sha256(),"representation":representation.name(),
             "adapterScaleBits":adapter.map(|selection| format!("{:08x}", selection.scale.to_bits())),
             "adapterSha256":adapter.map(|_| bonsai_prism_runtime::model::lora::SWIFT_ADAPTER_SHA256),
+            "multiRankAdapterSha256": serde_json::Value::Null,
+            "multiRankAdapterScaleBits": multi_rank_adapter.map(|selection| format!("{:08x}", selection.scale.to_bits())),
+            "multiRankAdapterMaxRank": serde_json::Value::Null,
             "rowWorkers":row_workers,"backendRequested":arguments[1],"promptTokens":prompt
         }),
     )?;
     let result = (|| {
-        let graph = load_graph(path, backend, representation, adapter, row_workers)?;
+        let (graph, multi_meta) = load_graph_with_adapters(
+            path,
+            backend,
+            representation,
+            adapter,
+            multi_rank_adapter,
+            row_workers,
+        )?;
+        if let Some(meta) = multi_meta {
+            receipt.value["multiRankAdapterSha256"] = json!(meta.sha256);
+            receipt.value["multiRankAdapterScaleBits"] =
+                json!(format!("{:08x}", meta.scale.to_bits()));
+            receipt.value["multiRankAdapterMaxRank"] = json!(meta.max_rank);
+        }
         receipt.step("exact-model-and-profile-loaded")?;
         exercise(graph, &prompt, evidence, &mut receipt)
     })();

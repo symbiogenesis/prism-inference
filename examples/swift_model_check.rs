@@ -8,15 +8,15 @@ mod request_timing;
 #[path = "swift_model_check/rollback.rs"]
 mod rollback;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use bonsai_native_hash::Hasher;
-use bonsai_prism_runtime::graph::{Qwen35, StateComponent};
+use bonsai_prism_runtime::graph::{KvCachePolicy, Qwen35, StateComponent};
 use bonsai_prism_runtime::kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism};
-use bonsai_prism_runtime::model::lora::RankOneAdapter;
+use bonsai_prism_runtime::model::lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter};
 use bonsai_prism_runtime::model::swift::{self, Representation};
 use bonsai_prism_runtime::runtime::greedy;
 use bonsai_prism_runtime::token_input::read_tokens;
@@ -36,6 +36,7 @@ const USAGE: &str = concat!(
     "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
     "For load/forward/trajectory/rollback/request-timing/ffn-timing, --row-workers <1..18> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
     "For selected current-weight load/forward/trajectory/rollback/request-timing/ffn-timing, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
+    "For load/forward/rollback, optionally prefix --multi-rank-adapter <absolute-gguf>[:<scale-0..2>] (default scale 0.0; NpuFriendly policy) alongside or without --rank-one-adapter.\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
@@ -75,7 +76,11 @@ fn run() -> Result<()> {
     let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let representation = select_representation(&mut arguments);
     let row_workers = select_row_workers(&mut arguments)?;
-    let adapter = select_adapter(&mut arguments)?;
+    let mut adapter = select_adapter(&mut arguments)?;
+    let multi_rank_adapter = select_multi_rank_adapter(&mut arguments)?;
+    if adapter.is_none() {
+        adapter = select_adapter(&mut arguments)?;
+    }
     if arguments.len() == 1 && arguments[0] == "--help" {
         std::io::stdout().lock().write_all(USAGE.as_bytes())?;
         return Ok(());
@@ -102,7 +107,11 @@ fn run() -> Result<()> {
         ));
     }
     if mode == "inspect" {
-        if arguments.len() != 2 || adapter.is_some() || row_workers.is_some() {
+        if arguments.len() != 2
+            || adapter.is_some()
+            || multi_rank_adapter.is_some()
+            || row_workers.is_some()
+        {
             return Err(reject("inspect takes only the model path"));
         }
         return report(
@@ -111,57 +120,67 @@ fn run() -> Result<()> {
             representation,
         );
     }
+    if !matches!(mode.as_str(), "load" | "forward" | "rollback") && multi_rank_adapter.is_some() {
+        return Err(reject(
+            "--multi-rank-adapter is supported only for load, forward, and rollback",
+        ));
+    }
+    dispatch_mode(
+        mode,
+        &path,
+        &arguments[2..],
+        representation,
+        adapter.as_ref(),
+        multi_rank_adapter.as_ref(),
+        row_workers.unwrap_or(1),
+    )
+}
+
+fn dispatch_mode(
+    mode: &str,
+    path: &Path,
+    tail: &[String],
+    representation: Representation,
+    adapter: Option<&AdapterSelection>,
+    multi_rank_adapter: Option<&MultiRankAdapterSelection>,
+    row_workers: usize,
+) -> Result<()> {
     if mode == "load" {
-        if arguments.len() != 2 {
+        if !tail.is_empty() {
             return Err(reject("load takes only the model path"));
         }
-        let graph = load_graph(
-            &path,
+        let (graph, _) = load_graph_with_adapters(
+            path,
             MatvecBackend::Auto,
             representation,
-            adapter.as_ref(),
-            row_workers.unwrap_or(1),
+            adapter,
+            multi_rank_adapter,
+            row_workers,
         )?;
         return emit(
             &json!({"event":"graph-ready","identity":graph.identity(),"vocabulary":graph.vocab_size(),"initial_checkpoint_bytes":graph.checkpoint_bytes(),"maximum_live_state_payload_bytes":swift::STATE_PAYLOAD_BYTES,"full_attention_blocks":16,"recurrent_blocks":48,"row_workers":graph.row_workers(),"parallel_row_operations":graph.backend_statistics().parallel_row_operations}),
         );
     }
-    match mode.as_str() {
+    match mode {
         "forward" => forward(
-            &path,
-            &arguments[2..],
+            path,
+            tail,
             representation,
-            adapter.as_ref(),
-            row_workers.unwrap_or(1),
+            adapter,
+            multi_rank_adapter,
+            row_workers,
         ),
-        "trajectory" => trajectory(
-            &path,
-            &arguments[2..],
-            representation,
-            adapter.as_ref(),
-            row_workers.unwrap_or(1),
-        ),
+        "trajectory" => trajectory(path, tail, representation, adapter, row_workers),
         "rollback" => rollback::run(
-            &path,
-            &arguments[2..],
+            path,
+            tail,
             representation,
-            adapter.as_ref(),
-            row_workers.unwrap_or(1),
+            adapter,
+            multi_rank_adapter,
+            row_workers,
         ),
-        "request-timing" => request_timing::run(
-            &path,
-            &arguments[2..],
-            representation,
-            adapter.as_ref(),
-            row_workers.unwrap_or(1),
-        ),
-        "ffn-timing" => ffn_timing::run(
-            &path,
-            &arguments[2..],
-            representation,
-            adapter.as_ref(),
-            row_workers.unwrap_or(1),
-        ),
+        "request-timing" => request_timing::run(path, tail, representation, adapter, row_workers),
+        "ffn-timing" => ffn_timing::run(path, tail, representation, adapter, row_workers),
         _ => Err(reject("unsupported evaluation mode")),
     }
 }
@@ -231,6 +250,102 @@ fn select_adapter(arguments: &mut Vec<String>) -> Result<Option<AdapterSelection
     Ok(Some(AdapterSelection { path, scale }))
 }
 
+struct MultiRankAdapterSelection {
+    path: PathBuf,
+    scale: f32,
+}
+
+struct MultiRankMetadata {
+    sha256: String,
+    max_rank: usize,
+    target_count: usize,
+    scale: f32,
+}
+
+fn split_multi_rank_path_and_scale(raw: &str) -> Result<(PathBuf, f32)> {
+    let (path_text, scale) = if let Some((prefix, suffix)) = raw.rsplit_once(':')
+        && !suffix.contains(['\\', '/'])
+    {
+        if suffix.is_empty() {
+            return Err(reject("multi-rank adapter scale after ':' cannot be empty"));
+        }
+        (prefix, suffix.parse::<f32>()?)
+    } else {
+        (raw, 0.0_f32)
+    };
+    let path = PathBuf::from(path_text);
+    if !path.is_absolute()
+        || path_text.contains(['%', '\0'])
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || !scale.is_finite()
+        || !(0.0..=2.0).contains(&scale)
+    {
+        return Err(reject(
+            "multi-rank adapter requires an expanded absolute path and finite scale in 0..2",
+        ));
+    }
+    Ok((path, scale))
+}
+
+fn select_multi_rank_adapter(
+    arguments: &mut Vec<String>,
+) -> Result<Option<MultiRankAdapterSelection>> {
+    if arguments
+        .first()
+        .is_none_or(|argument| argument != "--multi-rank-adapter")
+    {
+        return Ok(None);
+    }
+    if arguments.len() < 2 {
+        return Err(reject(
+            "multi-rank adapter requires an absolute path and optional ':scale'",
+        ));
+    }
+    let (path, scale) = split_multi_rank_path_and_scale(&arguments[1])?;
+    arguments.drain(..2);
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--multi-rank-adapter")
+    {
+        return Err(reject("duplicate multi-rank adapter selection"));
+    }
+    Ok(Some(MultiRankAdapterSelection { path, scale }))
+}
+
+fn hash_adapter_file(path: &Path) -> Result<(u64, String)> {
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(reject(
+            "multi-rank adapter must be a non-empty regular file",
+        ));
+    }
+    let mut hasher = Hasher::new()?;
+    let mut buffer = vec![0_u8; 65_536];
+    let mut read_bytes = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read])?;
+        read_bytes = read_bytes
+            .checked_add(u64::try_from(read)?)
+            .ok_or_else(|| reject("multi-rank adapter byte length overflow"))?;
+    }
+    if read_bytes != metadata.len() {
+        return Err(reject(
+            "multi-rank adapter byte length changed during hashing",
+        ));
+    }
+    Ok((read_bytes, hex::encode(hasher.finish()?)))
+}
+
 fn select_representation(arguments: &mut Vec<String>) -> Representation {
     if arguments
         .first()
@@ -271,29 +386,80 @@ fn load_graph(
     selection: Option<&AdapterSelection>,
     row_workers: usize,
 ) -> Result<Qwen35> {
+    let (graph, _) = load_graph_with_adapters(
+        path,
+        backend,
+        representation,
+        selection,
+        None,
+        row_workers,
+    )?;
+    Ok(graph)
+}
+
+fn load_graph_with_adapters(
+    path: &Path,
+    backend: MatvecBackend,
+    representation: Representation,
+    selection: Option<&AdapterSelection>,
+    multi_rank: Option<&MultiRankAdapterSelection>,
+    row_workers: usize,
+) -> Result<(Qwen35, Option<MultiRankMetadata>)> {
     // Reject unavailable worker counts before opening/hashing model artifacts.
     let parallelism = RowParallelism::new(row_workers)?;
     let (model, receipt) = swift::load_representation(path, MODEL_BUDGET, representation)?;
     report("weights-loaded", receipt, representation)?;
-    let mut graph = if let Some(selection) = selection {
+    let rank_one = if let Some(selection) = selection {
         let adapter =
             RankOneAdapter::load_swift_representation(&selection.path, &model, representation)?;
         emit(
             &json!({"event":"rank-one-adapter-loaded", "weight_representation":representation.name(), "model_sha256":representation.model_sha256(), "adapter_sha256":adapter.identity(), "target_pairs":adapter.target_count(), "scale":selection.scale, "scale_bits":format!("{:08x}", selection.scale.to_bits()), "qualification":"unqualified-basis-logits-quality-resources-and-service; original activation basis; no adapter permutation"}),
         )?;
-        Qwen35::with_rank_one_adapter(
-            model,
-            swift::CONTEXT_TOKENS,
-            1024 * 1024 * 1024,
-            backend,
-            adapter,
-            selection.scale,
-        )?
+        Some((adapter, selection.scale))
     } else {
-        Qwen35::with_state_budget(model, swift::CONTEXT_TOKENS, 1024 * 1024 * 1024, backend)?
+        None
     };
+    let (multi_adapter, multi_metadata) = if let Some(selection) = multi_rank {
+        let (bytes, sha256) = hash_adapter_file(&selection.path)?;
+        let loaded = MultiRankAdapter::load_verified(
+            &model,
+            &selection.path,
+            bytes,
+            &sha256,
+            512 * 1024 * 1024,
+            MultiRankPolicy::NpuFriendly,
+        )?;
+        let metadata = MultiRankMetadata {
+            sha256,
+            max_rank: loaded.max_rank(),
+            target_count: loaded.target_count(),
+            scale: selection.scale,
+        };
+        emit(&json!({
+            "event": "multi-rank-adapter-loaded",
+            "weight_representation": representation.name(),
+            "model_sha256": representation.model_sha256(),
+            "multi_rank_adapter_sha256": metadata.sha256,
+            "multi_rank_target_pairs": metadata.target_count,
+            "multi_rank_max_rank": metadata.max_rank,
+            "multi_rank_scale": metadata.scale,
+            "multi_rank_scale_bits": format!("{:08x}", metadata.scale.to_bits()),
+        }))?;
+        (Some((loaded, selection.scale)), Some(metadata))
+    } else {
+        (None, None)
+    };
+    let mut graph = Qwen35::with_adapters_and_kv(
+        model,
+        swift::CONTEXT_TOKENS,
+        1024 * 1024 * 1024,
+        backend,
+        rank_one,
+        multi_adapter,
+        KvCachePolicy::F16,
+    )?;
     graph.set_row_parallelism(parallelism);
-    Ok(graph)
+    Ok((graph, multi_metadata))
 }
 
 fn forward(
@@ -301,6 +467,7 @@ fn forward(
     arguments: &[String],
     representation: Representation,
     adapter: Option<&AdapterSelection>,
+    multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
     if arguments.len() != 3 {
@@ -316,7 +483,14 @@ fn forward(
     if !valid_tokens(&tokens) || tokens.len() > 16 {
         return Err(reject("forward requires 1..16 valid token IDs"));
     }
-    let mut graph = load_graph(path, backend, representation, adapter, row_workers)?;
+    let (mut graph, multi_metadata) = load_graph_with_adapters(
+        path,
+        backend,
+        representation,
+        adapter,
+        multi_rank_adapter,
+        row_workers,
+    )?;
     let mut logits = Vec::new();
     let mut remaining = usize::MAX;
     for (position, token) in tokens.into_iter().enumerate() {
@@ -324,9 +498,26 @@ fn forward(
         graph.evaluate_into(token, &mut logits)?;
         let evaluation_milliseconds = started.elapsed().as_secs_f64() * 1000.0;
         let output = snapshot(&graph, &logits, evidence, position, &mut remaining)?;
-        emit(
-            &json!({"event":"forward-step","position":position,"input_token":token,"greedy_token":greedy(&logits)?,"logits":output,"logit_count":logits.len(),"checkpoint_bytes":graph.checkpoint_bytes(),"identity":graph.identity(),"backend_requested":arguments[1],"row_workers":graph.row_workers(),"parallel_row_operations":graph.backend_statistics().parallel_row_operations,"evaluation_milliseconds":evaluation_milliseconds}),
-        )?;
+        let mut record = json!({
+            "event": "forward-step",
+            "position": position,
+            "input_token": token,
+            "greedy_token": greedy(&logits)?,
+            "logits": output,
+            "logit_count": logits.len(),
+            "checkpoint_bytes": graph.checkpoint_bytes(),
+            "identity": graph.identity(),
+            "backend_requested": arguments[1],
+            "row_workers": graph.row_workers(),
+            "parallel_row_operations": graph.backend_statistics().parallel_row_operations,
+            "evaluation_milliseconds": evaluation_milliseconds,
+        });
+        if let Some(meta) = &multi_metadata {
+            record["multiRankAdapterSha256"] = json!(meta.sha256);
+            record["multiRankAdapterScaleBits"] = json!(format!("{:08x}", meta.scale.to_bits()));
+            record["multiRankAdapterMaxRank"] = json!(meta.max_rank);
+        }
+        emit(&record)?;
     }
     Ok(())
 }
@@ -479,8 +670,8 @@ fn report(event: &str, receipt: swift::LoadReceipt, representation: Representati
 #[cfg(test)]
 mod tests {
     use super::{
-        Representation, Result, select_adapter, select_representation, select_row_workers,
-        write_values,
+        Representation, Result, select_adapter, select_multi_rank_adapter, select_representation,
+        select_row_workers, write_values,
     };
 
     #[test]
@@ -676,6 +867,59 @@ mod tests {
         assert!(!serialized.contains('\\'));
         assert!(!serialized.contains('/'));
         assert!(!serialized.contains("C:"));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_rank_adapter_selection_parses_optional_scale_and_drive_letters() -> Result<()> {
+        let path = std::env::temp_dir().join("daisyrose-lora.gguf");
+        let path_str = path.to_string_lossy().into_owned();
+
+        let mut default_args = vec![
+            "--multi-rank-adapter".to_owned(),
+            path_str.clone(),
+            "forward".to_owned(),
+        ];
+        let default_sel =
+            select_multi_rank_adapter(&mut default_args)?.ok_or("missing default multi-rank")?;
+        assert_eq!(default_sel.path, path);
+        assert_eq!(default_sel.scale.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(default_args, ["forward"]);
+
+        let mut scaled_args = vec![
+            "--multi-rank-adapter".to_owned(),
+            format!("{path_str}:0.5"),
+            "rollback".to_owned(),
+        ];
+        let scaled_sel =
+            select_multi_rank_adapter(&mut scaled_args)?.ok_or("missing scaled multi-rank")?;
+        assert_eq!(scaled_sel.path, path);
+        assert_eq!(scaled_sel.scale.to_bits(), 0.5_f32.to_bits());
+        assert_eq!(scaled_args, ["rollback"]);
+
+        for bad in [
+            "relative.gguf",
+            "relative.gguf:0.5",
+            &format!("{path_str}:"),
+            &format!("{path_str}:NaN"),
+            &format!("{path_str}:-0.1"),
+            &format!("{path_str}:2.1"),
+            "%TEMP%\\daisyrose.gguf:0.5",
+        ] {
+            let mut bad_args = vec!["--multi-rank-adapter".to_owned(), bad.to_owned()];
+            assert!(
+                select_multi_rank_adapter(&mut bad_args).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+
+        let mut duplicate = vec![
+            "--multi-rank-adapter".to_owned(),
+            path_str.clone(),
+            "--multi-rank-adapter".to_owned(),
+            path_str,
+        ];
+        assert!(select_multi_rank_adapter(&mut duplicate).is_err());
         Ok(())
     }
 }

@@ -58,7 +58,7 @@ if(MSVC)
   target_compile_options(prism-upstream-server-context PRIVATE /utf-8)
 endif()
 
-add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp jinja.hpp codec.hpp peg.hpp chat_templates.hpp chat_parser.hpp chat_auto.hpp vocab.hpp vocab_session.hpp model_runtime.hpp chat_analysis.hpp public_c_abi.c public_c_abi.h arg_parser.hpp model_resolution.hpp chat.hpp generated_model.hpp optimizer.hpp dspark.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp codec_buffers.hpp)
+add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp jinja.hpp codec.hpp peg.hpp chat_templates.hpp chat_parser.hpp chat_auto.hpp vocab.hpp vocab_session.hpp model_runtime.hpp chat_analysis.hpp arg_parser.hpp model_resolution.hpp chat.hpp generated_model.hpp optimizer.hpp dspark.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp codec_buffers.hpp)
 target_include_directories(prism-upstream-common-bridge PRIVATE "${PRISM_SOURCE_DIR}/src" "${PRISM_SOURCE_DIR}" "${PRISM_SOURCE_DIR}/ggml/src")
 target_link_libraries(prism-upstream-common-bridge PRIVATE llama-common mtmd prism-upstream-server-context)
 # The same-revision CI tool bundle also supplies the small ggml-only wrapper.
@@ -72,7 +72,6 @@ if(MSVC)
   set_property(SOURCE bridge.cpp APPEND PROPERTY COMPILE_OPTIONS /EHs /EHc-)
 endif()
 
-set_source_files_properties(public_c_abi.c PROPERTIES LANGUAGE C)
 set_target_properties(prism-upstream-common-bridge PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 
 # Actual production LoRA exporter; no upstream test translation unit.

@@ -22,7 +22,6 @@
 #include "dspark.hpp"
 #include "backend_ops.hpp"
 #include "backend_session.hpp"
-#include "public_c_abi.h"
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -101,9 +100,7 @@ void validate_operation(const wire_json & operation) {
     require(operation.is_object() && operation.contains("Kind") && operation.at("Kind").is_string(),
             "operation Kind must be a string");
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (kind == "public-c-abi") {
-        require_keys(operation, {"Kind"});
-    } else if (prism_jinja::handles(kind)) {
+    if (prism_jinja::handles(kind)) {
         prism_jinja::validate(operation);
     } else if (prism_codec::handles(kind)) {
         prism_codec::validate(operation);
@@ -136,14 +133,6 @@ void validate_operation(const wire_json & operation) {
 
 wire_json execute(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (kind == "public-c-abi") {
-        const auto value = prism_public_c_abi_observe();
-        return wire_json{{"ModelParams", {{"Size", value.model_params_size}, {"Alignment", value.model_params_alignment}}},
-                {"ContextParams", {{"Size", value.context_params_size}, {"Alignment", value.context_params_alignment}}},
-                {"Batch", {{"Size", value.batch_size}, {"Alignment", value.batch_alignment}}},
-                {"TokenSize", value.token_size}, {"PositionSize", value.position_size},
-                {"SequenceIdSize", value.sequence_id_size}, {"CStandard", value.c_standard}};
-    }
     if (prism_jinja::handles(kind)) {
         return prism_jinja::execute(operation);
     }

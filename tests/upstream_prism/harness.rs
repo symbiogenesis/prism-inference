@@ -101,6 +101,7 @@ mod reference_logging;
 mod reference_mtmd;
 mod reference_mtmd_chunks;
 mod reference_provider;
+mod reference_public_c_abi;
 mod reference_quantization;
 mod reference_reasoning;
 mod reference_sampling;
@@ -323,7 +324,12 @@ const CASES: &[Case] = &[
         Bridge::Common,
         chat_analysis::run,
     ),
-    register("test-c", "tests/test-c.c", Bridge::Common, public_c::run),
+    register(
+        "test-c",
+        "tests/test-c.c",
+        Bridge::Independent,
+        public_c::run,
+    ),
     register(
         "test-tokenizer-1-spm",
         "tests/test-tokenizer-1-spm.cpp",

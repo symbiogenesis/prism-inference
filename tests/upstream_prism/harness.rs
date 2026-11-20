@@ -94,6 +94,7 @@ mod reference_allocation;
 mod reference_arena_graph;
 mod reference_arg_parser;
 mod reference_batch_allocator;
+mod reference_chat_templates;
 mod reference_codec;
 mod reference_codec_buffers;
 mod reference_dspark_logsnr;
@@ -419,7 +420,7 @@ const CASES: &[Case] = &[
     register(
         "test-chat-template",
         "tests/test-chat-template.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         chat_template::run,
     ),
     register(

@@ -165,7 +165,7 @@ const BUILTIN_INVENTORY: &[(&str, &[&str])] = &[
 // Error classification (wire errors vs Jinja phase exceptions)
 // ---------------------------------------------------------------------------
 
-enum JinjaError {
+pub(super) enum JinjaError {
     Standard(String),
     NotImplemented(String),
 }
@@ -177,6 +177,12 @@ impl JinjaError {
 
     fn unimpl(message: impl Into<String>) -> Self {
         Self::NotImplemented(message.into())
+    }
+
+    pub(super) fn message(&self) -> &str {
+        match self {
+            Self::Standard(msg) | Self::NotImplemented(msg) => msg,
+        }
     }
 
     fn into_wire(self, runtime_phase: bool) -> Value {
@@ -191,7 +197,7 @@ impl JinjaError {
     }
 }
 
-type JResult<T> = std::result::Result<T, JinjaError>;
+pub(super) type JResult<T> = std::result::Result<T, JinjaError>;
 
 // ---------------------------------------------------------------------------
 // Streaming 64-bit block hasher
@@ -255,13 +261,13 @@ impl BlockHasher {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-struct TextSpan {
-    bytes: Vec<u8>,
-    is_input: bool,
+pub(super) struct TextSpan {
+    pub(super) bytes: Vec<u8>,
+    pub(super) is_input: bool,
 }
 
 #[derive(Clone, Debug)]
-struct JVal(Rc<RefCell<ValCell>>);
+pub(super) struct JVal(Rc<RefCell<ValCell>>);
 
 #[derive(Clone, Debug)]
 struct ValCell {
@@ -298,35 +304,43 @@ impl JVal {
         })))
     }
 
-    fn undefined() -> Self {
+    pub(super) fn undefined() -> Self {
         Self::new(ValKind::Undefined)
     }
 
-    fn none() -> Self {
+    pub(super) fn none() -> Self {
         Self::new(ValKind::None)
     }
 
-    fn boolean(flag: bool) -> Self {
+    pub(super) fn boolean(flag: bool) -> Self {
         Self::new(ValKind::Bool(flag))
     }
 
-    fn int(num: i64) -> Self {
+    pub(super) fn int(num: i64) -> Self {
         Self::new(ValKind::Int(num))
     }
 
-    fn float(num: f64) -> Self {
+    pub(super) fn float(num: f64) -> Self {
         Self::new(ValKind::Float(num))
     }
 
-    fn bytes(raw: Vec<u8>, is_input: bool) -> Self {
+    pub(super) fn bytes(raw: Vec<u8>, is_input: bool) -> Self {
         Self::new(ValKind::String(vec![TextSpan {
             bytes: raw,
             is_input,
         }]))
     }
 
-    fn text_str(text: impl Into<String>) -> Self {
+    pub(super) fn text_str(text: impl Into<String>) -> Self {
         Self::bytes(text.into().into_bytes(), false)
+    }
+
+    pub(super) fn array(elems: Vec<Self>) -> Self {
+        Self::new(ValKind::Array(elems))
+    }
+
+    pub(super) fn object(pairs: Vec<(Self, Self)>) -> Self {
+        Self::new(ValKind::Object(pairs))
     }
 
     fn kind_cloned(&self) -> ValKind {
@@ -345,15 +359,15 @@ impl JVal {
         self.0.borrow_mut().used = true;
     }
 
-    fn is_used(&self) -> bool {
+    pub(super) fn is_used(&self) -> bool {
         self.0.borrow().used
     }
 
-    fn is_array_access(&self) -> bool {
+    pub(super) fn is_array_access(&self) -> bool {
         self.0.borrow().array_access
     }
 
-    fn is_string(&self) -> bool {
+    pub(super) fn is_string(&self) -> bool {
         matches!(self.0.borrow().kind, ValKind::String(_))
     }
 
@@ -361,7 +375,7 @@ impl JVal {
         matches!(self.0.borrow().kind, ValKind::Int(_))
     }
 
-    fn is_undefined(&self) -> bool {
+    pub(super) fn is_undefined(&self) -> bool {
         matches!(self.0.borrow().kind, ValKind::Undefined)
     }
 
@@ -523,7 +537,7 @@ impl JVal {
         }
     }
 
-    fn raw_bytes(&self) -> Vec<u8> {
+    pub(super) fn raw_bytes(&self) -> Vec<u8> {
         self.mark_recursive();
         let mut out = Vec::new();
         let mut steps = 0_usize;
@@ -685,7 +699,7 @@ impl JVal {
         }
     }
 
-    fn set_member(&self, key: Self, value: Self) -> JResult<()> {
+    pub(super) fn set_member(&self, key: Self, value: Self) -> JResult<()> {
         self.ensure_acyclic_insert(&value)?;
         self.ensure_acyclic_insert(&key)?;
         let kind_snapshot = self.kind_cloned();
@@ -718,7 +732,7 @@ impl JVal {
         }
     }
 
-    fn lookup_exact_key(&self, wanted: &[u8]) -> Option<Self> {
+    pub(super) fn lookup_exact_key(&self, wanted: &[u8]) -> Option<Self> {
         let cell = self.0.borrow();
         let ValKind::Object(pairs) = &cell.kind else {
             return None;
@@ -731,7 +745,7 @@ impl JVal {
         None
     }
 
-    fn lookup_exact_index(&self, idx: usize) -> Option<Self> {
+    pub(super) fn lookup_exact_index(&self, idx: usize) -> Option<Self> {
         let cell = self.0.borrow();
         let ValKind::Array(elems) = &cell.kind else {
             return None;
@@ -764,7 +778,7 @@ impl JVal {
         Ok(())
     }
 
-    fn deep_clone_fresh(&self) -> Self {
+    pub(super) fn deep_clone_fresh(&self) -> Self {
         match self.kind_cloned() {
             ValKind::Undefined => Self::undefined(),
             ValKind::None => Self::none(),
@@ -953,6 +967,7 @@ fn merge_spans(spans: Vec<TextSpan>) -> Vec<TextSpan> {
 
 struct VarSeed {
     depth: usize,
+    max_depth: usize,
 }
 
 impl<'de> DeserializeSeed<'de> for VarSeed {
@@ -962,15 +977,19 @@ impl<'de> DeserializeSeed<'de> for VarSeed {
         self,
         deserializer: D,
     ) -> std::result::Result<JVal, D::Error> {
-        if self.depth > MAX_JSON_DEPTH {
-            return Err(de::Error::custom("variables nesting exceeds 32 limit"));
+        if self.depth > self.max_depth {
+            return Err(de::Error::custom("variables nesting exceeds limit"));
         }
-        deserializer.deserialize_any(VarVisitor { depth: self.depth })
+        deserializer.deserialize_any(VarVisitor {
+            depth: self.depth,
+            max_depth: self.max_depth,
+        })
     }
 }
 
 struct VarVisitor {
     depth: usize,
+    max_depth: usize,
 }
 
 impl<'de> Visitor<'de> for VarVisitor {
@@ -1014,6 +1033,7 @@ impl<'de> Visitor<'de> for VarVisitor {
         let mut elems = Vec::new();
         while let Some(item) = seq.next_element_seed(VarSeed {
             depth: self.depth + 1,
+            max_depth: self.max_depth,
         })? {
             elems.push(item);
         }
@@ -1029,6 +1049,7 @@ impl<'de> Visitor<'de> for VarVisitor {
             }
             let val = map.next_value_seed(VarSeed {
                 depth: self.depth + 1,
+                max_depth: self.max_depth,
             })?;
             pairs.push((JVal::text_str(key), val));
         }
@@ -1036,16 +1057,28 @@ impl<'de> Visitor<'de> for VarVisitor {
     }
 }
 
-fn parse_variables_json(text: &str) -> Result<JVal> {
-    if text.len() > MAX_VARIABLES_BYTES {
-        return Err(invalid("variables exceed 256 KiB limit"));
+pub(super) fn parse_json_jval_bounded(
+    text: &str,
+    max_bytes: usize,
+    max_depth: usize,
+) -> Result<JVal> {
+    if text.len() > max_bytes {
+        return Err(invalid("JSON variables exceed byte limit"));
     }
     let mut de = serde_json::Deserializer::from_str(text);
-    let root = VarSeed { depth: 0 }
-        .deserialize(&mut de)
-        .map_err(|err| invalid(format!("invalid variables JSON: {err}")))?;
+    let root = VarSeed {
+        depth: 0,
+        max_depth,
+    }
+    .deserialize(&mut de)
+    .map_err(|err| invalid(format!("invalid variables JSON: {err}")))?;
     de.end()
         .map_err(|err| invalid(format!("trailing variables JSON: {err}")))?;
+    Ok(root)
+}
+
+pub(super) fn parse_variables_json(text: &str) -> Result<JVal> {
+    let root = parse_json_jval_bounded(text, MAX_VARIABLES_BYTES, MAX_JSON_DEPTH)?;
     if !matches!(root.kind_cloned(), ValKind::Object(_)) {
         return Err(invalid("variables JSON must contain an object"));
     }
@@ -1567,9 +1600,9 @@ enum BlockSegment {
     Tag(String),
 }
 
-fn scan_template_segments(source: &str) -> JResult<Vec<BlockSegment>> {
-    if source.len() > MAX_TEMPLATE_BYTES {
-        return Err(JinjaError::std("Jinja template exceeds 64 KiB bound"));
+fn scan_template_segments(source: &str, max_bytes: usize) -> JResult<Vec<BlockSegment>> {
+    if source.len() > max_bytes {
+        return Err(JinjaError::std("Jinja template exceeds byte bound"));
     }
     let trailing_nl = source.ends_with('\n');
     let mut normalized = source.replace("\r\n", "\n").replace('\r', "\n");
@@ -1881,8 +1914,12 @@ impl StmtParser {
     }
 }
 
-fn parse_template(source: &str) -> JResult<Vec<Stmt>> {
-    let segments = scan_template_segments(source)?;
+/// Parsed Jinja template program.
+#[derive(Clone, Debug)]
+pub(super) struct Program(Vec<Stmt>);
+
+pub(super) fn parse_template_with_limit(source: &str, max_bytes: usize) -> JResult<Program> {
+    let segments = scan_template_segments(source, max_bytes)?;
     let mut parser = StmtParser {
         segments,
         cursor: 0,
@@ -1892,7 +1929,11 @@ fn parse_template(source: &str) -> JResult<Vec<Stmt>> {
     if parser.cursor != parser.segments.len() {
         return Err(JinjaError::std("unexpected Jinja closing tag"));
     }
-    Ok(program)
+    Ok(Program(program))
+}
+
+pub(super) fn parse_template(source: &str) -> JResult<Program> {
+    parse_template_with_limit(source, MAX_TEMPLATE_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -1912,10 +1953,11 @@ struct Evaluator {
     stmt_depth: usize,
     expr_depth: usize,
     output_bytes: usize,
+    now_unix_seconds: Option<i64>,
 }
 
 impl Evaluator {
-    fn new(globals: &JVal) -> Self {
+    fn new_with_now(globals: &JVal, now_unix_seconds: Option<i64>) -> Self {
         let root_scope = if let ValKind::Object(pairs) = globals.kind_cloned() {
             pairs
                 .into_iter()
@@ -1930,6 +1972,7 @@ impl Evaluator {
             stmt_depth: 0,
             expr_depth: 0,
             output_bytes: 0,
+            now_unix_seconds,
         }
     }
 
@@ -2573,7 +2616,29 @@ impl Evaluator {
             let extra = pos_args.get(1..).unwrap_or_default();
             return Ok(JVal::boolean(self.eval_test(&target, test_name, extra)?));
         }
-        if name == "strftime_now" || name == "slice" {
+        if name == "strftime_now" {
+            let Some(unix_secs) = self.now_unix_seconds else {
+                return Err(JinjaError::unimpl(
+                    "Jinja builtin 'strftime_now' is not implemented",
+                ));
+            };
+            if pos_args.len() > 1 {
+                return Err(JinjaError::std("strftime_now accepts one format argument"));
+            }
+            let fmt_val = if let Some(val) = kw_args.get("format") {
+                val.clone()
+            } else if let Some(val) = pos_args.first() {
+                val.clone()
+            } else {
+                return Err(JinjaError::std("strftime_now requires a format string"));
+            };
+            let fmt_bytes = fmt_val.raw_bytes();
+            let fmt_str = std::str::from_utf8(&fmt_bytes)
+                .map_err(|_| JinjaError::std("strftime_now format must be valid UTF-8"))?;
+            let formatted = format_strftime_utc(unix_secs, fmt_str)?;
+            return Ok(JVal::bytes(formatted.into_bytes(), false));
+        }
+        if name == "slice" {
             return Err(JinjaError::unimpl(format!(
                 "Jinja builtin '{name}' is not implemented"
             )));
@@ -4304,25 +4369,182 @@ fn validate_operation(op_val: &Value) -> Result<ValidatedOp> {
     }
 }
 
-fn eval_program(program: &[Stmt], globals: &JVal) -> JResult<Vec<TextSpan>> {
-    let mut evaluator = Evaluator::new(globals);
-    let mut out = Vec::new();
-    evaluator.exec_block(program, &mut out)?;
+struct UtcCalendar {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    wday: i64,
+    month_idx: usize,
+    wday_idx: usize,
+    yday: i64,
+}
+
+fn utc_calendar_from_unix(unix_secs: i64) -> JResult<UtcCalendar> {
+    const CUM_DAYS: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    if !(-62_167_219_200..=253_402_300_799).contains(&unix_secs) {
+        return Err(JinjaError::std("strftime_now timestamp outside UTC range"));
+    }
+    let days = unix_secs.div_euclid(86_400);
+    let secs_of_day = unix_secs.rem_euclid(86_400);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    let wday = (days + 4).rem_euclid(7);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    let is_leap = (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0);
+    let month_idx = usize::try_from(month - 1).map_err(|_| JinjaError::std("invalid UTC month"))?;
+    let wday_idx = usize::try_from(wday).map_err(|_| JinjaError::std("invalid UTC weekday"))?;
+    let yday = CUM_DAYS[month_idx] + i64::from(is_leap && month > 2) + day;
+    Ok(UtcCalendar {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        wday,
+        month_idx,
+        wday_idx,
+        yday,
+    })
+}
+
+fn format_strftime_utc(unix_secs: i64, fmt: &str) -> JResult<String> {
+    use std::fmt::Write as _;
+
+    const MONTH_ABBR: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const MONTH_FULL: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    const WDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const WDAY_FULL: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+
+    let cal = utc_calendar_from_unix(unix_secs)?;
+    let (year, month, day) = (cal.year, cal.month, cal.day);
+    let (hour, minute, second) = (cal.hour, cal.minute, cal.second);
+    let (wday, month_idx, wday_idx, yday) = (cal.wday, cal.month_idx, cal.wday_idx, cal.yday);
+
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        let Some(spec) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        let write_res = match spec {
+            'Y' => write!(out, "{year:04}"),
+            'y' => write!(out, "{:02}", year.rem_euclid(100)),
+            'm' => write!(out, "{month:02}"),
+            'd' => write!(out, "{day:02}"),
+            'e' => write!(out, "{day:2}"),
+            'H' => write!(out, "{hour:02}"),
+            'I' => write!(
+                out,
+                "{:02}",
+                match hour % 12 {
+                    0 => 12,
+                    val => val,
+                }
+            ),
+            'M' => write!(out, "{minute:02}"),
+            'S' => write!(out, "{second:02}"),
+            'p' => out.write_str(if hour < 12 { "AM" } else { "PM" }),
+            'P' => out.write_str(if hour < 12 { "am" } else { "pm" }),
+            'b' | 'h' => out.write_str(MONTH_ABBR[month_idx]),
+            'B' => out.write_str(MONTH_FULL[month_idx]),
+            'a' => out.write_str(WDAY_ABBR[wday_idx]),
+            'A' => out.write_str(WDAY_FULL[wday_idx]),
+            'w' => write!(out, "{wday}"),
+            'u' => write!(out, "{}", if wday == 0 { 7 } else { wday }),
+            'j' => write!(out, "{yday:03}"),
+            'F' => write!(out, "{year:04}-{month:02}-{day:02}"),
+            'T' => write!(out, "{hour:02}:{minute:02}:{second:02}"),
+            'R' => write!(out, "{hour:02}:{minute:02}"),
+            'D' => write!(out, "{month:02}/{day:02}/{:02}", year.rem_euclid(100)),
+            'z' => out.write_str("+0000"),
+            'Z' => out.write_str("UTC"),
+            'n' => out.write_str("\n"),
+            't' => out.write_str("\t"),
+            '%' => out.write_str("%"),
+            's' => write!(out, "{unix_secs}"),
+            other => {
+                out.push('%');
+                out.push(other);
+                Ok(())
+            }
+        };
+        write_res.map_err(|_| JinjaError::std("strftime_now formatting failed"))?;
+    }
     Ok(out)
 }
 
-fn execute_caps(template: &str) -> JResult<Value> {
+pub(super) fn eval_program_with_now(
+    program: &Program,
+    globals: &JVal,
+    now_unix_seconds: Option<i64>,
+) -> JResult<Vec<TextSpan>> {
+    let mut evaluator = Evaluator::new_with_now(globals, now_unix_seconds);
+    let mut out = Vec::new();
+    evaluator.exec_block(&program.0, &mut out)?;
+    Ok(out)
+}
+
+pub(super) fn eval_program(program: &Program, globals: &JVal) -> JResult<Vec<TextSpan>> {
+    eval_program_with_now(program, globals, None)
+}
+
+pub(super) fn execute_caps_flags(
+    program: &Program,
+    now_unix_seconds: Option<i64>,
+) -> JResult<(bool, bool)> {
     const CAPS_PROBE_JSON: &str = r#"{"messages":[{"role":"user","content":"STRING_MARKER"}],"tools":[],"bos_token":"","eos_token":"","add_generation_prompt":true}"#;
-    let program = parse_template(template)?;
     let probe_vars =
         parse_variables_json(CAPS_PROBE_JSON).map_err(|err| JinjaError::std(err.to_string()))?;
     let mut rendered_bytes = Vec::new();
-    let succeeded = eval_program(&program, &probe_vars).is_ok_and(|spans| {
-        for span in spans {
-            rendered_bytes.extend(span.bytes);
-        }
-        true
-    });
+    let succeeded =
+        eval_program_with_now(program, &probe_vars, now_unix_seconds).is_ok_and(|spans| {
+            for span in spans {
+                rendered_bytes.extend(span.bytes);
+            }
+            true
+        });
     let typed = probe_vars
         .lookup_exact_key(b"messages")
         .and_then(|msgs| msgs.lookup_exact_index(0))
@@ -4332,6 +4554,12 @@ fn execute_caps(template: &str) -> JResult<Value> {
         .windows(b"STRING_MARKER".len())
         .any(|win| win == b"STRING_MARKER");
     let string_supported = succeeded && (!typed || has_marker);
+    Ok((string_supported, typed))
+}
+
+fn execute_caps(template: &str) -> JResult<Value> {
+    let program = parse_template(template)?;
+    let (string_supported, typed) = execute_caps_flags(&program, None)?;
     Ok(json!({
         "SupportsStringContent": string_supported,
         "SupportsTypedContent": typed,

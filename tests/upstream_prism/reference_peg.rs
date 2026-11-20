@@ -51,13 +51,13 @@ pub(super) const INVALID_PARSER_ID: ParserId = usize::MAX;
 /// Bit flags controlling PEG parse behavior.
 pub(super) mod parse_flags {
     /// Default complete-input parsing mode.
+    pub(in super::super) const NONE: u8 = 0;
+    /// Partial/streaming input mode (`NEED_MORE_INPUT` allowed at input horizon).
     #[allow(
         dead_code,
         reason = "Exposed for Stage 2-4 chat PEG/auto/chat providers"
     )]
-    pub(super) const NONE: u8 = 0;
-    /// Partial/streaming input mode (`NEED_MORE_INPUT` allowed at input horizon).
-    pub(super) const IS_PARTIAL: u8 = 1 << 0;
+    pub(in super::super) const IS_PARTIAL: u8 = 1 << 0;
 }
 
 /// Outcome category of a PEG parse attempt.
@@ -72,7 +72,8 @@ pub(super) enum ParseResultType {
 }
 
 impl ParseResultType {
-    const fn as_u8(self) -> u8 {
+    /// Returns the numeric wire code (`0` = Fail, `1` = Success, `2` = `NeedMoreInput`).
+    pub(super) const fn as_u8(self) -> u8 {
         match self {
             Self::Fail => 0,
             Self::Success => 1,
@@ -787,6 +788,35 @@ impl ParserBuilder {
         id
     }
 
+    /// Reserves a placeholder rule node and registers it before building its body.
+    pub(super) fn begin_rule_lazy(&mut self, name: impl Into<String>, trigger: bool) -> ParserId {
+        let name = name.into();
+        let placeholder = self.push(ParserNode::Rule {
+            name: name.clone(),
+            child: INVALID_PARSER_ID,
+            trigger,
+        });
+        self.rules.insert(name, placeholder);
+        placeholder
+    }
+
+    /// Completes a placeholder rule reserved by [`Self::begin_rule_lazy`].
+    pub(super) fn finish_rule_lazy(
+        &mut self,
+        placeholder: ParserId,
+        name: impl Into<String>,
+        child: ParserId,
+        trigger: bool,
+    ) {
+        if let Some(slot) = self.parsers.get_mut(placeholder) {
+            *slot = ParserNode::Rule {
+                name: name.into(),
+                child,
+                trigger,
+            };
+        }
+    }
+
     /// Defines a named rule lazily via callback (`rule-lazy`).
     pub(super) fn rule_lazy<F>(
         &mut self,
@@ -798,20 +828,9 @@ impl ParserBuilder {
         F: FnOnce(&mut Self) -> Result<ParserId>,
     {
         let name = name.into();
-        let placeholder = self.push(ParserNode::Rule {
-            name: name.clone(),
-            child: INVALID_PARSER_ID,
-            trigger,
-        });
-        self.rules.insert(name.clone(), placeholder);
+        let placeholder = self.begin_rule_lazy(name.clone(), trigger);
         let child = build_body(self)?;
-        if let Some(slot) = self.parsers.get_mut(placeholder) {
-            *slot = ParserNode::Rule {
-                name,
-                child,
-                trigger,
-            };
-        }
+        self.finish_rule_lazy(placeholder, name, child, trigger);
         Ok(placeholder)
     }
 
@@ -1902,14 +1921,27 @@ impl Arena {
 
     /// Generates a GBNF grammar string from the arena (`lazy` = trigger-only mode).
     pub(super) fn build_grammar(&self, lazy: bool) -> Result<String> {
-        let mut emitter = GbnfEmitter::new(self);
+        let mut emitter = GbnfEmitter::new(self, None);
+        Self::finish_grammar(&mut emitter, lazy)
+    }
+
+    /// Generates a GBNF grammar string with a custom hook for parser-ID overrides (e.g., `schema` nodes).
+    pub(super) fn build_grammar_with_hook<F>(&self, lazy: bool, mut hook: F) -> Result<String>
+    where
+        F: FnMut(ParserId, &mut BTreeMap<String, String>) -> Result<Option<String>>,
+    {
+        let mut emitter = GbnfEmitter::new(self, Some(&mut hook));
+        Self::finish_grammar(&mut emitter, lazy)
+    }
+
+    fn finish_grammar(emitter: &mut GbnfEmitter<'_, '_>, lazy: bool) -> Result<String> {
         if lazy {
             emitter.emit_lazy()?;
         } else {
             emitter.emit_eager()?;
         }
         let mut output = String::new();
-        for (name, body) in emitter.rules {
+        for (name, body) in &emitter.rules {
             let _ = writeln!(output, "{name} ::= {body}");
         }
         Ok(output)
@@ -2270,22 +2302,27 @@ impl GbnfExpr {
     }
 }
 
-struct GbnfEmitter<'a> {
+type SchemaHook<'b> =
+    &'b mut dyn FnMut(ParserId, &mut BTreeMap<String, String>) -> Result<Option<String>>;
+
+struct GbnfEmitter<'a, 'b> {
     arena: &'a Arena,
     rules: BTreeMap<String, String>,
     rule_names: BTreeMap<ParserId, String>,
     emitted_rules: BTreeSet<String>,
     subrule_counter: usize,
+    schema_hook: Option<SchemaHook<'b>>,
 }
 
-impl<'a> GbnfEmitter<'a> {
-    const fn new(arena: &'a Arena) -> Self {
+impl<'a, 'b> GbnfEmitter<'a, 'b> {
+    const fn new(arena: &'a Arena, schema_hook: Option<SchemaHook<'b>>) -> Self {
         Self {
             arena,
             rules: BTreeMap::new(),
             rule_names: BTreeMap::new(),
             emitted_rules: BTreeSet::new(),
             subrule_counter: 0,
+            schema_hook,
         }
     }
 
@@ -2590,6 +2627,11 @@ impl<'a> GbnfEmitter<'a> {
     }
 
     fn emit_expr(&mut self, id: ParserId) -> Result<GbnfExpr> {
+        if let Some(hook) = self.schema_hook.as_deref_mut()
+            && let Some(rule_name) = hook(id, &mut self.rules)?
+        {
+            return Ok(GbnfExpr::atom(rule_name));
+        }
         let node = self
             .arena
             .parsers
@@ -2818,7 +2860,7 @@ fn build_ac_dfa_gbnf(
     prefix: &str,
     delims: &[&str],
     is_ac: bool,
-    emitter: &mut GbnfEmitter<'_>,
+    emitter: &mut GbnfEmitter<'_, '_>,
 ) -> String {
     let nodes = build_ac_trie(delims);
 

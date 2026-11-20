@@ -95,6 +95,7 @@ mod reference_arena_graph;
 mod reference_arg_parser;
 mod reference_batch_allocator;
 mod reference_chat_analysis;
+mod reference_chat_parser;
 mod reference_chat_templates;
 mod reference_codec;
 mod reference_codec_buffers;
@@ -403,7 +404,7 @@ const CASES: &[Case] = &[
     register(
         "test-chat-peg-parser",
         "tests/test-chat-peg-parser.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         chat_peg::run,
     ),
     register(

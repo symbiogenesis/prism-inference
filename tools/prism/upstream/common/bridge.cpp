@@ -1,6 +1,5 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
-#include "chat_parser.hpp"
 #include "chat_auto.hpp"
 #include "vocab.hpp"
 #include "model_runtime.hpp"
@@ -85,9 +84,7 @@ void validate_operation(const wire_json & operation) {
     require(operation.is_object() && operation.contains("Kind") && operation.at("Kind").is_string(),
             "operation Kind must be a string");
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (prism_chat_parser::handles(kind)) {
-        prism_chat_parser::validate(operation);
-    } else if (prism_chat_auto::handles(kind)) {
+    if (prism_chat_auto::handles(kind)) {
         prism_chat_auto::validate(operation);
     } else if (prism_vocab::handles(kind)) {
         prism_vocab::validate(operation);
@@ -102,9 +99,6 @@ void validate_operation(const wire_json & operation) {
 
 wire_json execute(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (prism_chat_parser::handles(kind)) {
-        return prism_chat_parser::execute(operation);
-    }
     if (prism_chat_auto::handles(kind)) {
         return prism_chat_auto::execute(operation);
     }

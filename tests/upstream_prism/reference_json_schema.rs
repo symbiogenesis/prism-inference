@@ -46,22 +46,33 @@ fn bounded_preview(text: &str) -> String {
 
 // Insertion-order preserving JSON value & parser.
 
+/// Insertion-order-preserving JSON DOM value for JSON Schema inspection and conversion.
 #[derive(Clone, Debug, PartialEq)]
-enum JsonVal {
+pub(super) enum JsonVal {
+    /// JSON `null`.
     Null,
+    /// JSON boolean.
     Bool(bool),
+    /// JSON number retaining original lexeme and integer/float representations.
     Number {
+        /// Original JSON number lexeme.
         raw: String,
+        /// Exact signed 64-bit integer value when integral and in range.
         int_value: Option<i64>,
+        /// Finite IEEE 754 `f64` value.
         float_value: f64,
     },
+    /// JSON string.
     Str(String),
+    /// JSON array.
     Array(Vec<Self>),
+    /// JSON object preserving key insertion order.
     Object(Vec<(String, Self)>),
 }
 
 impl JsonVal {
-    fn get(&self, key: &str) -> &Self {
+    /// Returns the property value for `key`, or `JsonVal::Null` if absent.
+    pub(super) fn get(&self, key: &str) -> &Self {
         if let Self::Object(entries) = self {
             entries
                 .iter()
@@ -72,11 +83,13 @@ impl JsonVal {
         }
     }
 
-    fn has(&self, key: &str) -> bool {
+    /// Returns `true` if `self` is an object containing `key`.
+    pub(super) fn has(&self, key: &str) -> bool {
         matches!(self, Self::Object(entries) if entries.iter().any(|(name, _)| name == key))
     }
 
-    fn text(&self) -> Option<&str> {
+    /// Returns the inner string slice if `self` is `JsonVal::Str`.
+    pub(super) fn text(&self) -> Option<&str> {
         if let Self::Str(value) = self {
             Some(value.as_str())
         } else {
@@ -84,7 +97,8 @@ impl JsonVal {
         }
     }
 
-    fn array(&self) -> &[Self] {
+    /// Returns the inner slice if `self` is `JsonVal::Array`, otherwise empty.
+    pub(super) fn array(&self) -> &[Self] {
         if let Self::Array(values) = self {
             values.as_slice()
         } else {
@@ -92,7 +106,8 @@ impl JsonVal {
         }
     }
 
-    fn object(&self) -> &[(String, Self)] {
+    /// Returns the key-value entries if `self` is `JsonVal::Object`, otherwise empty.
+    pub(super) fn object(&self) -> &[(String, Self)] {
         if let Self::Object(entries) = self {
             entries.as_slice()
         } else {
@@ -100,11 +115,13 @@ impl JsonVal {
         }
     }
 
-    fn is(&self, expected: &str) -> bool {
+    /// Returns `true` if `self` is `JsonVal::Str(expected)`.
+    pub(super) fn is(&self, expected: &str) -> bool {
         self.text() == Some(expected)
     }
 
-    const fn number(&self) -> Option<i64> {
+    /// Returns the exact integer value if `self` is an integral `JsonVal::Number`.
+    pub(super) const fn number(&self) -> Option<i64> {
         if let Self::Number { int_value, .. } = self {
             *int_value
         } else {
@@ -112,7 +129,8 @@ impl JsonVal {
         }
     }
 
-    fn set(&mut self, key: &str, value: Self) {
+    /// Inserts or updates `key` on a `JsonVal::Object`.
+    pub(super) fn set(&mut self, key: &str, value: Self) {
         if let Self::Object(entries) = self {
             if let Some((_, existing)) = entries.iter_mut().find(|(name, _)| name == key) {
                 *existing = value;
@@ -122,19 +140,22 @@ impl JsonVal {
         }
     }
 
-    fn remove(&mut self, key: &str) {
+    /// Removes `key` from a `JsonVal::Object`.
+    pub(super) fn remove(&mut self, key: &str) {
         if let Self::Object(entries) = self {
             entries.retain(|(name, _)| name != key);
         }
     }
 
-    const fn empty(&self) -> bool {
+    /// Returns `true` for `Null`, empty `Array`, or empty `Object`.
+    pub(super) const fn empty(&self) -> bool {
         matches!(self, Self::Null)
             || matches!(self, Self::Array(values) if values.is_empty())
             || matches!(self, Self::Object(entries) if entries.is_empty())
     }
 
-    fn dump(&self) -> String {
+    /// Serializes `self` to compact JSON preserving key order and number lexemes.
+    pub(super) fn dump(&self) -> String {
         let mut out = String::new();
         self.write_dump(&mut out);
         out
@@ -193,7 +214,8 @@ fn write_json_string(text: &str, out: &mut String) {
     out.push('"');
 }
 
-struct JsonParser<'a> {
+/// Bounded, insertion-order-preserving JSON parser.
+pub(super) struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
@@ -207,7 +229,15 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_root(input: &'a str) -> std::result::Result<JsonVal, String> {
-        if input.len() > MAX_SCHEMA_BYTES {
+        Self::parse_with_limit(input, MAX_SCHEMA_BYTES)
+    }
+
+    /// Parses a JSON value enforcing `max_bytes` and nesting/duplicate-key bounds.
+    pub(super) fn parse_with_limit(
+        input: &'a str,
+        max_bytes: usize,
+    ) -> std::result::Result<JsonVal, String> {
+        if input.len() > max_bytes {
             return Err("schema JSON exceeds source byte bound".to_owned());
         }
         let mut parser = Self::new(input);
@@ -481,9 +511,29 @@ impl<'a> JsonParser<'a> {
 
 // Local `$ref` resolution and `resolves_to_string` inspection.
 
-fn resolve_refs_walk(
+fn lookup_json_pointer<'a>(root: &'a JsonVal, reference: &str) -> Option<&'a JsonVal> {
+    let rest = reference.strip_prefix("#/")?;
+    let mut target = root;
+    for key in rest.split('/') {
+        target = match target {
+            JsonVal::Object(values) => values
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
+            JsonVal::Array(values) => key
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| values.get(index)),
+            _ => None,
+        }?;
+    }
+    Some(target)
+}
+
+fn resolve_refs_walk_with_roots(
     node: &JsonVal,
     root: &JsonVal,
+    extra_roots: &[JsonVal],
     refs: &mut BTreeMap<String, JsonVal>,
     depth: usize,
 ) -> std::result::Result<(), String> {
@@ -492,7 +542,7 @@ fn resolve_refs_walk(
     }
     if let JsonVal::Array(values) = node {
         for value in values {
-            resolve_refs_walk(value, root, refs, depth + 1)?;
+            resolve_refs_walk_with_roots(value, root, extra_roots, refs, depth + 1)?;
         }
         return Ok(());
     }
@@ -504,34 +554,38 @@ fn resolve_refs_walk(
         if refs.contains_key(reference) {
             return Ok(());
         }
-        let Some(rest) = reference.strip_prefix("#/") else {
+        if !reference.starts_with("#/") {
             return Err(format!("unsupported schema ref {reference}"));
-        };
-        let mut target = root;
-        for key in rest.split('/') {
-            target = match target {
-                JsonVal::Object(values) => values
-                    .iter()
-                    .find(|(name, _)| name == key)
-                    .map(|(_, value)| value),
-                JsonVal::Array(values) => key
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| values.get(index)),
-                _ => None,
-            }
-            .ok_or_else(|| format!("unresolved schema ref {reference}"))?;
         }
+        let target = lookup_json_pointer(root, reference)
+            .or_else(|| {
+                extra_roots
+                    .iter()
+                    .find_map(|extra| lookup_json_pointer(extra, reference))
+            })
+            .ok_or_else(|| format!("unresolved schema ref {reference}"))?
+            .clone();
         refs.insert(reference.to_owned(), target.clone());
+        resolve_refs_walk_with_roots(&target, root, extra_roots, refs, depth + 1)?;
         return Ok(());
     }
     for (_, value) in node.object() {
-        resolve_refs_walk(value, root, refs, depth + 1)?;
+        resolve_refs_walk_with_roots(value, root, extra_roots, refs, depth + 1)?;
     }
     Ok(())
 }
 
-fn check_resolves_to_string(
+fn resolve_refs_walk(
+    node: &JsonVal,
+    root: &JsonVal,
+    refs: &mut BTreeMap<String, JsonVal>,
+    depth: usize,
+) -> std::result::Result<(), String> {
+    resolve_refs_walk_with_roots(node, root, &[], refs, depth)
+}
+
+/// Returns `true` when `node` resolves to a JSON string schema under `refs`.
+pub(super) fn check_resolves_to_string(
     node: &JsonVal,
     refs: &BTreeMap<String, JsonVal>,
     visited: &mut BTreeSet<String>,
@@ -1215,9 +1269,11 @@ impl PatternParser<'_> {
 struct SchemaConverter {
     rules: BTreeMap<String, String>,
     refs: BTreeMap<String, JsonVal>,
+    extra_roots: Vec<JsonVal>,
     resolving: BTreeSet<String>,
     depth: usize,
     dotall: bool,
+    raw: bool,
 }
 
 impl SchemaConverter {
@@ -1225,9 +1281,11 @@ impl SchemaConverter {
         Self {
             rules: BTreeMap::from([("space".into(), "| \" \" | \"\\n\"{1,2} [ \\t]{0,20}".into())]),
             refs: BTreeMap::new(),
+            extra_roots: Vec::new(),
             resolving: BTreeSet::new(),
             depth: 0,
             dotall: false,
+            raw: false,
         }
     }
 
@@ -1281,7 +1339,7 @@ impl SchemaConverter {
     }
 
     fn resolve(&mut self, schema: &JsonVal) -> std::result::Result<(), String> {
-        resolve_refs_walk(schema, schema, &mut self.refs, 0)
+        resolve_refs_walk_with_roots(schema, schema, &self.extra_roots, &mut self.refs, 0)
     }
 
     fn reference(&mut self, reference: &str) -> std::result::Result<String, String> {
@@ -1292,11 +1350,27 @@ impl SchemaConverter {
         if self.rules.contains_key(&name) || !self.resolving.insert(reference.to_owned()) {
             return Ok(name);
         }
-        let resolved = self
-            .refs
-            .get(reference)
-            .cloned()
-            .ok_or_else(|| format!("unresolved schema ref {reference}"))?;
+        let resolved = if let Some(found) = self.refs.get(reference).cloned() {
+            found
+        } else {
+            let found = self
+                .extra_roots
+                .iter()
+                .find_map(|extra| lookup_json_pointer(extra, reference))
+                .cloned()
+                .ok_or_else(|| format!("unresolved schema ref {reference}"))?;
+            self.refs.insert(reference.to_owned(), found.clone());
+            for extra in &self.extra_roots {
+                let _ = resolve_refs_walk_with_roots(
+                    &found,
+                    extra,
+                    &self.extra_roots,
+                    &mut self.refs,
+                    0,
+                );
+            }
+            found
+        };
         let result = self.visit(&resolved, &name);
         self.resolving.remove(reference);
         result
@@ -1320,7 +1394,11 @@ impl SchemaConverter {
             if parser.depth != 0 {
                 return Err(PatternError::Invalid);
             }
-            Ok(format!("\"\\\"\" ({rule}) \"\\\"\""))
+            if self.raw {
+                Ok(format!("({rule})"))
+            } else {
+                Ok(format!("\"\\\"\" ({rule}) \"\\\"\""))
+            }
         })();
         match outcome {
             Ok(rule) => Ok(self.add(name, &rule)),
@@ -1405,6 +1483,10 @@ impl SchemaConverter {
         result
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Preserves object property/additionalProperties grammar construction cleanly"
+    )]
     fn object_rule(
         &mut self,
         properties: &[(String, JsonVal)],
@@ -1420,97 +1502,103 @@ impl SchemaConverter {
         } else {
             format!("{name}-")
         };
-        let mut names = Vec::new();
-        let mut mandatory = Vec::new();
-        let mut optional = Vec::new();
-        let mut kv_rules = BTreeMap::new();
-        for (key, prop_schema) in properties {
-            let val_rule = self.visit(prop_schema, &format!("{prefix}{key}"))?;
-            let kv_body = format!(
-                "{} space \":\" space {val_rule}",
-                format_literal(&JsonVal::Str(key.clone()).dump())
-            );
-            let rule = self.add(&format!("{prefix}{key}-kv"), &kv_body);
-            kv_rules.insert(key.clone(), rule);
-            names.push(key.clone());
-            if required.contains(key) {
-                mandatory.push(key.clone());
-            } else {
-                optional.push(key.clone());
-            }
-        }
-        if matches!(additional, JsonVal::Bool(true) | JsonVal::Object(_)) {
-            let subname = format!("{prefix}additional");
-            let val_rule = if matches!(additional, JsonVal::Object(_)) {
-                self.visit(additional, &format!("{subname}-value"))?
-            } else {
-                self.primitive("value", "value")?
-            };
-            let key_rule = if names.is_empty() {
-                self.primitive("string", "string")?
-            } else {
-                let expr = self.not_strings(&names)?;
-                self.add(&format!("{subname}-k"), &expr)
-            };
-            let rule = self.add(
-                &format!("{subname}-kv"),
-                &format!("{key_rule} \":\" space {val_rule}"),
-            );
-            kv_rules.insert("*".into(), rule);
-            optional.push("*".into());
-        }
-        let mut seen_optional = false;
-        let mut interleaved = false;
-        for key in &names {
-            if required.contains(key) {
-                interleaved |= seen_optional;
-            } else {
-                seen_optional = true;
-            }
-        }
-        let declared = if interleaved
-            && names.first().is_some_and(|key| required.contains(key))
-            && !kv_rules.contains_key("*")
-        {
-            let mut out = format!("\"{{\" space {}", kv_rules[&names[0]]);
-            for key in &names[1..] {
-                let kv = format!(" \",\" space {}", kv_rules[key]);
+        let saved_raw = self.raw;
+        self.raw = false;
+        let res = (|| -> std::result::Result<String, String> {
+            let mut names = Vec::new();
+            let mut mandatory = Vec::new();
+            let mut optional = Vec::new();
+            let mut kv_rules = BTreeMap::new();
+            for (key, prop_schema) in properties {
+                let val_rule = self.visit(prop_schema, &format!("{prefix}{key}"))?;
+                let kv_body = format!(
+                    "{} space \":\" space {val_rule}",
+                    format_literal(&JsonVal::Str(key.clone()).dump())
+                );
+                let rule = self.add(&format!("{prefix}{key}-kv"), &kv_body);
+                kv_rules.insert(key.clone(), rule);
+                names.push(key.clone());
                 if required.contains(key) {
-                    out.push_str(&kv);
+                    mandatory.push(key.clone());
                 } else {
-                    let _ = write!(out, " ({kv} )?");
+                    optional.push(key.clone());
                 }
             }
+            if matches!(additional, JsonVal::Bool(true) | JsonVal::Object(_)) {
+                let subname = format!("{prefix}additional");
+                let val_rule = if matches!(additional, JsonVal::Object(_)) {
+                    self.visit(additional, &format!("{subname}-value"))?
+                } else {
+                    self.primitive("value", "value")?
+                };
+                let key_rule = if names.is_empty() {
+                    self.primitive("string", "string")?
+                } else {
+                    let expr = self.not_strings(&names)?;
+                    self.add(&format!("{subname}-k"), &expr)
+                };
+                let rule = self.add(
+                    &format!("{subname}-kv"),
+                    &format!("{key_rule} \":\" space {val_rule}"),
+                );
+                kv_rules.insert("*".into(), rule);
+                optional.push("*".into());
+            }
+            let mut seen_optional = false;
+            let mut interleaved = false;
+            for key in &names {
+                if required.contains(key) {
+                    interleaved |= seen_optional;
+                } else {
+                    seen_optional = true;
+                }
+            }
+            let declared = if interleaved
+                && names.first().is_some_and(|key| required.contains(key))
+                && !kv_rules.contains_key("*")
+            {
+                let mut out = format!("\"{{\" space {}", kv_rules[&names[0]]);
+                for key in &names[1..] {
+                    let kv = format!(" \",\" space {}", kv_rules[key]);
+                    if required.contains(key) {
+                        out.push_str(&kv);
+                    } else {
+                        let _ = write!(out, " ({kv} )?");
+                    }
+                }
+                out.push_str(" space \"}\"");
+                Some(out)
+            } else {
+                None
+            };
+            let mut out = format!(
+                "\"{{\" space {}",
+                mandatory
+                    .iter()
+                    .map(|key| kv_rules[key].clone())
+                    .collect::<Vec<_>>()
+                    .join(" \",\" space ")
+            );
+            if !optional.is_empty() {
+                out.push_str(" (");
+                if !mandatory.is_empty() {
+                    out.push_str(" \",\" space ( ");
+                }
+                let mut alts = Vec::new();
+                for index in 0..optional.len() {
+                    alts.push(self.optional_rest(&optional[index..], false, &kv_rules, &prefix));
+                }
+                out.push_str(&alts.join(" | "));
+                if !mandatory.is_empty() {
+                    out.push_str(" )");
+                }
+                out.push_str(" )?");
+            }
             out.push_str(" space \"}\"");
-            Some(out)
-        } else {
-            None
-        };
-        let mut out = format!(
-            "\"{{\" space {}",
-            mandatory
-                .iter()
-                .map(|key| kv_rules[key].clone())
-                .collect::<Vec<_>>()
-                .join(" \",\" space ")
-        );
-        if !optional.is_empty() {
-            out.push_str(" (");
-            if !mandatory.is_empty() {
-                out.push_str(" \",\" space ( ");
-            }
-            let mut alts = Vec::new();
-            for index in 0..optional.len() {
-                alts.push(self.optional_rest(&optional[index..], false, &kv_rules, &prefix));
-            }
-            out.push_str(&alts.join(" | "));
-            if !mandatory.is_empty() {
-                out.push_str(" )");
-            }
-            out.push_str(" )?");
-        }
-        out.push_str(" space \"}\"");
-        Ok(declared.map_or_else(|| out.clone(), |decl| format!("{decl} | {out}")))
+            Ok(declared.map_or_else(|| out.clone(), |decl| format!("{decl} | {out}")))
+        })();
+        self.raw = saved_raw;
+        res
     }
 
     fn visit(&mut self, schema: &JsonVal, name: &str) -> std::result::Result<String, String> {
@@ -1577,7 +1665,13 @@ impl SchemaConverter {
             return Ok(self.add(&rule_name, &rule));
         }
         if schema.has("const") {
-            let body = format_literal(&schema.get("const").dump());
+            let val = schema.get("const");
+            let body = if self.raw {
+                val.text()
+                    .map_or_else(|| format_literal(&val.dump()), format_literal)
+            } else {
+                format_literal(&val.dump())
+            };
             return Ok(self.add(&rule_name, &body));
         }
         if schema.has("enum") {
@@ -1585,7 +1679,14 @@ impl SchemaConverter {
                 .get("enum")
                 .array()
                 .iter()
-                .map(|v| format_literal(&v.dump()))
+                .map(|v| {
+                    if self.raw {
+                        v.text()
+                            .map_or_else(|| format_literal(&v.dump()), format_literal)
+                    } else {
+                        format_literal(&v.dump())
+                    }
+                })
                 .collect();
             return Ok(self.add(&rule_name, &format!("({})", vals.join(" | "))));
         }
@@ -1658,25 +1759,33 @@ impl SchemaConverter {
             } else {
                 "prefixItems"
             });
-            let rule = if let JsonVal::Array(tuple) = items {
+            let saved_raw = self.raw;
+            self.raw = false;
+            let rule_res = if let JsonVal::Array(tuple) = items {
                 let mut rules = Vec::new();
                 for (index, item) in tuple.iter().enumerate() {
                     rules.push(self.visit(item, &format!("{prefix}tuple-{index}"))?);
                 }
-                format!("\"[\" space {} space \"]\"", rules.join(" \",\" space "))
-            } else {
-                let item = self.visit(items, &format!("{prefix}item"))?;
-                format!(
+                Ok(format!(
                     "\"[\" space {} space \"]\"",
-                    repetition(
-                        &item,
-                        int_bound(schema, "minItems", 0)?,
-                        int_bound(schema, "maxItems", i32::MAX)?,
-                        "\",\" space"
-                    )
-                )
+                    rules.join(" \",\" space ")
+                ))
+            } else {
+                self.visit(items, &format!("{prefix}item"))
+                    .and_then(|item| {
+                        Ok(format!(
+                            "\"[\" space {} space \"]\"",
+                            repetition(
+                                &item,
+                                int_bound(schema, "minItems", 0)?,
+                                int_bound(schema, "maxItems", i32::MAX)?,
+                                "\",\" space"
+                            )
+                        ))
+                    })
             };
-            return Ok(self.add(&rule_name, &rule));
+            self.raw = saved_raw;
+            return Ok(self.add(&rule_name, &rule_res?));
         }
         if (matches!(kind, JsonVal::Null) || kind.is("string")) && schema.has("pattern") {
             let pat = schema
@@ -1691,11 +1800,22 @@ impl SchemaConverter {
                     suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'5')
                 })
             {
+                if self.raw {
+                    return Ok(self.add(
+                        if rule_name == "root" { "root" } else { fmt_str },
+                        r#"[0-9a-fA-F]{8} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{12}"#,
+                    ));
+                }
                 return self.primitive(if rule_name == "root" { "root" } else { fmt_str }, "uuid");
             }
             let prim = format!("{fmt_str}-string");
             if builtin(&prim).is_some() {
-                let value = self.primitive(&prim, &prim)?;
+                let target_kind = if self.raw && builtin(fmt_str).is_some() {
+                    fmt_str
+                } else {
+                    &prim
+                };
+                let value = self.primitive(target_kind, target_kind)?;
                 return Ok(self.add(&rule_name, &value));
             }
         }
@@ -1704,7 +1824,12 @@ impl SchemaConverter {
             let min_len = int_bound(schema, "minLength", 0)?;
             let max_len = int_bound(schema, "maxLength", i32::MAX)?;
             let rep = repetition(&ch_rule, min_len, max_len, "");
-            return Ok(self.add(&rule_name, &format!("\"\\\"\" {rep} \"\\\"\"")));
+            let body = if self.raw {
+                rep
+            } else {
+                format!("\"\\\"\" {rep} \"\\\"\"")
+            };
+            return Ok(self.add(&rule_name, &body));
         }
         if kind.is("integer")
             && ["minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum"]
@@ -1744,6 +1869,10 @@ impl SchemaConverter {
             .text()
             .filter(|k| builtin(k).is_some())
             .ok_or_else(|| format!("unrecognized schema {}", bounded_preview(&schema.dump())))?;
+        if self.raw && kind_name == "string" {
+            let ch_rule = self.primitive("char", "char")?;
+            return Ok(self.add(&rule_name, &format!("{ch_rule}*")));
+        }
         self.primitive(
             if rule_name == "root" {
                 "root"
@@ -1790,7 +1919,14 @@ impl SchemaConverter {
             }
         } else if component.has("enum") {
             for value in component.get("enum").array() {
-                *enums.entry(format_literal(&value.dump())).or_default() += 1;
+                let lit = if self.raw {
+                    value
+                        .text()
+                        .map_or_else(|| format_literal(&value.dump()), format_literal)
+                } else {
+                    format_literal(&value.dump())
+                };
+                *enums.entry(lit).or_default() += 1;
             }
         }
         Ok(())
@@ -1801,6 +1937,70 @@ fn int_bound(schema: &JsonVal, name: &str, default: i32) -> std::result::Result<
     schema.get(name).number().map_or(Ok(default), |value| {
         i32::try_from(value).map_err(|e| e.to_string())
     })
+}
+
+/// Stateful JSON Schema to GBNF converter preserving shared `$ref` definitions and rule tables.
+pub(super) struct SchemaGrammarContext {
+    converter: SchemaConverter,
+}
+
+impl SchemaGrammarContext {
+    /// Creates an empty schema grammar context.
+    pub(super) fn new() -> Self {
+        Self {
+            converter: SchemaConverter::new(),
+        }
+    }
+
+    /// Merges externally emitted GBNF rules before generating schema rules.
+    pub(super) fn merge_rules(&mut self, rules: &BTreeMap<String, String>) {
+        for (name, body) in rules {
+            self.converter
+                .rules
+                .entry(name.clone())
+                .or_insert_with(|| body.clone());
+        }
+    }
+
+    /// Registers a schema document for external `$ref` resolution.
+    pub(super) fn resolve_refs(&mut self, schema: &JsonVal) -> std::result::Result<(), String> {
+        self.converter.extra_roots.push(schema.clone());
+        resolve_refs_walk_with_roots(
+            schema,
+            schema,
+            &self.converter.extra_roots,
+            &mut self.converter.refs,
+            0,
+        )
+    }
+
+    /// Resolves refs and returns `true` when `schema` resolves to a JSON string.
+    pub(super) fn resolves_to_string(&self, schema: &JsonVal) -> bool {
+        let mut refs = self.converter.refs.clone();
+        let _ =
+            resolve_refs_walk_with_roots(schema, schema, &self.converter.extra_roots, &mut refs, 0);
+        let mut visited = BTreeSet::new();
+        check_resolves_to_string(schema, &refs, &mut visited, 0)
+    }
+
+    /// Converts `schema` into GBNF rules named under `name` and returns the root rule symbol.
+    pub(super) fn add_schema(
+        &mut self,
+        name: &str,
+        schema: &JsonVal,
+        raw: bool,
+    ) -> std::result::Result<String, String> {
+        self.converter.resolve(schema)?;
+        self.converter.raw = raw;
+        let res = self.converter.visit(schema, name);
+        self.converter.raw = false;
+        res
+    }
+
+    /// Returns the accumulated GBNF rules map.
+    pub(super) const fn rules(&self) -> &BTreeMap<String, String> {
+        &self.converter.rules
+    }
 }
 
 fn convert_to_gbnf(schema_json: &str, force_gbnf: bool) -> std::result::Result<String, String> {

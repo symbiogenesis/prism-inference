@@ -1,14 +1,38 @@
 #pragma once
 // Generic production chat calls. Rust owns all inputs, control flow and assertions.
-#include "chat_parser.hpp"
+#include "chat.h"
+#include "chat-peg-parser.h"
+#include "llama.h"
+#include "peg-parser.h"
 #include "tools/server/server-chat.h"
 #include "tools/server/server-common.h"
+#include <nlohmann/json.hpp>
 #include <chrono>
+#include <climits>
+#include <cstdint>
+#include <initializer_list>
+#include <map>
 #include <regex>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace prism_chat {
 using json=nlohmann::ordered_json;
-using prism_peg::require;using prism_peg::fields;using prism_peg::string;using prism_peg::integer;
+inline void require(bool value, const char * message) { if (!value) throw std::runtime_error(message); }
+inline void fields(const json & object, std::initializer_list<const char *> keys) {
+    require(object.is_object() && object.size() == keys.size(), "PEG fields mismatch");
+    for (const auto * key : keys) require(object.contains(key), "missing or unknown PEG field");
+}
+inline std::int64_t integer(const json & value, std::int64_t low, std::int64_t high) {
+    require(value.is_number_integer(), "PEG argument must be an integer");
+    if (value.is_number_unsigned()) require(value.get<std::uint64_t>() <= std::uint64_t(high), "PEG integer exceeds bound");
+    const auto result = value.get<std::int64_t>(); require(result >= low && result <= high, "PEG integer outside bound"); return result;
+}
+inline void string(const json & value, std::size_t maximum = 65536) {
+    require(value.is_string() && value.get_ref<const std::string &>().size() <= maximum, "PEG string exceeds bound");
+}
 inline bool handles(const std::string & kind){return kind=="chat-trace"||kind=="chat-value"||kind=="chat-server-params"||kind=="chat-generic-parse"||kind=="chat-regex";}
 inline std::string bytes(const json & x){require(x.is_array()&&x.size()<=1024*1024,"chat byte input exceeds bound");std::string s;for(const auto & v:x){integer(v,0,255);s.push_back(static_cast<char>(v.get<unsigned>()));}return s;}
 inline common_json raw(const json & x){string(x,4*1024*1024);return common_json::parse(x.get<std::string>());}

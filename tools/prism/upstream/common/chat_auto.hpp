@@ -1,12 +1,40 @@
 #pragma once
 // Generic production auto-parser observations; all workloads and assertions are Rust-owned.
-#include "chat_parser.hpp"
+#include "chat.h"
+#include "chat-auto-parser.h"
+#include "chat-auto-parser-helpers.h"
+#include "peg-parser.h"
+#include <nlohmann/json.hpp>
+#include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <optional>
+#include <stdexcept>
+#include <string>
 
 namespace prism_chat_auto {
 using json=nlohmann::ordered_json;
-using prism_peg::require;using prism_peg::fields;using prism_peg::string;using prism_peg::integer;
+inline void require(bool value, const char * message) { if (!value) throw std::runtime_error(message); }
+inline void fields(const json & object, std::initializer_list<const char *> keys) {
+    require(object.is_object() && object.size() == keys.size(), "PEG fields mismatch");
+    for (const auto * key : keys) require(object.contains(key), "missing or unknown PEG field");
+}
+inline std::int64_t integer(const json & value, std::int64_t low, std::int64_t high) {
+    require(value.is_number_integer(), "PEG argument must be an integer");
+    if (value.is_number_unsigned()) require(value.get<std::uint64_t>() <= std::uint64_t(high), "PEG integer exceeds bound");
+    const auto result = value.get<std::int64_t>(); require(result >= low && result <= high, "PEG integer outside bound"); return result;
+}
+inline void string(const json & value, std::size_t maximum = 65536) {
+    require(value.is_string() && value.get_ref<const std::string &>().size() <= maximum, "PEG string exceeds bound");
+}
+inline json wire_message(const common_chat_msg & msg) {
+    json tools = json::array();
+    for (const auto & tool : msg.tool_calls) tools.push_back(json{{"Name", tool.name}, {"Arguments", tool.arguments}, {"Id", tool.id}});
+    return json{{"Role", msg.role}, {"Content", msg.content}, {"ReasoningContent", msg.reasoning_content}, {"ToolCalls", tools}};
+}
+inline json wire_parse_result(const common_peg_parse_result & r) {
+    return json{{"Type", static_cast<int>(r.type)}, {"Start", r.start}, {"End", r.end}};
+}
 inline bool handles(const std::string & kind){return kind=="chat-helper"||kind=="chat-compare-variants"||kind=="chat-auto-trace";}
 inline common_json raw(const json & value){string(value,4*1024*1024);return common_json::parse(value.get<std::string>());}
 inline void validate_params(const json & value){const auto params=raw(value);require(params.is_object(),"chat template params must be object");for(const auto & item:params.items()){const auto & key=item.key();require(key=="messages"||key=="tools"||key=="add_generation_prompt"||key=="enable_thinking"||key=="extra_context","unknown chat template parameter");if(key=="add_generation_prompt"||key=="enable_thinking")require(item.value().is_boolean(),"chat template flag must be boolean");}}
@@ -36,7 +64,7 @@ inline json execute(const json & op){
     common_chat_template tmpl(op.at("Template").get<std::string>(),op.at("BosToken").get<std::string>(),op.at("EosToken").get<std::string>());
     if(kind=="chat-compare-variants") {const auto base=params(op.at("ParametersJson"));std::function<void(template_params &)> modifier=nullptr;if(!op.at("ModifierJson").is_null()){const auto variant=params(op.at("ModifierJson"));modifier=[variant](template_params & p){p=variant;};}const auto value=autoparser::compare_variants(tmpl,base,modifier);return value?json{{"has_value",true},{"diff",split(value->diff)},{"output_A",value->output_A},{"output_B",value->output_B}}:json{{"has_value",false},{"diff",nullptr},{"output_A",nullptr},{"output_B",nullptr}};}
     autoparser::autoparser analyzer;std::optional<common_peg_arena> parser;json trace=json::array();
-    for(const auto & action:op.at("Actions")){const auto kind=action.at("Kind").get<std::string>();if(kind=="analyze"){analyzer.analyze_template(tmpl);trace.push_back(json{{"analysis",analysis(analyzer)}});}else if(kind=="original-caps"){trace.push_back(json{{"caps",caps(tmpl.original_caps())}});}else if(kind=="build-parser"){const auto p=raw(action.at("ParametersJson"));autoparser::generation_params inputs;if(p.contains("tools"))inputs.tools=p.at("tools");if(p.contains("messages"))inputs.messages=p.at("messages");if(p.contains("json_schema"))inputs.json_schema=p.at("json_schema");if(p.contains("reasoning_format"))inputs.reasoning_format=static_cast<common_reasoning_format>(p.at("reasoning_format").get<int>());if(p.contains("tool_choice"))inputs.tool_choice=static_cast<common_chat_tool_choice>(p.at("tool_choice").get<int>());if(p.contains("parallel_tool_calls"))inputs.parallel_tool_calls=p.at("parallel_tool_calls").get<bool>();if(p.contains("enable_thinking"))inputs.enable_thinking=p.at("enable_thinking").get<bool>();if(p.contains("add_generation_prompt"))inputs.add_generation_prompt=p.at("add_generation_prompt").get<bool>();parser=analyzer.build_parser(inputs,action.at("GenerationPrompt").get<std::string>());trace.push_back(json::object());}else{std::string input;for(const auto & byte:action.at("Bytes"))input.push_back(static_cast<char>(byte.get<int>()));common_peg_parse_context context(input,static_cast<common_peg_parse_flags>(action.at("Flags").get<int>()));const auto result=parser->parse(context);json msg=nullptr;if(action.at("Map").get<bool>()){common_chat_msg value;common_chat_peg_mapper(value).from_ast(context.ast,result);msg=prism_chat_parser::message(value);}trace.push_back(json{{"result",prism_chat_parser::parse_result(result)},{"message",msg}});}}
+    for(const auto & action:op.at("Actions")){const auto kind=action.at("Kind").get<std::string>();if(kind=="analyze"){analyzer.analyze_template(tmpl);trace.push_back(json{{"analysis",analysis(analyzer)}});}else if(kind=="original-caps"){trace.push_back(json{{"caps",caps(tmpl.original_caps())}});}else if(kind=="build-parser"){const auto p=raw(action.at("ParametersJson"));autoparser::generation_params inputs;if(p.contains("tools"))inputs.tools=p.at("tools");if(p.contains("messages"))inputs.messages=p.at("messages");if(p.contains("json_schema"))inputs.json_schema=p.at("json_schema");if(p.contains("reasoning_format"))inputs.reasoning_format=static_cast<common_reasoning_format>(p.at("reasoning_format").get<int>());if(p.contains("tool_choice"))inputs.tool_choice=static_cast<common_chat_tool_choice>(p.at("tool_choice").get<int>());if(p.contains("parallel_tool_calls"))inputs.parallel_tool_calls=p.at("parallel_tool_calls").get<bool>();if(p.contains("enable_thinking"))inputs.enable_thinking=p.at("enable_thinking").get<bool>();if(p.contains("add_generation_prompt"))inputs.add_generation_prompt=p.at("add_generation_prompt").get<bool>();parser=analyzer.build_parser(inputs,action.at("GenerationPrompt").get<std::string>());trace.push_back(json::object());}else{std::string input;for(const auto & byte:action.at("Bytes"))input.push_back(static_cast<char>(byte.get<int>()));common_peg_parse_context context(input,static_cast<common_peg_parse_flags>(action.at("Flags").get<int>()));const auto result=parser->parse(context);json msg=nullptr;if(action.at("Map").get<bool>()){common_chat_msg value;common_chat_peg_mapper(value).from_ast(context.ast,result);msg=wire_message(value);}trace.push_back(json{{"result",wire_parse_result(result)},{"message",msg}});}}
     return json{{"Trace",trace}};
 }
 } // namespace prism_chat_auto

@@ -1,15 +1,100 @@
 //! Safe process/file transport shared by Rust-owned quantization source ports.
+use super::engine::Engine;
 use super::llama_grammar::{array, exact_fields, field, uint};
-use super::model_session::Client;
+use super::reference_codec_buffers::Session;
 use super::{Result, invalid};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+#[derive(Clone)]
+pub(super) struct QuantClient {
+    session: Arc<Session>,
+}
+impl QuantClient {
+    pub(super) fn call(&self, worker: u32, operation: &Value) -> Result<Value> {
+        self.session.execute(worker, operation)
+    }
+}
+pub(super) struct QuantSession {
+    session: Arc<Session>,
+    directory: PathBuf,
+    cleanup: bool,
+    finished: bool,
+}
+impl QuantSession {
+    pub(super) fn open(engine: &Engine, name: &str) -> Result<Option<Self>> {
+        if engine.is_rust() {
+            return Ok(None);
+        }
+        let (directory, cleanup) = if engine.has_evidence_directory() {
+            (engine.evidence_path(name)?, false)
+        } else {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+            let sanitized: String = name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let dir = std::env::temp_dir().join(format!(
+                "SwiftBonsai-Quant-{sanitized}-{}-{nonce}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir(&dir)?;
+            (dir, true)
+        };
+        let session = Arc::new(Session::new(&directory)?);
+        Ok(Some(Self {
+            session,
+            directory,
+            cleanup,
+            finished: false,
+        }))
+    }
+    pub(super) fn open_quantization(engine: &Engine) -> Result<Option<Self>> {
+        Self::open(engine, "quantize-stats")
+    }
+    pub(super) fn evidence_directory(&self) -> &Path {
+        &self.directory
+    }
+    pub(super) fn client(&self) -> QuantClient {
+        QuantClient {
+            session: Arc::clone(&self.session),
+        }
+    }
+    pub(super) fn finish(mut self) -> Result<()> {
+        let requests = self.session.finish()?;
+        if !self.cleanup {
+            fs::write(
+                self.directory.join("session.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "SchemaVersion": 1,
+                    "Provider": "independent-rust-codec-buffers",
+                    "Requests": requests,
+                    "Completed": true,
+                }))?,
+            )?;
+        }
+        self.finished = true;
+        if self.cleanup {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+        Ok(())
+    }
+}
+impl Drop for QuantSession {
+    fn drop(&mut self) {
+        if self.cleanup && !self.finished {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+}
 #[derive(Clone)]
 pub(super) struct Driver {
-    pub(super) client: Client,
+    pub(super) client: QuantClient,
     pub(super) directory: PathBuf,
     serial: Arc<AtomicU64>,
 }
@@ -43,20 +128,19 @@ pub(super) fn verify(value: bool, message: impl Into<String>) -> Result<()> {
     if value { Ok(()) } else { Err(invalid(message)) }
 }
 impl Driver {
-    pub(super) fn new(client: Client, directory: &Path) -> Self {
+    pub(super) fn new(client: QuantClient, directory: &Path) -> Self {
         Self {
             client,
             directory: directory.into(),
             serial: Arc::new(AtomicU64::new(0)),
         }
     }
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Retains the existing Driver::call signature for quantize_perf and quantize_stats."
+    )]
     pub(super) fn call(&self, worker: u32, operation: Value) -> Result<Value> {
-        let reply = self.client.call(worker, operation, None)?;
-        verify(
-            reply.progress.is_empty(),
-            "quantization received unexpected progress",
-        )?;
-        Ok(reply.value)
+        self.client.call(worker, &operation)
     }
     pub(super) fn null(&self, worker: u32, operation: Value) -> Result<()> {
         verify(

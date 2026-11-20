@@ -11,7 +11,6 @@
 #include "dspark_runtime.hpp"
 #include "llguidance.hpp"
 #include "backend_sampler.hpp"
-#include "codec_buffers.hpp"
 #include "llama-model-saver.h"
 #include "ggml-cpu.h"
 #include <nlohmann/json.hpp>
@@ -76,7 +75,7 @@ struct lane{
 class session{
     FILE*wire;
     struct logger_state{ggml_log_callback original=nullptr;void*data=nullptr;ggml_log_level minimum=GGML_LOG_LEVEL_ERROR;bool active=false;}logger;
-    table<parameters>params;table<model>models;table<context>contexts;table<sampler>samplers;table<batch>batches;table<blob>blobs;table<temporary_file>files;table<checkpoint>checkpoints;prism_dspark_runtime::state dspark_runtime;prism_llguidance::state llguidance;prism_backend_sampler::state backend_sampler;prism_codec_buffers::state codec_buffers;
+    table<parameters>params;table<model>models;table<context>contexts;table<sampler>samplers;table<batch>batches;table<blob>blobs;table<temporary_file>files;table<checkpoint>checkpoints;prism_dspark_runtime::state dspark_runtime;prism_llguidance::state llguidance;prism_backend_sampler::state backend_sampler;
     std::atomic<std::uint64_t>next_handle{1},next_callback{1};std::atomic<std::size_t>inflight{0};
     std::mutex output_mutex,callback_mutex;std::condition_variable callback_ready;std::map<std::uint64_t,json>callback_returns;std::map<std::uint64_t,bool>pending_callbacks;bool stopping=false;
     std::map<std::uint32_t,std::unique_ptr<lane>>workers;
@@ -98,7 +97,6 @@ public:
     json execute(std::uint64_t request,std::uint32_t worker,const json&o){
         require(o.is_object()&&o.contains("Op"),"model operation Op required");const auto op=text(o.at("Op"),64);
         if(worker==0)backend_sampler.prepare(request,[this](std::uint64_t active,const json&event){return sampler_event(active,event);});
-        if(prism_codec_buffers::handles(op))return codec_buffers.execute(o,worker,[&](const json&v){return mod(v,worker);});
         if(prism_backend_sampler::handles(op))return backend_sampler.execute(o,worker,[&](const json&v){return ctx(v,worker);},[&](const json&v){return mod(v,worker);});
         if(op=="log-minimum"){fields(o,{"Op","Level"});auto level=integer(o.at("Level"),1,5);if(!logger.active){llama_log_get(&logger.original,&logger.data);logger.active=true;}logger.minimum=static_cast<ggml_log_level>(level);llama_log_set([](ggml_log_level severity,const char*message,void*opaque){auto&state=*static_cast<logger_state*>(opaque);state.original(severity>=state.minimum?severity:GGML_LOG_LEVEL_DEBUG,message,state.data);},&logger);return nullptr;}
         if(prism_llguidance::handles(op))return llguidance.execute(o,worker,[&](const json&v){return mod(v,worker);});

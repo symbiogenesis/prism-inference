@@ -2,8 +2,7 @@
 //! The native side supplies model/codec calls and bytes, never error calculations.
 use super::engine::Engine;
 use super::llama_grammar::{array, exact_fields, field, uint};
-use super::model_session::ModelSession;
-use super::quant_buffers::{Driver, Type, call, integer, pointer, row_size, verify};
+use super::quant_buffers::{Driver, QuantSession, Type, call, integer, pointer, row_size, verify};
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
 use std::fs;
@@ -685,7 +684,7 @@ pub(super) fn run_with_options(engine: &Engine, options: &Options) -> Result<Val
             "The complete quantization statistics source runs only in GitHub Actions on main",
         ));
     }
-    let Some(session) = ModelSession::open_quantization(engine)? else {
+    let Some(session) = QuantSession::open_quantization(engine)? else {
         return Ok(result(ID,false,"Rust runtime lacks production model tensor-map and codec trait APIs for the complete statistics source".into()));
     };
     let driver = Driver::new(session.client(), session.evidence_directory());

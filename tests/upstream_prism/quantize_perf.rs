@@ -1,7 +1,6 @@
 //! Full quantize-perf source workload. Every execution is restricted to CI.
 use super::engine::Engine;
-use super::model_session::ModelSession;
-use super::quant_buffers::{Driver, Type, call, integer, pointer, row_size, verify};
+use super::quant_buffers::{Driver, QuantSession, Type, call, integer, pointer, row_size, verify};
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
 use std::env;
@@ -313,7 +312,7 @@ pub(super) fn run_with_options(engine: &Engine, options: &Options) -> Result<Val
         })
         .collect::<Vec<_>>();
     verify(!operations.is_empty(), "perf operation selection empty")?;
-    let Some(session) = ModelSession::open(engine, "quantize-perf")? else {
+    let Some(session) = QuantSession::open(engine, "quantize-perf")? else {
         return Ok(result(ID,false,"Rust runtime lacks the production trait/buffer/timing APIs for the full performance source".into()));
     };
     let driver = Driver::new(session.client(), session.evidence_directory());

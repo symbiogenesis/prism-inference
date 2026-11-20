@@ -95,6 +95,7 @@ mod reference_arena_graph;
 mod reference_arg_parser;
 mod reference_batch_allocator;
 mod reference_codec;
+mod reference_codec_buffers;
 mod reference_dspark_logsnr;
 mod reference_gguf;
 mod reference_grammar;
@@ -183,13 +184,13 @@ const CASES: &[Case] = &[
     register(
         "test-quantize-perf",
         "tests/test-quantize-perf.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         quantize_perf::run,
     ),
     register(
         "test-quantize-stats",
         "tests/test-quantize-stats.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         quantize_stats::run,
     ),
     register(

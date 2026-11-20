@@ -21,7 +21,7 @@ pub(super) const IDS: [&str; 2] = [
 const QUANTIZE_SHA256: &str = "830e197b34efc57030cef3b83449264f8b2d4db76121796ae962602cdf675d6b";
 const CUDA_SHA256: &str = "17d72e91495a7ffe4e726e90ebe99bf9d7b9acbe1d451a38c865352c3559092a";
 
-const TYPE_COUNT: usize = 144;
+pub(super) const TYPE_COUNT: usize = 144;
 const MAX_OPS: usize = 128;
 const MAX_COUNT: usize = 8192;
 const MAX_BYTES: usize = 1024 * 1024;
@@ -32,16 +32,16 @@ const MAX_BLOCK_DIM: usize = 4096;
     reason = "Mirrors the four independent native codec capability flags."
 )]
 #[derive(Clone, Copy)]
-struct Traits {
-    type_id: usize,
-    name: Option<&'static str>,
-    block_size: usize,
-    type_size: usize,
-    from_float_cpu: bool,
-    from_float_ref: bool,
-    to_float: bool,
-    vec_dot: bool,
-    vec_dot_type: usize,
+pub(super) struct Traits {
+    pub(super) type_id: usize,
+    pub(super) name: Option<&'static str>,
+    pub(super) block_size: usize,
+    pub(super) type_size: usize,
+    pub(super) from_float_cpu: bool,
+    pub(super) from_float_ref: bool,
+    pub(super) to_float: bool,
+    pub(super) vec_dot: bool,
+    pub(super) vec_dot_type: usize,
 }
 
 const fn type_name(id: usize) -> Option<&'static str> {
@@ -130,7 +130,7 @@ const fn layout(id: usize) -> (usize, usize) {
     }
 }
 
-const fn traits_of(id: usize) -> Traits {
+pub(super) const fn traits_of(id: usize) -> Traits {
     let (block_size, type_size) = layout(id);
     let from_float_cpu = matches!(
         id,
@@ -480,7 +480,7 @@ const fn narrow_u32_to_u16(value: u32) -> u16 {
     u16::from_le_bytes([b0, b1])
 }
 
-const fn f16_to_f32(bits: u16) -> f32 {
+pub(super) const fn f16_to_f32(bits: u16) -> f32 {
     let raw = widen_u16(bits);
     let sign = (raw & 0x8000) << 16;
     let exp = (raw >> 10) & 0x1f;
@@ -625,7 +625,7 @@ fn float_dot(left: &[f32], right: &[f32]) -> Result<f32> {
 // Quantizer / Decoder / VecDot top-level dispatch
 // ---------------------------------------------------------------------------
 
-fn quantize_row(type_id: usize, input: &[f32]) -> Result<Vec<u8>> {
+pub(super) fn quantize_row(type_id: usize, input: &[f32]) -> Result<Vec<u8>> {
     match type_id {
         0 => Ok(input.iter().flat_map(|v| v.to_le_bytes()).collect()),
         1 => quantize_f16(input),
@@ -646,7 +646,7 @@ fn quantize_row(type_id: usize, input: &[f32]) -> Result<Vec<u8>> {
     }
 }
 
-fn decode_row(type_id: usize, count: usize, packed: &[u8]) -> Result<Vec<f32>> {
+pub(super) fn decode_row(type_id: usize, count: usize, packed: &[u8]) -> Result<Vec<f32>> {
     let mut output = Vec::with_capacity(count);
     match type_id {
         1 => {
@@ -676,7 +676,12 @@ fn decode_row(type_id: usize, count: usize, packed: &[u8]) -> Result<Vec<f32>> {
     Ok(output)
 }
 
-fn vec_dot_row(type_id: usize, count: usize, weights: &[u8], activations: &[u8]) -> Result<f32> {
+pub(super) fn vec_dot_row(
+    type_id: usize,
+    count: usize,
+    weights: &[u8],
+    activations: &[u8],
+) -> Result<f32> {
     match type_id {
         0 => {
             let a = bytes_to_f32(weights)?;

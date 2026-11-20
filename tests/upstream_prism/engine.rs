@@ -64,6 +64,10 @@ impl Engine {
         matches!(self.target, Target::Rust)
     }
 
+    pub(super) const fn has_evidence_directory(&self) -> bool {
+        self.evidence_directory.is_some()
+    }
+
     pub(super) const fn reasoning_provider(&self) -> &'static str {
         if matches!(self.target, Target::Rust) {
             "production-rust"

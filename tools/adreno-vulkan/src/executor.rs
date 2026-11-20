@@ -924,6 +924,10 @@ impl VulkanPq2Executor {
         run_result
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Executes complete FFN SwiGLU scratch setup and 4-stage Vulkan submission together."
+    )]
     fn execute_ffn_swiglu_batched(
         &mut self,
         gate: &Tensor,
@@ -1056,6 +1060,10 @@ impl VulkanPq2Executor {
     #[allow(
         clippy::too_many_arguments,
         reason = "Executes complete fused FFN chain (with optional Hadamard, residual, and LoRA A dot) in one Vulkan submission."
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Validates inputs, prepares scratch buffers, acquires leases, and dispatches the fused FFN chain."
     )]
     fn execute_ffn_chain_batched(
         &mut self,

@@ -1519,8 +1519,8 @@ impl Drop for AdrenoVulkanDevice {
         // SAFETY: Destroying owned pipeline cache.
         unsafe {
             self.device
-                .destroy_pipeline_cache(self.pipeline_cache, None)
-        };
+                .destroy_pipeline_cache(self.pipeline_cache, None);
+        }
         // SAFETY: Destroying owned fence.
         unsafe { self.device.destroy_fence(self.fence, None) };
         // SAFETY: Destroying owned descriptor pool.

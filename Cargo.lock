@@ -107,7 +107,7 @@ dependencies = [
  "ash",
  "bonsai-gguf",
  "bonsai-hexagon-runtime",
- "bonsai-native-hash 0.1.5",
+ "bonsai-native-hash",
  "bonsai-ternary",
  "hex",
  "prism-inference",
@@ -128,7 +128,7 @@ dependencies = [
 name = "bonsai-gguf"
 version = "0.1.8"
 dependencies = [
- "bonsai-native-hash 0.1.5",
+ "bonsai-native-hash",
  "bonsai-ternary",
  "hex",
  "serde_json",
@@ -145,7 +145,7 @@ version = "0.1.0"
 dependencies = [
  "bonsai-gguf",
  "bonsai-hexagon-native",
- "bonsai-native-hash 0.1.5",
+ "bonsai-native-hash",
  "bonsai-ternary",
  "bonsai-windows-process",
  "hex",
@@ -156,29 +156,10 @@ dependencies = [
 
 [[package]]
 name = "bonsai-native-hash"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8d2e05287d77ea0fe409474ac76dc9fe02783b32786ec77ac7467b75d6c3ed2"
-dependencies = [
- "sha2",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "bonsai-native-hash"
 version = "0.1.5"
 dependencies = [
  "sha2",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "bonsai-neon-dot"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e0a0891e6efade20e21ab528058aa9ebf851699dbc37f2a735f66e7efe3f644"
-dependencies = [
- "bonsai-ternary",
 ]
 
 [[package]]
@@ -205,11 +186,11 @@ version = "0.1.4"
 
 [[package]]
 name = "bonsai-windows-credentials"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94da447b6f49bde8fcbcb4918c8a894f7f9c7d4be7d42e433a5c30a0ead4e2ff"
+checksum = "4af5912161cb92a47e9e7b6db3934a74cb1a34c5607d14b6c65dde354d2710fb"
 dependencies = [
- "bonsai-native-hash 0.1.4",
+ "bonsai-native-hash",
  "hex",
  "windows-sys 0.61.2",
  "zeroize",
@@ -217,12 +198,12 @@ dependencies = [
 
 [[package]]
 name = "bonsai-windows-process"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b3f69dfd8ff188ae1559467795523ebbbe83f3fef984c5d29515195c21aa4b4"
+checksum = "1238cf494a203e0a8860e51b17ca45c81f8f172b5d4c589a037a80d4d57d931b"
 dependencies = [
  "ash",
- "bonsai-neon-dot 0.1.6",
+ "bonsai-neon-dot",
  "bonsai-ternary",
  "flatbuffers",
  "hex",
@@ -509,7 +490,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1098,7 +1079,7 @@ dependencies = [
 name = "prism-conformance-policy"
 version = "0.1.0"
 dependencies = [
- "bonsai-native-hash 0.1.5",
+ "bonsai-native-hash",
  "hex",
  "serde",
  "serde_json",
@@ -1106,13 +1087,13 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "aho-corasick",
  "base64ct",
  "bonsai-gguf",
- "bonsai-native-hash 0.1.5",
- "bonsai-neon-dot 0.1.7",
+ "bonsai-native-hash",
+ "bonsai-neon-dot",
  "bonsai-prism",
  "bonsai-ternary",
  "crc32fast",
@@ -1132,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "bonsai-adreno-vulkan",
  "bonsai-hexagon-native",
@@ -1303,7 +1284,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1542,7 +1523,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1868,7 +1849,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

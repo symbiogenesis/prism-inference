@@ -406,3 +406,63 @@ and placing all 19 `RequiredReferencePassedIds` in `baseline.json` off
 checked-in C++. Direct native requests for those retired operations reject;
 complete Prism suite execution, native bridge compilation and owning hosted
 acceptance remain pending.
+
+## Retired model-resolution, codec-buffers, PEG and chat native providers
+
+`--target rust-reference` and the ordinary `cpp` reference selector now route
+fifteen additional source contracts across eight retired common bridge headers
+through independent clean-room safe Rust providers (disclosing
+`NativeReferenceReplay: false` without importing `bonsai_prism_runtime`,
+calling native bridges, or reading precomputed expected-answer fixtures):
+
+- `test-model-resolution` (`tests/test-model-resolution.cpp`, SHA-256
+  `d596a6befca98035acfab4e71e72f50a698a11062fcac138735b3fe1aa9af593`) via
+  `tests/upstream_prism/reference_model_resolution.rs`
+- `test-quantize-perf` (`tests/test-quantize-perf.cpp`, SHA-256
+  `09de1812b11836bd899a63dfa6b06927a2d0a012edc1e702a33fb51c95d63563`) and
+  `test-quantize-stats` (`tests/test-quantize-stats.cpp`, SHA-256
+  `1866b300a8966c3797740a5b4543236d92d1c7b8f2ca67829f453ffcd5b9707b`) via
+  `tests/upstream_prism/reference_codec_buffers.rs`
+- `test-peg-parser` (`tests/test-peg-parser.cpp`, SHA-256
+  `52ebb967feae3aec877a1d3cb1c509b2598a9c799e60401a82253a5d4844038b`) and its
+  six nested suites (`tests/peg-parser/test-basic.cpp`, SHA-256
+  `24c5c31c65b2f5fc88919a4b5d06506ae644f8f0460c14c0134cd5439c5a7694`;
+  `tests/peg-parser/test-gbnf-generation.cpp`, SHA-256
+  `d14973bb98faaa87d1e17af30b76d413e2ac6541ab800c20eb55d48c8fa1952a`;
+  `tests/peg-parser/test-json-parser.cpp`, SHA-256
+  `2731298bf7f28047852e4f420243fc533bdb1408611257f47a5fff2adacb36fc`;
+  `tests/peg-parser/test-json-serialization.cpp`, SHA-256
+  `276f50faa0f1f50da7d5289b3e13110c26cf9120ff23bbdb4a6a8c12c384a028`;
+  `tests/peg-parser/test-python-dict-parser.cpp`, SHA-256
+  `ab6b20f141fed193bc93e810608c1b6800415d14ff832ad3ff84671594d18d4f`; and
+  `tests/peg-parser/test-unicode.cpp`, SHA-256
+  `5eda6c6457af1ff1a62081dadac597d7706bb656e9941bb828de6421d9c563cf`) via
+  `tests/upstream_prism/reference_peg.rs`
+- `test-chat-template` (`tests/test-chat-template.cpp`, SHA-256
+  `7a790605222858ca5d5a2de94de27115d693e2c293638c392b7726a44ad3451f`) via
+  `tests/upstream_prism/reference_chat_templates.rs`
+- `test-chat-analysis` (`tests/test-chat-analysis.cpp`, SHA-256
+  `d895ae1736845640b8dab486c68189726821abfbbfc0ca96f98cd419633ad1a1`) via
+  `tests/upstream_prism/reference_chat_analysis.rs`
+- `test-chat-peg-parser` (`tests/test-chat-peg-parser.cpp`, SHA-256
+  `c0583c716c65fa7c06fc9b282fc8d24aecde29fa55271536e8c23dfbbc0429e0`) via
+  `tests/upstream_prism/reference_chat_parser.rs`
+- `test-chat-auto-parser` (`tests/test-chat-auto-parser.cpp`, SHA-256
+  `d69af3154f3ed738e47a74280bcd63d2e90cd60b05dff7f5f1f7a5b26c59478c`) via
+  `tests/upstream_prism/reference_chat_auto.rs`
+- `test-chat` (`tests/test-chat.cpp`, SHA-256
+  `9920d484dfe35d8ccec4e34f3dd6a23e1788a479a419cab231c361d3cad4e8b4`) via
+  `tests/upstream_prism/reference_chat.rs`
+
+All fifteen sources bind pinned upstream commit
+`b87ca7225456b06b0975b8239c66b5aecf07e37c` (MIT terms retained in [LICENSE](LICENSE)).
+`common/model_resolution.hpp`, `common/codec_buffers.hpp`, `common/peg.hpp`,
+`common/chat_templates.hpp`, `common/chat_analysis.hpp`, `common/chat_parser.hpp`,
+`common/chat_auto.hpp`, and `common/chat.hpp`, together with their bridge
+includes, dispatch branches, CMake build edges, and the
+`prism-upstream-server-context` CMake library target (`server-chat.cpp`/
+`server-common.cpp`), are removed, leaving 12 checked-in C++ files and zero
+checked-in C files (12 native files total) across the common bridge snapshot.
+Direct native requests for those retired operations reject; complete Prism suite
+execution, native bridge compilation and owning hosted acceptance remain
+pending.

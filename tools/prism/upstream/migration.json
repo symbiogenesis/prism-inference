@@ -9,7 +9,7 @@
       "SourceSha256": "24c5c31c65b2f5fc88919a4b5d06506ae644f8f0460c14c0134cd5439c5a7694",
       "Category": "model-free",
       "Needs": [
-        "PEG builder/parser production API"
+        "clean-room Rust PEG reference provider (reference_peg.rs) and PEG builder/parser production API"
       ],
       "AssertionsToPort": "All character classes and escapes; optional/choice/sequence/repetition; recursive rules; markers; complete/partial/no-match semantics.",
       "LegacyReferenceRequired": false,
@@ -20,7 +20,7 @@
       "SourceSha256": "d14973bb98faaa87d1e17af30b76d413e2ac6541ab800c20eb55d48c8fa1952a",
       "Category": "model-free",
       "Needs": [
-        "PEG builder and GBNF production API"
+        "clean-room Rust PEG reference provider (reference_peg.rs) and PEG builder and GBNF production API"
       ],
       "AssertionsToPort": "All literal expected grammars; operator precedence; delimiter/Unicode overlap; unreachable-rule pruning; triggers; silent/tagged/atomic wrappers.",
       "LegacyReferenceRequired": false,
@@ -31,7 +31,7 @@
       "SourceSha256": "2731298bf7f28047852e4f420243fc533bdb1408611257f47a5fff2adacb36fc",
       "Category": "model-free",
       "Needs": [
-        "PEG JSON parser production API"
+        "clean-room Rust PEG reference provider (reference_peg.rs) and PEG JSON parser production API"
       ],
       "AssertionsToPort": "All mixed/nested JSON literals; partial object/array/escape need-more states; object-member success/partial/failure.",
       "LegacyReferenceRequired": false,
@@ -42,7 +42,7 @@
       "SourceSha256": "276f50faa0f1f50da7d5289b3e13110c26cf9120ff23bbdb4a6a8c12c384a028",
       "Category": "correctness-and-benchmark",
       "Needs": [
-        "PEG serialization production API",
+        "clean-room Rust PEG reference provider (reference_peg.rs) and PEG serialization production API",
         "CI benchmark lane for deserialize timing"
       ],
       "AssertionsToPort": "Compare parser result before/after JSON serialization; preserve separate deserialize benchmark without making its timings correctness expectations.",
@@ -54,7 +54,7 @@
       "SourceSha256": "ab6b20f141fed193bc93e810608c1b6800415d14ff832ad3ff84671594d18d4f",
       "Category": "model-free",
       "Needs": [
-        "PEG Python dict parser production API"
+        "clean-room Rust PEG reference provider (reference_peg.rs) and PEG Python dict parser production API"
       ],
       "AssertionsToPort": "All quote/escape/Unicode/nesting/partial literals; Python True/False/None; reject JSON true/false/null; configurable flexible JSON-string rules.",
       "LegacyReferenceRequired": false,
@@ -65,7 +65,7 @@
       "SourceSha256": "5eda6c6457af1ff1a62081dadac597d7706bb656e9941bb828de6421d9c563cf",
       "Category": "model-free",
       "Needs": [
-        "PEG Unicode production API"
+        "clean-room Rust PEG reference provider (reference_peg.rs) and PEG Unicode production API"
       ],
       "AssertionsToPort": "All Unicode any/class/until/json-string cases including CJK/emoji; valid/incomplete/malformed UTF-8 and escaped strings.",
       "LegacyReferenceRequired": false,
@@ -174,7 +174,7 @@
       "Category": "manual-diagnostic",
       "Needs": [
         "bundled models/templates/*.jinja",
-        "chat differential-analysis API"
+        "clean-room Rust chat differential-analysis reference provider (reference_chat_analysis.rs) and production API"
       ],
       "AssertionsToPort": "Manual analysis tool has no automated correctness assertions; Rust diagnostic equivalent should preserve template selection/render differences and fail missing assets; do not label diagnostic output full engine parity.",
       "LegacyReferenceRequired": false,
@@ -186,7 +186,7 @@
       "Category": "model-free",
       "Needs": [
         "bundled models/templates/*.jinja",
-        "chat auto-parser/Jinja/PEG APIs"
+        "clean-room Rust chat auto-parser reference provider (reference_chat_auto.rs) and chat auto-parser/Jinja/PEG APIs"
       ],
       "AssertionsToPort": "All diff-split/prefix/suffix/segment/marker/quote normalization and template-specific tool/reasoning detection tables; role markers across all templates; debug template mode separate.",
       "LegacyReferenceRequired": false,
@@ -197,7 +197,7 @@
       "SourceSha256": "c0583c716c65fa7c06fc9b282fc8d24aecde29fa55271536e8c23dfbbc0429e0",
       "Category": "correctness-and-benchmark",
       "Needs": [
-        "PEG/chat parser production API",
+        "clean-room Rust chat PEG parser reference provider (reference_chat_parser.rs) and PEG/chat parser production API",
         "simple tokenizer equivalent",
         "CI benchmark lane"
       ],
@@ -210,7 +210,7 @@
       "SourceSha256": "7a790605222858ca5d5a2de94de27115d693e2c293638c392b7726a44ad3451f",
       "Category": "model-free",
       "Needs": [
-        "chat template production API",
+        "clean-room Rust chat template reference provider (reference_chat_templates.rs) and chat template production API",
         "optional manual .jinja and JSON data"
       ],
       "AssertionsToPort": "All default embedded template/message expectations; manual path/directory handling and supplied JSON paths separate; default requires no full model.",
@@ -223,7 +223,7 @@
       "Category": "model-free",
       "Needs": [
         "bundled models/templates/*.jinja",
-        "server-chat/common-chat production APIs"
+        "clean-room Rust chat reference provider (reference_chat.rs) and production Rust chat APIs"
       ],
       "AssertionsToPort": "All 317KB template/parser/message/tool/Responses conversion expectations; reasoning budgets/effort; malformed UTF-8; reconstruction and generation prompts; default run from upstream root.",
       "LegacyReferenceRequired": false,
@@ -504,7 +504,7 @@
       "SourceSha256": "d596a6befca98035acfab4e71e72f50a698a11062fcac138735b3fe1aa9af593",
       "Category": "loopback-network-model-free",
       "Needs": [
-        "common argument/download resolution APIs",
+        "clean-room Rust model-resolution reference provider (reference_model_resolution.rs) and production Rust resolution APIs",
         "Rust loopback HTTP fixture server",
         "isolated cache/env"
       ],
@@ -574,7 +574,7 @@
       "SourceSha256": "52ebb967feae3aec877a1d3cb1c509b2598a9c799e60401a82253a5d4844038b",
       "Category": "helper-with-benchmark-default",
       "Needs": [
-        "six nested PEG test modules",
+        "clean-room Rust PEG reference provider (reference_peg.rs) and six nested PEG test modules",
         "serialization benchmark lane"
       ],
       "AssertionsToPort": "This main only registers nested basic/unicode/json/gbnf/serialization/python-dict suites; share Rust cases and prove all registration groups execute without double-counting assertions; serialization includes benchmark.",
@@ -648,7 +648,7 @@
       "Category": "benchmark-only",
       "Needs": [
         "CI benchmark runner",
-        "all quantization type traits",
+        "clean-room Rust codec-buffers reference provider (reference_codec_buffers.rs) and all quantization type traits",
         "alignment/size/iteration parameters"
       ],
       "AssertionsToPort": "Original source is performance utility; port workload type/op/size/alignment selection and correctness preconditions; record measurements separately with no invented pass floor; never run locally.",
@@ -661,7 +661,7 @@
       "Category": "model-statistics-diagnostic",
       "Needs": [
         "full F32/F16 model (default models/7B/ggml-model-f16.gguf)",
-        "quantization kernels",
+        "clean-room Rust codec-buffers reference provider (reference_codec_buffers.rs) and quantization kernels",
         "CI profiling lane for timings"
       ],
       "AssertionsToPort": "Per-layer/type weighted error statistics histograms filters thread configuration; original reports stats and duration rather than a model-quality pass threshold; safe Rust diagnostic equivalent.",

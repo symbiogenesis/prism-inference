@@ -226,13 +226,16 @@ their owning grammar is freed. Grammar handles are freed on every exit path.
 
 ## Generic production codecs
 
-`common/codec.hpp` is retired from the native bridge and direct native requests
-for `codec-inventory`, `codec-quantize`, `codec-dequantize`, and `codec-vec-dot`
-reject (persistent `qb-*` buffer operations in `common/codec_buffers.hpp` remain
-unchanged). `--target rust-reference` and the ordinary `cpp` reference selector
+`common/codec.hpp` and `common/codec_buffers.hpp` are retired from the native
+bridge and direct native requests for `codec-inventory`, `codec-quantize`,
+`codec-dequantize`, `codec-vec-dot`, and persistent `qb-*` buffer operations
+reject. `--target rust-reference` and the ordinary `cpp` reference selector
 route `tests/test-quantize-fns.cpp` and `tests/test-ptq1_0-cuda-dot.cpp` through
-`tests/upstream_prism/reference_codec.rs` (`nativeReferenceReplay=false`). Production
-Rust retains its separate `engine_codec` transport.
+`tests/upstream_prism/reference_codec.rs`, and `tests/test-quantize-perf.cpp`
+and `tests/test-quantize-stats.cpp` through
+`tests/upstream_prism/reference_codec_buffers.rs`
+(`nativeReferenceReplay=false`). Production Rust retains its separate
+`engine_codec` transport.
 
 Codec byte transport uses lowercase hex containing little-endian packed blocks
 or IEEE binary32 values. Type IDs are the pinned production ggml enum values.
@@ -262,15 +265,22 @@ reported as GPU execution.
 
 ## Generic PEG builder and parse transport
 
+`common/peg.hpp` is retired from the native bridge and direct native requests
+for `peg-evaluate`, `peg-serialize`, and `peg-deserialize` reject.
+`--target rust-reference` and the ordinary `cpp` reference selector route
+`tests/test-peg-parser.cpp` and its six nested `tests/peg-parser/*.cpp` suites
+through `tests/upstream_prism/reference_peg.rs` (`nativeReferenceReplay=false`).
+
 `peg-evaluate` takes exact fields `Kind`, `Graph`, `Inputs`, `GenerateGrammar`,
 `RoundTrip`. A graph is `{Statements:[{Let?:name,Expr:expression}],Root:expression}`.
 Expressions are `{Ref:localName}` or `{Op:method,Args:[arguments]}`. Method names
 and argument order follow the production PEG builder. `add`, `or`, `space-add`
 call its actual `+`, `|`, `<<` overloads; raw string operands retain the string
 overloads. `rule-lazy` takes a name, a nested graph body, and optional trigger
-boolean, invoking the production callback overload. Other supported methods are
-listed in `peg.hpp`; they include `marker`, JSON/Python value parsers, character
-classes, rules, tagging, repetition, delimiters and GBNF wrappers.
+boolean, invoking the production callback overload. Other supported methods were
+previously exposed by retired `common/peg.hpp`; they include `marker`,
+JSON/Python value parsers, character classes, rules, tagging, repetition,
+delimiters and GBNF wrappers.
 
 Construction is in explicit statement and child-array order, with at most 4,096
 statements per graph, 16,384 expression nodes and 48 expression/graph nesting
@@ -400,13 +410,18 @@ snapshot selects at most 2 MiB tensor data. Native files use exclusive owned tem
 beneath the caller's absolute process working directory, and failure to create a file fails the
 operation.
 
-`chat-builtins`, `legacy-chat-render` and `common-chat-render` expose production template inventory
-and rendering. Legacy rendering returns the raw return code and supplied-capacity byte buffer;
-common rendering returns the production prompt or exception metadata. Templates, normalization and
-comparisons are Rust-owned. The preliminary `chat-peg-trace` transport evaluates a supplied
-declarative graph with the production chat PEG builder, retains its arena across explicit actions,
-and returns raw parse/mapping/diff observations. Source registration requires the corresponding
-complete Rust port; compiling this adapter does not establish source coverage.
+`common/chat_templates.hpp` and `common/chat_parser.hpp` are retired from the
+native bridge and direct native requests for `chat-builtins`,
+`legacy-chat-render`, `common-chat-render`, and `chat-peg-trace` reject.
+`--target rust-reference` and the ordinary `cpp` reference selector route
+`tests/test-chat-template.cpp` through
+`tests/upstream_prism/reference_chat_templates.rs` and
+`tests/test-chat-peg-parser.cpp` through
+`tests/upstream_prism/reference_chat_parser.rs` (`nativeReferenceReplay=false`).
+For `chat-builtins`, `legacy-chat-render`, and `common-chat-render`, templates,
+normalization and comparisons are Rust-owned; for `chat-peg-trace`, the Rust
+reference evaluates a supplied declarative graph, retains its arena across
+explicit actions, and returns raw parse/mapping/diff observations.
 
 `vocab-runtime-info` returns production hardware concurrency. `vocab-evaluate` loads a supplied
 absolute GGUF path with vocabulary-only model parameters and optionally creates the production
@@ -421,8 +436,10 @@ serialization. External vocabularies remain under the runner's verified source d
 target uses existing production `Tokenizer`, `Vocabulary` and optional `SpecialTokens` construction
 as its vocabulary context, and preserves unsupported metadata errors without relabeling formats.
 
-`chat_auto.hpp` exposes production chat helpers, template-variant comparison and
-analyzer/parser traces.
+`common/chat_auto.hpp` is retired from the native bridge and direct native
+requests reject. `--target rust-reference` and the ordinary `cpp` reference
+selector route `tests/test-chat-auto-parser.cpp` through
+`tests/upstream_prism/reference_chat_auto.rs` (`nativeReferenceReplay=false`).
 
 The separate `--model-session` mode provides bounded JSON-lines production model/context operations
 on persistent native worker lanes. `vocab_session.hpp` provides batch
@@ -444,9 +461,12 @@ observing `#[repr(C)]` ABI mirror sizes/alignments, token/position/sequence-ID
 scalar widths and the C17 standard constant without invoking native code or
 asserting pass verdicts outside Rust.
 
-`chat-template-trace` exposes supplied production template capabilities, direct applies, diffs and undefined-variable
-statistics. Rust supplies action order, the shared timestamp and structural comparisons; returned
-rendering bytes are hex so partial UTF-8 is retained.
+`common/chat_analysis.hpp` is retired from the native bridge and direct native
+requests for `chat-template-trace` reject. `--target rust-reference` and the
+ordinary `cpp` reference selector route `tests/test-chat-analysis.cpp` through
+`tests/upstream_prism/reference_chat_analysis.rs` (`nativeReferenceReplay=false`).
+Rust supplies action order, the shared timestamp and structural comparisons;
+returned rendering bytes are hex so partial UTF-8 is retained.
 
 `grammar-trace` also accepts explicit `accept-codepoint` actions (`Grammar`, `CodePoint`), calling
 `llama_grammar_accept` and returning the same exception, message and stack-size fields as token
@@ -454,17 +474,21 @@ acceptance. Top-level file-mode `unicode-encode` and `unicode-decode` are retire
 `unicode-regex-split` (handled by `reference_unicode.rs`); session-mode `vocab_session.hpp`
 primitives remain only on `--model-session`.
 
-`common/arg_parser.hpp` is retired from the native bridge and direct native requests
-for `argument-enums`, `argument-parser-trace` and `remote-get-content` reject.
-`--target rust-reference` and the ordinary `cpp` reference selector route
+`common/arg_parser.hpp` and `common/model_resolution.hpp` are retired from the
+native bridge and direct native requests for `argument-enums`,
+`argument-parser-trace`, `remote-get-content`, and session resolution operations
+reject. `--target rust-reference` and the ordinary `cpp` reference selector route
 `tests/test-arg-parser.cpp` through `tests/upstream_prism/reference_arg_parser.rs`
-(`nativeReferenceReplay=false`). The session-only resolution operations remain in
-`model_resolution.hpp` and expose caller-supplied model-resolution plans and handler actions.
+and `tests/test-model-resolution.cpp` through
+`tests/upstream_prism/reference_model_resolution.rs`
+(`nativeReferenceReplay=false`).
 
-`chat-trace`, `chat-value`, `chat-server-params`, `chat-generic-parse` and `chat-regex` expose
-production chat/response conversions, parsers and raw regex observations. The build links the
-upstream production server-context source list as a static library without enabling the HTTP server
-executable or UI.
+`common/chat.hpp` and the `prism-upstream-server-context` CMake library target
+(`server-chat.cpp`/`server-common.cpp`) are retired from the native bridge, and
+direct native requests for `chat-trace`, `chat-value`, `chat-server-params`,
+`chat-generic-parse`, and `chat-regex` reject. `--target rust-reference` and
+the ordinary `cpp` reference selector route `tests/test-chat.cpp` through
+`tests/upstream_prism/reference_chat.rs` (`nativeReferenceReplay=false`).
 
 The session `model-user` operation calls production `llama_model_init_from_user` using
 caller-supplied metadata. Each production tensor-initialization callback sends its actual TensorSpec

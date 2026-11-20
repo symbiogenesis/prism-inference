@@ -94,6 +94,7 @@ mod reference_allocation;
 mod reference_arena_graph;
 mod reference_arg_parser;
 mod reference_batch_allocator;
+mod reference_codec;
 mod reference_dspark_logsnr;
 mod reference_gguf;
 mod reference_grammar;
@@ -558,13 +559,13 @@ const CASES: &[Case] = &[
     register(
         "test-quantize-fns",
         "tests/test-quantize-fns.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         codec_assertions::run_quantize,
     ),
     register(
         "test-ptq1_0-cuda-dot",
         "tests/test-ptq1_0-cuda-dot.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         codec_assertions::run_ptq_cuda,
     ),
     register(

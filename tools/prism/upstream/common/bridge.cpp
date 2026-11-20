@@ -1,7 +1,6 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
 #include "jinja.hpp"
-#include "codec.hpp"
 #include "peg.hpp"
 // MTMD publishes its own logging macros; later common headers include log.h.
 #undef LOG_DBG
@@ -99,8 +98,6 @@ void validate_operation(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
     if (prism_jinja::handles(kind)) {
         prism_jinja::validate(operation);
-    } else if (prism_codec::handles(kind)) {
-        prism_codec::validate(operation);
     } else if (prism_peg::handles(kind)) {
         prism_peg::validate(operation);
     } else if (prism_chat_templates::handles(kind)) {
@@ -126,9 +123,6 @@ wire_json execute(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
     if (prism_jinja::handles(kind)) {
         return prism_jinja::execute(operation);
-    }
-    if (prism_codec::handles(kind)) {
-        return prism_codec::execute(operation);
     }
     if (prism_peg::handles(kind)) {
         return prism_peg::execute(operation);

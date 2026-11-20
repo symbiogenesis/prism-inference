@@ -369,9 +369,7 @@ impl Engine {
         match self.target {
             Target::Cpp => self.execute_common(name, request),
             Target::Rust => super::engine_codec::execute(request),
-            Target::RustReference => Err(invalid(
-                "the independent Rust reference has no codec provider",
-            )),
+            Target::RustReference => super::reference_provider::execute(request).map(Some),
         }
     }
 

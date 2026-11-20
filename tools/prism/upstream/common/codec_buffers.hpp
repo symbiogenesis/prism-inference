@@ -2,24 +2,44 @@
 // warmups, iterations, scheduling, timing math, statistics and expectations.
 #pragma once
 #include "action_file.hpp"
-#include "codec.hpp"
+#include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama-model.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
 #endif
 namespace prism_codec_buffers {
 using json=nlohmann::ordered_json;
-using prism_codec::require;
-using prism_codec::keys;
-using prism_codec::integer;
+inline void require(bool condition, const char * message) {
+    if (!condition) throw std::runtime_error(message);
+}
+inline void keys(const json & value, std::initializer_list<const char *> names) {
+    require(value.is_object() && value.size() == names.size(), "codec object fields mismatch");
+    for (const auto * name : names) require(value.contains(name), "missing codec field");
+}
+inline std::size_t integer(const json & value, std::size_t maximum) {
+    require(value.is_number_integer() && (value.is_number_unsigned() || value.get<std::int64_t>() >= 0),
+            "codec integer must be nonnegative");
+    const auto number = value.get<std::uint64_t>();
+    require(number <= maximum, "codec integer exceeds bound");
+    return static_cast<std::size_t>(number);
+}
 constexpr std::size_t max_buffer=512ULL*1024*1024;
 inline bool handles(const std::string&op){return op.rfind("qb-",0)==0;}
 inline std::string text(const json&v){require(v.is_string(),"codec buffer text required");auto s=v.get<std::string>();require(s.size()<=32768&&s.find('\0')==std::string::npos,"codec buffer text exceeds bound");return s;}

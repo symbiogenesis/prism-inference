@@ -26,7 +26,10 @@ pub use placement::{
     plan_x1_v73_three_processor_placement,
 };
 mod composite;
-pub use composite::{CompositeProjectionExecutor, CompositeTelemetry, HybridPrefillCoordinator};
+pub use composite::{
+    CompositeProjectionExecutor, CompositeTelemetry, HybridPrefillCoordinator,
+    OwnedCompositeProjectionExecutor,
+};
 
 type Result<T> = bonsai_prism_runtime::Result<T>;
 

@@ -801,6 +801,42 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
     } else {
         bonsai_neon_dot::Pq2Dotprod::detect()
     };
+    let (chunks8, rem8) = preparations.as_chunks::<8>();
+    let block_count = chunks[0].len();
+    if has_precomputed
+        && rem8.is_empty()
+        && !chunks8.is_empty()
+        && block_count != 0
+        && rows.iter().all(|row| row.len() == block_count * 34)
+        && let Some(dotprod) = dotprod
+    {
+        let mut out_buf = [[[0.0_f32; 8]; 8]; 4];
+        for (batch_idx, batch) in chunks8.chunks(4).enumerate() {
+            let mut arg_chunks: [[&[bonsai_neon_dot::Pq2Activation]; 8]; 4] = [[&[]; 8]; 4];
+            for (c, chunk) in batch.iter().enumerate() {
+                arg_chunks[c] =
+                    std::array::from_fn(|t| &chunk[t].pq2_consumption[..block_count]);
+            }
+            let out_slice = &mut out_buf[..batch.len()];
+            let result = if pinned {
+                dotprod.dot_scaled_8x8_chunks::<true>(rows, &arg_chunks[..batch.len()], out_slice)
+            } else {
+                dotprod.dot_scaled_8x8_chunks::<false>(rows, &arg_chunks[..batch.len()], out_slice)
+            };
+            let Some(()) = result else {
+                return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+            };
+            for (c, chunk_out) in out_slice.iter().enumerate() {
+                let base = (batch_idx * 4 + c) * 8;
+                for row in 0..8 {
+                    sums[row][base..base + 8].copy_from_slice(&chunk_out[row]);
+                }
+            }
+        }
+        let block_count_u64 = u64::try_from(block_count).ok()?;
+        *decoded_blocks = decoded_blocks.saturating_add(block_count_u64.saturating_mul(8));
+        return Some(Ok(sums));
+    }
     for index in 0..chunks[0].len() {
         let b0 = &chunks[0][index];
         let b1 = &chunks[1][index];

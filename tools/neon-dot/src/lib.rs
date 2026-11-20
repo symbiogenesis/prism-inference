@@ -334,6 +334,32 @@ impl Pq2Dotprod {
             })
         }
     }
+
+    /// Consumes complete PQ2 rows across `1..=4` eight-token chunks (`8..=32` tokens)
+    /// inside a single full-K invocation, preserving bit-exact `0 ULP` parity.
+    ///
+    /// Returns `None` for unsupported chunk/output geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks<const FUSED: bool>(
+        self,
+        rows: [&[u8]; 8],
+        chunks: &[[&[Pq2Activation]; 8]],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        if !scaled::valid_scaled_8x8_chunks(rows, chunks, outputs.len()) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_scaled_8x8_chunks::<FUSED>(self, rows, chunks, outputs)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            scaled::portable_scaled_8x8_chunks::<FUSED>(rows, chunks, outputs)
+        }
+    }
 }
 
 /// Returns whether the current CPU supports ARMv8.2-A `i8mm` (`SMMLA`).

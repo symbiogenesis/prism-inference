@@ -46,87 +46,94 @@ fn first_decode_fits(batch: i32, catchup: i32, anchors: i32) -> bool {
             .is_some_and(|left| demand <= left)
 }
 
-pub(super) fn execute(value: &Value) -> Result<Value> {
+fn dispatch_reference(value: &Value) -> Option<Result<Value>> {
     if super::reference_mtmd_chunks::handles(value) {
-        return super::reference_mtmd_chunks::execute(value);
+        return Some(super::reference_mtmd_chunks::execute(value));
     }
     if super::reference_dspark_logsnr::handles(value) {
-        return super::reference_dspark_logsnr::execute(value);
+        return Some(super::reference_dspark_logsnr::execute(value));
     }
     if super::reference_optimizer::handles(value) {
-        return super::reference_optimizer::execute(value);
+        return Some(super::reference_optimizer::execute(value));
     }
     if super::reference_gguf::handles(value) {
-        return super::reference_gguf::execute(value);
+        return Some(super::reference_gguf::execute(value));
     }
     if super::reference_grammar_parser::handles(value) {
-        return super::reference_grammar_parser::execute(value);
+        return Some(super::reference_grammar_parser::execute(value));
     }
     if super::reference_jinja::handles(value) {
-        return super::reference_jinja::execute(value);
+        return Some(super::reference_jinja::execute(value));
     }
     if super::reference_chat_templates::handles(value) {
-        return super::reference_chat_templates::execute(value);
+        return Some(super::reference_chat_templates::execute(value));
     }
     if super::reference_chat_analysis::handles(value) {
-        return super::reference_chat_analysis::execute(value);
+        return Some(super::reference_chat_analysis::execute(value));
     }
     if super::reference_grammar::handles(value) {
-        return super::reference_grammar::execute(value);
+        return Some(super::reference_grammar::execute(value));
     }
     if super::reference_json_schema::handles(value) {
-        return super::reference_json_schema::execute(value);
+        return Some(super::reference_json_schema::execute(value));
     }
     if super::reference_logging::handles(value) {
-        return super::reference_logging::execute(value);
+        return Some(super::reference_logging::execute(value));
     }
     if super::reference_mtmd::handles(value) {
-        return super::reference_mtmd::execute(value);
+        return Some(super::reference_mtmd::execute(value));
     }
     if super::reference_reasoning::handles(value) {
-        return super::reference_reasoning::execute(value);
+        return Some(super::reference_reasoning::execute(value));
     }
     if super::reference_sampling::handles(value) {
-        return super::reference_sampling::execute(value);
+        return Some(super::reference_sampling::execute(value));
     }
     if super::reference_allocation::handles(value) {
-        return super::reference_allocation::execute(value);
+        return Some(super::reference_allocation::execute(value));
     }
     if super::reference_batch_allocator::handles(value) {
-        return super::reference_batch_allocator::execute(value);
+        return Some(super::reference_batch_allocator::execute(value));
     }
     if super::reference_threadpool::handles(value) {
-        return super::reference_threadpool::execute(value);
+        return Some(super::reference_threadpool::execute(value));
     }
     if super::reference_quantization::handles(value) {
-        return super::reference_quantization::execute(value);
+        return Some(super::reference_quantization::execute(value));
     }
     if super::reference_unicode::handles(value) {
-        return super::reference_unicode::execute(value);
+        return Some(super::reference_unicode::execute(value));
     }
     if super::reference_arena_graph::handles(value) {
-        return super::reference_arena_graph::execute(value);
+        return Some(super::reference_arena_graph::execute(value));
     }
     if super::reference_tensor_graph::handles(value) {
-        return super::reference_tensor_graph::execute(value);
+        return Some(super::reference_tensor_graph::execute(value));
     }
     if super::reference_public_c_abi::handles(value) {
-        return super::reference_public_c_abi::execute(value);
+        return Some(super::reference_public_c_abi::execute(value));
     }
     if super::reference_arg_parser::handles(value) {
-        return super::reference_arg_parser::execute(value);
+        return Some(super::reference_arg_parser::execute(value));
     }
     if super::reference_model_resolution::handles(value) {
-        return super::reference_model_resolution::execute(value);
+        return Some(super::reference_model_resolution::execute(value));
     }
     if super::reference_codec::handles(value) {
-        return super::reference_codec::execute(value);
+        return Some(super::reference_codec::execute(value));
     }
     if super::reference_codec_buffers::handles(value) {
-        return super::reference_codec_buffers::execute(value);
+        return Some(super::reference_codec_buffers::execute(value));
     }
     if super::reference_peg::handles(value) {
-        return super::reference_peg::execute(value);
+        return Some(super::reference_peg::execute(value));
+    }
+    None
+}
+
+pub(super) fn execute(value: &Value) -> Result<Value> {
+    if let Some(result) = dispatch_reference(value) {
+        return result;
     }
     if !value["Operations"]
         .as_array()

@@ -823,6 +823,68 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
             }
         }
     }
+    let daisy_sha = "cd".repeat(32);
+    let stacked = ModelProfile {
+        adapter: true,
+        daisyrose_adapter: true,
+        daisyrose_adapter_sha256: Some(Arc::from(daisy_sha.as_str())),
+        daisyrose_adapter_max_rank: Some(16),
+        ..ModelProfile::default()
+    }
+    .readiness(19);
+    assert_eq!(stacked["data"][0]["supports_daisyrose_scale"], json!(true));
+    assert_eq!(stacked["data"][0]["daisyrose_scale_range"], json!([0, 2]));
+    assert_eq!(stacked["data"][0]["daisyrose_adapter_sha256"], json!(daisy_sha));
+    assert_eq!(stacked["data"][0]["daisyrose_adapter_max_rank"], json!(16));
+}
+
+#[test]
+fn canonical_stacked_daisyrose_lora_validates_ids_and_defaults() -> TestResult {
+    let base_bytes = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
+    let both = ModelProfile {
+        adapter: true,
+        daisyrose_adapter: true,
+        daisyrose_adapter_sha256: Some(Arc::from("cd".repeat(32))),
+        daisyrose_adapter_max_rank: Some(16),
+        ..ModelProfile::default()
+    };
+    let daisy_only = ModelProfile {
+        daisyrose_adapter: true,
+        daisyrose_adapter_sha256: Some(Arc::from("cd".repeat(32))),
+        daisyrose_adapter_max_rank: Some(16),
+        ..ModelProfile::default()
+    };
+
+    // Stacked profile allows [0] or [0, 1], forbids empty or omitting id 0.
+    assert!(canonical_for_profile(&base_bytes, &both).is_err());
+    assert!(canonical_for_profile(&base_bytes, &daisy_only).is_ok());
+
+    for valid_both in [
+        json!([{"id": 0, "scale": 1.3}]),
+        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}]),
+        json!([{"id": 1, "scale": 0.5}, {"id": 0, "scale": 1.3}]),
+    ] {
+        let mut value: Value = serde_json::from_slice(&base_bytes)?;
+        value["lora"] = valid_both;
+        assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &both).is_ok());
+    }
+    for invalid_both in [
+        json!([{"id": 1, "scale": 0.5}]),
+        json!([{"id": 0, "scale": 1.3}, {"id": 0, "scale": 0.5}]),
+        json!([{"id": 0, "scale": 1.3}, {"id": 2, "scale": 0.5}]),
+        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 2.1}]),
+    ] {
+        let mut value: Value = serde_json::from_slice(&base_bytes)?;
+        value["lora"] = invalid_both;
+        assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &both).is_err());
+    }
+
+    let mut value: Value = serde_json::from_slice(&base_bytes)?;
+    value["lora"] = json!([{"id": 0, "scale": 0.75}]);
+    assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &daisy_only).is_ok());
+    value["lora"] = json!([{"id": 1, "scale": 0.75}]);
+    assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &daisy_only).is_err());
+    Ok(())
 }
 
 #[test]

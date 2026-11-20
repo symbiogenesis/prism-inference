@@ -98,7 +98,7 @@ pub async fn serve(
     session: SwiftSession,
     key: String,
 ) -> Result<(), NativeBackendError> {
-    serve_with_placement(listener, session, key, Placement::Auto).await
+    Box::pin(serve_with_placement(listener, session, key, Placement::Auto)).await
 }
 
 /// Serve a verified session with one immutable trusted projection placement.
@@ -567,7 +567,7 @@ struct FixedBody<'a> {
     #[serde(borrow)]
     chat_template_kwargs: Object<FixedTemplate<'a>>,
     #[serde(default, deserialize_with = "optional_lora")]
-    lora: Option<[Object<PinnedLora>; 1]>,
+    lora: Option<Vec<Object<PinnedLora>>>,
 }
 
 #[derive(Deserialize)]
@@ -588,8 +588,8 @@ struct PinnedLora {
 
 fn optional_lora<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<[Object<PinnedLora>; 1]>, D::Error> {
-    <[Object<PinnedLora>; 1]>::deserialize(deserializer).map(Some)
+) -> Result<Option<Vec<Object<PinnedLora>>>, D::Error> {
+    Vec::<Object<PinnedLora>>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize)]
@@ -597,7 +597,42 @@ struct PrivateBody<'a, 'b> {
     #[serde(flatten)]
     body: BackendChat<'a, 'b>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    lora: Option<[PinnedLora; 1]>,
+    lora: Option<Vec<PinnedLora>>,
+}
+
+fn validate_canonical_lora(
+    raw: Option<Vec<Object<PinnedLora>>>,
+    profile: &ModelProfile,
+) -> Result<Option<Vec<PinnedLora>>, NativeBackendError> {
+    let entries: Option<Vec<PinnedLora>> = raw.map(|items| items.into_iter().map(|Object(item)| item).collect());
+    if let Some(items) = &entries {
+        if !(1..=2).contains(&items.len()) {
+            return Err(NativeBackendError::Schema);
+        }
+        for item in items {
+            if !item.scale.is_finite() || !(0.0..=2.0).contains(&item.scale) {
+                return Err(NativeBackendError::Schema);
+            }
+        }
+    }
+    match (profile.adapter, profile.daisyrose_adapter, entries) {
+        (false, false | true, None) => Ok(None),
+        (true, false, Some(items)) | (false, true, Some(items))
+            if items.len() == 1 && items[0].id == 0 =>
+        {
+            Ok(Some(items))
+        }
+        (true, true, Some(items)) => match items.as_slice() {
+            [only] if only.id == 0 => Ok(Some(items)),
+            [first, second]
+                if (first.id == 0 && second.id == 1) || (first.id == 1 && second.id == 0) =>
+            {
+                Ok(Some(items))
+            }
+            _ => Err(NativeBackendError::Schema),
+        },
+        _ => Err(NativeBackendError::Schema),
+    }
 }
 
 #[cfg(test)]
@@ -619,17 +654,7 @@ fn canonical_for_profile(
     }
     let Object(body): Object<FixedBody<'_>> =
         serde_json::from_slice(bytes).map_err(|_| NativeBackendError::Schema)?;
-    if match body.lora.as_ref() {
-        Some([Object(lora)]) => {
-            !profile.adapter
-                || lora.id != 0
-                || !lora.scale.is_finite()
-                || !(0.0..=2.0).contains(&lora.scale)
-        }
-        None => profile.adapter,
-    } {
-        return Err(NativeBackendError::Schema);
-    }
+    let lora = validate_canonical_lora(body.lora, profile)?;
     if !crate::valid_history_for_vision(&body.messages, profile.vision)
         || !(1..=MAX_COMPLETION_TOKENS).contains(&body.max_completion_tokens)
         || body.n != 1
@@ -674,7 +699,7 @@ fn canonical_for_profile(
                 preserve_thinking: true,
             },
         },
-        lora: body.lora.map(|[Object(lora)]| [lora]),
+        lora,
     })
     .map_err(|_| NativeBackendError::Schema)?;
     Ok(PendingChat {

@@ -61,9 +61,18 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| usize::try_from(n).ok())
             .ok_or(Rejection::CompletionLimit)?;
-        let adapter_scale = parse_adapter_scale(&value)?;
+        let has_rank_one = session.adapter_identity().is_some();
+        let has_multi_rank = session.secondary_adapter_identity().is_some();
+        let (adapter_scale, multi_rank_scale) =
+            parse_adapter_scales(&value, has_rank_one, has_multi_rank)?;
         let prompt = session
-            .prepare_with_settings(messages, output, enable_thinking, adapter_scale)
+            .prepare_with_adapter_scales(
+                messages,
+                output,
+                enable_thinking,
+                adapter_scale,
+                multi_rank_scale,
+            )
             .map_err(|error| classify_preparation_error(error.as_ref()))?;
         let count = prompt.prompt_tokens();
         prepared = Some(prompt);
@@ -73,12 +82,8 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
     Ok(NativeChat { admitted, prompt })
 }
 
-fn parse_adapter_scale(value: &serde_json::Value) -> Result<Option<f32>, Rejection> {
-    let Some(lora) = value.get("lora") else {
-        return Ok(None);
-    };
-    let raw = serde_json::from_value::<f64>(lora[0]["scale"].clone())
-        .map_err(|_| Rejection::ChatSchema)?;
+fn parse_scale_value(raw_val: &serde_json::Value) -> Result<f32, Rejection> {
+    let raw = serde_json::from_value::<f64>(raw_val.clone()).map_err(|_| Rejection::ChatSchema)?;
     if !raw.is_finite() || !(0.0..=f64::from(f32::MAX)).contains(&raw) {
         return Err(Rejection::ChatSchema);
     }
@@ -91,7 +96,67 @@ fn parse_adapter_scale(value: &serde_json::Value) -> Result<Option<f32>, Rejecti
     if !scale.is_finite() || scale < 0.0 {
         return Err(Rejection::ChatSchema);
     }
-    Ok(Some(scale))
+    Ok(scale)
+}
+
+#[cfg(test)]
+fn parse_adapter_scale(value: &serde_json::Value) -> Result<Option<f32>, Rejection> {
+    let Some(lora) = value.get("lora") else {
+        return Ok(None);
+    };
+    let Some(entries) = lora.as_array() else {
+        return Err(Rejection::ChatSchema);
+    };
+    if entries.len() != 1 {
+        return Err(Rejection::ChatSchema);
+    }
+    Ok(Some(parse_scale_value(&entries[0]["scale"])?))
+}
+
+fn parse_adapter_scales(
+    value: &serde_json::Value,
+    has_rank_one: bool,
+    has_multi_rank: bool,
+) -> Result<(Option<f32>, Option<f32>), Rejection> {
+    let Some(lora) = value.get("lora") else {
+        return Ok((None, has_multi_rank.then_some(0.0)));
+    };
+    let Some(entries) = lora.as_array() else {
+        return Err(Rejection::ChatSchema);
+    };
+    if !(1..=2).contains(&entries.len()) {
+        return Err(Rejection::ChatSchema);
+    }
+    let mut slot0: Option<f32> = None;
+    let mut slot1: Option<f32> = None;
+    for entry in entries {
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(Rejection::ChatSchema)?;
+        let scale = parse_scale_value(&entry["scale"])?;
+        match id {
+            0 if slot0.is_none() => slot0 = Some(scale),
+            1 if slot1.is_none() => slot1 = Some(scale),
+            _ => return Err(Rejection::ChatSchema),
+        }
+    }
+    match (has_rank_one, has_multi_rank) {
+        (false, false) => Err(Rejection::ChatSchema),
+        (true, false) => match (slot0, slot1) {
+            (Some(r1), None) => Ok((Some(r1), None)),
+            _ => Err(Rejection::ChatSchema),
+        },
+        (false, true) => match (slot0, slot1) {
+            (Some(mr), None) => Ok((None, Some(mr))),
+            _ => Err(Rejection::ChatSchema),
+        },
+        (true, true) => match (slot0, slot1) {
+            (Some(r1), Some(mr)) => Ok((Some(r1), Some(mr))),
+            (Some(r1), None) => Ok((Some(r1), Some(0.0))),
+            _ => Err(Rejection::ChatSchema),
+        },
+    }
 }
 
 fn classify_preparation_error(
@@ -143,9 +208,54 @@ pub fn complete_with_timings(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_preparation_error, parse_adapter_scale};
+    use super::{classify_preparation_error, parse_adapter_scale, parse_adapter_scales};
     use crate::Rejection;
     use serde_json::json;
+
+    #[test]
+    fn parse_adapter_scales_maps_stacked_ids_and_defaults_daisyrose_to_zero() {
+        assert_eq!(parse_adapter_scales(&json!({}), false, false), Ok((None, None)));
+        assert_eq!(
+            parse_adapter_scales(&json!({}), false, true),
+            Ok((None, Some(0.0)))
+        );
+        assert_eq!(
+            parse_adapter_scales(&json!({"lora": [{"id": 0, "scale": 1.3}]}), true, true),
+            Ok((Some(1.3), Some(0.0)))
+        );
+        assert_eq!(
+            parse_adapter_scales(
+                &json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}]}),
+                true,
+                true
+            ),
+            Ok((Some(1.3), Some(0.5)))
+        );
+        assert_eq!(
+            parse_adapter_scales(
+                &json!({"lora": [{"id": 1, "scale": 0.5}, {"id": 0, "scale": 1.3}]}),
+                true,
+                true
+            ),
+            Ok((Some(1.3), Some(0.5)))
+        );
+        assert_eq!(
+            parse_adapter_scales(&json!({"lora": [{"id": 0, "scale": 0.75}]}), false, true),
+            Ok((None, Some(0.75)))
+        );
+        for (body, r1, mr) in [
+            (json!({"lora": [{"id": 1, "scale": 0.5}]}), true, true),
+            (json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 0, "scale": 0.5}]}), true, true),
+            (json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}]}), true, false),
+            (json!({"lora": [{"id": 0, "scale": 0.5}]}), false, false),
+        ] {
+            assert_eq!(
+                parse_adapter_scales(&body, r1, mr),
+                Err(Rejection::ChatSchema),
+                "expected rejection for {body} (r1={r1}, mr={mr})"
+            );
+        }
+    }
 
     #[test]
     fn parse_adapter_scale_validates_f64_before_binary32_narrowing() {

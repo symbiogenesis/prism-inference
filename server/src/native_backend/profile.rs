@@ -131,6 +131,9 @@ pub(super) struct ModelProfile {
     pub projection_startup: ProjectionStartup,
     pub representation: Representation,
     pub adapter: bool,
+    pub daisyrose_adapter: bool,
+    pub daisyrose_adapter_sha256: Option<Arc<str>>,
+    pub daisyrose_adapter_max_rank: Option<u16>,
     pub vision: bool,
     pub image_max_tokens: Option<usize>,
     pub prompt_reuse: PromptReuse,
@@ -150,6 +153,9 @@ impl Default for ModelProfile {
             projection_startup: ProjectionStartup::default(),
             representation: Representation::default(),
             adapter: false,
+            daisyrose_adapter: false,
+            daisyrose_adapter_sha256: None,
+            daisyrose_adapter_max_rank: None,
             vision: false,
             image_max_tokens: None,
             prompt_reuse: PromptReuse::default(),
@@ -188,6 +194,12 @@ impl ModelProfile {
             if self.adapter {
                 model["abliteration_scale_range"] = json!([0, 2]);
             }
+        }
+        if self.daisyrose_adapter {
+            model["supports_daisyrose_scale"] = json!(true);
+            model["daisyrose_scale_range"] = json!([0, 2]);
+            model["daisyrose_adapter_sha256"] = json!(self.daisyrose_adapter_sha256.as_deref());
+            model["daisyrose_adapter_max_rank"] = json!(self.daisyrose_adapter_max_rank);
         }
         if self.vision {
             model["vision"] = json!(true);

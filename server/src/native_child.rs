@@ -12,7 +12,7 @@ use bonsai_prism_runtime::{
     runtime::PromptReuse,
     swift_session::{
         BranchCheckpoints, CpuPrefill, CpuSpeculation, DEFAULT_MAX_IMAGE_TOKENS, MAX_IMAGE_TOKENS,
-        MIN_IMAGE_TOKENS, MMPROJ_MEMORY_BYTES, SwiftSession,
+        MIN_IMAGE_TOKENS, MMPROJ_MEMORY_BYTES, MultiRankAdapterSpec, SwiftSession,
         validate_calibrated_cow_execution_capacity, validate_context_capacity_with_kv,
         validate_execution_capacity_with_reuse,
     },
@@ -38,6 +38,13 @@ enum AdmissionPolicy {
     CalibratedCow,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaisyRoseConfig {
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
 struct Config {
     placement: Placement,
     model: PathBuf,
@@ -48,6 +55,7 @@ struct Config {
     row_workers: usize,
     representation: Representation,
     adapter: Option<PathBuf>,
+    daisyrose_lora: Option<DaisyRoseConfig>,
     mmproj: Option<PathBuf>,
     image_max_tokens: usize,
     prompt_reuse: PromptReuse,
@@ -101,6 +109,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut cpu_family = None;
     let mut repacked_ptq1 = false;
     let mut adapter = None;
+    let (mut daisyrose_path, mut daisyrose_bytes, mut daisyrose_sha256) = (None, None, None);
     let mut mmproj = None;
     let mut image_max_tokens = None;
     let mut prompt_reuse = None;
@@ -130,6 +139,15 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             Some("--model") if model.is_none() => model = Some(PathBuf::from(value)),
             Some("--key-file") if key.is_none() => key = Some(PathBuf::from(value)),
             Some("--abliterate-lora") if adapter.is_none() => adapter = Some(PathBuf::from(value)),
+            Some("--daisyrose-lora") if daisyrose_path.is_none() => {
+                daisyrose_path = Some(PathBuf::from(value));
+            }
+            Some("--daisyrose-lora-bytes") if daisyrose_bytes.is_none() => {
+                daisyrose_bytes = Some(value);
+            }
+            Some("--daisyrose-lora-sha256") if daisyrose_sha256.is_none() => {
+                daisyrose_sha256 = Some(value);
+            }
             Some("--mmproj") if mmproj.is_none() => mmproj = Some(PathBuf::from(value)),
             Some("--image-max-tokens") if image_max_tokens.is_none() => {
                 image_max_tokens = Some(value);
@@ -287,6 +305,11 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let resolved_kv_cache =
         kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE);
     let resolved_policy = admission_policy.unwrap_or_default();
+    let daisyrose_lora = resolve_daisyrose_config(
+        daisyrose_path,
+        daisyrose_bytes,
+        daisyrose_sha256,
+    )?;
     let config = Config {
         placement: placement.unwrap_or_default(),
         model: model.ok_or_else(invalid)?,
@@ -302,6 +325,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             Representation::Pq2
         },
         adapter,
+        daisyrose_lora,
         mmproj,
         image_max_tokens: resolved_image_max_tokens,
         prompt_reuse: prompt_reuse.unwrap_or_default(),
@@ -323,8 +347,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         )?,
     };
     if let Some(expected_sections) = config.verified_sections {
-        let configured_sections =
-            1_usize + usize::from(config.adapter.is_some()) + usize::from(config.mmproj.is_some());
+        let configured_sections = 1_usize
+            + usize::from(config.adapter.is_some())
+            + usize::from(config.daisyrose_lora.is_some())
+            + usize::from(config.mmproj.is_some());
         if expected_sections != configured_sections {
             return Err(invalid());
         }
@@ -388,11 +414,42 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     }
     for path in std::iter::once(&config.model)
         .chain(config.adapter.as_ref())
+        .chain(config.daisyrose_lora.as_ref().map(|item| &item.path))
         .chain(config.mmproj.as_ref())
     {
         validate_read_path(path)?;
     }
     Ok(config)
+}
+
+fn resolve_daisyrose_config(
+    path: Option<PathBuf>,
+    bytes: Option<OsString>,
+    sha256: Option<OsString>,
+) -> io::Result<Option<DaisyRoseConfig>> {
+    match (path, bytes, sha256) {
+        (None, None, None) => Ok(None),
+        (Some(path), Some(raw_bytes), Some(raw_sha256)) => {
+            let bytes = raw_bytes
+                .to_str()
+                .ok_or_else(invalid)?
+                .parse::<u64>()
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(invalid)?;
+            let sha256 = raw_sha256
+                .to_str()
+                .ok_or_else(invalid)?
+                .to_ascii_lowercase();
+            let _ = decode_sha256_hex(&sha256)?;
+            Ok(Some(DaisyRoseConfig {
+                path,
+                bytes,
+                sha256,
+            }))
+        }
+        _ => Err(invalid()),
+    }
 }
 
 fn resolve_speculation(
@@ -595,7 +652,7 @@ fn decode_sha256_hex(hex: &str) -> io::Result<[u8; 32]> {
 }
 
 fn expected_verified_sections(config: &Config) -> io::Result<Vec<(u32, u64, [u8; 32])>> {
-    let mut expected = Vec::with_capacity(3);
+    let mut expected = Vec::with_capacity(4);
     expected.push((
         0_u32,
         config.representation.model_bytes(),
@@ -608,6 +665,10 @@ fn expected_verified_sections(config: &Config) -> io::Result<Vec<(u32, u64, [u8;
             SWIFT_ADAPTER_BYTES,
             decode_sha256_hex(SWIFT_ADAPTER_SHA256)?,
         ));
+    }
+    if let Some(ref daisyrose) = config.daisyrose_lora {
+        let slot = u32::try_from(expected.len()).map_err(|_| invalid())?;
+        expected.push((slot, daisyrose.bytes, decode_sha256_hex(&daisyrose.sha256)?));
     }
     if config.mmproj.is_some() {
         let slot = u32::try_from(expected.len()).map_err(|_| invalid())?;
@@ -700,6 +761,7 @@ fn prepare_transport(transport: &ChildTransport) -> io::Result<PreparedTransport
 }
 
 fn required_memory_bytes(config: &Config) -> io::Result<u64> {
+    const DAISYROSE_SCRATCH_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
     let base_required_bytes = config.capacity.map_or(
         crate::configuration::REQUIRED_AVAILABLE_BYTES,
         |(_, memory)| memory + 4 * 1024 * 1024 * 1024,
@@ -709,8 +771,14 @@ fn required_memory_bytes(config: &Config) -> io::Result<u64> {
     } else {
         0
     };
+    let daisyrose_reserve_bytes = config
+        .daisyrose_lora
+        .as_ref()
+        .and_then(|item| item.bytes.checked_add(DAISYROSE_SCRATCH_HEADROOM_BYTES))
+        .unwrap_or(0);
     base_required_bytes
         .checked_add(vision_reserve_bytes)
+        .and_then(|bytes| bytes.checked_add(daisyrose_reserve_bytes))
         .ok_or_else(|| {
             startup::at(
                 Stage::Memory,
@@ -729,9 +797,10 @@ async fn serve_prepared(
             let listener = bound_loopback_socket(port)
                 .and_then(|socket| socket.listen(1))
                 .map_err(|error| startup::at(Stage::Listener, &error))?;
-            let result =
-                crate::native_backend::serve_with_placement(listener, session, key, placement)
-                    .await;
+            let result = Box::pin(crate::native_backend::serve_with_placement(
+                listener, session, key, placement,
+            ))
+            .await;
             drop(guard);
             result
         }
@@ -799,10 +868,15 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     }
     let parallelism = RowParallelism::new(config.row_workers)
         .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
-    let mut session = SwiftSession::load_profile_with_execution_and_reuse(
+    let mut session = SwiftSession::load_profile_with_adapters(
         &config.model,
         config.representation,
         config.adapter.as_deref(),
+        config.daisyrose_lora.as_ref().map(|item| MultiRankAdapterSpec {
+            path: &item.path,
+            bytes: item.bytes,
+            sha256: &item.sha256,
+        }),
         MatvecBackend::Auto,
         config.seed,
         parallelism,
@@ -2030,6 +2104,63 @@ mod tests {
             selected_state_budget(context, KvCachePolicy::Rotated4).map_err(io::Error::other)?
                 > bonsai_prism_runtime::swift_session::STATE_MEMORY_BYTES
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_daisyrose_lora_verified_sections_and_partial_flag_rejection() -> io::Result<()>
+    {
+        let (directory, [model, _key, adapter]) = files()?;
+        let mmproj = directory.path().join("mmproj.gguf");
+        std::fs::write(&mmproj, [])?;
+        let daisy = directory.path().join("daisyrose.gguf");
+        std::fs::write(&daisy, b"placeholder")?;
+        let daisy_hash = "ab".repeat(32);
+
+        let pipe_base: Vec<OsString> = vec![
+            "--native-engine-child".into(),
+            "--broker-pipe".into(),
+            "--model".into(),
+            model,
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        let mut sec4 = pipe_base.clone();
+        sec4.extend([
+            "--abliterate-lora".into(),
+            adapter,
+            "--daisyrose-lora".into(),
+            daisy.clone().into_os_string(),
+            "--daisyrose-lora-bytes".into(),
+            "4096".into(),
+            "--daisyrose-lora-sha256".into(),
+            daisy_hash.into(),
+            "--mmproj".into(),
+            mmproj.into_os_string(),
+            "--verified-sections".into(),
+            "4".into(),
+        ]);
+        let parsed_sec4 = parse(sec4.clone())?;
+        assert_eq!(parsed_sec4.verified_sections, Some(4));
+        let expected_sec4 = expected_verified_sections(&parsed_sec4)?;
+        assert_eq!(expected_sec4.len(), 4);
+        assert_eq!(expected_sec4[2].0, 2);
+        assert_eq!(expected_sec4[2].1, 4096);
+        assert_eq!(expected_sec4[3].0, 3);
+
+        let last_idx = sec4.len() - 1;
+        sec4[last_idx] = "3".into();
+        assert!(parse(sec4).is_err());
+
+        let mut partial = pipe_base;
+        partial.extend([
+            "--daisyrose-lora".into(),
+            daisy.into_os_string(),
+            "--daisyrose-lora-bytes".into(),
+            "4096".into(),
+        ]);
+        assert!(parse(partial).is_err());
         Ok(())
     }
 }

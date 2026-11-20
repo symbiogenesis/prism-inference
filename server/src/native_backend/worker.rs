@@ -75,6 +75,11 @@ impl Engine for SwiftSession {
             projection_startup: ProjectionStartup::default(),
             representation: self.representation(),
             adapter: self.adapter_identity().is_some(),
+            daisyrose_adapter: self.secondary_adapter_identity().is_some(),
+            daisyrose_adapter_sha256: self.secondary_adapter_identity().map(Arc::from),
+            daisyrose_adapter_max_rank: self
+                .secondary_adapter_max_rank()
+                .and_then(|rank| u16::try_from(rank).ok()),
             vision: self.has_vision(),
             image_max_tokens: self.has_vision().then(|| self.max_image_tokens()),
             prompt_reuse: self.prompt_reuse(),

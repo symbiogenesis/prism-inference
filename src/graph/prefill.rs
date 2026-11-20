@@ -32,6 +32,12 @@ mod ffn_tests;
 #[path = "prefill_sibling_tests.rs"]
 mod sibling_tests;
 
+const fn coerce_executor<'a>(
+    executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
+) -> &'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a) {
+    &mut **executor
+}
+
 fn tiled_attention_scratch_bytes(
     geometry: &Geometry,
     arithmetic: Arithmetic,
@@ -384,8 +390,14 @@ impl Qwen35 {
     /// Rejects nonempty/already selected graphs, triangular GDN, insufficient
     /// additional reservation and identity-allocation failure.
     pub fn with_tiled_verification(mut self, additional_bytes: usize) -> Result<Self> {
-        if self.projection_executor.is_some() {
-            return Err(invalid("tiled verification requires CPU-only projections"));
+        if self
+            .projection_executor
+            .as_ref()
+            .is_some_and(|exec| !exec.supports_tile_tokens())
+        {
+            return Err(invalid(
+                "tiled verification requires CPU-only or tile-capable projections",
+            ));
         }
         let required = self.tiled_verification_scratch_bytes()?;
         let tile = self
@@ -434,7 +446,10 @@ impl Qwen35 {
         }
         if tokens.is_empty()
             || tokens.len() > self.verification_capacity()
-            || self.projection_executor.is_some()
+            || self
+                .projection_executor
+                .as_ref()
+                .is_some_and(|exec| !exec.supports_tile_tokens())
             || tokens
                 .iter()
                 .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
@@ -478,11 +493,20 @@ impl Qwen35 {
             .tiled_prefill
             .take()
             .ok_or_else(|| invalid("missing verification tile"))?;
+        let mut executor = self.projection_executor.take();
         let result = (|| {
             check()?;
-            self.ingest_cpu_tile(tokens, check, &mut tile, None, Some(output.as_mut_slice()))?;
+            let prefill_executor = executor.as_mut().map(coerce_executor);
+            self.ingest_cpu_tile(
+                tokens,
+                check,
+                &mut tile,
+                prefill_executor,
+                Some(output.as_mut_slice()),
+            )?;
             check()
         })();
+        self.projection_executor = executor;
         self.tiled_prefill = Some(tile);
         if result.is_err() {
             output.clear();
@@ -495,11 +519,6 @@ impl Qwen35 {
         tokens: &[u32],
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        const fn coerce_executor<'a>(
-            executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
-        ) -> &'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a) {
-            &mut **executor
-        }
         let mut executor = self.projection_executor.take();
         let prefill_executor = if self.tiled_prefill.is_some() {
             executor

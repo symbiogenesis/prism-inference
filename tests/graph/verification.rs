@@ -306,3 +306,114 @@ fn tiled_verification_runtime_accepts_bonus_and_replays_every_rejected_prefix() 
     }
     Ok(())
 }
+
+struct TileCapableExecutor {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for TileCapableExecutor {
+    fn identity(&self) -> &'static str {
+        "tile-capable-verification-mock"
+    }
+
+    fn supports(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    fn supports_tile_tokens(&self) -> bool {
+        true
+    }
+
+    fn supports_f32(&self, tensor: &Tensor) -> bool {
+        tensor.kind == 142
+    }
+
+    fn project(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[bonsai_ternary::Q8KBlock],
+        _fused: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err("unexpected q8k path on tile-capable f32 mock".into())
+    }
+
+    fn project_f32(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[f32],
+        _pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        output.clear();
+        let mut scratch =
+            bonsai_prism_runtime::kernels::MatvecScratch::with_backend(MatvecBackend::Auto);
+        scratch
+            .prepare(tensor, activation)?
+            .matvec_into(tensor, output)
+    }
+}
+
+#[test]
+fn tiled_verification_accepts_tile_capable_executor_and_restores_on_cancel() -> Result<()> {
+    let build = || -> Result<Qwen35> {
+        let model = packed_output_fixture(false);
+        let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+        rank_one_graph(model, factors, 1.3)
+    };
+    let mut expected = build()?;
+    let mut graph = build()?;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    graph.set_projection_executor(Some(Box::new(TileCapableExecutor {
+        calls: calls.clone(),
+    })));
+    let tile_bytes = graph.tiled_prefill_scratch_bytes(8)?;
+    let graph = graph.with_tiled_prefill(8, tile_bytes)?;
+    let logits_bytes = graph.tiled_verification_scratch_bytes()?;
+    let mut actual = graph.with_tiled_verification(logits_bytes)?;
+    let initial = graph_bits(&actual)?;
+
+    let draft = [0, 1, 1, 0];
+    let reference: Vec<_> = draft
+        .into_iter()
+        .map(|token| expected.evaluate(token))
+        .collect::<Result<_>>()?;
+    let mut rows = Vec::new();
+    actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
+    let invoked = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        invoked > 0,
+        "tile-capable executor should be invoked during verification"
+    );
+    assert_eq!(bits(&rows), bits(&reference));
+    assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+
+    let checkpoint = actual.checkpoint()?;
+    let checks = Cell::new(0);
+    assert!(
+        actual
+            .evaluate_batch_into(&draft, &mut rows, &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() >= 10 {
+                    Err("verification cancellation".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(rows, Vec::<Vec<f32>>::new());
+    actual.restore(&checkpoint)?;
+    assert_ne!(graph_bits(&actual)?, initial);
+
+    let calls_before_second = calls.load(std::sync::atomic::Ordering::Relaxed);
+    actual.evaluate_batch_into(&draft, &mut rows, &|| Ok(()))?;
+    assert!(
+        calls.load(std::sync::atomic::Ordering::Relaxed) > calls_before_second,
+        "projection executor must be restored onto graph after verification error/restore"
+    );
+    assert_eq!(rows.len(), draft.len());
+    Ok(())
+}

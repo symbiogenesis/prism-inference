@@ -1965,6 +1965,51 @@ enum LoopFlow {
     Continue,
 }
 
+fn builtin_from_json(
+    target: &JVal,
+    pos_args: &[JVal],
+    kw_args: &BTreeMap<String, JVal>,
+) -> JResult<JVal> {
+    if pos_args.len() != 1 || !kw_args.is_empty() {
+        return Err(JinjaError::std("Jinja from_json takes no extra arguments"));
+    }
+    if !target.is_string() {
+        return Err(JinjaError::std("Jinja from_json requires a JSON string"));
+    }
+    let raw = target.raw_bytes();
+    let text = std::str::from_utf8(&raw)
+        .map_err(|_| JinjaError::std("Jinja from_json input must be valid UTF-8"))?;
+    parse_json_jval_bounded(text, MAX_TEXT_BYTES, 64)
+        .map_err(|err| JinjaError::std(format!("Jinja from_json error: {err}")))
+}
+
+fn builtin_strftime_now(
+    now_unix_seconds: Option<i64>,
+    pos_args: &[JVal],
+    kw_args: &BTreeMap<String, JVal>,
+) -> JResult<JVal> {
+    let Some(unix_secs) = now_unix_seconds else {
+        return Err(JinjaError::unimpl(
+            "Jinja builtin 'strftime_now' is not implemented",
+        ));
+    };
+    if pos_args.len() > 1 {
+        return Err(JinjaError::std("strftime_now accepts one format argument"));
+    }
+    let fmt_val = if let Some(val) = kw_args.get("format") {
+        val.clone()
+    } else if let Some(val) = pos_args.first() {
+        val.clone()
+    } else {
+        return Err(JinjaError::std("strftime_now requires a format string"));
+    };
+    let fmt_bytes = fmt_val.raw_bytes();
+    let fmt_str = std::str::from_utf8(&fmt_bytes)
+        .map_err(|_| JinjaError::std("strftime_now format must be valid UTF-8"))?;
+    let formatted = format_strftime_utc(unix_secs, fmt_str)?;
+    Ok(JVal::bytes(formatted.into_bytes(), false))
+}
+
 struct Evaluator {
     scopes: Vec<BTreeMap<String, JVal>>,
     steps: usize,
@@ -1972,6 +2017,7 @@ struct Evaluator {
     expr_depth: usize,
     output_bytes: usize,
     now_unix_seconds: Option<i64>,
+    allow_undef_str_add: bool,
 }
 
 impl Evaluator {
@@ -1991,6 +2037,7 @@ impl Evaluator {
             expr_depth: 0,
             output_bytes: 0,
             now_unix_seconds,
+            allow_undef_str_add: false,
         }
     }
 
@@ -2179,8 +2226,17 @@ impl Evaluator {
                 self.exec_block(alternate, out)?;
             } else {
                 let total = selected_items.len();
-                for (idx, item) in selected_items.into_iter().enumerate() {
-                    self.assign_target(target, item)?;
+                for (idx, item) in selected_items.iter().enumerate() {
+                    let previtem = idx
+                        .checked_sub(1)
+                        .and_then(|prev| selected_items.get(prev))
+                        .cloned()
+                        .unwrap_or_else(JVal::undefined);
+                    let nextitem = selected_items
+                        .get(idx + 1)
+                        .cloned()
+                        .unwrap_or_else(JVal::undefined);
+                    self.assign_target(target, item.clone())?;
                     let idx_i64 = i64::try_from(idx)
                         .map_err(|_| JinjaError::std("Jinja loop index overflow"))?;
                     let total_i64 = i64::try_from(total)
@@ -2196,6 +2252,8 @@ impl Evaluator {
                         (JVal::text_str("first"), JVal::boolean(idx == 0)),
                         (JVal::text_str("last"), JVal::boolean(idx + 1 == total)),
                         (JVal::text_str("length"), JVal::int(total_i64)),
+                        (JVal::text_str("previtem"), previtem),
+                        (JVal::text_str("nextitem"), nextitem),
                     ];
                     let loop_obj = JVal::new(ValKind::Object(loop_fields));
                     loop_obj.set_namespace();
@@ -2536,6 +2594,17 @@ impl Evaluator {
                 spans.extend(rhs.to_spans());
                 Ok(JVal::new(ValKind::String(spans)))
             }
+            "+" if self.allow_undef_str_add
+                && ((lhs.is_string() && rhs.is_undefined())
+                    || (lhs.is_undefined() && rhs.is_string())) =>
+            {
+                let spans = if lhs.is_string() {
+                    lhs.to_spans()
+                } else {
+                    rhs.to_spans()
+                };
+                Ok(JVal::new(ValKind::String(spans)))
+            }
             "+" if matches!(lhs.kind_cloned(), ValKind::Array(_) | ValKind::Tuple(_)) => {
                 let is_tuple = matches!(lhs.kind_cloned(), ValKind::Tuple(_));
                 let mut combined = lhs.iter_elements()?;
@@ -2635,26 +2704,7 @@ impl Evaluator {
             return Ok(JVal::boolean(self.eval_test(&target, test_name, extra)?));
         }
         if name == "strftime_now" {
-            let Some(unix_secs) = self.now_unix_seconds else {
-                return Err(JinjaError::unimpl(
-                    "Jinja builtin 'strftime_now' is not implemented",
-                ));
-            };
-            if pos_args.len() > 1 {
-                return Err(JinjaError::std("strftime_now accepts one format argument"));
-            }
-            let fmt_val = if let Some(val) = kw_args.get("format") {
-                val.clone()
-            } else if let Some(val) = pos_args.first() {
-                val.clone()
-            } else {
-                return Err(JinjaError::std("strftime_now requires a format string"));
-            };
-            let fmt_bytes = fmt_val.raw_bytes();
-            let fmt_str = std::str::from_utf8(&fmt_bytes)
-                .map_err(|_| JinjaError::std("strftime_now format must be valid UTF-8"))?;
-            let formatted = format_strftime_utc(unix_secs, fmt_str)?;
-            return Ok(JVal::bytes(formatted.into_bytes(), false));
+            return builtin_strftime_now(self.now_unix_seconds, pos_args, kw_args);
         }
         if name == "slice" {
             return Err(JinjaError::unimpl(format!(
@@ -2710,6 +2760,7 @@ impl Evaluator {
                 let encoded = encode_json_bytes(&target, &opts, 0)?;
                 Ok(JVal::bytes(encoded, false))
             }
+            "from_json" => builtin_from_json(&target, pos_args, kw_args),
             "upper" | "lower" | "capitalize" | "title" | "strip" | "trim" | "lstrip" | "rstrip"
             | "startswith" | "endswith" | "replace" | "split" | "rsplit" | "format" | "indent"
             | "wordcount" | "truncate" => invoke_string_builtin(&target, name, pos_args, kw_args),
@@ -2825,6 +2876,9 @@ impl Evaluator {
         name: &str,
         pos_args: &[JVal],
     ) -> JResult<JVal> {
+        if target.is_none() {
+            return Ok(JVal::new(ValKind::Array(Vec::new())));
+        }
         let by_attr = name.ends_with("attr");
         if by_attr {
             target.0.borrow_mut().array_access = true;
@@ -3197,6 +3251,7 @@ fn is_known_filter(name: &str) -> bool {
             | "first"
             | "float"
             | "format"
+            | "from_json"
             | "indent"
             | "int"
             | "items"
@@ -4544,6 +4599,18 @@ pub(super) fn eval_program_with_now(
     Ok(out)
 }
 
+pub(super) fn eval_program_chat_fallback(
+    program: &Program,
+    globals: &JVal,
+    now_unix_seconds: Option<i64>,
+) -> JResult<Vec<TextSpan>> {
+    let mut evaluator = Evaluator::new_with_now(globals, now_unix_seconds);
+    evaluator.allow_undef_str_add = true;
+    let mut out = Vec::new();
+    evaluator.exec_block(&program.0, &mut out)?;
+    Ok(out)
+}
+
 pub(super) fn eval_program_with_context(
     program: &Program,
     globals: &JVal,
@@ -4585,6 +4652,345 @@ pub(super) fn execute_caps_flags(
         .any(|win| win == b"STRING_MARKER");
     let string_supported = succeeded && (!typed || has_marker);
     Ok((string_supported, typed))
+}
+
+/// Full 9-field capabilities extracted from a parsed Jinja chat template.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Mirrors the nine boolean capability flags of upstream jinja::caps."
+)]
+pub(super) struct JinjaCaps {
+    pub(super) supports_tools: bool,
+    pub(super) supports_tool_calls: bool,
+    pub(super) supports_system_role: bool,
+    pub(super) supports_parallel_tool_calls: bool,
+    pub(super) supports_preserve_reasoning: bool,
+    pub(super) supports_reasoning_effort: bool,
+    pub(super) supports_string_content: bool,
+    pub(super) supports_typed_content: bool,
+    pub(super) supports_object_arguments: bool,
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|win| win == needle)
+}
+
+fn eval_probe_bytes(program: &Program, globals: &JVal, now_unix_seconds: i64) -> Option<Vec<u8>> {
+    let spans = eval_program_with_now(program, globals, Some(now_unix_seconds)).ok()?;
+    Some(spans.into_iter().flat_map(|span| span.bytes).collect())
+}
+
+fn make_probe_msg(role: &str, content: JVal) -> JVal {
+    JVal::object(vec![
+        (
+            JVal::text_str("role"),
+            JVal::bytes(role.as_bytes().to_vec(), true),
+        ),
+        (JVal::text_str("content"), content),
+    ])
+}
+
+fn make_typed_text(text: &str) -> JVal {
+    if text.is_empty() {
+        JVal::array(Vec::new())
+    } else {
+        JVal::array(vec![JVal::object(vec![
+            (JVal::text_str("type"), JVal::bytes(b"text".to_vec(), true)),
+            (
+                JVal::text_str("text"),
+                JVal::bytes(text.as_bytes().to_vec(), true),
+            ),
+        ])])
+    }
+}
+
+fn make_probe_globals(
+    messages: JVal,
+    tools: Option<JVal>,
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+    extra: &[(&str, JVal)],
+) -> JVal {
+    let mut pairs = vec![
+        (JVal::text_str("messages"), messages),
+        (JVal::text_str("bos_token"), JVal::bytes(Vec::new(), true)),
+        (JVal::text_str("eos_token"), JVal::bytes(Vec::new(), true)),
+        (
+            JVal::text_str("add_generation_prompt"),
+            JVal::boolean(add_generation_prompt),
+        ),
+        (
+            JVal::text_str("enable_thinking"),
+            JVal::boolean(enable_thinking),
+        ),
+    ];
+    if let Some(tools_val) = tools {
+        pairs.push((JVal::text_str("tools"), tools_val));
+    }
+    for (k, v) in extra {
+        pairs.push((JVal::text_str(*k), v.clone()));
+    }
+    JVal::object(pairs)
+}
+
+fn make_tool_calls_probe(calls: &[(&str, &str, JVal)], assistant_content: JVal) -> JVal {
+    let call_vals: Vec<JVal> = calls
+        .iter()
+        .map(|(id, name, args)| {
+            JVal::object(vec![
+                (
+                    JVal::text_str("id"),
+                    JVal::bytes(id.as_bytes().to_vec(), true),
+                ),
+                (
+                    JVal::text_str("type"),
+                    JVal::bytes(b"function".to_vec(), true),
+                ),
+                (
+                    JVal::text_str("function"),
+                    JVal::object(vec![
+                        (
+                            JVal::text_str("name"),
+                            JVal::bytes(name.as_bytes().to_vec(), true),
+                        ),
+                        (JVal::text_str("arguments"), args.clone()),
+                    ]),
+                ),
+            ])
+        })
+        .collect();
+    JVal::object(vec![
+        (
+            JVal::text_str("role"),
+            JVal::bytes(b"assistant".to_vec(), true),
+        ),
+        (JVal::text_str("content"), assistant_content),
+        (JVal::text_str("tool_calls"), JVal::array(call_vals)),
+    ])
+}
+
+fn probe_tool_caps(
+    program: &Program,
+    now_unix_seconds: i64,
+    msg_content: &dyn Fn(&str) -> JVal,
+) -> (bool, bool, bool, bool) {
+    let tools_json = r#"[{"type":"function","function":{"name":"caps_tool_alpha","description":"Alpha tool","parameters":{"type":"object","properties":{"arg":{"type":"string"}}}}}]"#;
+    let tools_val =
+        parse_json_jval_bounded(tools_json, 65_536, 16).unwrap_or_else(|_| JVal::array(Vec::new()));
+    let tools_globals = make_probe_globals(
+        JVal::array(vec![make_probe_msg("user", msg_content("hello"))]),
+        Some(tools_val.clone()),
+        true,
+        true,
+        &[],
+    );
+    let supports_tools = eval_probe_bytes(program, &tools_globals, now_unix_seconds)
+        .is_some_and(|bytes| contains_bytes(&bytes, b"caps_tool_alpha"));
+
+    let obj_args = JVal::object(vec![(
+        JVal::text_str("arg_k"),
+        JVal::bytes(b"arg_v".to_vec(), true),
+    )]);
+    let str_args = JVal::bytes(br#"{"arg_k":"arg_v"}"#.to_vec(), true);
+
+    let mut supports_tool_calls = false;
+    let mut supports_object_arguments = false;
+    let mut working_asst_empty = JVal::none();
+    let mut working_args_is_obj = true;
+
+    let empty_candidates = [JVal::none(), msg_content("")];
+    'probe_tc: for (is_obj, args) in [(true, &obj_args), (false, &str_args)] {
+        for empty_content in &empty_candidates {
+            let msgs = JVal::array(vec![
+                make_probe_msg("user", msg_content("hi")),
+                make_tool_calls_probe(
+                    &[("call00001", "tc_probe_one", args.clone())],
+                    empty_content.clone(),
+                ),
+            ]);
+            let globals = make_probe_globals(msgs, Some(tools_val.clone()), false, true, &[]);
+            if let Some(bytes) = eval_probe_bytes(program, &globals, now_unix_seconds)
+                && contains_bytes(&bytes, b"tc_probe_one")
+            {
+                supports_tool_calls = true;
+                working_asst_empty = empty_content.clone();
+                working_args_is_obj = is_obj;
+                if is_obj {
+                    supports_object_arguments = contains_bytes(&bytes, b"arg_k")
+                        && contains_bytes(&bytes, b"arg_v")
+                        && !contains_bytes(&bytes, br#"\"arg_k\""#);
+                }
+                break 'probe_tc;
+            }
+        }
+    }
+
+    let supports_parallel_tool_calls = if supports_tool_calls {
+        let arg = if working_args_is_obj {
+            obj_args
+        } else {
+            str_args
+        };
+        let msgs = JVal::array(vec![
+            make_probe_msg("user", msg_content("hi")),
+            make_tool_calls_probe(
+                &[
+                    ("call00001", "tc_probe_one", arg.clone()),
+                    ("call00002", "tc_probe_two", arg),
+                ],
+                working_asst_empty,
+            ),
+        ]);
+        let globals = make_probe_globals(msgs, Some(tools_val), false, true, &[]);
+        eval_probe_bytes(program, &globals, now_unix_seconds).is_some_and(|bytes| {
+            contains_bytes(&bytes, b"tc_probe_one") && contains_bytes(&bytes, b"tc_probe_two")
+        })
+    } else {
+        false
+    };
+
+    (
+        supports_tools,
+        supports_tool_calls,
+        supports_parallel_tool_calls,
+        supports_object_arguments,
+    )
+}
+
+fn probe_reasoning_caps(
+    program: &Program,
+    now_unix_seconds: i64,
+    msg_content: &dyn Fn(&str) -> JVal,
+) -> (bool, bool) {
+    let reason_asst = JVal::object(vec![
+        (
+            JVal::text_str("role"),
+            JVal::bytes(b"assistant".to_vec(), true),
+        ),
+        (JVal::text_str("content"), msg_content("answer")),
+        (
+            JVal::text_str("reasoning_content"),
+            JVal::bytes(b"REASON_CAPS_MARKER".to_vec(), true),
+        ),
+    ]);
+    let preserve_globals = make_probe_globals(
+        JVal::array(vec![
+            make_probe_msg("user", msg_content("hi")),
+            reason_asst,
+            make_probe_msg("user", msg_content("next")),
+        ]),
+        None,
+        false,
+        true,
+        &[],
+    );
+    let supports_preserve_reasoning =
+        eval_probe_bytes(program, &preserve_globals, now_unix_seconds)
+            .is_some_and(|bytes| contains_bytes(&bytes, b"REASON_CAPS_MARKER"));
+
+    let effort_high_globals = make_probe_globals(
+        JVal::array(vec![make_probe_msg("user", msg_content("hi"))]),
+        None,
+        true,
+        true,
+        &[("reasoning_effort", JVal::bytes(b"high".to_vec(), true))],
+    );
+    let effort_low_globals = make_probe_globals(
+        JVal::array(vec![make_probe_msg("user", msg_content("hi"))]),
+        None,
+        true,
+        true,
+        &[("reasoning_effort", JVal::bytes(b"low".to_vec(), true))],
+    );
+    let (high_res, high_scope) =
+        eval_program_with_context(program, &effort_high_globals, Some(now_unix_seconds));
+    let low_res = eval_probe_bytes(program, &effort_low_globals, now_unix_seconds);
+    let high_bytes = high_res
+        .ok()
+        .map(|spans| spans.into_iter().flat_map(|s| s.bytes).collect::<Vec<u8>>());
+    let supports_reasoning_effort = high_scope
+        .get("reasoning_effort")
+        .is_some_and(JVal::is_used)
+        || (high_bytes.is_some() && low_res.is_some() && high_bytes != low_res);
+    (supports_preserve_reasoning, supports_reasoning_effort)
+}
+
+/// Probes all nine capabilities of a parsed Jinja chat template.
+pub(super) fn detect_jinja_caps(program: &Program, now_unix_seconds: i64) -> JinjaCaps {
+    let (flag_str, flag_typed) =
+        execute_caps_flags(program, Some(now_unix_seconds)).unwrap_or((false, false));
+
+    let str_msg = make_probe_msg("user", JVal::bytes(b"STRING_MARKER".to_vec(), true));
+    let str_globals = make_probe_globals(
+        JVal::array(vec![str_msg]),
+        Some(JVal::array(Vec::new())),
+        true,
+        true,
+        &[],
+    );
+    let str_bytes = eval_probe_bytes(program, &str_globals, now_unix_seconds);
+    let str_has_marker = str_bytes
+        .as_deref()
+        .is_some_and(|bytes| contains_bytes(bytes, b"STRING_MARKER"));
+    let supports_string_content = flag_str && str_has_marker;
+
+    let typed_msg = make_probe_msg("user", make_typed_text("TYPED_MARKER"));
+    let typed_globals = make_probe_globals(
+        JVal::array(vec![typed_msg]),
+        Some(JVal::array(Vec::new())),
+        true,
+        true,
+        &[],
+    );
+    let typed_bytes = eval_probe_bytes(program, &typed_globals, now_unix_seconds);
+    let typed_rendered = typed_bytes.as_deref().is_some_and(|bytes| {
+        contains_bytes(bytes, b"TYPED_MARKER") && !contains_bytes(bytes, b"'type': 'text'")
+    });
+    let supports_typed_content = flag_typed || typed_rendered;
+    let use_typed = !supports_string_content && supports_typed_content;
+    let msg_content = |text: &str| -> JVal {
+        if use_typed {
+            make_typed_text(text)
+        } else {
+            JVal::bytes(text.as_bytes().to_vec(), true)
+        }
+    };
+
+    let sys_globals = make_probe_globals(
+        JVal::array(vec![
+            make_probe_msg("system", msg_content("SYS_CAPS_MARKER")),
+            make_probe_msg("user", msg_content("USR_CAPS_MARKER")),
+        ]),
+        None,
+        true,
+        true,
+        &[],
+    );
+    let supports_system_role = eval_probe_bytes(program, &sys_globals, now_unix_seconds)
+        .is_some_and(|bytes| contains_bytes(&bytes, b"SYS_CAPS_MARKER"));
+
+    let (
+        supports_tools,
+        supports_tool_calls,
+        supports_parallel_tool_calls,
+        supports_object_arguments,
+    ) = probe_tool_caps(program, now_unix_seconds, &msg_content);
+
+    let (supports_preserve_reasoning, supports_reasoning_effort) =
+        probe_reasoning_caps(program, now_unix_seconds, &msg_content);
+
+    JinjaCaps {
+        supports_tools,
+        supports_tool_calls,
+        supports_system_role,
+        supports_parallel_tool_calls,
+        supports_preserve_reasoning,
+        supports_reasoning_effort,
+        supports_string_content,
+        supports_typed_content,
+        supports_object_arguments,
+    }
 }
 
 fn execute_caps(template: &str) -> JResult<Value> {
@@ -4920,6 +5326,45 @@ mod tests {
             "Chunks": [vec![1_u8; 256 * 1024]]
         })))?;
         assert!(exact_hash["Results"][0]["Digest"].is_u64());
+
+        let loop_neighbors = execute(&wrap(&json!({
+            "Kind": "jinja-render",
+            "Template": "{% for x in arr %}[{{ loop.previtem if loop.previtem is defined else 'NONE' }},{{ x }},{{ loop.nextitem if loop.nextitem is defined else 'NONE' }}]{% endfor %}",
+            "Variables": {"arr": ["a", "b", "c"]}
+        })))?;
+        assert_eq!(
+            loop_neighbors["Results"][0]["Rendered"],
+            "[NONE,a,b][a,b,c][b,c,NONE]"
+        );
+
+        let parsed_json = execute(&wrap(&json!({
+            "Kind": "jinja-render",
+            "Template": "{% set d = raw | from_json %}{{ d.k }}:{{ d.nums[1] }}",
+            "Variables": {"raw": r#"{"k":"ok","nums":[10,20]}"#}
+        })))?;
+        assert_eq!(parsed_json["Results"][0]["Rendered"], "ok:20");
+
+        let bad_from_json = execute(&wrap(&json!({
+            "Kind": "jinja-render",
+            "Template": "{{ '{bad' | from_json }}",
+            "Variables": {}
+        })))?;
+        assert_eq!(bad_from_json["Results"][0]["ExceptionKind"], "standard");
+
+        let caps_prog = parse_template(
+            "{% if reasoning_effort is defined %}[{{ reasoning_effort }}]{% endif %}{% for m in messages %}{{ m.role }}:{% if m.content is string %}{{ m.content }}{% elif m.content is iterable %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endif %}{% if m.reasoning_content %}<think>{{ m.reasoning_content }}</think>{% endif %}{% if m.tool_calls %}{% for tc in m.tool_calls %}{{ tc.function.name }}({% for k, v in tc.function.arguments|items %}{{ k }}={{ v }}{% endfor %}){% endfor %}{% endif %}{% endfor %}{% if tools %}{{ tools[0].function.name }}{% endif %}",
+        )
+        .map_err(|err| invalid(err.message()))?;
+        let caps = detect_jinja_caps(&caps_prog, 0);
+        assert!(caps.supports_tools);
+        assert!(caps.supports_tool_calls);
+        assert!(caps.supports_system_role);
+        assert!(caps.supports_parallel_tool_calls);
+        assert!(caps.supports_preserve_reasoning);
+        assert!(caps.supports_reasoning_effort);
+        assert!(caps.supports_string_content);
+        assert!(caps.supports_typed_content);
+        assert!(caps.supports_object_arguments);
         Ok(())
     }
 

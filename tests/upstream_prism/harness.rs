@@ -95,6 +95,7 @@ mod reference_arena_graph;
 mod reference_arg_parser;
 mod reference_batch_allocator;
 mod reference_chat_analysis;
+mod reference_chat_auto;
 mod reference_chat_parser;
 mod reference_chat_templates;
 mod reference_codec;
@@ -392,7 +393,7 @@ const CASES: &[Case] = &[
     register(
         "test-chat-auto-parser",
         "tests/test-chat-auto-parser.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         chat_auto::run,
     ),
     register(

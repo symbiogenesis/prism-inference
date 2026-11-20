@@ -73,7 +73,8 @@ struct ValidatedTraceOp {
     actions: Vec<ValidatedAction>,
 }
 
-fn segment_markers(input: &[u8]) -> Vec<(bool, &[u8])> {
+/// Splits `input` into `(is_marker, slice)` segments delimited by `<...>` or `[...]`.
+pub(super) fn segment_markers(input: &[u8]) -> Vec<(bool, &[u8])> {
     let mut output = Vec::new();
     let mut opener = None;
     let mut start = 0;

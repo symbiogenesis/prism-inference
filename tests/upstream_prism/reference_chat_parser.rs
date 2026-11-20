@@ -357,6 +357,7 @@ impl ChatAstMapper<'_> {
                 if self.current_tool.is_none() {
                     self.current_tool = Some(ToolBuildState::default());
                 }
+                self.visit_list(&node.children);
             }
             TAG_TOOL_CLOSE => {
                 if let Some(tool) = self.current_tool.as_mut() {
@@ -1063,6 +1064,24 @@ impl ChatPegBuilder {
         parallel_tool_calls: bool,
         force_tool_calls: bool,
     ) -> Result<ParserId> {
+        self.standard_constructed_tools_with_ws(
+            markers,
+            tools,
+            parallel_tool_calls,
+            force_tool_calls,
+            false,
+        )
+    }
+
+    /// Builds a constructed tool-calling parser with optional inter-tag whitespace tolerance.
+    pub(super) fn standard_constructed_tools_with_ws(
+        &mut self,
+        markers: &BTreeMap<String, String>,
+        tools: &JsonVal,
+        parallel_tool_calls: bool,
+        force_tool_calls: bool,
+        tolerate_intertag_whitespace: bool,
+    ) -> Result<ParserId> {
         let mut parsed_tools = extract_tool_defs(tools, &[]);
         if parsed_tools.is_empty() {
             return Ok(if force_tool_calls {
@@ -1073,7 +1092,8 @@ impl ChatPegBuilder {
         }
         parsed_tools.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
-        let m = ConstructedMarkers::from_map(markers);
+        let mut m = ConstructedMarkers::from_map(markers);
+        m.tolerate_intertag_whitespace = tolerate_intertag_whitespace;
         let mut tool_parsers = Vec::with_capacity(parsed_tools.len());
         for (name, params_schema) in &parsed_tools {
             let p = self.build_single_constructed_tool(name, params_schema, &m)?;
@@ -1261,6 +1281,10 @@ impl ChatPegBuilder {
 
         let val_prefix = if m.arg_value_prefix.is_empty() {
             self.inner.eps()
+        } else if m.tolerate_intertag_whitespace {
+            let sp = self.inner.space();
+            let lit = self.inner.literal(&m.arg_value_prefix);
+            self.inner.add(sp, lit)
         } else {
             self.inner.literal(&m.arg_value_prefix)
         };
@@ -1342,6 +1366,7 @@ struct ConstructedMarkers {
     arg_value_prefix: String,
     arg_value_suffix: String,
     arg_separator: String,
+    tolerate_intertag_whitespace: bool,
 }
 
 impl ConstructedMarkers {
@@ -1474,6 +1499,7 @@ impl ConstructedMarkers {
                 "arg_value_suffix",
             ]),
             arg_separator: get(&["parameter_separator", "arg_separator"]),
+            tolerate_intertag_whitespace: false,
         }
     }
 }

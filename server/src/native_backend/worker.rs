@@ -49,17 +49,24 @@ pub(super) trait Engine: Send + 'static {
     fn initialize_worker_thread(&mut self) -> Result<ProjectionStartup, NativeBackendError> {
         Ok(ProjectionStartup::Cpu)
     }
+    fn initialize_worker_thread_for_placement(
+        &mut self,
+        placement: Placement,
+    ) -> Result<ProjectionStartup, NativeBackendError> {
+        match placement {
+            Placement::Cpu => Ok(ProjectionStartup::Cpu),
+            Placement::Auto | Placement::Vulkan | Placement::Composite => {
+                self.initialize_worker_thread()
+            }
+        }
+    }
 }
 
 fn initialize_for_placement(
     engine: &mut impl Engine,
     placement: Placement,
 ) -> Result<ProjectionStartup, NativeBackendError> {
-    if placement == Placement::Auto {
-        engine.initialize_worker_thread()
-    } else {
-        Ok(ProjectionStartup::Cpu)
-    }
+    engine.initialize_worker_thread_for_placement(placement)
 }
 
 impl Engine for SwiftSession {
@@ -163,358 +170,469 @@ impl Engine for SwiftSession {
         }
         Ok(ProjectionStartup::External(Arc::from(identity)))
     }
+    fn initialize_worker_thread_for_placement(
+        &mut self,
+        placement: Placement,
+    ) -> Result<ProjectionStartup, NativeBackendError> {
+        match placement {
+            Placement::Cpu => Ok(ProjectionStartup::Cpu),
+            Placement::Auto => self.initialize_worker_thread(),
+            Placement::Vulkan => install_vulkan_executor(self),
+            Placement::Composite => install_composite_executor(self),
+        }
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 static HEXAGON_PACKAGE_HINT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+type WorkerCompositeExecutor = bonsai_hexagon_runtime::OwnedCompositeProjectionExecutor<
+    bonsai_hexagon_runtime::NativeQ2Executor<hexagon_native_rpc::NativeQ2Session>,
+    bonsai_adreno_vulkan::VulkanPq2Executor,
+>;
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 thread_local! {
     static WORKER_HEXAGON_EXECUTOR: std::cell::RefCell<
         Option<bonsai_hexagon_runtime::NativeQ2Executor<hexagon_native_rpc::NativeQ2Session>>,
     > = const { std::cell::RefCell::new(None) };
+    static WORKER_COMPOSITE_EXECUTOR: std::cell::RefCell<Option<WorkerCompositeExecutor>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 struct WorkerThreadHexagonExecutor;
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for WorkerThreadHexagonExecutor {
-    fn identity(&self) -> &'static str {
-        "hexagon-hvx-native-q2-resident-v1-experimental"
-    }
-
-    fn operation_capacity(&self) -> Option<u64> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
-            slot.as_ref()
-                .and_then(bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::operation_capacity)
-        })
-    }
-
-    fn operation_count(&self, tensor: &bonsai_prism_runtime::model::Tensor) -> Option<u64> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
-            slot.as_ref()
-                .and_then(|executor| executor.operation_count(tensor))
-        })
-    }
-
-    fn supports(&self, tensor: &bonsai_prism_runtime::model::Tensor) -> bool {
-        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
-            slot.as_ref()
-                .is_some_and(|executor| executor.supports(tensor))
-        })
-    }
-
-    fn project(
-        &mut self,
-        tensor: &bonsai_prism_runtime::model::Tensor,
-        activation: &[bonsai_prism_runtime::kernels::Q8KBlock],
-        fused: bool,
-        output: &mut Vec<f32>,
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                output.clear();
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            executor.project(tensor, activation, fused, output)
-        })
-    }
-
-    fn supports_f32(&self, tensor: &bonsai_prism_runtime::model::Tensor) -> bool {
-        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
-            slot.as_ref()
-                .is_some_and(|executor| executor.supports_f32(tensor))
-        })
-    }
-
-    fn project_f32(
-        &mut self,
-        tensor: &bonsai_prism_runtime::model::Tensor,
-        activation: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                output.clear();
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            executor.project_f32(tensor, activation, pinned, output)
-        })
-    }
-
-    fn supports_f32_group(&self, tensors: &[&bonsai_prism_runtime::model::Tensor]) -> bool {
-        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
-            slot.as_ref()
-                .is_some_and(|executor| executor.supports_f32_group(tensors))
-        })
-    }
-
-    fn project_f32_group(
-        &mut self,
-        tensors: &[&bonsai_prism_runtime::model::Tensor],
-        activation: &[f32],
-        pinned: bool,
-        outputs: &mut [&mut Vec<f32>],
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                for output in outputs.iter_mut() {
-                    output.clear();
-                }
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            executor.project_f32_group(tensors, activation, pinned, outputs)
-        })
-    }
-
-    fn project_f32_tokens(
-        &mut self,
-        tensor: &bonsai_prism_runtime::model::Tensor,
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                for output in outputs.iter_mut() {
-                    output.clear();
-                }
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            executor.project_f32_tokens(tensor, activations, pinned, outputs)
-        })
-    }
-
-    fn project_f32_pair_tokens(
-        &mut self,
-        tensors: [&bonsai_prism_runtime::model::Tensor; 2],
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs_a: &mut [Vec<f32>],
-        outputs_b: &mut [Vec<f32>],
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                for output in outputs_a.iter_mut() {
-                    output.clear();
-                }
-                for output in outputs_b.iter_mut() {
-                    output.clear();
-                }
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            executor.project_f32_pair_tokens(tensors, activations, pinned, outputs_a, outputs_b)
-        })
-    }
-
-    fn project_f32_triple_tokens(
-        &mut self,
-        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs_a: &mut [Vec<f32>],
-        outputs_b: &mut [Vec<f32>],
-        outputs_c: &mut [Vec<f32>],
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                for output in outputs_a.iter_mut() {
-                    output.clear();
-                }
-                for output in outputs_b.iter_mut() {
-                    output.clear();
-                }
-                for output in outputs_c.iter_mut() {
-                    output.clear();
-                }
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            executor.project_f32_triple_tokens(
-                tensors,
-                activations,
-                pinned,
-                outputs_a,
-                outputs_b,
-                outputs_c,
-            )
-        })
-    }
-
-    fn supports_f32_ffn_swiglu(
-        &self,
-        gate: &bonsai_prism_runtime::model::Tensor,
-        up: &bonsai_prism_runtime::model::Tensor,
-    ) -> bool {
-        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
-            slot.as_ref().is_some_and(|executor| {
-                bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_swiglu(
-                    executor, gate, up,
-                )
-            })
-        })
-    }
-
-    fn project_f32_ffn_swiglu(
-        &mut self,
-        gate: &bonsai_prism_runtime::model::Tensor,
-        up: &bonsai_prism_runtime::model::Tensor,
-        activation: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                output.clear();
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_swiglu(
-                executor, gate, up, activation, pinned, output,
-            )
-        })
-    }
-
-    fn project_f32_ffn_swiglu_tokens(
-        &mut self,
-        gate: &bonsai_prism_runtime::model::Tensor,
-        up: &bonsai_prism_runtime::model::Tensor,
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                for output in outputs.iter_mut() {
-                    output.clear();
-                }
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_swiglu_tokens(
-                executor,
-                gate,
-                up,
-                activations,
-                pinned,
-                outputs,
-            )
-        })
-    }
-
-    fn supports_f32_ffn_chain(&self, tensors: [&bonsai_prism_runtime::model::Tensor; 3]) -> bool {
-        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
-            slot.as_ref().is_some_and(|executor| {
-                bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_chain(
-                    executor, tensors,
-                )
-            })
-        })
-    }
-
-    fn project_f32_ffn_chain(
-        &mut self,
-        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
-        activation: &[f32],
-        residual: Option<&[f32]>,
-        hadamard_block_size: Option<u32>,
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                output.clear();
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain(
-                executor,
-                tensors,
-                activation,
-                residual,
-                hadamard_block_size,
-                pinned,
-                output,
-            )
-        })
-    }
-
-    fn project_f32_ffn_chain_tokens(
-        &mut self,
-        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
-        activations: &[Vec<f32>],
-        residuals: Option<&[Vec<f32>]>,
-        hadamard_block_size: Option<u32>,
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> bonsai_prism_runtime::Result<()> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                for output in outputs.iter_mut() {
-                    output.clear();
-                }
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain_tokens(
-                executor,
-                tensors,
-                activations,
-                residuals,
-                hadamard_block_size,
-                pinned,
-                outputs,
-            )
-        })
-    }
-
-    fn supports_f32_ffn_chain_lora(
-        &self,
-        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
-    ) -> bool {
-        WORKER_HEXAGON_EXECUTOR.with_borrow(|slot| {
-            slot.as_ref().is_some_and(|executor| {
-                bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_chain_lora(
-                    executor, tensors,
-                )
-            })
-        })
-    }
-
-    fn project_f32_ffn_chain_lora(
-        &mut self,
-        tensors: [&bonsai_prism_runtime::model::Tensor; 3],
-        activation: &[f32],
-        residual: Option<&[f32]>,
-        hadamard_block_size: Option<u32>,
-        lora_a: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> bonsai_prism_runtime::Result<f32> {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let Some(executor) = slot.as_mut() else {
-                output.clear();
-                return Err(std::io::Error::other("missing worker Hexagon executor").into());
-            };
-            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain_lora(
-                executor,
-                tensors,
-                activation,
-                residual,
-                hadamard_block_size,
-                lora_a,
-                pinned,
-                output,
-            )
-        })
-    }
+struct WorkerThreadCompositeExecutor {
+    identity: Arc<str>,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-impl Drop for WorkerThreadHexagonExecutor {
-    fn drop(&mut self) {
-        WORKER_HEXAGON_EXECUTOR.with_borrow_mut(|slot| {
-            let _ = slot.take();
-        });
-    }
+macro_rules! impl_tls_pq2_executor {
+    ($ty:ty, $tls:ident, $missing:expr, |$this:ident| $identity:expr) => {
+        impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for $ty {
+            fn identity(&self) -> &str {
+                let $this = self;
+                $identity
+            }
+
+            fn operation_capacity(&self) -> Option<u64> {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().and_then(
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::operation_capacity,
+                    )
+                })
+            }
+
+            fn operation_count(&self, tensor: &bonsai_prism_runtime::model::Tensor) -> Option<u64> {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().and_then(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::operation_count(
+                            executor, tensor,
+                        )
+                    })
+                })
+            }
+
+            fn supports(&self, tensor: &bonsai_prism_runtime::model::Tensor) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports(
+                            executor, tensor,
+                        )
+                    })
+                })
+            }
+
+            fn supports_q8(&self, tensor: &bonsai_prism_runtime::model::Tensor) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_q8(
+                            executor, tensor,
+                        )
+                    })
+                })
+            }
+
+            fn supports_f32(&self, tensor: &bonsai_prism_runtime::model::Tensor) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32(
+                            executor, tensor,
+                        )
+                    })
+                })
+            }
+
+            fn supports_f32_group(&self, tensors: &[&bonsai_prism_runtime::model::Tensor]) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_group(
+                            executor, tensors,
+                        )
+                    })
+                })
+            }
+
+            fn supports_tile_tokens(&self) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_tile_tokens,
+                    )
+                })
+            }
+
+            fn project(
+                &mut self,
+                tensor: &bonsai_prism_runtime::model::Tensor,
+                activation: &[bonsai_prism_runtime::kernels::Q8KBlock],
+                fused: bool,
+                output: &mut Vec<f32>,
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        output.clear();
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project(
+                        executor, tensor, activation, fused, output,
+                    )
+                })
+            }
+
+            fn project_q8(
+                &mut self,
+                tensor: &bonsai_prism_runtime::model::Tensor,
+                activation: &[bonsai_prism_runtime::kernels::Q8Block],
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        output.clear();
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_q8(
+                        executor, tensor, activation, pinned, output,
+                    )
+                })
+            }
+
+            fn project_f32(
+                &mut self,
+                tensor: &bonsai_prism_runtime::model::Tensor,
+                activation: &[f32],
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        output.clear();
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32(
+                        executor, tensor, activation, pinned, output,
+                    )
+                })
+            }
+
+            fn project_f32_group(
+                &mut self,
+                tensors: &[&bonsai_prism_runtime::model::Tensor],
+                activation: &[f32],
+                pinned: bool,
+                outputs: &mut [&mut Vec<f32>],
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        for output in outputs.iter_mut() {
+                            output.clear();
+                        }
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_group(
+                        executor, tensors, activation, pinned, outputs,
+                    )
+                })
+            }
+
+            fn project_f32_tokens(
+                &mut self,
+                tensor: &bonsai_prism_runtime::model::Tensor,
+                activations: &[Vec<f32>],
+                pinned: bool,
+                outputs: &mut [Vec<f32>],
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        for output in outputs.iter_mut() {
+                            output.clear();
+                        }
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_tokens(
+                        executor,
+                        tensor,
+                        activations,
+                        pinned,
+                        outputs,
+                    )
+                })
+            }
+
+            fn project_f32_pair_tokens(
+                &mut self,
+                tensors: [&bonsai_prism_runtime::model::Tensor; 2],
+                activations: &[Vec<f32>],
+                pinned: bool,
+                outputs_a: &mut [Vec<f32>],
+                outputs_b: &mut [Vec<f32>],
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        for output in outputs_a.iter_mut().chain(outputs_b.iter_mut()) {
+                            output.clear();
+                        }
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_pair_tokens(
+                        executor,
+                        tensors,
+                        activations,
+                        pinned,
+                        outputs_a,
+                        outputs_b,
+                    )
+                })
+            }
+
+            fn project_f32_triple_tokens(
+                &mut self,
+                tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+                activations: &[Vec<f32>],
+                pinned: bool,
+                outputs_a: &mut [Vec<f32>],
+                outputs_b: &mut [Vec<f32>],
+                outputs_c: &mut [Vec<f32>],
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        for output in outputs_a
+                            .iter_mut()
+                            .chain(outputs_b.iter_mut())
+                            .chain(outputs_c.iter_mut())
+                        {
+                            output.clear();
+                        }
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_triple_tokens(
+                        executor,
+                        tensors,
+                        activations,
+                        pinned,
+                        outputs_a,
+                        outputs_b,
+                        outputs_c,
+                    )
+                })
+            }
+
+            fn supports_f32_ffn_swiglu(
+                &self,
+                gate: &bonsai_prism_runtime::model::Tensor,
+                up: &bonsai_prism_runtime::model::Tensor,
+            ) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_swiglu(
+                            executor, gate, up,
+                        )
+                    })
+                })
+            }
+
+            fn project_f32_ffn_swiglu(
+                &mut self,
+                gate: &bonsai_prism_runtime::model::Tensor,
+                up: &bonsai_prism_runtime::model::Tensor,
+                activation: &[f32],
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        output.clear();
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_swiglu(
+                        executor, gate, up, activation, pinned, output,
+                    )
+                })
+            }
+
+            fn project_f32_ffn_swiglu_tokens(
+                &mut self,
+                gate: &bonsai_prism_runtime::model::Tensor,
+                up: &bonsai_prism_runtime::model::Tensor,
+                activations: &[Vec<f32>],
+                pinned: bool,
+                outputs: &mut [Vec<f32>],
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        for output in outputs.iter_mut() {
+                            output.clear();
+                        }
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_swiglu_tokens(
+                        executor,
+                        gate,
+                        up,
+                        activations,
+                        pinned,
+                        outputs,
+                    )
+                })
+            }
+
+            fn supports_f32_ffn_chain(
+                &self,
+                tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+            ) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_chain(
+                            executor, tensors,
+                        )
+                    })
+                })
+            }
+
+            fn project_f32_ffn_chain(
+                &mut self,
+                tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+                activation: &[f32],
+                residual: Option<&[f32]>,
+                hadamard_block_size: Option<u32>,
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        output.clear();
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain(
+                        executor,
+                        tensors,
+                        activation,
+                        residual,
+                        hadamard_block_size,
+                        pinned,
+                        output,
+                    )
+                })
+            }
+
+            fn project_f32_ffn_chain_tokens(
+                &mut self,
+                tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+                activations: &[Vec<f32>],
+                residuals: Option<&[Vec<f32>]>,
+                hadamard_block_size: Option<u32>,
+                pinned: bool,
+                outputs: &mut [Vec<f32>],
+            ) -> bonsai_prism_runtime::Result<()> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        for output in outputs.iter_mut() {
+                            output.clear();
+                        }
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain_tokens(
+                        executor,
+                        tensors,
+                        activations,
+                        residuals,
+                        hadamard_block_size,
+                        pinned,
+                        outputs,
+                    )
+                })
+            }
+
+            fn supports_f32_ffn_chain_lora(
+                &self,
+                tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+            ) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32_ffn_chain_lora(
+                            executor, tensors,
+                        )
+                    })
+                })
+            }
+
+            fn project_f32_ffn_chain_lora(
+                &mut self,
+                tensors: [&bonsai_prism_runtime::model::Tensor; 3],
+                activation: &[f32],
+                residual: Option<&[f32]>,
+                hadamard_block_size: Option<u32>,
+                lora_a: &[f32],
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> bonsai_prism_runtime::Result<f32> {
+                $tls.with_borrow_mut(|slot| {
+                    let Some(executor) = slot.as_mut() else {
+                        output.clear();
+                        return Err(std::io::Error::other($missing).into());
+                    };
+                    bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::project_f32_ffn_chain_lora(
+                        executor,
+                        tensors,
+                        activation,
+                        residual,
+                        hadamard_block_size,
+                        lora_a,
+                        pinned,
+                        output,
+                    )
+                })
+            }
+        }
+
+        impl Drop for $ty {
+            fn drop(&mut self) {
+                $tls.with_borrow_mut(|slot| {
+                    let _ = slot.take();
+                });
+            }
+        }
+    };
 }
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+impl_tls_pq2_executor!(
+    WorkerThreadHexagonExecutor,
+    WORKER_HEXAGON_EXECUTOR,
+    "missing worker Hexagon executor",
+    |_this| "hexagon-hvx-native-q2-resident-v1-experimental"
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+impl_tls_pq2_executor!(
+    WorkerThreadCompositeExecutor,
+    WORKER_COMPOSITE_EXECUTOR,
+    "missing worker composite executor",
+    |this| this.identity.as_ref()
+);
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 fn has_signed_htp_module(dir: &std::path::Path) -> bool {
@@ -579,8 +697,49 @@ fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
     has_signed_htp_module(&staged).then_some(staged)
 }
 
+#[cfg(windows)]
+const VULKAN_WEIGHT_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+#[cfg(windows)]
+fn collect_layer_projection_tensors(
+    session: &SwiftSession,
+    layers: std::ops::Range<usize>,
+    include_output: bool,
+) -> Vec<&bonsai_prism_runtime::model::Tensor> {
+    const LAYER_PROJECTION_SUFFIXES: [&str; 10] = [
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_qkv.weight",
+        "attn_gate.weight",
+        "attn_output.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight",
+        "ssm_out.weight",
+    ];
+    let mut tensors = Vec::new();
+    for layer in layers {
+        for suffix in LAYER_PROJECTION_SUFFIXES {
+            if let Some(tensor) = session.projection_tensor(&format!("blk.{layer}.{suffix}")) {
+                tensors.push(tensor);
+            }
+        }
+    }
+    if include_output && let Some(output) = session.projection_tensor("output.weight") {
+        tensors.push(output);
+    }
+    tensors
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<ProjectionStartup> {
+fn open_hexagon_native_q2_executor(
+    session: &SwiftSession,
+) -> Option<(
+    bonsai_hexagon_runtime::NativeQ2Executor<hexagon_native_rpc::NativeQ2Session>,
+    Vec<bonsai_prism_runtime::model::Tensor>,
+    bonsai_hexagon_runtime::NativeQ2ResidencyStatistics,
+)> {
     if session.representation() != bonsai_prism_runtime::model::swift::Representation::Pq2
         || session.cpu_speculation().is_some()
     {
@@ -634,6 +793,12 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
         executor.select_and_prewarm_tensors(&tensors).ok()?;
     }
     let residency = executor.residency_statistics();
+    Some((executor, tensors, residency))
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<ProjectionStartup> {
+    let (executor, _tensors, residency) = open_hexagon_native_q2_executor(session)?;
     let startup = if residency.tensors_prepared == 168
         && residency.weight_payload_bytes_prepared == 2_888_663_040
     {
@@ -658,6 +823,121 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
     });
     session.set_projection_executor(Some(Box::new(WorkerThreadHexagonExecutor)));
     Some(startup)
+}
+
+fn install_vulkan_executor(
+    session: &mut SwiftSession,
+) -> Result<ProjectionStartup, NativeBackendError> {
+    #[cfg(windows)]
+    {
+        let mut executor =
+            bonsai_adreno_vulkan::VulkanPq2Executor::open_default(VULKAN_WEIGHT_BUDGET_BYTES)
+                .map_err(|_| NativeBackendError::Configuration)?;
+        let tensors = collect_layer_projection_tensors(session, 0..64, true);
+        let warmed = executor
+            .prewarm_tensors(&tensors)
+            .map_err(|_| NativeBackendError::Configuration)?;
+        let identity: Arc<str> = Arc::from(
+            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::identity(&executor),
+        );
+        let resident_tensors = u64::try_from(warmed).map_err(|_| NativeBackendError::Engine)?;
+        let resident_weight_bytes =
+            u64::try_from(executor.cached_weight_bytes()).map_err(|_| NativeBackendError::Engine)?;
+        let startup = ProjectionStartup::AdrenoVulkan {
+            identity,
+            resident_tensors,
+            resident_weight_bytes,
+        };
+        if !startup.valid(Placement::Vulkan) {
+            return Err(NativeBackendError::Configuration);
+        }
+        session.set_projection_executor(Some(Box::new(executor)));
+        Ok(startup)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = session;
+        Err(NativeBackendError::Configuration)
+    }
+}
+
+fn install_composite_executor(
+    session: &mut SwiftSession,
+) -> Result<ProjectionStartup, NativeBackendError> {
+    #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+    {
+        let (npu, npu_tensors, npu_residency) =
+            open_hexagon_native_q2_executor(session).ok_or(NativeBackendError::Configuration)?;
+        let mut npu_layers = 0_usize;
+        for layer in 0..bonsai_hexagon_runtime::X1_V73_MAX_NPU_LAYERS {
+            let prefix = format!("blk.{layer}.");
+            let mut found_any = false;
+            let mut all_supported = true;
+            for tensor in &npu_tensors {
+                if tensor.name.starts_with(&prefix) {
+                    found_any = true;
+                    if !bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports(&npu, tensor)
+                    {
+                        all_supported = false;
+                        break;
+                    }
+                }
+            }
+            if found_any && all_supported {
+                npu_layers = layer + 1;
+            } else {
+                break;
+            }
+        }
+        if npu_layers == 0 || npu_layers >= 64 {
+            return Err(NativeBackendError::Configuration);
+        }
+        let plan = bonsai_hexagon_runtime::plan_three_processor_placement(
+            64,
+            npu_layers,
+            64 - npu_layers,
+            4,
+            bonsai_hexagon_runtime::AcceleratorTarget::AdrenoGpuVulkan,
+        )
+        .map_err(|_| NativeBackendError::Configuration)?;
+        let mut gpu =
+            bonsai_adreno_vulkan::VulkanPq2Executor::open_default(VULKAN_WEIGHT_BUDGET_BYTES)
+                .map_err(|_| NativeBackendError::Configuration)?;
+        let gpu_tensors = collect_layer_projection_tensors(session, npu_layers..64, false);
+        let gpu_warmed = gpu
+            .prewarm_tensors(&gpu_tensors)
+            .map_err(|_| NativeBackendError::Configuration)?;
+        let gpu_bytes =
+            u64::try_from(gpu.cached_weight_bytes()).map_err(|_| NativeBackendError::Engine)?;
+        let composite = bonsai_hexagon_runtime::OwnedCompositeProjectionExecutor::new(&plan, npu, gpu)
+            .map_err(|_| NativeBackendError::Configuration)?;
+        let identity: Arc<str> = Arc::from(
+            bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::identity(&composite),
+        );
+        let startup = ProjectionStartup::Composite {
+            identity: Arc::clone(&identity),
+            npu_resident_tensors: npu_residency.tensors_prepared,
+            gpu_resident_tensors: u64::try_from(gpu_warmed)
+                .map_err(|_| NativeBackendError::Engine)?,
+            resident_weight_bytes: npu_residency
+                .weight_payload_bytes_prepared
+                .saturating_add(gpu_bytes),
+            host_metadata_bytes: npu_residency.metadata_payload_bytes,
+        };
+        if !startup.valid(Placement::Composite) {
+            return Err(NativeBackendError::Configuration);
+        }
+        WORKER_COMPOSITE_EXECUTOR.with_borrow_mut(|slot| {
+            *slot = Some(composite);
+        });
+        session.set_projection_executor(Some(Box::new(WorkerThreadCompositeExecutor { identity })));
+        Ok(startup)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")))]
+    {
+        let _ = session;
+        Err(NativeBackendError::Configuration)
+    }
 }
 
 pub(super) enum Input {

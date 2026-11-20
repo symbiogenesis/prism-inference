@@ -45,17 +45,46 @@ pub(super) enum ProjectionStartup {
         resident_weight_bytes: u64,
         host_metadata_bytes: usize,
     },
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "Only Windows builds initialize the Adreno Vulkan projection executor."
+        )
+    )]
+    AdrenoVulkan {
+        identity: Arc<str>,
+        resident_tensors: u64,
+        resident_weight_bytes: u64,
+    },
+    #[cfg_attr(
+        not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")),
+        allow(
+            dead_code,
+            reason = "Only Windows ARM64 builds initialize the Hexagon + Adreno Vulkan composite executor."
+        )
+    )]
+    Composite {
+        identity: Arc<str>,
+        npu_resident_tensors: u64,
+        gpu_resident_tensors: u64,
+        resident_weight_bytes: u64,
+        host_metadata_bytes: usize,
+    },
+}
+
+fn valid_ascii_graphic_identity(identity: &str) -> bool {
+    !identity.is_empty()
+        && identity.len() <= 256
+        && identity.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 impl ProjectionStartup {
     pub(super) fn valid(&self, placement: Placement) -> bool {
         match self {
-            Self::Cpu => true,
+            Self::Cpu => matches!(placement, Placement::Auto | Placement::Cpu),
             Self::External(identity) => {
-                placement == Placement::Auto
-                    && !identity.is_empty()
-                    && identity.len() <= 256
-                    && identity.bytes().all(|byte| byte.is_ascii_graphic())
+                placement == Placement::Auto && valid_ascii_graphic_identity(identity)
             }
             Self::NativeQ2 {
                 resident_tensors,
@@ -77,6 +106,30 @@ impl ProjectionStartup {
                     && matches!(*architecture, 73 | 81)
                     && (1..168).contains(resident_tensors)
                     && (1..2_888_663_040).contains(resident_weight_bytes)
+                    && (1..=524_288).contains(host_metadata_bytes)
+            }
+            Self::AdrenoVulkan {
+                identity,
+                resident_tensors,
+                resident_weight_bytes,
+            } => {
+                placement == Placement::Vulkan
+                    && valid_ascii_graphic_identity(identity)
+                    && *resident_tensors >= 1
+                    && *resident_weight_bytes >= 1
+            }
+            Self::Composite {
+                identity,
+                npu_resident_tensors,
+                gpu_resident_tensors,
+                resident_weight_bytes,
+                host_metadata_bytes,
+            } => {
+                placement == Placement::Composite
+                    && valid_ascii_graphic_identity(identity)
+                    && *npu_resident_tensors >= 1
+                    && *gpu_resident_tensors >= 1
+                    && *resident_weight_bytes >= 1
                     && (1..=524_288).contains(host_metadata_bytes)
             }
         }
@@ -112,10 +165,40 @@ impl ProjectionStartup {
                 *resident_weight_bytes,
                 *host_metadata_bytes,
             ),
+            Self::AdrenoVulkan {
+                identity,
+                resident_tensors,
+                resident_weight_bytes,
+            } => (
+                "adreno-vulkan",
+                Some(identity.as_ref()),
+                *resident_tensors,
+                *resident_weight_bytes,
+                0,
+            ),
+            Self::Composite {
+                identity,
+                npu_resident_tensors,
+                gpu_resident_tensors,
+                resident_weight_bytes,
+                host_metadata_bytes,
+            } => (
+                "composite-hexagon-vulkan",
+                Some(identity.as_ref()),
+                npu_resident_tensors.saturating_add(*gpu_resident_tensors),
+                *resident_weight_bytes,
+                *host_metadata_bytes,
+            ),
+        };
+        let requested = match placement {
+            Placement::Auto => "auto",
+            Placement::Cpu => "cpu",
+            Placement::Vulkan => "vulkan",
+            Placement::Composite => "composite",
         };
         json!({
             "schema_version": 1,
-            "requested": if placement == Placement::Cpu { "cpu" } else { "auto" },
+            "requested": requested,
             "effective": effective,
             "identity": identity,
             "resident_tensors": tensors,
@@ -183,9 +266,20 @@ impl ModelProfile {
             "row_workers": self.row_workers,
             "startup_projection": self.projection_startup.readiness(self.placement),
         });
-        if self.placement == Placement::Cpu {
-            model["placement"] = json!("cpu");
-            model["projection_backend"] = json!("cpu");
+        match self.placement {
+            Placement::Auto => {}
+            Placement::Cpu => {
+                model["placement"] = json!("cpu");
+                model["projection_backend"] = json!("cpu");
+            }
+            Placement::Vulkan => {
+                model["placement"] = json!("vulkan");
+                model["projection_backend"] = json!("adreno-vulkan");
+            }
+            Placement::Composite => {
+                model["placement"] = json!("composite");
+                model["projection_backend"] = json!("composite-hexagon-vulkan");
+            }
         }
         if self.representation != Representation::Pq2 || self.adapter {
             model["weight_representation"] = json!(self.representation.name());

@@ -2575,3 +2575,158 @@ fn broker_pipe_serves_authenticated_requests_cancels_in_place_and_recovers() -> 
         Ok(())
     })
 }
+
+#[test]
+fn explicit_vulkan_and_composite_placements_bind_readiness() -> TestResult {
+    use profile::ProjectionStartup;
+
+    let vulkan_observed = Observation {
+        startup_projection: Some(ProjectionStartup::AdrenoVulkan {
+            identity: Arc::from("adreno-vulkan-v2:x2_90:0123456789abcdef:dot4x8"),
+            resident_tensors: 400,
+            resident_weight_bytes: 5_400_000_000,
+        }),
+        ..Observation::default()
+    };
+    let vulkan_worker =
+        Worker::with_placement(FakeEngine(vulkan_observed.clone()), 42, Placement::Vulkan)
+            .map_err(|error| format!("{error:?}"))?;
+    let vulkan_readiness = vulkan_worker.profile.readiness(vulkan_worker.seed);
+    let vulkan_model = &vulkan_readiness["data"][0];
+    assert_eq!(vulkan_model["placement"], "vulkan");
+    assert_eq!(vulkan_model["projection_backend"], "adreno-vulkan");
+    assert_eq!(
+        vulkan_model["startup_projection"],
+        json!({
+            "schema_version": 1,
+            "requested": "vulkan",
+            "effective": "adreno-vulkan",
+            "identity": "adreno-vulkan-v2:x2_90:0123456789abcdef:dot4x8",
+            "resident_tensors": 400,
+            "resident_weight_bytes": 5_400_000_000_u64,
+            "host_metadata_bytes": 0,
+        })
+    );
+    drop(vulkan_worker);
+    assert!(vulkan_observed.terminated.load(Ordering::Acquire));
+
+    let composite_observed = Observation {
+        startup_projection: Some(ProjectionStartup::Composite {
+            identity: Arc::from("composite-projection-v1:abcdef"),
+            npu_resident_tensors: 168,
+            gpu_resident_tensors: 232,
+            resident_weight_bytes: 5_600_000_000,
+            host_metadata_bytes: 262_144,
+        }),
+        ..Observation::default()
+    };
+    let composite_worker = Worker::with_placement(
+        FakeEngine(composite_observed.clone()),
+        42,
+        Placement::Composite,
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    let composite_readiness = composite_worker.profile.readiness(composite_worker.seed);
+    let composite_model = &composite_readiness["data"][0];
+    assert_eq!(composite_model["placement"], "composite");
+    assert_eq!(
+        composite_model["projection_backend"],
+        "composite-hexagon-vulkan"
+    );
+    assert_eq!(
+        composite_model["startup_projection"],
+        json!({
+            "schema_version": 1,
+            "requested": "composite",
+            "effective": "composite-hexagon-vulkan",
+            "identity": "composite-projection-v1:abcdef",
+            "resident_tensors": 400,
+            "resident_weight_bytes": 5_600_000_000_u64,
+            "host_metadata_bytes": 262_144,
+        })
+    );
+    drop(composite_worker);
+    assert!(composite_observed.terminated.load(Ordering::Acquire));
+    Ok(())
+}
+
+#[test]
+fn explicit_vulkan_and_composite_placements_reject_cpu_fallback_and_bad_profiles() {
+    use profile::ProjectionStartup;
+
+    for (placement, startup) in [
+        (Placement::Vulkan, None),
+        (Placement::Composite, None),
+        (
+            Placement::Vulkan,
+            Some(ProjectionStartup::AdrenoVulkan {
+                identity: Arc::from(""),
+                resident_tensors: 1,
+                resident_weight_bytes: 1,
+            }),
+        ),
+        (
+            Placement::Vulkan,
+            Some(ProjectionStartup::AdrenoVulkan {
+                identity: Arc::from("adreno-vulkan-v2"),
+                resident_tensors: 0,
+                resident_weight_bytes: 1,
+            }),
+        ),
+        (
+            Placement::Composite,
+            Some(ProjectionStartup::Composite {
+                identity: Arc::from("composite-projection-v1:abcdef"),
+                npu_resident_tensors: 0,
+                gpu_resident_tensors: 232,
+                resident_weight_bytes: 1,
+                host_metadata_bytes: 1,
+            }),
+        ),
+        (
+            Placement::Composite,
+            Some(ProjectionStartup::Composite {
+                identity: Arc::from("composite-projection-v1:abcdef"),
+                npu_resident_tensors: 168,
+                gpu_resident_tensors: 0,
+                resident_weight_bytes: 1,
+                host_metadata_bytes: 1,
+            }),
+        ),
+        (
+            Placement::Composite,
+            Some(ProjectionStartup::Composite {
+                identity: Arc::from("composite-projection-v1:abcdef"),
+                npu_resident_tensors: 168,
+                gpu_resident_tensors: 232,
+                resident_weight_bytes: 1,
+                host_metadata_bytes: 0,
+            }),
+        ),
+        (
+            Placement::Auto,
+            Some(ProjectionStartup::AdrenoVulkan {
+                identity: Arc::from("adreno-vulkan-v2"),
+                resident_tensors: 400,
+                resident_weight_bytes: 5_400_000_000,
+            }),
+        ),
+        (
+            Placement::Auto,
+            Some(ProjectionStartup::Composite {
+                identity: Arc::from("composite-projection-v1:abcdef"),
+                npu_resident_tensors: 168,
+                gpu_resident_tensors: 232,
+                resident_weight_bytes: 5_600_000_000,
+                host_metadata_bytes: 1,
+            }),
+        ),
+    ] {
+        let rejected = Observation {
+            startup_projection: startup,
+            ..Observation::default()
+        };
+        assert!(Worker::with_placement(FakeEngine(rejected.clone()), 42, placement).is_err());
+        assert!(rejected.terminated.load(Ordering::Acquire));
+    }
+}

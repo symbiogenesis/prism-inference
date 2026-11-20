@@ -265,6 +265,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                 placement = Some(match value.to_str() {
                     Some("auto") => Placement::Auto,
                     Some("cpu") => Placement::Cpu,
+                    Some("vulkan") => Placement::Vulkan,
+                    Some("composite") => Placement::Composite,
                     _ => return Err(invalid()),
                 });
             }
@@ -845,7 +847,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
             ),
         ));
     }
-    if config.placement == Placement::Auto {
+    if matches!(config.placement, Placement::Auto | Placement::Composite) {
         crate::native_backend::register_hexagon_model_path(&config.model);
     }
     crate::configuration::validate_environment(std::env::vars_os().map(|(name, _)| name))
@@ -937,7 +939,12 @@ mod tests {
             "42".into(),
         ];
         assert_eq!(parse(base.clone())?.placement, Placement::Auto);
-        for (name, expected) in [("auto", Placement::Auto), ("cpu", Placement::Cpu)] {
+        for (name, expected) in [
+            ("auto", Placement::Auto),
+            ("cpu", Placement::Cpu),
+            ("vulkan", Placement::Vulkan),
+            ("composite", Placement::Composite),
+        ] {
             let mut selected = base.clone();
             selected.extend(["--placement".into(), name.into()]);
             let config = parse(selected.clone())?;

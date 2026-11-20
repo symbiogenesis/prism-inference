@@ -1115,6 +1115,7 @@ dependencies = [
 name = "prism-inference-server"
 version = "0.1.32"
 dependencies = [
+ "bonsai-adreno-vulkan",
  "bonsai-hexagon-native",
  "bonsai-hexagon-runtime",
  "bonsai-windows-credentials",

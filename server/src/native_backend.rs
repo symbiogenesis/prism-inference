@@ -50,6 +50,10 @@ pub enum Placement {
     Auto,
     /// Execute projections on the CPU without discovering or opening accelerators.
     Cpu,
+    /// Require the Adreno Vulkan GPU projection executor with resident prewarmed weights.
+    Vulkan,
+    /// Require the strict Hexagon NPU prefix + Adreno Vulkan GPU overflow composite executor.
+    Composite,
 }
 
 /// Value-free private child errors; keys, prompts and model diagnostics are absent.

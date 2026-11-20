@@ -1,13 +1,5 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
-#include "peg.hpp"
-// MTMD publishes its own logging macros; later common headers include log.h.
-#undef LOG_DBG
-#undef LOG_TRC
-#undef LOG_INF
-#undef LOG_WRN
-#undef LOG_ERR
-#undef LOG_CNT
 #include "chat_templates.hpp"
 #include "chat_parser.hpp"
 #include "chat_auto.hpp"
@@ -95,9 +87,7 @@ void validate_operation(const wire_json & operation) {
     require(operation.is_object() && operation.contains("Kind") && operation.at("Kind").is_string(),
             "operation Kind must be a string");
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (prism_peg::handles(kind)) {
-        prism_peg::validate(operation);
-    } else if (prism_chat_templates::handles(kind)) {
+    if (prism_chat_templates::handles(kind)) {
         prism_chat_templates::validate(operation);
     } else if (prism_chat_parser::handles(kind)) {
         prism_chat_parser::validate(operation);
@@ -118,9 +108,6 @@ void validate_operation(const wire_json & operation) {
 
 wire_json execute(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (prism_peg::handles(kind)) {
-        return prism_peg::execute(operation);
-    }
     if (prism_chat_templates::handles(kind)) {
         return prism_chat_templates::execute(operation);
     }

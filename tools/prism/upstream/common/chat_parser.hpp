@@ -1,10 +1,37 @@
 #pragma once
 // Generic production chat PEG transport. Rust supplies graphs, inputs, references and all assertions.
-#include "peg.hpp"
+#include "peg-parser.h"
+#include "json-schema-to-grammar.h"
 #include "chat-peg-parser.h"
 #include "chat-auto-parser.h"
 #include "chat-auto-parser-helpers.h"
 #include "ggml.h"
+#include <nlohmann/json.hpp>
+#include <cstdint>
+#include <initializer_list>
+#include <map>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace prism_peg {
+using json = nlohmann::ordered_json;
+inline void require(bool value, const char * message) { if (!value) throw std::runtime_error(message); }
+inline void fields(const json & object, std::initializer_list<const char *> keys) {
+    require(object.is_object() && object.size() == keys.size(), "PEG fields mismatch");
+    for (const auto * key : keys) require(object.contains(key), "missing or unknown PEG field");
+}
+inline std::int64_t integer(const json & value, std::int64_t low, std::int64_t high) {
+    require(value.is_number_integer(), "PEG argument must be an integer");
+    if (value.is_number_unsigned()) require(value.get<std::uint64_t>() <= std::uint64_t(high), "PEG integer exceeds bound");
+    const auto result = value.get<std::int64_t>(); require(result >= low && result <= high, "PEG integer outside bound"); return result;
+}
+inline void string(const json & value, std::size_t maximum = 65536) {
+    require(value.is_string() && value.get_ref<const std::string &>().size() <= maximum, "PEG string exceeds bound");
+}
+} // namespace prism_peg
 
 namespace prism_chat_parser {
 using json = nlohmann::ordered_json;

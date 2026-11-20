@@ -107,6 +107,7 @@ mod reference_model_resolution;
 mod reference_mtmd;
 mod reference_mtmd_chunks;
 mod reference_optimizer;
+mod reference_peg;
 mod reference_provider;
 mod reference_public_c_abi;
 mod reference_quantization;
@@ -436,43 +437,43 @@ const CASES: &[Case] = &[
     register(
         "peg-basic",
         "tests/peg-parser/test-basic.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         peg::run_basic,
     ),
     register(
         "peg-gbnf",
         "tests/peg-parser/test-gbnf-generation.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         peg::run_gbnf,
     ),
     register(
         "peg-json",
         "tests/peg-parser/test-json-parser.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         peg::run_json,
     ),
     register(
         "peg-serialization",
         "tests/peg-parser/test-json-serialization.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         peg::run_serialization,
     ),
     register(
         "peg-python-dict",
         "tests/peg-parser/test-python-dict-parser.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         peg::run_python_dict,
     ),
     register(
         "peg-unicode",
         "tests/peg-parser/test-unicode.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         peg::run_unicode,
     ),
     register(
         "test-peg-parser",
         "tests/test-peg-parser.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         peg::run_all,
     ),
     register(

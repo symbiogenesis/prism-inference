@@ -1120,7 +1120,8 @@ fn build_message_jval(role: &str, content: &str, typed_content: bool) -> JVal {
     ])
 }
 
-fn current_unix_seconds() -> i64 {
+/// Returns current UTC Unix timestamp in seconds, falling back to `0`.
+pub(super) fn current_unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -1296,6 +1297,119 @@ pub(super) fn common_apply_template(
         .map_err(|err| err.message().to_owned())?;
     let bytes: Vec<u8> = spans.into_iter().flat_map(|s| s.bytes).collect();
     String::from_utf8(bytes).map_err(|_| "rendered chat template is not valid UTF-8".to_owned())
+}
+
+fn adapt_message_content(val: JVal, to_typed: bool, to_string: bool) -> JVal {
+    if to_typed && val.is_string() {
+        let raw = val.raw_bytes();
+        if raw.is_empty() {
+            return JVal::array(Vec::new());
+        }
+        return JVal::array(vec![JVal::object(vec![
+            (JVal::text_str("type"), JVal::bytes(b"text".to_vec(), true)),
+            (JVal::text_str("text"), JVal::bytes(raw, true)),
+        ])]);
+    }
+    if to_string && let Some(parts) = val.as_array_elems() {
+        let mut joined = Vec::new();
+        let mut all_text = true;
+        for part in parts {
+            let is_text = part
+                .lookup_exact_key(b"type")
+                .is_some_and(|t| t.raw_bytes() == b"text");
+            if is_text && let Some(text_val) = part.lookup_exact_key(b"text") {
+                joined.extend_from_slice(&text_val.raw_bytes());
+            } else {
+                all_text = false;
+                break;
+            }
+        }
+        if all_text {
+            return JVal::bytes(joined, true);
+        }
+    }
+    val
+}
+
+/// Adapts arbitrary JSON chat messages to typed or string content based on `caps`.
+pub(super) fn adapt_messages_for_caps(messages: &JVal, caps: TemplateCaps) -> JVal {
+    let to_typed = !caps.supports_string_content && caps.supports_typed_content;
+    let to_string = caps.supports_string_content && !caps.supports_typed_content;
+    if !to_typed && !to_string {
+        return messages.clone();
+    }
+    let Some(elems) = messages.as_array_elems() else {
+        return messages.clone();
+    };
+    let adapted = elems
+        .into_iter()
+        .map(|msg| {
+            let Some(pairs) = msg.as_object_pairs() else {
+                return msg;
+            };
+            let new_pairs = pairs
+                .into_iter()
+                .map(|(k, v)| {
+                    if k.raw_bytes() == b"content" {
+                        (k, adapt_message_content(v, to_typed, to_string))
+                    } else {
+                        (k, v)
+                    }
+                })
+                .collect();
+            JVal::object(new_pairs)
+        })
+        .collect();
+    JVal::array(adapted)
+}
+
+/// Renders a pre-parsed chat template directly from structured JSON inputs (`chat_analysis` / `chat`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Direct mirror of upstream common_chat_template_direct_apply input parameters."
+)]
+pub(super) fn common_direct_apply(
+    program: &Program,
+    caps: TemplateCaps,
+    bos: &str,
+    eos: &str,
+    messages: &JVal,
+    tools: Option<JVal>,
+    add_generation_prompt: bool,
+    enable_thinking: Option<bool>,
+    now_unix_seconds: i64,
+) -> std::result::Result<Vec<u8>, String> {
+    let adapted = adapt_messages_for_caps(messages, caps);
+    let mut pairs = vec![
+        (JVal::text_str("messages"), adapted),
+        (
+            JVal::text_str("bos_token"),
+            JVal::bytes(bos.as_bytes().to_vec(), true),
+        ),
+        (
+            JVal::text_str("eos_token"),
+            JVal::bytes(eos.as_bytes().to_vec(), true),
+        ),
+        (
+            JVal::text_str("add_generation_prompt"),
+            JVal::boolean(add_generation_prompt),
+        ),
+    ];
+    if let Some(tools_val) = tools
+        && !tools_val.is_none()
+        && tools_val
+            .as_array_elems()
+            .is_none_or(|elems| !elems.is_empty())
+    {
+        pairs.push((JVal::text_str("tools"), tools_val));
+    }
+    if let Some(thinking) = enable_thinking {
+        pairs.push((JVal::text_str("enable_thinking"), JVal::boolean(thinking)));
+    }
+    let globals = JVal::object(pairs);
+    let spans = eval_program_with_now(program, &globals, Some(now_unix_seconds))
+        .map_err(|err| err.message().to_owned())?;
+    Ok(spans.into_iter().flat_map(|s| s.bytes).collect())
 }
 
 // ---------------------------------------------------------------------------

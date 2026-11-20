@@ -58,7 +58,7 @@ if(MSVC)
   target_compile_options(prism-upstream-server-context PRIVATE /utf-8)
 endif()
 
-add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp chat_parser.hpp chat_auto.hpp vocab.hpp vocab_session.hpp model_runtime.hpp chat_analysis.hpp chat.hpp generated_model.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp)
+add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp chat_parser.hpp chat_auto.hpp vocab.hpp vocab_session.hpp model_runtime.hpp chat.hpp generated_model.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp)
 target_include_directories(prism-upstream-common-bridge PRIVATE "${PRISM_SOURCE_DIR}/src" "${PRISM_SOURCE_DIR}" "${PRISM_SOURCE_DIR}/ggml/src")
 target_link_libraries(prism-upstream-common-bridge PRIVATE llama-common mtmd prism-upstream-server-context)
 # The same-revision CI tool bundle also supplies the small ggml-only wrapper.

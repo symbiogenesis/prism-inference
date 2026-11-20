@@ -379,6 +379,24 @@ impl JVal {
         matches!(self.0.borrow().kind, ValKind::Undefined)
     }
 
+    pub(super) fn is_none(&self) -> bool {
+        matches!(self.0.borrow().kind, ValKind::None)
+    }
+
+    pub(super) fn as_array_elems(&self) -> Option<Vec<Self>> {
+        match &self.0.borrow().kind {
+            ValKind::Array(elems) | ValKind::Tuple(elems) => Some(elems.clone()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn as_object_pairs(&self) -> Option<Vec<(Self, Self)>> {
+        match &self.0.borrow().kind {
+            ValKind::Object(pairs) => Some(pairs.clone()),
+            _ => None,
+        }
+    }
+
     fn all_spans_input(&self) -> bool {
         let cell = self.0.borrow();
         matches!(&cell.kind, ValKind::String(spans) if spans.iter().all(|span| span.is_input))
@@ -4524,6 +4542,18 @@ pub(super) fn eval_program_with_now(
     let mut out = Vec::new();
     evaluator.exec_block(&program.0, &mut out)?;
     Ok(out)
+}
+
+pub(super) fn eval_program_with_context(
+    program: &Program,
+    globals: &JVal,
+    now_unix_seconds: Option<i64>,
+) -> (JResult<Vec<TextSpan>>, BTreeMap<String, JVal>) {
+    let mut evaluator = Evaluator::new_with_now(globals, now_unix_seconds);
+    let mut out = Vec::new();
+    let res = evaluator.exec_block(&program.0, &mut out).map(|_| out);
+    let root = evaluator.scopes.into_iter().next().unwrap_or_default();
+    (res, root)
 }
 
 pub(super) fn eval_program(program: &Program, globals: &JVal) -> JResult<Vec<TextSpan>> {

@@ -94,6 +94,7 @@ mod reference_allocation;
 mod reference_arena_graph;
 mod reference_arg_parser;
 mod reference_batch_allocator;
+mod reference_chat_analysis;
 mod reference_chat_templates;
 mod reference_codec;
 mod reference_codec_buffers;
@@ -330,7 +331,7 @@ const CASES: &[Case] = &[
     register(
         "test-chat-analysis",
         "tests/test-chat-analysis.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         chat_analysis::run,
     ),
     register(

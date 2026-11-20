@@ -1,29 +1,64 @@
-//! Thin native/Rust observation adapters for production model-resolution APIs.
+//! Thin independent-reference/Rust observation adapters for model-resolution APIs.
 
 use super::super::engine::Engine;
-use super::super::model_session::{Client as NativeClient, ModelSession as NativeSession};
+use super::super::reference_model_resolution::Resolver as ReferenceResolver;
 use super::super::{Result, invalid};
 use bonsai_prism_runtime::resolution::{File, Handler, Model, Options, Params, Plan, Resolver};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 pub(super) enum Client {
-    Native(NativeClient),
+    Reference(ReferenceResolver),
     Runtime(Resolver),
 }
 pub(super) enum ModelSession {
-    Native(NativeSession),
+    Reference(ReferenceResolver),
     Runtime(Resolver),
+}
+fn validate_environment(environment: &[(String, String)]) -> Result<()> {
+    let mut names = HashSet::new();
+    for (name, value) in environment {
+        if !names.insert(name) {
+            return Err(invalid("duplicate resolution test environment variable"));
+        }
+        match name.as_str() {
+            "LLAMA_CACHE" => {
+                let path = Path::new(value);
+                if !path.is_absolute() || !path.is_dir() || value.contains('%') {
+                    return Err(invalid(
+                        "LLAMA_CACHE requires an existing expanded absolute directory",
+                    ));
+                }
+            }
+            "MODEL_ENDPOINT" => {
+                let port = value
+                    .trim_end_matches('/')
+                    .strip_prefix("http://127.0.0.1:")
+                    .ok_or_else(|| {
+                        invalid("MODEL_ENDPOINT must be the explicit local IPv4 fixture server")
+                    })?
+                    .parse::<u16>()?;
+                if port == 0 {
+                    return Err(invalid("MODEL_ENDPOINT requires a bound nonzero port"));
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "resolution test environment variable is not allowlisted",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 impl ModelSession {
     pub(super) fn open_with_environment(
         engine: &Engine,
-        name: &str,
+        _name: &str,
         environment: &[(String, String)],
     ) -> Result<Option<Self>> {
-        if let Some(session) = NativeSession::open_with_environment(engine, name, environment)? {
-            return Ok(Some(Self::Native(session)));
-        }
+        validate_environment(environment)?;
         let get = |key| {
             environment
                 .iter()
@@ -31,19 +66,28 @@ impl ModelSession {
                 .map(|(_, value)| value.clone())
                 .ok_or_else(|| invalid(format!("resolution environment lacks {key}")))
         };
-        let resolver = Resolver::new(PathBuf::from(get("LLAMA_CACHE")?), get("MODEL_ENDPOINT")?)?;
+        let cache = PathBuf::from(get("LLAMA_CACHE")?);
+        let endpoint = get("MODEL_ENDPOINT")?;
+        if !engine.is_rust() {
+            let resolver = ReferenceResolver::new(cache, endpoint)?;
+            return Ok(Some(Self::Reference(resolver)));
+        }
+        let resolver = Resolver::new(cache, endpoint)?;
         Ok(Some(Self::Runtime(resolver)))
     }
     pub(super) fn client(&self) -> Client {
         match self {
-            Self::Native(session) => Client::Native(session.client()),
+            Self::Reference(resolver) => Client::Reference(resolver.clone()),
             Self::Runtime(resolver) => Client::Runtime(resolver.clone()),
         }
     }
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "Preserves fallible ModelSession::finish signature expected by model_resolution::run."
+    )]
     pub(super) fn finish(self) -> Result<()> {
         match self {
-            Self::Native(session) => session.finish(),
-            Self::Runtime(_) => Ok(()),
+            Self::Reference(_) | Self::Runtime(_) => Ok(()),
         }
     }
 }
@@ -71,19 +115,19 @@ fn flag(value: &Value, key: &str) -> Result<bool> {
         .ok_or_else(|| invalid(format!("resolution boolean {key} missing")))
 }
 impl Client {
-    pub(super) fn invoke(&self, operation: Value) -> Result<Value> {
+    pub(super) fn invoke(&self, operation: &Value) -> Result<Value> {
         let Self::Runtime(resolver) = self else {
-            let Self::Native(client) = self else {
+            let Self::Reference(resolver) = self else {
                 return Err(invalid("resolution client variant"));
             };
-            return Ok(client.call(0, operation, None)?.value);
+            return resolver.invoke(operation);
         };
-        match text(&operation, "Op")? {
+        match text(operation, "Op")? {
             "resolution-pause-log" => Ok(Value::Null),
             "resolution-plan" => {
                 let model = Model {
-                    hf_repo: text(&operation, "HfRepo")?.into(),
-                    hf_file: text(&operation, "HfFile")?.into(),
+                    hf_repo: text(operation, "HfRepo")?.into(),
+                    hf_file: text(operation, "HfFile")?.into(),
                     ..Model::default()
                 };
                 let value = &operation["Options"];
@@ -119,8 +163,8 @@ impl Client {
                         .ok_or_else(|| invalid("invalid example"))?,
                 )?;
                 let mut handler = Handler::initialize(resolver, &params, example)?;
-                params.offline = flag(&operation, "OfflineAfterInit")?;
-                if flag(&operation, "Apply")? {
+                params.offline = flag(operation, "OfflineAfterInit")?;
+                if flag(operation, "Apply")? {
                     handler.apply(resolver, &mut params)?;
                 }
                 Ok(

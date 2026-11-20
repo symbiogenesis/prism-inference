@@ -6,7 +6,6 @@
 #include "sampling.h"
 #include "chat.h"
 #include "vocab_session.hpp"
-#include "model_resolution.hpp"
 #include "generated_model.hpp"
 #include "context_graph.hpp"
 #include "dspark_runtime.hpp"
@@ -104,7 +103,6 @@ public:
         if(op=="log-minimum"){fields(o,{"Op","Level"});auto level=integer(o.at("Level"),1,5);if(!logger.active){llama_log_get(&logger.original,&logger.data);logger.active=true;}logger.minimum=static_cast<ggml_log_level>(level);llama_log_set([](ggml_log_level severity,const char*message,void*opaque){auto&state=*static_cast<logger_state*>(opaque);state.original(severity>=state.minimum?severity:GGML_LOG_LEVEL_DEBUG,message,state.data);},&logger);return nullptr;}
         if(prism_llguidance::handles(op))return llguidance.execute(o,worker,[&](const json&v){return mod(v,worker);});
         if(prism_dspark_runtime::handles(op))return dspark_runtime.execute(o,worker,[this,worker](const json&v){return ctx(v,worker);},[this,worker](const json&v){return mod(v,worker);},[this,worker](const json&v){return bat(v,worker);});
-        if(prism_model_resolution::handles(op))return prism_model_resolution::execute(o);
         if(prism_context_graph::handles(op)){auto owner=ctx(o.at("Context"),worker);return prism_context_graph::execute(o,owner->value);}
         if(prism_generated_model::handles(op)){std::shared_ptr<context>owned;if(op!="kv-center-write")owned=ctx(o.at("Context"),worker);return prism_generated_model::execute(o,owned?owned->value:nullptr);}
         if(prism_vocab_session::handles(op)){std::shared_ptr<context>owned;llama_context*shared=nullptr;if(op=="vocab-tokenize"||op=="vocab-detokenize"||op=="raw-vocab-detokenize"){owned=contexts.get(number(o.at("Context"),1000000),worker,true);shared=owned->value;}return prism_vocab_session::execute(o,shared);}

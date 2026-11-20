@@ -102,6 +102,7 @@ mod reference_grammar_parser;
 mod reference_jinja;
 mod reference_json_schema;
 mod reference_logging;
+mod reference_model_resolution;
 mod reference_mtmd;
 mod reference_mtmd_chunks;
 mod reference_optimizer;
@@ -314,7 +315,7 @@ const CASES: &[Case] = &[
     register(
         "test-model-resolution",
         "tests/test-model-resolution.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         model_resolution::run,
     ),
     register(

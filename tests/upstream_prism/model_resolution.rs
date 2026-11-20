@@ -11,7 +11,9 @@ use super::{Result, invalid, result};
 use runtime::{Client, ModelSession};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "model_resolution_server.rs"]
 mod server;
@@ -64,7 +66,7 @@ fn strings(value: &Value) -> Result<Vec<String>> {
         })
         .collect()
 }
-fn invoke(client: &Client, operation: Value) -> Result<Value> {
+fn invoke(client: &Client, operation: &Value) -> Result<Value> {
     client.invoke(operation)
 }
 fn cached(cache: &Path, repo: &str, file: &str) -> Result<String> {
@@ -149,7 +151,7 @@ fn plans(
             let before = server.request_count()?;
             let value = invoke(
                 client,
-                json!({"Op":"resolution-plan","HfRepo":case["HfRepo"],"HfFile":case["HfFile"],"Options":{"Mmproj":sidecars,"Mtp":sidecars,"Dflash":sidecars,"Eagle3":sidecars,"Dspark":sidecars}}),
+                &json!({"Op":"resolution-plan","HfRepo":case["HfRepo"],"HfFile":case["HfFile"],"Options":{"Mmproj":sidecars,"Mtp":sidecars,"Dflash":sidecars,"Eagle3":sidecars,"Dspark":sidecars}}),
             )?;
             checks.guard(
                 server.request_count()?.saturating_sub(before) >= 2,
@@ -384,7 +386,7 @@ fn assemblies(
     for case in &cases {
         let value = invoke(
             client,
-            json!({"Op":"resolution-handler","Arguments":case.arguments,"Example":12,"OfflineAfterInit":true,"Apply":true}),
+            &json!({"Op":"resolution-handler","Arguments":case.arguments,"Example":12,"OfflineAfterInit":true,"Apply":true}),
         )?;
         checks.source(
             value["Parsed"].as_bool() == Some(true),
@@ -454,6 +456,65 @@ fn cache_refs(cache: &Path, requests: &[Value], checks: &mut Checks) -> Result<V
     }
     Ok(files)
 }
+struct CacheDirectory {
+    path: PathBuf,
+    owned_temp: bool,
+}
+
+impl CacheDirectory {
+    fn create(engine: &Engine) -> Result<Self> {
+        match engine.evidence_path("model-resolution-cache") {
+            Ok(path) => Ok(Self {
+                path,
+                owned_temp: false,
+            }),
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("native bridge evidence directory is missing") =>
+            {
+                static COUNTER: AtomicU64 = AtomicU64::new(1);
+                let root = std::env::temp_dir();
+                std::fs::create_dir_all(&root)?;
+                for _ in 0..64 {
+                    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+                    let candidate = root.join(format!(
+                        "prism-model-resolution-{}-{nonce}-{seq}",
+                        std::process::id()
+                    ));
+                    match std::fs::create_dir(&candidate) {
+                        Ok(()) => {
+                            return Ok(Self {
+                                path: candidate,
+                                owned_temp: true,
+                            });
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                Err(invalid(
+                    "failed to allocate temporary model-resolution cache directory",
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CacheDirectory {
+    fn drop(&mut self) {
+        if self.owned_temp {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 pub(super) fn run(engine: &Engine) -> Result<Value> {
     let fixture: Value = serde_json::from_str(INPUTS)?;
     verify(
@@ -465,7 +526,8 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
         listings.len() == 10,
         "original listing family inventory changed",
     )?;
-    let cache = engine.evidence_path("model-resolution-cache")?;
+    let cache_dir = CacheDirectory::create(engine)?;
+    let cache = cache_dir.path();
     let server = FixtureServer::start(COMMIT)?;
     let environment = vec![
         (
@@ -490,16 +552,16 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
     let client = session.client();
     let mut checks = Checks::default();
     let outcome = (|| {
-        invoke(&client, json!({"Op":"resolution-pause-log"}))?;
+        invoke(&client, &json!({"Op":"resolution-pause-log"}))?;
         let plans = plans(&client, &server, &fixture, &listings, &mut checks)?;
-        let assemblies = assemblies(&client, &server, &cache, &listings, &mut checks)?;
+        let assemblies = assemblies(&client, &server, cache, &listings, &mut checks)?;
         Ok((plans, assemblies))
     })();
     let finished = session.finish();
     let requests = server.finish();
     let detail = match (outcome, finished, requests) {
         (Ok((plans, assemblies)), Ok(()), Ok(requests)) => {
-            let refs = cache_refs(&cache, &requests, &mut checks)?;
+            let refs = cache_refs(cache, &requests, &mut checks)?;
             json!({"PlanVariants":plans,"AssemblyCases":assemblies,"HTTPRequests":requests,"CacheRefs":refs,"CacheDirectory":cache})
         }
         (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {

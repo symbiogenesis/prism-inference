@@ -1352,3 +1352,61 @@ fn bench_arm3_attention() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "Predeclared bounded AC-logged owner-device timing comparison."]
+fn bench_arm4_coalesced_and_ffn_chain() -> TestResult {
+    let gate = build_pq2_tensor("bench.ffn_gate.5120x17408", 5120, 17408, true);
+    let up = build_pq2_tensor("bench.ffn_up.5120x17408", 5120, 17408, true);
+    let down = build_pq2_tensor("bench.ffn_down.17408x5120", 17408, 5120, true);
+    let mut exec = VulkanPq2Executor::open_default(512 * 1024 * 1024)?;
+    let prewarm_start = Instant::now();
+    let warmed = exec.prewarm_tensors(&[&gate, &up, &down])?;
+    let prewarm_ms = prewarm_start.elapsed().as_secs_f64() * 1000.0;
+
+    let act1 = fill_f32_pattern(5120, 0.03125);
+    let res1 = fill_f32_pattern(5120, 0.01);
+    let acts4 = vec![act1.clone(); 4];
+    let ress4 = vec![res1.clone(); 4];
+    let mut out1 = Vec::new();
+    let mut outs4 = vec![Vec::new(); 4];
+
+    let (g1_min, g1_med, g1_max) =
+        time_ms_stats(|| exec.project_f32(&gate, &act1, true, &mut out1), 5)?;
+    let (g4_min, g4_med, g4_max) =
+        time_ms_stats(|| exec.project_f32_tokens(&gate, &acts4, true, &mut outs4), 5)?;
+    let (c1_min, c1_med, c1_max) = time_ms_stats(
+        || {
+            exec.project_f32_ffn_chain(
+                [&gate, &up, &down],
+                &act1,
+                Some(&res1),
+                Some(128),
+                true,
+                &mut out1,
+            )
+        },
+        5,
+    )?;
+    let (c4_min, c4_med, c4_max) = time_ms_stats(
+        || {
+            exec.project_f32_ffn_chain_tokens(
+                [&gate, &up, &down],
+                &acts4,
+                Some(&ress4),
+                Some(128),
+                true,
+                &mut outs4,
+            )
+        },
+        5,
+    )?;
+
+    let mut stdout = std::io::stdout().lock();
+    writeln!(
+        stdout,
+        "ARM4_COALESCED_FFN warmed={warmed} cached_bytes={} prewarm_ms={prewarm_ms:.3} gemv1_5120x17408_ms={g1_med:.3} (min={g1_min:.3}, max={g1_max:.3}) gemm4_5120x17408_ms={g4_med:.3} (min={g4_min:.3}, max={g4_max:.3}) ffn_chain1_ms={c1_med:.3} (min={c1_min:.3}, max={c1_max:.3}) ffn_chain4_ms={c4_med:.3} (min={c4_min:.3}, max={c4_max:.3})",
+        exec.cached_weight_bytes()
+    )?;
+    Ok(())
+}

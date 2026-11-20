@@ -2523,8 +2523,8 @@ impl<'a, 'b> GbnfEmitter<'a, 'b> {
             '\'' => "'".to_owned(),
             '\\' => "\\\\".to_owned(),
             ']' => "\\]".to_owned(),
-            '^' => "\\^".to_owned(),
-            '-' => "\\-".to_owned(),
+            '^' => "\\x5E".to_owned(),
+            '-' => "\\x2D".to_owned(),
             c if u32::from(c) < 0x20 => format!("\\x{:02x}", u32::from(c)),
             c => c.to_string(),
         };
@@ -2563,18 +2563,19 @@ impl<'a, 'b> GbnfEmitter<'a, 'b> {
     }
 
     fn emit_sequence(&mut self, items: Vec<ParserId>) -> Result<GbnfExpr> {
-        let mut parts = Vec::with_capacity(items.len());
+        let mut exprs = Vec::with_capacity(items.len());
         for item in items {
             let expr = self.emit_expr(item)?;
             if !expr.text.is_empty() {
-                parts.push(expr.wrap_for_sequence());
+                exprs.push(expr);
             }
         }
-        if parts.is_empty() {
+        if exprs.is_empty() {
             Ok(GbnfExpr::atom(String::new()))
-        } else if parts.len() == 1 {
-            Ok(GbnfExpr::atom(parts.remove(0)))
+        } else if exprs.len() == 1 {
+            Ok(exprs.remove(0))
         } else {
+            let parts: Vec<String> = exprs.into_iter().map(GbnfExpr::wrap_for_sequence).collect();
             Ok(GbnfExpr {
                 text: parts.join(" "),
                 prec: GbnfPrecedence::Sequence,
@@ -2583,18 +2584,19 @@ impl<'a, 'b> GbnfEmitter<'a, 'b> {
     }
 
     fn emit_choice(&mut self, items: Vec<ParserId>) -> Result<GbnfExpr> {
-        let mut parts = Vec::with_capacity(items.len());
+        let mut exprs = Vec::with_capacity(items.len());
         for item in items {
             let expr = self.emit_expr(item)?;
             if !expr.text.is_empty() {
-                parts.push(expr.text);
+                exprs.push(expr);
             }
         }
-        if parts.is_empty() {
+        if exprs.is_empty() {
             Ok(GbnfExpr::atom(String::new()))
-        } else if parts.len() == 1 {
-            Ok(GbnfExpr::atom(parts.remove(0)))
+        } else if exprs.len() == 1 {
+            Ok(exprs.remove(0))
         } else {
+            let parts: Vec<String> = exprs.into_iter().map(|e| e.text).collect();
             Ok(GbnfExpr {
                 text: parts.join(" | "),
                 prec: GbnfPrecedence::Choice,
@@ -2785,8 +2787,8 @@ fn format_ac_char(ch: char) -> String {
         '\\' => "\\\\".to_owned(),
         ']' => "\\]".to_owned(),
         '[' => "\\[".to_owned(),
-        '-' => "\\-".to_owned(),
-        '^' => "\\^".to_owned(),
+        '-' => "\\x2D".to_owned(),
+        '^' => "\\x5E".to_owned(),
         c if u32::from(c) < 0x20 || u32::from(c) == 0x7F => {
             format!("\\x{:02X}", u32::from(c))
         }

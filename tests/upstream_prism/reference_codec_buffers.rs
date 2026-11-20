@@ -1662,6 +1662,22 @@ mod tests {
         Ok(())
     }
 
+    fn publish_next_file(path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut temp_os = OsString::from(path.as_os_str());
+        temp_os.push(".partial");
+        let temporary = PathBuf::from(temp_os);
+        {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.flush()?;
+        }
+        fs::rename(&temporary, path)?;
+        Ok(())
+    }
+
     fn run_concurrent_checkpoints(
         session: &Arc<Session>,
         dir: &Path,
@@ -1709,7 +1725,7 @@ mod tests {
                 for (got, &exp) in stored.as_chunks::<4>().0.iter().zip(expected_vals) {
                     assert_eq!(f32::from_le_bytes(*got).to_bits(), exp.to_bits());
                 }
-                fs::write(&next_file, b"[]")?;
+                publish_next_file(&next_file, b"[]")?;
                 let final_res = rx.recv().map_err(|_| invalid("worker disconnected"))??;
                 assert_eq!(final_res, json!({"Trace": []}));
                 join.join().map_err(|_| invalid("worker panicked"))?;
@@ -2020,11 +2036,11 @@ mod tests {
         while !ckpt1.is_file() {
             thread::sleep(Duration::from_millis(1));
         }
-        fs::write(&next1, serde_json::to_vec(&batch2)?)?;
+        publish_next_file(&next1, &serde_json::to_vec(&batch2)?)?;
         while !ckpt2.is_file() {
             thread::sleep(Duration::from_millis(1));
         }
-        fs::write(&next2, b"[]")?;
+        publish_next_file(&next2, b"[]")?;
         let final_trace = rx.recv().map_err(|_| invalid("worker disconnected"))??;
         assert_eq!(final_trace, json!({"Trace": []}));
         worker.join().map_err(|_| invalid("worker panicked"))?;

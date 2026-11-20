@@ -107,7 +107,7 @@ dependencies = [
  "ash",
  "bonsai-gguf",
  "bonsai-hexagon-runtime",
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.5",
  "bonsai-ternary",
  "hex",
  "prism-inference",
@@ -126,9 +126,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-gguf"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.5",
  "bonsai-ternary",
  "hex",
  "serde_json",
@@ -145,7 +145,7 @@ version = "0.1.0"
 dependencies = [
  "bonsai-gguf",
  "bonsai-hexagon-native",
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.5",
  "bonsai-ternary",
  "bonsai-windows-process",
  "hex",
@@ -157,6 +157,16 @@ dependencies = [
 [[package]]
 name = "bonsai-native-hash"
 version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8d2e05287d77ea0fe409474ac76dc9fe02783b32786ec77ac7467b75d6c3ed2"
+dependencies = [
+ "sha2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bonsai-native-hash"
+version = "0.1.5"
 dependencies = [
  "sha2",
  "windows-sys 0.61.2",
@@ -165,6 +175,15 @@ dependencies = [
 [[package]]
 name = "bonsai-neon-dot"
 version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e0a0891e6efade20e21ab528058aa9ebf851699dbc37f2a735f66e7efe3f644"
+dependencies = [
+ "bonsai-ternary",
+]
+
+[[package]]
+name = "bonsai-neon-dot"
+version = "0.1.7"
 dependencies = [
  "bonsai-ternary",
 ]
@@ -190,7 +209,7 @@ version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94da447b6f49bde8fcbcb4918c8a894f7f9c7d4be7d42e433a5c30a0ead4e2ff"
 dependencies = [
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.4",
  "hex",
  "windows-sys 0.61.2",
  "zeroize",
@@ -203,7 +222,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b3f69dfd8ff188ae1559467795523ebbbe83f3fef984c5d29515195c21aa4b4"
 dependencies = [
  "ash",
- "bonsai-neon-dot",
+ "bonsai-neon-dot 0.1.6",
  "bonsai-ternary",
  "flatbuffers",
  "hex",
@@ -1079,7 +1098,7 @@ dependencies = [
 name = "prism-conformance-policy"
 version = "0.1.0"
 dependencies = [
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.5",
  "hex",
  "serde",
  "serde_json",
@@ -1092,8 +1111,8 @@ dependencies = [
  "aho-corasick",
  "base64ct",
  "bonsai-gguf",
- "bonsai-native-hash",
- "bonsai-neon-dot",
+ "bonsai-native-hash 0.1.5",
+ "bonsai-neon-dot 0.1.7",
  "bonsai-prism",
  "bonsai-ternary",
  "crc32fast",

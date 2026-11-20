@@ -1,6 +1,6 @@
 [package]
 name = "bonsai-gguf"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 rust-version.workspace = true
 publish = ["crates-io"]
@@ -23,7 +23,7 @@ path = "src/main.rs"
 required-features = ["report"]
 
 [dependencies]
-bonsai-native-hash = { path = "../native-hash", version = "=0.1.4" }
+bonsai-native-hash = { path = "../native-hash", version = "=0.1.5" }
 bonsai-ternary = { path = "../ternary", version = "=0.1.4", optional = true }
 hex.workspace = true
 serde_json = { workspace = true, optional = true }

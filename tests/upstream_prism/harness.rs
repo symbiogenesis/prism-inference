@@ -99,6 +99,7 @@ mod reference_dspark_logsnr;
 mod reference_gguf;
 mod reference_grammar;
 mod reference_grammar_parser;
+mod reference_jinja;
 mod reference_json_schema;
 mod reference_logging;
 mod reference_mtmd;
@@ -505,7 +506,7 @@ const CASES: &[Case] = &[
     register(
         "test-jinja",
         "tests/test-jinja.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         jinja::run,
     ),
     register(

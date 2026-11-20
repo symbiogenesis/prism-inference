@@ -29,7 +29,6 @@ const MAX_ROLE_BYTES: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 65_536;
 const MAX_MESSAGES_TOTAL_BYTES: usize = 1024 * 1024;
 
-#[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
 pub(super) const CHATML_JINJA_TEMPLATE: &str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}";
 
 const BUILTIN_TEMPLATES: &[&str] = &[

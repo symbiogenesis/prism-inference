@@ -2,7 +2,6 @@
 // inputs, expected results and assertions; no upstream test source is compiled.
 #include "vocab.hpp"
 #include "model_runtime.hpp"
-#include "chat.hpp"
 #include "backend_ops.hpp"
 #include "backend_session.hpp"
 #include <nlohmann/json.hpp>
@@ -85,8 +84,6 @@ void validate_operation(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
     if (prism_vocab::handles(kind)) {
         prism_vocab::validate(operation);
-    } else if (prism_chat::handles(kind)) {
-        prism_chat::validate(operation);
     } else if (prism_backend_ops::handles(kind)) {
         prism_backend_ops::validate(operation);
     } else {
@@ -98,9 +95,6 @@ wire_json execute(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
     if (prism_vocab::handles(kind)) {
         return prism_vocab::execute(operation);
-    }
-    if (prism_chat::handles(kind)) {
-        return prism_chat::execute(operation);
     }
     if (prism_backend_ops::handles(kind)) {
         return prism_backend_ops::execute(operation);

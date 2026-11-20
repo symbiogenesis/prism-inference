@@ -43,24 +43,9 @@ if(DEFINED PRISM_LLGUIDANCE_LIBRARY OR DEFINED PRISM_LLGUIDANCE_INCLUDE_DIR)
   endif()
 endif()
 
-# Only these two production units supply the chat conversion APIs used here.
-# Do not compile the server context, task, queue, transport or MCP machinery.
-find_package(Threads REQUIRED)
-set(PRISM_SERVER_CONTEXT_SOURCES
-  server-chat.cpp server-common.cpp)
-list(TRANSFORM PRISM_SERVER_CONTEXT_SOURCES PREPEND "${PRISM_SOURCE_DIR}/tools/server/")
-add_library(prism-upstream-server-context STATIC ${PRISM_SERVER_CONTEXT_SOURCES})
-target_include_directories(prism-upstream-server-context PRIVATE
-  "${PRISM_SOURCE_DIR}/tools/server" "${PRISM_SOURCE_DIR}/tools/mtmd"
-  "${PRISM_SOURCE_DIR}/src" "${PRISM_SOURCE_DIR}")
-target_link_libraries(prism-upstream-server-context PUBLIC llama-common mtmd Threads::Threads)
-if(MSVC)
-  target_compile_options(prism-upstream-server-context PRIVATE /utf-8)
-endif()
-
-add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp vocab.hpp vocab_session.hpp model_runtime.hpp chat.hpp generated_model.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp)
+add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp vocab.hpp vocab_session.hpp model_runtime.hpp generated_model.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp)
 target_include_directories(prism-upstream-common-bridge PRIVATE "${PRISM_SOURCE_DIR}/src" "${PRISM_SOURCE_DIR}" "${PRISM_SOURCE_DIR}/ggml/src")
-target_link_libraries(prism-upstream-common-bridge PRIVATE llama-common mtmd prism-upstream-server-context)
+target_link_libraries(prism-upstream-common-bridge PRIVATE llama-common mtmd)
 # The same-revision CI tool bundle also supplies the small ggml-only wrapper.
 # Reuse this tree's production ggml libraries instead of compiling them again in
 # a second CMake project. Ordinary common-only builds never request this target.

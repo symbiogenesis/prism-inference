@@ -325,7 +325,6 @@ impl ChatTemplate {
     }
 
     /// Compiles `source` with explicit UTC `now_unix_seconds` and probes [`JinjaCaps`].
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) fn new_with_now(
         source: &str,
         bos_token: &str,
@@ -356,7 +355,6 @@ impl ChatTemplate {
     }
 
     /// Evaluates the template with `params` and optional `now_unix_seconds` override.
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) fn apply_with_now(
         &self,
         params: &TemplateParams,
@@ -367,7 +365,6 @@ impl ChatTemplate {
 
     /// Evaluates the template with `params`, optional `now_unix_seconds` override, and optional
     /// forced object-typed tool arguments during message adaptation.
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) fn apply_with_now_object_args(
         &self,
         params: &TemplateParams,
@@ -639,7 +636,7 @@ pub(super) enum ToolFormatMode {
     /// Native JSON object/array tool calls (`1`).
     Json = 1,
     /// Tag-based function wrapper with JSON arguments (`2`).
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+    #[expect(dead_code, reason = "Retained for TagWithJsonArgs mode parity")]
     TagWithJsonArgs = 2,
     /// Tag-constructed function and tagged argument calls (`3`).
     TagWithTagged = 3,
@@ -884,7 +881,6 @@ impl AutoAnalysis {
     }
 }
 
-#[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
 pub(super) fn caps_to_json(c: JinjaCaps) -> Value {
     json!({
         "supports_tools": c.supports_tools,

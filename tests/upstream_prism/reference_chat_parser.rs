@@ -92,13 +92,10 @@ pub(super) struct ChatMessage {
     /// Parsed tool calls in order.
     pub(super) tool_calls: Vec<ChatToolCall>,
     /// Optional structured content parts.
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) content_parts: Vec<ChatContentPart>,
     /// Optional tool response name.
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) tool_name: String,
     /// Optional tool response call ID.
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) tool_call_id: String,
 }
 
@@ -685,7 +682,6 @@ impl ChatPegBuilder {
     }
 
     /// Builds a content parser for a JSON Schema allowing optional markdown fences and whitespace.
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) fn schema_content_parser(&mut self, schema: &JsonVal) -> Result<ParserId> {
         let json_p = self.inner.json()?;
         let schema_p = self.schema(json_p, "response".to_owned(), schema.clone(), false);
@@ -1392,7 +1388,6 @@ impl ChatPegBuilder {
 }
 
 /// Returns whether `schema` permits string values directly or within unions.
-#[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
 pub(super) fn schema_resolves_to_string(schema: &JsonVal) -> bool {
     SchemaGrammarContext::new().resolves_to_string(schema)
 }
@@ -1663,13 +1658,11 @@ pub(super) struct ChatArena {
 
 impl ChatArena {
     /// Serializes the underlying PEG arena to compact JSON.
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) fn to_json_string(&self) -> Result<String> {
         self.arena.to_json_string()
     }
 
     /// Deserializes a runtime-only [`ChatArena`] from serialized PEG JSON.
-    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
     pub(super) fn from_json_str(json_str: &str) -> Result<Self> {
         let arena = Arena::from_json_str(json_str)?;
         Ok(Self {

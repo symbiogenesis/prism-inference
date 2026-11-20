@@ -4858,26 +4858,28 @@ fn probe_tool_caps(
     )
 }
 
-fn probe_reasoning_caps(
+fn probe_preserve_reasoning(
     program: &Program,
     now_unix_seconds: i64,
     msg_content: &dyn Fn(&str) -> JVal,
-) -> (bool, bool) {
-    let reason_asst = JVal::object(vec![
-        (
-            JVal::text_str("role"),
-            JVal::bytes(b"assistant".to_vec(), true),
-        ),
-        (JVal::text_str("content"), msg_content("answer")),
-        (
-            JVal::text_str("reasoning_content"),
-            JVal::bytes(b"REASON_CAPS_MARKER".to_vec(), true),
-        ),
-    ]);
+) -> bool {
+    let make_reason_asst = || {
+        JVal::object(vec![
+            (
+                JVal::text_str("role"),
+                JVal::bytes(b"assistant".to_vec(), true),
+            ),
+            (JVal::text_str("content"), msg_content("answer")),
+            (
+                JVal::text_str("reasoning_content"),
+                JVal::bytes(b"REASON_CAPS_MARKER".to_vec(), true),
+            ),
+        ])
+    };
     let preserve_globals = make_probe_globals(
         JVal::array(vec![
             make_probe_msg("user", msg_content("hi")),
-            reason_asst,
+            make_reason_asst(),
             make_probe_msg("user", msg_content("next")),
         ]),
         None,
@@ -4885,23 +4887,50 @@ fn probe_reasoning_caps(
         true,
         &[],
     );
-    let supports_preserve_reasoning =
-        eval_probe_bytes(program, &preserve_globals, now_unix_seconds)
-            .is_some_and(|bytes| contains_bytes(&bytes, b"REASON_CAPS_MARKER"));
+    if eval_probe_bytes(program, &preserve_globals, now_unix_seconds)
+        .is_some_and(|bytes| contains_bytes(&bytes, b"REASON_CAPS_MARKER"))
+    {
+        return true;
+    }
+    let drop_globals = make_probe_globals(
+        JVal::array(vec![
+            make_probe_msg("user", msg_content("hi")),
+            make_reason_asst(),
+            make_probe_msg("user", msg_content("next")),
+        ]),
+        None,
+        false,
+        true,
+        &[("drop_thinking", JVal::boolean(false))],
+    );
+    let (drop_res, drop_scope) =
+        eval_program_with_context(program, &drop_globals, Some(now_unix_seconds));
+    drop_scope.get("drop_thinking").is_some_and(JVal::is_used)
+        && drop_res
+            .ok()
+            .map(|spans| spans.into_iter().flat_map(|s| s.bytes).collect::<Vec<u8>>())
+            .is_some_and(|bytes| contains_bytes(&bytes, b"REASON_CAPS_MARKER"))
+}
 
+fn probe_reasoning_effort_var(
+    program: &Program,
+    now_unix_seconds: i64,
+    msg_content: &dyn Fn(&str) -> JVal,
+    var_name: &str,
+) -> bool {
     let effort_high_globals = make_probe_globals(
         JVal::array(vec![make_probe_msg("user", msg_content("hi"))]),
         None,
         true,
         true,
-        &[("reasoning_effort", JVal::bytes(b"high".to_vec(), true))],
+        &[(var_name, JVal::bytes(b"high".to_vec(), true))],
     );
     let effort_low_globals = make_probe_globals(
         JVal::array(vec![make_probe_msg("user", msg_content("hi"))]),
         None,
         true,
         true,
-        &[("reasoning_effort", JVal::bytes(b"low".to_vec(), true))],
+        &[(var_name, JVal::bytes(b"low".to_vec(), true))],
     );
     let (high_res, high_scope) =
         eval_program_with_context(program, &effort_high_globals, Some(now_unix_seconds));
@@ -4909,10 +4938,25 @@ fn probe_reasoning_caps(
     let high_bytes = high_res
         .ok()
         .map(|spans| spans.into_iter().flat_map(|s| s.bytes).collect::<Vec<u8>>());
-    let supports_reasoning_effort = high_scope
-        .get("reasoning_effort")
-        .is_some_and(JVal::is_used)
-        || (high_bytes.is_some() && low_res.is_some() && high_bytes != low_res);
+    high_scope.get(var_name).is_some_and(JVal::is_used)
+        || (high_bytes.is_some() && low_res.is_some() && high_bytes != low_res)
+}
+
+fn probe_reasoning_caps(
+    program: &Program,
+    now_unix_seconds: i64,
+    msg_content: &dyn Fn(&str) -> JVal,
+) -> (bool, bool) {
+    let supports_preserve_reasoning =
+        probe_preserve_reasoning(program, now_unix_seconds, msg_content);
+    let supports_reasoning_effort =
+        probe_reasoning_effort_var(program, now_unix_seconds, msg_content, "reasoning_effort")
+            || probe_reasoning_effort_var(
+                program,
+                now_unix_seconds,
+                msg_content,
+                "reasoning_strength",
+            );
     (supports_preserve_reasoning, supports_reasoning_effort)
 }
 

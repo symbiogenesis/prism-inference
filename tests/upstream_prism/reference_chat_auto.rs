@@ -321,17 +321,27 @@ pub(super) struct ChatTemplate {
 impl ChatTemplate {
     /// Compiles `source` with `bos_token` / `eos_token` and probes [`JinjaCaps`].
     pub(super) fn new(source: &str, bos_token: &str, eos_token: &str) -> Self {
-        let now = current_unix_seconds();
+        Self::new_with_now(source, bos_token, eos_token, current_unix_seconds())
+    }
+
+    /// Compiles `source` with explicit UTC `now_unix_seconds` and probes [`JinjaCaps`].
+    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+    pub(super) fn new_with_now(
+        source: &str,
+        bos_token: &str,
+        eos_token: &str,
+        now_unix_seconds: i64,
+    ) -> Self {
         let program = parse_template_with_limit(source, MAX_TEMPLATE_BYTES).ok();
-        let caps = program
-            .as_ref()
-            .map_or_else(JinjaCaps::default, |prog| detect_jinja_caps(prog, now));
+        let caps = program.as_ref().map_or_else(JinjaCaps::default, |prog| {
+            detect_jinja_caps(prog, now_unix_seconds)
+        });
         Self {
             bos_token: bos_token.to_owned(),
             eos_token: eos_token.to_owned(),
             program,
             caps,
-            now_unix_seconds: now,
+            now_unix_seconds,
         }
     }
 
@@ -342,13 +352,40 @@ impl ChatTemplate {
 
     /// Evaluates the template with `params`, returning rendered UTF-8 text or error string.
     pub(super) fn apply(&self, params: &TemplateParams) -> std::result::Result<String, String> {
+        self.apply_with_now(params, None)
+    }
+
+    /// Evaluates the template with `params` and optional `now_unix_seconds` override.
+    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+    pub(super) fn apply_with_now(
+        &self,
+        params: &TemplateParams,
+        now_unix_seconds: Option<i64>,
+    ) -> std::result::Result<String, String> {
+        self.apply_with_now_object_args(params, now_unix_seconds, false)
+    }
+
+    /// Evaluates the template with `params`, optional `now_unix_seconds` override, and optional
+    /// forced object-typed tool arguments during message adaptation.
+    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+    pub(super) fn apply_with_now_object_args(
+        &self,
+        params: &TemplateParams,
+        now_unix_seconds: Option<i64>,
+        force_object_args: bool,
+    ) -> std::result::Result<String, String> {
         let program = self
             .program
             .as_ref()
             .ok_or_else(|| "invalid Jinja template".to_owned())?;
+        let now = now_unix_seconds.unwrap_or(self.now_unix_seconds);
+        let mut caps = self.caps;
+        if force_object_args {
+            caps.supports_object_arguments = true;
+        }
         let mut pairs = Vec::new();
         if let Some(ref msgs) = params.messages {
-            let adapted = adapt_messages_for_template(msgs, self.caps);
+            let adapted = adapt_messages_for_template(msgs, caps);
             pairs.push((JVal::text_str("messages"), adapted));
         }
         if let Some(ref tools_val) = params.tools
@@ -385,10 +422,10 @@ impl ChatTemplate {
             }
         }
         let globals = JVal::object(pairs);
-        let spans = match eval_program_with_now(program, &globals, Some(self.now_unix_seconds)) {
+        let spans = match eval_program_with_now(program, &globals, Some(now)) {
             Ok(s) => s,
             Err(first_err) if params.extra_context.is_none() => {
-                eval_program_chat_fallback(program, &globals, Some(self.now_unix_seconds))
+                eval_program_chat_fallback(program, &globals, Some(now))
                     .map_err(|_| first_err.message().to_owned())?
             }
             Err(err) => return Err(err.message().to_owned()),
@@ -506,7 +543,8 @@ fn adapt_tool_call_entry(tc: JVal, want_object: bool) -> JVal {
     JVal::object(adapted)
 }
 
-fn adapt_messages_for_template(messages: &JVal, caps: JinjaCaps) -> JVal {
+#[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+pub(super) fn adapt_messages_for_template(messages: &JVal, caps: JinjaCaps) -> JVal {
     let basic_caps = super::reference_chat_templates::TemplateCaps {
         supports_tools: caps.supports_tools,
         supports_tool_calls: caps.supports_tool_calls,
@@ -846,7 +884,8 @@ impl AutoAnalysis {
     }
 }
 
-fn caps_to_json(c: JinjaCaps) -> Value {
+#[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+pub(super) fn caps_to_json(c: JinjaCaps) -> Value {
     json!({
         "supports_tools": c.supports_tools,
         "supports_tool_calls": c.supports_tool_calls,
@@ -2311,6 +2350,10 @@ impl AutoParser {
     }
 
     /// Builds a [`ChatArena`] parser matching `self.analysis`, `inputs`, and `generation_prompt`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Coordinates reasoning, tools, schema, and open-thinking fallback assembly"
+    )]
     pub(super) fn build_parser(
         &self,
         inputs: &GenerationParams,
@@ -2319,26 +2362,170 @@ impl AutoParser {
         let mut builder = ChatPegBuilder::new();
         let mut parts: Vec<ParserId> = Vec::new();
 
-        // 1. Optional or prefilled reasoning segment.
-        if self.analysis.reasoning.mode != ReasoningMode::None
-            && inputs.reasoning_format != 0
-            && !self.analysis.reasoning.end.is_empty()
+        // Prepare tool and post-reasoning body parsers first so already-open reasoning
+        // can branch cleanly on `</think>` closing tags, direct tool triggers, or EOF.
+        let has_tools = inputs.tools.as_ref().is_some_and(|t| !t.array().is_empty())
+            && inputs.tool_choice != 2
+            && self.analysis.tools.format.mode != ToolFormatMode::None;
+        let force_tools = inputs.tool_choice == 1;
+
+        let mut tool_triggers = Vec::new();
+        let f = &self.analysis.tools.format;
+        let sec_start_trig = f.section_start.trim();
+        let per_call_trig = f.per_call_start.trim();
+        let fn_pfx_trig = self.analysis.tools.function.name_prefix.trim();
+        if !sec_start_trig.is_empty() {
+            tool_triggers.push(sec_start_trig.to_owned());
+        } else if !per_call_trig.is_empty() {
+            tool_triggers.push(per_call_trig.to_owned());
+            if per_call_trig == "<tool_call>" && fn_pfx_trig == "<function=" {
+                tool_triggers.push("<function=".to_owned());
+            }
+        } else if !fn_pfx_trig.is_empty() {
+            tool_triggers.push(fn_pfx_trig.to_owned());
+        }
+
+        let bare_json_tools = has_tools
+            && tool_triggers.is_empty()
+            && !force_tools
+            && self.analysis.content.start.is_empty();
+        let tool_parser = if has_tools {
+            let tools_val = inputs
+                .tools
+                .as_ref()
+                .ok_or_else(|| invalid("missing tools value"))?;
+            Some(self.build_tools_parser(
+                &mut builder,
+                tools_val,
+                inputs.parallel_tool_calls,
+                force_tools || bare_json_tools,
+            )?)
+        } else {
+            None
+        };
+
+        let mut body_parts: Vec<ParserId> = Vec::new();
+        if let Some(tools_p) = tool_parser {
+            if !self.analysis.content.start.is_empty() && !self.analysis.content.end.is_empty() {
+                let c_open = builder.inner_mut().literal(&self.analysis.content.start);
+                let until_end = builder.inner_mut().until(&self.analysis.content.end);
+                let c_body = builder.content(until_end);
+                let c_close = builder.inner_mut().literal(&self.analysis.content.end);
+                let wrapped = builder.inner_mut().sequence(vec![c_open, c_body, c_close]);
+                let opt_content = builder.inner_mut().optional(wrapped);
+                body_parts.push(opt_content);
+                body_parts.push(tools_p);
+            } else if bare_json_tools {
+                let fallback = if let Some(ref schema) = inputs.json_schema
+                    && !matches!(schema, JsonVal::Null)
+                {
+                    builder.schema_content_parser(schema)?
+                } else {
+                    let rest = builder.inner_mut().rest();
+                    builder.content(rest)
+                };
+                body_parts.push(builder.inner_mut().or(tools_p, fallback));
+            } else if !tool_triggers.is_empty() {
+                let until_trig = builder.inner_mut().until_one_of(tool_triggers.clone());
+                let c_body = builder.content(until_trig);
+                body_parts.push(c_body);
+                body_parts.push(tools_p);
+            } else {
+                body_parts.push(tools_p);
+            }
+        } else if !self.analysis.content.start.is_empty() && !self.analysis.content.end.is_empty() {
+            let c_open = builder.inner_mut().literal(&self.analysis.content.start);
+            let until_end = builder.inner_mut().until(&self.analysis.content.end);
+            let c_body = builder.content(until_end);
+            let c_close = builder.inner_mut().literal(&self.analysis.content.end);
+            body_parts.push(builder.inner_mut().sequence(vec![c_open, c_body, c_close]));
+        } else if let Some(ref schema) = inputs.json_schema
+            && !matches!(schema, JsonVal::Null)
         {
-            let start_tag = &self.analysis.reasoning.start;
-            let end_tag = &self.analysis.reasoning.end;
+            body_parts.push(builder.schema_content_parser(schema)?);
+        } else {
+            let rest = builder.inner_mut().rest();
+            body_parts.push(builder.content(rest));
+        }
+
+        let after_body = if body_parts.len() == 1 {
+            body_parts[0]
+        } else {
+            builder.inner_mut().sequence(body_parts.clone())
+        };
+
+        // 1. Optional or prefilled reasoning segment (kept in `content` when format == 0).
+        if self.analysis.reasoning.mode != ReasoningMode::None
+            && !self.analysis.reasoning.end.trim().is_empty()
+        {
+            let start_tag = self.analysis.reasoning.start.trim();
+            let end_tag = self.analysis.reasoning.end.trim();
             let prompt_trimmed = generation_prompt.trim_end();
             let already_open = !start_tag.is_empty()
                 && prompt_trimmed.ends_with(start_tag)
                 && !prompt_trimmed.ends_with(end_tag);
             let already_closed = prompt_trimmed.ends_with(end_tag);
+            let constructed_tools = has_tools
+                && self.analysis.tools.format.mode == ToolFormatMode::TagWithTagged
+                && !tool_triggers.is_empty();
 
-            if already_open {
-                let until_end = builder.inner_mut().until(end_tag);
+            if inputs.reasoning_format == 0 {
+                if already_open {
+                    let until_end = if constructed_tools {
+                        let mut delims = vec![end_tag.to_owned()];
+                        delims.extend(tool_triggers);
+                        builder.inner_mut().until_one_of(delims)
+                    } else {
+                        builder.inner_mut().until(end_tag)
+                    };
+                    let close = builder.inner_mut().literal(end_tag);
+                    let closed_head = builder.inner_mut().sequence(vec![until_end, close]);
+                    let closed_content = builder.content(closed_head);
+                    let opt_closed = if !force_tools && inputs.json_schema.is_none() {
+                        builder.inner_mut().optional(closed_content)
+                    } else {
+                        closed_content
+                    };
+                    parts.push(opt_closed);
+                } else if !already_closed && !start_tag.is_empty() {
+                    let open = builder.inner_mut().literal(start_tag);
+                    let until_end = builder.inner_mut().until(end_tag);
+                    let close = builder.inner_mut().literal(end_tag);
+                    let inner = builder.inner_mut().sequence(vec![open, until_end, close]);
+                    let block = builder.content(inner);
+                    parts.push(builder.inner_mut().optional(block));
+                }
+            } else if already_open {
+                let until_end = if constructed_tools {
+                    let mut delims = vec![end_tag.to_owned()];
+                    delims.extend(tool_triggers);
+                    builder.inner_mut().until_one_of(delims)
+                } else {
+                    builder.inner_mut().until(end_tag)
+                };
                 let body = builder.reasoning(until_end);
+                let r_block = builder.reasoning_block(body);
+
                 let close = builder.inner_mut().literal(end_tag);
                 let sp = builder.inner_mut().space();
-                let block = builder.inner_mut().sequence(vec![body, close, sp]);
-                parts.push(builder.reasoning_block(block));
+                let closed_branch = builder.inner_mut().sequence(vec![close, sp, after_body]);
+
+                let after_reason = if constructed_tools && let Some(tools_p) = tool_parser {
+                    let branch = builder.inner_mut().choice(vec![closed_branch, tools_p]);
+                    if !force_tools && inputs.json_schema.is_none() {
+                        builder.inner_mut().optional(branch)
+                    } else {
+                        branch
+                    }
+                } else if !force_tools && inputs.json_schema.is_none() {
+                    builder.inner_mut().optional(closed_branch)
+                } else {
+                    closed_branch
+                };
+
+                let full = builder.inner_mut().sequence(vec![r_block, after_reason]);
+                builder.set_root(full);
+                return builder.build();
             } else if !already_closed && !start_tag.is_empty() {
                 let open = builder.inner_mut().literal(start_tag);
                 let sp1 = builder.inner_mut().space();
@@ -2354,67 +2541,7 @@ impl AutoParser {
             }
         }
 
-        // 2. Tools + content parsers.
-        let has_tools = inputs.tools.as_ref().is_some_and(|t| !t.array().is_empty())
-            && inputs.tool_choice != 2
-            && self.analysis.tools.format.mode != ToolFormatMode::None;
-
-        let tool_parser = if has_tools {
-            let tools_val = inputs
-                .tools
-                .as_ref()
-                .ok_or_else(|| invalid("missing tools value"))?;
-            let force = inputs.tool_choice == 1;
-            Some(self.build_tools_parser(
-                &mut builder,
-                tools_val,
-                inputs.parallel_tool_calls,
-                force,
-            )?)
-        } else {
-            None
-        };
-
-        if let Some(tools_p) = tool_parser {
-            let mut triggers = Vec::new();
-            let f = &self.analysis.tools.format;
-            if !f.section_start.is_empty() {
-                triggers.push(f.section_start.clone());
-            } else if !f.per_call_start.is_empty() {
-                triggers.push(f.per_call_start.clone());
-            } else if !self.analysis.tools.function.name_prefix.is_empty() {
-                triggers.push(self.analysis.tools.function.name_prefix.clone());
-            }
-            if !self.analysis.content.start.is_empty() && !self.analysis.content.end.is_empty() {
-                let c_open = builder.inner_mut().literal(&self.analysis.content.start);
-                let until_end = builder.inner_mut().until(&self.analysis.content.end);
-                let c_body = builder.content(until_end);
-                let c_close = builder.inner_mut().literal(&self.analysis.content.end);
-                let wrapped = builder.inner_mut().sequence(vec![c_open, c_body, c_close]);
-                let opt_content = builder.inner_mut().optional(wrapped);
-                parts.push(opt_content);
-            } else if inputs.tool_choice != 1 && !triggers.is_empty() {
-                let until_trig = builder.inner_mut().until_one_of(triggers);
-                let c_body = builder.content(until_trig);
-                parts.push(c_body);
-            }
-            parts.push(tools_p);
-        } else if !self.analysis.content.start.is_empty() && !self.analysis.content.end.is_empty() {
-            let c_open = builder.inner_mut().literal(&self.analysis.content.start);
-            let until_end = builder.inner_mut().until(&self.analysis.content.end);
-            let c_body = builder.content(until_end);
-            let c_close = builder.inner_mut().literal(&self.analysis.content.end);
-            parts.push(builder.inner_mut().sequence(vec![c_open, c_body, c_close]));
-        } else if let Some(ref schema) = inputs.json_schema
-            && !matches!(schema, JsonVal::Null)
-        {
-            let json_p = builder.inner_mut().json()?;
-            let schema_p = builder.schema(json_p, "response".to_owned(), schema.clone(), false);
-            parts.push(builder.content(schema_p));
-        } else {
-            let rest = builder.inner_mut().rest();
-            parts.push(builder.content(rest));
-        }
+        parts.extend(body_parts);
 
         let root = if parts.len() == 1 {
             parts[0]
@@ -2435,13 +2562,13 @@ impl AutoParser {
         let f = &self.analysis.tools.format;
         match f.mode {
             ToolFormatMode::Json => builder.standard_json_tools(&JsonToolsOptions {
-                section_start: &f.section_start,
-                section_end: &f.section_end,
+                section_start: f.section_start.trim(),
+                section_end: f.section_end.trim(),
                 tools: tools_val,
                 parallel_tool_calls: parallel,
                 force_tool_calls: force,
-                per_call_start: &f.per_call_start,
-                per_call_end: &f.per_call_end,
+                per_call_start: f.per_call_start.trim(),
+                per_call_end: f.per_call_end.trim(),
                 fun_name_is_key: f.fun_name_is_key,
                 tools_array_wrapped: f.tools_array_wrapped,
                 name_field: &f.name_field,

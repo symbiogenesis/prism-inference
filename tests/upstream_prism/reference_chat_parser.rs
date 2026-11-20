@@ -684,6 +684,35 @@ impl ChatPegBuilder {
         wrapper
     }
 
+    /// Builds a content parser for a JSON Schema allowing optional markdown fences and whitespace.
+    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+    pub(super) fn schema_content_parser(&mut self, schema: &JsonVal) -> Result<ParserId> {
+        let json_p = self.inner.json()?;
+        let schema_p = self.schema(json_p, "response".to_owned(), schema.clone(), false);
+        let content_schema = self.content(schema_p);
+        let fence_open = self.inner.literal("```");
+        let fence_lang = self.inner.literal("json");
+        let opt_lang = self.inner.optional(fence_lang);
+        let fence_close = self.inner.literal("```");
+        let sp_lead = self.inner.space();
+        let sp_open = self.inner.space();
+        let sp_close = self.inner.space();
+        let sp_tail_fenced = self.inner.space();
+        let sp_tail_raw = self.inner.space();
+        let fenced = self.inner.sequence(vec![
+            fence_open,
+            opt_lang,
+            sp_open,
+            content_schema,
+            sp_close,
+            fence_close,
+            sp_tail_fenced,
+        ]);
+        let raw = self.inner.sequence(vec![content_schema, sp_tail_raw]);
+        let body = self.inner.choice(vec![fenced, raw]);
+        Ok(self.inner.sequence(vec![sp_lead, body]))
+    }
+
     /// Generates an order-independent permutation parser/grammar over `children`.
     pub(super) fn permute(&mut self, prefix: &str, children: &[ParserId]) -> ParserId {
         match children.len() {
@@ -1118,7 +1147,13 @@ impl ChatPegBuilder {
         };
 
         let section = wrap_section(&mut self.inner, &m.section_start, calls_seq, &m.section_end);
-        let triggered = self.trigger_rule("tool-call", section);
+        let section_with_ws = if m.section_end.is_empty() && m.tool_end.is_empty() {
+            section
+        } else {
+            let sp = self.inner.space();
+            self.inner.add(section, sp)
+        };
+        let triggered = self.trigger_rule("tool-call", section_with_ws);
         Ok(if force_tool_calls {
             triggered
         } else {
@@ -1144,8 +1179,15 @@ impl ChatPegBuilder {
             }
             (false, false) => {
                 let l1 = self.inner.literal(&m.tool_start);
+                let first = if m.tool_start.trim() == "<tool_call>"
+                    && m.func_name_prefix.trim() == "<function="
+                {
+                    self.inner.optional(l1)
+                } else {
+                    l1
+                };
                 let l2 = self.inner.literal(&m.func_name_prefix);
-                let seq = self.inner.space_add(l1, l2);
+                let seq = self.inner.space_add(first, l2);
                 self.tool_open(seq)
             }
         };
@@ -1347,6 +1389,12 @@ impl ChatPegBuilder {
             schemas: self.schemas,
         })
     }
+}
+
+/// Returns whether `schema` permits string values directly or within unions.
+#[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+pub(super) fn schema_resolves_to_string(schema: &JsonVal) -> bool {
+    SchemaGrammarContext::new().resolves_to_string(schema)
 }
 
 struct ConstructedMarkers {
@@ -1614,6 +1662,22 @@ pub(super) struct ChatArena {
 }
 
 impl ChatArena {
+    /// Serializes the underlying PEG arena to compact JSON.
+    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+    pub(super) fn to_json_string(&self) -> Result<String> {
+        self.arena.to_json_string()
+    }
+
+    /// Deserializes a runtime-only [`ChatArena`] from serialized PEG JSON.
+    #[allow(dead_code, reason = "Exposed for Stage 4 chat provider")]
+    pub(super) fn from_json_str(json_str: &str) -> Result<Self> {
+        let arena = Arena::from_json_str(json_str)?;
+        Ok(Self {
+            arena,
+            schemas: BTreeMap::new(),
+        })
+    }
+
     /// Parses `ctx` from byte offset 0.
     pub(super) fn parse_with_context(&self, ctx: &mut ParseContext<'_>) -> Result<ParseResult> {
         self.arena.parse_with_context(ctx)

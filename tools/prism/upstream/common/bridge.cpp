@@ -19,7 +19,6 @@
 #include "arg_parser.hpp"
 #include "chat.hpp"
 #include "optimizer.hpp"
-#include "dspark.hpp"
 #include "backend_ops.hpp"
 #include "backend_session.hpp"
 #include <nlohmann/json.hpp>
@@ -124,8 +123,6 @@ void validate_operation(const wire_json & operation) {
         prism_optimizer::validate(operation);
     } else if (prism_backend_ops::handles(kind)) {
         prism_backend_ops::validate(operation);
-    } else if (prism_dspark::handles(kind)) {
-        prism_dspark::validate(operation);
     } else {
         throw std::runtime_error("unknown operation Kind");
     }
@@ -168,9 +165,6 @@ wire_json execute(const wire_json & operation) {
     }
     if (prism_backend_ops::handles(kind)) {
         return prism_backend_ops::execute(operation);
-    }
-    if (prism_dspark::handles(kind)) {
-        return prism_dspark::execute(operation);
     }
     throw std::runtime_error("unknown operation Kind");
 }

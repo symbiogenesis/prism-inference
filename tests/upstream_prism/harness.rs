@@ -93,6 +93,7 @@ mod recurrent_rollback;
 mod reference_allocation;
 mod reference_arena_graph;
 mod reference_batch_allocator;
+mod reference_dspark_logsnr;
 mod reference_gguf;
 mod reference_grammar;
 mod reference_grammar_parser;
@@ -243,7 +244,7 @@ const CASES: &[Case] = &[
     register(
         "test-dspark-logsnr-meta",
         "tests/test-dspark-logsnr-meta.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         dspark_logsnr::run,
     ),
     register(

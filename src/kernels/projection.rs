@@ -354,6 +354,220 @@ pub trait Pq2ProjectionExecutor {
     }
 }
 
+macro_rules! forward_pq2_projection_executor {
+    ($inner:ident => $target:ty) => {
+        impl<$inner: Pq2ProjectionExecutor + ?Sized> Pq2ProjectionExecutor for $target {
+            fn identity(&self) -> &str {
+                (**self).identity()
+            }
+
+            fn operation_capacity(&self) -> Option<u64> {
+                (**self).operation_capacity()
+            }
+
+            fn operation_count(&self, tensor: &Tensor) -> Option<u64> {
+                (**self).operation_count(tensor)
+            }
+
+            fn supports(&self, tensor: &Tensor) -> bool {
+                (**self).supports(tensor)
+            }
+
+            fn project(
+                &mut self,
+                tensor: &Tensor,
+                activation: &[Q8KBlock],
+                fused: bool,
+                output: &mut Vec<f32>,
+            ) -> Result<()> {
+                (**self).project(tensor, activation, fused, output)
+            }
+
+            fn supports_q8(&self, tensor: &Tensor) -> bool {
+                (**self).supports_q8(tensor)
+            }
+
+            fn project_q8(
+                &mut self,
+                tensor: &Tensor,
+                activation: &[Q8Block],
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> Result<()> {
+                (**self).project_q8(tensor, activation, pinned, output)
+            }
+
+            fn supports_f32(&self, tensor: &Tensor) -> bool {
+                (**self).supports_f32(tensor)
+            }
+
+            fn project_f32(
+                &mut self,
+                tensor: &Tensor,
+                activation: &[f32],
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> Result<()> {
+                (**self).project_f32(tensor, activation, pinned, output)
+            }
+
+            fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
+                (**self).supports_f32_group(tensors)
+            }
+
+            fn project_f32_group(
+                &mut self,
+                tensors: &[&Tensor],
+                activation: &[f32],
+                pinned: bool,
+                outputs: &mut [&mut Vec<f32>],
+            ) -> Result<()> {
+                (**self).project_f32_group(tensors, activation, pinned, outputs)
+            }
+
+            fn project_f32_tokens(
+                &mut self,
+                tensor: &Tensor,
+                activations: &[Vec<f32>],
+                pinned: bool,
+                outputs: &mut [Vec<f32>],
+            ) -> Result<()> {
+                (**self).project_f32_tokens(tensor, activations, pinned, outputs)
+            }
+
+            fn project_f32_pair_tokens(
+                &mut self,
+                tensors: [&Tensor; 2],
+                activations: &[Vec<f32>],
+                pinned: bool,
+                outputs_a: &mut [Vec<f32>],
+                outputs_b: &mut [Vec<f32>],
+            ) -> Result<()> {
+                (**self).project_f32_pair_tokens(tensors, activations, pinned, outputs_a, outputs_b)
+            }
+
+            fn project_f32_triple_tokens(
+                &mut self,
+                tensors: [&Tensor; 3],
+                activations: &[Vec<f32>],
+                pinned: bool,
+                outputs_a: &mut [Vec<f32>],
+                outputs_b: &mut [Vec<f32>],
+                outputs_c: &mut [Vec<f32>],
+            ) -> Result<()> {
+                (**self).project_f32_triple_tokens(
+                    tensors,
+                    activations,
+                    pinned,
+                    outputs_a,
+                    outputs_b,
+                    outputs_c,
+                )
+            }
+
+            fn supports_f32_ffn_swiglu(&self, gate: &Tensor, up: &Tensor) -> bool {
+                (**self).supports_f32_ffn_swiglu(gate, up)
+            }
+
+            fn project_f32_ffn_swiglu(
+                &mut self,
+                gate: &Tensor,
+                up: &Tensor,
+                activation: &[f32],
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> Result<()> {
+                (**self).project_f32_ffn_swiglu(gate, up, activation, pinned, output)
+            }
+
+            fn project_f32_ffn_swiglu_tokens(
+                &mut self,
+                gate: &Tensor,
+                up: &Tensor,
+                activations: &[Vec<f32>],
+                pinned: bool,
+                outputs: &mut [Vec<f32>],
+            ) -> Result<()> {
+                (**self).project_f32_ffn_swiglu_tokens(gate, up, activations, pinned, outputs)
+            }
+
+            fn supports_f32_ffn_chain(&self, tensors: [&Tensor; 3]) -> bool {
+                (**self).supports_f32_ffn_chain(tensors)
+            }
+
+            fn supports_tile_tokens(&self) -> bool {
+                (**self).supports_tile_tokens()
+            }
+
+            fn project_f32_ffn_chain(
+                &mut self,
+                tensors: [&Tensor; 3],
+                activation: &[f32],
+                residual: Option<&[f32]>,
+                hadamard_block_size: Option<u32>,
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> Result<()> {
+                (**self).project_f32_ffn_chain(
+                    tensors,
+                    activation,
+                    residual,
+                    hadamard_block_size,
+                    pinned,
+                    output,
+                )
+            }
+
+            fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
+                (**self).supports_f32_ffn_chain_lora(tensors)
+            }
+
+            fn project_f32_ffn_chain_lora(
+                &mut self,
+                tensors: [&Tensor; 3],
+                activation: &[f32],
+                residual: Option<&[f32]>,
+                hadamard_block_size: Option<u32>,
+                lora_a: &[f32],
+                pinned: bool,
+                output: &mut Vec<f32>,
+            ) -> Result<f32> {
+                (**self).project_f32_ffn_chain_lora(
+                    tensors,
+                    activation,
+                    residual,
+                    hadamard_block_size,
+                    lora_a,
+                    pinned,
+                    output,
+                )
+            }
+
+            fn project_f32_ffn_chain_tokens(
+                &mut self,
+                tensors: [&Tensor; 3],
+                activations: &[Vec<f32>],
+                residuals: Option<&[Vec<f32>]>,
+                hadamard_block_size: Option<u32>,
+                pinned: bool,
+                outputs: &mut [Vec<f32>],
+            ) -> Result<()> {
+                (**self).project_f32_ffn_chain_tokens(
+                    tensors,
+                    activations,
+                    residuals,
+                    hadamard_block_size,
+                    pinned,
+                    outputs,
+                )
+            }
+        }
+    };
+}
+
+forward_pq2_projection_executor!(E => &mut E);
+forward_pq2_projection_executor!(E => Box<E>);
+
 impl PreparedMatvec<'_> {
     fn validate_f32_ffn_chain(
         &self,
@@ -396,7 +610,7 @@ impl PreparedMatvec<'_> {
         residual: Option<&[f32]>,
         hadamard_block_size: Option<u32>,
         output: &mut Vec<f32>,
-        executor: &mut dyn Pq2ProjectionExecutor,
+        executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<()> {
         let result = (|| {
             let (_, down_rows) = self.validate_f32_ffn_chain(tensors, residual)?;
@@ -443,7 +657,7 @@ impl PreparedMatvec<'_> {
         hadamard_block_size: Option<u32>,
         lora_a: &[f32],
         output: &mut Vec<f32>,
-        executor: &mut dyn Pq2ProjectionExecutor,
+        executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<f32> {
         let result = (|| {
             let (down_cols, down_rows) = self.validate_f32_ffn_chain(tensors, residual)?;
@@ -487,7 +701,7 @@ impl PreparedMatvec<'_> {
         gate: &Tensor,
         up: &Tensor,
         output: &mut Vec<f32>,
-        executor: &mut dyn Pq2ProjectionExecutor,
+        executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<()> {
         let result = (|| {
             let (gate_cols, gate_rows, _) = dimensions(gate)?;
@@ -534,7 +748,7 @@ impl PreparedMatvec<'_> {
         &mut self,
         tensors: &[&Tensor],
         outputs: &mut [&mut Vec<f32>],
-        executor: &mut dyn Pq2ProjectionExecutor,
+        executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<()> {
         if tensors.is_empty() || tensors.len() != outputs.len() {
             return Err(invalid("mismatched projection group outputs"));
@@ -595,7 +809,7 @@ impl PreparedMatvec<'_> {
         &mut self,
         tensor: &Tensor,
         output: &mut Vec<f32>,
-        executor: &mut dyn Pq2ProjectionExecutor,
+        executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<()> {
         let result = (|| {
             let (columns, rows, _) = dimensions(tensor)?;

@@ -3419,6 +3419,9 @@ impl Qwen35 {
             tile.set_row_parallelism(parallelism.clone());
         }
         self.workspace
+            .adapter
+            .set_row_parallelism(parallelism.clone());
+        self.workspace
             .projection
             .matvec
             .set_row_parallelism(parallelism);
@@ -9286,6 +9289,26 @@ mod tests {
             return Err(crate::invalid("expected full attention layer"));
         }
         assert_eq!(decoder.release_executor_resident_host_weights()?, 0);
+        drop(decoder);
+        Ok(())
+    }
+
+    #[cfg(feature = "parallel-rows")]
+    #[test]
+    fn qwen35_set_row_parallelism_propagates_to_adapter_scratch() -> Result<()> {
+        let (model, guard, _) = build_mapped_pq2_release_fixture()?;
+        let _guard = guard;
+        let mut decoder = super::Qwen35::new(model, 32)?;
+        assert_eq!(decoder.row_workers(), 1);
+        assert_eq!(decoder.workspace.adapter.row_workers(), 1);
+
+        decoder.set_row_parallelism(crate::kernels::RowParallelism::new(4)?);
+        assert_eq!(decoder.row_workers(), 4);
+        assert_eq!(decoder.workspace.adapter.row_workers(), 4);
+
+        crate::Decoder::reset(&mut decoder)?;
+        assert_eq!(decoder.row_workers(), 4);
+        assert_eq!(decoder.workspace.adapter.row_workers(), 4);
         drop(decoder);
         Ok(())
     }

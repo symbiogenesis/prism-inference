@@ -4560,7 +4560,7 @@ fn check_lora_multi_b_dims(
     Ok(())
 }
 
-const MULTI_A_PARALLEL_ELEM_THRESHOLD: usize = 262_144;
+const MULTI_A_PARALLEL_ELEM_THRESHOLD: usize = 65_536;
 const MULTI_B_PARALLEL_ROW_THRESHOLD: usize = 1024;
 
 type NeonMultiAChunkFn<W> = fn(&[W], usize, &[f32], &mut [f32]) -> Option<bool>;

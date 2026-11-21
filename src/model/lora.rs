@@ -165,6 +165,15 @@ impl Scratch {
         }
     }
 
+    pub(crate) fn set_row_parallelism(&mut self, parallelism: crate::kernels::RowParallelism) {
+        self.matvec.set_row_parallelism(parallelism);
+    }
+
+    #[cfg(all(test, feature = "parallel-rows"))]
+    pub(crate) const fn row_workers(&self) -> usize {
+        self.matvec.row_workers()
+    }
+
     pub(crate) fn apply_dense_b_dot(
         &mut self,
         lora_b: &[f32],

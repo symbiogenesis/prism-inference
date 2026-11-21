@@ -975,4 +975,93 @@ mod tests {
             .is_err()
         );
     }
+
+    #[cfg(feature = "parallel-rows")]
+    #[test]
+    fn multi_rank_parallel_rows_preserve_single_and_batched_f16_bits() -> Result<()> {
+        // Dimensions match Swift attn_k / attn_v (5120 x 1024) at rank 16 (81,920 A elems >= 65,536
+        // and 1,024 B rows >= 1,024) so both A and B kernels dispatch onto the row worker pool.
+        let target = "blk.3.attn_k.weight";
+        let in_features = 5120_usize;
+        let out_features = 1024_usize;
+        let rank = 16_usize;
+        let base = base_model(&[(target, [in_features, out_features])]);
+        let a_vals: Vec<f32> = (0..in_features * rank)
+            .map(|i| [-0.03125_f32, 0.0625, -0.015_625, 0.046_875, 0.0][(i * 7 + i / 13) % 5])
+            .collect();
+        let b_vals: Vec<f32> = (0..rank * out_features)
+            .map(|i| {
+                [0.015_625_f32, -0.03125, 0.007_812_5, -0.023_437_5, 0.03125][(i * 5 + i / 11) % 5]
+            })
+            .collect();
+        let adapter_model = Model {
+            identity: "c".repeat(64),
+            metadata: adapter_metadata(16.0),
+            tensors: BTreeMap::from([
+                (
+                    format!("{target}.lora_a"),
+                    f16_tensor(&format!("{target}.lora_a"), &[in_features, rank], &a_vals),
+                ),
+                (
+                    format!("{target}.lora_b"),
+                    f16_tensor(&format!("{target}.lora_b"), &[rank, out_features], &b_vals),
+                ),
+            ]),
+        };
+        let adapter =
+            MultiRankAdapter::from_model(&base, &adapter_model, MultiRankPolicy::NpuFriendly)?;
+
+        let inputs: Vec<Vec<f32>> = (0..4_usize)
+            .map(|tok| {
+                (0..in_features)
+                    .map(|i| [-1.25_f32, 0.5, 2.0, -0.75, 0.125][(i + tok * 3) % 5])
+                    .collect()
+            })
+            .collect();
+        let initial_outputs: Vec<Vec<f32>> = (0..4_usize)
+            .map(|tok| {
+                (0..out_features)
+                    .map(|i| [1.5_f32, -0.25, 0.75, -2.0][(i + tok) % 4])
+                    .collect()
+            })
+            .collect();
+
+        let mut serial_scratch = Scratch::new(MatvecBackend::ExperimentalNeon, true);
+        let mut parallel_scratch = Scratch::new(MatvecBackend::ExperimentalNeon, true);
+        parallel_scratch.set_row_parallelism(crate::kernels::RowParallelism::new(4)?);
+
+        let mut serial_single = initial_outputs[0].clone();
+        let mut parallel_single = initial_outputs[0].clone();
+        adapter.linear(
+            target,
+            &inputs[0],
+            1.0,
+            &mut serial_single,
+            &mut serial_scratch,
+        )?;
+        adapter.linear(
+            target,
+            &inputs[0],
+            1.0,
+            &mut parallel_single,
+            &mut parallel_scratch,
+        )?;
+        let to_bits = |slice: &[f32]| slice.iter().copied().map(f32::to_bits).collect::<Vec<_>>();
+        assert_eq!(to_bits(&parallel_single), to_bits(&serial_single));
+
+        let mut serial_batch = initial_outputs.clone();
+        let mut parallel_batch = initial_outputs;
+        adapter.linear_tokens(target, &inputs, 1.0, &mut serial_batch, &mut serial_scratch)?;
+        adapter.linear_tokens(
+            target,
+            &inputs,
+            1.0,
+            &mut parallel_batch,
+            &mut parallel_scratch,
+        )?;
+        for (actual, expected) in parallel_batch.iter().zip(&serial_batch) {
+            assert_eq!(to_bits(actual), to_bits(expected));
+        }
+        Ok(())
+    }
 }

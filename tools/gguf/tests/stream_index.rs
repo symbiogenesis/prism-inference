@@ -397,3 +397,30 @@ fn stream_index_rejects_bad_booleans_alignment_and_zero_tensors() -> io::Result<
     assert_eq!(z.data_offset, 24);
     Ok(())
 }
+
+#[test]
+fn read_index_cancellable_accepts_concrete_closure_and_dyn_callback() -> io::Result<()> {
+    let bytes = build_gguf(3, 32, &[(b"k", kv_u32(1))], &[(b"weight", &[1], 0, 0)], 4);
+    let len = u64::try_from(bytes.len()).unwrap();
+    let policy = asr_policy();
+
+    let mut concrete_polls = 0_usize;
+    let parsed_concrete =
+        read_index_cancellable(&mut Cursor::new(&bytes), len, &policy, &mut || {
+            concrete_polls += 1;
+            false
+        })?;
+    assert_eq!(parsed_concrete.tensors["weight"].bytes, 4);
+    assert!(concrete_polls > 0);
+
+    let mut dyn_polls = 0_usize;
+    let mut dyn_cb = || {
+        dyn_polls += 1;
+        false
+    };
+    let cancel_dyn: &mut dyn FnMut() -> bool = &mut dyn_cb;
+    let parsed_dyn = read_index_cancellable(&mut Cursor::new(&bytes), len, &policy, cancel_dyn)?;
+    assert_eq!(parsed_dyn.tensors["weight"].bytes, 4);
+    assert!(dyn_polls > 0);
+    Ok(())
+}

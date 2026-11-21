@@ -222,18 +222,18 @@ pub struct ParsedIndex {
     pub tensors: BTreeMap<String, IndexedTensor>,
 }
 
-struct StreamReader<'a, R> {
+struct StreamReader<'a, R, C: ?Sized> {
     reader: BufReader<&'a mut R>,
     position: u64,
     file_bytes: u64,
     remaining_budget: usize,
     retained_string_array_bytes: usize,
     policy: &'a IndexPolicy<'a>,
-    cancel: &'a mut dyn FnMut() -> bool,
+    cancel: &'a mut C,
     scratch: Vec<u8>,
 }
 
-impl<R: Read + Seek> StreamReader<'_, R> {
+impl<R: Read + Seek, C: FnMut() -> bool + ?Sized> StreamReader<'_, R, C> {
     fn charge(&mut self, bytes: usize) -> io::Result<()> {
         self.remaining_budget = self
             .remaining_budget
@@ -713,7 +713,7 @@ pub fn read_index_cancellable<R: Read + Seek>(
     source: &mut R,
     file_bytes: u64,
     policy: &IndexPolicy<'_>,
-    cancel: &mut dyn FnMut() -> bool,
+    cancel: &mut (impl FnMut() -> bool + ?Sized),
 ) -> io::Result<ParsedIndex> {
     check_cancel(cancel)?;
     if !(MIN_HEADER_BYTES..=policy.max_file_bytes).contains(&file_bytes) {

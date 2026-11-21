@@ -60,19 +60,18 @@ impl Write for Transcript {
         if self.finished {
             return Err(io::Error::other("backend transcript is already finalized"));
         }
-        if self.spill.is_none() && bytes.len() <= MEMORY_BYTES - self.memory.len() {
+        let output = if let Some(output) = &mut self.spill {
+            output
+        } else if bytes.len() <= MEMORY_BYTES - self.memory.len() {
             self.memory.extend_from_slice(bytes);
+            return Ok(bytes.len());
         } else {
-            if self.spill.is_none() {
-                let mut output = BufWriter::new(File::create(&self.path)?);
-                output.write_all(&self.memory)?;
-                self.memory.clear();
-                self.spill = Some(output);
-            }
-            if let Some(output) = &mut self.spill {
-                output.write_all(bytes)?;
-            }
-        }
+            let mut output = BufWriter::new(File::create(&self.path)?);
+            output.write_all(&self.memory)?;
+            self.memory.clear();
+            self.spill.insert(output)
+        };
+        output.write_all(bytes)?;
         Ok(bytes.len())
     }
 

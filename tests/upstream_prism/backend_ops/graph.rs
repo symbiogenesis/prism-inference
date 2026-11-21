@@ -248,7 +248,7 @@ pub(super) struct Plan<'a> {
     pub(super) contexts_current: bool,
     pub(super) graphs: BTreeMap<u32, Json>,
     scalars: BTreeMap<u32, Value>,
-    shape_queries: BTreeMap<(String, u32), Value>,
+    shape_queries: BTreeMap<(&'static str, u32), Value>,
     next_context: u32,
     next_backend: u32,
     next_tensor: u32,
@@ -383,13 +383,12 @@ impl<'a> Plan<'a> {
         // initializer loops. Retain the actual typed production observation
         // until a metadata mutation, rather than emitting the same native
         // query hundreds of thousands of times and exhausting the action cap.
-        let shape_key = if matches!(name, "ggml_nelements" | "ggml_nrows") {
-            match values.first() {
-                Some(Value::Handle(Handle::Tensor(id))) => Some((name.to_owned(), *id)),
-                _ => None,
+        let shape_key = match (name, values.first()) {
+            ("ggml_nelements", Some(Value::Handle(Handle::Tensor(id)))) => {
+                Some(("ggml_nelements", *id))
             }
-        } else {
-            None
+            ("ggml_nrows", Some(Value::Handle(Handle::Tensor(id)))) => Some(("ggml_nrows", *id)),
+            _ => None,
         };
         if let Some(value) = shape_key
             .as_ref()
@@ -437,7 +436,7 @@ impl<'a> Plan<'a> {
                     .as_u64()
                     .ok_or_else(|| invalid("shape query scalar is missing"))?,
             )?;
-            let observed = self.observe_scalar(id)?;
+            let observed = self.observe_scalar(id)?.clone();
             self.shape_queries.insert(key, observed.clone());
             return Ok(observed);
         }
@@ -473,20 +472,20 @@ impl<'a> Plan<'a> {
             .ok_or_else(|| invalid("source tensor handle is absent from production contexts"))
     }
 
-    pub(super) fn observe_scalar(&mut self, id: u32) -> Result<Value> {
-        if !self.scalars.contains_key(&id) {
-            self.push(json!({"Op":"scalar","Scalar":id,"Release":true}));
-            let _ = self.flush()?;
+    pub(super) fn observe_scalar(&mut self, id: u32) -> Result<&Value> {
+        if let Some(value) = self.scalars.get(&id) {
+            return Ok(value);
         }
+        self.push(json!({"Op":"scalar","Scalar":id,"Release":true}));
+        let _ = self.flush()?;
         self.scalars
             .get(&id)
-            .cloned()
             .ok_or_else(|| invalid("source scalar handle observation is missing"))
     }
 
     pub(super) fn resolve_integer(&mut self, value: &Json) -> Result<Value> {
         if let Some(id) = value.get("Scalar").and_then(Json::as_u64) {
-            return self.observe_scalar(u32::try_from(id)?);
+            return Ok(self.observe_scalar(u32::try_from(id)?)?.clone());
         }
         if let Some(field) = value.get("TensorField") {
             let tensor = self.tensor(u32::try_from(

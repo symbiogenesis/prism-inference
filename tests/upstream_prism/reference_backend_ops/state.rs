@@ -136,17 +136,17 @@ impl BackendState {
     }
 
     pub(super) fn tensor(&self, id: u32) -> Result<&TensorMeta> {
-        let cid = self.canonical_id(id)?;
+        let cid = self.aliases.get(&id).copied().unwrap_or(id);
         self.tensors
             .get(&cid)
-            .ok_or_else(|| invalid(format!("missing tensor {cid}")))
+            .ok_or_else(|| invalid(format!("unknown tensor id {id}")))
     }
 
     pub(super) fn tensor_mut(&mut self, id: u32) -> Result<&mut TensorMeta> {
-        let cid = self.canonical_id(id)?;
+        let cid = self.aliases.get(&id).copied().unwrap_or(id);
         self.tensors
             .get_mut(&cid)
-            .ok_or_else(|| invalid(format!("missing tensor {cid}")))
+            .ok_or_else(|| invalid(format!("unknown tensor id {id}")))
     }
 
     pub(super) fn register_alias(&mut self, existing: u32, alias: u32) -> Result<()> {

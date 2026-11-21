@@ -152,21 +152,18 @@ impl<'a, 'b> Production<'a, 'b> {
         }
     }
 
-    fn feature_info(&mut self, id: u32) -> Result<Json> {
-        if !self.features.contains_key(&id) {
-            self.graph
-                .push(json!({"Op":"backend-features","Backend":id}));
-            let values = self.graph.flush()?;
-            let observed = values
-                .last()
-                .ok_or_else(|| invalid("production backend features observation missing"))?
-                .clone();
-            self.features.insert(id, observed);
+    fn feature_info(&mut self, id: u32) -> Result<&Json> {
+        if let Some(features) = self.features.get(&id) {
+            return Ok(features);
         }
-        self.features
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| invalid("production backend features not retained"))
+        self.graph
+            .push(json!({"Op":"backend-features","Backend":id}));
+        let values = self.graph.flush()?;
+        let observed = values
+            .into_iter()
+            .next_back()
+            .ok_or_else(|| invalid("production backend features observation missing"))?;
+        Ok(self.features.entry(id).or_insert(observed))
     }
 
     pub(super) fn add_sentinel(&mut self, context: u32) -> Result<()> {

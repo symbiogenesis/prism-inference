@@ -848,15 +848,13 @@ impl CompiledRegex {
     }
 
     fn match_regex(&mut self) -> Result<&Regex> {
-        if self.full_match.is_none() {
-            let anchored = format!(r"\A(?:{})\z", self.raw_translated);
-            let compiled = Regex::new(&anchored)
-                .map_err(|err| invalid(format!("invalid anchored regex: {err}")))?;
-            self.full_match = Some(compiled);
+        if let Some(regex) = self.full_match.as_ref() {
+            return Ok(regex);
         }
-        self.full_match
-            .as_ref()
-            .ok_or_else(|| invalid("missing compiled full-match regex"))
+        let anchored = format!(r"\A(?:{})\z", self.raw_translated);
+        let compiled = Regex::new(&anchored)
+            .map_err(|err| invalid(format!("invalid anchored regex: {err}")))?;
+        Ok(self.full_match.insert(compiled))
     }
 }
 
@@ -868,15 +866,14 @@ fn execute_chat_regex(op: &Value) -> Result<Value> {
     let mut trace = Vec::new();
     for action in array(op, "Actions")? {
         let pat_idx = usize::try_from(int_bound(field(action, "Pattern")?, 0, 127)?)?;
-        if compiled[pat_idx].is_none() {
+        let re = if let Some(re) = compiled[pat_idx].as_mut() {
+            re
+        } else {
             let pat_str = raw_patterns[pat_idx]
                 .as_str()
                 .ok_or_else(|| invalid("regex pattern must be string"))?;
-            compiled[pat_idx] = Some(CompiledRegex::compile(pat_str)?);
-        }
-        let re = compiled[pat_idx]
-            .as_mut()
-            .ok_or_else(|| invalid("regex pattern missing"))?;
+            compiled[pat_idx].insert(CompiledRegex::compile(pat_str)?)
+        };
         let input_bytes = decode_bytes(field(action, "Bytes")?)?;
         let func = field(action, "Function")?
             .as_str()
@@ -6124,18 +6121,15 @@ impl ChatTraceState {
         let applied = self
             .applied
             .as_ref()
-            .ok_or_else(|| ("runtime", "chat parse requires apply".to_owned()))?
-            .clone();
+            .ok_or_else(|| ("runtime", "chat parse requires apply".to_owned()))?;
 
-        if self.cached_arena.is_none() {
+        let arena = if let Some(arena) = self.cached_arena.as_ref() {
+            arena
+        } else {
             let loaded = ChatArena::from_json_str(&applied.parser)
                 .map_err(|e| ("runtime", e.to_string()))?;
-            self.cached_arena = Some(loaded);
-        }
-        let arena = self
-            .cached_arena
-            .as_ref()
-            .ok_or_else(|| ("runtime", "missing cached chat arena".to_owned()))?;
+            self.cached_arena.insert(loaded)
+        };
 
         let safe_len = safe_utf8_prefix(input);
         let invalid_mid_utf8 = std::str::from_utf8(&input[..safe_len]).is_err();

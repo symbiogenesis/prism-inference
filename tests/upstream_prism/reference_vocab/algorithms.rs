@@ -2,8 +2,10 @@
 //!
 //! No `bonsai_prism_runtime` or external tokenizer reference crates are imported or called.
 
+use std::borrow::Borrow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::hash::{Hash, Hasher};
 
 use super::super::{Result, invalid};
 use super::gguf::MetaValue;
@@ -75,6 +77,66 @@ struct TokenEntry {
 type SpmHeap = BinaryHeap<(ScoreKey, Reverse<usize>, usize, usize, u64, u64)>;
 type BpeHeap = BinaryHeap<Reverse<(usize, usize, usize, usize, u64, u64)>>;
 
+struct MergePair(Box<[u8]>, Box<[u8]>);
+
+trait MergePairKey {
+    fn parts(&self) -> (&[u8], &[u8]);
+}
+
+impl MergePairKey for MergePair {
+    fn parts(&self) -> (&[u8], &[u8]) {
+        (&self.0, &self.1)
+    }
+}
+
+struct MergePairLookup<'a>(&'a [u8], &'a [u8]);
+
+impl MergePairKey for MergePairLookup<'_> {
+    fn parts(&self) -> (&[u8], &[u8]) {
+        (self.0, self.1)
+    }
+}
+
+impl MergePairLookup<'_> {
+    const fn as_key(&self) -> &(dyn MergePairKey + '_) {
+        self
+    }
+}
+
+impl<'a> Borrow<dyn MergePairKey + 'a> for MergePair {
+    fn borrow(&self) -> &(dyn MergePairKey + 'a) {
+        self
+    }
+}
+
+impl PartialEq for MergePair {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for MergePair {}
+
+impl Hash for MergePair {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl PartialEq for dyn MergePairKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn MergePairKey + '_ {}
+
+impl Hash for dyn MergePairKey + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
 /// Clean-room independent GGUF vocabulary model and tokenizer.
 #[expect(
     clippy::struct_excessive_bools,
@@ -89,7 +151,7 @@ pub(in super::super) struct ReferenceVocab {
     pre_type: String,
     entries: Vec<TokenEntry>,
     token_to_id: HashMap<Vec<u8>, i32>,
-    merges: HashMap<(Vec<u8>, Vec<u8>), usize>,
+    merges: HashMap<MergePair, usize>,
     pre_patterns: Vec<Regex>,
     gpt_alphabet: [String; 256],
     gpt_char_to_byte: Vec<(char, u8)>,
@@ -248,7 +310,7 @@ impl ReferenceVocab {
                     .map_err(|_| invalid("vocabulary merge rule is not valid UTF-8"))?;
                 if let Some((left, right)) = s.split_once(' ') {
                     merges
-                        .entry((left.as_bytes().to_vec(), right.as_bytes().to_vec()))
+                        .entry(MergePair(left.as_bytes().into(), right.as_bytes().into()))
                         .or_insert(rank);
                 }
             }
@@ -889,7 +951,7 @@ impl ReferenceVocab {
     ) {
         if let Some(&rank) = self
             .merges
-            .get(&(sym_bytes[left].clone(), sym_bytes[right].clone()))
+            .get(MergePairLookup(&sym_bytes[left], &sym_bytes[right]).as_key())
         {
             heap.push(Reverse((rank, left, right, 0, rev[left], rev[right])));
         }

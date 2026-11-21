@@ -1086,15 +1086,14 @@ struct PatternParser<'a> {
 }
 
 impl PatternParser<'_> {
-    fn subrule(&mut self, rule: &str) -> String {
+    fn subrule(&mut self, rule: &str) -> &str {
         if let Some(existing) = self.subrules.get(rule) {
-            return existing.clone();
+            return existing;
         }
         let assigned = self
             .converter
             .add(&format!("{}-{}", self.name, self.subrules.len() + 1), rule);
-        self.subrules.insert(rule.to_owned(), assigned.clone());
-        assigned
+        self.subrules.entry(rule.to_owned()).or_insert(assigned)
     }
 
     #[expect(
@@ -1200,10 +1199,11 @@ impl PatternParser<'_> {
                         _ => return Err(PatternError::Unsupported),
                     };
                     let piece = sequence.last_mut().ok_or(PatternError::Invalid)?;
-                    if !piece.1 {
-                        piece.0 = self.subrule(&piece.0);
-                    }
-                    piece.0 = repetition(&piece_to_rule(piece), minimum, maximum, "");
+                    piece.0 = if piece.1 {
+                        repetition(&piece_to_rule(piece), minimum, maximum, "")
+                    } else {
+                        repetition(self.subrule(&piece.0), minimum, maximum, "")
+                    };
                     piece.1 = false;
                 }
                 _ => {
@@ -1955,10 +1955,9 @@ impl SchemaGrammarContext {
     /// Merges externally emitted GBNF rules before generating schema rules.
     pub(super) fn merge_rules(&mut self, rules: &BTreeMap<String, String>) {
         for (name, body) in rules {
-            self.converter
-                .rules
-                .entry(name.clone())
-                .or_insert_with(|| body.clone());
+            if !self.converter.rules.contains_key(name) {
+                self.converter.rules.insert(name.clone(), body.clone());
+            }
         }
     }
 

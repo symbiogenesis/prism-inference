@@ -557,7 +557,7 @@ struct JsonIdFields<'a> {
 pub(super) struct ChatPegBuilder {
     inner: ParserBuilder,
     schemas: BTreeMap<ParserId, SchemaSpec>,
-    permute_cache: BTreeMap<(String, usize), ParserId>,
+    permute_cache: BTreeMap<String, BTreeMap<usize, ParserId>>,
 }
 
 impl ChatPegBuilder {
@@ -726,7 +726,11 @@ impl ChatPegBuilder {
     }
 
     fn build_permute_mask(&mut self, prefix: &str, children: &[ParserId], mask: usize) -> ParserId {
-        if let Some(&cached) = self.permute_cache.get(&(prefix.to_owned(), mask)) {
+        if let Some(&cached) = self
+            .permute_cache
+            .get(prefix)
+            .and_then(|by_mask| by_mask.get(&mask))
+        {
             return cached;
         }
         let body = if mask.is_power_of_two() {
@@ -751,7 +755,12 @@ impl ChatPegBuilder {
         };
         let rule_name = format!("{prefix}-{mask}");
         let id = self.inner.rule(&rule_name, body, false);
-        self.permute_cache.insert((prefix.to_owned(), mask), id);
+        if let Some(by_mask) = self.permute_cache.get_mut(prefix) {
+            by_mask.insert(mask, id);
+        } else {
+            self.permute_cache
+                .insert(prefix.to_owned(), BTreeMap::from([(mask, id)]));
+        }
         id
     }
 
@@ -1700,9 +1709,9 @@ impl ChatArena {
                     .add_schema(&spec.name, &spec.schema, spec.raw)
                     .map_err(invalid)?;
                 for (name, body) in schema_ctx.rules() {
-                    existing_rules
-                        .entry(name.clone())
-                        .or_insert_with(|| body.clone());
+                    if !existing_rules.contains_key(name) {
+                        existing_rules.insert(name.clone(), body.clone());
+                    }
                 }
                 Ok(Some(root_symbol))
             })

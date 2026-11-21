@@ -54,16 +54,16 @@ struct CompositeCore {
 impl CompositeCore {
     fn new(
         plan: &HeterogeneousPlacementPlan,
-        npu: &dyn Pq2ProjectionExecutor,
-        gpu: &dyn Pq2ProjectionExecutor,
+        npu_identity: &str,
+        gpu_identity: &str,
     ) -> Result<Self> {
         if plan.cpu_layers != 0
             || plan.total_layers == 0
             || plan.npu_layers + plan.gpu_layers != plan.total_layers
             || plan.layers.len() != plan.total_layers
             || !valid_component_identity(&plan.identity)
-            || !valid_component_identity(npu.identity())
-            || !valid_component_identity(gpu.identity())
+            || !valid_component_identity(npu_identity)
+            || !valid_component_identity(gpu_identity)
         {
             return Err(invalid("invalid composite projection placement"));
         }
@@ -71,7 +71,7 @@ impl CompositeCore {
         digest.update(b"prism-composite-projection-v1\0")?;
         digest.update(&u64::try_from(plan.npu_layers)?.to_le_bytes())?;
         digest.update(&u64::try_from(plan.total_layers)?.to_le_bytes())?;
-        for component in [plan.identity.as_str(), npu.identity(), gpu.identity()] {
+        for component in [plan.identity.as_str(), npu_identity, gpu_identity] {
             digest.update(&u64::try_from(component.len())?.to_le_bytes())?;
             digest.update(component.as_bytes())?;
         }
@@ -126,569 +126,18 @@ impl CompositeCore {
         }
     }
 
-    fn finish_dispatch(
+    fn finish_dispatch<T>(
         &mut self,
         target: RouteTarget,
         count: u64,
-        result: Result<()>,
-    ) -> Result<()> {
+        result: Result<T>,
+    ) -> Result<T> {
         match result {
-            Ok(()) => {
+            Ok(value) => {
                 self.record_success(target, count);
-                Ok(())
+                Ok(value)
             }
             Err(error) => {
-                self.telemetry.faulted = true;
-                Err(error)
-            }
-        }
-    }
-
-    fn operation_capacity(
-        &self,
-        npu: &dyn Pq2ProjectionExecutor,
-        gpu: &dyn Pq2ProjectionExecutor,
-    ) -> Option<u64> {
-        if self.telemetry.faulted {
-            Some(0)
-        } else {
-            npu.operation_capacity()
-                .zip(gpu.operation_capacity())
-                .and_then(|(left, right)| left.checked_add(right))
-        }
-    }
-
-    fn operation_count(
-        &self,
-        npu: &dyn Pq2ProjectionExecutor,
-        gpu: &dyn Pq2ProjectionExecutor,
-        tensor: &Tensor,
-    ) -> Option<u64> {
-        match self.single_target(&tensor.name)? {
-            RouteTarget::Npu => npu.operation_count(tensor),
-            RouteTarget::Gpu => gpu.operation_count(tensor),
-        }
-    }
-
-    fn supports_tile_tokens(
-        &self,
-        npu: &dyn Pq2ProjectionExecutor,
-        gpu: &dyn Pq2ProjectionExecutor,
-    ) -> bool {
-        !self.telemetry.faulted
-            && (self.plan_npu_layers == 0 || npu.supports_tile_tokens())
-            && (self.plan_npu_layers == self.plan_total_layers || gpu.supports_tile_tokens())
-    }
-
-    fn query_single(
-        &self,
-        npu: &dyn Pq2ProjectionExecutor,
-        gpu: &dyn Pq2ProjectionExecutor,
-        tensor: &Tensor,
-        check: impl Fn(&dyn Pq2ProjectionExecutor) -> bool,
-    ) -> bool {
-        match self.single_target(&tensor.name) {
-            Some(RouteTarget::Npu) => check(npu),
-            Some(RouteTarget::Gpu) => check(gpu),
-            None => false,
-        }
-    }
-
-    fn query_group(
-        &self,
-        npu: &dyn Pq2ProjectionExecutor,
-        gpu: &dyn Pq2ProjectionExecutor,
-        tensors: &[&Tensor],
-        check: impl Fn(&dyn Pq2ProjectionExecutor) -> bool,
-    ) -> bool {
-        match self.group_target(tensors) {
-            Some(RouteTarget::Npu) => check(npu),
-            Some(RouteTarget::Gpu) => check(gpu),
-            None => false,
-        }
-    }
-
-    fn project(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensor: &Tensor,
-        activation: &[Q8KBlock],
-        fused: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        output.clear();
-        if !self.query_single(npu, gpu, tensor, |exec| exec.supports(tensor)) {
-            return Err(invalid("unavailable composite Q8_K projection placement"));
-        }
-        let target = self
-            .route(&tensor.name)
-            .ok_or_else(|| invalid("missing composite layer target"))?;
-        let result = match target {
-            RouteTarget::Npu => npu.project(tensor, activation, fused, output),
-            RouteTarget::Gpu => gpu.project(tensor, activation, fused, output),
-        };
-        if result.is_err() {
-            output.clear();
-        }
-        self.finish_dispatch(target, 1, result)
-    }
-
-    fn project_q8(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensor: &Tensor,
-        activation: &[Q8Block],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        output.clear();
-        if !self.query_single(npu, gpu, tensor, |exec| exec.supports_q8(tensor)) {
-            return Err(invalid("unavailable composite Q8_0 projection placement"));
-        }
-        let target = self
-            .route(&tensor.name)
-            .ok_or_else(|| invalid("missing composite layer target"))?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_q8(tensor, activation, pinned, output),
-            RouteTarget::Gpu => gpu.project_q8(tensor, activation, pinned, output),
-        };
-        if result.is_err() {
-            output.clear();
-        }
-        self.finish_dispatch(target, 1, result)
-    }
-
-    fn project_f32(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensor: &Tensor,
-        activation: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        output.clear();
-        if !self.query_single(npu, gpu, tensor, |exec| exec.supports_f32(tensor)) {
-            return Err(invalid("unavailable composite F32 projection placement"));
-        }
-        let target = self
-            .route(&tensor.name)
-            .ok_or_else(|| invalid("missing composite layer target"))?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_f32(tensor, activation, pinned, output),
-            RouteTarget::Gpu => gpu.project_f32(tensor, activation, pinned, output),
-        };
-        if result.is_err() {
-            output.clear();
-        }
-        self.finish_dispatch(target, 1, result)
-    }
-
-    fn project_f32_group(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensors: &[&Tensor],
-        activation: &[f32],
-        pinned: bool,
-        outputs: &mut [&mut Vec<f32>],
-    ) -> Result<()> {
-        for output in outputs.iter_mut() {
-            output.clear();
-        }
-        if !self.query_group(npu, gpu, tensors, |exec| exec.supports_f32_group(tensors)) {
-            return Err(invalid(
-                "unavailable composite F32 group projection placement",
-            ));
-        }
-        let target = self
-            .group_target(tensors)
-            .ok_or_else(|| invalid("missing composite group target"))?;
-        let count = u64::try_from(tensors.len())?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_f32_group(tensors, activation, pinned, outputs),
-            RouteTarget::Gpu => gpu.project_f32_group(tensors, activation, pinned, outputs),
-        };
-        if result.is_err() {
-            for output in outputs.iter_mut() {
-                output.clear();
-            }
-        }
-        self.finish_dispatch(target, count, result)
-    }
-
-    fn project_f32_tokens(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensor: &Tensor,
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> Result<()> {
-        clear_vec_slice(outputs);
-        if activations.len() != outputs.len() {
-            return Err(invalid("mismatched F32 token projection outputs"));
-        }
-        if !self.query_single(npu, gpu, tensor, |exec| exec.supports_f32(tensor)) {
-            return Err(invalid(
-                "unavailable composite F32 token projection placement",
-            ));
-        }
-        let target = self
-            .route(&tensor.name)
-            .ok_or_else(|| invalid("missing composite layer target"))?;
-        let count = u64::try_from(activations.len())?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_f32_tokens(tensor, activations, pinned, outputs),
-            RouteTarget::Gpu => gpu.project_f32_tokens(tensor, activations, pinned, outputs),
-        };
-        if result.is_err() {
-            clear_vec_slice(outputs);
-        }
-        self.finish_dispatch(target, count, result)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep shared pair token projection arguments matching Pq2ProjectionExecutor."
-    )]
-    fn project_f32_pair_tokens(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensors: [&Tensor; 2],
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs_a: &mut [Vec<f32>],
-        outputs_b: &mut [Vec<f32>],
-    ) -> Result<()> {
-        clear_vec_slice(outputs_a);
-        clear_vec_slice(outputs_b);
-        if activations.len() != outputs_a.len() || activations.len() != outputs_b.len() {
-            return Err(invalid("mismatched F32 pair token projection outputs"));
-        }
-        if !self.query_group(npu, gpu, &tensors, |exec| exec.supports_f32_group(&tensors)) {
-            return Err(invalid(
-                "unavailable composite F32 pair token projection placement",
-            ));
-        }
-        let target = self
-            .group_target(&tensors)
-            .ok_or_else(|| invalid("missing composite pair group target"))?;
-        let count = u64::try_from(activations.len().saturating_mul(2))?;
-        let result = match target {
-            RouteTarget::Npu => {
-                npu.project_f32_pair_tokens(tensors, activations, pinned, outputs_a, outputs_b)
-            }
-            RouteTarget::Gpu => {
-                gpu.project_f32_pair_tokens(tensors, activations, pinned, outputs_a, outputs_b)
-            }
-        };
-        if result.is_err() {
-            clear_vec_slice(outputs_a);
-            clear_vec_slice(outputs_b);
-        }
-        self.finish_dispatch(target, count, result)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep shared triple token projection arguments matching Pq2ProjectionExecutor."
-    )]
-    fn project_f32_triple_tokens(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensors: [&Tensor; 3],
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs_a: &mut [Vec<f32>],
-        outputs_b: &mut [Vec<f32>],
-        outputs_c: &mut [Vec<f32>],
-    ) -> Result<()> {
-        clear_vec_slice(outputs_a);
-        clear_vec_slice(outputs_b);
-        clear_vec_slice(outputs_c);
-        if activations.len() != outputs_a.len()
-            || activations.len() != outputs_b.len()
-            || activations.len() != outputs_c.len()
-        {
-            return Err(invalid("mismatched F32 triple token projection outputs"));
-        }
-        if !self.query_group(npu, gpu, &tensors, |exec| exec.supports_f32_group(&tensors)) {
-            return Err(invalid(
-                "unavailable composite F32 triple token projection placement",
-            ));
-        }
-        let target = self
-            .group_target(&tensors)
-            .ok_or_else(|| invalid("missing composite triple group target"))?;
-        let count = u64::try_from(activations.len().saturating_mul(3))?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_f32_triple_tokens(
-                tensors,
-                activations,
-                pinned,
-                outputs_a,
-                outputs_b,
-                outputs_c,
-            ),
-            RouteTarget::Gpu => gpu.project_f32_triple_tokens(
-                tensors,
-                activations,
-                pinned,
-                outputs_a,
-                outputs_b,
-                outputs_c,
-            ),
-        };
-        if result.is_err() {
-            clear_vec_slice(outputs_a);
-            clear_vec_slice(outputs_b);
-            clear_vec_slice(outputs_c);
-        }
-        self.finish_dispatch(target, count, result)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep FFN SwiGLU routing parameters aligned with Pq2ProjectionExecutor."
-    )]
-    fn project_f32_ffn_swiglu(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        gate: &Tensor,
-        up: &Tensor,
-        activation: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        output.clear();
-        if !self.query_group(npu, gpu, &[gate, up], |exec| {
-            exec.supports_f32_ffn_swiglu(gate, up)
-        }) {
-            return Err(invalid("unavailable composite F32 FFN SwiGLU placement"));
-        }
-        let target = self
-            .group_target(&[gate, up])
-            .ok_or_else(|| invalid("missing composite FFN SwiGLU target"))?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_f32_ffn_swiglu(gate, up, activation, pinned, output),
-            RouteTarget::Gpu => gpu.project_f32_ffn_swiglu(gate, up, activation, pinned, output),
-        };
-        if result.is_err() {
-            output.clear();
-        }
-        self.finish_dispatch(target, 2, result)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep FFN SwiGLU token routing parameters aligned with Pq2ProjectionExecutor."
-    )]
-    fn project_f32_ffn_swiglu_tokens(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        gate: &Tensor,
-        up: &Tensor,
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> Result<()> {
-        clear_vec_slice(outputs);
-        if activations.len() != outputs.len() {
-            return Err(invalid(
-                "mismatched F32 FFN SwiGLU token projection outputs",
-            ));
-        }
-        if !self.query_group(npu, gpu, &[gate, up], |exec| {
-            exec.supports_f32_ffn_swiglu(gate, up)
-        }) {
-            return Err(invalid(
-                "unavailable composite F32 FFN SwiGLU token placement",
-            ));
-        }
-        let target = self
-            .group_target(&[gate, up])
-            .ok_or_else(|| invalid("missing composite FFN SwiGLU target"))?;
-        let count = u64::try_from(activations.len().saturating_mul(2))?;
-        let result = match target {
-            RouteTarget::Npu => {
-                npu.project_f32_ffn_swiglu_tokens(gate, up, activations, pinned, outputs)
-            }
-            RouteTarget::Gpu => {
-                gpu.project_f32_ffn_swiglu_tokens(gate, up, activations, pinned, outputs)
-            }
-        };
-        if result.is_err() {
-            clear_vec_slice(outputs);
-        }
-        self.finish_dispatch(target, count, result)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep FFN chain routing parameters aligned with Pq2ProjectionExecutor."
-    )]
-    fn project_f32_ffn_chain(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensors: [&Tensor; 3],
-        activation: &[f32],
-        residual: Option<&[f32]>,
-        hadamard_block_size: Option<u32>,
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        output.clear();
-        if !self.query_group(npu, gpu, &tensors, |exec| {
-            exec.supports_f32_ffn_chain(tensors)
-        }) {
-            return Err(invalid("unavailable composite F32 FFN chain placement"));
-        }
-        let target = self
-            .group_target(&tensors)
-            .ok_or_else(|| invalid("missing composite FFN chain target"))?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_f32_ffn_chain(
-                tensors,
-                activation,
-                residual,
-                hadamard_block_size,
-                pinned,
-                output,
-            ),
-            RouteTarget::Gpu => gpu.project_f32_ffn_chain(
-                tensors,
-                activation,
-                residual,
-                hadamard_block_size,
-                pinned,
-                output,
-            ),
-        };
-        if result.is_err() {
-            output.clear();
-        }
-        self.finish_dispatch(target, 3, result)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep FFN chain token routing parameters aligned with Pq2ProjectionExecutor."
-    )]
-    fn project_f32_ffn_chain_tokens(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensors: [&Tensor; 3],
-        activations: &[Vec<f32>],
-        residuals: Option<&[Vec<f32>]>,
-        hadamard_block_size: Option<u32>,
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> Result<()> {
-        clear_vec_slice(outputs);
-        if activations.len() != outputs.len()
-            || residuals.is_some_and(|res| res.len() != activations.len())
-        {
-            return Err(invalid("mismatched F32 FFN chain token projection outputs"));
-        }
-        if !self.query_group(npu, gpu, &tensors, |exec| {
-            exec.supports_f32_ffn_chain(tensors)
-        }) {
-            return Err(invalid(
-                "unavailable composite F32 FFN chain token placement",
-            ));
-        }
-        let target = self
-            .group_target(&tensors)
-            .ok_or_else(|| invalid("missing composite FFN chain target"))?;
-        let count = u64::try_from(activations.len().saturating_mul(3))?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_f32_ffn_chain_tokens(
-                tensors,
-                activations,
-                residuals,
-                hadamard_block_size,
-                pinned,
-                outputs,
-            ),
-            RouteTarget::Gpu => gpu.project_f32_ffn_chain_tokens(
-                tensors,
-                activations,
-                residuals,
-                hadamard_block_size,
-                pinned,
-                outputs,
-            ),
-        };
-        if result.is_err() {
-            clear_vec_slice(outputs);
-        }
-        self.finish_dispatch(target, count, result)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep FFN chain LoRA routing parameters aligned with Pq2ProjectionExecutor."
-    )]
-    fn project_f32_ffn_chain_lora(
-        &mut self,
-        npu: &mut dyn Pq2ProjectionExecutor,
-        gpu: &mut dyn Pq2ProjectionExecutor,
-        tensors: [&Tensor; 3],
-        activation: &[f32],
-        residual: Option<&[f32]>,
-        hadamard_block_size: Option<u32>,
-        lora_a: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<f32> {
-        output.clear();
-        if !self.query_group(npu, gpu, &tensors, |exec| {
-            exec.supports_f32_ffn_chain_lora(tensors)
-        }) {
-            return Err(invalid(
-                "unavailable composite F32 FFN chain LoRA placement",
-            ));
-        }
-        let target = self
-            .group_target(&tensors)
-            .ok_or_else(|| invalid("missing composite FFN chain LoRA target"))?;
-        let result = match target {
-            RouteTarget::Npu => npu.project_f32_ffn_chain_lora(
-                tensors,
-                activation,
-                residual,
-                hadamard_block_size,
-                lora_a,
-                pinned,
-                output,
-            ),
-            RouteTarget::Gpu => gpu.project_f32_ffn_chain_lora(
-                tensors,
-                activation,
-                residual,
-                hadamard_block_size,
-                lora_a,
-                pinned,
-                output,
-            ),
-        };
-        match result {
-            Ok(dot) => {
-                self.record_success(target, 3);
-                Ok(dot)
-            }
-            Err(error) => {
-                output.clear();
                 self.telemetry.faulted = true;
                 Err(error)
             }
@@ -702,35 +151,13 @@ fn clear_vec_slice(outputs: &mut [Vec<f32>]) {
     }
 }
 
-/// Strict two-processor [`Pq2ProjectionExecutor`] dispatching prefix layers to NPU
-/// and overflow layers to GPU according to a [`HeterogeneousPlacementPlan`].
-pub struct CompositeProjectionExecutor<'a> {
-    core: CompositeCore,
-    npu: &'a mut dyn Pq2ProjectionExecutor,
-    gpu: &'a mut dyn Pq2ProjectionExecutor,
-}
-
-impl<'a> CompositeProjectionExecutor<'a> {
-    /// Construct a composite NPU + GPU executor from an explicit placement plan.
-    ///
-    /// # Errors
-    /// Rejects plans with non-zero CPU layers, empty/inconsistent layer tables, or
-    /// invalid child executor identities.
-    pub fn new(
-        plan: &HeterogeneousPlacementPlan,
-        npu: &'a mut dyn Pq2ProjectionExecutor,
-        gpu: &'a mut dyn Pq2ProjectionExecutor,
-    ) -> Result<Self> {
-        let core = CompositeCore::new(plan, npu, gpu)?;
-        Ok(Self { core, npu, gpu })
-    }
-
-    /// Snapshot cumulative NPU/GPU projection counts and latched fault status.
-    #[must_use]
-    pub const fn telemetry(&self) -> CompositeTelemetry {
-        self.core.telemetry
-    }
-}
+/// Strict two-processor [`Pq2ProjectionExecutor`] dispatching prefix layers to a borrowed
+/// NPU executor and overflow layers to a borrowed GPU executor according to a
+/// [`HeterogeneousPlacementPlan`].
+pub type CompositeProjectionExecutor<'a> = OwnedCompositeProjectionExecutor<
+    &'a mut dyn Pq2ProjectionExecutor,
+    &'a mut dyn Pq2ProjectionExecutor,
+>;
 
 /// Owned strict two-processor [`Pq2ProjectionExecutor`] dispatching prefix layers
 /// to an owned NPU executor and overflow layers to an owned GPU executor.
@@ -747,7 +174,7 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> OwnedCompositeProjectio
     /// Rejects plans with non-zero CPU layers, empty/inconsistent layer tables, or
     /// invalid child executor identities.
     pub fn new(plan: &HeterogeneousPlacementPlan, npu: N, gpu: G) -> Result<Self> {
-        let core = CompositeCore::new(plan, &npu, &gpu)?;
+        let core = CompositeCore::new(plan, npu.identity(), gpu.identity())?;
         Ok(Self { core, npu, gpu })
     }
 
@@ -755,255 +182,6 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> OwnedCompositeProjectio
     #[must_use]
     pub const fn telemetry(&self) -> CompositeTelemetry {
         self.core.telemetry
-    }
-}
-
-impl Pq2ProjectionExecutor for CompositeProjectionExecutor<'_> {
-    fn identity(&self) -> &str {
-        &self.core.identity
-    }
-
-    fn operation_capacity(&self) -> Option<u64> {
-        self.core.operation_capacity(self.npu, self.gpu)
-    }
-
-    fn operation_count(&self, tensor: &Tensor) -> Option<u64> {
-        self.core.operation_count(self.npu, self.gpu, tensor)
-    }
-
-    fn supports(&self, tensor: &Tensor) -> bool {
-        self.core
-            .query_single(self.npu, self.gpu, tensor, |exec| exec.supports(tensor))
-    }
-
-    fn supports_q8(&self, tensor: &Tensor) -> bool {
-        self.core
-            .query_single(self.npu, self.gpu, tensor, |exec| exec.supports_q8(tensor))
-    }
-
-    fn supports_f32(&self, tensor: &Tensor) -> bool {
-        self.core
-            .query_single(self.npu, self.gpu, tensor, |exec| exec.supports_f32(tensor))
-    }
-
-    fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
-        self.core.query_group(self.npu, self.gpu, tensors, |exec| {
-            exec.supports_f32_group(tensors)
-        })
-    }
-
-    fn project(
-        &mut self,
-        tensor: &Tensor,
-        activation: &[Q8KBlock],
-        fused: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        self.core
-            .project(self.npu, self.gpu, tensor, activation, fused, output)
-    }
-
-    fn project_q8(
-        &mut self,
-        tensor: &Tensor,
-        activation: &[Q8Block],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        self.core
-            .project_q8(self.npu, self.gpu, tensor, activation, pinned, output)
-    }
-
-    fn project_f32(
-        &mut self,
-        tensor: &Tensor,
-        activation: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        self.core
-            .project_f32(self.npu, self.gpu, tensor, activation, pinned, output)
-    }
-
-    fn project_f32_group(
-        &mut self,
-        tensors: &[&Tensor],
-        activation: &[f32],
-        pinned: bool,
-        outputs: &mut [&mut Vec<f32>],
-    ) -> Result<()> {
-        self.core
-            .project_f32_group(self.npu, self.gpu, tensors, activation, pinned, outputs)
-    }
-
-    fn project_f32_tokens(
-        &mut self,
-        tensor: &Tensor,
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> Result<()> {
-        self.core
-            .project_f32_tokens(self.npu, self.gpu, tensor, activations, pinned, outputs)
-    }
-
-    fn project_f32_pair_tokens(
-        &mut self,
-        tensors: [&Tensor; 2],
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs_a: &mut [Vec<f32>],
-        outputs_b: &mut [Vec<f32>],
-    ) -> Result<()> {
-        self.core.project_f32_pair_tokens(
-            self.npu,
-            self.gpu,
-            tensors,
-            activations,
-            pinned,
-            outputs_a,
-            outputs_b,
-        )
-    }
-
-    fn project_f32_triple_tokens(
-        &mut self,
-        tensors: [&Tensor; 3],
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs_a: &mut [Vec<f32>],
-        outputs_b: &mut [Vec<f32>],
-        outputs_c: &mut [Vec<f32>],
-    ) -> Result<()> {
-        self.core.project_f32_triple_tokens(
-            self.npu,
-            self.gpu,
-            tensors,
-            activations,
-            pinned,
-            outputs_a,
-            outputs_b,
-            outputs_c,
-        )
-    }
-
-    fn supports_f32_ffn_swiglu(&self, gate: &Tensor, up: &Tensor) -> bool {
-        self.core
-            .query_group(self.npu, self.gpu, &[gate, up], |exec| {
-                exec.supports_f32_ffn_swiglu(gate, up)
-            })
-    }
-
-    fn project_f32_ffn_swiglu(
-        &mut self,
-        gate: &Tensor,
-        up: &Tensor,
-        activation: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        self.core
-            .project_f32_ffn_swiglu(self.npu, self.gpu, gate, up, activation, pinned, output)
-    }
-
-    fn project_f32_ffn_swiglu_tokens(
-        &mut self,
-        gate: &Tensor,
-        up: &Tensor,
-        activations: &[Vec<f32>],
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> Result<()> {
-        self.core.project_f32_ffn_swiglu_tokens(
-            self.npu,
-            self.gpu,
-            gate,
-            up,
-            activations,
-            pinned,
-            outputs,
-        )
-    }
-
-    fn supports_f32_ffn_chain(&self, tensors: [&Tensor; 3]) -> bool {
-        self.core.query_group(self.npu, self.gpu, &tensors, |exec| {
-            exec.supports_f32_ffn_chain(tensors)
-        })
-    }
-
-    fn supports_tile_tokens(&self) -> bool {
-        self.core.supports_tile_tokens(self.npu, self.gpu)
-    }
-
-    fn project_f32_ffn_chain(
-        &mut self,
-        tensors: [&Tensor; 3],
-        activation: &[f32],
-        residual: Option<&[f32]>,
-        hadamard_block_size: Option<u32>,
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<()> {
-        self.core.project_f32_ffn_chain(
-            self.npu,
-            self.gpu,
-            tensors,
-            activation,
-            residual,
-            hadamard_block_size,
-            pinned,
-            output,
-        )
-    }
-
-    fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
-        self.core.query_group(self.npu, self.gpu, &tensors, |exec| {
-            exec.supports_f32_ffn_chain_lora(tensors)
-        })
-    }
-
-    fn project_f32_ffn_chain_lora(
-        &mut self,
-        tensors: [&Tensor; 3],
-        activation: &[f32],
-        residual: Option<&[f32]>,
-        hadamard_block_size: Option<u32>,
-        lora_a: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
-    ) -> Result<f32> {
-        self.core.project_f32_ffn_chain_lora(
-            self.npu,
-            self.gpu,
-            tensors,
-            activation,
-            residual,
-            hadamard_block_size,
-            lora_a,
-            pinned,
-            output,
-        )
-    }
-
-    fn project_f32_ffn_chain_tokens(
-        &mut self,
-        tensors: [&Tensor; 3],
-        activations: &[Vec<f32>],
-        residuals: Option<&[Vec<f32>]>,
-        hadamard_block_size: Option<u32>,
-        pinned: bool,
-        outputs: &mut [Vec<f32>],
-    ) -> Result<()> {
-        self.core.project_f32_ffn_chain_tokens(
-            self.npu,
-            self.gpu,
-            tensors,
-            activations,
-            residuals,
-            hadamard_block_size,
-            pinned,
-            outputs,
-        )
     }
 }
 
@@ -1015,37 +193,53 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
     }
 
     fn operation_capacity(&self) -> Option<u64> {
-        self.core.operation_capacity(&self.npu, &self.gpu)
+        if self.core.telemetry.faulted {
+            Some(0)
+        } else {
+            self.npu
+                .operation_capacity()
+                .zip(self.gpu.operation_capacity())
+                .and_then(|(left, right)| left.checked_add(right))
+        }
     }
 
     fn operation_count(&self, tensor: &Tensor) -> Option<u64> {
-        self.core.operation_count(&self.npu, &self.gpu, tensor)
+        match self.core.single_target(&tensor.name)? {
+            RouteTarget::Npu => self.npu.operation_count(tensor),
+            RouteTarget::Gpu => self.gpu.operation_count(tensor),
+        }
     }
 
     fn supports(&self, tensor: &Tensor) -> bool {
-        self.core
-            .query_single(&self.npu, &self.gpu, tensor, |exec| exec.supports(tensor))
+        match self.core.single_target(&tensor.name) {
+            Some(RouteTarget::Npu) => self.npu.supports(tensor),
+            Some(RouteTarget::Gpu) => self.gpu.supports(tensor),
+            None => false,
+        }
     }
 
     fn supports_q8(&self, tensor: &Tensor) -> bool {
-        self.core
-            .query_single(&self.npu, &self.gpu, tensor, |exec| {
-                exec.supports_q8(tensor)
-            })
+        match self.core.single_target(&tensor.name) {
+            Some(RouteTarget::Npu) => self.npu.supports_q8(tensor),
+            Some(RouteTarget::Gpu) => self.gpu.supports_q8(tensor),
+            None => false,
+        }
     }
 
     fn supports_f32(&self, tensor: &Tensor) -> bool {
-        self.core
-            .query_single(&self.npu, &self.gpu, tensor, |exec| {
-                exec.supports_f32(tensor)
-            })
+        match self.core.single_target(&tensor.name) {
+            Some(RouteTarget::Npu) => self.npu.supports_f32(tensor),
+            Some(RouteTarget::Gpu) => self.gpu.supports_f32(tensor),
+            None => false,
+        }
     }
 
     fn supports_f32_group(&self, tensors: &[&Tensor]) -> bool {
-        self.core
-            .query_group(&self.npu, &self.gpu, tensors, |exec| {
-                exec.supports_f32_group(tensors)
-            })
+        match self.core.group_target(tensors) {
+            Some(RouteTarget::Npu) => self.npu.supports_f32_group(tensors),
+            Some(RouteTarget::Gpu) => self.gpu.supports_f32_group(tensors),
+            None => false,
+        }
     }
 
     fn project(
@@ -1055,14 +249,23 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         fused: bool,
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        self.core.project(
-            &mut self.npu,
-            &mut self.gpu,
-            tensor,
-            activation,
-            fused,
-            output,
-        )
+        output.clear();
+        let target = self
+            .core
+            .single_target(&tensor.name)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports(tensor),
+                RouteTarget::Gpu => self.gpu.supports(tensor),
+            })
+            .ok_or_else(|| invalid("unavailable composite Q8_K projection placement"))?;
+        let result = match target {
+            RouteTarget::Npu => self.npu.project(tensor, activation, fused, output),
+            RouteTarget::Gpu => self.gpu.project(tensor, activation, fused, output),
+        };
+        if result.is_err() {
+            output.clear();
+        }
+        self.core.finish_dispatch(target, 1, result)
     }
 
     fn project_q8(
@@ -1072,14 +275,23 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        self.core.project_q8(
-            &mut self.npu,
-            &mut self.gpu,
-            tensor,
-            activation,
-            pinned,
-            output,
-        )
+        output.clear();
+        let target = self
+            .core
+            .single_target(&tensor.name)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_q8(tensor),
+                RouteTarget::Gpu => self.gpu.supports_q8(tensor),
+            })
+            .ok_or_else(|| invalid("unavailable composite Q8_0 projection placement"))?;
+        let result = match target {
+            RouteTarget::Npu => self.npu.project_q8(tensor, activation, pinned, output),
+            RouteTarget::Gpu => self.gpu.project_q8(tensor, activation, pinned, output),
+        };
+        if result.is_err() {
+            output.clear();
+        }
+        self.core.finish_dispatch(target, 1, result)
     }
 
     fn project_f32(
@@ -1089,14 +301,23 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        self.core.project_f32(
-            &mut self.npu,
-            &mut self.gpu,
-            tensor,
-            activation,
-            pinned,
-            output,
-        )
+        output.clear();
+        let target = self
+            .core
+            .single_target(&tensor.name)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32(tensor),
+                RouteTarget::Gpu => self.gpu.supports_f32(tensor),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 projection placement"))?;
+        let result = match target {
+            RouteTarget::Npu => self.npu.project_f32(tensor, activation, pinned, output),
+            RouteTarget::Gpu => self.gpu.project_f32(tensor, activation, pinned, output),
+        };
+        if result.is_err() {
+            output.clear();
+        }
+        self.core.finish_dispatch(target, 1, result)
     }
 
     fn project_f32_group(
@@ -1106,14 +327,32 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         outputs: &mut [&mut Vec<f32>],
     ) -> Result<()> {
-        self.core.project_f32_group(
-            &mut self.npu,
-            &mut self.gpu,
-            tensors,
-            activation,
-            pinned,
-            outputs,
-        )
+        for output in outputs.iter_mut() {
+            output.clear();
+        }
+        let target = self
+            .core
+            .group_target(tensors)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32_group(tensors),
+                RouteTarget::Gpu => self.gpu.supports_f32_group(tensors),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 group projection placement"))?;
+        let count = u64::try_from(tensors.len())?;
+        let result = match target {
+            RouteTarget::Npu => self
+                .npu
+                .project_f32_group(tensors, activation, pinned, outputs),
+            RouteTarget::Gpu => self
+                .gpu
+                .project_f32_group(tensors, activation, pinned, outputs),
+        };
+        if result.is_err() {
+            for output in outputs.iter_mut() {
+                output.clear();
+            }
+        }
+        self.core.finish_dispatch(target, count, result)
     }
 
     fn project_f32_tokens(
@@ -1123,14 +362,31 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         outputs: &mut [Vec<f32>],
     ) -> Result<()> {
-        self.core.project_f32_tokens(
-            &mut self.npu,
-            &mut self.gpu,
-            tensor,
-            activations,
-            pinned,
-            outputs,
-        )
+        clear_vec_slice(outputs);
+        if activations.len() != outputs.len() {
+            return Err(invalid("mismatched F32 token projection outputs"));
+        }
+        let target = self
+            .core
+            .single_target(&tensor.name)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32(tensor),
+                RouteTarget::Gpu => self.gpu.supports_f32(tensor),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 token projection placement"))?;
+        let count = u64::try_from(activations.len())?;
+        let result = match target {
+            RouteTarget::Npu => self
+                .npu
+                .project_f32_tokens(tensor, activations, pinned, outputs),
+            RouteTarget::Gpu => self
+                .gpu
+                .project_f32_tokens(tensor, activations, pinned, outputs),
+        };
+        if result.is_err() {
+            clear_vec_slice(outputs);
+        }
+        self.core.finish_dispatch(target, count, result)
     }
 
     fn project_f32_pair_tokens(
@@ -1141,15 +397,35 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         outputs_a: &mut [Vec<f32>],
         outputs_b: &mut [Vec<f32>],
     ) -> Result<()> {
-        self.core.project_f32_pair_tokens(
-            &mut self.npu,
-            &mut self.gpu,
-            tensors,
-            activations,
-            pinned,
-            outputs_a,
-            outputs_b,
-        )
+        clear_vec_slice(outputs_a);
+        clear_vec_slice(outputs_b);
+        if activations.len() != outputs_a.len() || activations.len() != outputs_b.len() {
+            return Err(invalid("mismatched F32 pair token projection outputs"));
+        }
+        let target = self
+            .core
+            .group_target(&tensors)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32_group(&tensors),
+                RouteTarget::Gpu => self.gpu.supports_f32_group(&tensors),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 pair token projection placement"))?;
+        let count = u64::try_from(activations.len().saturating_mul(2))?;
+        let result = match target {
+            RouteTarget::Npu => {
+                self.npu
+                    .project_f32_pair_tokens(tensors, activations, pinned, outputs_a, outputs_b)
+            }
+            RouteTarget::Gpu => {
+                self.gpu
+                    .project_f32_pair_tokens(tensors, activations, pinned, outputs_a, outputs_b)
+            }
+        };
+        if result.is_err() {
+            clear_vec_slice(outputs_a);
+            clear_vec_slice(outputs_b);
+        }
+        self.core.finish_dispatch(target, count, result)
     }
 
     fn project_f32_triple_tokens(
@@ -1161,23 +437,58 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         outputs_b: &mut [Vec<f32>],
         outputs_c: &mut [Vec<f32>],
     ) -> Result<()> {
-        self.core.project_f32_triple_tokens(
-            &mut self.npu,
-            &mut self.gpu,
-            tensors,
-            activations,
-            pinned,
-            outputs_a,
-            outputs_b,
-            outputs_c,
-        )
+        clear_vec_slice(outputs_a);
+        clear_vec_slice(outputs_b);
+        clear_vec_slice(outputs_c);
+        if activations.len() != outputs_a.len()
+            || activations.len() != outputs_b.len()
+            || activations.len() != outputs_c.len()
+        {
+            return Err(invalid("mismatched F32 triple token projection outputs"));
+        }
+        let target = self
+            .core
+            .group_target(&tensors)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32_group(&tensors),
+                RouteTarget::Gpu => self.gpu.supports_f32_group(&tensors),
+            })
+            .ok_or_else(|| {
+                invalid("unavailable composite F32 triple token projection placement")
+            })?;
+        let count = u64::try_from(activations.len().saturating_mul(3))?;
+        let result = match target {
+            RouteTarget::Npu => self.npu.project_f32_triple_tokens(
+                tensors,
+                activations,
+                pinned,
+                outputs_a,
+                outputs_b,
+                outputs_c,
+            ),
+            RouteTarget::Gpu => self.gpu.project_f32_triple_tokens(
+                tensors,
+                activations,
+                pinned,
+                outputs_a,
+                outputs_b,
+                outputs_c,
+            ),
+        };
+        if result.is_err() {
+            clear_vec_slice(outputs_a);
+            clear_vec_slice(outputs_b);
+            clear_vec_slice(outputs_c);
+        }
+        self.core.finish_dispatch(target, count, result)
     }
 
     fn supports_f32_ffn_swiglu(&self, gate: &Tensor, up: &Tensor) -> bool {
-        self.core
-            .query_group(&self.npu, &self.gpu, &[gate, up], |exec| {
-                exec.supports_f32_ffn_swiglu(gate, up)
-            })
+        match self.core.group_target(&[gate, up]) {
+            Some(RouteTarget::Npu) => self.npu.supports_f32_ffn_swiglu(gate, up),
+            Some(RouteTarget::Gpu) => self.gpu.supports_f32_ffn_swiglu(gate, up),
+            None => false,
+        }
     }
 
     fn project_f32_ffn_swiglu(
@@ -1188,15 +499,27 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        self.core.project_f32_ffn_swiglu(
-            &mut self.npu,
-            &mut self.gpu,
-            gate,
-            up,
-            activation,
-            pinned,
-            output,
-        )
+        output.clear();
+        let target = self
+            .core
+            .group_target(&[gate, up])
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32_ffn_swiglu(gate, up),
+                RouteTarget::Gpu => self.gpu.supports_f32_ffn_swiglu(gate, up),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 FFN SwiGLU placement"))?;
+        let result = match target {
+            RouteTarget::Npu => self
+                .npu
+                .project_f32_ffn_swiglu(gate, up, activation, pinned, output),
+            RouteTarget::Gpu => self
+                .gpu
+                .project_f32_ffn_swiglu(gate, up, activation, pinned, output),
+        };
+        if result.is_err() {
+            output.clear();
+        }
+        self.core.finish_dispatch(target, 2, result)
     }
 
     fn project_f32_ffn_swiglu_tokens(
@@ -1207,26 +530,50 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         outputs: &mut [Vec<f32>],
     ) -> Result<()> {
-        self.core.project_f32_ffn_swiglu_tokens(
-            &mut self.npu,
-            &mut self.gpu,
-            gate,
-            up,
-            activations,
-            pinned,
-            outputs,
-        )
+        clear_vec_slice(outputs);
+        if activations.len() != outputs.len() {
+            return Err(invalid(
+                "mismatched F32 FFN SwiGLU token projection outputs",
+            ));
+        }
+        let target = self
+            .core
+            .group_target(&[gate, up])
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32_ffn_swiglu(gate, up),
+                RouteTarget::Gpu => self.gpu.supports_f32_ffn_swiglu(gate, up),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 FFN SwiGLU token placement"))?;
+        let count = u64::try_from(activations.len().saturating_mul(2))?;
+        let result = match target {
+            RouteTarget::Npu => {
+                self.npu
+                    .project_f32_ffn_swiglu_tokens(gate, up, activations, pinned, outputs)
+            }
+            RouteTarget::Gpu => {
+                self.gpu
+                    .project_f32_ffn_swiglu_tokens(gate, up, activations, pinned, outputs)
+            }
+        };
+        if result.is_err() {
+            clear_vec_slice(outputs);
+        }
+        self.core.finish_dispatch(target, count, result)
     }
 
     fn supports_f32_ffn_chain(&self, tensors: [&Tensor; 3]) -> bool {
-        self.core
-            .query_group(&self.npu, &self.gpu, &tensors, |exec| {
-                exec.supports_f32_ffn_chain(tensors)
-            })
+        match self.core.group_target(&tensors) {
+            Some(RouteTarget::Npu) => self.npu.supports_f32_ffn_chain(tensors),
+            Some(RouteTarget::Gpu) => self.gpu.supports_f32_ffn_chain(tensors),
+            None => false,
+        }
     }
 
     fn supports_tile_tokens(&self) -> bool {
-        self.core.supports_tile_tokens(&self.npu, &self.gpu)
+        !self.core.telemetry.faulted
+            && (self.core.plan_npu_layers == 0 || self.npu.supports_tile_tokens())
+            && (self.core.plan_npu_layers == self.core.plan_total_layers
+                || self.gpu.supports_tile_tokens())
     }
 
     fn project_f32_ffn_chain(
@@ -1238,23 +585,45 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        self.core.project_f32_ffn_chain(
-            &mut self.npu,
-            &mut self.gpu,
-            tensors,
-            activation,
-            residual,
-            hadamard_block_size,
-            pinned,
-            output,
-        )
+        output.clear();
+        let target = self
+            .core
+            .group_target(&tensors)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32_ffn_chain(tensors),
+                RouteTarget::Gpu => self.gpu.supports_f32_ffn_chain(tensors),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 FFN chain placement"))?;
+        let result = match target {
+            RouteTarget::Npu => self.npu.project_f32_ffn_chain(
+                tensors,
+                activation,
+                residual,
+                hadamard_block_size,
+                pinned,
+                output,
+            ),
+            RouteTarget::Gpu => self.gpu.project_f32_ffn_chain(
+                tensors,
+                activation,
+                residual,
+                hadamard_block_size,
+                pinned,
+                output,
+            ),
+        };
+        if result.is_err() {
+            output.clear();
+        }
+        self.core.finish_dispatch(target, 3, result)
     }
 
     fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
-        self.core
-            .query_group(&self.npu, &self.gpu, &tensors, |exec| {
-                exec.supports_f32_ffn_chain_lora(tensors)
-            })
+        match self.core.group_target(&tensors) {
+            Some(RouteTarget::Npu) => self.npu.supports_f32_ffn_chain_lora(tensors),
+            Some(RouteTarget::Gpu) => self.gpu.supports_f32_ffn_chain_lora(tensors),
+            None => false,
+        }
     }
 
     fn project_f32_ffn_chain_lora(
@@ -1267,17 +636,39 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         output: &mut Vec<f32>,
     ) -> Result<f32> {
-        self.core.project_f32_ffn_chain_lora(
-            &mut self.npu,
-            &mut self.gpu,
-            tensors,
-            activation,
-            residual,
-            hadamard_block_size,
-            lora_a,
-            pinned,
-            output,
-        )
+        output.clear();
+        let target = self
+            .core
+            .group_target(&tensors)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32_ffn_chain_lora(tensors),
+                RouteTarget::Gpu => self.gpu.supports_f32_ffn_chain_lora(tensors),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 FFN chain LoRA placement"))?;
+        let result = match target {
+            RouteTarget::Npu => self.npu.project_f32_ffn_chain_lora(
+                tensors,
+                activation,
+                residual,
+                hadamard_block_size,
+                lora_a,
+                pinned,
+                output,
+            ),
+            RouteTarget::Gpu => self.gpu.project_f32_ffn_chain_lora(
+                tensors,
+                activation,
+                residual,
+                hadamard_block_size,
+                lora_a,
+                pinned,
+                output,
+            ),
+        };
+        if result.is_err() {
+            output.clear();
+        }
+        self.core.finish_dispatch(target, 3, result)
     }
 
     fn project_f32_ffn_chain_tokens(
@@ -1289,16 +680,43 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
         pinned: bool,
         outputs: &mut [Vec<f32>],
     ) -> Result<()> {
-        self.core.project_f32_ffn_chain_tokens(
-            &mut self.npu,
-            &mut self.gpu,
-            tensors,
-            activations,
-            residuals,
-            hadamard_block_size,
-            pinned,
-            outputs,
-        )
+        clear_vec_slice(outputs);
+        if activations.len() != outputs.len()
+            || residuals.is_some_and(|res| res.len() != activations.len())
+        {
+            return Err(invalid("mismatched F32 FFN chain token projection outputs"));
+        }
+        let target = self
+            .core
+            .group_target(&tensors)
+            .filter(|&target| match target {
+                RouteTarget::Npu => self.npu.supports_f32_ffn_chain(tensors),
+                RouteTarget::Gpu => self.gpu.supports_f32_ffn_chain(tensors),
+            })
+            .ok_or_else(|| invalid("unavailable composite F32 FFN chain token placement"))?;
+        let count = u64::try_from(activations.len().saturating_mul(3))?;
+        let result = match target {
+            RouteTarget::Npu => self.npu.project_f32_ffn_chain_tokens(
+                tensors,
+                activations,
+                residuals,
+                hadamard_block_size,
+                pinned,
+                outputs,
+            ),
+            RouteTarget::Gpu => self.gpu.project_f32_ffn_chain_tokens(
+                tensors,
+                activations,
+                residuals,
+                hadamard_block_size,
+                pinned,
+                outputs,
+            ),
+        };
+        if result.is_err() {
+            clear_vec_slice(outputs);
+        }
+        self.core.finish_dispatch(target, count, result)
     }
 }
 

@@ -121,7 +121,7 @@ impl<'a> ValidatedVocabulary<'a> {
         self.tokens.len()
     }
 
-    pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = (&'a str, i32)> {
+    pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = (&'a str, i32)> + use<'a> {
         self.tokens
             .iter()
             .map(String::as_str)
@@ -327,6 +327,29 @@ mod tests {
             types.push(4);
         }
         assert!(Vocabulary::from_metadata(&over_limit, max_chunks + 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn validated_vocabulary_entries_iterator_outlives_wrapper() -> Result<()> {
+        let metadata = Metadata::from([
+            ("tokenizer.ggml.model".to_owned(), "gpt2".into()),
+            ("tokenizer.ggml.pre".to_owned(), "qwen35".into()),
+            (
+                "tokenizer.ggml.tokens".to_owned(),
+                vec!["Ġhi", "<|eos|>"].into(),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_owned(),
+                vec![1_i32, 3].into(),
+            ),
+        ]);
+        let entries = {
+            let validated = ValidatedVocabulary::from_metadata(&metadata, 2)?;
+            validated.entries()
+        };
+        let collected: Vec<(&str, i32)> = entries.collect();
+        assert_eq!(collected, [("Ġhi", 1), ("<|eos|>", 3)]);
         Ok(())
     }
 }

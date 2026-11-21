@@ -825,6 +825,14 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
     Some(startup)
 }
 
+#[cfg_attr(
+    not(windows),
+    allow(
+        clippy::missing_const_for_fn,
+        clippy::needless_pass_by_ref_mut,
+        reason = "Non-Windows stub matches the Windows Vulkan executor signature."
+    )
+)]
 fn install_vulkan_executor(
     session: &mut SwiftSession,
 ) -> Result<ProjectionStartup, NativeBackendError> {
@@ -860,6 +868,14 @@ fn install_vulkan_executor(
     }
 }
 
+#[cfg_attr(
+    not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")),
+    allow(
+        clippy::missing_const_for_fn,
+        clippy::needless_pass_by_ref_mut,
+        reason = "Non-ARM64 Windows stub matches the ARM64 composite executor signature."
+    )
+)]
 fn install_composite_executor(
     session: &mut SwiftSession,
 ) -> Result<ProjectionStartup, NativeBackendError> {

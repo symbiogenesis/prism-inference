@@ -4830,7 +4830,8 @@ fn lora_multi_b_tokens_impl<W: MultiLoraScalarWeight>(
 
 #[allow(
     unused_variables,
-    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+    clippy::missing_const_for_fn,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON, where the fallback is non-constant."
 )]
 fn neon_multi_a_f16(
     a_weights: &[u16],
@@ -4860,7 +4861,8 @@ fn neon_multi_a_f16(
 
 #[allow(
     unused_variables,
-    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+    clippy::missing_const_for_fn,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON, where the fallback is non-constant."
 )]
 fn neon_multi_a_f32(
     a_weights: &[f32],
@@ -4890,7 +4892,8 @@ fn neon_multi_a_f32(
 
 #[allow(
     unused_variables,
-    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+    clippy::missing_const_for_fn,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON, where the fallback is non-constant."
 )]
 fn neon_multi_a_tokens_f16(
     a_weights: &[u16],
@@ -4921,7 +4924,8 @@ fn neon_multi_a_tokens_f16(
 
 #[allow(
     unused_variables,
-    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+    clippy::missing_const_for_fn,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON, where the fallback is non-constant."
 )]
 fn neon_multi_a_tokens_f32(
     a_weights: &[f32],
@@ -4952,7 +4956,8 @@ fn neon_multi_a_tokens_f32(
 
 #[allow(
     unused_variables,
-    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+    clippy::missing_const_for_fn,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON, where the fallback is non-constant."
 )]
 fn neon_multi_b_f16(
     b_weights: &[u16],
@@ -4983,7 +4988,8 @@ fn neon_multi_b_f16(
 
 #[allow(
     unused_variables,
-    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+    clippy::missing_const_for_fn,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON, where the fallback is non-constant."
 )]
 fn neon_multi_b_f32(
     b_weights: &[f32],
@@ -5014,7 +5020,8 @@ fn neon_multi_b_f32(
 
 #[allow(
     unused_variables,
-    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+    clippy::missing_const_for_fn,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON, where the fallback is non-constant."
 )]
 fn neon_multi_b_tokens_f16(
     b_weights: &[u16],
@@ -5055,7 +5062,8 @@ fn neon_multi_b_tokens_f16(
 
 #[allow(
     unused_variables,
-    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON."
+    clippy::missing_const_for_fn,
+    reason = "Parameters are consumed only on AArch64 Windows MSVC NEON, where the fallback is non-constant."
 )]
 fn neon_multi_b_tokens_f32(
     b_weights: &[f32],

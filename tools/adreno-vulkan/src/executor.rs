@@ -6,7 +6,7 @@
 //! [`VulkanAttentionExecutor`] supporting single-dispatch fused and 3-stage decomposed attention.
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::{borrow::Borrow, cmp::Ordering, collections::BTreeMap};
 
 use bonsai_prism_runtime::{
     kernels::{Pq2ProjectionExecutor, Q8Block},
@@ -41,6 +41,70 @@ struct WeightCacheKey {
     kind: u32,
     cols: usize,
     rows: usize,
+}
+
+trait WeightKey {
+    fn parts(&self) -> (&str, u32, usize, usize);
+}
+
+impl WeightKey for WeightCacheKey {
+    fn parts(&self) -> (&str, u32, usize, usize) {
+        (&self.name, self.kind, self.cols, self.rows)
+    }
+}
+
+struct WeightCacheLookup<'a> {
+    name: &'a str,
+    kind: u32,
+    cols: usize,
+    rows: usize,
+}
+
+impl WeightKey for WeightCacheLookup<'_> {
+    fn parts(&self) -> (&str, u32, usize, usize) {
+        (self.name, self.kind, self.cols, self.rows)
+    }
+}
+
+impl WeightCacheLookup<'_> {
+    const fn as_key(&self) -> &(dyn WeightKey + '_) {
+        self
+    }
+
+    fn to_owned_key(&self) -> WeightCacheKey {
+        WeightCacheKey {
+            name: self.name.to_owned(),
+            kind: self.kind,
+            cols: self.cols,
+            rows: self.rows,
+        }
+    }
+}
+
+impl<'a> Borrow<dyn WeightKey + 'a> for WeightCacheKey {
+    fn borrow(&self) -> &(dyn WeightKey + 'a) {
+        self
+    }
+}
+
+impl PartialEq for dyn WeightKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn WeightKey + '_ {}
+
+impl PartialOrd for dyn WeightKey + '_ {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for dyn WeightKey + '_ {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.parts().cmp(&other.parts())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -626,27 +690,25 @@ impl VulkanPq2Executor {
         rows: usize,
         protected: &[BufferId],
     ) -> Result<WeightLease, Error> {
-        let key = WeightCacheKey {
-            name: tensor.name.clone(),
+        let lookup = WeightCacheLookup {
+            name: &tensor.name,
             kind: tensor.kind,
             cols,
             rows,
         };
-        if let Some(cached) = self.weight_cache.get_mut(&key)
-            && cached
+        if let Some(cached) = self.weight_cache.get_mut(lookup.as_key()) {
+            if cached
                 .weak_source
                 .upgrade()
                 .is_some_and(|live| TensorBytes::ptr_eq(&live, &tensor.data))
-        {
-            self.cache_access_counter += 1;
-            cached.last_used = self.cache_access_counter;
-            return Ok(WeightLease::Cached(cached.storage.span()));
-        }
-
-        if let Some(stale) = self.weight_cache.get(&key) {
-            let stale_buf = stale.storage.span().buffer;
+            {
+                self.cache_access_counter += 1;
+                cached.last_used = self.cache_access_counter;
+                return Ok(WeightLease::Cached(cached.storage.span()));
+            }
+            let stale_buf = cached.storage.span().buffer;
             if !protected.contains(&stale_buf)
-                && let Some(removed) = self.weight_cache.remove(&key)
+                && let Some(removed) = self.weight_cache.remove(lookup.as_key())
             {
                 self.cached_bytes = self.cached_bytes.saturating_sub(removed.bytes);
                 if let ResidentStorage::Standalone(id) = removed.storage {
@@ -690,7 +752,7 @@ impl VulkanPq2Executor {
             self.device
                 .write_buffer_u32_at(span.buffer, span.offset, &self.repack_scratch)?;
             self.record_cached(
-                key,
+                lookup.to_owned_key(),
                 ResidentStorage::Arena(span),
                 upload_bytes,
                 &tensor.data,
@@ -725,7 +787,7 @@ impl VulkanPq2Executor {
             return Err(err);
         }
         self.record_cached(
-            key,
+            lookup.to_owned_key(),
             ResidentStorage::Standalone(buf),
             upload_bytes,
             &tensor.data,

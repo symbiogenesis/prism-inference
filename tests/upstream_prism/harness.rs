@@ -93,6 +93,7 @@ mod recurrent_rollback;
 mod reference_allocation;
 mod reference_arena_graph;
 mod reference_arg_parser;
+mod reference_backend_ops;
 mod reference_batch_allocator;
 mod reference_chat;
 mod reference_chat_analysis;
@@ -204,7 +205,7 @@ const CASES: &[Case] = &[
     register(
         "test-backend-ops",
         "tests/test-backend-ops.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         backend_ops::run,
     ),
     register(
@@ -597,7 +598,7 @@ const BENCHMARKS: &[Case] = &[
     register(
         "backend-ops-performance",
         "tests/test-backend-ops.cpp#performance",
-        Bridge::Common,
+        Bridge::Independent,
         backend_ops::benchmark,
     ),
     register(

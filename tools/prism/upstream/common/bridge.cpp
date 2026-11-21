@@ -1,8 +1,6 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
 #include "model_runtime.hpp"
-#include "backend_ops.hpp"
-#include "backend_session.hpp"
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -81,31 +79,19 @@ void validate_operation(const wire_json & operation) {
     require(operation.is_object() && operation.contains("Kind") && operation.at("Kind").is_string(),
             "operation Kind must be a string");
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (prism_backend_ops::handles(kind)) {
-        prism_backend_ops::validate(operation);
-    } else {
-        throw std::runtime_error("unknown operation Kind");
-    }
+    (void) kind;
+    throw std::runtime_error("unknown operation Kind");
 }
 
 wire_json execute(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (prism_backend_ops::handles(kind)) {
-        return prism_backend_ops::execute(operation);
-    }
+    (void) kind;
     throw std::runtime_error("unknown operation Kind");
 }
 } // namespace
 
 int main(int argc, char ** argv) {
     try {
-        if (argc == 2 && std::strcmp(argv[1], "--backend-session") == 0) {
-#ifdef _WIN32
-            _setmode(_fileno(stdin), _O_BINARY);
-            _setmode(_fileno(stdout), _O_BINARY);
-#endif
-            return prism_backend_session::serve();
-        }
         if (argc == 2 && std::strcmp(argv[1], "--model-session") == 0) {
             return prism_model_runtime::serve();
         }

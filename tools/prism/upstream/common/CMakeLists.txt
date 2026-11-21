@@ -43,7 +43,7 @@ if(DEFINED PRISM_LLGUIDANCE_LIBRARY OR DEFINED PRISM_LLGUIDANCE_INCLUDE_DIR)
   endif()
 endif()
 
-add_executable(prism-upstream-common-bridge bridge.cpp action_file.hpp vocab_session.hpp model_runtime.hpp generated_model.hpp backend_ops.hpp backend_session.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp)
+add_executable(prism-upstream-common-bridge bridge.cpp vocab_session.hpp model_runtime.hpp generated_model.hpp dspark_runtime.hpp llguidance.hpp backend_sampler.hpp context_graph.hpp)
 target_include_directories(prism-upstream-common-bridge PRIVATE "${PRISM_SOURCE_DIR}/src" "${PRISM_SOURCE_DIR}" "${PRISM_SOURCE_DIR}/ggml/src")
 target_link_libraries(prism-upstream-common-bridge PRIVATE llama-common mtmd)
 # The same-revision CI tool bundle also supplies the small ggml-only wrapper.

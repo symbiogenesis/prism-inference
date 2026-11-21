@@ -7,13 +7,13 @@ use super::{MAX_ACTION_FILE, MAX_ACTIONS, MAX_FILE_BYTES, MAX_OBSERVATION, Sessi
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -62,8 +62,84 @@ fn response(mut value: Value, sequence: u64) -> Result<Value> {
         .ok_or_else(|| invalid("backend pipe missing result"))
 }
 
+struct PipeBuffer {
+    bytes: VecDeque<u8>,
+    closed: bool,
+}
+
+#[derive(Clone)]
+struct DuplexPipe {
+    state: Arc<(Mutex<PipeBuffer>, Condvar)>,
+}
+
+impl DuplexPipe {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(PipeBuffer {
+                    bytes: VecDeque::new(),
+                    closed: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn close(&self) {
+        let (mutex, condvar) = &*self.state;
+        let mut guard = lock(mutex);
+        guard.closed = true;
+        drop(guard);
+        condvar.notify_all();
+    }
+}
+
+impl Read for DuplexPipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let (mutex, condvar) = &*self.state;
+        let mut guard = lock(mutex);
+        while guard.bytes.is_empty() && !guard.closed {
+            guard = condvar
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if guard.bytes.is_empty() {
+            return Ok(0);
+        }
+        let count = buf.len().min(guard.bytes.len());
+        for slot in &mut buf[..count] {
+            *slot = guard.bytes.pop_front().unwrap_or(0);
+        }
+        drop(guard);
+        Ok(count)
+    }
+}
+
+impl Write for DuplexPipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let (mutex, condvar) = &*self.state;
+        let mut guard = lock(mutex);
+        if guard.closed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "backend duplex pipe is closed",
+            ));
+        }
+        guard.bytes.extend(buf);
+        drop(guard);
+        condvar.notify_all();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Monitor {
-    child: Mutex<Child>,
+    req_pipe: DuplexPipe,
+    resp_pipe: DuplexPipe,
+    exited: AtomicBool,
     deadline: Mutex<Option<Instant>>,
     done: AtomicBool,
     fatal: Mutex<Option<String>>,
@@ -76,14 +152,16 @@ impl Monitor {
             *fatal = Some(message.into());
         }
         drop(fatal);
-        let _ = lock(&self.child).kill();
+        self.req_pipe.close();
+        self.resp_pipe.close();
     }
 }
 
 struct Worker {
     monitor: Arc<Monitor>,
-    input: Option<ChildStdin>,
+    input: Option<DuplexPipe>,
     output: Option<mpsc::Receiver<std::result::Result<Value, String>>>,
+    session_thread: Option<JoinHandle<Result<()>>>,
     readers: Vec<JoinHandle<()>>,
     sequence: u64,
     poisoned: bool,
@@ -94,64 +172,47 @@ struct Worker {
 
 impl Worker {
     fn open(engine: &Engine) -> Result<Option<Self>> {
-        let Some(spec) = engine.model_session_spec("backend-pipe")? else {
+        if engine.is_rust() {
             return Ok(None);
-        };
-        let errors = File::create(spec.evidence_directory.join("stderr.log"))?;
-        let mut child = Command::new(spec.executable)
-            .arg("--backend-session")
-            .current_dir(&spec.evidence_directory)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let (Some(input), Some(output), Some(mut stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(invalid("backend pipe creation failed"));
-        };
+        }
+        let directory = engine.evidence_path("backend-pipe")?;
+        let req_tx = DuplexPipe::new();
+        let mut req_rx = req_tx.clone();
+        let mut resp_tx = DuplexPipe::new();
+        let resp_rx = resp_tx.clone();
         let monitor = Arc::new(Monitor {
-            child: Mutex::new(child),
+            req_pipe: req_tx.clone(),
+            resp_pipe: resp_rx.clone(),
+            exited: AtomicBool::new(false),
             deadline: Mutex::new(None),
             done: AtomicBool::new(false),
             fatal: Mutex::new(None),
         });
+        let session_monitor = Arc::clone(&monitor);
+        let stderr_path = directory.join("stderr.log");
+        let session_thread = thread::spawn(move || -> Result<()> {
+            let outcome =
+                crate::reference_backend_ops::run_framed_session(&mut req_rx, &mut resp_tx);
+            req_rx.close();
+            resp_tx.close();
+            session_monitor.exited.store(true, Ordering::Release);
+            if let Err(ref error) = outcome {
+                let _ = File::create(&stderr_path)
+                    .and_then(|mut f| f.write_all(error.to_string().as_bytes()));
+                session_monitor.fail(format!("reference backend session failed: {error}"));
+            }
+            outcome
+        });
         let (sender, receiver) = mpsc::sync_channel(1);
         let mut readers = Vec::new();
         readers.push(thread::spawn(move || {
-            let mut output = BufReader::new(output);
+            let mut output = BufReader::new(resp_rx);
             loop {
                 let result = read_frame(&mut output).map_err(|error| error.to_string());
                 let failed = result.is_err();
                 if sender.send(result).is_err() || failed {
                     break;
                 }
-            }
-        }));
-        let error_monitor = Arc::clone(&monitor);
-        readers.push(thread::spawn(move || {
-            let mut errors = BufWriter::new(errors);
-            let mut bytes = [0; 16_384];
-            let mut total = 0_usize;
-            let result: std::io::Result<()> = (|| {
-                loop {
-                    let count = stderr.read(&mut bytes)?;
-                    if count == 0 {
-                        return errors.flush();
-                    }
-                    total += count;
-                    // One partition now shares a process; retain a bounded log
-                    // instead of allocating a separate 1MiB log per geometry.
-                    if total > 64 * 1024 * 1024 {
-                        return Err(std::io::Error::other("backend stderr exceeds64MiB"));
-                    }
-                    errors.write_all(&bytes[..count])?;
-                }
-            })();
-            if let Err(error) = result {
-                error_monitor.fail(format!("backend stderr capture failed: {error}"));
             }
         }));
         let watchdog = Arc::clone(&monitor);
@@ -166,13 +227,14 @@ impl Worker {
         }));
         Ok(Some(Self {
             monitor,
-            input: Some(input),
+            input: Some(req_tx),
             output: Some(receiver),
+            session_thread: Some(session_thread),
             readers,
             sequence: 0,
             poisoned: false,
             finished: false,
-            directory: spec.evidence_directory,
+            directory,
             case_deadline: None,
         }))
     }
@@ -196,7 +258,7 @@ impl Worker {
             };
             let bytes = serde_json::to_vec(&request)?;
             if bytes.is_empty() || bytes.len() > MAX_ACTION_FILE {
-                return Err(invalid("backend pipe request exceeds128MiB"));
+                return Err(invalid("backend pipe request exceeds 128MiB"));
             }
             self.sequence = sequence;
             let input = self
@@ -225,10 +287,10 @@ impl Worker {
     fn poison(&mut self, message: &str) {
         self.poisoned = true;
         self.monitor.fail(message);
-        // Complete native termination before the driver hashes or prunes the
-        // failed geometry's files. Killing alone can return before Windows has
-        // closed every native file handle and completed outstanding writes.
-        let _ = lock(&self.monitor.child).wait();
+        self.input.take();
+        if let Some(handle) = self.session_thread.take() {
+            let _ = handle.join();
+        }
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -237,18 +299,23 @@ impl Worker {
             Instant::now() + Duration::from_secs(10),
         )?;
         self.input.take();
+        self.monitor.req_pipe.close();
         let started = Instant::now();
-        let status = loop {
-            let exited = lock(&self.monitor.child).try_wait()?;
-            if let Some(status) = exited {
-                break status;
-            }
+        while !self.monitor.exited.load(Ordering::Acquire) {
             if started.elapsed() > Duration::from_secs(10) {
                 return Err(invalid("backend pipe did not exit after shutdown"));
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(5));
+        }
+        let session_result = if let Some(handle) = self.session_thread.take() {
+            handle
+                .join()
+                .map_err(|_| invalid("backend session thread panicked"))?
+        } else {
+            Ok(())
         };
         self.monitor.done.store(true, Ordering::Release);
+        self.monitor.resp_pipe.close();
         self.output.take();
         for reader in self.readers.drain(..) {
             reader
@@ -259,15 +326,18 @@ impl Worker {
             return Err(invalid(error.clone()));
         }
         self.finished = true;
+        let exit_code = if session_result.is_ok() {
+            Some(0)
+        } else {
+            Some(1)
+        };
         fs::write(
             self.directory.join("session.json"),
             serde_json::to_vec_pretty(&json!({
-                "SchemaVersion":1,"Requests":self.sequence,"ExitCode":status.code(),"FreshStatePerGeometry":true
+                "SchemaVersion":1,"Requests":self.sequence,"ExitCode":exit_code,"FreshStatePerGeometry":true
             }))?,
         )?;
-        if !status.success() {
-            return Err(invalid("backend pipe process exited unsuccessfully"));
-        }
+        session_result?;
         Ok(())
     }
 }
@@ -276,18 +346,25 @@ impl Drop for Worker {
     fn drop(&mut self) {
         if !self.finished {
             self.monitor.done.store(true, Ordering::Release);
-            let _ = lock(&self.monitor.child).kill();
+            self.monitor.req_pipe.close();
+            self.monitor.resp_pipe.close();
             self.input.take();
             self.output.take();
-            let status = lock(&self.monitor.child).wait();
-            // A failed native process cannot send a second queued frame.
+            let exit_code = self
+                .session_thread
+                .take()
+                .map(|handle| i32::from(!handle.join().is_ok_and(|r| r.is_ok())));
             for reader in self.readers.drain(..) {
                 let _ = reader.join();
             }
-            let _ = fs::write(self.directory.join("session.json"), serde_json::to_vec_pretty(&json!({
-                "SchemaVersion":1,"Requests":self.sequence,"ExitCode":status.ok().and_then(|status|status.code()),
-                "FreshStatePerGeometry":true,"Poisoned":self.poisoned,"Error":*lock(&self.monitor.fatal)
-            })).unwrap_or_default());
+            let _ = fs::write(
+                self.directory.join("session.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "SchemaVersion":1,"Requests":self.sequence,"ExitCode":exit_code,
+                    "FreshStatePerGeometry":true,"Poisoned":self.poisoned,"Error":*lock(&self.monitor.fatal)
+                }))
+                .unwrap_or_default(),
+            );
         }
     }
 }
@@ -454,35 +531,16 @@ mod tests {
     };
     use super::*;
 
-    fn native_rejects_frame(bridge: &Path, directory: &Path, frame: &[u8]) -> Result<()> {
-        let mut child = Command::new(bridge)
-            .arg("--backend-session")
-            .current_dir(directory)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(File::create(directory.join("malformed-frame.log"))?)
-            .spawn()?;
-        if let Some(mut input) = child.stdin.take() {
-            let _ = input.write_all(frame);
-        }
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                assert!(
-                    !status.success(),
-                    "malformed/EOF backend transport input must exit unsuccessfully"
-                );
-                return Ok(());
-            }
-            if started.elapsed() > Duration::from_secs(10) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(invalid(
-                    "malformed backend frame did not terminate the native process",
-                ));
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+    fn native_rejects_frame(frame: &[u8]) {
+        let mut output = Vec::new();
+        assert!(
+            crate::reference_backend_ops::run_framed_session(
+                &mut std::io::Cursor::new(frame),
+                &mut output,
+            )
+            .is_err(),
+            "malformed/EOF backend transport input must fail"
+        );
     }
 
     fn numerical_fixture(session: &mut Session) -> Result<(Vec<Value>, Vec<u8>)> {
@@ -572,7 +630,7 @@ mod tests {
         ))
     }
 
-    fn native_failure_guards(engine: &Engine, bridge: &Path, root: &Path) -> Result<()> {
+    fn native_failure_guards(engine: &Engine) -> Result<()> {
         let mut expired =
             Worker::open(engine)?.ok_or_else(|| invalid("native backend worker unavailable"))?;
         assert!(
@@ -589,7 +647,7 @@ mod tests {
             (u32::try_from(MAX_ACTION_FILE)? + 1).to_le_bytes().to_vec(),
             vec![5, 0, 0, 0, b'{'],
         ] {
-            native_rejects_frame(bridge, root, &frame)?;
+            native_rejects_frame(&frame);
         }
         for invalid in [
             json!({"Sequence":2,"Operation":{"Op":"shutdown"}}),
@@ -599,7 +657,7 @@ mod tests {
             let payload = serde_json::to_vec(&invalid)?;
             let mut frame = u32::try_from(payload.len())?.to_le_bytes().to_vec();
             frame.extend(payload);
-            native_rejects_frame(bridge, root, &frame)?;
+            native_rejects_frame(&frame);
         }
         Ok(())
     }
@@ -688,14 +746,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the checked native backend tools; explicitly required by the backend tools CI job"]
     fn native_file_and_pipe_observations_match_and_geometry_state_is_fresh() -> Result<()> {
-        let bridge = PathBuf::from(std::env::var("BONSAI_BACKEND_TRANSPORT_BRIDGE")?);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
-        let base = std::env::var_os("BONSAI_BACKEND_TRANSPORT_EVIDENCE")
-            .map_or_else(std::env::temp_dir, PathBuf::from);
+        let base = std::env::temp_dir();
         if !base.is_absolute() || !base.is_dir() {
             return Err(invalid(
                 "backend transport evidence parent must be an existing absolute directory",
@@ -709,7 +764,7 @@ mod tests {
         let engine = Engine::new(
             super::super::super::super::engine::Target::Cpp,
             None,
-            Some(bridge.clone()),
+            None,
             Some(root.clone()),
             None,
             None,
@@ -761,18 +816,15 @@ mod tests {
         );
         assert!(!poisoned.healthy());
         assert!(
-            lock(
-                &poisoned
-                    .worker
-                    .as_ref()
-                    .ok_or_else(|| invalid("native worker missing"))?
-                    .borrow()
-                    .monitor
-                    .child
-            )
-            .try_wait()?
-            .is_some(),
-            "failed native worker must be reaped before evidence retention"
+            poisoned
+                .worker
+                .as_ref()
+                .ok_or_else(|| invalid("native worker missing"))?
+                .borrow()
+                .monitor
+                .exited
+                .load(Ordering::Acquire),
+            "failed native worker must exit before evidence retention"
         );
         let directory = engine.evidence_path("after-bad-action")?;
         assert!(
@@ -781,7 +833,7 @@ mod tests {
                 .is_err()
         );
         drop(poisoned);
-        native_failure_guards(&engine, &bridge, &root)?;
+        native_failure_guards(&engine)?;
         // Keep failed runs for inspection; remove only this uniquely owned tree
         // after every comparison and native process shutdown has succeeded.
         fs::remove_dir_all(root)?;

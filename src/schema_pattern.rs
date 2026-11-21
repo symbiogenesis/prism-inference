@@ -192,10 +192,11 @@ impl Parser<'_> {
                         _ => return Err(PatternError::Unsupported),
                     };
                     let piece = sequence.last_mut().ok_or(PatternError::Invalid)?;
-                    if !piece.1 {
-                        self.subrule(&piece.0).clone_into(&mut piece.0);
-                    }
-                    piece.0 = repetition(&to_rule(piece), minimum, maximum, "");
+                    piece.0 = if piece.1 {
+                        repetition(&to_rule(piece), minimum, maximum, "")
+                    } else {
+                        repetition(self.subrule(&piece.0), minimum, maximum, "")
+                    };
                     piece.1 = false;
                 }
                 _ => {

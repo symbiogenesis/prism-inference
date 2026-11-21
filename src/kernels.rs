@@ -6493,7 +6493,11 @@ mod tests {
         let no_neon_b_tok_f32 =
             |_: &[f32], _: &[f32], _: usize, _: f32, _: &[&[f32]], _: usize, _: &mut [f32]| None;
 
-        for workers in [1_usize, 4] {
+        #[cfg(feature = "parallel-rows")]
+        let worker_counts = [1_usize, 4];
+        #[cfg(not(feature = "parallel-rows"))]
+        let worker_counts = [1_usize];
+        for workers in worker_counts {
             let parallelism = super::RowParallelism::new(workers)?;
             for (in_features, rank, out_features) in [
                 (1_usize, 1_usize, 1_usize),

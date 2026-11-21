@@ -296,7 +296,11 @@ impl BatchAllocator {
             {
                 return Ok(false);
             }
-            self.set_indices.entry(set.clone()).or_default().push(index);
+            if let Some(indices) = self.set_indices.get_mut(&set) {
+                indices.push(index);
+            } else {
+                self.set_indices.insert(set.clone(), vec![index]);
+            }
             self.sequence_sets.push(set);
         }
         for id in 0..sequence_limit {

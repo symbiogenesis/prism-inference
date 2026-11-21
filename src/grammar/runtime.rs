@@ -1122,7 +1122,7 @@ fn is_finite_logits_rejection(error: &crate::Error) -> bool {
         })
 }
 
-impl<S: Sampler + Clone> Sampler for GrammarConstrainedSampler<S> {
+impl<S: Sampler> Sampler for GrammarConstrainedSampler<S> {
     fn sample(&mut self, logits: &[f32]) -> Result<u32> {
         if logits.len() != self.candidates.len()
             || logits.is_empty()
@@ -1348,6 +1348,46 @@ mod tests {
         assert_eq!(masked_sampler.sample(&[9.0, 8.0, 7.0, -2.0])?, 3);
         assert!(masked_sampler.grammar().is_accepting());
         assert_eq!(masked_sampler.inner().draws, 3);
+        Ok(())
+    }
+
+    struct NonCloneArgmaxSampler {
+        calls: usize,
+    }
+
+    impl Sampler for NonCloneArgmaxSampler {
+        fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+            self.calls += 1;
+            let mut best_idx = 0_usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (idx, &val) in logits.iter().enumerate() {
+                if val > best_val {
+                    best_val = val;
+                    best_idx = idx;
+                }
+            }
+            Ok(u32::try_from(best_idx)?)
+        }
+    }
+
+    #[test]
+    fn constrained_sampler_implements_sampler_without_inner_clone() -> Result<()> {
+        let (candidates, eog) = constrained_test_candidates()?;
+        let grammar = GrammarState::from_grammar(Grammar::parse("root ::= \"ab\"")?, "root")?;
+        let mut sampler = GrammarConstrainedSampler::new(
+            NonCloneArgmaxSampler { calls: 0 },
+            grammar,
+            candidates,
+            eog,
+        )?;
+        assert_eq!(Sampler::sample(&mut sampler, &[1.0, 5.0, 4.0, 10.0])?, 0);
+        assert_eq!(
+            Sampler::sample_finite(&mut sampler, FiniteLogits::new(&[9.0, 2.0, 8.0, 10.0])?)?,
+            1
+        );
+        assert_eq!(Sampler::sample(&mut sampler, &[9.0, 8.0, 7.0, -2.0])?, 3);
+        assert!(sampler.grammar().is_accepting());
+        assert_eq!(sampler.inner().calls, 3);
         Ok(())
     }
 

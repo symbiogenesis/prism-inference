@@ -2767,36 +2767,36 @@ impl<'a, const N: usize> IqGrid<'a, N> {
     }
 
     fn candidates(&mut self, key: usize, levels: &[u8]) -> &[usize] {
-        if !self.neighbours.contains_key(&key) {
-            let mut distances: Vec<(i32, usize)> = self
-                .points
-                .iter()
-                .enumerate()
-                .map(|(index, point)| {
-                    let d = point.iter().zip(levels).fold(0_i32, |sum, (&q, &l)| {
-                        let diff = i32::from(q) - (2 * i32::from(l) + 1);
-                        sum + diff * diff
-                    });
-                    (d, index)
-                })
-                .collect();
-            distances.sort_unstable();
-            let mut previous = distances[0].0;
-            let mut shells = 1_usize;
-            let mut neighbours = Vec::new();
-            for (distance, index) in distances {
-                if distance > previous {
-                    if shells == self.shells {
-                        break;
-                    }
-                    previous = distance;
-                    shells += 1;
-                }
-                neighbours.push(index);
-            }
-            self.neighbours.insert(key, neighbours);
+        if let Some(neighbours) = self.neighbours.get(&key) {
+            return neighbours;
         }
-        &self.neighbours[&key]
+        let mut distances: Vec<(i32, usize)> = self
+            .points
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let d = point.iter().zip(levels).fold(0_i32, |sum, (&q, &l)| {
+                    let diff = i32::from(q) - (2 * i32::from(l) + 1);
+                    sum + diff * diff
+                });
+                (d, index)
+            })
+            .collect();
+        distances.sort_unstable();
+        let mut previous = distances[0].0;
+        let mut shells = 1_usize;
+        let mut neighbours = Vec::new();
+        for (distance, index) in distances {
+            if distance > previous {
+                if shells == self.shells {
+                    break;
+                }
+                previous = distance;
+                shells += 1;
+            }
+            neighbours.push(index);
+        }
+        self.neighbours.entry(key).or_insert(neighbours)
     }
 
     #[expect(

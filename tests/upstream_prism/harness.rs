@@ -107,6 +107,7 @@ mod reference_grammar;
 mod reference_grammar_parser;
 mod reference_jinja;
 mod reference_json_schema;
+mod reference_llguidance;
 mod reference_logging;
 mod reference_model_resolution;
 mod reference_mtmd;

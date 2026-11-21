@@ -95,26 +95,26 @@ pub(in super::super) struct ReferenceVocab {
     gpt_char_to_byte: Vec<(char, u8)>,
     byte_tokens: [Option<i32>; 256],
     specials: Vec<(Vec<u8>, i32, bool)>,
-    pub(super) bos: Option<i32>,
-    pub(super) eos: Option<i32>,
-    pub(super) eot: Option<i32>,
-    pub(super) eom: Option<i32>,
-    pub(super) unk: Option<i32>,
-    pub(super) sep: Option<i32>,
-    pub(super) nl: Option<i32>,
-    pub(super) pad: Option<i32>,
-    pub(super) cls: Option<i32>,
-    pub(super) mask: Option<i32>,
-    pub(super) add_bos: bool,
-    pub(super) add_eos: bool,
-    pub(super) add_sep: bool,
+    pub(in super::super) bos: Option<i32>,
+    pub(in super::super) eos: Option<i32>,
+    pub(in super::super) eot: Option<i32>,
+    pub(in super::super) eom: Option<i32>,
+    pub(in super::super) unk: Option<i32>,
+    pub(in super::super) sep: Option<i32>,
+    pub(in super::super) nl: Option<i32>,
+    pub(in super::super) pad: Option<i32>,
+    pub(in super::super) cls: Option<i32>,
+    pub(in super::super) mask: Option<i32>,
+    pub(in super::super) add_bos: bool,
+    pub(in super::super) add_eos: bool,
+    pub(in super::super) add_sep: bool,
     add_space_prefix: bool,
     escape_whitespaces: bool,
     treat_whitespace_as_suffix: bool,
     ignore_merges: bool,
     lowercase_normalizer: bool,
     strip_accents_normalizer: bool,
-    pub(super) chat_template: Option<String>,
+    pub(in super::super) chat_template: Option<String>,
 }
 
 fn opt_token_id(meta: &BTreeMap<String, MetaValue>, key: &str, count: usize) -> Option<i32> {
@@ -357,11 +357,14 @@ impl ReferenceVocab {
         self.vocab_type
     }
 
-    #[expect(
-        dead_code,
-        reason = "Session metadata helpers are used across subsequent tokenizer/llguidance/model session adapters."
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Session metadata helpers are used across subsequent tokenizer/llguidance/model session adapters."
+        )
     )]
-    pub(super) const fn vocab_size(&self) -> usize {
+    pub(in super::super) const fn vocab_size(&self) -> usize {
         self.entries.len()
     }
 
@@ -372,7 +375,7 @@ impl ReferenceVocab {
             reason = "Session metadata helpers are used across subsequent tokenizer/llguidance/model session adapters."
         )
     )]
-    pub(super) fn is_control(&self, token: i32) -> bool {
+    pub(in super::super) fn is_control(&self, token: i32) -> bool {
         usize::try_from(token)
             .ok()
             .and_then(|idx| self.entries.get(idx))
@@ -386,7 +389,7 @@ impl ReferenceVocab {
             reason = "Session metadata helpers are used across subsequent tokenizer/llguidance/model session adapters."
         )
     )]
-    pub(super) fn is_eog(&self, token: i32) -> bool {
+    pub(in super::super) fn is_eog(&self, token: i32) -> bool {
         Some(token) == self.eos
             || Some(token) == self.eot
             || Some(token) == self.eom
@@ -470,7 +473,12 @@ impl ReferenceVocab {
             reason = "Session piece helpers are used across subsequent tokenizer/llguidance/model session adapters."
         )
     )]
-    pub(super) fn token_to_piece(&self, token: i32, lstrip: i32, special: bool) -> Result<Vec<u8>> {
+    pub(in super::super) fn token_to_piece(
+        &self,
+        token: i32,
+        lstrip: i32,
+        special: bool,
+    ) -> Result<Vec<u8>> {
         let idx = usize::try_from(token).map_err(|_| invalid("negative token ID"))?;
         let entry = self
             .entries
@@ -587,7 +595,7 @@ impl ReferenceVocab {
         Ok(out)
     }
 
-    pub(super) fn tokenize(
+    pub(in super::super) fn tokenize(
         &self,
         input: &[u8],
         add_special: bool,

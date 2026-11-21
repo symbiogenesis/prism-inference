@@ -1,6 +1,6 @@
 //! Opt-in bounded triangular GDN chunks; no cumulative-decay division.
 
-use super::{TileReuse, TiledPrefill, project_tile, project_tile_pair, reborrow_executor};
+use super::{TileReuse, TiledPrefill, project_tile, project_tile_pair};
 use crate::graph::{
     ActiveAdapters, Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms,
     copy_into, finite, l2_norm, resize_into, sigmoid, small_float,
@@ -475,7 +475,7 @@ pub(super) fn recurrent_tile<'a>(
     count: usize,
     check: &dyn Fn() -> Result<()>,
     tile: &mut TiledPrefill,
-    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
 ) -> Result<()> {
     let (
         LayerState::Recurrent {
@@ -505,7 +505,7 @@ pub(super) fn recurrent_tile<'a>(
         &mut tile.recurrent_gate[..count],
         &mut tile.transformed[..count],
         &mut tile.projector,
-        reborrow_executor(&mut executor),
+        executor.as_deref_mut(),
         check,
     )?;
     check()?;
@@ -523,7 +523,7 @@ pub(super) fn recurrent_tile<'a>(
         &mut tile.alpha[..count],
         &mut tile.transformed[..count],
         &mut tile.projector,
-        reborrow_executor(&mut executor),
+        executor.as_deref_mut(),
         check,
     )?;
     let width = geometry.ssm_head;
@@ -1077,7 +1077,7 @@ pub(super) fn recurrent_tile<'a>(
         &mut tile.attention[..count],
         &mut tile.transformed[..count],
         &mut tile.projector,
-        reborrow_executor(&mut executor),
+        executor,
         check,
     )?;
     finite(convolution, "convolution state")?;

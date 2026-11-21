@@ -32,12 +32,6 @@ mod ffn_tests;
 #[path = "prefill_sibling_tests.rs"]
 mod sibling_tests;
 
-const fn coerce_executor<'a>(
-    executor: &'a mut Box<dyn crate::kernels::Pq2ProjectionExecutor + Send>,
-) -> &'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a) {
-    &mut **executor
-}
-
 fn tiled_attention_scratch_bytes(
     geometry: &Geometry,
     arithmetic: Arithmetic,
@@ -64,15 +58,6 @@ fn tiled_attention_scratch_bytes(
 pub(super) struct TileReuse<'a> {
     basis: Option<&'a Tensor>,
     prepared: Option<&'a Tensor>,
-}
-
-const fn reborrow_executor<'a, 'b: 'a>(
-    executor: &'a mut Option<&'b mut dyn crate::kernels::Pq2ProjectionExecutor>,
-) -> Option<&'a mut (dyn crate::kernels::Pq2ProjectionExecutor + 'a)> {
-    match executor {
-        Some(exec) => Some(*exec),
-        None => None,
-    }
 }
 
 /// Lifetime counters for explicitly selected CPU tiled prompt ingestion.
@@ -496,7 +481,7 @@ impl Qwen35 {
         let mut executor = self.projection_executor.take();
         let result = (|| {
             check()?;
-            let prefill_executor = executor.as_mut().map(coerce_executor);
+            let prefill_executor = executor.as_mut().map(Self::coerce_executor);
             self.ingest_cpu_tile(
                 tokens,
                 check,
@@ -523,10 +508,10 @@ impl Qwen35 {
         let prefill_executor = if self.tiled_prefill.is_some() {
             executor
                 .as_mut()
-                .map(coerce_executor)
+                .map(Self::coerce_executor)
                 .filter(|exec| exec.supports_tile_tokens())
         } else {
-            executor.as_mut().map(coerce_executor)
+            executor.as_mut().map(Self::coerce_executor)
         };
         let result = self.ingest_prefill_block_with_executor(tokens, check, prefill_executor);
         self.projection_executor = executor;
@@ -537,7 +522,7 @@ impl Qwen35 {
         &mut self,
         tokens: &[u32],
         check: &dyn Fn() -> Result<()>,
-        mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     ) -> Result<()> {
         if !self.state_consistent {
             return Err(invalid(
@@ -563,12 +548,7 @@ impl Qwen35 {
         let Some(mut tile) = self.tiled_prefill.take() else {
             for &token in tokens {
                 check()?;
-                self.evaluate_token_with_executor(
-                    token,
-                    None,
-                    reborrow_executor(&mut executor),
-                    None,
-                )?;
+                self.evaluate_token_with_executor(token, None, executor.as_deref_mut(), None)?;
                 check()?;
             }
             return Ok(());
@@ -576,13 +556,7 @@ impl Qwen35 {
         let result = (|| {
             for tokens in tokens.chunks(tile.tokens) {
                 check()?;
-                self.ingest_cpu_tile(
-                    tokens,
-                    check,
-                    &mut tile,
-                    reborrow_executor(&mut executor),
-                    None,
-                )?;
+                self.ingest_cpu_tile(tokens, check, &mut tile, executor.as_deref_mut(), None)?;
                 tile.statistics.completed_tiles = tile.statistics.completed_tiles.saturating_add(1);
                 tile.statistics.completed_tokens = tile
                     .statistics
@@ -605,7 +579,7 @@ impl Qwen35 {
         tokens: &[u32],
         check: &dyn Fn() -> Result<()>,
         tile: &mut TiledPrefill,
-        mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
         logits: Option<&mut [Vec<f32>]>,
     ) -> Result<()> {
         let count = tokens.len();
@@ -683,7 +657,7 @@ impl Qwen35 {
                             count,
                             check,
                             tile,
-                            reborrow_executor(&mut executor),
+                            executor.as_deref_mut(),
                         )?;
                     }
                     (Attention::Full(weights), LayerState::Full { keys, values }) => {
@@ -702,7 +676,7 @@ impl Qwen35 {
                             &mut tile.beta[..count],
                             &mut tile.transformed[..count],
                             &mut tile.projector,
-                            reborrow_executor(&mut executor),
+                            executor.as_deref_mut(),
                             check,
                         )?;
                         full_attention_kv_only_tile(
@@ -739,7 +713,7 @@ impl Qwen35 {
                         count,
                         check,
                         tile,
-                        reborrow_executor(&mut executor),
+                        executor.as_deref_mut(),
                     )?;
                 }
                 (Attention::Full(weights), LayerState::Full { keys, values }) => {
@@ -759,7 +733,7 @@ impl Qwen35 {
                         &mut tile.beta[..count],
                         &mut tile.transformed[..count],
                         &mut tile.projector,
-                        reborrow_executor(&mut executor),
+                        executor.as_deref_mut(),
                         check,
                     )?;
                     full_attention_tile(
@@ -794,7 +768,7 @@ impl Qwen35 {
                         &mut tile.attention[..count],
                         &mut tile.transformed[..count],
                         &mut tile.projector,
-                        reborrow_executor(&mut executor),
+                        executor.as_deref_mut(),
                         check,
                     )?;
                 }
@@ -828,7 +802,7 @@ impl Qwen35 {
                 &mut tile.attention[..count],
                 &mut tile.transformed[..count],
                 &tile.projector,
-                reborrow_executor(&mut executor),
+                executor.as_deref_mut(),
                 check,
             )? {
                 for (hidden, output) in tile.hidden[..count]
@@ -855,7 +829,7 @@ impl Qwen35 {
                     &mut tile.up[..count],
                     &mut tile.transformed[..count],
                     &mut tile.projector,
-                    reborrow_executor(&mut executor),
+                    executor.as_deref_mut(),
                     check,
                 )?;
                 check()?;
@@ -872,7 +846,7 @@ impl Qwen35 {
                     &mut tile.normalized[..count],
                     &mut tile.transformed[..count],
                     &mut tile.projector,
-                    reborrow_executor(&mut executor),
+                    executor.as_deref_mut(),
                     check,
                 )?;
                 for (hidden, output) in tile.hidden[..count]
@@ -910,7 +884,7 @@ impl Qwen35 {
                 logits,
                 &mut tile.transformed[..count],
                 &mut tile.projector,
-                reborrow_executor(&mut executor),
+                executor,
                 check,
             )?;
             for row in logits {
@@ -1006,7 +980,7 @@ fn recurrent_state_only_tile<'a>(
     count: usize,
     check: &dyn Fn() -> Result<()>,
     tile: &mut TiledPrefill,
-    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
 ) -> Result<()> {
     let (
         LayerState::Recurrent {
@@ -1035,7 +1009,7 @@ fn recurrent_state_only_tile<'a>(
         &mut tile.mixed[..count],
         &mut tile.transformed[..count],
         &mut tile.projector,
-        reborrow_executor(&mut executor),
+        executor.as_deref_mut(),
         check,
     )?;
     check()?;
@@ -1053,7 +1027,7 @@ fn recurrent_state_only_tile<'a>(
         &mut tile.alpha[..count],
         &mut tile.transformed[..count],
         &mut tile.projector,
-        reborrow_executor(&mut executor),
+        executor,
         check,
     )?;
     resize_into(history.len(), convolution)?;
@@ -2300,10 +2274,10 @@ fn project_tile_pair<'a>(
     outputs_b: &mut [Vec<f32>],
     transformed: &mut [Vec<f32>],
     projector: &mut ProjectionTile,
-    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
-    if let Some(exec) = reborrow_executor(&mut executor)
+    if let Some(exec) = executor.as_deref_mut()
         && tensors[0].kind == 142
         && tensors[1].kind == 142
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
@@ -2401,7 +2375,7 @@ fn project_tile_pair<'a>(
         outputs_a,
         transformed,
         projector,
-        reborrow_executor(&mut executor),
+        executor.as_deref_mut(),
         check,
     )?;
     check()?;
@@ -2418,7 +2392,7 @@ fn project_tile_pair<'a>(
         outputs_b,
         transformed,
         projector,
-        reborrow_executor(&mut executor),
+        executor,
         check,
     )
 }
@@ -2439,7 +2413,7 @@ fn try_project_tile_ffn_chain(
     outputs: &mut [Vec<f32>],
     transformed: &mut [Vec<f32>],
     projector: &ProjectionTile,
-    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<bool> {
     let [gate, up, down] = tensors;
@@ -2454,7 +2428,7 @@ fn try_project_tile_ffn_chain(
     {
         return Ok(false);
     }
-    let Some(exec) = reborrow_executor(&mut executor) else {
+    let Some(exec) = executor else {
         return Ok(false);
     };
     if !exec.supports_f32_ffn_chain(tensors) {
@@ -2515,11 +2489,11 @@ fn project_tile_ffn_swiglu<'a>(
     up_outputs: &mut [Vec<f32>],
     transformed: &mut [Vec<f32>],
     projector: &mut ProjectionTile,
-    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
     if !adapters.affects_any(&[gate, up])
-        && let Some(exec) = reborrow_executor(&mut executor)
+        && let Some(exec) = executor.as_deref_mut()
         && gate.kind == 142
         && up.kind == 142
         && transforms.basis(gate) == transforms.basis(up)
@@ -2732,10 +2706,10 @@ fn project_tile_triple<'a>(
     outputs_c: &mut [Vec<f32>],
     transformed: &mut [Vec<f32>],
     projector: &mut ProjectionTile,
-    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
-    if let Some(exec) = reborrow_executor(&mut executor)
+    if let Some(exec) = executor.as_deref_mut()
         && tensors[0].kind == 142
         && tensors[1].kind == 142
         && tensors[2].kind == 142
@@ -2849,7 +2823,7 @@ fn project_tile_triple<'a>(
         outputs_b,
         transformed,
         projector,
-        reborrow_executor(&mut executor),
+        executor.as_deref_mut(),
         check,
     )?;
     check()?;
@@ -2866,7 +2840,7 @@ fn project_tile_triple<'a>(
         outputs_c,
         transformed,
         projector,
-        reborrow_executor(&mut executor),
+        executor,
         check,
     )
 }
@@ -2888,7 +2862,7 @@ fn project_tile<'a>(
     outputs: &mut [Vec<f32>],
     transformed: &mut [Vec<f32>],
     projector: &mut ProjectionTile,
-    mut executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
     let basis = transforms.basis(tensor);
@@ -2908,7 +2882,7 @@ fn project_tile<'a>(
         transformed,
         projector.row_parallelism(),
     )?;
-    let prepared = if let Some(exec) = reborrow_executor(&mut executor) {
+    let prepared = if let Some(exec) = executor {
         let cols = tensor.dimensions.first().copied().unwrap_or(0);
         let rows = tensor
             .dimensions

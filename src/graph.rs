@@ -1601,7 +1601,7 @@ impl ActiveAdapters<'_> {
     }
 }
 
-struct Evaluation<'a, 'executor> {
+struct Evaluation<'a, 'executor, 'obj> {
     geometry: &'a Geometry,
     arithmetic: Arithmetic,
     transforms: &'a Transforms,
@@ -1611,7 +1611,7 @@ struct Evaluation<'a, 'executor> {
     projection: &'a mut ProjectionScratch,
     adapters: ActiveAdapters<'a>,
     adapter_scratch: &'a mut AdapterScratch,
-    executor: Option<&'executor mut dyn crate::kernels::Pq2ProjectionExecutor>,
+    executor: Option<&'executor mut (dyn crate::kernels::Pq2ProjectionExecutor + 'obj)>,
 }
 
 #[derive(Default)]
@@ -1873,7 +1873,7 @@ impl Transforms {
         geometry: &Geometry,
         mut outputs: [&mut Vec<f32>; N],
         scratch: &mut ProjectionScratch,
-        executor: &mut Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        executor: &mut Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     ) -> Result<()> {
         let mut pre_transformed = scratch.pre_transformed_len.take();
         let mut shared_transformed_ready = false;
@@ -3731,7 +3731,7 @@ impl Qwen35 {
         &mut self,
         token: u32,
         logits: Option<&mut Vec<f32>>,
-        executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
         probe: Option<&mut weight_patch::Intervention<'_>>,
     ) -> Result<()> {
         self.evaluate_token_recorded_with_executor(token, logits, executor, probe, None)
@@ -3741,7 +3741,7 @@ impl Qwen35 {
         &mut self,
         token: u32,
         logits: Option<&mut Vec<f32>>,
-        executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
         probe: Option<&mut weight_patch::Intervention<'_>>,
         timings: Option<&mut TokenTimings>,
     ) -> Result<()> {
@@ -3789,7 +3789,7 @@ impl Qwen35 {
     fn evaluate_hidden_with_executor(
         &mut self,
         logits: Option<&mut Vec<f32>>,
-        executor: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor>,
+        executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
         mut probe: Option<&mut weight_patch::Intervention<'_>>,
         mut timings: Option<&mut TokenTimings>,
         mrope_positions: [usize; 4],
@@ -4033,7 +4033,7 @@ impl Qwen35 {
     }
 }
 
-impl Evaluation<'_, '_> {
+impl Evaluation<'_, '_, '_> {
     fn adapter_affects_any(&self, tensors: &[&Tensor]) -> bool {
         self.adapters.affects_any(tensors)
     }

@@ -300,6 +300,7 @@ fn assert_zero_ulp(actual: &[f32], expected: &[f32], label: &str) {
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 fn pq2_q8k_exact_zero_ulp_parity_sdot_and_portable() -> TestResult {
     let tensor_small = build_pq2_tensor("test.pq2.512x137", 512, 137, true);
     let act_1 = build_q8k_activations(512, 1, 1);
@@ -403,6 +404,7 @@ fn pq2_q8k_exact_zero_ulp_parity_sdot_and_portable() -> TestResult {
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 fn pq2_q8_0_and_ptq1_exact_zero_ulp_parity_sdot_and_portable() -> TestResult {
     let pq2_odd = build_pq2_tensor("test.pq2.384x73", 384, 73, true);
     let q8_384 = build_q8_activations(384, 3);
@@ -608,6 +610,7 @@ fn synthetic_qwen35_model() -> Result<Model, Box<dyn std::error::Error + Send + 
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 fn qwen35_with_vulkan_executor_matches_cpu_logits_checkpoint_and_rollback() -> TestResult {
     let cpu_model = synthetic_qwen35_model()?;
     let gpu_model = synthetic_qwen35_model()?;
@@ -655,6 +658,7 @@ fn qwen35_with_vulkan_executor_matches_cpu_logits_checkpoint_and_rollback() -> T
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 fn gpu_quantize_q8k_4plane_matches_cpu_bit_for_bit() -> TestResult {
     use bonsai_adreno_vulkan::{AdrenoVulkanDevice, spirv};
     let mut device = AdrenoVulkanDevice::open()?;
@@ -739,6 +743,7 @@ fn gpu_quantize_q8k_4plane_matches_cpu_bit_for_bit() -> TestResult {
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 fn pq2_zero_f16_scale_block_accepted_and_matches_cpu() -> TestResult {
     let cols = 256_usize;
     let rows = 67_usize;
@@ -773,6 +778,7 @@ fn pq2_zero_f16_scale_block_accepted_and_matches_cpu() -> TestResult {
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 fn f32_direct_and_group_tokens_match_cpu() -> TestResult {
     let mut exec = VulkanPq2Executor::open_default(64 * 1024 * 1024)?;
     let cols = 512_usize;
@@ -847,6 +853,7 @@ fn f32_direct_and_group_tokens_match_cpu() -> TestResult {
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 fn f32_ffn_chain_hadamard_and_lora_match_cpu() -> TestResult {
     let mut exec = VulkanPq2Executor::open_default(64 * 1024 * 1024)?;
     let cols = 512_usize;
@@ -952,6 +959,7 @@ fn f32_ffn_chain_hadamard_and_lora_match_cpu() -> TestResult {
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 fn composite_executor_routes_overflow_layers_to_vulkan_executor() -> TestResult {
     struct MockNpuExecutor;
 
@@ -1030,6 +1038,7 @@ fn assert_close(actual: &[f32], expected: &[f32], max_tol: f32, label: &str) {
 }
 
 #[test]
+#[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
 #[expect(
     clippy::too_many_lines,
     reason = "Covers short fused, decomposed, causal, long-seq pipelined, and resource-limit parity."

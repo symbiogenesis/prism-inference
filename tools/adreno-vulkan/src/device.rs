@@ -1857,6 +1857,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
     fn opens_native_qualcomm_adreno_and_queries_capabilities() -> Result<(), Error> {
         let device = AdrenoVulkanDevice::open()?;
         let caps = device.capabilities();

@@ -205,7 +205,7 @@ impl ContextState {
         if p1 >= 0 && mem.entries.iter().any(|e| e.pos >= p1) {
             return false;
         }
-        if let Some((saved_entries, saved_rec)) = mem.rollback_snapshots.get(&p0).cloned() {
+        if let Some((saved_entries, saved_rec)) = mem.rollback_snapshots.remove(&p0) {
             mem.entries = saved_entries;
             mem.recurrent_state = saved_rec;
             mem.rollback_snapshots.clear();
@@ -642,8 +642,9 @@ fn linear_with_lora(
     for (adapter, user_scale) in loras {
         let a_name = format!("{stem}.lora_a");
         let b_name = format!("{stem}.lora_b");
-        if adapter.tensors.contains_key(&a_name) && adapter.tensors.contains_key(&b_name) {
-            let a_entry = &adapter.tensors[&a_name];
+        if let (Some(a_entry), Some(b_entry)) =
+            (adapter.tensors.get(&a_name), adapter.tensors.get(&b_name))
+        {
             let rank = usize::try_from(a_entry.ne[1].max(1))?;
             let alpha = adapter
                 .kvs
@@ -652,7 +653,7 @@ fn linear_with_lora(
                 .unwrap_or(1.0);
             let scale = f64::from(user_scale * alpha) / f64::from(u32::try_from(rank)?);
             let a_vals = a_entry.to_f32()?;
-            let b_vals = adapter.tensor_f32(&b_name)?;
+            let b_vals = b_entry.to_f32()?;
             let hidden = matvec_f64_round(&a_vals, input)?;
             let delta = matvec_f64_round(&b_vals, &hidden)?;
             for (dst, d) in out.iter_mut().zip(delta) {
@@ -907,16 +908,18 @@ fn project_logits(
             };
             let a_name = format!("{stem}.lora_a");
             let b_name = format!("{stem}.lora_b");
-            if adapter.tensors.contains_key(&a_name) && adapter.tensors.contains_key(&b_name) {
-                let rank = usize::try_from(adapter.tensors[&a_name].ne[1].max(1))?;
+            if let (Some(a_entry), Some(b_entry)) =
+                (adapter.tensors.get(&a_name), adapter.tensors.get(&b_name))
+            {
+                let rank = usize::try_from(a_entry.ne[1].max(1))?;
                 let alpha = adapter
                     .kvs
                     .get("general.lora.alpha")
                     .and_then(GgufValue::as_f32_coerce)
                     .unwrap_or(1.0);
                 let scale = f64::from(user_scale * alpha) / f64::from(u32::try_from(rank)?);
-                let hidden = matvec_f64_round(&adapter.tensor_f32(&a_name)?, final_h)?;
-                let delta = matvec_f64_round(&adapter.tensor_f32(&b_name)?, &hidden)?;
+                let hidden = matvec_f64_round(&a_entry.to_f32()?, final_h)?;
+                let delta = matvec_f64_round(&b_entry.to_f32()?, &hidden)?;
                 for (dst, d) in out.iter_mut().zip(delta) {
                     *dst = f64_to_f32(scale.mul_add(f64::from(d), f64::from(*dst)));
                 }
@@ -984,8 +987,8 @@ fn run_dspark_decode(
         let mut emb = embed_token(&model, drow.token)?;
         let is_mask = drow.token == model.mask_token_id;
         if let (Some(w1), Some(w2)) = (&snr_w1, &snr_w2) {
-            let cond = if let Some(cached) = two_row_cache.get(&is_mask) {
-                cached.clone()
+            let cond: &[f32] = if let Some(cached) = two_row_cache.get(&is_mask) {
+                cached
             } else {
                 let snr_val = if is_mask { 0.0_f32 } else { 1.0_f32 };
                 let in_dim = w1.len() / n_embd.max(1);
@@ -993,11 +996,10 @@ fn run_dspark_decode(
                 let h1 = matvec_f64_round(w1, &snr_in)?;
                 let silu: Vec<f32> = h1.into_iter().map(|x| x / (1.0 + (-x).exp())).collect();
                 let h2 = matvec_f64_round(w2, &silu)?;
-                two_row_cache.insert(is_mask, h2.clone());
-                h2
+                two_row_cache.entry(is_mask).or_insert(h2)
             };
-            fc2_all.extend_from_slice(&cond);
-            for (ei, &ci) in emb.iter_mut().zip(&cond) {
+            fc2_all.extend_from_slice(cond);
+            for (ei, &ci) in emb.iter_mut().zip(cond) {
                 *ei += ci;
             }
         }

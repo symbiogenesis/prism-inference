@@ -3,13 +3,12 @@
 //! Requests run on persistent native worker lanes. Rust controls each operation,
 //! callback decision and assertion; the bridge contains no test schedules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -20,7 +19,6 @@ use super::{Result, invalid};
 
 const MAX_FRAME: u64 = 16 * 1024 * 1024;
 const MAX_STREAM: u64 = 64 * 1024 * 1024;
-const MAX_STDERR: u64 = 1024 * 1024;
 // Real-eval retains one model/speculation scope across all24 source prompts;
 // its default96-token AR and verify schedules require at most~33k primitives.
 const MAX_REQUESTS: u64 = 65536;
@@ -82,14 +80,123 @@ struct Pending {
     timeout: Duration,
 }
 
+struct PipeBuffer {
+    bytes: VecDeque<u8>,
+    closed_writer: bool,
+    closed_reader: bool,
+}
+
+struct PipeChannel {
+    buf: Mutex<PipeBuffer>,
+    cv: Condvar,
+}
+
+struct PipeReader {
+    chan: Arc<PipeChannel>,
+}
+
+struct PipeWriter {
+    chan: Arc<PipeChannel>,
+}
+
+fn duplex_pipe() -> (PipeWriter, PipeReader) {
+    let chan = Arc::new(PipeChannel {
+        buf: Mutex::new(PipeBuffer {
+            bytes: VecDeque::new(),
+            closed_writer: false,
+            closed_reader: false,
+        }),
+        cv: Condvar::new(),
+    });
+    (
+        PipeWriter {
+            chan: Arc::clone(&chan),
+        },
+        PipeReader { chan },
+    )
+}
+
+impl Read for PipeReader {
+    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        let mut g = self
+            .chan
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while g.bytes.is_empty() && !g.closed_writer {
+            g = self
+                .chan
+                .cv
+                .wait(g)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let n = dst.len().min(g.bytes.len());
+        for slot in dst.iter_mut().take(n) {
+            *slot = g.bytes.pop_front().unwrap_or(0);
+        }
+        drop(g);
+        Ok(n)
+    }
+}
+
+impl Drop for PipeReader {
+    fn drop(&mut self) {
+        let mut g = self
+            .chan
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.closed_reader = true;
+        drop(g);
+        self.chan.cv.notify_all();
+    }
+}
+
+impl Write for PipeWriter {
+    fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+        let mut g = self
+            .chan
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.closed_reader {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session pipe reader closed",
+            ));
+        }
+        g.bytes.extend(src);
+        drop(g);
+        self.chan.cv.notify_all();
+        Ok(src.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for PipeWriter {
+    fn drop(&mut self) {
+        let mut g = self
+            .chan
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.closed_writer = true;
+        drop(g);
+        self.chan.cv.notify_all();
+    }
+}
+
 struct Writer {
-    stdin: Option<ChildStdin>,
+    stdin: Option<PipeWriter>,
     log: File,
     bytes: u64,
 }
 
 struct State {
-    child: Mutex<Child>,
+    server: Mutex<Option<JoinHandle<Result<()>>>>,
     writer: Mutex<Writer>,
     pending: Mutex<HashMap<u64, Pending>>,
     fatal: Mutex<Option<String>>,
@@ -102,7 +209,7 @@ struct State {
 }
 
 // All transport mutations are short and contain no user callbacks. A poisoned
-// lock is still recovered for mandatory kill/reap and pending-request cleanup.
+// lock is still recovered for mandatory close and pending-request cleanup.
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
         .lock()
@@ -122,9 +229,7 @@ impl State {
         for (_, request) in pending {
             let _ = request.sender.send(Err(message.clone()));
         }
-        // Never acquire writer here: killing the child must also interrupt a
-        // pipe write that is blocked because the native reader stopped.
-        let _ = lock(&self.child).kill();
+        let _ = lock(&self.writer).stdin.take();
     }
 
     fn check(&self) -> Result<()> {
@@ -422,24 +527,6 @@ fn read_stdout(state: &State, output: impl Read, mut log: File) -> Result<()> {
     }
 }
 
-fn read_stderr(state: &State, mut stderr: impl Read, mut log: File) -> Result<()> {
-    let mut total = 0_u64;
-    let mut bytes = [0; 16384];
-    loop {
-        let count = stderr.read(&mut bytes)?;
-        if count == 0 {
-            return Ok(());
-        }
-        total = total
-            .checked_add(u64::try_from(count)?)
-            .filter(|bytes| *bytes <= MAX_STDERR)
-            .ok_or_else(|| invalid("native session stderr exceeds bound"))?;
-        log.write_all(&bytes[..count])?;
-        log.flush()?;
-        state.check()?;
-    }
-}
-
 pub(super) struct ModelSession {
     state: Arc<State>,
     readers: Vec<JoinHandle<()>>,
@@ -487,28 +574,23 @@ impl ModelSession {
         validate_environment(environment)?;
         let request_log = File::create(spec.evidence_directory.join("requests.jsonl"))?;
         let response_log = File::create(spec.evidence_directory.join("responses.jsonl"))?;
-        let error_log = File::create(spec.evidence_directory.join("stderr.log"))?;
-        let mut child = Command::new(&spec.executable)
-            .arg("--model-session")
-            .envs(environment.iter().map(|(key, value)| (key, value)))
-            .current_dir(&spec.evidence_directory)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        // std::process guarantees these handles for Stdio::piped. Keep explicit
-        // cleanup for an unexpected platform failure instead of leaking a child.
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(invalid("native session pipe creation failed"));
-        };
+        let _error_log = File::create(spec.evidence_directory.join("stderr.log"))?;
+        let (to_server_tx, to_server_rx) = duplex_pipe();
+        let (to_client_tx, to_client_rx) = duplex_pipe();
+        let server_dir = spec.evidence_directory.clone();
+        let initial_env = environment.to_vec();
+        let server = thread::spawn(move || {
+            super::reference_model_runtime::run_framed_session_with_env(
+                to_server_rx,
+                to_client_tx,
+                &server_dir,
+                &initial_env,
+            )
+        });
         let state = Arc::new(State {
-            child: Mutex::new(child),
+            server: Mutex::new(Some(server)),
             writer: Mutex::new(Writer {
-                stdin: Some(stdin),
+                stdin: Some(to_server_tx),
                 log: request_log,
                 bytes: 0,
             }),
@@ -529,14 +611,8 @@ impl ModelSession {
         let mut readers = Vec::new();
         let output_state = Arc::clone(&state);
         readers.push(thread::spawn(move || {
-            if let Err(error) = read_stdout(&output_state, stdout, response_log) {
+            if let Err(error) = read_stdout(&output_state, to_client_rx, response_log) {
                 output_state.fail(format!("native session stdout: {error}"));
-            }
-        }));
-        let error_state = Arc::clone(&state);
-        readers.push(thread::spawn(move || {
-            if let Err(error) = read_stderr(&error_state, stderr, error_log) {
-                error_state.fail(format!("native session stderr: {error}"));
             }
         }));
         let watchdog_state = Arc::clone(&state);
@@ -555,20 +631,13 @@ impl ModelSession {
         }
     }
 
-    fn wait_for_exit(&self) -> Result<ExitStatus> {
-        let started = Instant::now();
-        loop {
-            let status = lock(&self.state.child).try_wait()?;
-            if let Some(status) = status {
-                return Ok(status);
-            }
-            if started.elapsed() >= SHUTDOWN_TIMEOUT {
-                self.state
-                    .fail("native session did not exit after shutdown");
-                return Ok(lock(&self.state.child).wait()?);
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+    fn wait_for_exit(&self) -> Result<()> {
+        let Some(handle) = lock(&self.state.server).take() else {
+            return Ok(());
+        };
+        handle
+            .join()
+            .map_err(|_| invalid("in-process model session thread panicked"))?
     }
 
     fn join(&mut self) -> Result<()> {
@@ -596,14 +665,19 @@ impl ModelSession {
             self.state
                 .fail(format!("native shutdown write failed: {error}"));
         }
-        let status = self.wait_for_exit()?;
+        let server_res = self.wait_for_exit();
         self.join()?;
         self.finished = true;
         let fatal = lock(&self.state.fatal).clone();
+        let exit_code = if server_res.is_ok() && fatal.is_none() {
+            Some(0_i32)
+        } else {
+            Some(1_i32)
+        };
         fs::write(
             self.evidence_directory().join("session.json"),
             serde_json::to_vec_pretty(&json!({
-            "SchemaVersion":1,"ExitCode":status.code(),"Requests":self.state.next_id.load(Ordering::Relaxed) - 1,
+            "SchemaVersion":1,"ExitCode":exit_code,"Requests":self.state.next_id.load(Ordering::Relaxed) - 1,
                 "ElapsedMilliseconds":self.state.started.elapsed().as_millis(),"Error":fatal,
                 "QuantizationScope":self.state.quantization,"SessionTimeoutSeconds":self.state.session_timeout.as_secs(),
             }))?,
@@ -611,9 +685,7 @@ impl ModelSession {
         if let Some(error) = fatal {
             return Err(invalid(error));
         }
-        if !status.success() {
-            return Err(invalid(format!("native session exited with {status}")));
-        }
+        server_res?;
         Ok(())
     }
 }
@@ -660,7 +732,7 @@ impl Drop for ModelSession {
         if !self.finished {
             self.state
                 .fail("native session dropped before successful finish");
-            let _ = lock(&self.state.child).wait();
+            let _ = self.wait_for_exit();
             let _ = self.join();
         }
     }

@@ -208,8 +208,10 @@ pub(super) fn supports(id: &str) -> bool {
         || id == super::reference_chat_parser::ID
         || id == super::reference_chat_auto::ID
         || id == super::reference_chat::ID
+        || id == super::reference_llguidance::ID
         || super::reference_backend_ops::IDS.contains(&id)
         || super::reference_vocab::IDS.contains(&id)
+        || super::reference_model_runtime::IDS.contains(&id)
 }
 
 pub(super) fn handles(value: &Value) -> bool {
@@ -254,12 +256,61 @@ pub(super) fn handles(value: &Value) -> bool {
 }
 
 pub(super) fn identity() -> Value {
-    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": [MTP_ID, super::reference_reasoning::ID, super::reference_sampling::ID, super::reference_logging::ID, super::reference_mtmd::ID, super::reference_mtmd_chunks::ID, super::reference_dspark_logsnr::ID, super::reference_optimizer::ID, super::reference_gguf::ID, super::reference_grammar_parser::ID, super::reference_jinja::ID, super::reference_chat_templates::ID, super::reference_chat_analysis::ID, super::reference_grammar::IDS[0], super::reference_grammar::IDS[1], super::reference_json_schema::IDS[0], super::reference_json_schema::IDS[1], super::reference_threadpool::ID, super::reference_batch_allocator::ID, super::reference_allocation::ID, super::reference_quantization::ID, super::reference_unicode::ID, super::reference_arena_graph::ID, super::reference_tensor_graph::IDS[0], super::reference_tensor_graph::IDS[1], super::reference_tensor_graph::IDS[2], super::reference_public_c_abi::ID, super::reference_arg_parser::ID, super::reference_model_resolution::ID, super::reference_codec::IDS[0], super::reference_codec::IDS[1], super::reference_codec_buffers::IDS[0], super::reference_codec_buffers::IDS[1], super::reference_peg::IDS[0], super::reference_peg::IDS[1], super::reference_peg::IDS[2], super::reference_peg::IDS[3], super::reference_peg::IDS[4], super::reference_peg::IDS[5], super::reference_peg::IDS[6], super::reference_chat_parser::ID, super::reference_chat_auto::ID, super::reference_chat::ID, super::reference_vocab::IDS[0], super::reference_vocab::IDS[1], super::reference_vocab::IDS[2], super::reference_backend_ops::IDS[0], super::reference_backend_ops::IDS[1]],
+    let mut supported_ids = vec![
+        MTP_ID,
+        super::reference_reasoning::ID,
+        super::reference_sampling::ID,
+        super::reference_logging::ID,
+        super::reference_mtmd::ID,
+        super::reference_mtmd_chunks::ID,
+        super::reference_dspark_logsnr::ID,
+        super::reference_optimizer::ID,
+        super::reference_gguf::ID,
+        super::reference_grammar_parser::ID,
+        super::reference_jinja::ID,
+        super::reference_chat_templates::ID,
+        super::reference_chat_analysis::ID,
+        super::reference_grammar::IDS[0],
+        super::reference_grammar::IDS[1],
+        super::reference_json_schema::IDS[0],
+        super::reference_json_schema::IDS[1],
+        super::reference_threadpool::ID,
+        super::reference_batch_allocator::ID,
+        super::reference_allocation::ID,
+        super::reference_quantization::ID,
+        super::reference_unicode::ID,
+        super::reference_arena_graph::ID,
+        super::reference_tensor_graph::IDS[0],
+        super::reference_tensor_graph::IDS[1],
+        super::reference_tensor_graph::IDS[2],
+        super::reference_public_c_abi::ID,
+        super::reference_arg_parser::ID,
+        super::reference_model_resolution::ID,
+        super::reference_codec::IDS[0],
+        super::reference_codec::IDS[1],
+        super::reference_codec_buffers::IDS[0],
+        super::reference_codec_buffers::IDS[1],
+        super::reference_peg::IDS[0],
+        super::reference_peg::IDS[1],
+        super::reference_peg::IDS[2],
+        super::reference_peg::IDS[3],
+        super::reference_peg::IDS[4],
+        super::reference_peg::IDS[5],
+        super::reference_peg::IDS[6],
+        super::reference_chat_parser::ID,
+        super::reference_chat_auto::ID,
+        super::reference_chat::ID,
+        super::reference_llguidance::ID,
+    ];
+    supported_ids.extend_from_slice(super::reference_vocab::IDS);
+    supported_ids.extend_from_slice(super::reference_backend_ops::IDS);
+    supported_ids.extend_from_slice(super::reference_model_runtime::IDS);
+    json!({"Kind": "independent-rust-reference", "SupportedSourceIds": supported_ids,
         "UpstreamCommit": super::UPSTREAM,
         "ProductionSource": {"Path": "common/speculative.cpp", "Bytes": 183_232, "Sha256": SOURCE_SHA256},
         "AssertionSource": {"Path": MTP_ID, "Bytes": 812, "Sha256": TEST_SHA256},
         "Arithmetic": "nonnegative-capacity-minus-reserved-anchors-v1",
-        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_sampling::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity(), super::reference_dspark_logsnr::identity(), super::reference_optimizer::identity(), super::reference_gguf::identity(), super::reference_grammar_parser::identity(), super::reference_jinja::identity(), super::reference_chat_templates::identity(), super::reference_chat_analysis::identity(), super::reference_grammar::identity(), super::reference_json_schema::identity(), super::reference_threadpool::identity(), super::reference_batch_allocator::identity(), super::reference_allocation::identity(), super::reference_quantization::identity(), super::reference_unicode::identity(), super::reference_arena_graph::identity(), super::reference_tensor_graph::identity(), super::reference_public_c_abi::identity(), super::reference_arg_parser::identity(), super::reference_model_resolution::identity(), super::reference_codec::identity(), super::reference_codec_buffers::identity(), super::reference_peg::identity(), super::reference_chat_parser::identity(), super::reference_chat_auto::identity(), super::reference_chat::identity(), super::reference_vocab::identity(), super::reference_backend_ops::identity()],
+        "AdditionalProviders": [super::reference_reasoning::identity(), super::reference_sampling::identity(), super::reference_logging::identity(), super::reference_mtmd::identity(), super::reference_mtmd_chunks::identity(), super::reference_dspark_logsnr::identity(), super::reference_optimizer::identity(), super::reference_gguf::identity(), super::reference_grammar_parser::identity(), super::reference_jinja::identity(), super::reference_chat_templates::identity(), super::reference_chat_analysis::identity(), super::reference_grammar::identity(), super::reference_json_schema::identity(), super::reference_threadpool::identity(), super::reference_batch_allocator::identity(), super::reference_allocation::identity(), super::reference_quantization::identity(), super::reference_unicode::identity(), super::reference_arena_graph::identity(), super::reference_tensor_graph::identity(), super::reference_public_c_abi::identity(), super::reference_arg_parser::identity(), super::reference_model_resolution::identity(), super::reference_codec::identity(), super::reference_codec_buffers::identity(), super::reference_peg::identity(), super::reference_chat_parser::identity(), super::reference_chat_auto::identity(), super::reference_chat::identity(), super::reference_vocab::identity(), super::reference_backend_ops::identity(), super::reference_llguidance::identity(), super::reference_model_runtime::identity()],
         "NativeReferenceReplay": false, "ProductionRuntimeCalled": false,
         "CompleteSourceGate": false, "NativeRetirementQualified": false})
 }
@@ -272,11 +323,11 @@ mod tests {
     #[test]
     fn independent_mtp_provider_preserves_all_six_source_assertions_and_signed_boundaries()
     -> Result<()> {
-        let engine = Engine::new(Target::RustReference, None, None, None, None, None)?;
+        let engine = Engine::new(Target::RustReference, None, None, None, None)?;
         let report = crate::common::run_mtp(&engine)?;
         assert_eq!(report["Id"], MTP_ID);
         assert_eq!(report["Status"], "pass", "{report}");
-        let reference_arm = Engine::new(Target::Cpp, None, None, None, None, None)?;
+        let reference_arm = Engine::new(Target::Cpp, None, None, None, None)?;
         assert_eq!(crate::common::run_mtp(&reference_arm)?, report);
         for (batch, demand, anchors, expected) in [
             (1, 0, 0, true),
@@ -337,7 +388,6 @@ mod tests {
             benchmark: None,
             diagnostic: None,
             bridge: None,
-            common_bridge: None,
             evidence_directory: None,
             source_directory: None,
             asset_directory: None,
@@ -349,19 +399,9 @@ mod tests {
         options.case = crate::CASES.iter().find(|case| !supports(case.id));
         assert!(options.validate().is_err());
         options.case = crate::CASES.iter().find(|case| case.id == MTP_ID);
-        options.common_bridge = Some(std::env::temp_dir().join("unused-native-bridge"));
+        options.bridge = Some(std::env::temp_dir().join("unused-native-bridge"));
         assert!(options.validate().is_err());
-        assert!(
-            Engine::new(
-                Target::RustReference,
-                None,
-                options.common_bridge,
-                None,
-                None,
-                None
-            )
-            .is_err()
-        );
+        assert!(Engine::new(Target::RustReference, options.bridge, None, None, None).is_err());
         Ok(())
     }
 }

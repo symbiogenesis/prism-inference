@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn independent_logger_preserves_source_schedule_and_reference_arm() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::logging::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

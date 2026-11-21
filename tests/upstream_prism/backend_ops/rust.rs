@@ -320,7 +320,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>(),
         )?;
-        let engine = Engine::new(Target::Rust, None, None, None, None, None)?;
+        let engine = Engine::new(Target::Rust, None, None, None, None)?;
         let outcome = transport::with_session(&engine, &directory, |session| {
             let observed=session.exchange(vec![
                 json!({"Op":"context-init","Id":1,"MemoryBytes":1_048_576,"NoAlloc":true}),
@@ -369,7 +369,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir(&directory)?;
-        let engine = Engine::new(Target::Rust, None, None, None, None, None)?;
+        let engine = Engine::new(Target::Rust, None, None, None, None)?;
         let (program, geometries) = program::load().map_err(invalid)?;
         let geometry = &geometries.eval[0];
         let outcome = transport::with_session(&engine, &directory, |session| {
@@ -408,7 +408,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("prism-rust-q4-cpy-{}-{nonce}", std::process::id()));
         fs::create_dir(&directory)?;
-        let engine = Engine::new(Target::Rust, None, None, None, None, None)?;
+        let engine = Engine::new(Target::Rust, None, None, None, None)?;
         let (program, geometries) = program::load().map_err(invalid)?;
         let geometry = &geometries.eval[INDEX];
         assert_eq!(geometry.class, "test_cpy");
@@ -459,16 +459,8 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir(&directory)?;
-        // An explicit immutable production bridge enables the same focused
-        // reproduction against C++; ordinary CI runs the Rust backend here.
-        let bridge = std::env::var_os("PRISM_FOCUSED_COMMON_BRIDGE").map(std::path::PathBuf::from);
-        let retain_native_evidence = bridge.is_some();
-        let target = if bridge.is_some() {
-            Target::Cpp
-        } else {
-            Target::Rust
-        };
-        let engine = Engine::new(target, None, bridge, Some(directory.clone()), None, None)?;
+        let retain_native_evidence = false;
+        let engine = Engine::new(Target::Rust, None, Some(directory.clone()), None, None)?;
         let (program, geometries) = program::load().map_err(invalid)?;
         let geometry = &geometries.eval[INDEX];
         assert_eq!(geometry.class, "test_argsort");

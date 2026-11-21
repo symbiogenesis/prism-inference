@@ -3052,7 +3052,7 @@ mod tests {
     #[test]
     fn independent_chat_auto_parser_passes_all_groups_on_rust_reference_and_cpp() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::chat_auto::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

@@ -1358,7 +1358,7 @@ mod tests {
     #[test]
     fn independent_arg_parser_passes_complete_test_arg_parser_suite() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::arg_parser::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

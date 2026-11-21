@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn independent_arena_graph_preserves_all_48_source_cases_and_both_arms() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::moe_reduce::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

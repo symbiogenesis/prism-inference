@@ -3572,7 +3572,7 @@ mod tests {
             (crate::peg::run_all, IDS[6]),
         ];
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             for (runner, expected_id) in suites {
                 let report = runner(&engine)?;
                 assert_eq!(report["Id"], expected_id);

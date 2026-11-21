@@ -7855,7 +7855,7 @@ mod tests {
     #[test]
     fn independent_codec_passes_quantize_fns_and_ptq_cuda_across_targets() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let quantize_report = crate::codec_assertions::run_quantize(&engine)?;
             assert_eq!(quantize_report["Id"], IDS[0]);
             assert_eq!(quantize_report["Status"], "pass", "{quantize_report}");

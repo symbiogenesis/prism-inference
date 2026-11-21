@@ -1760,7 +1760,7 @@ mod tests {
     fn independent_chat_templates_passes_all_73_source_conditions_across_reference_arms()
     -> Result<()> {
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::chat_template::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

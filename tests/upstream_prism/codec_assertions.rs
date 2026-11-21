@@ -1069,14 +1069,7 @@ mod tests {
 
     #[test]
     fn available_inventory_and_unavailable_cpu_quantizer_report_failed_source() -> Result<()> {
-        let engine = Engine::new(
-            super::super::engine::Target::Rust,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let engine = Engine::new(super::super::engine::Target::Rust, None, None, None, None)?;
         let report = run_quantize(&engine)?;
         assert_eq!(report["Id"], QUANTIZE_ID);
         assert_eq!(report["Status"], "fail");

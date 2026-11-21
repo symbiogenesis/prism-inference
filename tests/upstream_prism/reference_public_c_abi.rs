@@ -180,18 +180,18 @@ mod tests {
 
     #[test]
     fn independent_public_c_abi_passes_on_reference_and_cpp_while_rust_fails() -> Result<()> {
-        let reference = Engine::new(Target::RustReference, None, None, None, None, None)?;
+        let reference = Engine::new(Target::RustReference, None, None, None, None)?;
         let reference_report = crate::public_c::run(&reference)?;
         assert_eq!(reference_report["Id"], ID);
         assert_eq!(reference_report["Status"], "pass", "{reference_report}");
 
-        let cpp = Engine::new(Target::Cpp, None, None, None, None, None)?;
+        let cpp = Engine::new(Target::Cpp, None, None, None, None)?;
         let cpp_report = crate::public_c::run(&cpp)?;
         assert_eq!(cpp_report["Id"], ID);
         assert_eq!(cpp_report["Status"], "pass", "{cpp_report}");
         assert_eq!(cpp_report, reference_report);
 
-        let rust = Engine::new(Target::Rust, None, None, None, None, None)?;
+        let rust = Engine::new(Target::Rust, None, None, None, None)?;
         let rust_report = crate::public_c::run(&rust)?;
         assert_eq!(rust_report["Id"], ID);
         assert_eq!(rust_report["Status"], "fail", "{rust_report}");

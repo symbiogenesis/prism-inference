@@ -5,22 +5,10 @@
 //! runs incremental Earley traversal over vocabulary byte tries while preserving raw candidate
 //! bit patterns (`-0.0`, quiet/signaling NaN payloads).
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Wired into ReferenceModelSession in Commit 4.")
-)]
 #[path = "reference_llguidance/candidates.rs"]
 mod candidates;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Wired into ReferenceModelSession in Commit 4.")
-)]
 #[path = "reference_llguidance/grammar.rs"]
 mod grammar;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Wired into ReferenceModelSession in Commit 4.")
-)]
 #[path = "reference_llguidance/json_ast.rs"]
 mod json_ast;
 
@@ -36,13 +24,6 @@ use super::{Result, invalid};
 use candidates::{CandidateBuffer, CopyEncoding};
 use grammar::{EarleyState, Grammar};
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Reported in Commit 4 reference provider identity."
-    )
-)]
 pub(super) const ID: &str = "tests/test-grammar-llguidance.cpp";
 const SOURCE_SHA256: &str = "050d42e1577bdb537bd8c133e3a71354d5b64a9ea5cc8606962531095e28d56f";
 
@@ -60,10 +41,6 @@ pub(super) struct VocabTrie {
 }
 
 impl VocabTrie {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Wired into ReferenceModelSession in Commit 4.")
-    )]
     pub(super) fn build(vocab: Arc<ReferenceVocab>) -> Result<Self> {
         let count = vocab.vocab_size();
         let mut nodes = vec![TrieNode::default()];
@@ -288,10 +265,6 @@ enum Sampler {
 }
 
 /// Self-contained `LLGuidance` session state stored per `ReferenceModelSession`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Wired into ReferenceModelSession in Commit 4.")
-)]
 pub(super) struct LlgRegistry {
     next_id: u64,
     candidates: BTreeMap<u64, CandidateBuffer>,
@@ -299,10 +272,6 @@ pub(super) struct LlgRegistry {
     trie_cache: BTreeMap<usize, Arc<VocabTrie>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Wired into ReferenceModelSession in Commit 4.")
-)]
 impl LlgRegistry {
     pub(super) const fn new() -> Self {
         Self {
@@ -617,13 +586,6 @@ fn parse_indices(value: &Value) -> Result<Vec<usize>> {
 }
 
 /// Honest scope identity for `reference_llguidance`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Included in ReferenceProvider identity when wired in Commit 4."
-    )
-)]
 pub(super) fn identity() -> Value {
     json!({
         "Kind": "independent-rust-reference",

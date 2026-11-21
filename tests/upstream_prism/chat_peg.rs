@@ -893,28 +893,14 @@ mod tests {
     use super::*;
     #[test]
     fn production_original_chat_peg() -> Result<()> {
-        let engine = Engine::new(
-            super::super::engine::Target::Rust,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let engine = Engine::new(super::super::engine::Target::Rust, None, None, None, None)?;
         let report = run(&engine)?;
         assert_eq!(report["Status"], "pass", "{report:?}");
         Ok(())
     }
     #[test]
     fn production_original_chat_tags_and_permutations() -> Result<()> {
-        let engine = Engine::new(
-            super::super::engine::Target::Rust,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let engine = Engine::new(super::super::engine::Target::Rust, None, None, None, None)?;
         let fixture = fixture()?;
         let mut assertions = Assertions::default();
         run_tagged(&engine, &fixture, &mut assertions)?;

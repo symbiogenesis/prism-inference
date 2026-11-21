@@ -2786,7 +2786,7 @@ mod tests {
     fn independent_chat_peg_parser_passes_all_seven_groups_on_rust_reference_and_cpp() -> Result<()>
     {
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::chat_peg::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

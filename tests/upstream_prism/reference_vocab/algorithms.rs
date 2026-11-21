@@ -17,7 +17,7 @@ const MAX_TOKENS_OUTPUT: usize = 262_144;
 const MAX_VOCAB_SIZE: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum VocabType {
+pub(in super::super) enum VocabType {
     None = 0,
     Spm = 1,
     Bpe = 2,
@@ -349,32 +349,26 @@ impl ReferenceVocab {
         })
     }
 
-    #[expect(
-        dead_code,
-        reason = "Session metadata helpers are used across subsequent tokenizer/llguidance/model session adapters."
-    )]
-    pub(super) const fn vocab_type(&self) -> VocabType {
+    pub(in super::super) const fn vocab_type(&self) -> VocabType {
         self.vocab_type
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Session metadata helpers are used across subsequent tokenizer/llguidance/model session adapters."
-        )
-    )]
+    pub(in super::super) const fn vocab_type_i32(&self) -> i32 {
+        match self.vocab_type {
+            VocabType::None => 0,
+            VocabType::Spm => 1,
+            VocabType::Bpe => 2,
+            VocabType::Wpm => 3,
+            VocabType::Ugm => 4,
+            VocabType::Rwkv => 5,
+            VocabType::Plamo2 => 6,
+        }
+    }
+
     pub(in super::super) const fn vocab_size(&self) -> usize {
         self.entries.len()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Session metadata helpers are used across subsequent tokenizer/llguidance/model session adapters."
-        )
-    )]
     pub(in super::super) fn is_control(&self, token: i32) -> bool {
         usize::try_from(token)
             .ok()
@@ -382,13 +376,6 @@ impl ReferenceVocab {
             .is_some_and(|entry| entry.kind == TokenType::Control)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Session metadata helpers are used across subsequent tokenizer/llguidance/model session adapters."
-        )
-    )]
     pub(in super::super) fn is_eog(&self, token: i32) -> bool {
         Some(token) == self.eos
             || Some(token) == self.eot
@@ -466,13 +453,6 @@ impl ReferenceVocab {
         Some(mask)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Session piece helpers are used across subsequent tokenizer/llguidance/model session adapters."
-        )
-    )]
     pub(in super::super) fn token_to_piece(
         &self,
         token: i32,
@@ -547,7 +527,7 @@ impl ReferenceVocab {
         }
     }
 
-    pub(super) fn detokenize(
+    pub(in super::super) fn detokenize(
         &self,
         tokens: &[i32],
         remove_special: bool,

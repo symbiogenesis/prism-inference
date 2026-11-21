@@ -745,14 +745,7 @@ mod tests {
         }
 
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(
-                target,
-                None,
-                None,
-                None,
-                Some(dir.path().to_path_buf()),
-                None,
-            )?;
+            let engine = Engine::new(target, None, None, Some(dir.path().to_path_buf()), None)?;
             let report = crate::chat_analysis::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

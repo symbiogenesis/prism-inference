@@ -28,11 +28,12 @@ use serde_json::{Value, json};
 
 use super::llama_grammar::{array, exact_fields, field, uint};
 use super::{Result, invalid};
-pub(super) use algorithms::ReferenceVocab;
+pub(super) use algorithms::{ReferenceVocab, VocabType};
 
 /// Upstream source routes backed by the file-mode vocabulary provider.
 pub(super) const IDS: &[&str] = &[
     "tests/test-tokenizer-0.cpp",
+    "tests/test-tokenizer-0.py",
     "tests/test-tokenizer-0.sh",
     "tests/test-tokenizers-repo.sh",
 ];
@@ -52,13 +53,6 @@ const MAX_RETURNED_TOKENS: usize = 262_144;
 const MAX_DETOKENIZED_BYTES: usize = 1024 * 1024;
 
 /// Loads a bounded GGUF v2/v3 vocabulary independently from disk.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Also consumed directly by upcoming persistent session reference modules."
-    )
-)]
 pub(super) fn load_gguf_vocab(path: &Path) -> Result<Arc<ReferenceVocab>> {
     let meta = gguf::read_vocabulary_metadata(path, MAX_GGUF_FILE_BYTES)?;
     Ok(Arc::new(ReferenceVocab::from_metadata(&meta)?))

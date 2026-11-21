@@ -1457,7 +1457,7 @@ mod tests {
     #[test]
     fn independent_tensor_graph_preserves_col2im_dfly_and_rope_suites() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             for runner in [
                 crate::numerics::run_col2im,
                 crate::numerics::run_dfly,

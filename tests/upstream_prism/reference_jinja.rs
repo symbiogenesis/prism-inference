@@ -5220,7 +5220,7 @@ mod tests {
     fn independent_jinja_provider_passes_complete_test_jinja_suite_across_reference_arms()
     -> Result<()> {
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::jinja::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

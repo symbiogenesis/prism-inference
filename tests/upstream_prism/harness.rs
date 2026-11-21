@@ -111,6 +111,7 @@ mod reference_json_schema;
 mod reference_llguidance;
 mod reference_logging;
 mod reference_model_resolution;
+mod reference_model_runtime;
 mod reference_mtmd;
 mod reference_mtmd_chunks;
 mod reference_optimizer;
@@ -147,7 +148,6 @@ const MTMD_ID: &str = "tests/test-mtmd-impl.cpp";
 enum Bridge {
     Independent,
     Ggml,
-    Common,
 }
 
 struct Case {
@@ -187,7 +187,7 @@ const CASES: &[Case] = &[
     register(
         "test-tokenizer-random",
         "tests/test-tokenizer-random.py",
-        Bridge::Common,
+        Bridge::Independent,
         tokenizer_random::run,
     ),
     register(
@@ -217,43 +217,43 @@ const CASES: &[Case] = &[
     register(
         "test-lora-conversion-inference",
         "tests/test-lora-conversion-inference.sh",
-        Bridge::Common,
+        Bridge::Independent,
         lora_conversion::run,
     ),
     register(
         "test-backend-sampler",
         "tests/test-backend-sampler.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         backend_sampler::run,
     ),
     register(
         "test-export-graph-ops",
         "tests/test-export-graph-ops.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         export_graph::run,
     ),
     register(
         "test-dspark-forward",
         "tests/test-dspark-forward.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         dspark_forward::run,
     ),
     register(
         "test-dspark-loop",
         "tests/test-dspark-loop.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         dspark_loop::run,
     ),
     register(
         "test-dspark-real-eval",
         "tests/test-dspark-real-eval.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         dspark_real::run,
     ),
     register(
         "test-grammar-llguidance",
         "tests/test-grammar-llguidance.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         llguidance::run,
     ),
     register(
@@ -283,13 +283,13 @@ const CASES: &[Case] = &[
     register(
         "test-llama-archs",
         "tests/test-llama-archs.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         architectures::run,
     ),
     register(
         "test-recurrent-state-rollback",
         "tests/test-recurrent-state-rollback.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         recurrent_rollback::run,
     ),
     register(
@@ -301,7 +301,7 @@ const CASES: &[Case] = &[
     register(
         "test-kv-mean-center",
         "tests/test-kv-mean-center.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         kv_mean_center::run,
     ),
     register(
@@ -349,13 +349,13 @@ const CASES: &[Case] = &[
     register(
         "test-tokenizer-1-spm",
         "tests/test-tokenizer-1-spm.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         tokenizer_roundtrip::run_spm,
     ),
     register(
         "test-tokenizer-1-bpe",
         "tests/test-tokenizer-1-bpe.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         tokenizer_roundtrip::run_bpe,
     ),
     register(
@@ -367,31 +367,31 @@ const CASES: &[Case] = &[
     register(
         "test-autorelease",
         "tests/test-autorelease.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         |engine| model_lifecycle::run(engine, "tests/test-autorelease.cpp"),
     ),
     register(
         "test-model-load-cancel",
         "tests/test-model-load-cancel.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         |engine| model_lifecycle::run(engine, "tests/test-model-load-cancel.cpp"),
     ),
     register(
         "test-save-load-state",
         "tests/test-save-load-state.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         |engine| model_lifecycle::run(engine, "tests/test-save-load-state.cpp"),
     ),
     register(
         "test-state-restore-fragmented",
         "tests/test-state-restore-fragmented.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         |engine| model_lifecycle::run(engine, "tests/test-state-restore-fragmented.cpp"),
     ),
     register(
         "test-thread-safety",
         "tests/test-thread-safety.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         |engine| model_lifecycle::run(engine, "tests/test-thread-safety.cpp"),
     ),
     register(
@@ -433,7 +433,7 @@ const CASES: &[Case] = &[
     register(
         "test-mtmd-c-api",
         "tests/test-mtmd-c-api.c",
-        Bridge::Common,
+        Bridge::Independent,
         mtmd_chunks::run,
     ),
     register(
@@ -523,7 +523,7 @@ const CASES: &[Case] = &[
     register(
         "test-mtmd-impl",
         "tests/test-mtmd-impl.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         mtmd::run,
     ),
     register(
@@ -583,7 +583,7 @@ const CASES: &[Case] = &[
     register(
         "test-log",
         "tests/test-log.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         logging::run,
     ),
     register(
@@ -604,19 +604,19 @@ const BENCHMARKS: &[Case] = &[
     register(
         "chat-peg",
         "tests/test-chat-peg-parser.cpp#performance",
-        Bridge::Common,
+        Bridge::Independent,
         chat_peg::benchmark,
     ),
     register(
         "sampling",
         "tests/test-sampling.cpp#performance",
-        Bridge::Common,
+        Bridge::Independent,
         sampling::benchmark,
     ),
     register(
         "peg-deserialize",
         "tests/peg-parser/test-json-serialization.cpp#deserialize",
-        Bridge::Common,
+        Bridge::Independent,
         peg::benchmark_deserialization,
     ),
 ];
@@ -632,7 +632,6 @@ struct Options {
     benchmark: Option<&'static Case>,
     diagnostic: Option<PathBuf>,
     bridge: Option<PathBuf>,
-    common_bridge: Option<PathBuf>,
     evidence_directory: Option<PathBuf>,
     source_directory: Option<PathBuf>,
     asset_directory: Option<PathBuf>,
@@ -657,7 +656,6 @@ fn options() -> Result<Options> {
     let mut benchmark = None;
     let mut diagnostic = None;
     let mut bridge = None;
-    let mut common_bridge = None;
     let mut evidence_directory = None;
     let mut source_directory = None;
     let mut asset_directory = None;
@@ -702,9 +700,6 @@ fn options() -> Result<Options> {
             Some("--diagnostic") if diagnostic.is_none() => {
                 diagnostic = Some(absolute_path(value, "--diagnostic")?);
             }
-            Some("--common-bridge") if common_bridge.is_none() => {
-                common_bridge = Some(absolute_path(value, "--common-bridge")?);
-            }
             Some("--evidence-directory") if evidence_directory.is_none() => {
                 evidence_directory = Some(absolute_path(value, "--evidence-directory")?);
             }
@@ -726,7 +721,6 @@ fn options() -> Result<Options> {
         benchmark,
         diagnostic,
         bridge,
-        common_bridge,
         evidence_directory,
         source_directory,
         asset_directory,
@@ -744,8 +738,7 @@ impl Options {
                 .is_none_or(|case| !reference_provider::supports(case.id))
                 || self.benchmark.is_some()
                 || self.diagnostic.is_some()
-                || self.bridge.is_some()
-                || self.common_bridge.is_some())
+                || self.bridge.is_some())
         {
             return Err(invalid(
                 "rust-reference supports only explicit migrated source cases without native bridges, benchmarks or diagnostics",
@@ -781,13 +774,6 @@ impl Options {
                 && self.bridge.is_none()
             {
                 return Err(invalid("selected C++ cases require --bridge"));
-            }
-            if (self.benchmark.is_some()
-                || self.diagnostic.is_some()
-                || selected(self.case).any(|case| case.bridge == Bridge::Common))
-                && self.common_bridge.is_none()
-            {
-                return Err(invalid("selected C++ cases require --common-bridge"));
             }
         }
 
@@ -967,7 +953,6 @@ fn main() -> Result<()> {
     let engine = Engine::new(
         options.target,
         options.bridge,
-        options.common_bridge,
         options.evidence_directory,
         options.source_directory,
         options.asset_directory,

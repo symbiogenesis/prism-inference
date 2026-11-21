@@ -1209,7 +1209,7 @@ mod tests {
     fn independent_grammar_provider_passes_llama_grammar_and_validator_across_all_targets()
     -> Result<()> {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let grammar_report = crate::llama_grammar::run(&engine)?;
             assert_eq!(grammar_report["Id"], IDS[0]);
             assert_eq!(grammar_report["Status"], "pass", "{grammar_report}");

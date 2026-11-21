@@ -2325,7 +2325,7 @@ mod tests {
     #[test]
     fn independent_optimizer_provider_passes_all_164_subtests_across_targets() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::optimizer::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

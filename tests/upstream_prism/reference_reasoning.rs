@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn independent_reasoning_preserves_complete_source_assertions() -> Result<()> {
-        let engine = Engine::new(Target::RustReference, None, None, None, None, None)?;
+        let engine = Engine::new(Target::RustReference, None, None, None, None)?;
         let report = crate::reasoning_budget::run(&engine)?;
         assert_eq!(report["Id"], ID);
         assert_eq!(report["Status"], "pass", "{report}");
@@ -425,9 +425,9 @@ mod tests {
                 .is_some_and(|detail| detail.contains("71 required semantic conditions;")
                     && detail.contains("failed=0;"))
         );
-        let reference_arm = Engine::new(Target::Cpp, None, None, None, None, None)?;
+        let reference_arm = Engine::new(Target::Cpp, None, None, None, None)?;
         assert_eq!(crate::reasoning_budget::run(&reference_arm)?, report);
-        let candidate = Engine::new(Target::Rust, None, None, None, None, None)?;
+        let candidate = Engine::new(Target::Rust, None, None, None, None)?;
         let report = crate::reasoning_budget::run(&candidate)?;
         assert_eq!(report["Status"], "pass", "{report}");
         Ok(())

@@ -443,7 +443,6 @@ mod tests {
         let engine = Engine::new(
             super::super::super::engine::Target::Rust,
             None,
-            None,
             Some(evidence),
             Some(source.clone().into()),
             None,

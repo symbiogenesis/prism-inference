@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn independent_mtmd_preserves_complete_source_and_both_reference_selectors() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::mtmd::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

@@ -48,14 +48,12 @@ pub(super) enum Output {
 pub(super) struct Engine {
     target: Target,
     bridge: Option<PathBuf>,
-    common_bridge: Option<PathBuf>,
     evidence_directory: Option<PathBuf>,
     source_directory: Option<PathBuf>,
     asset_directory: Option<PathBuf>,
 }
 
 pub(super) struct ModelSessionSpec {
-    pub(super) executable: PathBuf,
     pub(super) evidence_directory: PathBuf,
 }
 
@@ -87,21 +85,19 @@ impl Engine {
     pub(super) fn new(
         target: Target,
         bridge: Option<PathBuf>,
-        common_bridge: Option<PathBuf>,
         evidence_directory: Option<PathBuf>,
         source_directory: Option<PathBuf>,
         asset_directory: Option<PathBuf>,
     ) -> Result<Self> {
-        if matches!(target, Target::RustReference) && (bridge.is_some() || common_bridge.is_some())
-        {
+        if matches!(target, Target::RustReference) && bridge.is_some() {
             return Err(invalid(
                 "the independent Rust reference cannot load native bridges",
             ));
         }
-        for path in [&bridge, &common_bridge].into_iter().flatten() {
-            if !path.is_absolute() || !path.is_file() {
-                return Err(invalid("native bridge must be an existing absolute file"));
-            }
+        if let Some(path) = &bridge
+            && (!path.is_absolute() || !path.is_file())
+        {
+            return Err(invalid("native bridge must be an existing absolute file"));
         }
         if let Some(path) = &evidence_directory {
             if !path.is_absolute() {
@@ -112,7 +108,6 @@ impl Engine {
         let engine = Self {
             target,
             bridge,
-            common_bridge,
             evidence_directory,
             source_directory,
             asset_directory,
@@ -190,10 +185,6 @@ impl Engine {
             return Ok(None);
         }
         Ok(Some(ModelSessionSpec {
-            executable: self
-                .common_bridge
-                .clone()
-                .ok_or_else(|| invalid("native common bridge path is missing"))?,
             evidence_directory: self.evidence_path(
                 &name
                     .chars()
@@ -207,38 +198,6 @@ impl Engine {
                     .collect::<String>(),
             )?,
         }))
-    }
-
-    pub(super) fn production_tool(&self, name: &str) -> Result<Option<PathBuf>> {
-        if name != "llama-export-lora" {
-            return Err(invalid("unknown production tool"));
-        }
-        if matches!(self.target, Target::Rust) {
-            return Ok(None);
-        }
-        let bridge = fs::canonicalize(
-            self.common_bridge
-                .as_ref()
-                .ok_or_else(|| invalid("native common bridge missing"))?,
-        )?;
-        let directory = bridge
-            .parent()
-            .ok_or_else(|| invalid("native bridge has no parent"))?;
-        let file = directory.join(if cfg!(windows) {
-            "llama-export-lora.exe"
-        } else {
-            "llama-export-lora"
-        });
-        if !file.is_file() {
-            return Err(invalid("verified production tool was not provisioned"));
-        }
-        let file = fs::canonicalize(file)?;
-        if file.parent() != Some(directory) {
-            return Err(invalid(
-                "production tool escaped the verified bridge directory",
-            ));
-        }
-        Ok(Some(file))
     }
 
     pub(super) fn execute(&self, name: &str, requests: &[Request]) -> Result<Vec<Output>> {
@@ -356,17 +315,8 @@ impl Engine {
             }
             return super::engine_vocab::execute(request);
         }
-        let bridge = self
-            .common_bridge
-            .as_ref()
-            .ok_or_else(|| invalid("native common bridge path is missing"))?;
-        let request = serde_json::to_vec(request)?;
-        if request.len() > 16 * 1024 * 1024 {
-            return Err(invalid("common bridge request exceeds size bound"));
-        }
-        Ok(Some(serde_json::from_slice(
-            &self.exchange(bridge, name, &request, "json", timeout)?,
-        )?))
+        let _ = (name, timeout);
+        Err(invalid("unsupported common operation"))
     }
 
     pub(super) fn execute_codec(&self, name: &str, request: &Value) -> Result<Option<Value>> {

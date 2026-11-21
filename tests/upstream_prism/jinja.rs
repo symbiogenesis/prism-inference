@@ -1055,14 +1055,7 @@ mod tests {
     }
     #[test]
     fn production_original_jinja_observations() -> Result<()> {
-        let engine = Engine::new(
-            super::super::engine::Target::Rust,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let engine = Engine::new(super::super::engine::Target::Rust, None, None, None, None)?;
         let mut assertions = Assertions::default();
         hash_assertions(&engine, &mut assertions)?;
         stats_assertions(&engine, &mut assertions)?;
@@ -1079,14 +1072,7 @@ mod tests {
     }
     #[test]
     fn production_original_jinja_fuzz() -> Result<()> {
-        let engine = Engine::new(
-            super::super::engine::Target::Rust,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let engine = Engine::new(super::super::engine::Target::Rust, None, None, None, None)?;
         let inventory = exchange(
             &engine,
             "jinja-builtins",

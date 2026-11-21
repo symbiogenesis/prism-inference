@@ -242,14 +242,7 @@ mod tests {
     use super::*;
     #[test]
     fn production_original_chat_templates() -> Result<()> {
-        let engine = Engine::new(
-            super::super::engine::Target::Rust,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let engine = Engine::new(super::super::engine::Target::Rust, None, None, None, None)?;
         let report = run(&engine)?;
         assert_eq!(report["Status"], "pass", "{report:?}");
         Ok(())

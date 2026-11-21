@@ -679,7 +679,6 @@ mod tests {
         let engine = Engine::new(
             super::super::super::super::engine::Target::Rust,
             None,
-            None,
             Some(root.clone()),
             None,
             None,
@@ -763,7 +762,6 @@ mod tests {
         fs::create_dir(&root)?;
         let engine = Engine::new(
             super::super::super::super::engine::Target::Cpp,
-            None,
             None,
             Some(root.clone()),
             None,

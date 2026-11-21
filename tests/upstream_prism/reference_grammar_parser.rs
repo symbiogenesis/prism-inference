@@ -572,7 +572,7 @@ mod tests {
     fn independent_grammar_parser_preserves_all_274_source_assertions_and_both_arms() -> Result<()>
     {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::grammar_parser::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

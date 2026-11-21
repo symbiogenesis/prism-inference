@@ -7117,7 +7117,7 @@ mod tests {
     #[test]
     fn independent_chat_suite_passes_on_rust_and_cpp_targets() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let outcome = crate::chat::run(&engine)?;
             assert_eq!(outcome["Id"], ID);
             assert_eq!(outcome["Status"], "pass", "chat suite failed: {outcome}");

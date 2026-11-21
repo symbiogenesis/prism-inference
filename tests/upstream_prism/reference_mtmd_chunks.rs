@@ -495,7 +495,7 @@ mod tests {
     fn independent_mtmd_chunks_preserves_all_46_source_assertions_and_required_reference_id()
     -> Result<()> {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::mtmd_chunks::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

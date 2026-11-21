@@ -735,7 +735,7 @@ mod tests {
             (Target::RustReference, ref_dir.path()),
             (Target::Cpp, cpp_dir.path()),
         ] {
-            let engine = Engine::new(target, None, None, Some(dir.to_path_buf()), None, None)?;
+            let engine = Engine::new(target, None, Some(dir.to_path_buf()), None, None)?;
             let report = crate::dspark_logsnr::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

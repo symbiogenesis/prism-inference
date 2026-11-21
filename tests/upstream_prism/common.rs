@@ -150,14 +150,7 @@ mod tests {
     use super::*;
 
     fn rust_engine() -> Result<Engine> {
-        Engine::new(
-            super::super::engine::Target::Rust,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        Engine::new(super::super::engine::Target::Rust, None, None, None, None)
     }
 
     #[test]

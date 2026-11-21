@@ -499,7 +499,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    #[ignore = "requires BONSAI_BACKEND_TRANSPORT_BRIDGE naming the checked native common bridge"]
     #[expect(
         clippy::too_many_lines,
         reason = "Keeps the complete native field-import equivalence and malformed-input schedule together."
@@ -507,9 +506,8 @@ mod tests {
     fn native_candidate_templates_match_original_file_imports() -> super::Result<()> {
         use super::super::engine::{Engine, Target};
         use super::{ModelSession, call, handle, null, patch};
-        use std::{fs, path::PathBuf, time::SystemTime};
+        use std::{fs, time::SystemTime};
 
-        let bridge = PathBuf::from(std::env::var("BONSAI_BACKEND_TRANSPORT_BRIDGE")?);
         let evidence = std::env::temp_dir().join(format!(
             "prism-llg-candidate-equivalence-{}-{}",
             std::process::id(),
@@ -517,7 +515,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         ));
-        let engine = Engine::new(Target::Cpp, None, Some(bridge), Some(evidence), None, None)?;
+        let engine = Engine::new(Target::Cpp, None, Some(evidence), None, None)?;
         let session = ModelSession::open(&engine, "llguidance-candidate-equivalence")?
             .ok_or_else(|| super::invalid("native candidate session unavailable"))?;
         let client = session.client();

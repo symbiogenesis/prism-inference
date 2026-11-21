@@ -2153,7 +2153,7 @@ mod tests {
     #[test]
     fn independent_json_schema_passes_grammar_integration_across_all_targets() -> Result<()> {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::grammar_integration::run(&engine)?;
             assert_eq!(report["Id"], IDS[1]);
             assert_eq!(
@@ -2190,9 +2190,9 @@ mod tests {
         assert_eq!(cpp_only.len(), 6);
         assert_eq!(rts_cases.len(), 28);
 
-        let rust_ref = Engine::new(Target::RustReference, None, None, None, None, None)?;
-        let cpp = Engine::new(Target::Cpp, None, None, None, None, None)?;
-        let rust = Engine::new(Target::Rust, None, None, None, None, None)?;
+        let rust_ref = Engine::new(Target::RustReference, None, None, None, None)?;
+        let cpp = Engine::new(Target::Cpp, None, None, None, None)?;
+        let rust = Engine::new(Target::Rust, None, None, None, None)?;
 
         for case in shared.iter().chain(cpp_only.iter()) {
             let schema_str = case["SchemaJson"]

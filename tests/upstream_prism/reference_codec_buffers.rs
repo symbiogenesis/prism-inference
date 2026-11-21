@@ -1896,12 +1896,12 @@ mod tests {
 
     #[test]
     fn quant_session_supports_reference_and_cpp_and_preserves_rust_unsupported() -> Result<()> {
-        let rust_engine = Engine::new(Target::Rust, None, None, None, None, None)?;
+        let rust_engine = Engine::new(Target::Rust, None, None, None, None)?;
         assert!(QuantSession::open(&rust_engine, "quantize-perf")?.is_none());
         assert!(QuantSession::open_quantization(&rust_engine)?.is_none());
 
         for target in [Target::RustReference, Target::Cpp] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let session = QuantSession::open(&engine, "quantize-perf")?
                 .ok_or_else(|| invalid("expected QuantSession for reference target"))?;
             let driver = Driver::new(session.client(), session.evidence_directory());
@@ -2072,7 +2072,6 @@ mod tests {
                     benchmark: None,
                     diagnostic: None,
                     bridge: None,
-                    common_bridge: None,
                     evidence_directory: evidence,
                     source_directory: None,
                     asset_directory: None,

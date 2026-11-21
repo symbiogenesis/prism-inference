@@ -1068,7 +1068,7 @@ mod tests {
     fn independent_gguf_provider_passes_complete_test_gguf_suite_across_all_targets() -> Result<()>
     {
         for target in [Target::RustReference, Target::Cpp, Target::Rust] {
-            let engine = Engine::new(target, None, None, None, None, None)?;
+            let engine = Engine::new(target, None, None, None, None)?;
             let report = crate::gguf::run(&engine)?;
             assert_eq!(report["Id"], ID);
             assert_eq!(report["Status"], "pass", "{report}");

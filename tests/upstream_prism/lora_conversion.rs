@@ -1,29 +1,15 @@
 //! Complete safe Rust controller for the pinned `LoRA` conversion/inference shell.
 //! Original expected texts remain hash-locked external assets, not source code.
 use super::engine::Engine;
-use super::lora_inputs::{Inputs, digest, hash_bytes};
+use super::lora_inputs::{Inputs, hash_bytes};
 use super::model_session::{Client, ModelSession};
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
 use std::fs;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 const ID: &str = "tests/test-lora-conversion-inference.sh";
 const SOURCE_SHA: &str = "69584616380bdaa7f6ee1e53d165408118fb0897e1280f964eb7bc3b932b9c9a";
 const ARCHITECTURES: [&str; 3] = ["Gemma2ForCausalLM", "LlamaForCausalLM", "Phi3ForCausalLM"];
-const OUTPUT_CAP: u64 = 1024 * 1024;
-struct Process(Child);
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 fn invoke(client: &Client, operation: Value) -> Result<Value> {
     Ok(client.call(0, operation, None)?.value)
@@ -56,83 +42,10 @@ fn merged(
     output: &Path,
     directory: &Path,
 ) -> Result<Value> {
-    let executable = engine
-        .production_tool("llama-export-lora")?
-        .ok_or_else(|| invalid("target lacks production LoRA merger"))?;
-    let mut process = Process(
-        Command::new(&executable)
-            .args(["-m"])
-            .arg(base)
-            .arg("-o")
-            .arg(output)
-            .arg("--lora")
-            .arg(adapter)
-            .current_dir(directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
-    let child = &mut process.0;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| invalid("LoRA exporter stdout missing"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| invalid("LoRA exporter stderr missing"))?;
-    let overflow = Arc::new(AtomicBool::new(false));
-    let capture = |stream: Box<dyn Read + Send>, overflow: Arc<AtomicBool>| {
-        thread::spawn(move || -> std::io::Result<Vec<u8>> {
-            let mut data = Vec::new();
-            stream.take(OUTPUT_CAP + 1).read_to_end(&mut data)?;
-            if u64::try_from(data.len()).unwrap_or(u64::MAX) > OUTPUT_CAP {
-                overflow.store(true, Ordering::Release);
-            }
-            Ok(data)
-        })
-    };
-    let out = capture(Box::new(stdout), Arc::clone(&overflow));
-    let err = capture(Box::new(stderr), Arc::clone(&overflow));
-    let started = Instant::now();
-    let mut limit = None;
-    let status = loop {
-        if overflow.load(Ordering::Acquire) || started.elapsed() > Duration::from_mins(3) {
-            limit = Some("production LoRA exporter exceeded output/time bound");
-            let _ = child.kill();
-            break child.wait()?;
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = out
-        .join()
-        .map_err(|_| invalid("LoRA stdout collector panicked"))??;
-    let stderr = err
-        .join()
-        .map_err(|_| invalid("LoRA stderr collector panicked"))??;
-    fs::write(directory.join("export.stdout"), &stdout)?;
-    fs::write(directory.join("export.stderr"), &stderr)?;
-    if limit.is_some()
-        || stdout.len() > usize::try_from(OUTPUT_CAP)?
-        || stderr.len() > usize::try_from(OUTPUT_CAP)?
-        || !status.success()
-    {
-        return Err(invalid(format!(
-            "production LoRA merger failed: {status}; {}",
-            limit.unwrap_or("see external exporter logs")
-        )));
+    if engine.is_rust() {
+        return Err(invalid("target lacks production LoRA merger"));
     }
-    let (length, sha) = digest(output)?;
-    if !(24..=256 * 1024 * 1024).contains(&length) {
-        return Err(invalid("merged production GGUF extent differs"));
-    }
-    Ok(
-        json!({"Tool":executable,"Status":status.code(),"Bytes":length,"Sha256":sha,"StdoutBytes":stdout.len(),"StderrBytes":stderr.len()}),
-    )
+    super::reference_model_runtime::export_lora_in_process(base, adapter, output, directory)
 }
 /// Bash command substitution drops trailing LF, then the source trim removes
 /// leading POSIX whitespace. Expected inputs are UTF-8, so lengths are characters.

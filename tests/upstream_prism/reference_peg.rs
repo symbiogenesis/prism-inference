@@ -2345,9 +2345,9 @@ impl<'a, 'b> GbnfEmitter<'a, 'b> {
         }
     }
 
-    fn rule_gbnf_name(&mut self, rule_id: ParserId, raw_name: &str) -> String {
+    fn rule_gbnf_name(&mut self, rule_id: ParserId, raw_name: &str) -> &str {
         if let Some(existing) = self.rule_names.get(&rule_id) {
-            return existing.clone();
+            return existing;
         }
         let base = Self::escape_name(raw_name);
         let mut candidate = base.clone();
@@ -2360,8 +2360,7 @@ impl<'a, 'b> GbnfEmitter<'a, 'b> {
             candidate = format!("{base}-{suffix}");
             suffix += 1;
         }
-        self.rule_names.insert(rule_id, candidate.clone());
-        candidate
+        self.rule_names.entry(rule_id).or_insert(candidate)
     }
 
     fn add_unique_rule(&mut self, base: &str, body: String) -> String {
@@ -2479,8 +2478,9 @@ impl<'a, 'b> GbnfEmitter<'a, 'b> {
         raw_name: &str,
         child: ParserId,
     ) -> Result<String> {
-        let gbnf_name = self.rule_gbnf_name(rule_id, raw_name);
-        if self.emitted_rules.insert(gbnf_name.clone()) {
+        let gbnf_name = self.rule_gbnf_name(rule_id, raw_name).to_owned();
+        if !self.emitted_rules.contains(&gbnf_name) {
+            self.emitted_rules.insert(gbnf_name.clone());
             let body = self.emit_expr(child)?.text;
             self.rules.insert(gbnf_name.clone(), body);
         }
@@ -2844,10 +2844,15 @@ fn build_ac_trie(delims: &[&str]) -> Vec<AcTrieNode> {
         let edges: Vec<(char, usize)> = nodes[u].children.iter().map(|(&c, &v)| (c, v)).collect();
         for (ch, v) in edges {
             let mut f = nodes[u].fail;
-            while f != 0 && !nodes[f].children.contains_key(&ch) {
+            let target = loop {
+                if let Some(&next) = nodes[f].children.get(&ch) {
+                    break next;
+                }
+                if f == 0 {
+                    break 0;
+                }
                 f = nodes[f].fail;
-            }
-            let target = nodes[f].children.get(&ch).copied().unwrap_or(0);
+            };
             nodes[v].fail = target;
             if nodes[target].is_end {
                 nodes[v].is_end = true;

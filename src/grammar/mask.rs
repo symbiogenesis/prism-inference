@@ -420,7 +420,7 @@ impl GrammarMaskCache {
                 }
                 continue;
             };
-            let mask = if let Some(cached) = self.positions.get(&position) {
+            let mask: &PositionMask = if let Some(cached) = self.positions.get(&position) {
                 cached
             } else {
                 let computed = build_position_mask(&self.trie, &self.rules, position)?;
@@ -436,8 +436,7 @@ impl GrammarMaskCache {
                     )?;
                     continue;
                 }
-                self.positions.insert(position, computed);
-                &self.positions[&position]
+                self.positions.entry(position).or_insert(computed)
             };
             apply_position_mask(
                 &self.trie,

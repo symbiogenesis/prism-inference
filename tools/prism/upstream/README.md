@@ -15,17 +15,18 @@ in [LICENSE](LICENSE).
 
 ## Bridge boundary
 
-The Rust PQ2/PTQ1 adapter in `bridge/` and separate native `common/` adapter contain
-serialization, input validation and production calls. Generators, expected values,
-assertions and tolerances belong to the safe Rust harness. Protocols are defined
-in [PROTOCOL.md](PROTOCOL.md) and [common/PROTOCOL.md](common/PROTOCOL.md).
+The Rust PQ2/PTQ1 adapter in `bridge/` contains serialization, input validation
+and production `ggml` calls. All former `common/` C++ bridge files and headers
+have been retired to clean-room safe Rust providers in `tests/upstream_prism/`
+(`0` checked-in C++ files and `0` checked-in C files remain in Prism).
+Generators, expected values, assertions and tolerances belong to the safe Rust
+harness. Protocols are defined in [PROTOCOL.md](PROTOCOL.md) and
+[common/PROTOCOL.md](common/PROTOCOL.md).
 
-`reference-patches.lock.json` binds production saver and Llama 3 corrections by
-original/corrected/patch hashes. Only verified external translation units are
-substituted; original archives and test predicates stay intact. Saver correction
-preserves DSpark metadata and sixteen tensors. Llama 3 correction disables inherited
-punctuation cleanup for its three canonical aliases; see
-[BPE acceptance](BPE-ACCEPTANCE.md). Receipts identify the corrected reference.
+`reference-patches.lock.json` binds historical patch digests
+by original/corrected/patch hashes. Only verified external translation units were
+substituted during the C++ bridge era; original archives and test predicates stay
+intact. See [BPE acceptance](BPE-ACCEPTANCE.md).
 
 Input locks retain independent corpora, immutable publisher revisions, bounded
 GGUF prefixes and HTTP range/size/hash checks. Expected schemas never generate
@@ -40,7 +41,7 @@ Configure this directory against a verified source extraction with
 `prism-upstream-bridge`. `RustBridge.cmake` uses the pinned workspace compiler and
 production ggml libraries through a reviewed C ABI, without dependency downloads.
 `PRISM_RUST_TOOLCHAIN` selects another explicitly installed compiler. Windows Rust
-target and CMake architecture must agree. Build `common/` separately for its API.
+target and CMake architecture must agree.
 
 ```text
 cargo run -p prism-inference --example upstream_prism -- \
@@ -51,9 +52,10 @@ cargo run -p prism-inference --example upstream_prism -- \
 ```
 
 Use `--target rust` without bridge options for the runtime arm. PTQ1's selector is
-`test-ptq1_0-element-map`; Unicode uses `--common-bridge`. The supervising
-`tests/Test-PrismUpstream.ps1` retains required requests/responses and checks all
-reference results in the final gate. GGML adapter use also requires
+`test-ptq1_0-element-map`; all non-GGML `common/` reference cases run in-process
+in `tests/upstream_prism/` without a separate common C++ executable. The
+supervising `tests/Test-PrismUpstream.ps1` retains required requests/responses and
+checks all reference results in the final gate. GGML adapter use also requires
 `tests/Test-PrismGgmlBridge.ps1` protocol/resource rejection checks; optional
 `-ReferenceBridge` compares adapters independently.
 
@@ -462,7 +464,46 @@ All fifteen sources bind pinned upstream commit
 includes, dispatch branches, CMake build edges, and the
 `prism-upstream-server-context` CMake library target (`server-chat.cpp`/
 `server-common.cpp`), are removed, leaving 12 checked-in C++ files and zero
-checked-in C files (12 native files total) across the common bridge snapshot.
-Direct native requests for those retired operations reject; complete Prism suite
-execution, native bridge compilation and owning hosted acceptance remain
-pending.
+checked-in C files (12 native files total) across the historical common bridge
+snapshot. Direct native requests for those retired operations reject.
+
+## Retired remaining common C++ bridge and session headers (12 -> 0)
+
+All remaining C++ files in the common bridge (`tools/prism/upstream/common/`:
+`action_file.hpp`, `backend_ops.hpp`, `backend_session.hpp`, `vocab.hpp`,
+`backend_sampler.hpp`, `context_graph.hpp`, `dspark_runtime.hpp`,
+`generated_model.hpp`, `llguidance.hpp`, `model_runtime.hpp`, `vocab_session.hpp`,
+`bridge.cpp`) and `tools/prism/upstream/common/CMakeLists.txt` (along with the
+`--common-bridge` option and `llama-export-lora` C++ LoRA merge tool) are now
+retired and deleted, leaving **0 checked-in C++ files** and **0 checked-in C
+files** across the Prism repository.
+
+Clean-room safe Rust replacements in `tests/upstream_prism/` now supply all
+corresponding reference observations:
+
+- `tests/test-backend-ops.cpp` (action-file, backend-ops, backend-session) via
+  `tests/upstream_prism/reference_backend_ops.rs` and `backend_ops/pipe.rs`.
+- `tests/test-tokenizer-0.cpp`, `tests/test-tokenizer-0.py`,
+  `tests/test-tokenizer-0.sh`, and `tests/test-tokenizers-repo.sh` via
+  `tests/upstream_prism/reference_vocab.rs`.
+- `tests/test-grammar-llguidance.cpp` via `tests/upstream_prism/reference_llguidance.rs`.
+- Persistent model/session, LoRA merge (`export_lora_in_process`), DSpark,
+  sampler, forward/context, architecture inventory, and vocabulary/tokenizer
+  suites (`tests/test-backend-sampler.cpp`, `tests/test-export-graph-ops.cpp`,
+  `tests/test-lora-conversion-inference.sh`, `tests/test-tokenizer-random.py`,
+  `tests/test-tokenizer-1-spm.cpp`, `tests/test-tokenizer-1-bpe.cpp`,
+  `tests/test-dspark-forward.cpp`, `tests/test-dspark-loop.cpp`,
+  `tests/test-dspark-real-eval.cpp`, `tests/test-llama-archs.cpp`,
+  `tests/test-recurrent-state-rollback.cpp`, `tests/test-kv-mean-center.cpp`,
+  `tests/test-autorelease.cpp`, `tests/test-model-load-cancel.cpp`,
+  `tests/test-save-load-state.cpp`, `tests/test-state-restore-fragmented.cpp`,
+  and `tests/test-thread-safety.cpp`) via in-process `model_session.rs` duplex
+  pipes into `tests/upstream_prism/reference_model_runtime.rs` and
+  `tests/upstream_prism/reference_model_runtime/*`.
+
+Non-common infrastructure retained without checked-in C++: the Rust `PQ2`/`PTQ1`
+GGML adapter in `tools/prism/upstream/bridge/`, top-level `CMakeLists.txt` /
+`RustBridge.cmake` (which build `prism-upstream-bridge` against the pinned
+external upstream archive at runtime), `patches/`, lockfiles, `LICENSE`, and
+`NOTICE`. Complete Prism suite execution, native GGML bridge compilation, and
+owning hosted CI acceptance remain pending.

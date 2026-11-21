@@ -1,40 +1,40 @@
-# Production common-library process adapter
+# Retired common-library JSON protocol specification
 
-Build this separate CMake tree with `PRISM_SOURCE_DIR` naming the verified pinned
-upstream root, and target `prism-upstream-common-bridge`. It statically links the
-production `llama`, `llama-common` and `mtmd` libraries. Tests, tools, examples, server,
-apps, TLS, optional external libraries and dependency downloads are disabled.
-The [safe Rust harness](../README.md) owns every generated input, reference,
-schedule, tolerance and verdict. This adapter validates and serializes production
-calls and raw observations; it contains no upstream test sources or assertions.
+The native C++ `tools/prism/upstream/common/` adapter (`prism-upstream-common-bridge`
+and `common/CMakeLists.txt`) is retired; zero checked-in C++ files and zero
+checked-in C files remain in Prism. Clean-room safe Rust providers in
+`tests/upstream_prism/` now execute both the file-mode operations and the persistent
+JSON-lines session protocol in-process (`model_session.rs` over `duplex_pipe` into
+`tests/upstream_prism/reference_model_runtime*`, plus `reference_backend_ops.rs`
+via `backend_ops/pipe.rs`). The [safe Rust harness](../README.md) owns every
+generated input, reference, schedule, tolerance and verdict. Protocols are defined
+in [../PROTOCOL.md](../PROTOCOL.md) and this document.
 
-Run `prism-upstream-common-bridge --input ABSOLUTE_PATH --output ABSOLUTE_PATH`.
-Input and output are bounded UTF-8 JSON objects:
+Input and output frames remain bounded UTF-8 JSON objects:
 
 ```json
 {"SchemaVersion":1,"Operations":[{"Kind":"<operation-kind>"}]}
 ```
 
-Every operation is validated before any production API executes. Operation fields are exact; unknown
+Every operation is validated before execution. Operation fields are exact; unknown
 fields, duplicate object keys, unknown kinds and incorrect types are rejected.
-JSON nesting is limited to 160 levels for declarative
-graph transport. Request and response files are at most 16 MiB, and operations number 1 through 128.
-Paths must be absolute and distinct.
+JSON nesting is limited to 160 levels for declarative graph transport (16 levels
+for persistent session requests). Request and response files are at most 16 MiB,
+and operations number 1 through 128. Paths must be absolute and distinct.
 
-A zero process exit means completion and a written
-response (`{"SchemaVersion":1,"Results":[...]}`). Errors return a nonzero exit and a message on
-stderr. Discard any response from a failing process. The caller owns the timeout and file lifecycle.
+Nonzero exits / returned session errors distinguish infrastructure failures from
+measured test observations (`{"SchemaVersion":1,"Results":[...]}`). Errors never
+produce pass verdicts. The caller owns all timeouts and artifact lifetimes.
 
 The former top-level `unicode-regex-split`, `unicode-encode` and `unicode-decode` file operations are
-retired. Those operations now belong to the independent Rust reference provider
-(`tests/upstream_prism/reference_unicode.rs`) selected by the source harness; the native common
-executable rejects them in file mode. Session-mode `unicode-encode`/`unicode-decode` primitives
-inside `--model-session` (`vocab_session.hpp`) remain unchanged.
+retired to the independent Rust reference provider
+(`tests/upstream_prism/reference_unicode.rs`) selected by the source harness.
+Session-mode `unicode-encode`/`unicode-decode` primitives are served in-process
+by `reference_model_runtime/llg_vocab.rs` (replacing retired `vocab_session.hpp`).
 
 The former `mtp-first-decode-fits` native operation is retired. Its exact
-`Batch`, `Catchup`, `Sequences` i32 protocol and `{"Fits":boolean}` result now
-belong to the independent Rust reference selected by the source harness. The
-native executable rejects this operation as unknown.
+`Batch`, `Catchup`, `Sequences` i32 protocol and `{"Fits":boolean}` result belong
+to `reference_provider.rs`.
 
 ## Generic Jinja operations
 
@@ -441,14 +441,15 @@ requests reject. `--target rust-reference` and the ordinary `cpp` reference
 selector route `tests/test-chat-auto-parser.cpp` through
 `tests/upstream_prism/reference_chat_auto.rs` (`nativeReferenceReplay=false`).
 
-The separate `--model-session` mode provides bounded JSON-lines production model/context operations
-on persistent native worker lanes. `vocab_session.hpp` provides batch
-primitives `vocab-tokenize`, `vocab-detokenize`, `unicode-encode` and `unicode-decode`, each at
-most512 supplied items and1MiB supplied bytes. Values and per-item exception metadata return in
-parallel arrays.
-Vocabulary-only model loading and shared read-only context access preserve the original concurrent
-tokenizer domain. Complete roundtrip coverage requires the safe Rust source ports, not merely these
-native calls.
+The separate `--model-session` protocol now runs in-process over duplex pipes in
+`tests/upstream_prism/model_session.rs` backed by
+`tests/upstream_prism/reference_model_runtime/` (`session.rs`, `llg_vocab.rs`,
+replacing retired `vocab_session.hpp`). `llg_vocab.rs` provides batch primitives
+`vocab-tokenize`, `vocab-detokenize`, `unicode-encode` and `unicode-decode`,
+each at most 512 supplied items and 1 MiB supplied bytes. Values and per-item
+exception metadata return in parallel arrays. Vocabulary loading and shared
+read-only access preserve the concurrent tokenizer domain. Complete roundtrip
+coverage remains owned by the safe Rust source ports.
 
 `json-schema-convert` and `json-schema-info` return production grammar/exception
 metadata and ordered schema-information traces.
@@ -471,8 +472,9 @@ returned rendering bytes are hex so partial UTF-8 is retained.
 `grammar-trace` also accepts explicit `accept-codepoint` actions (`Grammar`, `CodePoint`), calling
 `llama_grammar_accept` and returning the same exception, message and stack-size fields as token
 acceptance. Top-level file-mode `unicode-encode` and `unicode-decode` are retired alongside
-`unicode-regex-split` (handled by `reference_unicode.rs`); session-mode `vocab_session.hpp`
-primitives remain only on `--model-session`.
+`unicode-regex-split` (handled by `reference_unicode.rs`); session-mode `vocab-tokenize`,
+`vocab-detokenize`, `unicode-encode` and `unicode-decode` run in-process via
+`reference_model_runtime/llg_vocab.rs` (retired `common/vocab_session.hpp`).
 
 `common/arg_parser.hpp` and `common/model_resolution.hpp` are retired from the
 native bridge and direct native requests for `argument-enums`,
@@ -490,13 +492,14 @@ direct native requests for `chat-trace`, `chat-value`, `chat-server-params`,
 the ordinary `cpp` reference selector route `tests/test-chat.cpp` through
 `tests/upstream_prism/reference_chat.rs` (`nativeReferenceReplay=false`).
 
-The session `model-user` operation calls production `llama_model_init_from_user` using
-caller-supplied metadata. Each production tensor-initialization callback sends its actual TensorSpec
-to Rust and reads the caller's bounded data file; native code performs only the requested F32-to-F16
-conversion when supplied as float32 bytes. Callback failures are latched and reported
-after the C API returns, without unwinding
-across the C callback. Context options and raw KV-center/logit observations expose production
-behavior without a native training or generation policy.
+The in-process session `model-user` / `model-init-from-user` operation (now
+served by `reference_model_runtime/gguf_model.rs`, retiring
+`common/generated_model.hpp` and `common/model_runtime.hpp`) reads
+caller-supplied GGUF metadata, invokes tensor-initialization `TensorSpec`
+callbacks over the duplex JSON-lines pipe, reads bounded tensor payloads, and
+latches callback failures without unwinding. Context options and raw
+KV-center/logit observations (`reference_model_runtime/forward.rs`, retiring
+`common/context_graph.hpp`) remain bounded by the in-process protocol.
 
 `common/optimizer.hpp` is retired from the native bridge and direct native requests
 for `optimizer-info` and `optimizer-trace` reject. `--target rust-reference` and the
@@ -509,8 +512,8 @@ bounded F32 graph and dataset descriptors, and explicit production allocator, op
 epoch and fit actions. Tensor values and result doubles use raw little-endian bytes/bits, retaining
 NaNs. Fit callbacks select the supplied per-epoch parameter struct. Raw saved tensor
 bytes support caller-requested save/restore
-without introducing expected values. At most8192 actions, sixteen live
-contexts/buffers/datasets/optimizers/results,256 tensor descriptors,1MiB per data payload and4096
+without introducing expected values. At most 8192 actions, sixteen live
+contexts/buffers/datasets/optimizers/results, 256 tensor descriptors, 1 MiB per data payload and 4096
 fit epochs are accepted. Context and buffer lifetimes are validated separately from numerical test
 predicates.
 
@@ -519,68 +522,33 @@ The native `quantization-info` and `quantization-model` bridge operations (forme
 through `tests/upstream_prism/reference_quantization.rs` and disclose `nativeReferenceReplay=false`;
 direct native requests reject as unsupported.
 
+`backend-graph` (previously backed by retired `action_file.hpp`,
+`backend_ops.hpp`, and `backend_session.hpp`) is now served via
+`tests/upstream_prism/reference_backend_ops.rs` and `backend_ops/pipe.rs`.
 `backend-graph` accepts `Directory`, `MaxFileBytes` and either an `Actions` array or an absolute
-`ActionsFile` beneath that directory. Native `call` actions
-dispatch an explicit allowlist of production GGML functions using typed
-context/tensor/graph/backend/buffer/scalar handles, signed/unsigned integers, raw float bits and
-bounded arrays. Integer argument marshalling can read supplied tensor metadata and checked binary
-arithmetic. It does not implement class-specific graph construction or control flow.
+`ActionsFile` beneath that directory, returning `Trace`, one raw result per
+requested action, under the exact bounded JSON-lines pipe protocol below.
 
-The result is `Trace`, one raw result per requested action. Context snapshots enumerate actual
-production tensors in context order; tensor metadata includes canonical ID and all bound aliases,
-dimensions, strides, operation parameters, sources, view root, byte/element/row counts and
-production flags/descriptions. Graph snapshots return ordered nodes, leaves and
-gradient/gradient-accumulator handles. `allocate`, `supports`, tensor-file I/O, caller-supplied
-mutable tensor fields, clocks and production quantization/dequantization primitives are explicit
-actions. Binary files contain native little-endian observations on the supported Windows ARM64
-platform and must remain beneath `Directory` after canonicalization. `tensor-get` accepts
-`FileOffset` and optional `Truncate`; `scalar` accepts optional `Release` so an observed scalar
-handle can be reused.
-
-`compare` calls the actual production backend comparison API, with a serialization-only callback
-that always continues. It writes independent raw left/right tensor files and metadata for every
-selected callback, plus explicitly requested captures. It performs no equality, tolerance,
-finite-value or sentinel assertions. Callback exceptions are latched and reported after the
-production C API returns. CPU backend creation returns whether the production `set_use_ref`
-procedure is available, and applies the caller's reference-mode choice when available.
-
-Inline actions are capped at65,536. External action arrays are capped at128MiB,524,288 cumulative
-actions and160 JSON nesting levels, rejecting duplicate object keys. There are at most16 contexts,
-four CPU backends,32,768 handles per table,1GiB total context arenas and4GiB per binary file; a
-comparison captures at most8GiB. The ordinary16MiB response limit remains in force. A final
-`checkpoint` action atomically publishes the current raw `Trace` (including its empty
-acknowledgment) and waits up to the supplied1..60,000 milliseconds for a fresh next-actions file.
-That supplied array continues in the same scope; an empty array ends it. Rust owns every
-continuation, including source gradient and timing stop conditions. This transport wait neither
-generates actions nor decides numerical results. Full source matrices and benchmark execution remain
-CI-only.
-
-`model-load-observe` (`common/dspark.hpp`) is retired from the native bridge and direct
-native requests reject; `--target rust-reference` and the ordinary `cpp` reference selector
-route `tests/test-dspark-logsnr-meta.cpp` through `tests/upstream_prism/reference_dspark_logsnr.rs`
-(`nativeReferenceReplay=false`) with an independent bounded GGUF v2/v3 parser and log-SNR guard.
-The persistent DSpark operations (`common/dspark_runtime.hpp`) remain unchanged and expose model loading/logging, context
-staging/capture, tensor observations, samplers and speculation primitives. The provider
-retains production owners and callback data for their required lifetimes.
+`model-load-observe` (`common/dspark.hpp`) is retired and `--target rust-reference`
+routes `tests/test-dspark-logsnr-meta.cpp` through
+`tests/upstream_prism/reference_dspark_logsnr.rs` (`nativeReferenceReplay=false`)
+with an independent bounded GGUF v2/v3 parser and log-SNR guard. The persistent
+DSpark operations (formerly `common/dspark_runtime.hpp`) are now served
+in-process by `tests/upstream_prism/reference_model_runtime/dspark.rs` and
+`session.rs` with zero checked-in C++ code, exposing clean-room staging/capture,
+tensor observations, samplers and speculation primitives under identical framing bounds.
 
 Persistent sessions accept at most 65,536 requests, with a 16 MiB frame, 64 MiB
-stream, 90-second operation and 240-second session limit.
-`context-logits` accepts row indices from -1 through 2047, including the
-production API's last-row selector. `model-chat-render` applies the loaded model's
-own production template to supplied messages and explicit thinking/generation flags.
+stream, 90-second operation and 240-second session limit (extended where configured
+in `model_session.rs`). `context-logits` accepts row indices from -1 through 2047.
+`model-chat-render` renders chat messages against loaded GGUF template metadata via
+`reference_model_runtime/architectures.rs`.
 
-The persistent `llg-*` operations construct production LLGuidance, distribution and chain samplers and
-retain caller-owned candidate vectors. Candidate files supply exact little-endian
-IDs/logits/probabilities; updates may replace only logits or IDs/logits while retaining the original
-probability fields. Explicit patches, active-view metadata, apply probes, reset, accept and free
-operations return raw observations. Candidates are capped at 1,048,576 entries, files at 12 MiB
-and live sampler/candidate tables at64 entries each, within the existing model-session request and
-lifetime bounds.
-
-`llg-available` reports the actual `LLAMA_USE_LLGUIDANCE` feature definition. A complete source
-contract requires it to be true; disabled builds cannot count as passing coverage. The build
-consumes separately verified absolute `PRISM_LLGUIDANCE_LIBRARY` and `PRISM_LLGUIDANCE_INCLUDE_DIR`
-paths, enabling the pristine production common source without upstream network build steps.
-`Initialize-BonsaiPrismGrammarDependency` verifies the locked source archive, extracts fresh source
-and invokes only the pinned production Cargo package with `--locked` for the explicit target triple.
-All dependency sources, targets, temporary files and receipts remain external to Git worktrees.
+The persistent `llg-*` operations (formerly `common/llguidance.hpp`, now retired)
+are served in-process by `tests/upstream_prism/reference_llguidance.rs` and
+`reference_model_runtime/llg_vocab.rs` (together with clean-room chain samplers in
+`reference_model_runtime/sampler.rs`, retiring `common/backend_sampler.hpp`),
+retaining caller-owned candidate vectors, exact IEEE binary32 NaN/-0.0 bit
+patterns, reset/accept/apply probes, and bounded handle tables (at most 1,048,576
+candidate entries, 12 MiB candidate files, and 64 live tables). Complete hosted
+acceptance remains separate and pending.

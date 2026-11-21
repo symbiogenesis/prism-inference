@@ -121,6 +121,7 @@ mod reference_sampling;
 mod reference_tensor_graph;
 mod reference_threadpool;
 mod reference_unicode;
+mod reference_vocab;
 mod schema_python;
 mod tokenizer_roundtrip;
 mod validator;
@@ -178,7 +179,7 @@ const CASES: &[Case] = &[
     register(
         "test-tokenizer-0-shell",
         "tests/test-tokenizer-0.sh",
-        Bridge::Common,
+        Bridge::Independent,
         tokenizer_files::run_shell,
     ),
     register(
@@ -208,7 +209,7 @@ const CASES: &[Case] = &[
     register(
         "test-tokenizers-repo",
         "tests/test-tokenizers-repo.sh",
-        Bridge::Common,
+        Bridge::Independent,
         tokenizer_repository::run,
     ),
     register(
@@ -400,7 +401,7 @@ const CASES: &[Case] = &[
     register(
         "test-tokenizer-0",
         "tests/test-tokenizer-0.cpp",
-        Bridge::Common,
+        Bridge::Independent,
         tokenizer::run,
     ),
     register(

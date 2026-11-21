@@ -1,6 +1,5 @@
 // JSON serialization and production API dispatch only. The safe Rust suite supplies
 // inputs, expected results and assertions; no upstream test source is compiled.
-#include "vocab.hpp"
 #include "model_runtime.hpp"
 #include "backend_ops.hpp"
 #include "backend_session.hpp"
@@ -82,9 +81,7 @@ void validate_operation(const wire_json & operation) {
     require(operation.is_object() && operation.contains("Kind") && operation.at("Kind").is_string(),
             "operation Kind must be a string");
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (prism_vocab::handles(kind)) {
-        prism_vocab::validate(operation);
-    } else if (prism_backend_ops::handles(kind)) {
+    if (prism_backend_ops::handles(kind)) {
         prism_backend_ops::validate(operation);
     } else {
         throw std::runtime_error("unknown operation Kind");
@@ -93,9 +90,6 @@ void validate_operation(const wire_json & operation) {
 
 wire_json execute(const wire_json & operation) {
     const auto & kind = operation.at("Kind").get_ref<const std::string &>();
-    if (prism_vocab::handles(kind)) {
-        return prism_vocab::execute(operation);
-    }
     if (prism_backend_ops::handles(kind)) {
         return prism_backend_ops::execute(operation);
     }

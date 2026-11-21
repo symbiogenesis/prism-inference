@@ -23,7 +23,6 @@ $cases = @(for ($ordinal = 0; $ordinal -lt $catalog.AdapterIds.Count; $ordinal++
 })
 $revision = 'a' * 40
 $harness = 'b' * 64
-$bridge = 'c' * 64
 foreach ($index in 0..3) {
     $directory = Join-Path $scratch "prism-ordinary-results-$index"
     [void][IO.Directory]::CreateDirectory($directory)
@@ -32,7 +31,7 @@ foreach ($index in 0..3) {
         SourceArchiveSha256=$catalog.ArchiveSha256; Status='awaiting-backend'; Selection='All'
         SourcePartition=$index; SourcePartitionCount=4; NativePlatform='ARM64'; Architecture='Arm64'
         DeferredSource='tests/test-backend-ops.cpp'; HarnessSha256=$harness
-        NativeBuilds=@(@{ Family='common'; ExecutableSha256=$bridge }); CaseRuns=@(@{ Partition=$index })
+        NativeBuilds=@(); CaseRuns=@(@{ Partition=$index })
         AdditionalReceipt=@{ Retained=$true }
     }
     [IO.File]::WriteAllText((Join-Path $directory 'receipt.json'), ($receipt | ConvertTo-Json -Depth 10))
@@ -46,7 +45,7 @@ foreach ($index in 0..3) {
         [IO.File]::WriteAllText((Join-Path $directory "$target-results.json"), ($report | ConvertTo-Json -Depth 10))
     }
 }
-$parameters = @{ InputDirectory=$scratch; Catalog=$catalog; ProjectRevision=$revision; HarnessSha256=$harness; CommonBridgeSha256=$bridge }
+$parameters = @{ InputDirectory=$scratch; Catalog=$catalog; ProjectRevision=$revision; HarnessSha256=$harness }
 $merged = Merge-BonsaiPrismSourceResult @parameters
 foreach ($target in @('cpp','rust')) {
     Assert ($merged[$target].Cases.Count -eq $cases.Count) 'The source fan-in dropped an ordinary source.'
@@ -65,7 +64,7 @@ $otherReceiptPath = Join-Path $scratch 'prism-ordinary-results-1/receipt.json'
 $otherOriginal = [IO.File]::ReadAllText($otherReceiptPath)
 $otherReceipt = $otherOriginal | ConvertFrom-Json -AsHashtable
 $otherReceipt.HarnessSha256 = 'd' * 64
-$otherReceipt.NativeBuilds[0].ExecutableSha256 = 'e' * 64
+$otherReceipt.NativeBuilds = @(@{ Family='ggml'; ExecutableSha256=('e' * 64) })
 [IO.File]::WriteAllText($otherReceiptPath, ($otherReceipt | ConvertTo-Json -Depth 10))
 [void](Merge-BonsaiPrismSourceResult @parameters)
 [IO.File]::WriteAllText($otherReceiptPath, $otherOriginal)
@@ -95,7 +94,7 @@ foreach ($mutation in @(
     @{ Field='SourceArchiveSha256'; Value=('d' * 64) },
     @{ Field='HarnessSha256'; Value=('d' * 64) },
     @{ Field='CaseRuns'; Value=@{} },
-    @{ Field='NativeBuilds'; Value=@() }
+    @{ Field='NativeBuilds'; Value=@{} }
 )) {
     $changed = $original | ConvertFrom-Json -AsHashtable
     $changed[$mutation.Field] = $mutation.Value
@@ -104,9 +103,9 @@ foreach ($mutation in @(
 }
 [IO.File]::WriteAllText($receiptPath, $original)
 $changed = $original | ConvertFrom-Json -AsHashtable
-$changed.NativeBuilds[0].ExecutableSha256 = 'd' * 64
+$changed.NativeBuilds = @(@{ Family='ggml'; ExecutableSha256='invalid' })
 [IO.File]::WriteAllText($receiptPath, ($changed | ConvertTo-Json -Depth 10))
-Assert-Failure { Merge-BonsaiPrismSourceResult @parameters } 'Source fan-in accepted a different partition zero backend bridge.'
+Assert-Failure { Merge-BonsaiPrismSourceResult @parameters } 'Source fan-in accepted a malformed native build entry.'
 [IO.File]::WriteAllText($receiptPath, $original)
 $resultPath = Join-Path $scratch 'prism-ordinary-results-3/rust-results.json'
 $original = [IO.File]::ReadAllText($resultPath)

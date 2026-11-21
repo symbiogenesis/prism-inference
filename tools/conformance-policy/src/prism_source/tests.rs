@@ -40,7 +40,7 @@ fn fixture() -> Result<(PathBuf, Value)> {
     let request = json!({
         "Operation":"merge", "InputDirectory":root,
         "Catalog":{"UpstreamCommit":"a".repeat(40),"ArchiveSha256":"b".repeat(64),"AdapterIds":IDS},
-        "ProjectRevision":"c".repeat(40), "HarnessSha256":"d".repeat(64), "CommonBridgeSha256":"e".repeat(64)
+        "ProjectRevision":"c".repeat(40), "HarnessSha256":"d".repeat(64)
     });
     for index in 0..4 {
         let directory = root.join(format!("prism-ordinary-results-{index}"));
@@ -52,7 +52,7 @@ fn fixture() -> Result<(PathBuf, Value)> {
                 "SourceCommit":request["Catalog"]["UpstreamCommit"],"SourceArchiveSha256":request["Catalog"]["ArchiveSha256"],
                 "Status":"awaiting-backend","Selection":"All","SourcePartition":index,"SourcePartitionCount":4,
                 "NativePlatform":"ARM64","Architecture":"Arm64","DeferredSource":BACKEND,
-                "HarnessSha256":request["HarnessSha256"],"NativeBuilds":[{"Family":"common","ExecutableSha256":request["CommonBridgeSha256"]}],
+                "HarnessSha256":request["HarnessSha256"],"NativeBuilds":[],
                 "CaseRuns":[{"Partition":index}],"ExtraReceipt":{"Retained":true}
             }),
         )?;
@@ -119,7 +119,7 @@ fn fan_in_keeps_failures_order_extensions_and_exact_receipt_hashes() -> Result<(
         serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
     receipt["HarnessSha256"] = json!("f".repeat(64));
-    receipt["NativeBuilds"][0]["ExecutableSha256"] = json!("0".repeat(64));
+    receipt["NativeBuilds"] = json!([{"Family":"ggml","ExecutableSha256":"0".repeat(64)}]);
     write(&path, &receipt)?;
     let merged = run(request)?;
     let expected: Vec<_> = IDS.iter().copied().filter(|id| *id != BACKEND).collect();
@@ -177,10 +177,10 @@ fn fan_in_rejects_foreign_and_mistyped_provenance() -> Result<()> {
         ("SourceArchiveSha256", json!("f".repeat(64))),
         ("HarnessSha256", json!("f".repeat(64))),
         ("CaseRuns", json!({})),
-        ("NativeBuilds", json!([])),
+        ("NativeBuilds", json!({})),
         (
             "NativeBuilds",
-            json!([original["NativeBuilds"][0], original["NativeBuilds"][0]]),
+            json!([{"Family":"ggml","ExecutableSha256":"e".repeat(64)}, {"Family":"ggml","ExecutableSha256":"f".repeat(64)}]),
         ),
     ] {
         let mut changed = original.clone();
@@ -192,11 +192,11 @@ fn fan_in_rejects_foreign_and_mistyped_provenance() -> Result<()> {
         );
     }
     let mut changed = original.clone();
-    changed["NativeBuilds"][0]["ExecutableSha256"] = json!("f".repeat(64));
+    changed["NativeBuilds"] = json!([{"Family":"ggml","ExecutableSha256":"INVALID"}]);
     write(&path, &changed)?;
     assert!(run(request.clone()).is_err());
     write(&path, &original)?;
-    for field in ["ProjectRevision", "HarnessSha256", "CommonBridgeSha256"] {
+    for field in ["ProjectRevision", "HarnessSha256"] {
         let mut changed = request.clone();
         changed[field] = json!("INVALID");
         assert!(run(changed).is_err());

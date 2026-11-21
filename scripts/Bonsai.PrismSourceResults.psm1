@@ -20,12 +20,11 @@ function Merge-BonsaiPrismSourceResult {
         [Parameter(Mandatory)][string]$InputDirectory,
         [Parameter(Mandatory)][Collections.IDictionary]$Catalog,
         [Parameter(Mandatory)][string]$ProjectRevision,
-        [Parameter(Mandatory)][string]$HarnessSha256,
-        [Parameter(Mandatory)][string]$CommonBridgeSha256
+        [Parameter(Mandatory)][string]$HarnessSha256
     )
     return Invoke-PrismPolicy -Command prism-source -Request @{
         Operation='merge'; InputDirectory=(Resolve-ExternalPath $InputDirectory); Catalog=$Catalog
-        ProjectRevision=$ProjectRevision; HarnessSha256=$HarnessSha256; CommonBridgeSha256=$CommonBridgeSha256
+        ProjectRevision=$ProjectRevision; HarnessSha256=$HarnessSha256
     }
 }
 

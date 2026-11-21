@@ -80,8 +80,6 @@ function New-BonsaiPrismBackendContext {
     param(
         [Parameter(Mandatory)][string]$HarnessPath,
         [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$HarnessSha256,
-        [string]$CommonBridgePath,
-        [ValidatePattern('^[a-f0-9]{64}$')][string]$CommonBridgeSha256,
         [Parameter(Mandatory)][string]$SourceDirectory,
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [Parameter(Mandatory)][ValidateSet('cpp', 'rust')][string]$Target,
@@ -90,12 +88,6 @@ function New-BonsaiPrismBackendContext {
     )
     if ($ProjectRevision -cnotmatch '^[a-f0-9]{40}$') { throw 'A complete project revision is required.' }
     $harness = Assert-BonsaiPrismBackendBinary -Path $HarnessPath -Sha256 $HarnessSha256
-    $bridge = $null
-    if ($Target -ceq 'cpp') {
-        $bridge = Assert-BonsaiPrismBackendBinary -Path $CommonBridgePath -Sha256 $CommonBridgeSha256
-    } elseif ($CommonBridgePath -or $CommonBridgeSha256) {
-        throw 'The Rust target does not accept a C++ common bridge.'
-    }
     $source = Resolve-ExternalPath $SourceDirectory
     if (-not [IO.Directory]::Exists($source)) { throw 'Verified upstream source directory is missing.' }
     $sourceFile = Resolve-ExternalPath (Join-Path $source 'tests/test-backend-ops.cpp')
@@ -115,7 +107,6 @@ function New-BonsaiPrismBackendContext {
     $context = [ordered]@{
         SchemaVersion = 1; Kind = 'prism-backend-context'; Target = $Target; ProjectRevision = $ProjectRevision
         HarnessPath = $harness; HarnessSha256 = $HarnessSha256
-        CommonBridgePath = $bridge; CommonBridgeSha256 = $(if ($Target -ceq 'cpp') { $CommonBridgeSha256 } else { $null })
         SourceDirectory = $source; SourceSha256 = $script:BackendSourceSha256
         EvidenceDirectory = $root; TimeoutSeconds = $TimeoutSeconds
     }
@@ -135,7 +126,6 @@ function Assert-BonsaiPrismBackendContext {
         throw 'Invalid backend orchestration context.'
     }
     $null = Assert-BonsaiPrismBackendBinary -Path $Context.HarnessPath -Sha256 $Context.HarnessSha256
-    if ($Context.Target -ceq 'cpp') { $null = Assert-BonsaiPrismBackendBinary -Path $Context.CommonBridgePath -Sha256 $Context.CommonBridgeSha256 }
     $null = Resolve-ExternalPath $Context.EvidenceDirectory
     if (-not [IO.Directory]::Exists($Context.EvidenceDirectory)) { throw 'Backend evidence root disappeared.' }
 }
@@ -147,7 +137,7 @@ function New-BonsaiPrismBackendEnvelope {
     param([Collections.IDictionary]$Context, [Collections.IDictionary]$Payload)
     return [ordered]@{
         SchemaVersion=1; Target=$Context.Target; ProjectRevision=$Context.ProjectRevision
-        HarnessSha256=$Context.HarnessSha256; CommonBridgeSha256=$Context.CommonBridgeSha256; Payload=$Payload
+        HarnessSha256=$Context.HarnessSha256; Payload=$Payload
     }
 }
 
@@ -156,11 +146,11 @@ function Get-BonsaiPrismBackendPayload {
     [OutputType([Collections.IDictionary])]
     param([Collections.IDictionary]$Context, [object]$Envelope,
         [string[]]$Statuses, [string]$Mode, [int]$Index = -1, [int]$Count = -1)
-    if ($Envelope -isnot [Collections.IDictionary] -or $Envelope.Count -ne 6 -or
-        @('SchemaVersion','Target','ProjectRevision','HarnessSha256','CommonBridgeSha256','Payload').Where({-not $Envelope.Contains($_)}).Count -or
+    if ($Envelope -isnot [Collections.IDictionary] -or $Envelope.Count -ne 5 -or
+        @('SchemaVersion','Target','ProjectRevision','HarnessSha256','Payload').Where({-not $Envelope.Contains($_)}).Count -or
         $Envelope.SchemaVersion -ne 1 -or $Envelope.Target -cne $Context.Target -or
         $Envelope.ProjectRevision -cne $Context.ProjectRevision -or $Envelope.HarnessSha256 -cne $Context.HarnessSha256 -or
-        $Envelope.CommonBridgeSha256 -cne $Context.CommonBridgeSha256 -or $Envelope.Payload -isnot [Collections.IDictionary]) {
+        $Envelope.Payload -isnot [Collections.IDictionary]) {
         throw 'Backend cross-job record target, revision, binary identity or envelope differs.'
     }
     $record = $Envelope.Payload
@@ -192,7 +182,6 @@ function Invoke-BonsaiPrismBackendDiagnostic {
         Write-BonsaiPrismBackendJson -Path $config -Value $Request
         $arguments = @('--target', $Context.Target, '--diagnostic', $config, '--output', $output,
             '--source-directory', $Context.SourceDirectory, '--evidence-directory', (Join-Path $stage 'bridge'))
-        if ($Context.Target -ceq 'cpp') { $arguments += @('--common-bridge', $Context.CommonBridgePath) }
         $process = Invoke-BonsaiNativeProcess -Executable $Context.HarnessPath -ArgumentList $arguments -WorkingDirectory $stage -TimeoutSeconds $Context.TimeoutSeconds -LogPath $log
         if ([Text.Encoding]::UTF8.GetByteCount($process.StandardOutput) -gt $script:BackendLogLimit -or
             [Text.Encoding]::UTF8.GetByteCount($process.StandardError) -gt $script:BackendLogLimit) {

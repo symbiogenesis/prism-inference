@@ -124,13 +124,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.Native.psm1')
           $receipt = Get-Content -LiteralPath (Join-Path $env:PRISM_UPSTREAM_EVIDENCE 'receipt.json') -Raw | ConvertFrom-Json
-          $bridge = @($receipt.NativeBuilds | Where-Object { $_.Family -ceq 'common' })
-          if ($receipt.Status -cnotin @('complete','awaiting-backend') -or $bridge.Count -ne 1) { throw 'Benchmark requires the settled reference build.' }
+          if ($receipt.Status -cnotin @('complete','awaiting-backend')) { throw 'Benchmark requires the settled reference build.' }
           foreach ($benchmark in @('peg-deserialize', 'sampling', 'chat-peg')) {
             foreach ($target in @('cpp', 'rust')) {
               $output = Join-Path $env:PRISM_UPSTREAM_EVIDENCE "$benchmark-$target-benchmark.json"
               $arguments = @('--target', $target, '--benchmark', $benchmark, '--output', $output)
-              if ($target -eq 'cpp') { $arguments += @('--common-bridge', $bridge[0].Executable, '--evidence-directory', (Join-Path $env:PRISM_UPSTREAM_EVIDENCE "$benchmark-benchmark-bridge")) }
+              if ($target -eq 'cpp') { $arguments += @('--evidence-directory', (Join-Path $env:PRISM_UPSTREAM_EVIDENCE "$benchmark-benchmark-bridge")) }
               $result = Invoke-BonsaiNativeProcess -Executable $receipt.HarnessExecutable -ArgumentList $arguments -WorkingDirectory $env:PRISM_UPSTREAM_EVIDENCE -TimeoutSeconds 300 -LogPath (Join-Path $env:PRISM_UPSTREAM_EVIDENCE "$benchmark-$target-benchmark.log")
               if ($result.ExitCode -ne 0) { throw "Benchmark infrastructure failed for $target." }
               $report = Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
@@ -427,8 +426,7 @@ jobs:
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.PrismSource.psm1')
           $inference = Resolve-PrismSource
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/Bonsai.PrismBackendBundle.psm1')
-          $bundle = Import-BonsaiPrismBackendBundle -Directory (Join-Path $env:PRISM_BACKEND_TOOLS_EVIDENCE 'backend-tools') -Repository $inference
-          $env:BONSAI_BACKEND_TRANSPORT_BRIDGE = $bundle.CommonBridgePath
+          $bundle = Import-BonsaiPrismBackendBundle -Directory (Join-Path $env:PRISM_BACKEND_TOOLS_EVIDENCE 'backend-tools') -Repository $inference -RequireSharedTools
           $env:BONSAI_BACKEND_TRANSPORT_EVIDENCE = Join-Path $env:PRISM_BACKEND_TOOLS_EVIDENCE 'transport-checks'
           [void][IO.Directory]::CreateDirectory($env:BONSAI_BACKEND_TRANSPORT_EVIDENCE)
           $checks = @(
@@ -437,7 +435,7 @@ jobs:
           )
           foreach ($check in $checks) {
             $log = Join-Path $env:PRISM_BACKEND_TOOLS_EVIDENCE (($check -replace '::', '-') + '.log')
-            cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --manifest-path (Join-Path $inference 'Cargo.toml') --package prism-inference --example upstream_prism --target-dir (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') --locked --offline --release $check -- --ignored --exact 2>&1 | Tee-Object -FilePath $log
+            cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --manifest-path (Join-Path $inference 'Cargo.toml') --package prism-inference --example upstream_prism --target-dir (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-PrismUpstreamRust') --locked --offline --release $check -- --exact 2>&1 | Tee-Object -FilePath $log
             if (-not (Select-String -LiteralPath $log -SimpleMatch 'test result: ok. 1 passed; 0 failed;')) { throw "Required native equivalence check did not run exactly once: $check" }
           }
       - name: Publish revision-bound native backend shard tools

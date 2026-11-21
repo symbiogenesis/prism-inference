@@ -85,7 +85,7 @@ $nativeSource = $source
 $sharedTools = $null
 if ($CommonToolsBundleDirectory) {
     Import-Module (Join-Path $repo 'scripts/Bonsai.PrismBackendBundle.psm1')
-    $sharedTools = Import-BonsaiPrismBackendBundle -Directory $CommonToolsBundleDirectory -Repository $runtimeSource -Toolchain $Toolchain -RequireCommonTools
+    $sharedTools = Import-BonsaiPrismBackendBundle -Directory $CommonToolsBundleDirectory -Repository $runtimeSource -Toolchain $Toolchain -RequireSharedTools
 }
 if ($NativeBuildDirectory -and -not $sharedTools) {
     $nativeBuildRoot = Resolve-ExternalPath $NativeBuildDirectory
@@ -135,7 +135,6 @@ $receipt = [ordered]@{
 }
 if ($sharedTools) {
     $receipt.SharedTools = @{ Directory=$CommonToolsBundleDirectory; ManifestSha256=$sharedTools.ManifestSha256; SameRevision=$true }
-    $receipt.ReferenceProductionFix = $sharedTools.ReferenceProductionFix
 }
 $receiptPath = Join-Path $evidence 'receipt.json'
 [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 8))
@@ -172,73 +171,73 @@ $adapters = @{
     Pq2RowShapes = @{ Name = 'test-pq2-row-shapes'; Family = 'ggml' }
     Ptq1ElementMap = @{ Name = 'test-ptq1_0-element-map'; Family = 'ggml' }
     Unicode = @{ Name = 'test-unicode'; Family = 'independent' }
-    MtpCatchupBatch = @{ Name = 'test-mtp-catchup-batch'; Family = 'common' }
-    Jinja = @{ Name = 'test-jinja'; Family = 'common' }
-    MtmdImpl = @{ Name = 'test-mtmd-impl'; Family = 'common' }
+    MtpCatchupBatch = @{ Name = 'test-mtp-catchup-batch'; Family = 'independent' }
+    Jinja = @{ Name = 'test-jinja'; Family = 'independent' }
+    MtmdImpl = @{ Name = 'test-mtmd-impl'; Family = 'independent' }
     GrammarParser = @{ Name = 'test-grammar-parser'; Family = 'independent' }
-    ReasoningBudget = @{ Name = 'test-reasoning-budget'; Family = 'common' }
+    ReasoningBudget = @{ Name = 'test-reasoning-budget'; Family = 'independent' }
     Col2im = @{ Name = 'test-col2im-1d'; Family = 'independent' }
     Dfly = @{ Name = 'test-dfly-fusion'; Family = 'independent' }
     Rope = @{ Name = 'test-rope'; Family = 'independent' }
     LlamaGrammar = @{ Name = 'test-llama-grammar'; Family = 'independent' }
-    LlGuidance = @{ Name = 'test-grammar-llguidance'; Family = 'common' }
+    LlGuidance = @{ Name = 'test-grammar-llguidance'; Family = 'independent' }
     GrammarIntegration = @{ Name = 'test-grammar-integration'; Family = 'independent' }
-    Quantize = @{ Name = 'test-quantize-fns'; Family = 'common' }
-    QuantizePerf = @{ Name = 'test-quantize-perf'; Family = 'common' }
-    QuantizeStats = @{ Name = 'test-quantize-stats'; Family = 'common' }
-    PtqCuda = @{ Name = 'test-ptq1_0-cuda-dot'; Family = 'common' }
-    Log = @{ Name = 'test-log'; Family = 'common' }
+    Quantize = @{ Name = 'test-quantize-fns'; Family = 'independent' }
+    QuantizePerf = @{ Name = 'test-quantize-perf'; Family = 'independent' }
+    QuantizeStats = @{ Name = 'test-quantize-stats'; Family = 'independent' }
+    PtqCuda = @{ Name = 'test-ptq1_0-cuda-dot'; Family = 'independent' }
+    Log = @{ Name = 'test-log'; Family = 'independent' }
     MoeReduce = @{ Name = 'test-moe-weighted-reduce'; Family = 'independent' }
-    PegBasic = @{ Name = 'peg-basic'; Id = 'tests/peg-parser/test-basic.cpp'; Family = 'common' }
-    PegGbnf = @{ Name = 'peg-gbnf'; Id = 'tests/peg-parser/test-gbnf-generation.cpp'; Family = 'common' }
-    PegJson = @{ Name = 'peg-json'; Id = 'tests/peg-parser/test-json-parser.cpp'; Family = 'common' }
-    PegSerialization = @{ Name = 'peg-serialization'; Id = 'tests/peg-parser/test-json-serialization.cpp'; Family = 'common' }
-    PegPythonDict = @{ Name = 'peg-python-dict'; Id = 'tests/peg-parser/test-python-dict-parser.cpp'; Family = 'common' }
-    PegUnicode = @{ Name = 'peg-unicode'; Id = 'tests/peg-parser/test-unicode.cpp'; Family = 'common' }
-    PegParser = @{ Name = 'test-peg-parser'; Family = 'common' }
+    PegBasic = @{ Name = 'peg-basic'; Id = 'tests/peg-parser/test-basic.cpp'; Family = 'independent' }
+    PegGbnf = @{ Name = 'peg-gbnf'; Id = 'tests/peg-parser/test-gbnf-generation.cpp'; Family = 'independent' }
+    PegJson = @{ Name = 'peg-json'; Id = 'tests/peg-parser/test-json-parser.cpp'; Family = 'independent' }
+    PegSerialization = @{ Name = 'peg-serialization'; Id = 'tests/peg-parser/test-json-serialization.cpp'; Family = 'independent' }
+    PegPythonDict = @{ Name = 'peg-python-dict'; Id = 'tests/peg-parser/test-python-dict-parser.cpp'; Family = 'independent' }
+    PegUnicode = @{ Name = 'peg-unicode'; Id = 'tests/peg-parser/test-unicode.cpp'; Family = 'independent' }
+    PegParser = @{ Name = 'test-peg-parser'; Family = 'independent' }
     BatchAllocator = @{ Name = 'test-batch-alloc'; Family = 'independent' }
     Allocator = @{ Name = 'test-alloc'; Family = 'independent' }
     Barrier = @{ Name = 'test-barrier'; Family = 'independent' }
-    BackendSampler = @{ Name = 'test-backend-sampler'; Family = 'common' }
-    BackendOps = @{ Name = 'test-backend-ops'; Family = 'common' }
-    ExportGraph = @{ Name = 'test-export-graph-ops'; Family = 'common' }
-    LoraConversion = @{ Name = 'test-lora-conversion-inference'; Id = 'tests/test-lora-conversion-inference.sh'; Family = 'common' }
-    TokenizersRepo = @{ Name = 'test-tokenizers-repo'; Id = 'tests/test-tokenizers-repo.sh'; Family = 'common' }
+    BackendSampler = @{ Name = 'test-backend-sampler'; Family = 'independent' }
+    BackendOps = @{ Name = 'test-backend-ops'; Family = 'independent' }
+    ExportGraph = @{ Name = 'test-export-graph-ops'; Family = 'independent' }
+    LoraConversion = @{ Name = 'test-lora-conversion-inference'; Id = 'tests/test-lora-conversion-inference.sh'; Family = 'independent' }
+    TokenizersRepo = @{ Name = 'test-tokenizers-repo'; Id = 'tests/test-tokenizers-repo.sh'; Family = 'independent' }
     TokenizerPython = @{ Name = 'test-tokenizer-0-python'; Id = 'tests/test-tokenizer-0.py'; Family = 'independent' }
-    TokenizerShell = @{ Name = 'test-tokenizer-0-shell'; Id = 'tests/test-tokenizer-0.sh'; Family = 'common' }
-    TokenizerRandom = @{ Name = 'test-tokenizer-random'; Id = 'tests/test-tokenizer-random.py'; Family = 'common' }
-    ChatTemplate = @{ Name = 'test-chat-template'; Family = 'common' }
-    MtmdCApi = @{ Name = 'test-mtmd-c-api'; Id = 'tests/test-mtmd-c-api.c'; Family = 'common' }
+    TokenizerShell = @{ Name = 'test-tokenizer-0-shell'; Id = 'tests/test-tokenizer-0.sh'; Family = 'independent' }
+    TokenizerRandom = @{ Name = 'test-tokenizer-random'; Id = 'tests/test-tokenizer-random.py'; Family = 'independent' }
+    ChatTemplate = @{ Name = 'test-chat-template'; Family = 'independent' }
+    MtmdCApi = @{ Name = 'test-mtmd-c-api'; Id = 'tests/test-mtmd-c-api.c'; Family = 'independent' }
     Sampling = @{ Name = 'test-sampling'; Family = 'independent' }
-    ChatPeg = @{ Name = 'test-chat-peg-parser'; Family = 'common' }
+    ChatPeg = @{ Name = 'test-chat-peg-parser'; Family = 'independent' }
     Gguf = @{ Name = 'test-gguf'; Family = 'independent' }
-    ChatAuto = @{ Name = 'test-chat-auto-parser'; Family = 'common' }
-    Tokenizer0 = @{ Name = 'test-tokenizer-0'; Family = 'common' }
+    ChatAuto = @{ Name = 'test-chat-auto-parser'; Family = 'independent' }
+    Tokenizer0 = @{ Name = 'test-tokenizer-0'; Family = 'independent' }
     JsonSchema = @{ Name = 'test-json-schema-to-grammar'; Family = 'independent' }
-    ChatAnalysis = @{ Name = 'test-chat-analysis'; Family = 'common' }
-    PublicC = @{ Name = 'test-c'; Id = 'tests/test-c.c'; Family = 'common' }
-    DsparkLogSnr = @{ Name = 'test-dspark-logsnr-meta'; Family = 'common' }
-    DsparkForward = @{ Name = 'test-dspark-forward'; Family = 'common' }
-    DsparkLoop = @{ Name = 'test-dspark-loop'; Family = 'common' }
-    DsparkRealEval = @{ Name = 'test-dspark-real-eval'; Family = 'common' }
+    ChatAnalysis = @{ Name = 'test-chat-analysis'; Family = 'independent' }
+    PublicC = @{ Name = 'test-c'; Id = 'tests/test-c.c'; Family = 'independent' }
+    DsparkLogSnr = @{ Name = 'test-dspark-logsnr-meta'; Family = 'independent' }
+    DsparkForward = @{ Name = 'test-dspark-forward'; Family = 'independent' }
+    DsparkLoop = @{ Name = 'test-dspark-loop'; Family = 'independent' }
+    DsparkRealEval = @{ Name = 'test-dspark-real-eval'; Family = 'independent' }
     GgufMetadata = @{ Name = 'test-gguf-model-data'; Family = 'independent' }
     QuantSelection = @{ Name = 'test-quant-type-selection'; Family = 'independent' }
-    Architectures = @{ Name = 'test-llama-archs'; Family = 'common' }
-    RecurrentRollback = @{ Name = 'test-recurrent-state-rollback'; Family = 'common' }
-    KvMeanCenter = @{ Name = 'test-kv-mean-center'; Family = 'common' }
-    Optimizer = @{ Name = 'test-opt'; Family = 'common' }
+    Architectures = @{ Name = 'test-llama-archs'; Family = 'independent' }
+    RecurrentRollback = @{ Name = 'test-recurrent-state-rollback'; Family = 'independent' }
+    KvMeanCenter = @{ Name = 'test-kv-mean-center'; Family = 'independent' }
+    Optimizer = @{ Name = 'test-opt'; Family = 'independent' }
     DoubleFloat = @{ Name = 'test-double-float'; Family = 'independent' }
     GbnfValidator = @{ Name = 'test-gbnf-validator'; Family = 'independent' }
-    ArgParser = @{ Name = 'test-arg-parser'; Family = 'common' }
-    Chat = @{ Name = 'test-chat'; Family = 'common' }
-    ModelResolution = @{ Name = 'test-model-resolution'; Family = 'common' }
-    TokenizerSpm = @{ Name = 'test-tokenizer-1-spm'; Family = 'common' }
-    TokenizerBpe = @{ Name = 'test-tokenizer-1-bpe'; Family = 'common' }
-    Autorelease = @{ Name = 'test-autorelease'; Family = 'common' }
-    ModelLoadCancel = @{ Name = 'test-model-load-cancel'; Family = 'common' }
-    SaveLoadState = @{ Name = 'test-save-load-state'; Family = 'common' }
-    StateRestoreFragmented = @{ Name = 'test-state-restore-fragmented'; Family = 'common' }
-    ThreadSafety = @{ Name = 'test-thread-safety'; Family = 'common' }
+    ArgParser = @{ Name = 'test-arg-parser'; Family = 'independent' }
+    Chat = @{ Name = 'test-chat'; Family = 'independent' }
+    ModelResolution = @{ Name = 'test-model-resolution'; Family = 'independent' }
+    TokenizerSpm = @{ Name = 'test-tokenizer-1-spm'; Family = 'independent' }
+    TokenizerBpe = @{ Name = 'test-tokenizer-1-bpe'; Family = 'independent' }
+    Autorelease = @{ Name = 'test-autorelease'; Family = 'independent' }
+    ModelLoadCancel = @{ Name = 'test-model-load-cancel'; Family = 'independent' }
+    SaveLoadState = @{ Name = 'test-save-load-state'; Family = 'independent' }
+    StateRestoreFragmented = @{ Name = 'test-state-restore-fragmented'; Family = 'independent' }
+    ThreadSafety = @{ Name = 'test-thread-safety'; Family = 'independent' }
 }
 $selected = if ($Case -eq 'All') { @('Pq2RowShapes', 'Ptq1ElementMap', 'Unicode', 'MtpCatchupBatch', 'Jinja', 'MtmdImpl', 'GrammarParser', 'ReasoningBudget', 'Col2im', 'Dfly', 'Rope', 'LlamaGrammar', 'LlGuidance', 'GrammarIntegration', 'Quantize', 'QuantizePerf', 'QuantizeStats', 'PtqCuda', 'Log', 'MoeReduce', 'PegBasic', 'PegGbnf', 'PegJson', 'PegSerialization', 'PegPythonDict', 'PegUnicode', 'PegParser', 'BatchAllocator', 'Allocator', 'Barrier', 'BackendSampler', 'BackendOps', 'ExportGraph', 'LoraConversion', 'TokenizersRepo', 'TokenizerPython', 'TokenizerShell', 'TokenizerRandom', 'ChatTemplate', 'MtmdCApi', 'Sampling', 'ChatPeg', 'Gguf', 'ChatAuto', 'Tokenizer0', 'ChatAnalysis', 'PublicC', 'DsparkLogSnr', 'DsparkForward', 'DsparkLoop', 'DsparkRealEval', 'GgufMetadata', 'QuantSelection', 'Architectures', 'RecurrentRollback', 'KvMeanCenter', 'Optimizer', 'DoubleFloat', 'GbnfValidator', 'ArgParser', 'Chat', 'ModelResolution', 'TokenizerSpm', 'TokenizerBpe', 'JsonSchema', 'Autorelease', 'ModelLoadCancel', 'SaveLoadState', 'StateRestoreFragmented', 'ThreadSafety') } else { @($Case) }
 if ($DeferBackend) { $selected = @($selected | Where-Object { $_ -cne 'BackendOps' }) }
@@ -285,7 +284,6 @@ if (@($selected | Where-Object { $_ -in @('GgufMetadata', 'QuantSelection', 'Exp
 }
 $bridgeFamilies = @{
     ggml = @{ Source = $nativeAdapter; Target = 'prism-upstream-bridge'; Option = '--bridge' }
-    common = @{ Source = (Join-Path $nativeAdapter 'common'); Target = 'prism-upstream-common-bridge'; Option = '--common-bridge' }
 }
 if ($selected -contains 'LoraConversion') {
     if (-not $assetDirectory) { $assetDirectory = Join-Path $evidence 'model-assets' }
@@ -319,24 +317,8 @@ if ($selected -contains 'QuantizeStats') {
 $bridges = @{}
 $nativeBuilds = [Collections.Generic.List[object]]::new()
 $extension = if ($IsWindows) { '.exe' } else { '' }
-$grammarDependency = $null
-if ($selected -contains 'LlGuidance') {
-    if (-not $IsWindows) { throw 'The pinned grammar dependency acceptance lane targets Windows.' }
-    Import-Module (Join-Path $repo 'scripts/Bonsai.PrismGrammar.psm1')
-    $grammarTarget = if ($NativePlatform -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
-    $grammarDependency = Initialize-BonsaiPrismGrammarDependency -Repository $runtimeSource -Directory (Join-Path $nativeBuildRoot 'grammar') -Toolchain $Toolchain -TargetTriple $grammarTarget
-    $receipt.GrammarDependency = $grammarDependency
-    [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
-}
-$referencePatch = $null
-if (-not $sharedTools -and @($selected | Where-Object { $adapters[$_].Family -eq 'common' }).Count) {
-    Import-Module (Join-Path $repo 'scripts/Bonsai.PrismReferencePatch.psm1')
-    $referencePatch = Initialize-BonsaiPrismReferencePatch -Repository $runtimeSource -SourceDirectory $nativeSource -Directory (Join-Path $nativeBuildRoot 'reference-patches')
-    $receipt.ReferenceProductionFix = $referencePatch
-    [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 12))
-}
 $families = @($selected | ForEach-Object { $adapters[$_].Family } | Select-Object -Unique)
-if ($PrepareBackendToolsOnly) { $families = @('common', 'ggml') }
+if ($PrepareBackendToolsOnly) { $families = @('ggml') }
 foreach ($family in $families) {
     if ($family -eq 'independent') { continue }
     $definition = $bridgeFamilies[$family]
@@ -345,35 +327,15 @@ foreach ($family in $families) {
         if ($prepared.Count -ne 1) { throw "Shared tool bundle lacks the $family production-call bridge." }
         $bridges[$family] = $prepared[0].Executable
         $nativeBuilds.Add($prepared[0])
-        if ($family -ceq 'common' -and $selected -contains 'LoraConversion') { $receipt.LoraMergeTool = $sharedTools.LoraMergeTool }
         continue
     }
-    $buildFamily = if ($PrepareBackendToolsOnly) { 'common' } else { $family }
-    $build = Join-Path $nativeBuildRoot ("build-$buildFamily")
+    $build = Join-Path $nativeBuildRoot ("build-$family")
     $null = Resolve-ExternalPath $build
-    $buildSource = $bridgeFamilies[$buildFamily].Source
-    $configureArguments = @('-S', $buildSource, '-B', $build, "-DPRISM_SOURCE_DIR=$nativeSource", '-DCMAKE_BUILD_TYPE=Release',
+    $configureArguments = @('-S', $definition.Source, '-B', $build, "-DPRISM_SOURCE_DIR=$nativeSource", '-DCMAKE_BUILD_TYPE=Release',
         '-DLLAMA_BUILD_NUMBER=0', "-DLLAMA_BUILD_COMMIT=$($lock.Commit)", "-DPRISM_RUST_TOOLCHAIN=$Toolchain", "-DPRISM_RUSTUP_EXECUTABLE=$((Get-Command rustup -CommandType Application -ErrorAction Stop).Source)") + $generatorArguments
-    if ($buildFamily -eq 'common' -and $referencePatch) {
-        foreach ($patch in $referencePatch.Patches) {
-            $setting = switch -CaseSensitive ($patch.RelativeSource) {
-                'src/llama-model-saver.cpp' { 'PRISM_PATCHED_SAVER' }
-                'src/llama-vocab.cpp' { 'PRISM_PATCHED_VOCAB' }
-                default { throw 'Unexpected verified production source substitution.' }
-            }
-            $configureArguments += "-D$setting=$($patch.Path)"
-        }
-    }
-    if ($family -eq 'common' -and $grammarDependency) {
-        $configureArguments += @("-DPRISM_LLGUIDANCE_LIBRARY=$($grammarDependency.Library)", "-DPRISM_LLGUIDANCE_INCLUDE_DIR=$($grammarDependency.IncludeDirectory)")
-    }
     try {
-        if (-not $PrepareBackendToolsOnly -or $family -ceq 'common') {
-            $null = Invoke-UpstreamCommand -Executable $CMakePath -Arguments $configureArguments
-            $targets = @($definition.Target)
-            if ($PrepareBackendToolsOnly) { $targets += @('prism-upstream-bridge', 'llama-export-lora') }
-            $null = Invoke-UpstreamCommand -Executable $CMakePath -Arguments (@('--build', $build, '--config', 'Release', '--parallel', [string]$Parallel, '--target') + $targets)
-        }
+        $null = Invoke-UpstreamCommand -Executable $CMakePath -Arguments $configureArguments
+        $null = Invoke-UpstreamCommand -Executable $CMakePath -Arguments @('--build', $build, '--config', 'Release', '--parallel', [string]$Parallel, '--target', $definition.Target)
     } finally {
         if ($NativeBuildDirectory) {
             $diagnostics = Join-Path $evidence ("native-$family")
@@ -388,22 +350,6 @@ foreach ($family in $families) {
     if ($executables.Count -ne 1) { throw "Expected exactly one $family production-call bridge." }
     $bridges[$family] = $executables[0].FullName
     if ($IsWindows -and $NativePlatform -eq 'ARM64') { Assert-Arm64PE -Path $bridges[$family] }
-    if ($family -eq 'common' -and ($selected -contains 'LoraConversion' -or $PrepareBackendToolsOnly)) {
-        if (-not $PrepareBackendToolsOnly) {
-            $null = Invoke-UpstreamCommand -Executable $CMakePath -Arguments @('--build', $build, '--config', 'Release', '--parallel', [string]$Parallel, '--target', 'llama-export-lora')
-        }
-        $tools = @(Get-ChildItem -LiteralPath $build -Recurse -File -Filter ('llama-export-lora' + $extension))
-        if ($tools.Count -ne 1 -or $tools[0].DirectoryName -cne [IO.Path]::GetDirectoryName($bridges[$family])) {
-            throw 'Expected exactly one production LoRA export tool next to its common bridge.'
-        }
-        if ($IsWindows -and $NativePlatform -eq 'ARM64') { Assert-Arm64PE -Path $tools[0].FullName }
-        $receipt.LoraMergeTool = @{
-            ProjectRevision = $env:GITHUB_SHA
-            Target = 'llama-export-lora'; Executable = $tools[0].FullName
-            Sha256 = (Get-FileHash -LiteralPath $tools[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            VerifiedPeMachine = if ($IsWindows -and $NativePlatform -eq 'ARM64') { '0xAA64' } else { $null }
-        }
-    }
     $nativeBuilds.Add([ordered]@{
         ProjectRevision = $env:GITHUB_SHA
         Family = $family

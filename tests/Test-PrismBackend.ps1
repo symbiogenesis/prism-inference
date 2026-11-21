@@ -48,10 +48,6 @@ foreach ($target in @('cpp','rust')) {
         SourceDirectory=$bundle.SourceDirectory; EvidenceDirectory=(Join-Path $evidence $target)
         Target=$target; TimeoutSeconds=18000
     }
-    if ($target -ceq 'cpp') {
-        $parameters.CommonBridgePath=$bundle.CommonBridgePath
-        $parameters.CommonBridgeSha256=$bundle.CommonBridgeSha256
-    }
     $contexts[$target] = New-BonsaiPrismBackendContext @parameters
 }
 function Read-BackendStage {
@@ -155,7 +151,7 @@ $catalog = Import-BonsaiPrismCatalog -Path (Join-Path $runtimeSource 'tools/pris
 $ordinarySources = $null
 if ($PartitionedOrdinary) {
     Import-Module (Join-Path $repo 'scripts/Bonsai.PrismSourceResults.psm1')
-    $ordinarySources = Merge-BonsaiPrismSourceResult -InputDirectory $OrdinaryEvidenceDirectory -Catalog $catalog -ProjectRevision $env:GITHUB_SHA -HarnessSha256 $bundle.HarnessSha256 -CommonBridgeSha256 $bundle.CommonBridgeSha256
+    $ordinarySources = Merge-BonsaiPrismSourceResult -InputDirectory $OrdinaryEvidenceDirectory -Catalog $catalog -ProjectRevision $env:GITHUB_SHA -HarnessSha256 $bundle.HarnessSha256
     $ordinaryReceipt = $ordinarySources.Receipt
     Write-BackendStage -Name 'ordinary-partitions.json' -Value $ordinaryReceipt
 } else {
@@ -163,11 +159,9 @@ if ($PartitionedOrdinary) {
     if ((Get-Item -LiteralPath $ordinaryReceiptPath).Length -gt 1MB) { throw 'Ordinary source receipt exceeds1MiB.' }
     $ordinaryReceipt = Get-Content -LiteralPath $ordinaryReceiptPath -Raw | ConvertFrom-Json -AsHashtable -Depth 100 -DateKind String
 }
-$ordinaryCommon = @($ordinaryReceipt.NativeBuilds | Where-Object { $_.Family -ceq 'common' })
 if ($ordinaryReceipt.ProjectRevision -cne $env:GITHUB_SHA -or $ordinaryReceipt.Status -cne 'awaiting-backend' -or
     $ordinaryReceipt.DeferredSource -cne 'tests/test-backend-ops.cpp' -or
-    $ordinaryReceipt.HarnessSha256 -cne $bundle.HarnessSha256 -or $ordinaryCommon.Count -ne 1 -or
-    $ordinaryCommon[0].ExecutableSha256 -cne $bundle.CommonBridgeSha256) { throw 'Ordinary results are not the matching deferred source handoff.' }
+    $ordinaryReceipt.HarnessSha256 -cne $bundle.HarnessSha256) { throw 'Ordinary results are not the matching deferred source handoff.' }
 foreach ($target in @('cpp','rust')) {
     if ($PartitionedOrdinary) { $ordinary = $ordinarySources[$target] }
     else {

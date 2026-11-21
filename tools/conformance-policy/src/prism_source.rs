@@ -326,24 +326,21 @@ fn ordinary_ids(catalog: &Value) -> Result<Vec<&str>> {
     Ok(ids)
 }
 
-fn common_bridge(receipt: &Value) -> Result<&str> {
-    let mut common = None;
+fn validate_native_builds(receipt: &Value) -> Result<()> {
+    let mut seen = BTreeSet::new();
     for build in array(receipt, "NativeBuilds")? {
         object(build)?;
-        if text(build, "Family")? == "common" {
-            require(
-                common.is_none(),
-                "Prism source receipt repeats the common native build.",
-            )?;
-            let digest = text(build, "ExecutableSha256")?;
-            digest_identity(digest, 64)?;
-            common = Some(digest);
-        }
+        let family = text(build, "Family")?;
+        require(
+            !family.trim().is_empty() && seen.insert(family),
+            "Prism source receipt repeats or omits a native build family.",
+        )?;
+        digest_identity(text(build, "ExecutableSha256")?, 64)?;
     }
-    common.ok_or_else(|| "Prism source receipt lacks its common native build.".into())
+    Ok(())
 }
 
-fn validate_receipt<'a>(receipt: &'a Value, request: &Value, index: u64) -> Result<&'a str> {
+fn validate_receipt(receipt: &Value, request: &Value, index: u64) -> Result<()> {
     require(
         receipt["SchemaVersion"].as_u64() == Some(1)
             && text(receipt, "ProjectRevision")? == text(request, "ProjectRevision")?
@@ -360,16 +357,15 @@ fn validate_receipt<'a>(receipt: &'a Value, request: &Value, index: u64) -> Resu
     )?;
     let harness = text(receipt, "HarnessSha256")?;
     digest_identity(harness, 64)?;
-    let bridge = common_bridge(receipt)?;
+    validate_native_builds(receipt)?;
     array(receipt, "CaseRuns")?;
     if index == 0 {
         require(
-            harness == text(request, "HarnessSha256")?
-                && bridge == text(request, "CommonBridgeSha256")?,
+            harness == text(request, "HarnessSha256")?,
             "Ordinary partition zero differs from the backend tools.",
         )?;
     }
-    Ok(bridge)
+    Ok(())
 }
 
 fn merge(request: &Value) -> Result<Value> {
@@ -381,12 +377,10 @@ fn merge(request: &Value) -> Result<Value> {
             "Catalog",
             "ProjectRevision",
             "HarnessSha256",
-            "CommonBridgeSha256",
         ],
     )?;
     digest_identity(text(request, "ProjectRevision")?, 40)?;
     digest_identity(text(request, "HarnessSha256")?, 64)?;
-    digest_identity(text(request, "CommonBridgeSha256")?, 64)?;
     let root = external_path(Path::new(text(request, "InputDirectory")?))?;
     let ids = ordinary_ids(&request["Catalog"])?;
     let upstream = text(&request["Catalog"], "UpstreamCommit")?;
@@ -398,7 +392,7 @@ fn merge(request: &Value) -> Result<Value> {
     for index in 0..4 {
         let directory = root.join(format!("prism-ordinary-results-{index}"));
         let (receipt, digest) = inputs.read(&directory.join("receipt.json"), RECEIPT_LIMIT)?;
-        let bridge = validate_receipt(&receipt, request, index)?;
+        validate_receipt(&receipt, request, index)?;
         let expected: BTreeSet<_> = ids
             .iter()
             .copied()
@@ -428,7 +422,7 @@ fn merge(request: &Value) -> Result<Value> {
         }
         receipts.push(json!({
             "Index":index, "SourceCount":expected.len(), "HarnessSha256":text(&receipt,"HarnessSha256")?,
-            "CommonBridgeSha256":bridge, "ReceiptSha256":digest, "CaseRuns":receipt["CaseRuns"]
+            "ReceiptSha256":digest, "CaseRuns":receipt["CaseRuns"]
         }));
         case_runs.extend(array(&receipt, "CaseRuns")?.iter().cloned());
         if index == 0 {

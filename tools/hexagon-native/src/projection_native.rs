@@ -55,13 +55,26 @@ struct DomainMapper {
     unmap: Unmap,
 }
 
-fn entered(
-    report: &mut Q2ProjectionReport,
-    stage: &'static str,
-    progress: &mut impl FnMut(&Q2ProjectionReport),
-) {
+trait ProgressSink {
+    fn report(&mut self, report: &Q2ProjectionReport);
+}
+
+impl<F: FnMut(&Q2ProjectionReport)> ProgressSink for F {
+    fn report(&mut self, report: &Q2ProjectionReport) {
+        self(report);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct NoopProgress;
+
+impl ProgressSink for NoopProgress {
+    fn report(&mut self, _report: &Q2ProjectionReport) {}
+}
+
+fn entered(report: &mut Q2ProjectionReport, stage: &'static str, progress: &mut impl ProgressSink) {
     report.queue.stage = stage;
-    progress(report);
+    progress.report(report);
 }
 
 pub(super) fn run(
@@ -166,7 +179,7 @@ impl Mode {
     clippy::too_many_lines,
     reason = "One shared terminal ownership protocol covers both fixed signed-source arithmetic modes"
 )]
-fn run_mode<P: FnMut(&Q2ProjectionReport)>(
+fn run_mode<P: ProgressSink>(
     driver: Driver,
     package: &Path,
     limits: Q2ProjectionLimits,
@@ -191,7 +204,7 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         &mut |queue| {
             report.queue = *queue;
             report.queue.hmx_bitplane = mode.is_hmx();
-            progress(&report);
+            progress.report(&report);
         },
         compute::ComputeFixture::GuardedQ2NoBlock,
     )?;
@@ -437,13 +450,13 @@ fn run_mode<P: FnMut(&Q2ProjectionReport)>(
         &mut |queue| {
             let mut snapshot = report;
             snapshot.queue = *queue;
-            progress(&snapshot);
+            progress.report(&snapshot);
         },
     );
     if Instant::now() >= deadline {
         report.deadline_expired = true;
     }
-    progress(&report);
+    progress.report(&report);
     Ok(report)
 }
 
@@ -468,12 +481,12 @@ struct Session<'a, P> {
     failed: bool,
 }
 
-impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
+impl<P: ProgressSink> Session<'_, P> {
     fn fail(&mut self, stage: &'static str) -> Error {
         self.failed = true;
         self.report.queue.poisoned = true;
         self.report.queue.stage = stage;
-        (self.progress)(self.report);
+        self.progress.report(self.report);
         Error::Contract
     }
 
@@ -753,7 +766,7 @@ enum BatchWeights<'a, const B: usize> {
     Resident([&'a HmxQ2WeightHandle; B]),
 }
 
-impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
+impl<P: ProgressSink> Session<'_, P> {
     #[expect(
         clippy::too_many_lines,
         reason = "Keep both transient and immutable arena validation beside the shared correlated native submission"
@@ -2127,7 +2140,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
     }
 }
 
-impl<P: FnMut(&Q2ProjectionReport)> GuardedQ2Submitter for Session<'_, P> {
+impl<P: ProgressSink> GuardedQ2Submitter for Session<'_, P> {
     fn remaining_operations(&self) -> Option<u64> {
         Some(if self.failed {
             0
@@ -2154,7 +2167,7 @@ impl<P: FnMut(&Q2ProjectionReport)> GuardedQ2Submitter for Session<'_, P> {
     }
 }
 
-impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
+impl<P: ProgressSink> HmxQ2Submitter for Session<'_, P> {
     fn remaining_operations(&self) -> Option<u64> {
         Some(if self.failed {
             0
@@ -2298,7 +2311,7 @@ impl<P: FnMut(&Q2ProjectionReport)> HmxQ2Submitter for Session<'_, P> {
     }
 }
 
-impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
+impl<P: ProgressSink> Session<'_, P> {
     fn initialize_native_weights(
         &mut self,
         columns: usize,
@@ -2406,7 +2419,7 @@ impl<P: FnMut(&Q2ProjectionReport)> Session<'_, P> {
     }
 }
 
-impl<P: FnMut(&Q2ProjectionReport)> NativeQ2Submitter for Session<'_, P> {
+impl<P: ProgressSink> NativeQ2Submitter for Session<'_, P> {
     fn htp_architecture(&self) -> u32 {
         self.arch_profile.architecture
     }
@@ -2929,12 +2942,8 @@ pub(super) fn open_native_q2(
 }
 
 impl NativeQ2Session {
-    fn with_session<R>(
-        &mut self,
-        f: impl FnOnce(&mut Session<'_, fn(&Q2ProjectionReport)>) -> R,
-    ) -> R {
-        const fn noop(_: &Q2ProjectionReport) {}
-        let mut progress: fn(&Q2ProjectionReport) = noop;
+    fn with_session<R>(&mut self, f: impl FnOnce(&mut Session<'_, NoopProgress>) -> R) -> R {
+        let mut progress = NoopProgress;
         let mapper = Some(DomainMapper {
             domain: self.domain,
             map: self.calls.map,
@@ -4119,7 +4128,7 @@ mod tests {
             };
             let mut report = Q2ProjectionReport::new(SessionPreparationReport::new(0x81));
             let queue_write = WriteCall::Nonblocking(write);
-            let mut progress: fn(&Q2ProjectionReport) = |_| {};
+            let mut progress = NoopProgress;
             let mut session = Session {
                 report: &mut report,
                 queue_write: &queue_write,

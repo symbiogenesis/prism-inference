@@ -218,6 +218,160 @@ fn exact_head_into(
 
 #[expect(
     clippy::suboptimal_flops,
+    clippy::too_many_arguments,
+    reason = "Passes precomputed triangular WY tables and preserves exact separate FP32 multiply/add rounding."
+)]
+fn head_into_eight_row_block_scalar(
+    arithmetic: Arithmetic,
+    states: [&[f32]; 8],
+    inputs: &[Input<'_>],
+    cumulative: &[f32; 32],
+    cross_key: &[[f32; 32]; 32],
+    cross_query: &[[f32; 32]; 32],
+    last_products: &[f32; 32],
+    base_row: usize,
+    width: usize,
+    scale: f32,
+    output: &mut [f32],
+    scaled_deltas: &mut [[f32; 32]; 8],
+) -> Result<()> {
+    let count = inputs.len();
+    let mut deltas = [[0.0_f32; 32]; 8];
+    for token in 0..count {
+        let pairs =
+            arithmetic.gdn_dot_pair_eight_rows(states, inputs[token].key, inputs[token].query)?;
+        let cum = cumulative[token];
+        let beta = inputs[token].beta;
+        let out_base = token * width + base_row;
+        for sub in 0..8 {
+            let (key_dot, query_dot) = pairs[sub];
+            let mut predicted = cum * key_dot;
+            for (prior, &delta) in deltas[sub][..token].iter().enumerate() {
+                predicted += cross_key[token][prior] * delta;
+            }
+            deltas[sub][token] = (inputs[token].value[base_row + sub] - predicted) * beta;
+            let mut value = cum * query_dot;
+            for (prior, &delta) in deltas[sub][..=token].iter().enumerate() {
+                value += cross_query[token][prior] * delta;
+            }
+            output[out_base + sub] = value * scale;
+        }
+    }
+    for sub in 0..8 {
+        for (prior, &delta) in deltas[sub][..count].iter().enumerate() {
+            scaled_deltas[sub][prior] = last_products[prior] * delta;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Matches the scalar 8-row triangular WY helper contract without altering buffer ownership."
+)]
+fn head_into_eight_row_block_neon(
+    arithmetic: Arithmetic,
+    states: [&[f32]; 8],
+    inputs: &[Input<'_>],
+    cumulative: &[f32; 32],
+    cross_key: &[[f32; 32]; 32],
+    cross_query: &[[f32; 32]; 32],
+    last_products: &[f32; 32],
+    base_row: usize,
+    width: usize,
+    scale: f32,
+    output: &mut [f32],
+    scaled_deltas: &mut [[f32; 32]; 8],
+) -> Result<bool> {
+    use fearless_simd::{f32x4, prelude::*};
+
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return Ok(false);
+    };
+    let count = inputs.len();
+    let zero = f32x4::splat(neon, 0.0);
+    let mut deltas_lo = [zero; 32];
+    let mut deltas_hi = [zero; 32];
+    let scale_vec = f32x4::splat(neon, scale);
+
+    for token in 0..count {
+        let pairs =
+            arithmetic.gdn_dot_pair_eight_rows(states, inputs[token].key, inputs[token].query)?;
+        let cum_vec = f32x4::splat(neon, cumulative[token]);
+        let beta_vec = f32x4::splat(neon, inputs[token].beta);
+        let key_dots_lo =
+            f32x4::from_slice(neon, &[pairs[0].0, pairs[1].0, pairs[2].0, pairs[3].0]);
+        let key_dots_hi =
+            f32x4::from_slice(neon, &[pairs[4].0, pairs[5].0, pairs[6].0, pairs[7].0]);
+        let query_dots_lo =
+            f32x4::from_slice(neon, &[pairs[0].1, pairs[1].1, pairs[2].1, pairs[3].1]);
+        let query_dots_hi =
+            f32x4::from_slice(neon, &[pairs[4].1, pairs[5].1, pairs[6].1, pairs[7].1]);
+
+        let mut pred_lo = cum_vec * key_dots_lo;
+        let mut pred_hi = cum_vec * key_dots_hi;
+        let mut val_lo = cum_vec * query_dots_lo;
+        let mut val_hi = cum_vec * query_dots_hi;
+        for (((&ck_scalar, &cq_scalar), &d_lo), &d_hi) in cross_key[token][..token]
+            .iter()
+            .zip(&cross_query[token][..token])
+            .zip(&deltas_lo[..token])
+            .zip(&deltas_hi[..token])
+        {
+            let ck = f32x4::splat(neon, ck_scalar);
+            let cq = f32x4::splat(neon, cq_scalar);
+            pred_lo += ck * d_lo;
+            pred_hi += ck * d_hi;
+            val_lo += cq * d_lo;
+            val_hi += cq * d_hi;
+        }
+
+        let target_vals = &inputs[token].value[base_row..base_row + 8];
+        let v_lo = f32x4::from_slice(neon, &target_vals[0..4]);
+        let v_hi = f32x4::from_slice(neon, &target_vals[4..8]);
+        let d_tok_lo = (v_lo - pred_lo) * beta_vec;
+        let d_tok_hi = (v_hi - pred_hi) * beta_vec;
+        deltas_lo[token] = d_tok_lo;
+        deltas_hi[token] = d_tok_hi;
+
+        let cq_self = f32x4::splat(neon, cross_query[token][token]);
+        let out_lo = (val_lo + (cq_self * d_tok_lo)) * scale_vec;
+        let out_hi = (val_hi + (cq_self * d_tok_hi)) * scale_vec;
+        let out_base = token * width + base_row;
+        out_lo.store_slice(&mut output[out_base..out_base + 4]);
+        out_hi.store_slice(&mut output[out_base + 4..out_base + 8]);
+    }
+
+    for (prior, ((&lp_scalar, &d_lo), &d_hi)) in last_products[..count]
+        .iter()
+        .zip(&deltas_lo[..count])
+        .zip(&deltas_hi[..count])
+        .enumerate()
+    {
+        let lp = f32x4::splat(neon, lp_scalar);
+        let mut lo = [0.0_f32; 4];
+        let mut hi = [0.0_f32; 4];
+        (lp * d_lo).store_slice(&mut lo);
+        (lp * d_hi).store_slice(&mut hi);
+        for (slot, &val) in scaled_deltas[..4].iter_mut().zip(&lo) {
+            slot[prior] = val;
+        }
+        for (slot, &val) in scaled_deltas[4..8].iter_mut().zip(&hi) {
+            slot[prior] = val;
+        }
+    }
+    Ok(true)
+}
+
+#[expect(
+    clippy::suboptimal_flops,
     clippy::too_many_lines,
     reason = "The experimental FP32 chunk contract uses explicit separately rounded triangular arithmetic."
 )]
@@ -331,35 +485,51 @@ fn head_into(
         let base_row = block_idx * 8;
         let states: [&[f32]; 8] =
             std::array::from_fn(|r| &previous[(base_row + r) * width..(base_row + r + 1) * width]);
-        let mut deltas = [[0.0_f32; 32]; 8];
-        for token in 0..count {
-            let pairs = arithmetic.gdn_dot_pair_eight_rows(
-                states,
-                inputs[token].key,
-                inputs[token].query,
-            )?;
-            let cum = cumulative[token];
-            let beta = inputs[token].beta;
-            let out_base = token * width + base_row;
-            for sub in 0..8 {
-                let (key_dot, query_dot) = pairs[sub];
-                let mut predicted = cum * key_dot;
-                for (prior, &delta) in deltas[sub][..token].iter().enumerate() {
-                    predicted += cross_key[token][prior] * delta;
-                }
-                deltas[sub][token] = (inputs[token].value[base_row + sub] - predicted) * beta;
-                let mut value = cum * query_dot;
-                for (prior, &delta) in deltas[sub][..=token].iter().enumerate() {
-                    value += cross_query[token][prior] * delta;
-                }
-                output[out_base + sub] = value * scale;
-            }
-        }
         let mut scaled_deltas = [[0.0_f32; 32]; 8];
-        for sub in 0..8 {
-            for (prior, &delta) in deltas[sub][..count].iter().enumerate() {
-                scaled_deltas[sub][prior] = products[last][prior] * delta;
-            }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        let handled = head_into_eight_row_block_neon(
+            arithmetic,
+            states,
+            inputs,
+            &cumulative,
+            &cross_key,
+            &cross_query,
+            &products[last],
+            base_row,
+            width,
+            scale,
+            output,
+            &mut scaled_deltas,
+        )?;
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        )))]
+        let handled = false;
+        if !handled {
+            head_into_eight_row_block_scalar(
+                arithmetic,
+                states,
+                inputs,
+                &cumulative,
+                &cross_key,
+                &cross_query,
+                &products[last],
+                base_row,
+                width,
+                scale,
+                output,
+                &mut scaled_deltas,
+            )?;
         }
         let matrix_slice = &mut matrix[base_row * width..(base_row + 8) * width];
         let (h0, h1) = matrix_slice.split_at_mut(4 * width);
@@ -1843,6 +2013,119 @@ mod tests {
                 for (a, b) in actual_mat.iter().zip(&ref_mat) {
                     assert_eq!(a.to_bits(), b.to_bits());
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_eight_row_neon_case(width: usize, count: usize) -> Result<()> {
+        let prev: Vec<f32> = (0..width * width)
+            .map(|i| [0.125_f32, -0.0625, 0.03125, -0.0, 0.25][i % 5])
+            .collect();
+        let q_buf: Vec<f32> = (0..count * width)
+            .map(|i| f32::from(i8::try_from((i * 19) % 31).unwrap_or(0) - 15) * 0.03125)
+            .collect();
+        let k_buf: Vec<f32> = (0..count * width)
+            .map(|i| f32::from(i8::try_from((i * 23) % 31).unwrap_or(0) - 15) * 0.03125)
+            .collect();
+        let v_buf: Vec<f32> = (0..count * width)
+            .map(|i| f32::from(i8::try_from((i * 29) % 31).unwrap_or(0) - 15) * 0.03125)
+            .collect();
+        let inputs: Vec<_> = (0..count)
+            .map(|t| Input {
+                query: &q_buf[t * width..(t + 1) * width],
+                key: &k_buf[t * width..(t + 1) * width],
+                value: &v_buf[t * width..(t + 1) * width],
+                decay: [0.875_f32, 0.75, 0.0, 0.9375, 0.5][t % 5],
+                beta: [0.25_f32, 0.625, 1.0, 0.375, 0.5][t % 5],
+            })
+            .collect();
+        let mut cross_key = [[0.0_f32; 32]; 32];
+        let mut cross_query = [[0.0_f32; 32]; 32];
+        let mut cumulative = [0.0_f32; 32];
+        let mut last_products = [0.0_f32; 32];
+        let mut acc = 1.0_f32;
+        for t in 0..count {
+            acc *= inputs[t].decay;
+            cumulative[t] = acc;
+            last_products[t] = if t == count - 1 { 1.0 } else { 0.85 };
+            for p in 0..=t {
+                cross_key[t][p] =
+                    f32::from(i8::try_from((t * 7 + p * 3) % 9).unwrap_or(0) - 4) * 0.125;
+                cross_query[t][p] =
+                    f32::from(i8::try_from((t * 5 + p * 11) % 9).unwrap_or(0) - 4) * 0.125;
+            }
+        }
+        let scale = 1.0 / small_float(width)?.sqrt();
+        for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+            let mut scalar_out = vec![f32::NAN; count * width];
+            let mut scalar_sd = [[0.0_f32; 32]; 8];
+            let base_row = (width / 8 - 1) * 8;
+            let states: [&[f32]; 8] =
+                std::array::from_fn(|r| &prev[(base_row + r) * width..(base_row + r + 1) * width]);
+            head_into_eight_row_block_scalar(
+                arithmetic,
+                states,
+                &inputs,
+                &cumulative,
+                &cross_key,
+                &cross_query,
+                &last_products,
+                base_row,
+                width,
+                scale,
+                &mut scalar_out,
+                &mut scalar_sd,
+            )?;
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            {
+                let mut neon_out = vec![f32::NAN; count * width];
+                let mut neon_sd = [[0.0_f32; 32]; 8];
+                assert!(head_into_eight_row_block_neon(
+                    arithmetic,
+                    states,
+                    &inputs,
+                    &cumulative,
+                    &cross_key,
+                    &cross_query,
+                    &last_products,
+                    base_row,
+                    width,
+                    scale,
+                    &mut neon_out,
+                    &mut neon_sd,
+                )?);
+                for tok in 0..count {
+                    for sub in 0..8 {
+                        let idx = tok * width + base_row + sub;
+                        assert_eq!(neon_out[idx].to_bits(), scalar_out[idx].to_bits());
+                    }
+                }
+                for (n_row, s_row) in neon_sd.iter().zip(&scalar_sd) {
+                    for (n_val, s_val) in n_row[..count].iter().zip(&s_row[..count]) {
+                        assert_eq!(n_val.to_bits(), s_val.to_bits());
+                    }
+                }
+            }
+            let mut head_mat = vec![0.0_f32; width * width];
+            let mut head_out = Vec::new();
+            head(arithmetic, &prev, &inputs, &mut head_mat, &mut head_out)?;
+            assert_eq!(head_out.len(), count * width);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chunkwise_gdn_eight_row_neon_matches_scalar_at_zero_ulp() -> Result<()> {
+        for width in [64_usize, 128] {
+            for count in 1..=32_usize {
+                verify_eight_row_neon_case(width, count)?;
             }
         }
         Ok(())

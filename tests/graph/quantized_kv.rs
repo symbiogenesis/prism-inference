@@ -164,7 +164,10 @@ fn ordered_profile_fixture(pinned: bool, full_last: bool) -> Model {
 fn rotated_kv_tiled_prefill_retains_policy_bits_and_packed_page_storage() -> Result<()> {
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
         let empty = tile_profile(graph(policy, MatvecBackend::Scalar)?, false)?;
-        assert!(empty.with_chunkwise_gdn_prefill().is_err());
+        let chunkwise = empty.with_chunkwise_gdn_prefill()?;
+        assert_eq!(chunkwise.kv_cache_policy(), policy);
+        assert!(chunkwise.identity().ends_with(":gdn-wy-f32-v1"));
+        assert!(chunkwise.with_chunkwise_gdn_prefill().is_err());
         for pinned in [false, true] {
             for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
                 for full_last in [false, true] {

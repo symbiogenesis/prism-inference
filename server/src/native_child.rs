@@ -1741,7 +1741,8 @@ mod tests {
     }
 
     #[test]
-    fn native_child_cpu_prefill_gdn_enforces_f16_and_non_speculative_pairing() -> io::Result<()> {
+    fn native_child_cpu_prefill_gdn_allows_f16_and_rotated_and_enforces_non_speculative_pairing()
+    -> io::Result<()> {
         use bonsai_prism_runtime::swift_session::{
             CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES,
         };
@@ -1760,32 +1761,34 @@ mod tests {
             "42".into(),
         ];
 
-        for (mode, expected_chunkwise) in [("sequential", false), ("wy-f32", true)] {
-            let mut args = base.clone();
-            args.extend(
-                [
-                    "--kv-cache",
-                    "f16",
-                    "--context-tokens",
-                    "8192",
-                    "--memory-limit-bytes",
-                    &prefill_mem.to_string(),
-                    "--cpu-prefill-tokens",
-                    "16",
-                    "--cpu-prefill-scratch-bytes",
-                    &reserve.to_string(),
-                    "--cpu-prefill-gdn",
-                    mode,
-                ]
-                .map(OsString::from),
-            );
-            let parsed = parse(args.clone())?;
-            assert_eq!(
-                parsed.cpu_prefill.map(CpuPrefill::chunkwise_gdn),
-                Some(expected_chunkwise)
-            );
-            args.extend(["--cpu-prefill-gdn", mode].map(OsString::from));
-            assert!(parse(args).is_err());
+        for kv_flag in ["f16", "rsq4", "rsq4vf", "rsq4k3v"] {
+            for (mode, expected_chunkwise) in [("sequential", false), ("wy-f32", true)] {
+                let mut args = base.clone();
+                args.extend(
+                    [
+                        "--kv-cache",
+                        kv_flag,
+                        "--context-tokens",
+                        "8192",
+                        "--memory-limit-bytes",
+                        &prefill_mem.to_string(),
+                        "--cpu-prefill-tokens",
+                        "16",
+                        "--cpu-prefill-scratch-bytes",
+                        &reserve.to_string(),
+                        "--cpu-prefill-gdn",
+                        mode,
+                    ]
+                    .map(OsString::from),
+                );
+                let parsed = parse(args.clone())?;
+                assert_eq!(
+                    parsed.cpu_prefill.map(CpuPrefill::chunkwise_gdn),
+                    Some(expected_chunkwise)
+                );
+                args.extend(["--cpu-prefill-gdn", mode].map(OsString::from));
+                assert!(parse(args).is_err());
+            }
         }
 
         for bad in [
@@ -1804,20 +1807,6 @@ mod tests {
                 &reserve.to_string(),
                 "--cpu-prefill-gdn",
                 "triangular",
-            ],
-            vec![
-                "--kv-cache",
-                "rsq4",
-                "--context-tokens",
-                "8192",
-                "--memory-limit-bytes",
-                &prefill_mem.to_string(),
-                "--cpu-prefill-tokens",
-                "16",
-                "--cpu-prefill-scratch-bytes",
-                &reserve.to_string(),
-                "--cpu-prefill-gdn",
-                "wy-f32",
             ],
         ] {
             let mut args = base.clone();

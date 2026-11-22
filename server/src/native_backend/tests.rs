@@ -1299,8 +1299,17 @@ fn private_cpu_prefill_gdn_wy_f32_and_mixed_phase_hexagon_startup_bind_readiness
             }
         }
 
-        // Chunkwise GDN requires `:gdn-wy-f32-v1` exactly at the tail on FP16 without speculation.
+        // Chunkwise GDN requires `:gdn-wy-f32-v1` exactly at the tail without speculation (FP16 and rotated KV).
         let chunkwise = CpuPrefill::new(8, 64 * 1024 * 1024)?.with_chunkwise_gdn();
+        let rotated_ok = Observation {
+            kv_cache: Some(KvCachePolicy::Rotated4),
+            cpu_prefill: Some(chunkwise),
+            startup_graph_identity: Some(Arc::from(
+                "verified-model:kv-rsq4-d256-rht3-v1:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1",
+            )),
+            ..Observation::default()
+        };
+        assert!(Worker::new(FakeEngine(rotated_ok), 42).is_ok());
         for (cache, identity) in [
             (
                 KvCachePolicy::F16,
@@ -1312,7 +1321,7 @@ fn private_cpu_prefill_gdn_wy_f32_and_mixed_phase_hexagon_startup_bind_readiness
             ),
             (
                 KvCachePolicy::Rotated4,
-                "verified-model:kv-rsq4-d256-rht3-v1:cpu-tiled-ffn-v1:8:gdn-wy-f32-v1",
+                "verified-model:kv-rsq4-d256-rht3-v1:cpu-tiled-ffn-v1:8",
             ),
         ] {
             let observed = Observation {

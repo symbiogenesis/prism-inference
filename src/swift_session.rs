@@ -169,7 +169,7 @@ pub const MAX_REUSABLE_CHECKPOINTS: usize = 8;
 ///
 /// The selected KV policy is retained. By default this uses sequential-GDN tile
 /// arithmetic; calling [`Self::with_chunkwise_gdn`] selects the separately
-/// identified FP32 triangular GDN chunk algorithm on the FP16 KV profile.
+/// identified FP32 triangular GDN chunk algorithm across supported KV profiles.
 /// Owners must add the full reserve to their process allowance before loading.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuPrefill {
@@ -634,19 +634,13 @@ pub fn validate_prefill_capacity(
 /// Validate selected-cache context and the entire additional tile reservation.
 ///
 /// # Errors
-/// Rejects invalid context capacity, non-FP16 chunkwise GDN, insufficient memory
-/// and reservation overflow.
+/// Rejects invalid context capacity, insufficient memory, and reservation overflow.
 pub fn validate_prefill_capacity_with_kv(
     context_tokens: usize,
     memory_limit_bytes: u64,
     prefill: Option<CpuPrefill>,
     kv_cache: KvCachePolicy,
 ) -> Result<()> {
-    if prefill.is_some_and(CpuPrefill::chunkwise_gdn) && kv_cache != KvCachePolicy::F16 {
-        return Err(invalid(
-            "chunkwise GDN prefill requires the separate FP16 KV cache profile",
-        ));
-    }
     let reserve = prefill.map_or(0, CpuPrefill::scratch_bytes);
     let available = memory_limit_bytes
         .checked_sub(u64::try_from(reserve)?)
@@ -1132,9 +1126,8 @@ impl SwiftSession {
     /// Load an immutable CPU/accelerator profile with explicit prompt-reuse and
     /// sparse multi-branch checkpoint retention (`1..=8` reusable slots).
     ///
-    /// Invalid combinations (including chunkwise GDN outside FP16 or alongside
-    /// speculation, and branch checkpoints when reuse is disabled) reject before
-    /// any artifact I/O.
+    /// Invalid combinations (including chunkwise GDN alongside speculation, and
+    /// branch checkpoints when reuse is disabled) reject before any artifact I/O.
     ///
     /// # Errors
     /// Returns execution/reuse admission, artifact, graph and allocation failures.
@@ -2910,7 +2903,8 @@ mod tests {
     }
 
     #[test]
-    fn chunkwise_gdn_requires_fp16_without_speculation_before_artifact_io() -> Result<()> {
+    fn chunkwise_gdn_allows_fp16_and_rotated_kv_without_speculation_before_artifact_io()
+    -> Result<()> {
         let context = 8_192;
         let reserve = 64 * 1024 * 1024;
         let sequential = CpuPrefill::new(16, reserve)?;
@@ -2920,44 +2914,28 @@ mod tests {
         assert_eq!(chunkwise.tokens(), 16);
         assert_eq!(chunkwise.scratch_bytes(), reserve);
 
-        let f16_required = NON_CONTEXT_MEMORY_BYTES
-            + u64::try_from(context)? * context_token_memory_bytes(KvCachePolicy::F16)
-            + u64::try_from(reserve)?;
-        super::validate_prefill_capacity_with_kv(
-            context,
-            f16_required,
-            Some(chunkwise),
+        for policy in [
             KvCachePolicy::F16,
-        )?;
-        validate_execution_capacity_with_kv(
-            context,
-            f16_required,
-            Some(chunkwise),
-            None,
-            KvCachePolicy::F16,
-        )?;
-
-        for rotated in [
             KvCachePolicy::Rotated4,
             KvCachePolicy::Rotated4FittedValues,
             KvCachePolicy::Rotated4Keys3Values,
         ] {
-            assert!(
-                super::validate_prefill_capacity_with_kv(
-                    context,
-                    u64::MAX,
-                    Some(chunkwise),
-                    rotated
-                )
-                .is_err()
-            );
+            let required = NON_CONTEXT_MEMORY_BYTES
+                + u64::try_from(context)? * context_token_memory_bytes(policy)
+                + u64::try_from(reserve)?;
+            super::validate_prefill_capacity_with_kv(context, required, Some(chunkwise), policy)?;
+            validate_execution_capacity_with_kv(context, required, Some(chunkwise), None, policy)?;
+        }
+
+        let speculation = CpuSpeculation::new(4, 16 * 1024 * 1024, STATE_MEMORY_BYTES)?;
+        for policy in [KvCachePolicy::F16, KvCachePolicy::Rotated4] {
             assert!(
                 validate_execution_capacity_with_kv(
                     context,
                     u64::MAX,
                     Some(chunkwise),
-                    None,
-                    rotated
+                    Some(speculation),
+                    policy,
                 )
                 .is_err()
             );
@@ -2968,48 +2946,18 @@ mod tests {
                 MatvecBackend::Scalar,
                 42,
                 RowParallelism::default(),
-                rotated,
+                policy,
                 context,
-                Some(chunkwise),
-                None,
-            )
-            .err()
-            .ok_or("non-FP16 chunkwise GDN reached artifact loading")?;
-            assert_eq!(
-                error.to_string(),
-                "chunkwise GDN prefill requires the separate FP16 KV cache profile"
-            );
-        }
-
-        let speculation = CpuSpeculation::new(4, 16 * 1024 * 1024, STATE_MEMORY_BYTES)?;
-        assert!(
-            validate_execution_capacity_with_kv(
-                context,
-                u64::MAX,
                 Some(chunkwise),
                 Some(speculation),
-                KvCachePolicy::F16,
             )
-            .is_err()
-        );
-        let error = SwiftSession::load_profile_with_execution(
-            Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
-            Representation::Pq2,
-            None,
-            MatvecBackend::Scalar,
-            42,
-            RowParallelism::default(),
-            KvCachePolicy::F16,
-            context,
-            Some(chunkwise),
-            Some(speculation),
-        )
-        .err()
-        .ok_or("speculative chunkwise GDN reached artifact loading")?;
-        assert_eq!(
-            error.to_string(),
-            "chunkwise GDN prefill is incompatible with CPU speculation"
-        );
+            .err()
+            .ok_or("speculative chunkwise GDN reached artifact loading")?;
+            assert_eq!(
+                error.to_string(),
+                "chunkwise GDN prefill is incompatible with CPU speculation"
+            );
+        }
         Ok(())
     }
 

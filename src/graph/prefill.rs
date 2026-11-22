@@ -356,8 +356,10 @@ impl Qwen35 {
 
     /// Select a separately identified FP32 triangular GDN chunk algorithm.
     ///
-    /// Requires explicit FP16 tiled prefill selection on an empty graph. This changes
-    /// floating evaluation order; it does not promise bit-identical recurrence.
+    /// Requires explicit tiled prefill selection on an empty graph. Recurrent
+    /// GDN layers carry no KV cache, so this is valid on both FP16 and rotated
+    /// KV cache policies. This changes floating evaluation order; it does not
+    /// promise bit-identical recurrence.
     /// The initial qualification tolerance is `1e-3 + 1e-3 * abs(reference)` for
     /// complete logits and state, including long-prefix continuation and restore.
     /// This source API establishes no actual-model acceptance or speed benefit.
@@ -366,9 +368,6 @@ impl Qwen35 {
     /// # Errors
     /// Rejects nonempty, untiled or already selected graphs and failed identity allocation.
     pub fn with_chunkwise_gdn_prefill(mut self) -> Result<Self> {
-        if self.kv_cache_policy != super::KvCachePolicy::F16 {
-            return Err(invalid("chunkwise GDN requires the separate FP16 profile"));
-        }
         let Some(tile) = self.tiled_prefill.as_mut() else {
             return Err(invalid("chunkwise GDN requires explicit tiled prefill"));
         };
@@ -3448,4 +3447,353 @@ fn project_tile<'a>(
         basis: Some(tensor),
         prepared,
     })
+}
+
+#[cfg(test)]
+mod chunkwise_kv_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use bonsai_gguf::MetadataValue;
+
+    use super::super::{KvCachePolicy, MAX_STATE_BYTES, Qwen35};
+    use crate::kernels::MatvecBackend;
+    use crate::model::{Model, Tensor};
+    use crate::{Decoder, Result};
+
+    fn f32_tensor(name: &str, dims: &[usize], values: &[f32]) -> Tensor {
+        Tensor {
+            name: name.to_owned(),
+            dimensions: dims.to_vec(),
+            kind: 0,
+            data: Arc::<[u8]>::from(
+                values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        }
+    }
+
+    fn insert_hybrid_gdn_layer(
+        tensors: &mut BTreeMap<String, Tensor>,
+        emb: usize,
+        head: usize,
+        pat: &dyn Fn(usize, usize) -> Vec<f32>,
+        ones: &dyn Fn(usize) -> Vec<f32>,
+    ) {
+        tensors.extend([
+            (
+                "blk.0.attn_norm.weight".into(),
+                f32_tensor("blk.0.attn_norm.weight", &[emb], &ones(emb)),
+            ),
+            (
+                "blk.0.post_attention_norm.weight".into(),
+                f32_tensor("blk.0.post_attention_norm.weight", &[emb], &ones(emb)),
+            ),
+            (
+                "blk.0.attn_qkv.weight".into(),
+                f32_tensor(
+                    "blk.0.attn_qkv.weight",
+                    &[emb, 3 * head],
+                    &pat(emb * 3 * head, 3),
+                ),
+            ),
+            (
+                "blk.0.attn_gate.weight".into(),
+                f32_tensor("blk.0.attn_gate.weight", &[emb, head], &pat(emb * head, 4)),
+            ),
+            (
+                "blk.0.ssm_alpha.weight".into(),
+                f32_tensor("blk.0.ssm_alpha.weight", &[emb, 1], &pat(emb, 5)),
+            ),
+            (
+                "blk.0.ssm_beta.weight".into(),
+                f32_tensor("blk.0.ssm_beta.weight", &[emb, 1], &pat(emb, 6)),
+            ),
+            (
+                "blk.0.ssm_conv1d.weight".into(),
+                f32_tensor(
+                    "blk.0.ssm_conv1d.weight",
+                    &[2, 3 * head],
+                    &pat(2 * 3 * head, 7),
+                ),
+            ),
+            (
+                "blk.0.ssm_dt.bias".into(),
+                f32_tensor("blk.0.ssm_dt.bias", &[1], &[0.125]),
+            ),
+            (
+                "blk.0.ssm_a".into(),
+                f32_tensor("blk.0.ssm_a", &[1], &[-0.25]),
+            ),
+            (
+                "blk.0.ssm_norm.weight".into(),
+                f32_tensor("blk.0.ssm_norm.weight", &[head], &ones(head)),
+            ),
+            (
+                "blk.0.ssm_out.weight".into(),
+                f32_tensor("blk.0.ssm_out.weight", &[head, emb], &pat(head * emb, 8)),
+            ),
+        ]);
+    }
+
+    fn hybrid_gdn_rotated_kv_metadata() -> BTreeMap<String, MetadataValue> {
+        BTreeMap::from([
+            ("general.architecture".into(), MetadataValue::from("qwen35")),
+            ("qwen35.block_count".into(), MetadataValue::from(2_u32)),
+            ("qwen35.context_length".into(), MetadataValue::from(64_u32)),
+            (
+                "qwen35.embedding_length".into(),
+                MetadataValue::from(64_u32),
+            ),
+            (
+                "qwen35.feed_forward_length".into(),
+                MetadataValue::from(128_u32),
+            ),
+            (
+                "qwen35.attention.head_count".into(),
+                MetadataValue::from(1_u32),
+            ),
+            (
+                "qwen35.attention.head_count_kv".into(),
+                MetadataValue::from(1_u32),
+            ),
+            (
+                "qwen35.attention.key_length".into(),
+                MetadataValue::from(256_u32),
+            ),
+            (
+                "qwen35.attention.value_length".into(),
+                MetadataValue::from(256_u32),
+            ),
+            (
+                "qwen35.rope.dimension_count".into(),
+                MetadataValue::from(64_u32),
+            ),
+            (
+                "qwen35.rope.freq_base".into(),
+                MetadataValue::from(10_000.0_f32),
+            ),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon".into(),
+                MetadataValue::from(1e-6_f32),
+            ),
+            (
+                "qwen35.full_attention_interval".into(),
+                MetadataValue::from(2_u32),
+            ),
+            ("qwen35.ssm.state_size".into(), MetadataValue::from(64_u32)),
+            ("qwen35.ssm.group_count".into(), MetadataValue::from(1_u32)),
+            (
+                "qwen35.ssm.time_step_rank".into(),
+                MetadataValue::from(1_u32),
+            ),
+            ("qwen35.ssm.inner_size".into(), MetadataValue::from(64_u32)),
+            ("qwen35.ssm.conv_kernel".into(), MetadataValue::from(2_u32)),
+            (
+                "qwen35.rope.dimension_sections".into(),
+                MetadataValue::from(vec![16_u32, 16, 0, 0]),
+            ),
+            (
+                "qwen35.attention.recurrent_layers".into(),
+                MetadataValue::from(vec![true, false]),
+            ),
+        ])
+    }
+
+    fn insert_hybrid_full_attn_and_ffn(
+        tensors: &mut BTreeMap<String, Tensor>,
+        emb: usize,
+        ffn: usize,
+        full_head: usize,
+        pat: &dyn Fn(usize, usize) -> Vec<f32>,
+        ones: &dyn Fn(usize) -> Vec<f32>,
+    ) {
+        tensors.extend([
+            (
+                "blk.1.attn_norm.weight".into(),
+                f32_tensor("blk.1.attn_norm.weight", &[emb], &ones(emb)),
+            ),
+            (
+                "blk.1.post_attention_norm.weight".into(),
+                f32_tensor("blk.1.post_attention_norm.weight", &[emb], &ones(emb)),
+            ),
+            (
+                "blk.1.attn_q.weight".into(),
+                f32_tensor(
+                    "blk.1.attn_q.weight",
+                    &[emb, 2 * full_head],
+                    &pat(emb * 2 * full_head, 9),
+                ),
+            ),
+            (
+                "blk.1.attn_k.weight".into(),
+                f32_tensor(
+                    "blk.1.attn_k.weight",
+                    &[emb, full_head],
+                    &pat(emb * full_head, 10),
+                ),
+            ),
+            (
+                "blk.1.attn_v.weight".into(),
+                f32_tensor(
+                    "blk.1.attn_v.weight",
+                    &[emb, full_head],
+                    &pat(emb * full_head, 11),
+                ),
+            ),
+            (
+                "blk.1.attn_output.weight".into(),
+                f32_tensor(
+                    "blk.1.attn_output.weight",
+                    &[full_head, emb],
+                    &pat(full_head * emb, 12),
+                ),
+            ),
+            (
+                "blk.1.attn_q_norm.weight".into(),
+                f32_tensor("blk.1.attn_q_norm.weight", &[full_head], &ones(full_head)),
+            ),
+            (
+                "blk.1.attn_k_norm.weight".into(),
+                f32_tensor("blk.1.attn_k_norm.weight", &[full_head], &ones(full_head)),
+            ),
+        ]);
+        for layer in 0..2_usize {
+            let prefix = format!("blk.{layer}.");
+            tensors.extend([
+                (
+                    format!("{prefix}ffn_up.weight"),
+                    f32_tensor(
+                        &format!("{prefix}ffn_up.weight"),
+                        &[emb, ffn],
+                        &pat(emb * ffn, 13 + layer),
+                    ),
+                ),
+                (
+                    format!("{prefix}ffn_gate.weight"),
+                    f32_tensor(
+                        &format!("{prefix}ffn_gate.weight"),
+                        &[emb, ffn],
+                        &pat(emb * ffn, 15 + layer),
+                    ),
+                ),
+                (
+                    format!("{prefix}ffn_down.weight"),
+                    f32_tensor(
+                        &format!("{prefix}ffn_down.weight"),
+                        &[ffn, emb],
+                        &pat(ffn * emb, 17 + layer),
+                    ),
+                ),
+            ]);
+        }
+    }
+
+    fn hybrid_gdn_rotated_kv_fixture() -> Model {
+        let emb = 64_usize;
+        let ffn = 128_usize;
+        let ssm_head = 64_usize;
+        let full_head = 256_usize;
+        let vocab = 6_usize;
+        let metadata = hybrid_gdn_rotated_kv_metadata();
+        let pat = |len: usize, seed: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| [0.0625_f32, -0.03125, 0.015_625, -0.0625, 0.03125][(i + seed) % 5])
+                .collect()
+        };
+        let ones = |len: usize| vec![1.0_f32; len];
+        let mut tensors = BTreeMap::from([
+            (
+                "token_embd.weight".into(),
+                f32_tensor("token_embd.weight", &[emb, vocab], &pat(emb * vocab, 1)),
+            ),
+            (
+                "output.weight".into(),
+                f32_tensor("output.weight", &[emb, vocab], &pat(emb * vocab, 2)),
+            ),
+            (
+                "output_norm.weight".into(),
+                f32_tensor("output_norm.weight", &[emb], &ones(emb)),
+            ),
+        ]);
+        insert_hybrid_gdn_layer(&mut tensors, emb, ssm_head, &pat, &ones);
+        insert_hybrid_full_attn_and_ffn(&mut tensors, emb, ffn, full_head, &pat, &ones);
+        Model {
+            metadata,
+            tensors,
+            identity: "hybrid-gdn-rotated-kv-fixture".into(),
+        }
+    }
+
+    #[test]
+    fn chunkwise_gdn_works_on_fp16_and_all_rotated_kv_policies() -> Result<()> {
+        let prompt = [0_u32, 1, 2, 3, 1, 2];
+        for policy in [
+            KvCachePolicy::F16,
+            KvCachePolicy::Rotated4,
+            KvCachePolicy::Rotated4FittedValues,
+            KvCachePolicy::Rotated4Keys3Values,
+        ] {
+            let seq_base = Qwen35::with_adapters_and_kv(
+                hybrid_gdn_rotated_kv_fixture(),
+                16,
+                MAX_STATE_BYTES,
+                MatvecBackend::Scalar,
+                None,
+                None,
+                policy,
+            )?;
+            let scratch = seq_base.tiled_prefill_scratch_bytes(8)?;
+            let mut sequential = seq_base.with_tiled_prefill(8, scratch)?;
+            sequential.ingest_block(&prompt, &|| Ok(()))?;
+            let mut expected = Vec::new();
+            sequential.evaluate_into(4, &mut expected)?;
+
+            let wy_base = Qwen35::with_adapters_and_kv(
+                hybrid_gdn_rotated_kv_fixture(),
+                16,
+                MAX_STATE_BYTES,
+                MatvecBackend::Scalar,
+                None,
+                None,
+                policy,
+            )?;
+            let scratch_wy = wy_base.tiled_prefill_scratch_bytes(8)?;
+            let mut chunkwise = wy_base
+                .with_tiled_prefill(8, scratch_wy)?
+                .with_chunkwise_gdn_prefill()?;
+            assert!(chunkwise.identity().ends_with(":gdn-wy-f32-v1"));
+            assert_ne!(chunkwise.identity(), sequential.identity());
+            chunkwise.ingest_block(&prompt, &|| Ok(()))?;
+            assert!(chunkwise.tiled_prefill_statistics().chunkwise_gdn_heads > 0);
+            let mut actual = Vec::new();
+            chunkwise.evaluate_into(4, &mut actual)?;
+            for (&a, &e) in actual.iter().zip(&expected) {
+                let tol = 1e-3_f32.mul_add(e.abs(), 1e-3_f32);
+                assert!(
+                    (a - e).abs() <= tol,
+                    "policy={policy:?} |{a} - {e}| > {tol}"
+                );
+            }
+
+            let verify_base = Qwen35::with_adapters_and_kv(
+                hybrid_gdn_rotated_kv_fixture(),
+                16,
+                MAX_STATE_BYTES,
+                MatvecBackend::Scalar,
+                None,
+                None,
+                policy,
+            )?;
+            let scratch_v = verify_base.tiled_prefill_scratch_bytes(8)?;
+            let wy_for_verify = verify_base
+                .with_tiled_prefill(8, scratch_v)?
+                .with_chunkwise_gdn_prefill()?;
+            assert!(wy_for_verify.tiled_verification_scratch_bytes().is_err());
+        }
+        Ok(())
+    }
 }

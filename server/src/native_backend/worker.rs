@@ -1049,9 +1049,7 @@ fn valid_graph_profile(profile: &ModelProfile) -> bool {
                 && !identity.contains(":gdn-wy-f32-v1")
         },
         |prefill| {
-            if prefill.chunkwise_gdn()
-                && (profile.kv_cache != KvCachePolicy::F16 || profile.cpu_speculation.is_some())
-            {
+            if prefill.chunkwise_gdn() && profile.cpu_speculation.is_some() {
                 return false;
             }
             let mut suffix = format!(":cpu-tiled-ffn-v1:{}", prefill.tokens());

@@ -6,7 +6,7 @@
 //! and 3-stage decomposed attention with explicit IEEE-754 binary16 probability rounding).
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bonsai_native_hash::Hasher;
 
@@ -16,6 +16,7 @@ const SPIRV_MAGIC: u32 = 0x0723_0203;
 const SPIRV_VERSION_1_6: u32 = 0x0001_0600;
 const WORKGROUP_X: u32 = 64;
 
+const OP_EXTENSION: u16 = 10;
 const OP_EXT_INST_IMPORT: u16 = 11;
 const OP_EXT_INST: u16 = 12;
 const OP_MEMORY_MODEL: u16 = 14;
@@ -42,7 +43,9 @@ const OP_ACCESS_CHAIN: u16 = 65;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
 const OP_COMPOSITE_EXTRACT: u16 = 81;
+const OP_CONVERT_F_TO_S: u16 = 110;
 const OP_CONVERT_S_TO_F: u16 = 111;
+const OP_CONVERT_U_TO_F: u16 = 112;
 const OP_BITCAST: u16 = 124;
 const OP_I_ADD: u16 = 128;
 const OP_F_ADD: u16 = 129;
@@ -57,9 +60,12 @@ const OP_LOGICAL_AND: u16 = 167;
 const OP_SELECT: u16 = 169;
 const OP_I_EQUAL: u16 = 170;
 const OP_I_NOT_EQUAL: u16 = 171;
+const OP_U_GREATER_THAN_EQUAL: u16 = 174;
 const OP_U_LESS_THAN: u16 = 176;
 const OP_F_ORD_EQUAL: u16 = 180;
+const OP_F_ORD_LESS_THAN: u16 = 184;
 const OP_F_ORD_GREATER_THAN: u16 = 186;
+const OP_F_ORD_GREATER_THAN_EQUAL: u16 = 190;
 const OP_SHIFT_RIGHT_LOGICAL: u16 = 194;
 const OP_SHIFT_RIGHT_ARITHMETIC: u16 = 195;
 const OP_SHIFT_LEFT_LOGICAL: u16 = 196;
@@ -77,11 +83,16 @@ const OP_RETURN: u16 = 253;
 const OP_S_DOT: u16 = 4450;
 
 const CAPABILITY_SHADER: u32 = 1;
+const CAPABILITY_FLOAT64: u32 = 10;
+const CAPABILITY_INT64: u32 = 11;
 const CAPABILITY_DOT_PRODUCT_INPUT_4X8_BIT_PACKED: u32 = 6018;
 const CAPABILITY_DOT_PRODUCT: u32 = 6019;
 
 const GLSL_FABS: u32 = 4;
+const GLSL_FLOOR: u32 = 8;
 const GLSL_EXP: u32 = 27;
+const GLSL_LOG: u32 = 28;
+const GLSL_SQRT: u32 = 31;
 const GLSL_SMIN: u32 = 39;
 const GLSL_FMAX: u32 = 40;
 const GLSL_SMAX: u32 = 42;
@@ -996,6 +1007,10 @@ impl ShaderBuilder {
         self.binop(OP_SHIFT_LEFT_LOGICAL, self.u32_t, a, b)
     }
 
+    fn usub(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_I_SUB, self.u32_t, a, b)
+    }
+
     fn ushr(&mut self, a: u32, b: u32) -> u32 {
         self.binop(OP_SHIFT_RIGHT_LOGICAL, self.u32_t, a, b)
     }
@@ -1012,6 +1027,10 @@ impl ShaderBuilder {
         self.binop(OP_U_LESS_THAN, self.bool_t, a, b)
     }
 
+    fn u_ge(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_U_GREATER_THAN_EQUAL, self.bool_t, a, b)
+    }
+
     fn u_eq(&mut self, a: u32, b: u32) -> u32 {
         self.binop(OP_I_EQUAL, self.bool_t, a, b)
     }
@@ -1020,8 +1039,16 @@ impl ShaderBuilder {
         self.binop(OP_F_ORD_EQUAL, self.bool_t, a, b)
     }
 
+    fn f_lt(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_F_ORD_LESS_THAN, self.bool_t, a, b)
+    }
+
     fn f_gt(&mut self, a: u32, b: u32) -> u32 {
         self.binop(OP_F_ORD_GREATER_THAN, self.bool_t, a, b)
+    }
+
+    fn f_ge(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_F_ORD_GREATER_THAN_EQUAL, self.bool_t, a, b)
     }
 
     fn u_ne(&mut self, a: u32, b: u32) -> u32 {
@@ -1051,6 +1078,18 @@ impl ShaderBuilder {
     fn i32_to_f32(&mut self, val: u32) -> u32 {
         let id = self.alloc_id();
         push_inst(&mut self.fn_body, OP_CONVERT_S_TO_F, &[self.f32_t, id, val]);
+        id
+    }
+
+    fn u32_to_f32(&mut self, val: u32) -> u32 {
+        let id = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_CONVERT_U_TO_F, &[self.f32_t, id, val]);
+        id
+    }
+
+    fn f32_to_i32(&mut self, val: u32) -> u32 {
+        let id = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_CONVERT_F_TO_S, &[self.i32_t, id, val]);
         id
     }
 
@@ -1127,6 +1166,26 @@ impl ShaderBuilder {
         self.glsl1(self.f32_t, GLSL_FABS, a)
     }
 
+    fn f_floor(&mut self, a: u32) -> u32 {
+        self.glsl1(self.f32_t, GLSL_FLOOR, a)
+    }
+
+    fn f_exp(&mut self, a: u32) -> u32 {
+        self.glsl1(self.f32_t, GLSL_EXP, a)
+    }
+
+    fn f_log(&mut self, a: u32) -> u32 {
+        self.glsl1(self.f32_t, GLSL_LOG, a)
+    }
+
+    fn f_sqrt(&mut self, a: u32) -> u32 {
+        self.glsl1(self.f32_t, GLSL_SQRT, a)
+    }
+
+    fn f_max(&mut self, a: u32, b: u32) -> u32 {
+        self.glsl2(self.f32_t, GLSL_FMAX, a, b)
+    }
+
     fn s_min(&mut self, a: u32, b: u32) -> u32 {
         self.glsl2(self.i32_t, GLSL_SMIN, a, b)
     }
@@ -1156,7 +1215,7 @@ impl ShaderBuilder {
         self.unpack_half_pair(u32_val).0
     }
 
-    fn round_f16(&mut self, val: u32) -> u32 {
+    fn round_f16_bits(&mut self, val: u32) -> u32 {
         let bits = self.bitcast(self.u32_t, val);
         let mask_abs = self.const_u32(0x7FFF_FFFF);
         let abs_bits = self.uand(bits, mask_abs);
@@ -1196,7 +1255,11 @@ impl ShaderBuilder {
         let mask_sign = self.const_u32(0x8000);
         let sign_shr = self.ushr(bits, c16);
         let sign_bit = self.uand(sign_shr, mask_sign);
-        let half_u16 = self.uor(sign_bit, magnitude);
+        self.uor(sign_bit, magnitude)
+    }
+
+    fn round_f16(&mut self, val: u32) -> u32 {
+        let half_u16 = self.round_f16_bits(val);
         self.unpack_half_low(half_u16)
     }
 
@@ -3696,83 +3759,1551 @@ fn emit_dot_qk_row(
     b.fmul_nc(scale, acc_v)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Splits shared RMSNorm emission cleanly between standalone and fused residual kernels."
+)]
+fn emit_rms_norm_workgroup_body(
+    b: &mut ShaderBuilder,
+    in_buf: u32,
+    res_update: Option<(u32, u32)>,
+    w_buf: u32,
+    out_buf: u32,
+    wg_reduce: u32,
+    dim: u32,
+    eps_bits: u32,
+) {
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let row = b.load_input_component(wid_vec, 1);
 
-    fn assert_valid_spirv_structure(words: &[u32]) {
-        const OP_EXTENSION_OPCODE: u16 = 10;
+    let c0 = b.const_u32(0);
+    let c64 = b.const_u32(WORKGROUP_X);
+    let f_zero = b.const_f32(0.0);
+    let f_one = b.const_f32(1.0);
+    let eps = b.bitcast(b.f32_t, eps_bits);
 
-        assert!(words.len() >= 5);
-        assert_eq!(words[0], SPIRV_MAGIC);
-        assert_eq!(words[1], SPIRV_VERSION_1_6);
-        let bound = words[3];
-        assert!(bound > 1);
-        assert_eq!(words[4], 0);
+    let dim_ok = b.u_ne(dim, c0);
+    b.emit_if(dim_ok, |b| {
+        let base = b.umul(row, dim);
+        let acc_var = b.local_f32_var();
+        b.store_var(acc_var, f_zero);
 
-        let mut offset = 5;
-        let mut opcodes = Vec::new();
-        let mut entry_interface = Vec::new();
-        let mut global_vars = Vec::new();
-        let mut function_vars = Vec::new();
-        while offset < words.len() {
-            let header = words[offset];
-            let wc = usize::try_from(header >> 16).unwrap_or(0);
-            let op = u16::try_from(header & 0xFFFF).unwrap_or(0);
-            assert!(wc >= 1, "zero word count at word {offset}");
-            assert!(
-                offset + wc <= words.len(),
-                "truncated instruction at word {offset}"
-            );
-            let operands = &words[offset + 1..offset + wc];
-            if op == OP_ENTRY_POINT && operands.len() >= 3 {
-                let mut idx = 2;
-                while idx < operands.len() {
-                    let word = operands[idx];
+        b.emit_for_range(lid, dim, c64, |b, i| {
+            let idx = b.uadd(base, i);
+            let val = if let Some((res_buf, delta_buf)) = res_update {
+                let r = b.load_sb_f32(res_buf, idx);
+                let d = b.load_sb_f32(delta_buf, idx);
+                let updated = b.fadd_nc(r, d);
+                b.store_sb_f32(res_buf, idx, updated);
+                updated
+            } else {
+                b.load_sb_f32(in_buf, idx)
+            };
+            let sq = b.fmul_nc(val, val);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.fadd_nc(prev, sq);
+            b.store_var(acc_var, next);
+        });
+
+        let partial = b.load_var_f32(acc_var);
+        b.store_wg_f32(wg_reduce, lid, partial);
+        b.workgroup_barrier();
+        let sum_sq = emit_wg_reduce_64(b, wg_reduce, lid, false);
+
+        let dim_f = b.u32_to_f32(dim);
+        let mean = b.fdiv(sum_sq, dim_f);
+        let mean_eps = b.fadd_nc(mean, eps);
+        let denom = b.f_sqrt(mean_eps);
+        let scale = b.fdiv(f_one, denom);
+
+        let read_buf = res_update.map_or(in_buf, |(res_buf, _)| res_buf);
+        b.emit_for_range(lid, dim, c64, |b, i| {
+            let idx = b.uadd(base, i);
+            let v = b.load_sb_f32(read_buf, idx);
+            let w = b.load_sb_f32(w_buf, i);
+            let scaled = b.fmul_nc(v, scale);
+            let normed = b.fmul_nc(scaled, w);
+            b.store_sb_f32(out_buf, idx, normed);
+        });
+    });
+}
+
+/// Emits GPU `RMSNorm` SPIR-V 1.6 words (`out[r, i] = input[r, i] * rsqrt(mean(x^2) + eps) * weight[i]`).
+///
+/// Bindings: `0` read-only `input` (`f32`), `1` read-only `weight` (`f32`), `2` writable `out` (`f32`).
+/// Push constants (`2 × u32`): `[dim, eps_bits]`. Dispatch: `(1, rows, 1)` (`rows = 1` or `num_heads`).
+#[must_use]
+pub fn rms_norm_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let w_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+
+    let dim = b.load_push(push_var, 0);
+    let eps_bits = b.load_push(push_var, 1);
+    emit_rms_norm_workgroup_body(
+        &mut b, in_buf, None, w_buf, out_buf, wg_reduce, dim, eps_bits,
+    );
+
+    b.finish()
+}
+
+/// Emits fused in-place residual update + `RMSNorm` SPIR-V 1.6 words (`residual += delta; norm_out = rms_norm(residual)`).
+///
+/// Bindings: `0` read-write `residual_inout` (`f32`), `1` read-only `delta` (`f32`),
+/// `2` read-only `weight` (`f32`), `3` writable `norm_out` (`f32`).
+/// Push constants (`2 × u32`): `[dim, eps_bits]`. Dispatch: `(1, rows, 1)`.
+#[must_use]
+pub fn add_rms_norm_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let res_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
+    let delta_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let w_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+
+    let dim = b.load_push(push_var, 0);
+    let eps_bits = b.load_push(push_var, 1);
+    emit_rms_norm_workgroup_body(
+        &mut b,
+        res_buf,
+        Some((res_buf, delta_buf)),
+        w_buf,
+        out_buf,
+        wg_reduce,
+        dim,
+        eps_bits,
+    );
+
+    b.finish()
+}
+
+/// Emits elementwise in-place residual addition SPIR-V 1.6 words (`residual_inout[i] += delta[i]`).
+///
+/// Bindings: `0` read-write `residual_inout` (`f32`), `1` read-only `delta` (`f32`).
+/// Push constants (`1 × u32`): `[len]`. Dispatch: `(len.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn residual_add_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let res_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
+    let delta_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let len = b.load_push(push_var, 0);
+
+    let in_bounds = b.u_lt(idx, len);
+    b.emit_if(in_bounds, |b| {
+        let r = b.load_sb_f32(res_buf, idx);
+        let d = b.load_sb_f32(delta_buf, idx);
+        let sum = b.fadd_nc(r, d);
+        b.store_sb_f32(res_buf, idx, sum);
+    });
+
+    b.finish()
+}
+
+/// Emits per-head NeoX-style rotary embedding (`RoPE`) SPIR-V 1.6 words with optional binary16 rounding.
+///
+/// Preserves exact Prism `(cos, sin)` pairing across `0..rope_dim/2` paired with `rope_dim/2..rope_dim`,
+/// and rounds all `0..head_dim` elements per head to IEEE binary16 when `round_f16 != 0`.
+///
+/// Bindings: `0` read-write `vec_inout` (`f32`, `[heads, head_dim]`),
+/// `1` read-only `freqs` (`f32`, interleaved `[cos0, sin0, ...]`, length `rope_dim`).
+/// Push constants (`4 × u32`): `[heads, head_dim, rope_dim, round_f16]`.
+/// Dispatch: `(head_dim.div_ceil(64), heads, 1)`.
+#[must_use]
+pub fn rope_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 4);
+    let push_var = push_var.unwrap_or(0);
+    let vec_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
+    let freqs_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+
+    let gid = b.global_invocation_id();
+    let d = b.load_input_component(gid, 0);
+    let h = b.load_input_component(gid, 1);
+
+    let heads = b.load_push(push_var, 0);
+    let head_dim = b.load_push(push_var, 1);
+    let rope_dim = b.load_push(push_var, 2);
+    let round_flag = b.load_push(push_var, 3);
+
+    let d_ok = b.u_lt(d, head_dim);
+    let h_ok = b.u_lt(h, heads);
+    let in_bounds = b.logical_and(d_ok, h_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c2 = b.const_u32(2);
+        let half_rope = b.ushr(rope_dim, c1);
+        let head_base = b.umul(h, head_dim);
+        let do_round = b.u_ne(round_flag, c0);
+        let is_pair = b.u_lt(d, half_rope);
+
+        b.emit_if_else(
+            is_pair,
+            |b| {
+                let idx0 = b.uadd(head_base, d);
+                let idx1 = b.uadd(idx0, half_rope);
+                let first = b.load_sb_f32(vec_buf, idx0);
+                let second = b.load_sb_f32(vec_buf, idx1);
+                let f_off = b.umul(d, c2);
+                let f_sin_off = b.uadd(f_off, c1);
+                let cos_v = b.load_sb_f32(freqs_buf, f_off);
+                let sin_v = b.load_sb_f32(freqs_buf, f_sin_off);
+
+                let fc = b.fmul_nc(first, cos_v);
+                let ss = b.fmul_nc(second, sin_v);
+                let r0_raw = b.fsub_nc(fc, ss);
+                let fs = b.fmul_nc(first, sin_v);
+                let sc = b.fmul_nc(second, cos_v);
+                let r1_raw = b.fadd_nc(fs, sc);
+
+                b.emit_if_else(
+                    do_round,
+                    |b| {
+                        let r0 = b.round_f16(r0_raw);
+                        let r1 = b.round_f16(r1_raw);
+                        b.store_sb_f32(vec_buf, idx0, r0);
+                        b.store_sb_f32(vec_buf, idx1, r1);
+                    },
+                    |b| {
+                        b.store_sb_f32(vec_buf, idx0, r0_raw);
+                        b.store_sb_f32(vec_buf, idx1, r1_raw);
+                    },
+                );
+            },
+            |b| {
+                let past_rope = b.u_ge(d, rope_dim);
+                let tail_round = b.logical_and(past_rope, do_round);
+                b.emit_if(tail_round, |b| {
+                    let idx = b.uadd(head_base, d);
+                    let v = b.load_sb_f32(vec_buf, idx);
+                    let vr = b.round_f16(v);
+                    b.store_sb_f32(vec_buf, idx, vr);
+                });
+            },
+        );
+    });
+
+    b.finish()
+}
+
+/// Emits elementwise attention output gating SPIR-V 1.6 words (`values_inout[i] *= sigmoid(gate[i])`).
+///
+/// Bindings: `0` read-write `values_inout` (`f32`), `1` read-only `gate` (`f32`).
+/// Push constants (`1 × u32`): `[len]`. Dispatch: `(len.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn mul_sigmoid_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let vals_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
+    let gate_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let len = b.load_push(push_var, 0);
+
+    let in_bounds = b.u_lt(idx, len);
+    b.emit_if(in_bounds, |b| {
+        let f_zero = b.const_f32(0.0);
+        let f_one = b.const_f32(1.0);
+        let v = b.load_sb_f32(vals_buf, idx);
+        let g = b.load_sb_f32(gate_buf, idx);
+        let neg_g = b.fsub_nc(f_zero, g);
+        let e = b.f_exp(neg_g);
+        let denom = b.fadd_nc(f_one, e);
+        let sig = b.fdiv(f_one, denom);
+        let out = b.fmul_nc(v, sig);
+        b.store_sb_f32(vals_buf, idx, out);
+    });
+
+    b.finish()
+}
+
+/// Emits depthwise causal `conv1d` + rolling history shift + `SiLU` SPIR-V 1.6 words.
+///
+/// Matches Prism's channel-major `conv_state` layout (`channels * (kernel_size - 1)` floats, oldest
+/// tap first) and channel-major `conv_weight` (`channels * kernel_size` floats).
+///
+/// Bindings: `0` read-only `qkv_in` (`f32`), `1` read-write `conv_state_inout` (`f32`),
+/// `2` read-only `conv_weight` (`f32`), `3` writable `conv_out` (`f32`).
+/// Push constants (`2 × u32`): `[channels, kernel_size]`. Dispatch: `(channels.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn conv1d_silu_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let qkv_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let state_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
+    let weight_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let ch = b.load_input_component(gid, 0);
+    let channels = b.load_push(push_var, 0);
+    let kernel_size = b.load_push(push_var, 1);
+
+    let ch_ok = b.u_lt(ch, channels);
+    let c0 = b.const_u32(0);
+    let k_ok = b.u_ne(kernel_size, c0);
+    let in_bounds = b.logical_and(ch_ok, k_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let c1 = b.const_u32(1);
+        let f_zero = b.const_f32(0.0);
+        let f_one = b.const_f32(1.0);
+
+        let hist_width = b.usub(kernel_size, c1);
+        let w_base = b.umul(ch, kernel_size);
+        let acc_var = b.local_f32_var();
+        b.store_var(acc_var, f_zero);
+
+        let has_hist = b.u_lt(c1, kernel_size);
+        b.emit_if(has_hist, |b| {
+            let h_base = b.umul(ch, hist_width);
+            b.emit_for_range(c0, hist_width, c1, |b, t| {
+                let h_idx = b.uadd(h_base, t);
+                let w_idx = b.uadd(w_base, t);
+                let hv = b.load_sb_f32(state_buf, h_idx);
+                let wv = b.load_sb_f32(weight_buf, w_idx);
+                let prod = b.fmul_nc(hv, wv);
+                let prev = b.load_var_f32(acc_var);
+                let next = b.fadd_nc(prev, prod);
+                b.store_var(acc_var, next);
+            });
+        });
+
+        let cur = b.load_sb_f32(qkv_buf, ch);
+        let w_cur_idx = b.uadd(w_base, hist_width);
+        let w_cur = b.load_sb_f32(weight_buf, w_cur_idx);
+        let cur_prod = b.fmul_nc(cur, w_cur);
+        let prev_sum = b.load_var_f32(acc_var);
+        let conv_val = b.fadd_nc(prev_sum, cur_prod);
+
+        b.emit_if(has_hist, |b| {
+            let h_base = b.umul(ch, hist_width);
+            let shift_limit = b.usub(hist_width, c1);
+            b.emit_for_range(c0, shift_limit, c1, |b, t| {
+                let dst_idx = b.uadd(h_base, t);
+                let src_idx = b.uadd(dst_idx, c1);
+                let next_h = b.load_sb_f32(state_buf, src_idx);
+                b.store_sb_f32(state_buf, dst_idx, next_h);
+            });
+            let last_idx = b.uadd(h_base, shift_limit);
+            b.store_sb_f32(state_buf, last_idx, cur);
+        });
+
+        let neg_val = b.fsub_nc(f_zero, conv_val);
+        let e = b.f_exp(neg_val);
+        let denom = b.fadd_nc(f_one, e);
+        let activated = b.fdiv(conv_val, denom);
+        b.store_sb_f32(out_buf, ch, activated);
+    });
+
+    b.finish()
+}
+
+/// Emits per-head `ClampedL2` normalization SPIR-V 1.6 words (`x *= 1.0 / max(sqrt(sum(x^2)), eps)`).
+///
+/// Bindings: `0` read-write `vec_inout` (`f32`, `[heads, head_dim]`).
+/// Push constants (`3 × u32`): `[heads, head_dim, eps_bits]`. Dispatch: `(1, heads, 1)`.
+#[must_use]
+pub fn l2_norm_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 3);
+    let push_var = push_var.unwrap_or(0);
+    let vec_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let h = b.load_input_component(wid_vec, 1);
+
+    let heads = b.load_push(push_var, 0);
+    let head_dim = b.load_push(push_var, 1);
+    let eps_bits = b.load_push(push_var, 2);
+    let eps = b.bitcast(b.f32_t, eps_bits);
+
+    let h_ok = b.u_lt(h, heads);
+    b.emit_if(h_ok, |b| {
+        let c64 = b.const_u32(WORKGROUP_X);
+        let f_zero = b.const_f32(0.0);
+        let f_one = b.const_f32(1.0);
+        let base = b.umul(h, head_dim);
+
+        let acc_var = b.local_f32_var();
+        b.store_var(acc_var, f_zero);
+
+        b.emit_for_range(lid, head_dim, c64, |b, i| {
+            let idx = b.uadd(base, i);
+            let x = b.load_sb_f32(vec_buf, idx);
+            let sq = b.fmul_nc(x, x);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.fadd_nc(prev, sq);
+            b.store_var(acc_var, next);
+        });
+
+        let partial = b.load_var_f32(acc_var);
+        b.store_wg_f32(wg_reduce, lid, partial);
+        b.workgroup_barrier();
+        let sum_sq = emit_wg_reduce_64(b, wg_reduce, lid, false);
+
+        let norm = b.f_sqrt(sum_sq);
+        let clamped = b.f_max(norm, eps);
+        let scale = b.fdiv(f_one, clamped);
+
+        b.emit_for_range(lid, head_dim, c64, |b, i| {
+            let idx = b.uadd(base, i);
+            let x = b.load_sb_f32(vec_buf, idx);
+            let scaled = b.fmul_nc(x, scale);
+            b.store_sb_f32(vec_buf, idx, scaled);
+        });
+    });
+
+    b.finish()
+}
+
+/// Emits parallel per-head F32 GDN recurrent step SPIR-V 1.6 words (`[num_v_heads, head_dim, head_dim]`).
+///
+/// Updates each row `(vh, row)` in value-head, value-row, contiguous-key-column order:
+/// 1. `S[vh, row, :] *= alpha_decay[vh]` and `dot_k = dot(S[vh, row, :], k[kh, :])`
+/// 2. `delta = (v[vh, row] - dot_k) * beta[vh]`
+/// 3. `S[vh, row, :] += delta * k[kh, :]` and `out[vh, row] = dot(S[vh, row, :], q[kh, :]) * scale`
+///
+///    where `kh = vh % num_k_heads`.
+///
+/// Bindings: `0` read-write `state_inout` (`f32`), `1` read-only `q` (`f32`), `2` read-only `k` (`f32`),
+/// `3` read-only `v` (`f32`), `4` read-only `alpha_decay` (`f32`), `5` read-only `beta` (`f32`),
+/// `6` writable `out` (`f32`).
+/// Push constants (`4 × u32`): `[num_v_heads, num_k_heads, head_dim, scale_bits]`.
+/// Dispatch: `(head_dim, num_v_heads, 1)`.
+#[must_use]
+pub fn gdn_step_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 4);
+    let push_var = push_var.unwrap_or(0);
+    let state_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
+    let q_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let k_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let v_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly);
+    let alpha_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadOnly);
+    let beta_buf = b.storage_buffer(5, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(6, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let row = b.load_input_component(wid_vec, 0);
+    let vh = b.load_input_component(wid_vec, 1);
+
+    let v_heads = b.load_push(push_var, 0);
+    let k_heads = b.load_push(push_var, 1);
+    let head_dim = b.load_push(push_var, 2);
+    let scale_bits = b.load_push(push_var, 3);
+    let scale = b.bitcast(b.f32_t, scale_bits);
+
+    let c0 = b.const_u32(0);
+    let row_ok = b.u_lt(row, head_dim);
+    let vh_ok = b.u_lt(vh, v_heads);
+    let k_ok = b.u_ne(k_heads, c0);
+    let row_vh_ok = b.logical_and(row_ok, vh_ok);
+    let in_bounds = b.logical_and(row_vh_ok, k_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let c64 = b.const_u32(WORKGROUP_X);
+        let f_zero = b.const_f32(0.0);
+
+        let q_div = b.udiv(vh, k_heads);
+        let q_mul = b.umul(q_div, k_heads);
+        let kh = b.usub(vh, q_mul);
+
+        let k_base = b.umul(kh, head_dim);
+        let v_head_base = b.umul(vh, head_dim);
+        let head_state_elems = b.umul(head_dim, head_dim);
+        let state_head_base = b.umul(vh, head_state_elems);
+        let state_row_off = b.umul(row, head_dim);
+        let state_row_base = b.uadd(state_head_base, state_row_off);
+
+        let decay = b.load_sb_f32(alpha_buf, vh);
+        let beta_val = b.load_sb_f32(beta_buf, vh);
+        let v_idx = b.uadd(v_head_base, row);
+        let v_val = b.load_sb_f32(v_buf, v_idx);
+
+        let k_dot_var = b.local_f32_var();
+        b.store_var(k_dot_var, f_zero);
+        b.emit_for_range(lid, head_dim, c64, |b, col| {
+            let s_idx = b.uadd(state_row_base, col);
+            let k_idx = b.uadd(k_base, col);
+            let s_old = b.load_sb_f32(state_buf, s_idx);
+            let s_dec = b.fmul_nc(s_old, decay);
+            b.store_sb_f32(state_buf, s_idx, s_dec);
+            let kv = b.load_sb_f32(k_buf, k_idx);
+            let prod = b.fmul_nc(s_dec, kv);
+            let prev = b.load_var_f32(k_dot_var);
+            let next = b.fadd_nc(prev, prod);
+            b.store_var(k_dot_var, next);
+        });
+        let partial_k = b.load_var_f32(k_dot_var);
+        b.store_wg_f32(wg_reduce, lid, partial_k);
+        b.workgroup_barrier();
+        let dot_k = emit_wg_reduce_64(b, wg_reduce, lid, false);
+        b.workgroup_barrier();
+
+        let err = b.fsub_nc(v_val, dot_k);
+        let delta = b.fmul_nc(err, beta_val);
+
+        let q_dot_var = b.local_f32_var();
+        b.store_var(q_dot_var, f_zero);
+        b.emit_for_range(lid, head_dim, c64, |b, col| {
+            let s_idx = b.uadd(state_row_base, col);
+            let k_idx = b.uadd(k_base, col);
+            let s_dec = b.load_sb_f32(state_buf, s_idx);
+            let kv = b.load_sb_f32(k_buf, k_idx);
+            let qv = b.load_sb_f32(q_buf, k_idx);
+            let upd = b.fmul_nc(delta, kv);
+            let s_new = b.fadd_nc(s_dec, upd);
+            b.store_sb_f32(state_buf, s_idx, s_new);
+            let q_prod = b.fmul_nc(s_new, qv);
+            let prev = b.load_var_f32(q_dot_var);
+            let next = b.fadd_nc(prev, q_prod);
+            b.store_var(q_dot_var, next);
+        });
+        let partial_q = b.load_var_f32(q_dot_var);
+        b.store_wg_f32(wg_reduce, lid, partial_q);
+        b.workgroup_barrier();
+        let dot_q = emit_wg_reduce_64(b, wg_reduce, lid, false);
+
+        let is_t0 = b.u_eq(lid, c0);
+        b.emit_if(is_t0, |b| {
+            let out_v = b.fmul_nc(dot_q, scale);
+            b.store_sb_f32(out_buf, v_idx, out_v);
+        });
+    });
+
+    b.finish()
+}
+
+/// Emits GDN scalar decay/beta gate preparation SPIR-V 1.6 words (`alpha -> decay`, `beta -> sigmoid(beta)`).
+///
+/// Bindings: `0` read-write `alpha_inout` (`f32`), `1` read-write `beta_inout` (`f32`),
+/// `2` read-only `time_bias` (`f32`), `3` read-only `ssm_a` (`f32`).
+/// Push constants (`1 × u32`): `[num_v_heads]`. Dispatch: `(num_v_heads.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn gdn_gates_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let alpha_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
+    let beta_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
+    let bias_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let ssm_a_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly);
+
+    let gid = b.global_invocation_id();
+    let h = b.load_input_component(gid, 0);
+    let num_v_heads = b.load_push(push_var, 0);
+
+    let in_bounds = b.u_lt(h, num_v_heads);
+    b.emit_if(in_bounds, |b| {
+        let f_zero = b.const_f32(0.0);
+        let f_one = b.const_f32(1.0);
+        let c_20 = b.const_f32(20.0);
+
+        let beta_raw = b.load_sb_f32(beta_buf, h);
+        let neg_beta = b.fsub_nc(f_zero, beta_raw);
+        let exp_neg_beta = b.f_exp(neg_beta);
+        let beta_denom = b.fadd_nc(f_one, exp_neg_beta);
+        let beta_sig = b.fdiv(f_one, beta_denom);
+        b.store_sb_f32(beta_buf, h, beta_sig);
+
+        let alpha = b.load_sb_f32(alpha_buf, h);
+        let bias = b.load_sb_f32(bias_buf, h);
+        let decay_w = b.load_sb_f32(ssm_a_buf, h);
+
+        let is_zero_w = b.f_eq(decay_w, f_zero);
+        b.emit_if_else(
+            is_zero_w,
+            |b| {
+                b.store_sb_f32(alpha_buf, h, f_one);
+            },
+            |b| {
+                let linear = b.fadd_nc(alpha, bias);
+                let is_large = b.f_gt(linear, c_20);
+                b.emit_if_else(
+                    is_large,
+                    |b| {
+                        let prod = b.fmul_nc(linear, decay_w);
+                        let d = b.f_exp(prod);
+                        b.store_sb_f32(alpha_buf, h, d);
+                    },
+                    |b| {
+                        let e_lin = b.f_exp(linear);
+                        let one_plus = b.fadd_nc(f_one, e_lin);
+                        let sp = b.f_log(one_plus);
+                        let prod = b.fmul_nc(sp, decay_w);
+                        let d = b.f_exp(prod);
+                        b.store_sb_f32(alpha_buf, h, d);
+                    },
+                );
+            },
+        );
+    });
+
+    b.finish()
+}
+
+/// Emits interleaved Q+Gate deinterleaving SPIR-V 1.6 words (`[heads, 2, head_dim] -> q, gate`).
+///
+/// Bindings: `0` read-only `q_gate_in` (`f32`), `1` writable `q_out` (`f32`), `2` writable `gate_out` (`f32`).
+/// Push constants (`2 × u32`): `[num_heads, head_dim]`. Dispatch: `((num_heads * head_dim).div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn deinterleave_q_gate_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let q_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
+    let gate_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let num_heads = b.load_push(push_var, 0);
+    let head_dim = b.load_push(push_var, 1);
+
+    let c0 = b.const_u32(0);
+    let c2 = b.const_u32(2);
+    let total = b.umul(num_heads, head_dim);
+    let hd_ok = b.u_ne(head_dim, c0);
+    let idx_ok = b.u_lt(idx, total);
+    let in_bounds = b.logical_and(idx_ok, hd_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let h = b.udiv(idx, head_dim);
+        let h_dim = b.umul(h, head_dim);
+        let d = b.usub(idx, h_dim);
+        let two_dim = b.umul(c2, head_dim);
+        let q_head_off = b.umul(h, two_dim);
+        let g_head_off = b.uadd(q_head_off, head_dim);
+        let q_src = b.uadd(q_head_off, d);
+        let g_src = b.uadd(g_head_off, d);
+        let q_val = b.load_sb_f32(in_buf, q_src);
+        let g_val = b.load_sb_f32(in_buf, g_src);
+        b.store_sb_f32(q_buf, idx, q_val);
+        b.store_sb_f32(gate_buf, idx, g_val);
+    });
+
+    b.finish()
+}
+
+/// Emits in-place IEEE binary16 value rounding SPIR-V 1.6 words (`v = half_to_float(float_to_half(v))`).
+///
+/// Bindings: `0` read-write `vec_inout` (`f32`). Push constants (`1 × u32`): `[len]`.
+#[must_use]
+pub fn round_f16_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let vec_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let len = b.load_push(push_var, 0);
+
+    let in_bounds = b.u_lt(idx, len);
+    b.emit_if(in_bounds, |b| {
+        let v = b.load_sb_f32(vec_buf, idx);
+        let r = b.round_f16(v);
+        b.store_sb_f32(vec_buf, idx, r);
+    });
+
+    b.finish()
+}
+
+/// Emits GPU F32 KV cache token append SPIR-V 1.6 words (`cache[pos * kv_width + i] = cur[i]`).
+///
+/// Bindings: `0` read-only `cur` (`f32`), `1` writable `cache` (`f32`).
+/// Push constants (`2 × u32`): `[kv_width, pos]`. Dispatch: `(kv_width.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn kv_append_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let cur_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let cache_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let kv_width = b.load_push(push_var, 0);
+    let pos = b.load_push(push_var, 1);
+
+    let in_bounds = b.u_lt(idx, kv_width);
+    b.emit_if(in_bounds, |b| {
+        let base = b.umul(pos, kv_width);
+        let dst = b.uadd(base, idx);
+        let v = b.load_sb_f32(cur_buf, idx);
+        b.store_sb_f32(cache_buf, dst, v);
+    });
+
+    b.finish()
+}
+
+/// Emits GPU packed-FP16 KV cache token append SPIR-V 1.6 words (`cache_u32[pos * (kv_width/2) + p]`).
+///
+/// Bindings: `0` read-only `cur` (`f32`, even `kv_width`), `1` writable `cache_u32` (`u32`).
+/// Push constants (`2 × u32`): `[kv_width, pos]`. Dispatch: `((kv_width / 2).div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn kv_append_f16() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let cur_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let cache_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let pair_idx = b.load_input_component(gid, 0);
+    let kv_width = b.load_push(push_var, 0);
+    let pos = b.load_push(push_var, 1);
+
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c16 = b.const_u32(16);
+    let half_width = b.ushr(kv_width, c1);
+
+    let in_bounds = b.u_lt(pair_idx, half_width);
+    b.emit_if(in_bounds, |b| {
+        let e0 = b.umul(pair_idx, c2);
+        let e1 = b.uadd(e0, c1);
+        let v0 = b.load_sb_f32(cur_buf, e0);
+        let v1 = b.load_sb_f32(cur_buf, e1);
+        let h0 = b.round_f16_bits(v0);
+        let h1 = b.round_f16_bits(v1);
+        let hi_shifted = b.ushl(h1, c16);
+        let packed = b.uor(h0, hi_shifted);
+        let dst_base = b.umul(pos, half_width);
+        let dst = b.uadd(dst_base, pair_idx);
+        b.store_sb_u32(cache_buf, dst, packed);
+    });
+
+    b.finish()
+}
+
+/// Emits packed-FP16 to F32 KV unpack SPIR-V 1.6 words for `#40` attention consumption.
+///
+/// Bindings: `0` read-only `cache_u32` (`u32`), `1` writable `out_f32` (`f32`).
+/// Push constants (`1 × u32`): `[word_count]`. Dispatch: `(word_count.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn kv_unpack_f16_to_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let cache_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let w_idx = b.load_input_component(gid, 0);
+    let word_count = b.load_push(push_var, 0);
+
+    let in_bounds = b.u_lt(w_idx, word_count);
+    b.emit_if(in_bounds, |b| {
+        let c1 = b.const_u32(1);
+        let c2 = b.const_u32(2);
+        let packed = b.load_sb_u32(cache_buf, w_idx);
+        let (lo, hi) = b.unpack_half_pair(packed);
+        let dst0 = b.umul(w_idx, c2);
+        let dst1 = b.uadd(dst0, c1);
+        b.store_sb_f32(out_buf, dst0, lo);
+        b.store_sb_f32(out_buf, dst1, hi);
+    });
+
+    b.finish()
+}
+
+/// Emits pure SPIR-V 1.6 `F32 -> Q8_0` (`9` `u32` words per 32 elements) quantizer.
+///
+/// Matches Prism's `q8_with_input` contracts:
+/// - `pinned = false, native_scale = false`: `Source` (`d = max / 127`, `round` ties away from zero)
+/// - `pinned = true, native_scale = false`: `Pinned` `Q8` (`d = max / 127`, `round_ties_even`)
+/// - `pinned = true, native_scale = true`: `PinnedPtq1Q8` (`d = max * 0x3c010204`, `inv = 127 / max`, `round_ties_even`)
+///
+/// Bindings: `0` read-only `in_f32` (`f32`), `1` writable `out_q8` (`u32`, `num_blocks * 9`).
+/// Push constants (`1 × u32`): `[num_blocks]`. Dispatch: `(num_blocks.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn quantize_f32_to_q8_0(pinned: bool, native_scale: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let blk = b.load_input_component(gid, 0);
+    let num_blocks = b.load_push(push_var, 0);
+
+    let in_bounds = b.u_lt(blk, num_blocks);
+    b.emit_if(in_bounds, |b| {
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c9 = b.const_u32(9);
+        let c32 = b.const_u32(32);
+        let f_zero = b.const_f32(0.0);
+        let f_half = b.const_f32(0.5);
+        let f_one = b.const_f32(1.0);
+        let f_127 = b.const_f32(127.0);
+        let i_zero = b.const_i32(0);
+        let i_min = b.const_i32(-127);
+        let i_max = b.const_i32(127);
+
+        let in_base = b.umul(blk, c32);
+        let out_base = b.umul(blk, c9);
+
+        let max_var = b.local_f32_var();
+        b.store_var(max_var, f_zero);
+        b.emit_for_range(c0, c32, c1, |b, i| {
+            let in_idx = b.uadd(in_base, i);
+            let v = b.load_sb_f32(in_buf, in_idx);
+            let av = b.f_abs(v);
+            let prev = b.load_var_f32(max_var);
+            let mx = b.f_max(prev, av);
+            b.store_var(max_var, mx);
+        });
+        let maximum = b.load_var_f32(max_var);
+        let d = if native_scale {
+            let c_inv127 = b.const_f32(f32::from_bits(0x3c01_0204));
+            b.fmul_nc(maximum, c_inv127)
+        } else {
+            b.fdiv(maximum, f_127)
+        };
+        let scale = b.round_f16(d);
+        let scale_u32 = b.bitcast(b.u32_t, scale);
+        b.store_sb_u32(out_buf, out_base, scale_u32);
+
+        let zero_blk = b.f_eq(d, f_zero);
+        let safe_denom = b.select(
+            b.f32_t,
+            zero_blk,
+            f_one,
+            if native_scale { maximum } else { d },
+        );
+        let numer = if native_scale { f_127 } else { f_one };
+        let inv_cand = b.fdiv(numer, safe_denom);
+        let inv_scale = b.select(b.f32_t, zero_blk, f_zero, inv_cand);
+
+        for w_j in 0_u32..8 {
+            let mut qs = [0_u32; 4];
+            for lane in 0_u32..4 {
+                let elem_off = b.const_u32(w_j * 4 + lane);
+                let elem_idx = b.uadd(in_base, elem_off);
+                let v = b.load_sb_f32(in_buf, elem_idx);
+                let q = if pinned {
+                    quantize_one_q8k_lane(b, v, inv_scale, zero_blk, false)
+                } else {
+                    let prod = b.fmul_nc(v, inv_scale);
+                    let ax = b.f_abs(prod);
+                    let fl = b.f_floor(ax);
+                    let frac = b.fsub_nc(ax, fl);
+                    let up = b.f_ge(frac, f_half);
+                    let add_bit = b.select(b.f32_t, up, f_one, f_zero);
+                    let mag_f = b.fadd_nc(fl, add_bit);
+                    let mag_i = b.f32_to_i32(mag_f);
+                    let neg_i = b.isub(i_zero, mag_i);
+                    let is_neg = b.f_lt(prod, f_zero);
+                    let signed_q = b.select(b.i32_t, is_neg, neg_i, mag_i);
+                    let q_lo = b.s_max(signed_q, i_min);
+                    let q_clamped = b.s_min(q_lo, i_max);
+                    b.select(b.i32_t, zero_blk, i_zero, q_clamped)
+                };
+                qs[usize::try_from(lane).unwrap_or(0)] = q;
+            }
+            let packed = pack_four_i8_to_u32(b, qs);
+            let dst_off = b.const_u32(1 + w_j);
+            let dst_idx = b.uadd(out_base, dst_off);
+            b.store_sb_u32(out_buf, dst_idx, packed);
+        }
+    });
+
+    b.finish()
+}
+
+/// Emits dense `F32` matrix-vector multiplication SPIR-V 1.6 words (`[cols, rows] * [cols] -> [rows]`).
+///
+/// Uses one 64-thread workgroup per output row for coalesced memory loads.
+/// Bindings: `0` read-only `weights` (`f32`), `1` read-only `input` (`f32`), `2` writable `output` (`f32`).
+/// Push constants (`2 × u32`): `[cols, rows]`. Dispatch: `(rows, 1, 1)`.
+#[must_use]
+pub fn f32_matvec() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let w_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let in_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let row = b.load_input_component(wid_vec, 0);
+    let cols = b.load_push(push_var, 0);
+    let rows = b.load_push(push_var, 1);
+
+    let row_ok = b.u_lt(row, rows);
+    b.emit_if(row_ok, |b| {
+        let c0 = b.const_u32(0);
+        let c64 = b.const_u32(WORKGROUP_X);
+        let f_zero = b.const_f32(0.0);
+        let row_base = b.umul(row, cols);
+
+        let acc_var = b.local_f32_var();
+        b.store_var(acc_var, f_zero);
+        b.emit_for_range(lid, cols, c64, |b, c| {
+            let w_idx = b.uadd(row_base, c);
+            let wv = b.load_sb_f32(w_buf, w_idx);
+            let xv = b.load_sb_f32(in_buf, c);
+            let prod = b.fmul_nc(wv, xv);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.fadd_nc(prev, prod);
+            b.store_var(acc_var, next);
+        });
+
+        let partial = b.load_var_f32(acc_var);
+        b.store_wg_f32(wg_reduce, lid, partial);
+        b.workgroup_barrier();
+        let sum = emit_wg_reduce_64(b, wg_reduce, lid, false);
+
+        let is_t0 = b.u_eq(lid, c0);
+        b.emit_if(is_t0, |b| {
+            b.store_sb_f32(out_buf, row, sum);
+        });
+    });
+
+    b.finish()
+}
+
+/// Emits elementwise `F32` product SPIR-V 1.6 words (`out[i] = a[i] * b[i]`).
+///
+/// Bindings: `0` read-only `a` (`f32`), `1` read-only `b` (`f32`), `2` writable `out` (`f32`).
+/// Push constants (`1 × u32`): `[len]`. Dispatch: `(len.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn mul_f32_elemwise() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 1);
+    let push_var = push_var.unwrap_or(0);
+    let a_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let b_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let len = b.load_push(push_var, 0);
+
+    let in_bounds = b.u_lt(idx, len);
+    b.emit_if(in_bounds, |b| {
+        let av = b.load_sb_f32(a_buf, idx);
+        let bv = b.load_sb_f32(b_buf, idx);
+        let prod = b.fmul_nc(av, bv);
+        b.store_sb_f32(out_buf, idx, prod);
+    });
+
+    b.finish()
+}
+
+/// Emits grouped GDN SSM head permutation SPIR-V 1.6 words (`[repeat, key, d] -> [key, repeat, d]`).
+///
+/// Bindings: `0` read-only `in_f32` (`f32`), `1` writable `out_f32` (`f32`).
+/// Push constants (`3 × u32`): `[num_k_heads, repetitions, head_dim]`.
+/// Dispatch: `((num_k_heads * repetitions * head_dim).div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn permute_ssm_heads_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 3);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let num_k_heads = b.load_push(push_var, 0);
+    let repetitions = b.load_push(push_var, 1);
+    let head_dim = b.load_push(push_var, 2);
+
+    let c0 = b.const_u32(0);
+    let kh_rep = b.umul(num_k_heads, repetitions);
+    let total = b.umul(kh_rep, head_dim);
+    let kh_ok = b.u_ne(num_k_heads, c0);
+    let hd_ok = b.u_ne(head_dim, c0);
+    let dims_ok = b.logical_and(kh_ok, hd_ok);
+    let idx_ok = b.u_lt(idx, total);
+    let in_bounds = b.logical_and(idx_ok, dims_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let head_idx = b.udiv(idx, head_dim);
+        let head_off = b.umul(head_idx, head_dim);
+        let d = b.usub(idx, head_off);
+        let repeat = b.udiv(head_idx, num_k_heads);
+        let rep_k = b.umul(repeat, num_k_heads);
+        let key = b.usub(head_idx, rep_k);
+        let key_rep = b.umul(key, repetitions);
+        let dst_head = b.uadd(key_rep, repeat);
+        let dst_head_off = b.umul(dst_head, head_dim);
+        let dst_idx = b.uadd(dst_head_off, d);
+        let v = b.load_sb_f32(in_buf, idx);
+        b.store_sb_f32(out_buf, dst_idx, v);
+    });
+
+    b.finish()
+}
+
+/// Emits contiguous `F32` slice copy SPIR-V 1.6 words (`dst[i] = src[src_offset + i]`).
+///
+/// Useful for extracting unaligned tensor sub-slices on GPU without violating Vulkan
+/// `minStorageBufferOffsetAlignment`.
+///
+/// Bindings: `0` read-only `src` (`f32`), `1` writable `dst` (`f32`).
+/// Push constants (`2 × u32`): `[src_offset, len]`. Dispatch: `(len.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn copy_slice_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let push_var = push_var.unwrap_or(0);
+    let src_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let dst_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let idx = b.load_input_component(gid, 0);
+    let src_offset = b.load_push(push_var, 0);
+    let len = b.load_push(push_var, 1);
+
+    let in_bounds = b.u_lt(idx, len);
+    b.emit_if(in_bounds, |b| {
+        let src_idx = b.uadd(src_offset, idx);
+        let v = b.load_sb_f32(src_buf, src_idx);
+        b.store_sb_f32(dst_buf, idx, v);
+    });
+
+    b.finish()
+}
+
+/// Validates an emitted SPIR-V 1.6 compute module structurally.
+///
+/// Checks section ordering, ID bounds, balanced labels/terminators, entry-point interface
+/// completeness, and `OpSDot`/portable capability hygiene.
+///
+/// # Errors
+/// Returns [`Error::InvalidInput`] describing the structural or capability violation.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Single-pass SPIR-V 1.6 structural validator checking headers, sections, IDs, blocks, and capabilities."
+)]
+pub fn validate_spirv_module(words: &[u32], expected_sdot: Option<bool>) -> Result<(), Error> {
+    if words.len() < 5 {
+        return Err(Error::InvalidInput(
+            "SPIR-V module shorter than 5-word header".to_owned(),
+        ));
+    }
+    if words[0] != SPIRV_MAGIC {
+        return Err(Error::InvalidInput(format!(
+            "invalid SPIR-V magic 0x{:08x}",
+            words[0]
+        )));
+    }
+    if words[1] != SPIRV_VERSION_1_6 {
+        return Err(Error::InvalidInput(format!(
+            "invalid SPIR-V version 0x{:08x}, expected 1.6 (0x{SPIRV_VERSION_1_6:08x})",
+            words[1]
+        )));
+    }
+    let bound = words[3];
+    if bound <= 1 {
+        return Err(Error::InvalidInput(format!(
+            "invalid SPIR-V ID bound {bound}"
+        )));
+    }
+    if words[4] != 0 {
+        return Err(Error::InvalidInput(format!(
+            "non-zero SPIR-V reserved schema word 0x{:08x}",
+            words[4]
+        )));
+    }
+
+    let check_id = |id: u32, ctx: &str| -> Result<(), Error> {
+        if id == 0 || id >= bound {
+            Err(Error::InvalidInput(format!(
+                "SPIR-V ID {id} out of bound 1..{bound} in {ctx}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+
+    let mut offset = 5_usize;
+    let mut max_section = 0_u8;
+    let mut in_function = false;
+    let mut in_block = false;
+    let mut seen_first_block_non_var = false;
+    let mut seen_merge = false;
+    let mut function_depth = 0_usize;
+
+    let mut result_ids = BTreeSet::new();
+    let mut capabilities = BTreeSet::new();
+    let mut entry_interface = Vec::new();
+    let mut global_vars = Vec::new();
+    let mut function_vars = Vec::new();
+    let mut func_labels = BTreeSet::new();
+    let mut func_branch_targets = Vec::new();
+    let mut func_phi_preds = Vec::new();
+    let mut has_memory_model = false;
+    let mut has_entry_point = false;
+    let mut has_exec_mode = false;
+    let mut has_sdot = false;
+    let mut last_opcode = 0_u16;
+
+    while offset < words.len() {
+        let header = words[offset];
+        let wc = usize::try_from(header >> 16).unwrap_or(0);
+        let op = u16::try_from(header & 0xFFFF).unwrap_or(0);
+        if wc == 0 || offset + wc > words.len() {
+            return Err(Error::InvalidInput(format!(
+                "invalid SPIR-V instruction word count {wc} at offset {offset}"
+            )));
+        }
+        let ops = &words[offset + 1..offset + wc];
+        last_opcode = op;
+
+        let section = match op {
+            OP_CAPABILITY => 1,
+            OP_EXTENSION => {
+                return Err(Error::InvalidInput(
+                    "SPIR-V OpExtension is forbidden in core 1.6 modules".to_owned(),
+                ));
+            }
+            OP_EXT_INST_IMPORT => 3,
+            OP_MEMORY_MODEL => 4,
+            OP_ENTRY_POINT => 5,
+            OP_EXECUTION_MODE => 6,
+            OP_DECORATE | OP_MEMBER_DECORATE => 7,
+            OP_TYPE_VOID..=OP_TYPE_FUNCTION | OP_CONSTANT => 8,
+            OP_VARIABLE if !in_function => 8,
+            _ => 9,
+        };
+        if section < max_section {
+            return Err(Error::InvalidInput(format!(
+                "SPIR-V section order violation: opcode {op} (section {section}) after section {max_section}"
+            )));
+        }
+        max_section = section;
+
+        let mut register_result = |id: u32, ctx: &str| -> Result<(), Error> {
+            check_id(id, ctx)?;
+            if !result_ids.insert(id) {
+                return Err(Error::InvalidInput(format!(
+                    "duplicate SPIR-V result ID {id} in {ctx}"
+                )));
+            }
+            Ok(())
+        };
+
+        if in_function {
+            if op == OP_FUNCTION_END {
+                if in_block {
+                    return Err(Error::InvalidInput(
+                        "unterminated SPIR-V basic block before OpFunctionEnd".to_owned(),
+                    ));
+                }
+                for tgt in &func_branch_targets {
+                    if !func_labels.contains(tgt) {
+                        return Err(Error::InvalidInput(format!(
+                            "SPIR-V branch/merge references unknown label {tgt}"
+                        )));
+                    }
+                }
+                func_branch_targets.clear();
+                for pred in &func_phi_preds {
+                    if !func_labels.contains(pred) {
+                        return Err(Error::InvalidInput(format!(
+                            "SPIR-V OpPhi references unknown predecessor label {pred}"
+                        )));
+                    }
+                }
+                func_phi_preds.clear();
+                func_labels.clear();
+                in_function = false;
+                function_depth += 1;
+                offset += wc;
+                continue;
+            }
+            if op == OP_LABEL {
+                if in_block || seen_merge {
+                    return Err(Error::InvalidInput(
+                        "SPIR-V OpLabel encountered inside unterminated block".to_owned(),
+                    ));
+                }
+                let lbl = *ops
+                    .first()
+                    .ok_or_else(|| Error::InvalidInput("OpLabel missing ID".to_owned()))?;
+                register_result(lbl, "OpLabel")?;
+                func_labels.insert(lbl);
+                in_block = true;
+                offset += wc;
+                continue;
+            }
+            if !in_block {
+                return Err(Error::InvalidInput(format!(
+                    "SPIR-V instruction {op} outside basic block inside function"
+                )));
+            }
+            if seen_merge && !matches!(op, OP_BRANCH_CONDITIONAL | OP_BRANCH) {
+                return Err(Error::InvalidInput(format!(
+                    "SPIR-V merge instruction must immediately precede branch, got {op}"
+                )));
+            }
+            if op != OP_VARIABLE {
+                seen_first_block_non_var = true;
+            } else if seen_first_block_non_var {
+                return Err(Error::InvalidInput(
+                    "function-scoped OpVariable must appear in entry block before other ops"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        match op {
+            OP_CAPABILITY => {
+                let cap = *ops.first().ok_or_else(|| {
+                    Error::InvalidInput("OpCapability missing operand".to_owned())
+                })?;
+                if cap == CAPABILITY_FLOAT64 || cap == CAPABILITY_INT64 {
+                    return Err(Error::InvalidInput(format!(
+                        "forbidden non-portable SPIR-V capability {cap}"
+                    )));
+                }
+                capabilities.insert(cap);
+            }
+            OP_EXT_INST_IMPORT => {
+                let res = *ops.first().ok_or_else(|| {
+                    Error::InvalidInput("OpExtInstImport missing result".to_owned())
+                })?;
+                register_result(res, "OpExtInstImport")?;
+            }
+            OP_MEMORY_MODEL => {
+                has_memory_model = true;
+                if ops != [ADDRESSING_LOGICAL, MEMORY_MODEL_GLSL450] {
+                    return Err(Error::InvalidInput(
+                        "unexpected SPIR-V OpMemoryModel addressing/memory model".to_owned(),
+                    ));
+                }
+            }
+            OP_ENTRY_POINT => {
+                has_entry_point = true;
+                if ops.len() < 3 || ops[0] != EXEC_MODEL_GL_COMPUTE {
+                    return Err(Error::InvalidInput(
+                        "invalid OpEntryPoint execution model or operands".to_owned(),
+                    ));
+                }
+                check_id(ops[1], "OpEntryPoint fn")?;
+                let mut idx = 2_usize;
+                while idx < ops.len() {
+                    let word = ops[idx];
                     idx += 1;
                     if word.to_le_bytes().contains(&0) {
                         break;
                     }
                 }
-                entry_interface.extend_from_slice(&operands[idx..]);
-            } else if op == OP_VARIABLE && operands.len() >= 3 {
-                let var_id = operands[1];
-                let storage_class = operands[2];
-                if storage_class == STORAGE_FUNCTION {
-                    function_vars.push(var_id);
-                } else {
-                    global_vars.push(var_id);
+                for &iface_id in &ops[idx..] {
+                    check_id(iface_id, "OpEntryPoint interface")?;
+                    entry_interface.push(iface_id);
                 }
             }
-            opcodes.push(op);
-            offset += wc;
+            OP_EXECUTION_MODE => {
+                has_exec_mode = true;
+                let fn_id = *ops
+                    .first()
+                    .ok_or_else(|| Error::InvalidInput("OpExecutionMode missing fn".to_owned()))?;
+                check_id(fn_id, "OpExecutionMode")?;
+                if ops.get(1) == Some(&EXEC_MODE_LOCAL_SIZE)
+                    && (ops.len() < 5 || ops[2] == 0 || ops[3] == 0 || ops[4] == 0)
+                {
+                    return Err(Error::InvalidInput(
+                        "invalid LocalSize execution mode extents".to_owned(),
+                    ));
+                }
+            }
+            OP_DECORATE | OP_MEMBER_DECORATE => {
+                let target = *ops
+                    .first()
+                    .ok_or_else(|| Error::InvalidInput("OpDecorate missing target".to_owned()))?;
+                check_id(target, "OpDecorate")?;
+            }
+            OP_TYPE_VOID | OP_TYPE_BOOL | OP_TYPE_INT | OP_TYPE_FLOAT => {
+                let res = *ops
+                    .first()
+                    .ok_or_else(|| Error::InvalidInput("type opcode missing result".to_owned()))?;
+                register_result(res, "primitive type")?;
+            }
+            OP_TYPE_VECTOR => {
+                if ops.len() < 3 {
+                    return Err(Error::InvalidInput("OpTypeVector truncated".to_owned()));
+                }
+                register_result(ops[0], "OpTypeVector")?;
+                check_id(ops[1], "OpTypeVector element")?;
+            }
+            OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY | OP_TYPE_STRUCT | OP_TYPE_FUNCTION => {
+                let res = *ops
+                    .first()
+                    .ok_or_else(|| Error::InvalidInput("composite type missing id".to_owned()))?;
+                register_result(res, "composite type")?;
+                for &id in &ops[1..] {
+                    check_id(id, "composite type operand")?;
+                }
+            }
+            OP_TYPE_POINTER => {
+                if ops.len() < 3 {
+                    return Err(Error::InvalidInput("OpTypePointer truncated".to_owned()));
+                }
+                register_result(ops[0], "OpTypePointer")?;
+                check_id(ops[2], "OpTypePointer pointee")?;
+            }
+            OP_CONSTANT => {
+                if ops.len() < 3 {
+                    return Err(Error::InvalidInput("OpConstant truncated".to_owned()));
+                }
+                check_id(ops[0], "OpConstant type")?;
+                register_result(ops[1], "OpConstant")?;
+            }
+            OP_VARIABLE => {
+                if ops.len() < 3 {
+                    return Err(Error::InvalidInput("OpVariable truncated".to_owned()));
+                }
+                check_id(ops[0], "OpVariable type")?;
+                register_result(ops[1], "OpVariable")?;
+                if ops[2] == STORAGE_FUNCTION {
+                    if !in_function {
+                        return Err(Error::InvalidInput(
+                            "Function-scoped OpVariable outside function".to_owned(),
+                        ));
+                    }
+                    function_vars.push(ops[1]);
+                } else {
+                    if in_function {
+                        return Err(Error::InvalidInput(
+                            "non-Function OpVariable inside function".to_owned(),
+                        ));
+                    }
+                    global_vars.push(ops[1]);
+                }
+                if let Some(&init_id) = ops.get(3) {
+                    check_id(init_id, "OpVariable initializer")?;
+                }
+            }
+            OP_FUNCTION => {
+                if in_function || ops.len() < 4 {
+                    return Err(Error::InvalidInput("malformed OpFunction".to_owned()));
+                }
+                check_id(ops[0], "OpFunction ret type")?;
+                register_result(ops[1], "OpFunction")?;
+                check_id(ops[3], "OpFunction type")?;
+                in_function = true;
+                in_block = false;
+                seen_first_block_non_var = false;
+                seen_merge = false;
+            }
+            OP_EXT_INST => {
+                if ops.len() < 4 {
+                    return Err(Error::InvalidInput("OpExtInst truncated".to_owned()));
+                }
+                check_id(ops[0], "OpExtInst type")?;
+                register_result(ops[1], "OpExtInst")?;
+                check_id(ops[2], "OpExtInst import")?;
+                for &arg_id in &ops[4..] {
+                    check_id(arg_id, "OpExtInst arg")?;
+                }
+            }
+            OP_COMPOSITE_EXTRACT => {
+                if ops.len() < 4 {
+                    return Err(Error::InvalidInput(
+                        "OpCompositeExtract truncated".to_owned(),
+                    ));
+                }
+                check_id(ops[0], "OpCompositeExtract type")?;
+                register_result(ops[1], "OpCompositeExtract")?;
+                check_id(ops[2], "OpCompositeExtract composite")?;
+            }
+            OP_S_DOT => {
+                if ops.len() < 5 {
+                    return Err(Error::InvalidInput("OpSDot truncated".to_owned()));
+                }
+                has_sdot = true;
+                check_id(ops[0], "OpSDot type")?;
+                register_result(ops[1], "OpSDot")?;
+                check_id(ops[2], "OpSDot vec1")?;
+                check_id(ops[3], "OpSDot vec2")?;
+            }
+            OP_STORE => {
+                if ops.len() < 2 {
+                    return Err(Error::InvalidInput("OpStore truncated".to_owned()));
+                }
+                check_id(ops[0], "OpStore ptr")?;
+                check_id(ops[1], "OpStore val")?;
+            }
+            OP_CONTROL_BARRIER => {
+                if ops.len() != 3 {
+                    return Err(Error::InvalidInput("OpControlBarrier arity".to_owned()));
+                }
+                for &id in ops {
+                    check_id(id, "OpControlBarrier")?;
+                }
+            }
+            OP_SELECTION_MERGE => {
+                if ops.len() < 2 {
+                    return Err(Error::InvalidInput("OpSelectionMerge truncated".to_owned()));
+                }
+                check_id(ops[0], "OpSelectionMerge target")?;
+                func_branch_targets.push(ops[0]);
+                seen_merge = true;
+            }
+            OP_LOOP_MERGE => {
+                if ops.len() < 3 {
+                    return Err(Error::InvalidInput("OpLoopMerge truncated".to_owned()));
+                }
+                check_id(ops[0], "OpLoopMerge merge")?;
+                check_id(ops[1], "OpLoopMerge continue")?;
+                func_branch_targets.push(ops[0]);
+                func_branch_targets.push(ops[1]);
+                seen_merge = true;
+            }
+            OP_BRANCH => {
+                if ops.len() != 1 {
+                    return Err(Error::InvalidInput("OpBranch arity".to_owned()));
+                }
+                check_id(ops[0], "OpBranch target")?;
+                func_branch_targets.push(ops[0]);
+                in_block = false;
+                seen_merge = false;
+            }
+            OP_BRANCH_CONDITIONAL => {
+                if ops.len() < 3 {
+                    return Err(Error::InvalidInput(
+                        "OpBranchConditional truncated".to_owned(),
+                    ));
+                }
+                check_id(ops[0], "OpBranchConditional cond")?;
+                check_id(ops[1], "OpBranchConditional true")?;
+                check_id(ops[2], "OpBranchConditional false")?;
+                func_branch_targets.push(ops[1]);
+                func_branch_targets.push(ops[2]);
+                in_block = false;
+                seen_merge = false;
+            }
+            OP_RETURN => {
+                if !ops.is_empty() {
+                    return Err(Error::InvalidInput(
+                        "OpReturn must have no operands".to_owned(),
+                    ));
+                }
+                in_block = false;
+                seen_merge = false;
+            }
+            OP_PHI => {
+                if ops.len() < 4 || !ops.len().is_multiple_of(2) {
+                    return Err(Error::InvalidInput("OpPhi arity invalid".to_owned()));
+                }
+                check_id(ops[0], "OpPhi type")?;
+                register_result(ops[1], "OpPhi")?;
+                for pair in ops[2..].as_chunks::<2>().0 {
+                    check_id(pair[0], "OpPhi value")?;
+                    check_id(pair[1], "OpPhi label")?;
+                    func_phi_preds.push(pair[1]);
+                }
+            }
+            _ => {
+                if ops.len() < 2 {
+                    return Err(Error::InvalidInput(format!(
+                        "unexpected SPIR-V instruction opcode {op} with {} operands",
+                        ops.len()
+                    )));
+                }
+                check_id(ops[0], "result type")?;
+                register_result(ops[1], "instruction result")?;
+                for &id in &ops[2..] {
+                    check_id(id, "instruction operand")?;
+                }
+            }
         }
-        assert_eq!(offset, words.len());
-        assert_eq!(opcodes.last().copied(), Some(OP_FUNCTION_END));
-        assert!(!opcodes.contains(&OP_EXTENSION_OPCODE));
-        assert!(opcodes.contains(&OP_MEMORY_MODEL));
-        assert!(opcodes.contains(&OP_ENTRY_POINT));
-        assert!(opcodes.contains(&OP_EXECUTION_MODE));
 
-        let unique_iface: std::collections::BTreeSet<u32> =
-            entry_interface.iter().copied().collect();
-        assert_eq!(
-            unique_iface.len(),
-            entry_interface.len(),
-            "duplicate IDs in OpEntryPoint interface"
-        );
-        for var_id in &global_vars {
-            assert!(
-                unique_iface.contains(var_id),
+        offset += wc;
+    }
+
+    if in_function || in_block || function_depth == 0 || last_opcode != OP_FUNCTION_END {
+        return Err(Error::InvalidInput(
+            "SPIR-V module has unbalanced function/block termination".to_owned(),
+        ));
+    }
+    if !(has_memory_model && has_entry_point && has_exec_mode) {
+        return Err(Error::InvalidInput(
+            "SPIR-V module missing required MemoryModel, EntryPoint, or ExecutionMode".to_owned(),
+        ));
+    }
+    if !capabilities.contains(&CAPABILITY_SHADER) {
+        return Err(Error::InvalidInput(
+            "SPIR-V module missing Shader capability".to_owned(),
+        ));
+    }
+
+    let has_sdot_caps = capabilities.contains(&CAPABILITY_DOT_PRODUCT)
+        && capabilities.contains(&CAPABILITY_DOT_PRODUCT_INPUT_4X8_BIT_PACKED);
+    let any_sdot_cap = capabilities.contains(&CAPABILITY_DOT_PRODUCT)
+        || capabilities.contains(&CAPABILITY_DOT_PRODUCT_INPUT_4X8_BIT_PACKED);
+    if has_sdot && !has_sdot_caps {
+        return Err(Error::InvalidInput(
+            "SPIR-V module emits OpSDot without required DotProduct capabilities".to_owned(),
+        ));
+    }
+    if any_sdot_cap && !has_sdot_caps {
+        return Err(Error::InvalidInput(
+            "SPIR-V module declares incomplete DotProduct capabilities".to_owned(),
+        ));
+    }
+    match expected_sdot {
+        Some(true) if !(has_sdot && has_sdot_caps) => {
+            return Err(Error::InvalidInput(
+                "expected OpSDot module but OpSDot or DotProduct capability is missing".to_owned(),
+            ));
+        }
+        Some(false) if has_sdot || any_sdot_cap => {
+            return Err(Error::InvalidInput(
+                "portable SPIR-V module must not emit OpSDot or DotProduct capabilities".to_owned(),
+            ));
+        }
+        _ => {}
+    }
+
+    let unique_iface: BTreeSet<u32> = entry_interface.iter().copied().collect();
+    if unique_iface.len() != entry_interface.len() {
+        return Err(Error::InvalidInput(
+            "duplicate IDs in SPIR-V OpEntryPoint interface".to_owned(),
+        ));
+    }
+    for var_id in &global_vars {
+        if !unique_iface.contains(var_id) {
+            return Err(Error::InvalidInput(format!(
                 "missing global variable {var_id} from SPIR-V 1.6 OpEntryPoint interface"
-            );
+            )));
         }
-        for var_id in &function_vars {
-            assert!(
-                !unique_iface.contains(var_id),
+    }
+    for var_id in &function_vars {
+        if unique_iface.contains(var_id) {
+            return Err(Error::InvalidInput(format!(
                 "function-scoped variable {var_id} must not appear in OpEntryPoint interface"
-            );
+            )));
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_valid_spirv_structure(words: &[u32], expected_sdot: Option<bool>) {
+        assert_eq!(
+            validate_spirv_module(words, expected_sdot),
+            Ok(()),
+            "SPIR-V validation failed"
+        );
     }
 
     #[test]
@@ -3782,47 +5313,82 @@ mod tests {
         let s3 = pq2_q8k_gemv(false, false);
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
-        for module in [
-            pq2_q8k_gemv(true, true),
-            pq2_q8k_gemv(true, false),
-            pq2_q8k_gemv(false, true),
-            pq2_q8k_gemv(false, false),
-            pq2_q8k_gemv_coalesced(true, true, false),
-            pq2_q8k_gemv_coalesced(true, false, true),
-            pq2_q8k_gemv_coalesced(false, true, false),
-            pq2_q8k_gemv_coalesced(false, false, true),
-            pq2_q8k_gemm_4tok_coalesced(true, true, false),
-            pq2_q8k_gemm_4tok_coalesced(true, false, true),
-            pq2_q8k_gemm_4tok_coalesced(false, false, false),
-            pq2_q8_0_gemv(true),
-            pq2_q8_0_gemv(false),
-            pq2_q8_0_gemv_coalesced(true),
-            pq2_q8_0_gemv_coalesced(false),
-            ptq1_q8_0_gemv(true, true),
-            ptq1_q8_0_gemv(true, false),
-            ptq1_q8_0_gemv(false, true),
-            ptq1_q8_0_gemv(false, false),
-            ptq1_q8_0_gemv_coalesced(true, true),
-            ptq1_q8_0_gemv_coalesced(false, false),
-            ptq1_q8k_gemv(true),
-            ptq1_q8k_gemv(false),
-            ptq1_q8k_gemv_coalesced(true),
-            ptq1_q8k_gemv_coalesced(false),
-            quantize_f32_to_q8k_4plane(true),
-            quantize_f32_to_q8k_4plane(false),
-            ffn_swiglu_f32(false),
-            ffn_swiglu_f32(true),
-            ffn_hadamard_f32(),
-            dot_f32_scalar(),
-            attn_qk_scores(),
-            attn_softmax_f16(),
-            attn_pv_accum(),
-            attn_fused_f16prob(),
+
+        for (module, expected_sdot) in [
+            (pq2_q8k_gemv(true, true), Some(true)),
+            (pq2_q8k_gemv(true, false), Some(true)),
+            (pq2_q8k_gemv(false, true), Some(false)),
+            (pq2_q8k_gemv(false, false), Some(false)),
+            (pq2_q8k_gemv_coalesced(true, true, false), Some(true)),
+            (pq2_q8k_gemv_coalesced(true, false, true), Some(true)),
+            (pq2_q8k_gemv_coalesced(false, true, false), Some(false)),
+            (pq2_q8k_gemv_coalesced(false, false, true), Some(false)),
+            (pq2_q8k_gemm_4tok_coalesced(true, true, false), Some(true)),
+            (pq2_q8k_gemm_4tok_coalesced(true, false, true), Some(true)),
+            (
+                pq2_q8k_gemm_4tok_coalesced(false, false, false),
+                Some(false),
+            ),
+            (pq2_q8_0_gemv(true), Some(true)),
+            (pq2_q8_0_gemv(false), Some(false)),
+            (pq2_q8_0_gemv_coalesced(true), Some(true)),
+            (pq2_q8_0_gemv_coalesced(false), Some(false)),
+            (ptq1_q8_0_gemv(true, true), Some(true)),
+            (ptq1_q8_0_gemv(true, false), Some(true)),
+            (ptq1_q8_0_gemv(false, true), Some(false)),
+            (ptq1_q8_0_gemv(false, false), Some(false)),
+            (ptq1_q8_0_gemv_coalesced(true, true), Some(true)),
+            (ptq1_q8_0_gemv_coalesced(false, false), Some(false)),
+            (ptq1_q8k_gemv(true), Some(true)),
+            (ptq1_q8k_gemv(false), Some(false)),
+            (ptq1_q8k_gemv_coalesced(true), Some(true)),
+            (ptq1_q8k_gemv_coalesced(false), Some(false)),
+            (quantize_f32_to_q8k_4plane(true), Some(false)),
+            (quantize_f32_to_q8k_4plane(false), Some(false)),
+            (quantize_f32_to_q8_0(false, false), Some(false)),
+            (quantize_f32_to_q8_0(true, false), Some(false)),
+            (quantize_f32_to_q8_0(true, true), Some(false)),
+            (ffn_swiglu_f32(false), Some(false)),
+            (ffn_swiglu_f32(true), Some(false)),
+            (ffn_hadamard_f32(), Some(false)),
+            (dot_f32_scalar(), Some(false)),
+            (attn_qk_scores(), Some(false)),
+            (attn_softmax_f16(), Some(false)),
+            (attn_pv_accum(), Some(false)),
+            (attn_fused_f16prob(), Some(false)),
+            (rms_norm_f32(), Some(false)),
+            (add_rms_norm_f32(), Some(false)),
+            (residual_add_f32(), Some(false)),
+            (rope_f32(), Some(false)),
+            (mul_sigmoid_f32(), Some(false)),
+            (conv1d_silu_f32(), Some(false)),
+            (l2_norm_f32(), Some(false)),
+            (gdn_step_f32(), Some(false)),
+            (gdn_gates_f32(), Some(false)),
+            (deinterleave_q_gate_f32(), Some(false)),
+            (round_f16_f32(), Some(false)),
+            (kv_append_f32(), Some(false)),
+            (kv_append_f16(), Some(false)),
+            (kv_unpack_f16_to_f32(), Some(false)),
+            (f32_matvec(), Some(false)),
+            (mul_f32_elemwise(), Some(false)),
+            (permute_ssm_heads_f32(), Some(false)),
+            (copy_slice_f32(), Some(false)),
         ] {
-            assert_valid_spirv_structure(&module);
+            assert_valid_spirv_structure(&module, expected_sdot);
             let digest = shader_digest(&module)?;
             assert_eq!(digest.len(), 64);
         }
+
+        // Validator rejects tampered magic, bad version, out-of-bounds IDs, and sdot mismatch.
+        assert!(validate_spirv_module(&s3, Some(true)).is_err());
+        assert!(validate_spirv_module(&s1, Some(false)).is_err());
+        let mut bad_magic = s3.clone();
+        bad_magic[0] = 0;
+        assert!(validate_spirv_module(&bad_magic, None).is_err());
+        let mut bad_bound = s3;
+        bad_bound[3] = 2;
+        assert!(validate_spirv_module(&bad_bound, None).is_err());
         Ok(())
     }
 }

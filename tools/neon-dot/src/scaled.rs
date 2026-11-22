@@ -183,6 +183,20 @@ pub(super) fn valid_ptq1_8x_tokens<A: Q8ActivationView>(rows: [&[u8]; 8], tokens
             .all(|tok| tok.len() == len && tok.iter().all(|block| block.scale().is_finite()))
 }
 
+pub(super) fn valid_q8_0_8x_tokens<A: Q8ActivationView>(rows: [&[u8]; 8], tokens: &[&[A]]) -> bool {
+    if tokens.is_empty() || tokens.len() > 8 {
+        return false;
+    }
+    let block_count = tokens[0].len();
+    block_count != 0
+        && block_count
+            .checked_mul(34)
+            .is_some_and(|bytes| rows.iter().all(|row| row.len() == bytes))
+        && tokens.iter().all(|tok| {
+            tok.len() == block_count && tok.iter().all(|block| block.scale().is_finite())
+        })
+}
+
 #[cfg(any(test, not(target_arch = "aarch64")))]
 #[expect(
     clippy::suboptimal_flops,
@@ -275,6 +289,51 @@ pub(super) fn portable_ptq1_8x_tokens_validated<const PINNED: bool, A: Q8Activat
 }
 
 #[cfg(any(test, not(target_arch = "aarch64")))]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    clippy::suboptimal_flops,
+    reason = "32-element i8*i8 dot fits in f32 mantissa and non-FMA multiply-then-add matches scalar Q8_0 rounding."
+)]
+pub(super) fn portable_q8_0_8x_tokens_validated<A: Q8ActivationView>(
+    rows: [&[u8]; 8],
+    tokens: &[&[A]],
+    out: &mut [[f32; 8]; 8],
+) -> Option<()> {
+    let block_count = tokens[0].len();
+    let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
+    let mut acc = [[0.0_f32; 8]; 8];
+    for block_idx in 0..block_count {
+        let row_scales: [f32; 8] = std::array::from_fn(|r| {
+            let block = &row_chunks[r][block_idx];
+            bonsai_ternary::half_to_float(u16::from_le_bytes([block[0], block[1]]))
+        });
+        if !row_scales.iter().all(|scale| scale.is_finite()) {
+            return None;
+        }
+        for (t, token) in tokens.iter().enumerate() {
+            let act = &token[block_idx];
+            let act_scale = act.scale();
+            let act_vals = act.values();
+            for r in 0..8 {
+                let w_bytes = &row_chunks[r][block_idx][2..34];
+                let int_dot: i32 = w_bytes
+                    .iter()
+                    .zip(act_vals)
+                    .map(|(&w, &a)| i32::from(i8::from_ne_bytes([w])) * i32::from(a))
+                    .sum();
+                acc[r][t] += (row_scales[r] * act_scale) * (int_dot as f32);
+            }
+        }
+    }
+    if acc.iter().flatten().any(|sum| !sum.is_finite()) {
+        return None;
+    }
+    *out = acc;
+    Some(())
+}
+
+#[cfg(any(test, not(target_arch = "aarch64")))]
 pub(super) fn portable<const ROWS: usize, const FUSED: bool>(
     rows: [&[u8]; ROWS],
     activation: &[Pq2Activation],
@@ -335,7 +394,7 @@ pub(super) fn portable_validated<const ROWS: usize, const FUSED: bool>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Pq2Activation, portable};
+    use super::{Pq2Activation, portable, portable_q8_0_8x_tokens_validated};
 
     #[test]
     fn x1_scoped_pq2_matches_reference_and_revalidates_replaced_activations() {
@@ -1227,5 +1286,175 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    fn sample_q8_0_fixture(
+        blocks_per_row: usize,
+        tokens_count: usize,
+        seed: usize,
+    ) -> ([Vec<u8>; 8], Vec<Vec<super::Q8ActivationBlock>>) {
+        let f16_scales = [
+            0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3555, 0xb787, 0x3c00, 0xbc00,
+        ];
+        let act_scales = [0.0_f32, -0.0, 0.125, -0.375, 1.5, -2.25, 0.0625, -0.5];
+        let rows: [Vec<u8>; 8] = std::array::from_fn(|row| {
+            let mut bytes: Vec<u8> = (0..blocks_per_row * 34)
+                .map(|i| {
+                    i.wrapping_mul(61 + row)
+                        .wrapping_add(seed * 13 + row * 7)
+                        .to_le_bytes()[0]
+                })
+                .collect();
+            for (b, block) in bytes.as_chunks_mut::<34>().0.iter_mut().enumerate() {
+                let s = f16_scales[(b * 3 + row + seed) % f16_scales.len()];
+                block[..2].copy_from_slice(&s.to_le_bytes());
+                if (b + row) % 5 == 0 {
+                    block[2..34].fill(0x80);
+                } else if (b + row) % 7 == 0 {
+                    block[2..34].fill(0x7f);
+                }
+            }
+            bytes
+        });
+        let acts: Vec<Vec<super::Q8ActivationBlock>> = (0..tokens_count)
+            .map(|t| {
+                (0..blocks_per_row)
+                    .map(|b| super::Q8ActivationBlock {
+                        scale: act_scales[(t * 5 + b + seed) % act_scales.len()],
+                        values: std::array::from_fn(|lane| {
+                            if (t + b) % 6 == 0 {
+                                if (lane + t) % 2 == 0 { -128 } else { 127 }
+                            } else {
+                                i8::from_ne_bytes([lane
+                                    .wrapping_mul(43 + t)
+                                    .wrapping_add(b * 17 + seed)
+                                    .to_le_bytes()[0]])
+                            }
+                        }),
+                    })
+                    .collect()
+            })
+            .collect();
+        (rows, acts)
+    }
+
+    #[test]
+    fn x1_q8_0_scaled_8x_tokens_matches_portable_across_modes_and_extremes() {
+        let Some(detected) = crate::Q8Dotprod::detect() else {
+            return;
+        };
+        #[cfg(target_arch = "aarch64")]
+        let caps = [
+            detected,
+            crate::Q8Dotprod {
+                i8mm: false,
+                ..detected
+            },
+        ];
+        #[cfg(not(target_arch = "aarch64"))]
+        let caps = [detected];
+
+        for (seed, block_count) in [1_usize, 3, 16, 40].into_iter().enumerate() {
+            let (rows, acts) = sample_q8_0_fixture(block_count, 8, seed + 1);
+            let row_refs: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+            let act_refs: [&[super::Q8ActivationBlock]; 8] =
+                std::array::from_fn(|t| acts[t].as_slice());
+
+            for tok_count in 1..=8_usize {
+                let slice = &act_refs[..tok_count];
+                let mut exp = [[0.0_f32; 8]; 8];
+                assert!(portable_q8_0_8x_tokens_validated(row_refs, slice, &mut exp).is_some());
+                for cap in caps {
+                    let mut got = [[f32::NAN; 8]; 8];
+                    assert!(
+                        cap.dot_scaled_8x_tokens(row_refs, slice, &mut got)
+                            .is_some()
+                    );
+                    for r in 0..8 {
+                        assert_eq!(exp[r].map(f32::to_bits), got[r].map(f32::to_bits));
+                        assert!(got[r][tok_count..].iter().all(|v| v.to_bits() == 0));
+                    }
+                }
+                let mut via_top = [[f32::NAN; 8]; 8];
+                assert!(crate::dot_q8_0_scaled_8x_tokens(row_refs, slice, &mut via_top).is_some());
+                for r in 0..8 {
+                    assert_eq!(exp[r].map(f32::to_bits), via_top[r].map(f32::to_bits));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn x1_q8_0_scaled_8x_tokens_rejects_bad_inputs_and_overflow() {
+        let Some(detected) = crate::Q8Dotprod::detect() else {
+            return;
+        };
+        let (rows, mut acts) = sample_q8_0_fixture(2, 9, 99);
+        let row_refs: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+        let act_refs: Vec<&[super::Q8ActivationBlock]> = acts.iter().map(Vec::as_slice).collect();
+        let sentinel = [[123.5_f32; 8]; 8];
+        let mut out = sentinel;
+
+        assert!(
+            detected
+                .dot_scaled_8x_tokens(row_refs, &[], &mut out)
+                .is_none()
+        );
+        assert!(
+            detected
+                .dot_scaled_8x_tokens(row_refs, &act_refs[..9], &mut out)
+                .is_none()
+        );
+        let mut short_rows = row_refs;
+        short_rows[4] = &row_refs[4][..33];
+        assert!(
+            detected
+                .dot_scaled_8x_tokens(short_rows, &act_refs[..2], &mut out)
+                .is_none()
+        );
+        assert!(crate::dot_q8_0_scaled_8x_tokens(short_rows, &[], &mut out).is_none());
+
+        for bad_f16 in [0x7c00_u16, 0x7e00, 0xfc00] {
+            let mut bad_rows = rows.clone();
+            bad_rows[6][34..36].copy_from_slice(&bad_f16.to_le_bytes());
+            let bad_refs: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
+            assert!(
+                detected
+                    .dot_scaled_8x_tokens(bad_refs, &act_refs[..3], &mut out)
+                    .is_none()
+            );
+        }
+        acts[1][1].scale = f32::NAN;
+        let bad_act_refs: Vec<&[super::Q8ActivationBlock]> =
+            acts[..3].iter().map(Vec::as_slice).collect();
+        assert!(
+            detected
+                .dot_scaled_8x_tokens(row_refs, &bad_act_refs, &mut out)
+                .is_none()
+        );
+
+        let mut big_rows = rows;
+        for row in &mut big_rows {
+            row[..2].copy_from_slice(&0x7bff_u16.to_le_bytes());
+            row[2..34].fill(0x7f);
+            row[34..36].copy_from_slice(&0x7bff_u16.to_le_bytes());
+            row[36..68].fill(0x7f);
+        }
+        let big_acts = vec![
+            super::Q8ActivationBlock {
+                scale: 1.0e32,
+                values: [127; 32],
+            };
+            2
+        ];
+        let big_refs: [&[u8]; 8] = std::array::from_fn(|r| big_rows[r].as_slice());
+        assert!(
+            detected
+                .dot_scaled_8x_tokens(big_refs, &[big_acts.as_slice()], &mut out)
+                .is_none()
+        );
+        for r in 0..8 {
+            assert_eq!(out[r].map(f32::to_bits), sentinel[r].map(f32::to_bits));
+        }
     }
 }

@@ -4976,6 +4976,42 @@ pub(super) fn dot_q8_0_four_rows_tile<const TOKENS: usize>(
 }
 
 #[inline]
+fn try_dot_q8_0_eight_rows_tile_fast<const TOKENS: usize>(
+    rows: [&[u8]; 8],
+    preparations: &[super::MatvecScratch],
+    block_count: usize,
+    token_count: usize,
+) -> Option<Result<[[f32; TOKENS]; 8]>> {
+    if token_count == 0
+        || block_count == 0
+        || !rows.iter().all(|row| row.len() == block_count * 34)
+        || !preparations[..token_count]
+            .iter()
+            .all(|scratch| scratch.q8.len() >= block_count)
+    {
+        return None;
+    }
+    let dotprod = bonsai_neon_dot::Q8Dotprod::detect()?;
+    let mut sums = [[0.0_f32; TOKENS]; 8];
+    for (chunk_idx, chunk) in preparations[..token_count].chunks(8).enumerate() {
+        let mut tok_refs: [&[super::Q8Block]; 8] = [&[]; 8];
+        for (t, scratch) in chunk.iter().enumerate() {
+            tok_refs[t] = &scratch.q8[..block_count];
+        }
+        let mut out = [[0.0_f32; 8]; 8];
+        let Some(()) = dotprod.dot_scaled_8x_tokens_view(rows, &tok_refs[..chunk.len()], &mut out)
+        else {
+            return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+        };
+        let base = chunk_idx * 8;
+        for r in 0..8 {
+            sums[r][base..base + chunk.len()].copy_from_slice(&out[r][..chunk.len()]);
+        }
+    }
+    Some(Ok(sums))
+}
+
+#[inline]
 #[expect(
     clippy::suboptimal_flops,
     clippy::too_many_lines,
@@ -4986,12 +5022,17 @@ pub(super) fn dot_q8_0_eight_rows_tile<const TOKENS: usize>(
     preparations: &[super::MatvecScratch],
 ) -> Option<Result<[[f32; TOKENS]; 8]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let use_i8mm = bonsai_neon_dot::has_i8mm();
-    let use_dotprod = bonsai_neon_dot::has_dotprod();
-    let mut sums = [[0.0_f32; TOKENS]; 8];
     let chunks = rows.map(|row| row.as_chunks::<34>().0);
     let block_count = chunks[0].len();
     let token_count = preparations.len().min(TOKENS);
+    if let Some(fast) =
+        try_dot_q8_0_eight_rows_tile_fast::<TOKENS>(rows, preparations, block_count, token_count)
+    {
+        return Some(fast);
+    }
+    let use_i8mm = bonsai_neon_dot::has_i8mm();
+    let use_dotprod = bonsai_neon_dot::has_dotprod();
+    let mut sums = [[0.0_f32; TOKENS]; 8];
     for index in 0..block_count {
         let (scales_lo, scales_hi) = f16_bits_to_f32_x8(
             neon,
@@ -8054,6 +8095,97 @@ mod tests {
         );
         assert!(super::dot_ptq1_sixteen_rows_pinned(bad_refs, &input).is_err());
         assert!(super::dot_ptq1_sixteen_rows_source(bad_refs, &input).is_err());
+        Ok(())
+    }
+
+    fn verify_q8_0_tile_bits<const TOKENS: usize>(
+        row_refs: [&[u8]; 8],
+        preparations: &[super::super::MatvecScratch],
+        expected: &[[u32; 32]; 8],
+    ) -> crate::Result<()> {
+        let active = preparations.len().min(TOKENS);
+        let tile = super::dot_q8_0_eight_rows_tile::<TOKENS>(row_refs, preparations)
+            .ok_or_else(|| crate::invalid("expected NEON Q8_0 tile execution"))??;
+        for r in 0..8 {
+            for t in 0..active {
+                assert_eq!(tile[r][t].to_bits(), expected[r][t]);
+            }
+            for &val in &tile[r][active..TOKENS] {
+                assert_eq!(val.to_bits(), 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simd_neon_q8_0_eight_rows_tile_matches_scalar_bits() -> crate::Result<()> {
+        let blocks = 7_usize;
+        let row_bytes = blocks * 34;
+        let f16_scales = [
+            0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3555, 0xb787, 0x3c00, 0xbc00,
+        ];
+        let act_scales = [0.0_f32, -0.0, 0.125, -0.375, 1.25, -2.5, 0.0625, -0.75];
+        let mut data = vec![0_u8; 8 * row_bytes];
+        for r in 0..8 {
+            for b in 0..blocks {
+                let off = r * row_bytes + b * 34;
+                data[off..off + 2]
+                    .copy_from_slice(&f16_scales[(r * 5 + b) % f16_scales.len()].to_le_bytes());
+                for i in 0..32 {
+                    data[off + 2 + i] = ((r * 37 + b * 19 + i * 11) % 256).to_le_bytes()[0];
+                }
+            }
+        }
+        let row_refs: [&[u8]; 8] =
+            std::array::from_fn(|r| &data[r * row_bytes..(r + 1) * row_bytes]);
+        let preps: Vec<super::super::MatvecScratch> = (0..32)
+            .map(|t| super::super::MatvecScratch {
+                q8: (0..blocks)
+                    .map(|b| super::super::Q8Block {
+                        scale: act_scales[(t * 3 + b) % act_scales.len()],
+                        sum: 0.0,
+                        values: std::array::from_fn(|i| {
+                            i8::from_ne_bytes([((t * 29 + b * 13 + i * 7) % 256).to_le_bytes()[0]])
+                        }),
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+
+        let mut expected = [[0_u32; 32]; 8];
+        for r in 0..8 {
+            for t in 0..32 {
+                expected[r][t] =
+                    super::super::dot_legacy(super::super::Q8_0, row_refs[r], &preps[t].q8)?
+                        .to_bits();
+            }
+        }
+
+        verify_q8_0_tile_bits::<1>(row_refs, &preps[..1], &expected)?;
+        verify_q8_0_tile_bits::<2>(row_refs, &preps[..2], &expected)?;
+        verify_q8_0_tile_bits::<3>(row_refs, &preps[..3], &expected)?;
+        verify_q8_0_tile_bits::<4>(row_refs, &preps[..4], &expected)?;
+        verify_q8_0_tile_bits::<5>(row_refs, &preps[..5], &expected)?;
+        verify_q8_0_tile_bits::<6>(row_refs, &preps[..6], &expected)?;
+        verify_q8_0_tile_bits::<7>(row_refs, &preps[..7], &expected)?;
+        verify_q8_0_tile_bits::<8>(row_refs, &preps[..8], &expected)?;
+        verify_q8_0_tile_bits::<9>(row_refs, &preps[..9], &expected)?;
+        verify_q8_0_tile_bits::<16>(row_refs, &preps[..16], &expected)?;
+        verify_q8_0_tile_bits::<32>(row_refs, &preps[..32], &expected)?;
+        verify_q8_0_tile_bits::<32>(row_refs, &preps[..19], &expected)?;
+
+        for bad_f16 in [0x7c00_u16, 0x7e00] {
+            let mut bad_data = data.clone();
+            bad_data[5 * row_bytes + 4 * 34..5 * row_bytes + 4 * 34 + 2]
+                .copy_from_slice(&bad_f16.to_le_bytes());
+            let bad_refs: [&[u8]; 8] =
+                std::array::from_fn(|r| &bad_data[r * row_bytes..(r + 1) * row_bytes]);
+            assert!(
+                super::dot_q8_0_eight_rows_tile::<16>(bad_refs, &preps[..13])
+                    .is_some_and(|r| r.is_err())
+            );
+        }
         Ok(())
     }
 }

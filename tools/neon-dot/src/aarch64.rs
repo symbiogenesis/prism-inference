@@ -4791,6 +4791,332 @@ pub(super) fn ptq1_detected_dot_scaled_8x_tokens<const PINNED: bool, A: super::Q
     }
 }
 
+#[inline]
+#[target_feature(enable = "neon,i8mm")]
+fn load_q8_0_row_pair_packed(b0: &[u8; 34], b1: &[u8; 34]) -> [int8x16_t; 4] {
+    let h0 = b0[2..34].as_chunks::<16>().0;
+    let h1 = b1[2..34].as_chunks::<16>().0;
+    let (w_h0_lo, w_h0_hi) = pair_s8_lo_hi(
+        vreinterpretq_s8_u8(load_u8x16(&h0[0])),
+        vreinterpretq_s8_u8(load_u8x16(&h1[0])),
+    );
+    let (w_h1_lo, w_h1_hi) = pair_s8_lo_hi(
+        vreinterpretq_s8_u8(load_u8x16(&h0[1])),
+        vreinterpretq_s8_u8(load_u8x16(&h1[1])),
+    );
+    [w_h0_lo, w_h0_hi, w_h1_lo, w_h1_hi]
+}
+
+#[inline]
+#[target_feature(enable = "neon,i8mm")]
+fn q8_0_row_pair_i8mm<const PAIRS: usize, const HAS_ODD: bool, A: super::Q8ActivationView>(
+    pair_blocks: [&[u8; 34]; 2],
+    pair_scales: [f32; 2],
+    tokens: &[&[A]],
+    block_idx: usize,
+    mut acc_pairs: [core::arch::aarch64::float32x4_t; PAIRS],
+    mut acc_odd: core::arch::aarch64::float32x4_t,
+) -> (
+    [core::arch::aarch64::float32x4_t; PAIRS],
+    core::arch::aarch64::float32x4_t,
+) {
+    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_s8, vmulq_f32};
+    let [w_h0_lo, w_h0_hi, w_h1_lo, w_h1_hi] =
+        load_q8_0_row_pair_packed(pair_blocks[0], pair_blocks[1]);
+    let rs = load_f32x4_neon(&[
+        pair_scales[0],
+        pair_scales[0],
+        pair_scales[1],
+        pair_scales[1],
+    ]);
+    for p in 0..PAIRS {
+        let act0 = &tokens[2 * p][block_idx];
+        let act1 = &tokens[2 * p + 1][block_idx];
+        let a0_halves = act0.values().as_chunks::<16>().0;
+        let a1_halves = act1.values().as_chunks::<16>().0;
+        let (a_h0_lo, a_h0_hi) =
+            pair_s8_lo_hi(load_s8x16(&a0_halves[0]), load_s8x16(&a1_halves[0]));
+        let mut int_dot = smmla_s32(vdupq_n_s32(0), w_h0_lo, a_h0_lo);
+        int_dot = smmla_s32(int_dot, w_h0_hi, a_h0_hi);
+        let (a_h1_lo, a_h1_hi) =
+            pair_s8_lo_hi(load_s8x16(&a0_halves[1]), load_s8x16(&a1_halves[1]));
+        int_dot = smmla_s32(int_dot, w_h1_lo, a_h1_lo);
+        int_dot = smmla_s32(int_dot, w_h1_hi, a_h1_hi);
+        let as0 = act0.scale();
+        let as1 = act1.scale();
+        let d = vmulq_f32(rs, load_f32x4_neon(&[as0, as1, as0, as1]));
+        acc_pairs[p] = f32x4_scale_step::<false>(acc_pairs[p], d, vcvtq_f32_s32(int_dot));
+    }
+    if HAS_ODD {
+        let odd_act = &tokens[PAIRS * 2][block_idx];
+        let a_halves = odd_act.values().as_chunks::<16>().0;
+        let zero = vdupq_n_s8(0);
+        let (a_h0_lo, a_h0_hi) = pair_s8_lo_hi(load_s8x16(&a_halves[0]), zero);
+        let mut int_dot = smmla_s32(vdupq_n_s32(0), w_h0_lo, a_h0_lo);
+        int_dot = smmla_s32(int_dot, w_h0_hi, a_h0_hi);
+        let (a_h1_lo, a_h1_hi) = pair_s8_lo_hi(load_s8x16(&a_halves[1]), zero);
+        int_dot = smmla_s32(int_dot, w_h1_lo, a_h1_lo);
+        int_dot = smmla_s32(int_dot, w_h1_hi, a_h1_hi);
+        let as_odd = odd_act.scale();
+        let d = vmulq_f32(rs, load_f32x4_neon(&[as_odd, 0.0, as_odd, 0.0]));
+        acc_odd = f32x4_scale_step::<false>(acc_odd, d, vcvtq_f32_s32(int_dot));
+    }
+    (acc_pairs, acc_odd)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_q8_0_pair_outputs<const PAIRS: usize, const HAS_ODD: bool>(
+    row_base: usize,
+    acc_pairs: [core::arch::aarch64::float32x4_t; PAIRS],
+    acc_odd: core::arch::aarch64::float32x4_t,
+    out: &mut [[f32; 8]; 8],
+) {
+    for (p, acc) in acc_pairs.into_iter().enumerate() {
+        let mut vals = [0.0_f32; 4];
+        store_f32x4_neon(acc, &mut vals);
+        out[row_base][2 * p] = vals[0];
+        out[row_base][2 * p + 1] = vals[1];
+        out[row_base + 1][2 * p] = vals[2];
+        out[row_base + 1][2 * p + 1] = vals[3];
+    }
+    if HAS_ODD {
+        let mut vals = [0.0_f32; 4];
+        store_f32x4_neon(acc_odd, &mut vals);
+        out[row_base][PAIRS * 2] = vals[0];
+        out[row_base + 1][PAIRS * 2] = vals[2];
+    }
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn q8_0_scaled_8x_pairs_i8mm<
+    const PAIRS: usize,
+    const HAS_ODD: bool,
+    A: super::Q8ActivationView,
+>(
+    rows: [&[u8]; 8],
+    tokens: &[&[A]],
+    out: &mut [[f32; 8]; 8],
+) -> Option<()> {
+    use core::arch::aarch64::vdupq_n_f32;
+    let block_count = tokens[0].len();
+    let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
+    let mut acc0 = [vdupq_n_f32(0.0); PAIRS];
+    let mut acc1 = [vdupq_n_f32(0.0); PAIRS];
+    let mut acc2 = [vdupq_n_f32(0.0); PAIRS];
+    let mut acc3 = [vdupq_n_f32(0.0); PAIRS];
+    let mut odd0 = vdupq_n_f32(0.0);
+    let mut odd1 = vdupq_n_f32(0.0);
+    let mut odd2 = vdupq_n_f32(0.0);
+    let mut odd3 = vdupq_n_f32(0.0);
+    for (block_idx, _) in row_chunks[0].iter().enumerate().take(block_count) {
+        let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
+        let [rs_lo, rs_hi] = widen_row_scales_f16(&blocks)?;
+        (acc0, odd0) = q8_0_row_pair_i8mm::<PAIRS, HAS_ODD, A>(
+            [blocks[0], blocks[1]],
+            [rs_lo[0], rs_lo[1]],
+            tokens,
+            block_idx,
+            acc0,
+            odd0,
+        );
+        (acc1, odd1) = q8_0_row_pair_i8mm::<PAIRS, HAS_ODD, A>(
+            [blocks[2], blocks[3]],
+            [rs_lo[2], rs_lo[3]],
+            tokens,
+            block_idx,
+            acc1,
+            odd1,
+        );
+        (acc2, odd2) = q8_0_row_pair_i8mm::<PAIRS, HAS_ODD, A>(
+            [blocks[4], blocks[5]],
+            [rs_hi[0], rs_hi[1]],
+            tokens,
+            block_idx,
+            acc2,
+            odd2,
+        );
+        (acc3, odd3) = q8_0_row_pair_i8mm::<PAIRS, HAS_ODD, A>(
+            [blocks[6], blocks[7]],
+            [rs_hi[2], rs_hi[3]],
+            tokens,
+            block_idx,
+            acc3,
+            odd3,
+        );
+    }
+    let mut tmp = [[0.0_f32; 8]; 8];
+    store_q8_0_pair_outputs::<PAIRS, HAS_ODD>(0, acc0, odd0, &mut tmp);
+    store_q8_0_pair_outputs::<PAIRS, HAS_ODD>(2, acc1, odd1, &mut tmp);
+    store_q8_0_pair_outputs::<PAIRS, HAS_ODD>(4, acc2, odd2, &mut tmp);
+    store_q8_0_pair_outputs::<PAIRS, HAS_ODD>(6, acc3, odd3, &mut tmp);
+    if !tmp.iter().flatten().all(|v| v.is_finite()) {
+        return None;
+    }
+    *out = tmp;
+    Some(())
+}
+
+#[target_feature(enable = "neon,i8mm")]
+fn q8_0_scaled_8x_tokens_i8mm<A: super::Q8ActivationView>(
+    rows: [&[u8]; 8],
+    tokens: &[&[A]],
+    out: &mut [[f32; 8]; 8],
+) -> Option<()> {
+    match tokens.len() {
+        1 => q8_0_scaled_8x_pairs_i8mm::<0, true, A>(rows, tokens, out),
+        2 => q8_0_scaled_8x_pairs_i8mm::<1, false, A>(rows, tokens, out),
+        3 => q8_0_scaled_8x_pairs_i8mm::<1, true, A>(rows, tokens, out),
+        4 => q8_0_scaled_8x_pairs_i8mm::<2, false, A>(rows, tokens, out),
+        5 => q8_0_scaled_8x_pairs_i8mm::<2, true, A>(rows, tokens, out),
+        6 => q8_0_scaled_8x_pairs_i8mm::<3, false, A>(rows, tokens, out),
+        7 => q8_0_scaled_8x_pairs_i8mm::<3, true, A>(rows, tokens, out),
+        8 => q8_0_scaled_8x_pairs_i8mm::<4, false, A>(rows, tokens, out),
+        _ => None,
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_4rows_sdot<const TOKENS: usize, A: super::Q8ActivationView>(
+    blocks: [&[u8; 34]; 4],
+    row_scales: [f32; 4],
+    tokens: &[&[A]],
+    block_idx: usize,
+    mut acc: [core::arch::aarch64::float32x4_t; TOKENS],
+) -> [core::arch::aarch64::float32x4_t; TOKENS] {
+    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vmulq_f32};
+    let rs_vec = load_f32x4_neon(&row_scales);
+    let (w0_0, w0_1) = {
+        let h = blocks[0][2..34].as_chunks::<16>().0;
+        (
+            vreinterpretq_s8_u8(load_u8x16(&h[0])),
+            vreinterpretq_s8_u8(load_u8x16(&h[1])),
+        )
+    };
+    let (w1_0, w1_1) = {
+        let h = blocks[1][2..34].as_chunks::<16>().0;
+        (
+            vreinterpretq_s8_u8(load_u8x16(&h[0])),
+            vreinterpretq_s8_u8(load_u8x16(&h[1])),
+        )
+    };
+    let (w2_0, w2_1) = {
+        let h = blocks[2][2..34].as_chunks::<16>().0;
+        (
+            vreinterpretq_s8_u8(load_u8x16(&h[0])),
+            vreinterpretq_s8_u8(load_u8x16(&h[1])),
+        )
+    };
+    let (w3_0, w3_1) = {
+        let h = blocks[3][2..34].as_chunks::<16>().0;
+        (
+            vreinterpretq_s8_u8(load_u8x16(&h[0])),
+            vreinterpretq_s8_u8(load_u8x16(&h[1])),
+        )
+    };
+    for (t, tok) in tokens.iter().enumerate() {
+        let act = &tok[block_idx];
+        let a_halves = act.values().as_chunks::<16>().0;
+        let a0 = load_s8x16(&a_halves[0]);
+        let a1 = load_s8x16(&a_halves[1]);
+        let d0 = sdot32_vec(w0_0, w0_1, a0, a1);
+        let d1 = sdot32_vec(w1_0, w1_1, a0, a1);
+        let d2 = sdot32_vec(w2_0, w2_1, a0, a1);
+        let d3 = sdot32_vec(w3_0, w3_1, a0, a1);
+        let dots = vcvtq_f32_s32(reduce4_s32x4(d0, d1, d2, d3));
+        let d = vmulq_f32(rs_vec, vdupq_n_f32(act.scale()));
+        acc[t] = f32x4_scale_step::<false>(acc[t], d, dots);
+    }
+    acc
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_scaled_8x_n_dotprod<const TOKENS: usize, A: super::Q8ActivationView>(
+    rows: [&[u8]; 8],
+    tokens: &[&[A]],
+    out: &mut [[f32; 8]; 8],
+) -> Option<()> {
+    use core::arch::aarch64::vdupq_n_f32;
+    let block_count = tokens[0].len();
+    let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
+    let mut acc_lo = [vdupq_n_f32(0.0); TOKENS];
+    let mut acc_hi = [vdupq_n_f32(0.0); TOKENS];
+    for (block_idx, _) in row_chunks[0].iter().enumerate().take(block_count) {
+        let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
+        let [rs_lo, rs_hi] = widen_row_scales_f16(&blocks)?;
+        acc_lo = q8_0_4rows_sdot::<TOKENS, A>(
+            [blocks[0], blocks[1], blocks[2], blocks[3]],
+            rs_lo,
+            tokens,
+            block_idx,
+            acc_lo,
+        );
+        acc_hi = q8_0_4rows_sdot::<TOKENS, A>(
+            [blocks[4], blocks[5], blocks[6], blocks[7]],
+            rs_hi,
+            tokens,
+            block_idx,
+            acc_hi,
+        );
+    }
+    let mut tmp = [[0.0_f32; 8]; 8];
+    for t in 0..TOKENS {
+        let mut lo = [0.0_f32; 4];
+        let mut hi = [0.0_f32; 4];
+        store_f32x4_neon(acc_lo[t], &mut lo);
+        store_f32x4_neon(acc_hi[t], &mut hi);
+        for r in 0..4 {
+            tmp[r][t] = lo[r];
+            tmp[4 + r][t] = hi[r];
+        }
+    }
+    if !tmp.iter().flatten().all(|v| v.is_finite()) {
+        return None;
+    }
+    *out = tmp;
+    Some(())
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_scaled_8x_tokens_dotprod<A: super::Q8ActivationView>(
+    rows: [&[u8]; 8],
+    tokens: &[&[A]],
+    out: &mut [[f32; 8]; 8],
+) -> Option<()> {
+    match tokens.len() {
+        1 => q8_0_scaled_8x_n_dotprod::<1, A>(rows, tokens, out),
+        2 => q8_0_scaled_8x_n_dotprod::<2, A>(rows, tokens, out),
+        3 => q8_0_scaled_8x_n_dotprod::<3, A>(rows, tokens, out),
+        4 => q8_0_scaled_8x_n_dotprod::<4, A>(rows, tokens, out),
+        5 => q8_0_scaled_8x_n_dotprod::<5, A>(rows, tokens, out),
+        6 => q8_0_scaled_8x_n_dotprod::<6, A>(rows, tokens, out),
+        7 => q8_0_scaled_8x_n_dotprod::<7, A>(rows, tokens, out),
+        8 => q8_0_scaled_8x_n_dotprod::<8, A>(rows, tokens, out),
+        _ => None,
+    }
+}
+
+#[inline]
+pub(super) fn q8_0_detected_dot_scaled_8x_tokens<A: super::Q8ActivationView>(
+    detected: super::Q8Dotprod,
+    rows: [&[u8]; 8],
+    tokens: &[&[A]],
+    out: &mut [[f32; 8]; 8],
+) -> Option<()> {
+    if detected.i8mm && (tokens.len() >= 2 || !detected.dotprod) {
+        // SAFETY: `detected.i8mm` was established by `has_i8mm()` and baseline `neon` on AArch64;
+        // the safe caller validated row/token extents, token count `1..=8`, and finite scales.
+        unsafe { q8_0_scaled_8x_tokens_i8mm::<A>(rows, tokens, out) }
+    } else if detected.dotprod {
+        // SAFETY: `detected.dotprod` was established by `has_dotprod()` and baseline `neon` on
+        // AArch64; the safe caller validated row/token extents, token count `1..=8`, and finite scales.
+        unsafe { q8_0_scaled_8x_tokens_dotprod::<A>(rows, tokens, out) }
+    } else {
+        None
+    }
+}
+
 #[cfg(target_feature = "neon")]
 #[inline]
 #[target_feature(enable = "neon")]

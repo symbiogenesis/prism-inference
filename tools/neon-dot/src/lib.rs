@@ -501,6 +501,88 @@ impl Ptq1Dotprod {
     }
 }
 
+/// Detected `Q8_0` SIMD capability (`dotprod` and/or `i8mm`) reusable across full-K calls.
+///
+/// Construction checks CPU/OS eligibility once. Private fields prevent safe
+/// callers from forging a capability without that check.
+#[derive(Clone, Copy, Debug)]
+pub struct Q8Dotprod {
+    _detected: (),
+    #[cfg(target_arch = "aarch64")]
+    dotprod: bool,
+    #[cfg(target_arch = "aarch64")]
+    i8mm: bool,
+}
+
+impl Q8Dotprod {
+    /// Detects `Q8_0` `SDOT` and/or `I8MM` capability once.
+    #[cfg_attr(
+        not(target_arch = "aarch64"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "AArch64 builds inspect runtime CPU/OS feature flags."
+        )
+    )]
+    #[inline]
+    #[must_use]
+    pub fn detect() -> Option<Self> {
+        let dotprod = has_dotprod();
+        let i8mm = has_i8mm();
+        (dotprod || i8mm).then_some(Self {
+            _detected: (),
+            #[cfg(target_arch = "aarch64")]
+            dotprod,
+            #[cfg(target_arch = "aarch64")]
+            i8mm,
+        })
+    }
+
+    /// Consumes `8` complete 34-byte `Q8_0` weight rows across `1..=8` tokens inside
+    /// one full-K invocation using [`Q8ActivationBlock`] slices.
+    ///
+    /// Preserves exact `0 ULP` parity with scalar/NEON left-to-right non-FMA
+    /// `(row_scale * act_scale) * int_dot` accumulation. Columns `tokens.len()..8`
+    /// in `out` are zeroed. Returns `None` for invalid geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x_tokens(
+        &self,
+        rows: [&[u8]; 8],
+        tokens: &[&[Q8ActivationBlock]],
+        out: &mut [[f32; 8]; 8],
+    ) -> Option<()> {
+        self.dot_scaled_8x_tokens_view::<Q8ActivationBlock>(rows, tokens, out)
+    }
+
+    /// Consumes `8` complete 34-byte `Q8_0` weight rows across `1..=8` tokens inside
+    /// one full-K invocation over any [`Q8ActivationView`] token slices.
+    ///
+    /// Preserves exact `0 ULP` parity with scalar/NEON left-to-right non-FMA
+    /// `(row_scale * act_scale) * int_dot` accumulation. Columns `tokens.len()..8`
+    /// in `out` are zeroed. Returns `None` for invalid geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x_tokens_view<A: Q8ActivationView>(
+        &self,
+        rows: [&[u8]; 8],
+        tokens: &[&[A]],
+        out: &mut [[f32; 8]; 8],
+    ) -> Option<()> {
+        if !scaled::valid_q8_0_8x_tokens(rows, tokens) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::q8_0_detected_dot_scaled_8x_tokens(*self, rows, tokens, out)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            scaled::portable_q8_0_8x_tokens_validated(rows, tokens, out)
+        }
+    }
+}
+
 /// Returns whether the current CPU supports ARMv8.2-A `i8mm` (`SMMLA`).
 #[cfg(target_arch = "aarch64")]
 #[inline]
@@ -1207,6 +1289,48 @@ pub fn smmla_q8_0_8x4(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 4]) -> [[i32; 4]; 
         return tile;
     }
     rows.map(|row| cols.map(|col| dot_q8_0_block(row, col)))
+}
+
+/// Consumes `8` complete 34-byte `Q8_0` weight rows across `1..=8` [`Q8ActivationBlock`]
+/// token slices inside one full-K invocation.
+///
+/// Uses `I8MM`/`SDOT` on ARM64 or portable fallback otherwise, preserving exact
+/// `0 ULP` non-FMA rounding. Columns `tokens.len()..8` in `out` are zeroed.
+/// Returns `None` for empty or `> 8` token slices, invalid geometry, or nonfinite scales/outputs.
+#[inline]
+#[must_use]
+pub fn dot_q8_0_scaled_8x_tokens(
+    rows: [&[u8]; 8],
+    tokens: &[&[Q8ActivationBlock]],
+    out: &mut [[f32; 8]; 8],
+) -> Option<()> {
+    dot_q8_0_scaled_8x_tokens_view::<Q8ActivationBlock>(rows, tokens, out)
+}
+
+/// Consumes `8` complete 34-byte `Q8_0` weight rows across `1..=8` generic
+/// [`Q8ActivationView`] token slices inside one full-K invocation.
+///
+/// Uses `I8MM`/`SDOT` on ARM64 or portable fallback otherwise, preserving exact
+/// `0 ULP` non-FMA rounding. Columns `tokens.len()..8` in `out` are zeroed.
+/// Returns `None` for empty or `> 8` token slices, invalid geometry, or nonfinite scales/outputs.
+#[inline]
+#[must_use]
+pub fn dot_q8_0_scaled_8x_tokens_view<A: Q8ActivationView>(
+    rows: [&[u8]; 8],
+    tokens: &[&[A]],
+    out: &mut [[f32; 8]; 8],
+) -> Option<()> {
+    if !scaled::valid_q8_0_8x_tokens(rows, tokens) {
+        return None;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::q8_0_detected_dot_scaled_8x_tokens(Q8Dotprod::detect()?, rows, tokens, out)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        scaled::portable_q8_0_8x_tokens_validated(rows, tokens, out)
+    }
 }
 
 /// Computes a 2-row by 2-column 32-element `i8` matrix-matrix dot tile using

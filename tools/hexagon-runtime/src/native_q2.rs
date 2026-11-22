@@ -7,7 +7,7 @@
 //! `K <= 5120`, `M <= 17408` projection in a single DSP operation
 //! (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -17,12 +17,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bonsai_prism_runtime::{
     kernels::{Pq2ProjectionExecutor, RowParallelism, is_finite_slice},
-    model::Tensor,
+    model::{Model, Tensor},
 };
 use bonsai_ternary::Q8KBlock;
 use hexagon_native_rpc::{
-    NATIVE_Q2_MAX_COLUMNS, NATIVE_Q2_MAX_ROWS, NativeQ2ProjectionLimits, NativeQ2Submitter,
-    NativeQ2WeightHandle,
+    HMX_Q2_VTCM_REQUEST_BYTES, HtpArchProfile, NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES,
+    NATIVE_Q2_MAX_COLUMNS, NATIVE_Q2_MAX_ROWS, NATIVE_Q2_MAX_WEIGHT_ARENAS,
+    NATIVE_Q2_VTCM_REQUEST_BYTES, NativeQ2ProjectionLimits, NativeQ2Submitter,
+    NativeQ2WeightHandle, is_supported_htp_architecture,
 };
 
 use crate::guarded::{finite, scale, zeroed};
@@ -3920,6 +3922,419 @@ impl NativeQ2ArenaCache {
     }
 }
 
+/// Single resident `FastRPC` weight arena assignment produced by
+/// [`plan_native_q2_layers_for_budget`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaAssignment {
+    /// Zero-based resident arena index (`0..max_arenas`).
+    pub arena_index: usize,
+    /// Aligned resident `HTP_TYPE_Q2_0` payload bytes placed in this arena.
+    pub used_bytes: usize,
+    /// Unused bytes remaining under `max_arena_bytes` in this arena.
+    pub remaining_bytes: usize,
+    /// Ordered list of projection tensor names placed in this arena.
+    pub projections: Vec<String>,
+}
+
+/// Dynamic `#41` VTCM-aware multi-arena Hexagon `native-q2` placement plan.
+///
+/// Inspects real model tensor dimensions and quantization kinds (`PQ2_0`
+/// `kind == 142` and `PTQ1_0` `kind == 143`), validates per-projection VTCM
+/// working-set fit against queried `vtcm_bytes`, and packs the maximal
+/// contiguous decoder-layer prefix `blk.0..admitted_layers` across
+/// `1..=max_arenas` arenas bounded by `max_arena_bytes`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VtcmPlacementPlan {
+    /// Validated Hexagon HTP DSP architecture (`73` for X1 `v73`, `81` for X2 `v81`).
+    pub architecture: u32,
+    /// Total contiguous decoder layers found in the model (`blk.0..total_layers`).
+    pub total_layers: usize,
+    /// Number of contiguous prefix layers (`blk.0..admitted_layers`) admitted on Hexagon NPU.
+    pub admitted_layers: usize,
+    /// Total resident `HTP_TYPE_Q2_0` payload bytes across all admitted arenas.
+    pub resident_bytes: usize,
+    /// Usable HTP VTCM budget in bytes derived from queried `vtcm_bytes`.
+    pub usable_vtcm_bytes: u32,
+    /// Peak per-projection VTCM working-set footprint in bytes across NPU layers.
+    pub peak_vtcm_working_bytes: u32,
+    /// Ordered NPU-admitted projection tensor names (`blk.0..admitted_layers`).
+    pub npu_projections: Vec<String>,
+    /// Ordered overflow projection tensor names (`blk.admitted_layers..total_layers`).
+    pub overflow_projections: Vec<String>,
+    /// Non-empty per-arena breakdown covering every admitted NPU projection.
+    pub arena_assignments: Vec<ArenaAssignment>,
+}
+
+const GDN_LAYER_SUFFIXES: [&str; 6] = [
+    "ffn_up.weight",
+    "ffn_gate.weight",
+    "ffn_down.weight",
+    "attn_qkv.weight",
+    "attn_gate.weight",
+    "ssm_out.weight",
+];
+
+const FULL_ATTN_LAYER_SUFFIXES: [&str; 7] = [
+    "ffn_up.weight",
+    "ffn_gate.weight",
+    "ffn_down.weight",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_output.weight",
+];
+
+struct PlannedProjection {
+    name: String,
+    columns: usize,
+    padded_rows: usize,
+    packed_bytes: usize,
+}
+
+fn parse_blk_projection_name(name: &str) -> Option<(usize, &str)> {
+    let rest = name.strip_prefix("blk.")?;
+    let (digits, suffix) = rest.split_once('.')?;
+    if digits.is_empty()
+        || suffix.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    let layer = digits.parse::<usize>().ok()?;
+    Some((layer, suffix))
+}
+
+fn is_canonical_layer_projection_suffix(suffix: &str) -> bool {
+    GDN_LAYER_SUFFIXES.contains(&suffix) || FULL_ATTN_LAYER_SUFFIXES.contains(&suffix)
+}
+
+fn ordered_layer_projections(
+    mut layer_map: BTreeMap<&str, PlannedProjection>,
+) -> Result<Vec<PlannedProjection>> {
+    let ordered_suffixes: &[&str] = if layer_map.len() == GDN_LAYER_SUFFIXES.len()
+        && GDN_LAYER_SUFFIXES
+            .iter()
+            .all(|suffix| layer_map.contains_key(suffix))
+    {
+        &GDN_LAYER_SUFFIXES
+    } else if layer_map.len() == FULL_ATTN_LAYER_SUFFIXES.len()
+        && FULL_ATTN_LAYER_SUFFIXES
+            .iter()
+            .all(|suffix| layer_map.contains_key(suffix))
+    {
+        &FULL_ATTN_LAYER_SUFFIXES
+    } else {
+        return Err(invalid(
+            "decoder layer does not match canonical Swift 6- or 7-projection structure",
+        ));
+    };
+
+    let mut ordered = Vec::with_capacity(ordered_suffixes.len());
+    for &suffix in ordered_suffixes {
+        let projection = layer_map
+            .remove(suffix)
+            .ok_or_else(|| invalid("missing canonical decoder layer projection"))?;
+        ordered.push(projection);
+    }
+    Ok(ordered)
+}
+
+fn collect_planned_layers(model: &Model) -> Result<Vec<Vec<PlannedProjection>>> {
+    let mut layers_map: BTreeMap<usize, BTreeMap<&str, PlannedProjection>> = BTreeMap::new();
+    for (key, tensor) in &model.tensors {
+        if key != &tensor.name {
+            return Err(invalid("mismatched model tensor map key and tensor name"));
+        }
+        if !key.starts_with("blk.") {
+            continue;
+        }
+        let parsed = parse_blk_projection_name(key);
+        let is_quantized = tensor.kind == PQ2_KIND || tensor.kind == PTQ1_KIND;
+        if !is_quantized {
+            if parsed.is_some_and(|(_, suffix)| is_canonical_layer_projection_suffix(suffix)) {
+                return Err(invalid(
+                    "canonical decoder projection must use PQ2_0 (142) or PTQ1_0 (143)",
+                ));
+            }
+            continue;
+        }
+        let Some((layer_idx, suffix)) = parsed else {
+            return Err(invalid("invalid quantized decoder tensor name format"));
+        };
+        if !is_canonical_layer_projection_suffix(suffix) {
+            return Err(invalid("unrecognized quantized decoder projection suffix"));
+        }
+        let (columns, rows) = native_dimensions(tensor)?;
+        let padded_rows = rows.next_multiple_of(32);
+        let blocks = columns / 128;
+        let packed_bytes = padded_rows
+            .checked_mul(36)
+            .and_then(|bytes| bytes.checked_mul(blocks))
+            .ok_or_else(|| invalid("packed HTP_TYPE_Q2_0 projection size overflow"))?;
+        let layer_entry = layers_map.entry(layer_idx).or_default();
+        if layer_entry
+            .insert(
+                suffix,
+                PlannedProjection {
+                    name: tensor.name.clone(),
+                    columns,
+                    padded_rows,
+                    packed_bytes,
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid("duplicate quantized decoder projection in layer"));
+        }
+    }
+
+    if layers_map.is_empty() {
+        return Err(invalid(
+            "model contains no PQ2_0 or PTQ1_0 decoder layer projections",
+        ));
+    }
+
+    let mut layers = Vec::with_capacity(layers_map.len());
+    for (expected_idx, (actual_idx, layer_map)) in layers_map.into_iter().enumerate() {
+        if actual_idx != expected_idx {
+            return Err(invalid(
+                "non-contiguous decoder layer indices in Hexagon placement model",
+            ));
+        }
+        layers.push(ordered_layer_projections(layer_map)?);
+    }
+    Ok(layers)
+}
+
+fn usable_vtcm_budget(vtcm_bytes: u32) -> Result<u32> {
+    if vtcm_bytes == 0 {
+        return Err(invalid("Hexagon VTCM capacity must be non-zero"));
+    }
+    let usable = if vtcm_bytes >= 8 * 1024 * 1024 {
+        NATIVE_Q2_VTCM_REQUEST_BYTES
+    } else {
+        let headroom = vtcm_bytes / 8;
+        vtcm_bytes
+            .saturating_sub(headroom)
+            .min(NATIVE_Q2_VTCM_REQUEST_BYTES)
+    };
+    if usable < 65_536 {
+        return Err(invalid("Hexagon VTCM capacity below 64 KiB floor"));
+    }
+    Ok(usable)
+}
+
+fn projection_vtcm_working_bytes(
+    profile: HtpArchProfile,
+    usable_vtcm_bytes: u32,
+    columns: usize,
+    padded_rows: usize,
+) -> Option<u32> {
+    if columns == 0
+        || columns > NATIVE_Q2_MAX_COLUMNS
+        || !columns.is_multiple_of(128)
+        || padded_rows == 0
+        || padded_rows > NATIVE_Q2_MAX_ROWS
+        || !padded_rows.is_multiple_of(32)
+    {
+        return None;
+    }
+    let desired_vtcm = if columns > 6144 {
+        NATIVE_Q2_VTCM_REQUEST_BYTES
+    } else {
+        HMX_Q2_VTCM_REQUEST_BYTES
+    };
+    let vtcm_budget = usize::try_from(desired_vtcm.min(usable_vtcm_bytes)).ok()?;
+    let n_threads = usize::try_from(profile.hvx_workers.max(1)).ok()?;
+    let k_groups = ((columns + 127) >> 5) & !3;
+    let src1_row_size = k_groups.checked_mul(1280)?;
+    let k_tiles = (columns + 63) >> 6;
+    let dst_row_bytes = padded_rows.checked_mul(4)?;
+    let src1_vtcm = src1_row_size.next_multiple_of(256);
+    let dst_vtcm = dst_row_bytes
+        .div_ceil(n_threads)
+        .next_multiple_of(128)
+        .checked_mul(n_threads)?;
+    let act_vtcm = columns.checked_mul(4)?.next_multiple_of(512);
+    let mut n_prefetch = 16_usize;
+    while n_prefetch > 0 {
+        let src0_vtcm = n_prefetch
+            .checked_mul(k_tiles)?
+            .checked_mul(640)?
+            .next_multiple_of(256)
+            .checked_mul(n_threads)?;
+        let total_vtcm = src1_vtcm.checked_add(dst_vtcm.checked_add(src0_vtcm)?.max(act_vtcm))?;
+        if total_vtcm <= vtcm_budget {
+            return u32::try_from(total_vtcm).ok();
+        }
+        n_prefetch >>= 1;
+    }
+    None
+}
+
+fn try_place_layer_in_arenas(
+    layer: &[PlannedProjection],
+    profile: HtpArchProfile,
+    usable_vtcm_bytes: u32,
+    max_arena_bytes: usize,
+    arena_used: &mut [usize],
+    active_arena: &mut usize,
+) -> Option<(Vec<(usize, String)>, u32)> {
+    let mut trial_used = arena_used.to_vec();
+    let mut trial_arena = *active_arena;
+    let mut placements = Vec::with_capacity(layer.len());
+    let mut layer_peak_vtcm = 0_u32;
+
+    for proj in layer {
+        if proj.packed_bytes > max_arena_bytes {
+            return None;
+        }
+        let vtcm_work = projection_vtcm_working_bytes(
+            profile,
+            usable_vtcm_bytes,
+            proj.columns,
+            proj.padded_rows,
+        )?;
+        layer_peak_vtcm = layer_peak_vtcm.max(vtcm_work);
+
+        let mut placed = false;
+        for (idx, used) in trial_used.iter_mut().enumerate().skip(trial_arena) {
+            let start = used.next_multiple_of(128);
+            if let Some(end) = start.checked_add(proj.packed_bytes)
+                && end <= max_arena_bytes
+            {
+                *used = end;
+                trial_arena = idx;
+                placements.push((idx, proj.name.clone()));
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            return None;
+        }
+    }
+
+    arena_used.copy_from_slice(&trial_used);
+    *active_arena = trial_arena;
+    Some((placements, layer_peak_vtcm))
+}
+
+/// Plan dynamic VTCM-aware multi-arena Hexagon `native-q2` layer placement from
+/// actual `model` tensor geometry and queried hardware limits (`#41`).
+///
+/// Inspects every canonical `blk.<L>.<proj>` tensor (`PQ2_0` `kind == 142` or
+/// `PTQ1_0` `kind == 143`), computes its exact transcoded `HTP_TYPE_Q2_0` tile
+/// payload size, validates single-op geometry and per-tile VTCM working-set fit
+/// against `vtcm_bytes`, and greedily packs the maximal contiguous layer prefix
+/// `blk.0..admitted_layers` across up to `max_arenas` arenas bounded by
+/// `max_arena_bytes`. Any remaining layers become [`VtcmPlacementPlan::overflow_projections`].
+///
+/// [`DEFAULT_NATIVE_Q2_PROJECTIONS`] remains untouched as the verified 27-layer
+/// baseline.
+///
+/// # Errors
+/// Rejects unsupported HTP architectures (`arch` outside `{73, 81}`), zero or
+/// out-of-range `max_arena_bytes` / `max_arenas`, zero or sub-64 KiB
+/// `vtcm_bytes`, malformed/non-contiguous `model` layers, or budgets that admit
+/// zero complete layers.
+pub fn plan_native_q2_layers_for_budget(
+    model: &Model,
+    arch: u32,
+    max_arena_bytes: usize,
+    max_arenas: usize,
+    vtcm_bytes: u32,
+) -> Result<VtcmPlacementPlan> {
+    if !is_supported_htp_architecture(arch) {
+        return Err(invalid(
+            "unsupported Hexagon HTP architecture for native Q2 planning",
+        ));
+    }
+    if max_arena_bytes == 0 || max_arena_bytes > NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES {
+        return Err(invalid("invalid Hexagon max_arena_bytes budget"));
+    }
+    if max_arenas == 0 || max_arenas > NATIVE_Q2_MAX_WEIGHT_ARENAS {
+        return Err(invalid("invalid Hexagon max_arenas count"));
+    }
+    let usable_vtcm_bytes = usable_vtcm_budget(vtcm_bytes)?;
+    let profile = HtpArchProfile::for_architecture(arch, 0, vtcm_bytes)
+        .ok_or_else(|| invalid("unsupported Hexagon HTP architecture profile"))?;
+    let layers = collect_planned_layers(model)?;
+    let total_layers = layers.len();
+
+    let mut arena_used = vec![0_usize; max_arenas];
+    let mut arena_projections = vec![Vec::<String>::new(); max_arenas];
+    let mut active_arena = 0_usize;
+    let mut admitted_layers = 0_usize;
+    let mut npu_projections = Vec::new();
+    let mut overflow_projections = Vec::new();
+    let mut peak_vtcm_working_bytes = 0_u32;
+    let mut stopped = false;
+
+    for (layer_idx, layer) in layers.into_iter().enumerate() {
+        if !stopped
+            && let Some((placements, layer_vtcm)) = try_place_layer_in_arenas(
+                &layer,
+                profile,
+                usable_vtcm_bytes,
+                max_arena_bytes,
+                &mut arena_used,
+                &mut active_arena,
+            )
+        {
+            admitted_layers = layer_idx + 1;
+            peak_vtcm_working_bytes = peak_vtcm_working_bytes.max(layer_vtcm);
+            for (arena_idx, proj_name) in placements {
+                arena_projections[arena_idx].push(proj_name.clone());
+                npu_projections.push(proj_name);
+            }
+        } else {
+            stopped = true;
+            for proj in layer {
+                overflow_projections.push(proj.name);
+            }
+        }
+    }
+
+    if admitted_layers == 0 {
+        return Err(invalid(
+            "Hexagon VTCM and arena budgets admit zero native Q2 layers",
+        ));
+    }
+
+    let mut arena_assignments = Vec::new();
+    let mut resident_bytes = 0_usize;
+    for (arena_index, (used_bytes, projections)) in
+        arena_used.into_iter().zip(arena_projections).enumerate()
+    {
+        if projections.is_empty() {
+            continue;
+        }
+        resident_bytes = resident_bytes
+            .checked_add(used_bytes)
+            .ok_or_else(|| invalid("Hexagon resident arena bytes overflow"))?;
+        arena_assignments.push(ArenaAssignment {
+            arena_index,
+            used_bytes,
+            remaining_bytes: max_arena_bytes - used_bytes,
+            projections,
+        });
+    }
+
+    Ok(VtcmPlacementPlan {
+        architecture: arch,
+        total_layers,
+        admitted_layers,
+        resident_bytes,
+        usable_vtcm_bytes,
+        peak_vtcm_working_bytes,
+        npu_projections,
+        overflow_projections,
+        arena_assignments,
+    })
+}
+
 #[cfg(test)]
 #[path = "native_q2/multitile_tests.rs"]
 mod multitile_tests;
@@ -7046,5 +7461,286 @@ mod tests {
         );
         assert_eq!(wrong_kind_b.submitter.copies, 0);
         Ok(())
+    }
+
+    fn swift_layer_specs(layer_idx: usize) -> &'static [(&'static str, usize, usize)] {
+        if (layer_idx + 1).is_multiple_of(4) {
+            &[
+                ("ffn_up.weight", 5120, 17_408),
+                ("ffn_gate.weight", 5120, 17_408),
+                ("ffn_down.weight", 17_408, 5120),
+                ("attn_q.weight", 5120, 12_288),
+                ("attn_k.weight", 5120, 1024),
+                ("attn_v.weight", 5120, 1024),
+                ("attn_output.weight", 6144, 5120),
+            ]
+        } else {
+            &[
+                ("ffn_up.weight", 5120, 17_408),
+                ("ffn_gate.weight", 5120, 17_408),
+                ("ffn_down.weight", 17_408, 5120),
+                ("attn_qkv.weight", 5120, 10_240),
+                ("attn_gate.weight", 5120, 6144),
+                ("ssm_out.weight", 6144, 5120),
+            ]
+        }
+    }
+
+    fn synthetic_swift_model(layer_count: usize, kind_for_layer: impl Fn(usize) -> u32) -> Model {
+        let mut shape_cache: BTreeMap<(u32, usize, usize), Arc<[u8]>> = BTreeMap::new();
+        let mut tensors = BTreeMap::new();
+        for layer_idx in 0..layer_count {
+            let kind = kind_for_layer(layer_idx);
+            let block_bytes = source_block_bytes(kind).unwrap_or(34);
+            for &(suffix, columns, rows) in swift_layer_specs(layer_idx) {
+                let bytes = shape_cache
+                    .entry((kind, columns, rows))
+                    .or_insert_with(|| {
+                        Arc::<[u8]>::from(vec![0_u8; rows * (columns / 128) * block_bytes])
+                    })
+                    .clone();
+                let name = format!("blk.{layer_idx}.{suffix}");
+                tensors.insert(
+                    name.clone(),
+                    Tensor {
+                        name,
+                        kind,
+                        dimensions: vec![columns, rows],
+                        data: bytes.into(),
+                    },
+                );
+            }
+            if layer_idx == 0 {
+                tensors.insert(
+                    "blk.0.attn_norm.weight".to_owned(),
+                    Tensor {
+                        name: "blk.0.attn_norm.weight".to_owned(),
+                        kind: 0,
+                        dimensions: vec![5120],
+                        data: Arc::<[u8]>::from(vec![0_u8; 5120 * 4]).into(),
+                    },
+                );
+            }
+        }
+        tensors.insert(
+            "output.weight".to_owned(),
+            Tensor {
+                name: "output.weight".to_owned(),
+                kind: PTQ1_KIND,
+                dimensions: vec![5120, 1024],
+                data: Arc::<[u8]>::from(vec![0_u8; 1024 * (5120 / 128) * 28]).into(),
+            },
+        );
+        Model {
+            identity: "synthetic-swift-vtcm-plan".into(),
+            metadata: BTreeMap::new(),
+            tensors,
+        }
+    }
+
+    #[test]
+    fn vtcm_planner_v81_64_layers_matches_verified_27_layer_baseline_for_pq2_and_ptq1() -> Result<()>
+    {
+        let pq2_model = synthetic_swift_model(64, |_| PQ2_KIND);
+        let ptq1_model = synthetic_swift_model(64, |_| PTQ1_KIND);
+        let pq2_plan = plan_native_q2_layers_for_budget(
+            &pq2_model,
+            81,
+            NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES,
+            NATIVE_Q2_MAX_WEIGHT_ARENAS,
+            8 * 1024 * 1024,
+        )?;
+        let ptq1_plan = plan_native_q2_layers_for_budget(
+            &ptq1_model,
+            81,
+            NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES,
+            NATIVE_Q2_MAX_WEIGHT_ARENAS,
+            8 * 1024 * 1024,
+        )?;
+        assert_eq!(pq2_plan, ptq1_plan);
+        assert_eq!(pq2_plan.architecture, 81);
+        assert_eq!(pq2_plan.total_layers, 64);
+        assert_eq!(pq2_plan.admitted_layers, 27);
+        assert_eq!(
+            pq2_plan.resident_bytes,
+            DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES
+        );
+        assert_eq!(pq2_plan.usable_vtcm_bytes, NATIVE_Q2_VTCM_REQUEST_BYTES);
+        assert!(pq2_plan.peak_vtcm_working_bytes > 0);
+        assert!(pq2_plan.peak_vtcm_working_bytes <= pq2_plan.usable_vtcm_bytes);
+        assert_eq!(
+            pq2_plan.npu_projections,
+            DEFAULT_NATIVE_Q2_PROJECTIONS
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(pq2_plan.overflow_projections.len(), 232);
+        assert_eq!(pq2_plan.overflow_projections[0], "blk.27.ffn_up.weight");
+        assert_eq!(
+            pq2_plan.overflow_projections.last().map(String::as_str),
+            Some("blk.63.attn_output.weight")
+        );
+        assert_eq!(pq2_plan.arena_assignments.len(), 6);
+        let arena_sum: usize = pq2_plan
+            .arena_assignments
+            .iter()
+            .map(|a| a.used_bytes)
+            .sum();
+        assert_eq!(arena_sum, DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES);
+        for arena in &pq2_plan.arena_assignments {
+            assert_eq!(
+                arena.used_bytes + arena.remaining_bytes,
+                NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES
+            );
+            assert_ne!(arena.projections.len(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vtcm_planner_v73_smaller_arenas_and_overflow_boundary_layers() -> Result<()> {
+        let mixed_model = synthetic_swift_model(64, |idx| {
+            if idx.is_multiple_of(2) {
+                PTQ1_KIND
+            } else {
+                PQ2_KIND
+            }
+        });
+        let small_arena_bytes = 256 * 1024 * 1024;
+        let v73_small = plan_native_q2_layers_for_budget(
+            &mixed_model,
+            73,
+            small_arena_bytes,
+            4,
+            4 * 1024 * 1024,
+        )?;
+        assert_eq!(v73_small.architecture, 73);
+        assert_eq!(v73_small.total_layers, 64);
+        assert_eq!(v73_small.usable_vtcm_bytes, 3_670_016);
+        assert!(v73_small.peak_vtcm_working_bytes <= v73_small.usable_vtcm_bytes);
+        assert!(v73_small.admitted_layers > 0 && v73_small.admitted_layers < 27);
+        assert_eq!(v73_small.arena_assignments.len(), 4);
+        assert_eq!(
+            v73_small.overflow_projections[0],
+            format!("blk.{}.ffn_up.weight", v73_small.admitted_layers)
+        );
+        let expected_npu_count: usize = (0..v73_small.admitted_layers)
+            .map(|idx| swift_layer_specs(idx).len())
+            .sum();
+        assert_eq!(v73_small.npu_projections.len(), expected_npu_count);
+        assert_eq!(
+            v73_small.npu_projections.len() + v73_small.overflow_projections.len(),
+            400
+        );
+        let flattened_arena_projections: Vec<String> = v73_small
+            .arena_assignments
+            .iter()
+            .flat_map(|arena| arena.projections.iter().cloned())
+            .collect();
+        assert_eq!(flattened_arena_projections, v73_small.npu_projections);
+        let v73_small_arena_sum: usize = v73_small
+            .arena_assignments
+            .iter()
+            .map(|arena| arena.used_bytes)
+            .sum();
+        assert_eq!(v73_small_arena_sum, v73_small.resident_bytes);
+
+        let v73_full = plan_native_q2_layers_for_budget(
+            &mixed_model,
+            73,
+            NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES,
+            6,
+            4 * 1024 * 1024,
+        )?;
+        assert_eq!(v73_full.admitted_layers, 27);
+        assert_eq!(
+            v73_full.resident_bytes,
+            DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES
+        );
+
+        let small_model = synthetic_swift_model(8, |_| PTQ1_KIND);
+        let fit_all = plan_native_q2_layers_for_budget(
+            &small_model,
+            73,
+            NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES,
+            6,
+            4 * 1024 * 1024,
+        )?;
+        assert_eq!(fit_all.admitted_layers, 8);
+        assert_eq!(fit_all.overflow_projections.len(), 0);
+        assert_eq!(fit_all.arena_assignments.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn vtcm_planner_rejects_invalid_budgets_vtcm_and_malformed_models() {
+        let model = synthetic_swift_model(4, |_| PTQ1_KIND);
+        let max_arena = NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES;
+
+        // Zero, sub-floor, and insufficient VTCM budgets.
+        assert!(plan_native_q2_layers_for_budget(&model, 81, max_arena, 6, 0).is_err());
+        assert!(plan_native_q2_layers_for_budget(&model, 73, max_arena, 6, 0).is_err());
+        assert!(plan_native_q2_layers_for_budget(&model, 73, max_arena, 6, 65_536).is_err());
+        assert!(
+            plan_native_q2_layers_for_budget(&model, 81, max_arena, 6, 2 * 1024 * 1024).is_err()
+        );
+        assert!(plan_native_q2_layers_for_budget(&model, 73, max_arena, 6, 1024 * 1024).is_err());
+
+        // Invalid architectures and arena budgets.
+        assert!(
+            plan_native_q2_layers_for_budget(&model, 68, max_arena, 6, 8 * 1024 * 1024).is_err()
+        );
+        assert!(plan_native_q2_layers_for_budget(&model, 81, 0, 6, 8 * 1024 * 1024).is_err());
+        assert!(
+            plan_native_q2_layers_for_budget(&model, 81, max_arena + 1, 6, 8 * 1024 * 1024)
+                .is_err()
+        );
+        assert!(
+            plan_native_q2_layers_for_budget(&model, 81, max_arena, 0, 8 * 1024 * 1024).is_err()
+        );
+        assert!(
+            plan_native_q2_layers_for_budget(&model, 81, max_arena, 7, 8 * 1024 * 1024).is_err()
+        );
+        // Cannot fit even layer 0 in 64 MiB single arena.
+        assert!(
+            plan_native_q2_layers_for_budget(&model, 81, 64 * 1024 * 1024, 1, 8 * 1024 * 1024)
+                .is_err()
+        );
+
+        // Malformed models: empty, non-contiguous gap, incomplete layer, wrong canonical kind.
+        let empty = synthetic_swift_model(0, |_| PTQ1_KIND);
+        assert!(
+            plan_native_q2_layers_for_budget(&empty, 81, max_arena, 6, 8 * 1024 * 1024).is_err()
+        );
+
+        let mut gapped = synthetic_swift_model(3, |_| PTQ1_KIND);
+        let blk1_keys: Vec<String> = gapped
+            .tensors
+            .keys()
+            .filter(|name| name.starts_with("blk.1."))
+            .cloned()
+            .collect();
+        for key in blk1_keys {
+            gapped.tensors.remove(&key);
+        }
+        assert!(
+            plan_native_q2_layers_for_budget(&gapped, 81, max_arena, 6, 8 * 1024 * 1024).is_err()
+        );
+
+        let mut incomplete = synthetic_swift_model(2, |_| PTQ1_KIND);
+        incomplete.tensors.remove("blk.0.ssm_out.weight");
+        assert!(
+            plan_native_q2_layers_for_budget(&incomplete, 81, max_arena, 6, 8 * 1024 * 1024)
+                .is_err()
+        );
+
+        let mut bad_kind = synthetic_swift_model(1, |_| PTQ1_KIND);
+        if let Some(tensor) = bad_kind.tensors.get_mut("blk.0.ffn_up.weight") {
+            tensor.kind = 0;
+        }
+        assert!(
+            plan_native_q2_layers_for_budget(&bad_kind, 81, max_arena, 6, 8 * 1024 * 1024).is_err()
+        );
     }
 }

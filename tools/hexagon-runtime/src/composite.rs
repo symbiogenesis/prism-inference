@@ -1344,4 +1344,217 @@ mod tests {
         assert!(coordinator.record_next_step(4).is_err());
         Ok(())
     }
+
+    struct CompositePtq1Submitter;
+
+    impl hexagon_native_rpc::NativeQ2Submitter for CompositePtq1Submitter {
+        fn submit(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            assert!(columns >= 128 && columns.is_multiple_of(128));
+            assert!(rows >= 32 && rows.is_multiple_of(32));
+            assert_eq!(weights.len(), rows * (columns / 128) * 36);
+            assert_eq!(activation.len(), columns);
+            output.fill(9.25);
+            Ok(())
+        }
+    }
+
+    fn tensor_with_dims(name: &str, kind: u32, columns: usize, rows: usize) -> Tensor {
+        let block_bytes = if kind == 143 { 28 } else { 34 };
+        let mut block = vec![0_u8; block_bytes];
+        if kind == 143 {
+            block[26..28].copy_from_slice(&0x3C00_u16.to_le_bytes());
+        } else {
+            block[0..2].copy_from_slice(&0x3C00_u16.to_le_bytes());
+        }
+        let blocks = rows * (columns / 128);
+        let mut data = Vec::with_capacity(blocks * block_bytes);
+        for _ in 0..blocks {
+            data.extend_from_slice(&block);
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: vec![columns, rows],
+            kind,
+            data: Arc::<[u8]>::from(data).into(),
+        }
+    }
+
+    #[test]
+    fn ptq1_and_pq2_composite_routing_with_x1_v73_and_native_q2_npu() -> Result<()> {
+        let plan =
+            plan_x1_v73_three_processor_placement(64, 4, AcceleratorTarget::AdrenoGpuOpenCl)?;
+        let limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
+            256,
+            32,
+            16,
+            std::time::Duration::from_secs(4),
+        )
+        .map_err(|_| invalid("limits"))?;
+        let mut npu = crate::NativeQ2Executor::new(CompositePtq1Submitter, limits, 1024 * 1024);
+        let mut gpu = MockExecutor {
+            id: "adreno-ptq1-gpu",
+            capacity: Some(128),
+            fail_on: None,
+            tile_tokens: false,
+            calls: 0,
+        };
+        let mut composite = CompositeProjectionExecutor::new(&plan, &mut npu, &mut gpu)?;
+
+        let npu_ptq1 = tensor_with_dims("blk.0.ffn_up.weight", 143, 256, 32);
+        let npu_pq2 = tensor_with_dims("blk.1.ffn_gate.weight", 142, 256, 32);
+        let gpu_ptq1 = tensor_with_dims("blk.27.ffn_up.weight", 143, 256, 32);
+        assert!(composite.supports_f32(&npu_ptq1));
+        assert!(composite.supports_f32(&npu_pq2));
+        assert!(composite.supports_f32(&gpu_ptq1));
+
+        let mut out = Vec::new();
+        composite.project_f32(&npu_ptq1, &vec![1.0_f32; 256], true, &mut out)?;
+        assert_eq!(out, [9.25; 32]);
+        composite.project_f32(&npu_pq2, &vec![1.0_f32; 256], true, &mut out)?;
+        assert_eq!(out, [9.25; 32]);
+        composite.project_f32(&gpu_ptq1, &vec![1.0_f32; 256], true, &mut out)?;
+        assert_eq!(out, [3.0]);
+        assert_eq!(composite.telemetry().npu_projections, 2);
+        assert_eq!(composite.telemetry().gpu_projections, 1);
+        assert!(!composite.telemetry().faulted);
+        Ok(())
+    }
+
+    fn build_vtcm_ptq1_test_model() -> bonsai_prism_runtime::model::Model {
+        let mut tensors = std::collections::BTreeMap::new();
+        for layer_idx in 0..4_usize {
+            let kind = if layer_idx.is_multiple_of(2) {
+                143
+            } else {
+                142
+            };
+            let suffixes: &[&str] = if (layer_idx + 1).is_multiple_of(4) {
+                &[
+                    "ffn_up.weight",
+                    "ffn_gate.weight",
+                    "ffn_down.weight",
+                    "attn_q.weight",
+                    "attn_k.weight",
+                    "attn_v.weight",
+                    "attn_output.weight",
+                ]
+            } else {
+                &[
+                    "ffn_up.weight",
+                    "ffn_gate.weight",
+                    "ffn_down.weight",
+                    "attn_qkv.weight",
+                    "attn_gate.weight",
+                    "ssm_out.weight",
+                ]
+            };
+            for &suffix in suffixes {
+                let name = format!("blk.{layer_idx}.{suffix}");
+                let t = tensor_with_dims(&name, kind, 256, 32);
+                tensors.insert(name, t);
+            }
+        }
+        bonsai_prism_runtime::model::Model {
+            identity: "composite-vtcm-ptq1-model".into(),
+            metadata: std::collections::BTreeMap::new(),
+            tensors,
+        }
+    }
+
+    #[test]
+    fn owned_composite_routes_vtcm_planned_ptq1_and_overflow_layers() -> Result<()> {
+        let model = build_vtcm_ptq1_test_model();
+        // 13 * 2304 = 29_952 bytes fits blk.0 (6 * 2304 = 13_824) and blk.1 (6 * 2304 = 13_824 -> 27_648 total),
+        // leaving 2_304 < 13_824 so blk.2..4 overflow to GPU cleanly.
+        let vtcm_plan =
+            crate::plan_native_q2_layers_for_budget(&model, 73, 29_952, 1, 4 * 1024 * 1024)?;
+        assert_eq!(vtcm_plan.admitted_layers, 2);
+        assert_eq!(vtcm_plan.npu_projections.len(), 12);
+        assert_eq!(vtcm_plan.overflow_projections.len(), 13);
+
+        let het_plan = crate::plan_three_processor_placement(
+            vtcm_plan.total_layers,
+            vtcm_plan.admitted_layers,
+            vtcm_plan.total_layers - vtcm_plan.admitted_layers,
+            4,
+            AcceleratorTarget::AdrenoGpuOpenCl,
+        )?;
+        let limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
+            256,
+            32,
+            16,
+            std::time::Duration::from_secs(4),
+        )
+        .map_err(|_| invalid("limits"))?;
+        let npu_names: Vec<&str> = vtcm_plan
+            .npu_projections
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut npu = crate::NativeQ2Executor::new(CompositePtq1Submitter, limits, 1024 * 1024);
+        let mut placed_npu = crate::PlacedProjectionExecutor::new(&mut npu, &model, &npu_names)?;
+        assert!(placed_npu.supports_f32(&model.tensors["blk.0.ffn_up.weight"]));
+        assert!(placed_npu.supports_f32(&model.tensors["blk.1.ffn_gate.weight"]));
+        assert!(!placed_npu.supports_f32(&model.tensors["blk.2.ffn_up.weight"]));
+        let mut gpu = MockExecutor {
+            id: "adreno-overflow",
+            capacity: Some(64),
+            fail_on: None,
+            tile_tokens: false,
+            calls: 0,
+        };
+        let mut composite = CompositeProjectionExecutor::new(&het_plan, &mut placed_npu, &mut gpu)?;
+        let mut out = Vec::new();
+        composite.project_f32(
+            &model.tensors["blk.0.ffn_up.weight"],
+            &vec![1.0_f32; 256],
+            true,
+            &mut out,
+        )?;
+        assert_eq!(out, [9.25; 32]);
+        composite.project_f32(
+            &model.tensors["blk.1.ffn_gate.weight"],
+            &vec![1.0_f32; 256],
+            true,
+            &mut out,
+        )?;
+        assert_eq!(out, [9.25; 32]);
+        composite.project_f32(
+            &model.tensors["blk.2.ffn_up.weight"],
+            &vec![1.0_f32; 256],
+            true,
+            &mut out,
+        )?;
+        assert_eq!(out, [3.0]);
+        assert_eq!(composite.telemetry().npu_projections, 2);
+        assert_eq!(composite.telemetry().gpu_projections, 1);
+
+        let hexagon_child =
+            crate::NativeQ2Executor::new(CompositePtq1Submitter, limits, 1024 * 1024);
+        let adreno_child = MockExecutor {
+            id: "adreno-owned-overflow",
+            capacity: Some(64),
+            fail_on: None,
+            tile_tokens: false,
+            calls: 0,
+        };
+        let mut owned =
+            OwnedCompositeProjectionExecutor::new(&het_plan, hexagon_child, adreno_child)?;
+        owned.project_f32(
+            &model.tensors["blk.0.ffn_up.weight"],
+            &vec![1.0_f32; 256],
+            true,
+            &mut out,
+        )?;
+        assert_eq!(out, [9.25; 32]);
+        assert_eq!(owned.telemetry().npu_projections, 1);
+        Ok(())
+    }
 }

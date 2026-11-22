@@ -116,6 +116,533 @@ pub struct SpeculativeStats {
     pub replay_steps: u64,
     /// Total tokens replayed sequentially (`accepted_prefix + correction`) after batched rejection.
     pub replay_tokens: u64,
+    /// Number of partial-rejection replay spans scheduled for folding into the next verification block.
+    pub folded_replay_steps: u64,
+    /// Total tokens (`accepted_prefix + correction`) carried in folded replay tapes across verification rounds.
+    pub folded_replay_tokens: u64,
+    /// Number of explicit deferred-replay flushes executed outside verification-block folding.
+    pub folded_flushes: u64,
+    /// Draft tokens proposed by [`MovingSourceCursor`] beyond exact suffix matches.
+    pub cursor_draft_tokens: u64,
+    /// Speculative rounds skipped because [`AdaptiveSpeculationGate`] selected an exact serial burst.
+    pub adaptive_gate_skips: u64,
+    /// Exact serial decode tokens generated inside adaptive break-even cooldown bursts.
+    pub serial_burst_tokens: u64,
+}
+
+impl SpeculativeStats {
+    /// Record an accepted-prefix replay span scheduled to fold into the following verification block.
+    pub fn record_folded_carry(&mut self, carried_tokens: usize) {
+        self.folded_replay_steps = self.folded_replay_steps.saturating_add(1);
+        self.folded_replay_tokens = self
+            .folded_replay_tokens
+            .saturating_add(u64::try_from(carried_tokens).unwrap_or(u64::MAX));
+    }
+
+    /// Record an explicit flush of deferred folded replay state.
+    pub const fn record_folded_flush(&mut self) {
+        self.folded_flushes = self.folded_flushes.saturating_add(1);
+    }
+
+    /// Record draft tokens supplied by [`MovingSourceCursor`].
+    pub fn record_cursor_draft(&mut self, tokens: usize) {
+        self.cursor_draft_tokens = self
+            .cursor_draft_tokens
+            .saturating_add(u64::try_from(tokens).unwrap_or(u64::MAX));
+    }
+
+    /// Record an exact serial decode token executed under [`AdaptiveSpeculationGate`].
+    pub const fn record_adaptive_serial_burst(&mut self, increment_skip: bool) {
+        if increment_skip {
+            self.adaptive_gate_skips = self.adaptive_gate_skips.saturating_add(1);
+        }
+        self.serial_burst_tokens = self.serial_burst_tokens.saturating_add(1);
+    }
+}
+
+/// Result of proposing speculative draft tokens from [`SuffixTree`] plus [`MovingSourceCursor`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CursorDraft {
+    /// Total draft tokens written into the caller buffer (`<= MAX_SPECULATIVE_DRAFT_TOKENS`).
+    pub len: usize,
+    /// Leading tokens supplied by an exact [`SuffixTree`] match.
+    pub suffix_tokens: usize,
+    /// Tokens supplied or bridged by [`MovingSourceCursor`].
+    pub cursor_tokens: usize,
+}
+
+/// Bounded moving source cursor for bridging minor local edits during copying and code generation.
+///
+/// Tracks the most recent matched continuation position inside [`SuffixTree::history`] and searches
+/// only a small bounded window around that cursor when exact suffix matching misses after a minor
+/// local substitution, insertion, or deletion. Deactivates automatically after consecutive misses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MovingSourceCursor {
+    anchor: Option<usize>,
+    active_draft_start: Option<usize>,
+    stall_misses: usize,
+    resync_window: usize,
+    max_stall_misses: usize,
+}
+
+impl Default for MovingSourceCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MovingSourceCursor {
+    /// Default bounded forward/local window used to re-align the cursor after minor edits.
+    pub const DEFAULT_RESYNC_WINDOW: usize = 16;
+    /// Default consecutive miss budget before deactivating an anchored cursor.
+    pub const DEFAULT_MAX_STALL_MISSES: usize = 2;
+
+    /// Create an inactive cursor with default bounded resync parameters.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            anchor: None,
+            active_draft_start: None,
+            stall_misses: 0,
+            resync_window: Self::DEFAULT_RESYNC_WINDOW,
+            max_stall_misses: Self::DEFAULT_MAX_STALL_MISSES,
+        }
+    }
+
+    /// Clear any active source cursor state.
+    pub const fn reset(&mut self) {
+        self.anchor = None;
+        self.active_draft_start = None;
+        self.stall_misses = 0;
+    }
+
+    /// Current cursor position inside the suffix history, when active.
+    #[must_use]
+    pub const fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+
+    /// Propose up to `remaining_tokens` draft tokens from exact suffix match or active cursor.
+    ///
+    /// # Errors
+    /// Propagates invalid [`SuffixDraftConfig`] or suffix tree index overflow errors.
+    pub fn propose_with_tree(
+        &mut self,
+        tree: &SuffixTree,
+        config: SuffixDraftConfig,
+        remaining_tokens: usize,
+        storage: &mut [u32; MAX_SPECULATIVE_DRAFT_TOKENS],
+    ) -> Result<CursorDraft> {
+        config.validate()?;
+        let limit = config.max_draft_tokens.min(remaining_tokens);
+        if limit == 0 {
+            self.active_draft_start = None;
+            return Ok(CursorDraft::default());
+        }
+        let (suffix_len, suffix_start) = tree.propose_into_with_start(config, limit, storage)?;
+        if suffix_len > 0
+            && let Some(start) = suffix_start
+        {
+            self.anchor = Some(start);
+            self.active_draft_start = Some(start);
+            self.stall_misses = 0;
+            return Ok(CursorDraft {
+                len: suffix_len,
+                suffix_tokens: suffix_len,
+                cursor_tokens: 0,
+            });
+        }
+
+        let Some(pos) = self.anchor else {
+            self.active_draft_start = None;
+            return Ok(CursorDraft::default());
+        };
+        let history = tree.history();
+        let available = history.len().saturating_sub(pos).min(limit);
+        if available == 0 {
+            self.reset();
+            return Ok(CursorDraft::default());
+        }
+        storage[..available].copy_from_slice(&history[pos..pos + available]);
+        self.active_draft_start = Some(pos);
+        Ok(CursorDraft {
+            len: available,
+            suffix_tokens: 0,
+            cursor_tokens: available,
+        })
+    }
+
+    /// Update the bounded source cursor after committing one verification or serial step.
+    ///
+    /// `history` must already contain all newly committed tokens (including bonus or correction).
+    pub fn observe_round(
+        &mut self,
+        history: &[u32],
+        proposed: usize,
+        accepted: usize,
+        emitted_bonus: bool,
+    ) {
+        let Some(last) = history.last().copied() else {
+            self.reset();
+            return;
+        };
+        let Some(start) = self.active_draft_start.take().or(self.anchor) else {
+            return;
+        };
+        if proposed == 0 {
+            self.resync_around(history, start, last, true);
+            return;
+        }
+        let base = start.saturating_add(accepted);
+        if accepted >= proposed {
+            if emitted_bonus && history.get(base).copied() == Some(last) {
+                self.anchor = Some(base.saturating_add(1));
+                self.stall_misses = 0;
+            } else if emitted_bonus {
+                self.resync_around(history, base, last, true);
+            } else {
+                self.anchor = Some(base);
+                self.stall_misses = 0;
+            }
+            return;
+        }
+
+        // Partial or zero acceptance ending with one newly committed correction token `last`.
+        if accepted > 0 {
+            self.stall_misses = 0;
+            if let Some(aligned) = self.find_local_anchor(history, base, last, true) {
+                self.anchor = Some(aligned);
+            } else {
+                self.anchor = Some(base.saturating_add(1));
+            }
+            return;
+        }
+
+        self.stall_misses = self.stall_misses.saturating_add(1);
+        if self.stall_misses >= self.max_stall_misses {
+            self.reset();
+            return;
+        }
+        if let Some(aligned) = self.find_local_anchor(history, base, last, false) {
+            self.anchor = Some(aligned);
+        } else {
+            self.anchor = Some(base.saturating_add(1));
+        }
+    }
+
+    fn resync_around(&mut self, history: &[u32], base: usize, last: u32, allow_single_jump: bool) {
+        if history.get(base).copied() == Some(last) {
+            self.anchor = Some(base.saturating_add(1));
+            self.stall_misses = 0;
+            return;
+        }
+        if let Some(aligned) = self.find_local_anchor(history, base, last, allow_single_jump) {
+            self.anchor = Some(aligned);
+            self.stall_misses = 0;
+            return;
+        }
+        self.stall_misses = self.stall_misses.saturating_add(1);
+        if self.stall_misses >= self.max_stall_misses {
+            self.reset();
+        } else {
+            self.anchor = Some(base.saturating_add(1));
+        }
+    }
+
+    fn find_local_anchor(
+        &self,
+        history: &[u32],
+        base: usize,
+        last: u32,
+        allow_single_jump: bool,
+    ) -> Option<usize> {
+        // Keep the search strictly prior to the newly committed tail token(s).
+        let tail_guard = history.len().saturating_sub(2);
+        let lo = base.saturating_sub(2).max(1);
+        let hi = base
+            .saturating_add(self.resync_window)
+            .min(tail_guard);
+        if history.len() >= 2 && lo < hi {
+            let prev = history[history.len() - 2];
+            for idx in lo..hi {
+                if history[idx - 1] == prev && history[idx] == last {
+                    return Some(idx + 1);
+                }
+            }
+        }
+        if allow_single_jump {
+            let jump_lo = base.saturating_add(1);
+            let jump_hi = base
+                .saturating_add(MAX_SPECULATIVE_DRAFT_TOKENS)
+                .min(history.len().saturating_sub(1));
+            for (idx, &token) in history.iter().enumerate().take(jump_hi).skip(jump_lo) {
+                if token == last {
+                    return Some(idx + 1);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Decision returned by [`AdaptiveSpeculationGate::decide`] before a decode step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveGateDecision {
+    /// Attempt suffix/cursor drafting and batched verification.
+    Speculate,
+    /// Skip speculation for this step and emit an exact serial decode token.
+    SerialBurst,
+}
+
+/// Configuration for the self-calibrating [`AdaptiveSpeculationGate`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AdaptiveGateConfig {
+    /// Enable adaptive break-even throttling (`false` always allows speculation).
+    pub enabled: bool,
+    /// Minimum verified speculative rounds before throttling may engage.
+    pub warmup_rounds: usize,
+    /// EWMA smoothing factor in `(0.0, 1.0]` for acceptance and step timing estimates.
+    pub smoothing: f64,
+    /// Prior `verify_block / serial_step` cost ratio used before empirical serial/verify samples arrive.
+    pub initial_verify_to_serial_ratio: f64,
+    /// Multiplier applied to the empirical break-even emission rate (`1.0` = exact break-even).
+    pub break_even_margin: f64,
+    /// Initial exact serial burst length (in tokens) when rolling acceptance drops below break-even.
+    pub min_burst_tokens: usize,
+    /// Maximum exact serial burst length (in tokens) after repeated low-acceptance probes.
+    pub max_burst_tokens: usize,
+}
+
+impl Default for AdaptiveGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            warmup_rounds: 3,
+            smoothing: 0.25,
+            initial_verify_to_serial_ratio: 2.0,
+            break_even_margin: 1.0,
+            min_burst_tokens: 4,
+            max_burst_tokens: 32,
+        }
+    }
+}
+
+impl AdaptiveGateConfig {
+    /// Validate gate configuration bounds.
+    ///
+    /// # Errors
+    /// Rejects non-finite parameters, invalid smoothing or margin ranges, or inverted burst limits.
+    pub fn validate(&self) -> Result<()> {
+        if !self.smoothing.is_finite() || self.smoothing <= 0.0 || self.smoothing > 1.0 {
+            return Err(invalid("adaptive gate smoothing factor must lie in (0, 1]"));
+        }
+        if !self.initial_verify_to_serial_ratio.is_finite()
+            || self.initial_verify_to_serial_ratio < 1.0
+        {
+            return Err(invalid(
+                "adaptive gate initial verify/serial ratio must be finite and >= 1.0",
+            ));
+        }
+        if !self.break_even_margin.is_finite()
+            || self.break_even_margin <= 0.0
+            || self.break_even_margin > 4.0
+        {
+            return Err(invalid(
+                "adaptive gate break-even margin must lie in (0, 4]",
+            ));
+        }
+        if self.min_burst_tokens == 0 || self.min_burst_tokens > self.max_burst_tokens {
+            return Err(invalid(
+                "adaptive gate burst token bounds must satisfy 1 <= min <= max",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Self-calibrating adaptive break-even speculation gate.
+///
+/// Tracks rolling `verify / serial` latency (including folded flush overhead) and rolling
+/// emitted tokens per verified round. When empirical rolling acceptance falls below the measured
+/// break-even rate, the gate pauses speculation for a bounded exact serial burst before probing
+/// again so creative Thinking-OFF prose stays near native serial throughput while code/structured
+/// regions recover immediately.
+#[derive(Clone, Debug)]
+pub struct AdaptiveSpeculationGate {
+    config: AdaptiveGateConfig,
+    verified_rounds: usize,
+    serial_steps: usize,
+    ewma_emitted_per_verify: f64,
+    ewma_verify_ns: Option<f64>,
+    ewma_serial_ns: Option<f64>,
+    burst_remaining: usize,
+    next_burst_tokens: usize,
+    awaiting_probe: bool,
+}
+
+impl AdaptiveSpeculationGate {
+    /// Create a new adaptive gate from a validated [`AdaptiveGateConfig`].
+    ///
+    /// # Errors
+    /// Propagates [`AdaptiveGateConfig::validate`] failures.
+    pub fn new(config: AdaptiveGateConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            verified_rounds: 0,
+            serial_steps: 0,
+            ewma_emitted_per_verify: config.initial_verify_to_serial_ratio,
+            ewma_verify_ns: None,
+            ewma_serial_ns: None,
+            burst_remaining: 0,
+            next_burst_tokens: config.min_burst_tokens,
+            awaiting_probe: false,
+        })
+    }
+
+    /// Gate configuration.
+    #[must_use]
+    pub const fn config(&self) -> AdaptiveGateConfig {
+        self.config
+    }
+
+    /// Current rolling `verify_block / serial_step` cost ratio (`>= 1.0`).
+    #[must_use]
+    pub fn verify_to_serial_ratio(&self) -> f64 {
+        if let (Some(verify), Some(serial)) = (self.ewma_verify_ns, self.ewma_serial_ns)
+            && serial > 0.0
+        {
+            (verify / serial).clamp(1.0, 16.0)
+        } else {
+            self.config.initial_verify_to_serial_ratio
+        }
+    }
+
+    /// Minimum rolling tokens emitted per verification block needed to break even with serial decode.
+    #[must_use]
+    pub fn break_even_emitted_tokens(&self) -> f64 {
+        (self.verify_to_serial_ratio() * self.config.break_even_margin).max(1.0)
+    }
+
+    /// Rolling EWMA of emitted tokens per verified round.
+    #[must_use]
+    pub const fn rolling_emitted_per_verify(&self) -> f64 {
+        self.ewma_emitted_per_verify
+    }
+
+    /// Decide whether the next step should attempt speculative drafting or execute an exact serial burst.
+    pub const fn decide(&mut self) -> AdaptiveGateDecision {
+        if !self.config.enabled {
+            return AdaptiveGateDecision::Speculate;
+        }
+        if self.burst_remaining > 0 {
+            self.burst_remaining -= 1;
+            if self.burst_remaining == 0 {
+                self.awaiting_probe = true;
+            }
+            return AdaptiveGateDecision::SerialBurst;
+        }
+        AdaptiveGateDecision::Speculate
+    }
+
+    /// Record an observed exact serial step duration (`fallback`, serial burst, or single-token decode).
+    pub fn record_serial_step(&mut self, duration: std::time::Duration) {
+        self.serial_steps = self.serial_steps.saturating_add(1);
+        let ns = duration_to_ns_f64(duration);
+        if ns > 0.0 {
+            let alpha = self.config.smoothing;
+            self.ewma_serial_ns = Some(
+                self.ewma_serial_ns
+                    .map_or(ns, |prev| alpha.mul_add(ns, (1.0 - alpha) * prev)),
+            );
+        }
+    }
+
+    /// Charge explicit folded-replay flush overhead against the speculation verify cost estimate.
+    pub fn charge_flush_overhead(&mut self, flush_duration: std::time::Duration) {
+        let flush_ns = duration_to_ns_f64(flush_duration);
+        if flush_ns > 0.0 {
+            let alpha = self.config.smoothing;
+            self.ewma_verify_ns = Some(
+                self.ewma_verify_ns
+                    .map_or(flush_ns, |prev| alpha.mul_add(flush_ns, prev)),
+            );
+        }
+    }
+
+    /// Record one verified speculative round and update rolling cost and break-even state.
+    pub fn record_verify_round(
+        &mut self,
+        proposed: usize,
+        _accepted: usize,
+        emitted: usize,
+        verify_duration: std::time::Duration,
+        flush_duration: std::time::Duration,
+    ) {
+        if proposed == 0 {
+            self.awaiting_probe = false;
+            return;
+        }
+        self.verified_rounds = self.verified_rounds.saturating_add(1);
+        let alpha = self.config.smoothing;
+        let total_ns = duration_to_ns_f64(verify_duration.saturating_add(flush_duration));
+        if total_ns > 0.0 {
+            self.ewma_verify_ns = Some(
+                self.ewma_verify_ns
+                    .map_or(total_ns, |prev| alpha.mul_add(total_ns, (1.0 - alpha) * prev)),
+            );
+        }
+
+        let emitted_f64 = u64_to_f64(u64::try_from(emitted).unwrap_or(u64::MAX));
+        let threshold = self.break_even_emitted_tokens();
+        if self.verified_rounds == 1 {
+            self.ewma_emitted_per_verify = emitted_f64;
+        } else if self.awaiting_probe {
+            self.awaiting_probe = false;
+            if emitted_f64 >= threshold {
+                self.ewma_emitted_per_verify = self.ewma_emitted_per_verify.max(emitted_f64);
+                self.next_burst_tokens = self.config.min_burst_tokens;
+                self.burst_remaining = 0;
+                return;
+            }
+            self.ewma_emitted_per_verify =
+                alpha.mul_add(emitted_f64, (1.0 - alpha) * self.ewma_emitted_per_verify);
+            if self.config.enabled {
+                self.burst_remaining = self.next_burst_tokens;
+                self.next_burst_tokens = self
+                    .next_burst_tokens
+                    .saturating_mul(2)
+                    .min(self.config.max_burst_tokens);
+            }
+            return;
+        } else {
+            self.ewma_emitted_per_verify =
+                alpha.mul_add(emitted_f64, (1.0 - alpha) * self.ewma_emitted_per_verify);
+        }
+
+        if self.config.enabled && self.verified_rounds >= self.config.warmup_rounds {
+            if self.ewma_emitted_per_verify < threshold {
+                self.burst_remaining = self.next_burst_tokens;
+                self.next_burst_tokens = self
+                    .next_burst_tokens
+                    .saturating_mul(2)
+                    .min(self.config.max_burst_tokens);
+            } else {
+                self.next_burst_tokens = self.config.min_burst_tokens;
+            }
+        }
+    }
+}
+
+fn duration_to_ns_f64(duration: std::time::Duration) -> f64 {
+    let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+    u64_to_f64(nanos)
+}
+
+fn u64_to_f64(value: u64) -> f64 {
+    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(hi).mul_add(4_294_967_296.0, f64::from(lo))
 }
 
 /// Outcome recorded for one verified speculative round or unspeculated fallback step.
@@ -1283,26 +1810,53 @@ impl SuffixTree {
     ///
     /// # Errors
     /// Rejects an invalid [`SuffixDraftConfig`] or internal index overflow.
+    /// Propose up to `remaining_tokens` draft continuation tokens from `self.history`.
+    ///
+    /// # Errors
+    /// Rejects invalid suffix configuration or internal index overflow.
     pub fn propose_into(
         &self,
         config: SuffixDraftConfig,
         remaining_tokens: usize,
         storage: &mut [u32; MAX_SPECULATIVE_DRAFT_TOKENS],
     ) -> Result<usize> {
+        self.propose_into_with_start(config, remaining_tokens, storage)
+            .map(|(count, _)| count)
+    }
+
+    /// Complete token history currently indexed by this suffix tree.
+    #[must_use]
+    pub fn history(&self) -> &[u32] {
+        &self.history
+    }
+
+    /// Propose draft continuation tokens and return `(count, source_start)` inside [`Self::history`].
+    ///
+    /// # Errors
+    /// Rejects invalid suffix configuration or internal index overflow.
+    pub fn propose_into_with_start(
+        &self,
+        config: SuffixDraftConfig,
+        remaining_tokens: usize,
+        storage: &mut [u32; MAX_SPECULATIVE_DRAFT_TOKENS],
+    ) -> Result<(usize, Option<usize>)> {
         config.validate()?;
         let limit = config.max_draft_tokens.min(remaining_tokens);
         if limit == 0 || self.history.len() <= config.min_match_tokens {
-            return Ok(0);
+            return Ok((0, None));
         }
         let max_len = config.max_match_tokens.min(self.history.len() - 1);
         let (matched_len, best_node) = self.best_suffix_match(max_len, &[])?;
         if matched_len < config.min_match_tokens || best_node == 0 {
-            return Ok(0);
+            return Ok((0, None));
         }
         let start = usize::try_from(self.nodes[best_node].last_end)?;
         let available = self.history.len().saturating_sub(start).min(limit);
+        if available == 0 {
+            return Ok((0, None));
+        }
         storage[..available].copy_from_slice(&self.history[start..start + available]);
-        Ok(available)
+        Ok((available, Some(start)))
     }
 
     /// Propose a confidence-gated continuation chain using per-node empirical continuation counts.
@@ -2182,5 +2736,114 @@ mod tests {
         assert!(DraftTreeTopology::from_parents(&[Some(0)]).is_err());
         assert!(DraftTreeTopology::from_parents(&[]).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn moving_source_cursor_bridges_local_edit_and_deactivates_on_divergence() -> Result<()> {
+        use super::{CursorDraft, MovingSourceCursor};
+        let mut history = vec![
+            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 100, 101, 102,
+        ];
+        let mut tree = SuffixTree::new();
+        tree.sync(&history)?;
+        let config = SuffixDraftConfig::new(2, 8, 4)?;
+        let mut cursor = MovingSourceCursor::new();
+        let mut buf = [0_u32; MAX_SPECULATIVE_DRAFT_TOKENS];
+
+        let round1 = cursor.propose_with_tree(&tree, config, 16, &mut buf)?;
+        assert_eq!(
+            round1,
+            CursorDraft {
+                len: 4,
+                suffix_tokens: 4,
+                cursor_tokens: 0,
+            }
+        );
+        assert_eq!(&buf[..4], &[103, 104, 105, 106]);
+
+        // Accept [103, 104] and substitute 999 for 105 (breaking exact suffix matching).
+        history.extend_from_slice(&[103, 104, 999]);
+        tree.sync(&history)?;
+        cursor.observe_round(tree.history(), round1.len, 2, false);
+
+        let round2 = cursor.propose_with_tree(&tree, config, 16, &mut buf)?;
+        assert_eq!(round2.suffix_tokens, 0);
+        assert_eq!(round2.cursor_tokens, 4);
+        assert_eq!(&buf[..4], &[106, 107, 108, 109]);
+
+        // Sustained divergence deactivates the cursor cleanly within max_stall_misses.
+        history.push(888);
+        tree.sync(&history)?;
+        cursor.observe_round(tree.history(), round2.len, 0, false);
+        let round3 = cursor.propose_with_tree(&tree, config, 16, &mut buf)?;
+        assert!(round3.cursor_tokens > 0);
+
+        history.push(889);
+        tree.sync(&history)?;
+        cursor.observe_round(tree.history(), round3.len, 0, false);
+        assert_eq!(cursor.anchor(), None);
+
+        let round4 = cursor.propose_with_tree(&tree, config, 16, &mut buf)?;
+        assert_eq!(round4, CursorDraft::default());
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_speculation_gate_throttles_prose_and_recovers_on_code() -> Result<()> {
+        use super::{AdaptiveGateConfig, AdaptiveGateDecision, AdaptiveSpeculationGate};
+        let mut gate = AdaptiveSpeculationGate::new(AdaptiveGateConfig {
+            enabled: true,
+            warmup_rounds: 3,
+            smoothing: 0.5,
+            initial_verify_to_serial_ratio: 2.5,
+            break_even_margin: 1.0,
+            min_burst_tokens: 4,
+            max_burst_tokens: 16,
+        })?;
+        // Calibrate serial ~1 ms, verify ~3 ms -> break-even = 3.0 emitted tokens.
+        for _ in 0..3 {
+            gate.record_serial_step(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(gate.decide(), AdaptiveGateDecision::Speculate);
+        for _ in 0..3 {
+            gate.record_verify_round(
+                4,
+                0,
+                1,
+                std::time::Duration::from_millis(3),
+                std::time::Duration::ZERO,
+            );
+        }
+        assert!((gate.verify_to_serial_ratio() - 3.0).abs() <= 1e-9);
+        for _ in 0..4 {
+            assert_eq!(gate.decide(), AdaptiveGateDecision::SerialBurst);
+        }
+        // Probe after burst clears immediately when a high-acceptance block resumes.
+        assert_eq!(gate.decide(), AdaptiveGateDecision::Speculate);
+        gate.record_verify_round(
+            4,
+            4,
+            5,
+            std::time::Duration::from_millis(3),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(gate.decide(), AdaptiveGateDecision::Speculate);
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_stats_tracks_folded_cursor_and_gate_counters() {
+        let mut stats = SpeculativeStats::default();
+        stats.record_folded_carry(3);
+        stats.record_folded_flush();
+        stats.record_cursor_draft(4);
+        stats.record_adaptive_serial_burst(true);
+        stats.record_adaptive_serial_burst(true);
+        assert_eq!(stats.folded_replay_steps, 1);
+        assert_eq!(stats.folded_replay_tokens, 3);
+        assert_eq!(stats.folded_flushes, 1);
+        assert_eq!(stats.cursor_draft_tokens, 4);
+        assert_eq!(stats.adaptive_gate_skips, 2);
+        assert_eq!(stats.serial_burst_tokens, 2);
     }
 }

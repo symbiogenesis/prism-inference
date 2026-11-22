@@ -200,6 +200,310 @@ impl<const G: usize> PreparedQueryGroup<'_, G> {
     }
 }
 
+/// Paired finite rotated query groups for two consecutive tokens sharing one KV head.
+pub(crate) struct PreparedQueryPair<'a, const G: usize> {
+    quantizer: &'a Quantizer,
+    queries: [[&'a [f32; HEAD_DIM]; G]; 2],
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    native: Option<bonsai_neon_dot::kv_quant::PreparedQueryPair<'a, G>>,
+}
+
+impl<const G: usize> PreparedQueryPair<'_, G> {
+    /// Scores both token query groups (`2 * G` heads) from one packed key row.
+    pub(crate) fn score_pair(&self, packed: &[u8]) -> Result<([f32; G], [f32; G])> {
+        let (scale, codes) = self.quantizer.record(packed)?;
+        if scale == 0.0 {
+            return Ok(([0.0; G], [0.0; G]));
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        let (unscaled0, unscaled1) = if let Some(native) = &self.native {
+            let (dots0, dots1) = native.dot_both(codes);
+            let mut out0 = [0.0; G];
+            let mut out1 = [0.0; G];
+            for (dst, maybe) in out0.iter_mut().zip(dots0) {
+                *dst = maybe.ok_or_else(|| invalid("KV codec native dot rejected arithmetic"))?;
+            }
+            for (dst, maybe) in out1.iter_mut().zip(dots1) {
+                *dst = maybe.ok_or_else(|| invalid("KV codec native dot rejected arithmetic"))?;
+            }
+            (out0, out1)
+        } else {
+            (self.scalar_dots(codes, 0)?, self.scalar_dots(codes, 1)?)
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
+        let (unscaled0, unscaled1) = (self.scalar_dots(codes, 0)?, self.scalar_dots(codes, 1)?);
+        Ok((scale_dots(unscaled0, scale)?, scale_dots(unscaled1, scale)?))
+    }
+
+    /// Scores only the second token's `G` heads from its own packed key row.
+    pub(crate) fn score_second(&self, packed: &[u8]) -> Result<[f32; G]> {
+        let (scale, codes) = self.quantizer.record(packed)?;
+        if scale == 0.0 {
+            return Ok([0.0; G]);
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        let unscaled = if let Some(native) = &self.native {
+            let dots = native.dot_second(codes);
+            let mut out = [0.0; G];
+            for (dst, maybe) in out.iter_mut().zip(dots) {
+                *dst = maybe.ok_or_else(|| invalid("KV codec native dot rejected arithmetic"))?;
+            }
+            out
+        } else {
+            self.scalar_dots(codes, 1)?
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
+        let unscaled = self.scalar_dots(codes, 1)?;
+        scale_dots(unscaled, scale)
+    }
+
+    fn scalar_dots(&self, codes: &[u8], token: usize) -> Result<[f32; G]> {
+        let bits = self.quantizer.identity.bits.bit_width();
+        let centroids = self.quantizer.centroids();
+        let mut out = [0.0; G];
+        for (dst, query) in out.iter_mut().zip(self.queries[token]) {
+            *dst = scalar::dot(codes, bits, centroids, query)?;
+        }
+        Ok(out)
+    }
+}
+
+fn scale_dots<const G: usize>(unscaled: [f32; G], scale: f32) -> Result<[f32; G]> {
+    let mut scores = [0.0; G];
+    for (dst, value) in scores.iter_mut().zip(unscaled) {
+        let scaled = value * scale;
+        if !scaled.is_finite() {
+            return Err(invalid("KV codec score overflow"));
+        }
+        *dst = scaled;
+    }
+    Ok(scores)
+}
+
+enum GroupPairAccumulatorState<const G: usize> {
+    Scalar([[[f32; HEAD_DIM]; G]; 2]),
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    ))]
+    Native(bonsai_neon_dot::kv_quant::ValueGroupPairAccumulator<'static, G>),
+}
+
+/// Exclusive grouped value sums for two consecutive tokens sharing one KV head.
+pub(crate) struct ValueGroupPairAccumulator<'a, const G: usize> {
+    quantizer: &'a Quantizer,
+    state: GroupPairAccumulatorState<G>,
+    failed: bool,
+}
+
+impl<const G: usize> ValueGroupPairAccumulator<'_, G> {
+    /// Accumulates one shared packed value row across both token groups.
+    pub(crate) fn accumulate_pair(
+        &mut self,
+        packed: &[u8],
+        weights0: [f32; G],
+        weights1: [f32; G],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result = self.append_pair(packed, weights0, weights1);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn append_pair(&mut self, packed: &[u8], weights0: [f32; G], weights1: [f32; G]) -> Result<()> {
+        if weights0
+            .iter()
+            .chain(weights1.iter())
+            .any(|weight| !weight.is_finite())
+        {
+            return Err(invalid("KV codec weight must be finite"));
+        }
+        let (scale, codes) = self.quantizer.record(packed)?;
+        let mut weighted_scales = [[0.0_f32; G]; 2];
+        let mut any_nonzero = false;
+        for (dst, weight) in weighted_scales[0].iter_mut().zip(weights0) {
+            let weighted = weight * scale;
+            if !weighted.is_finite() {
+                return Err(invalid("KV codec weighted scale overflow"));
+            }
+            if weighted != 0.0 {
+                any_nonzero = true;
+            }
+            *dst = weighted;
+        }
+        for (dst, weight) in weighted_scales[1].iter_mut().zip(weights1) {
+            let weighted = weight * scale;
+            if !weighted.is_finite() {
+                return Err(invalid("KV codec weighted scale overflow"));
+            }
+            if weighted != 0.0 {
+                any_nonzero = true;
+            }
+            *dst = weighted;
+        }
+        if !any_nonzero {
+            return Ok(());
+        }
+        match &mut self.state {
+            GroupPairAccumulatorState::Scalar(outputs) => {
+                let bits = self.quantizer.identity.bits.bit_width();
+                let centroids = self.quantizer.centroids();
+                for token in 0..2 {
+                    for (output, &weighted_scale) in
+                        outputs[token].iter_mut().zip(&weighted_scales[token])
+                    {
+                        if weighted_scale != 0.0 {
+                            scalar::accumulate_in_place(
+                                codes,
+                                bits,
+                                centroids,
+                                weighted_scale,
+                                output,
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            GroupPairAccumulatorState::Native(acc) => {
+                let (ok0, ok1) = acc.accumulate_both(codes, weighted_scales[0], weighted_scales[1]);
+                if ok0.iter().chain(ok1.iter()).all(|&head_ok| head_ok) {
+                    Ok(())
+                } else {
+                    Err(invalid("KV codec native accumulation rejected arithmetic"))
+                }
+            }
+        }
+    }
+
+    /// Accumulates the second token's own packed value row across its `G` heads.
+    pub(crate) fn accumulate_second(&mut self, packed: &[u8], weights1: [f32; G]) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result = self.append_second(packed, weights1);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn append_second(&mut self, packed: &[u8], weights1: [f32; G]) -> Result<()> {
+        if weights1.iter().any(|weight| !weight.is_finite()) {
+            return Err(invalid("KV codec weight must be finite"));
+        }
+        let (scale, codes) = self.quantizer.record(packed)?;
+        let mut weighted_scales = [0.0; G];
+        let mut any_nonzero = false;
+        for (dst, weight) in weighted_scales.iter_mut().zip(weights1) {
+            let weighted = weight * scale;
+            if !weighted.is_finite() {
+                return Err(invalid("KV codec weighted scale overflow"));
+            }
+            if weighted != 0.0 {
+                any_nonzero = true;
+            }
+            *dst = weighted;
+        }
+        if !any_nonzero {
+            return Ok(());
+        }
+        match &mut self.state {
+            GroupPairAccumulatorState::Scalar(outputs) => {
+                let bits = self.quantizer.identity.bits.bit_width();
+                let centroids = self.quantizer.centroids();
+                for (output, &weighted_scale) in outputs[1].iter_mut().zip(&weighted_scales) {
+                    if weighted_scale != 0.0 {
+                        scalar::accumulate_in_place(
+                            codes,
+                            bits,
+                            centroids,
+                            weighted_scale,
+                            output,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            GroupPairAccumulatorState::Native(acc) => {
+                let ok = acc.accumulate_second(codes, weighted_scales);
+                if ok.iter().all(|&head_ok| head_ok) {
+                    Ok(())
+                } else {
+                    Err(invalid("KV codec native accumulation rejected arithmetic"))
+                }
+            }
+        }
+    }
+
+    /// Publishes both token groups' `G` accumulated output rows if every append succeeded.
+    pub(crate) fn finish(self) -> Result<[[[f32; HEAD_DIM]; G]; 2]> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        match self.state {
+            GroupPairAccumulatorState::Scalar(outputs) => Ok(outputs),
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            GroupPairAccumulatorState::Native(acc) => {
+                let finished = acc.finish();
+                let mut out = [[[0.0; HEAD_DIM]; G]; 2];
+                for (dst_token, src_token) in out.iter_mut().zip(finished) {
+                    for (dst, maybe) in dst_token.iter_mut().zip(src_token) {
+                        *dst = maybe.ok_or_else(|| {
+                            invalid("KV codec native accumulation rejected arithmetic")
+                        })?;
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
 enum GroupAccumulatorState<const G: usize> {
     Scalar([[f32; HEAD_DIM]; G]),
     #[cfg(all(
@@ -532,15 +836,16 @@ impl Quantizer {
         let mut row: [f32; HEAD_DIM] = input
             .try_into()
             .map_err(|_| invalid("KV codec requires exactly 256 channels"))?;
-        // The norm already visits every coordinate before normalization or
-        // publication. Validate there without a separate finite-input scan,
-        // retaining the original ordered binary64 FMA accumulation.
-        let squared_norm = row.iter().try_fold(0.0_f64, |sum, &value| {
-            if !value.is_finite() {
-                return Err(invalid("KV codec row must contain only finite values"));
-            }
-            Ok(f64::from(value).mul_add(f64::from(value), sum))
-        })?;
+        // Retain the exact sequential binary64 FMA order. Any nonfinite
+        // input produces nonfinite squared_norm (all squares are >= 0 or NaN),
+        // while 256 finite binary32 squares stay well below f64::MAX.
+        let mut squared_norm = 0.0_f64;
+        for &value in &row {
+            squared_norm = f64::from(value).mul_add(f64::from(value), squared_norm);
+        }
+        if !squared_norm.is_finite() {
+            return Err(invalid("KV codec row must contain only finite values"));
+        }
         let mut record = [0_u8; MAX_RECORD_BYTES];
         if squared_norm == 0.0 {
             out.copy_from_slice(&record[..self.encoded_len()]);
@@ -550,25 +855,66 @@ impl Quantizer {
         if scale == 0.0 {
             return Err(invalid("nonzero KV row scale underflows"));
         }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        if self.scalar_only {
+            for value in &mut row {
+                *value = scalar::checked_f32(f64::from(*value) / f64::from(scale))?;
+            }
+        } else if !bonsai_neon_dot::kv_quant::normalize(&mut row, scale) {
+            return Err(invalid("KV codec binary32 arithmetic overflow"));
+        }
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
         for value in &mut row {
             *value = scalar::checked_f32(f64::from(*value) / f64::from(scale))?;
         }
         self.forward(&mut row)?;
         let codes = &mut record[SCALE_BYTES..self.encoded_len()];
         let centroids = self.centroids();
-        // Preserve the explicit scalar codec's exhaustive nearest-code control;
-        // ordinary encoding uses the same rounded-distance rule over the
-        // immutable, strictly ordered active codebook.
-        for (index, &value) in row.iter().enumerate() {
-            let code = if self.scalar_only {
-                scalar::nearest(value, centroids, self.identity.bits.levels())
-            } else {
-                scalar::nearest_ordered(value, centroids, self.identity.bits.levels())
-            };
-            if !(scale * centroids[usize::from(code)]).is_finite() {
-                return Err(invalid("KV codec reconstructed coordinate overflow"));
+        let levels = self.identity.bits.levels();
+        let bit_width = self.identity.bits.bit_width();
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        let native_packed = !self.scalar_only
+            && centroids[..usize::from(levels)]
+                .iter()
+                .all(|&centroid| (scale * centroid).is_finite())
+            && bonsai_neon_dot::kv_quant::quantize_pack(&row, bit_width, centroids, codes);
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
+        let native_packed = false;
+        if !native_packed {
+            // Preserve the explicit scalar codec's exhaustive nearest-code control;
+            // ordinary encoding uses the same rounded-distance rule over the
+            // immutable, strictly ordered active codebook.
+            for (index, &value) in row.iter().enumerate() {
+                let code = if self.scalar_only {
+                    scalar::nearest(value, centroids, levels)
+                } else {
+                    scalar::nearest_ordered(value, centroids, levels)
+                };
+                if !(scale * centroids[usize::from(code)]).is_finite() {
+                    return Err(invalid("KV codec reconstructed coordinate overflow"));
+                }
+                scalar::write_code(codes, bit_width, index, code);
             }
-            scalar::write_code(codes, self.identity.bits.bit_width(), index, code);
         }
         let scale = if self.identity.version == FITTED_SCALE_VERSION {
             fitted_scale::select(&row, codes, self.identity.bits, centroids, scale)
@@ -677,6 +1023,59 @@ impl Quantizer {
         Ok(PreparedQueryGroup {
             quantizer: self,
             queries,
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            native,
+        })
+    }
+
+    /// Checks a pair of `G`-head immutable rotated queries for 2-token batched scoring.
+    pub(crate) fn prepare_query_pair<'a, const G: usize>(
+        &'a self,
+        first: [&'a [f32; HEAD_DIM]; G],
+        second: [&'a [f32; HEAD_DIM]; G],
+    ) -> Result<PreparedQueryPair<'a, G>> {
+        if G == 0 {
+            return Err(invalid("KV codec grouped query requires at least one head"));
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        let native = if self.scalar_only {
+            for query in first.iter().chain(second.iter()) {
+                finite_values(*query)?;
+            }
+            None
+        } else {
+            Some(
+                bonsai_neon_dot::kv_quant::PreparedQueryPair::new(
+                    self.identity.bits.bit_width(),
+                    self.centroids(),
+                    first,
+                    second,
+                )
+                .ok_or_else(|| invalid("KV codec row must contain only finite values"))?,
+            )
+        };
+        #[cfg(not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )))]
+        for query in first.iter().chain(second.iter()) {
+            finite_values(*query)?;
+        }
+        Ok(PreparedQueryPair {
+            quantizer: self,
+            queries: [first, second],
             #[cfg(all(
                 feature = "experimental-neon",
                 target_arch = "aarch64",
@@ -808,6 +1207,52 @@ impl Quantizer {
         })
     }
 
+    /// Starts one exclusive 2-token × `G`-head packed-value scan sharing one KV head.
+    #[cfg_attr(
+        not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        )),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "The shared native entry performs runtime ISA selection; portable construction keeps the same non-const API."
+        )
+    )]
+    pub(crate) fn value_group_pair_accumulator<const G: usize>(
+        &self,
+    ) -> Result<ValueGroupPairAccumulator<'_, G>> {
+        if G == 0 {
+            return Err(invalid(
+                "KV codec grouped accumulator requires at least one head",
+            ));
+        }
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc"
+        ))]
+        if !self.scalar_only {
+            let state = bonsai_neon_dot::kv_quant::ValueGroupPairAccumulator::new(
+                self.identity.bits.bit_width(),
+                self.centroids(),
+            )
+            .ok_or_else(|| invalid("KV codec native accumulation rejected codebook"))?;
+            return Ok(ValueGroupPairAccumulator {
+                quantizer: self,
+                state: GroupPairAccumulatorState::Native(state),
+                failed: false,
+            });
+        }
+        Ok(ValueGroupPairAccumulator {
+            quantizer: self,
+            state: GroupPairAccumulatorState::Scalar([[[0.0; HEAD_DIM]; G]; 2]),
+            failed: false,
+        })
+    }
+
     /// Decode one row into the original basis, for diagnostics or explicit replay.
     ///
     /// # Errors
@@ -926,4 +1371,52 @@ fn finite_row(input: &[f32]) -> Result<[f32; HEAD_DIM]> {
         .map_err(|_| invalid("KV codec requires exactly 256 channels"))?;
     finite_values(&row)?;
     Ok(row)
+}
+
+#[cfg(test)]
+mod neon_encode_tests {
+    use super::{Bits, HEAD_DIM, Quantizer};
+
+    #[test]
+    fn neon_assisted_encode_matches_scalar_bit_for_bit_across_sweeps() {
+        for bits in [Bits::Three, Bits::Four] {
+            for fitted in [false, true] {
+                let mut native = Quantizer::new(bits, 0x5157_4946_544b_5631);
+                let mut scalar = Quantizer::scalar(bits, 0x5157_4946_544b_5631);
+                if fitted {
+                    native = native.with_fitted_scale();
+                    scalar = scalar.with_fitted_scale();
+                }
+                let mut state = 0x1357_9bdf_2468_ace0_u64;
+                for case in 0..64 {
+                    let input: [f32; HEAD_DIM] = std::array::from_fn(|index| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        let signed_byte =
+                            i16::from(u8::try_from((state >> 56) & 0xff).unwrap_or(0)) - 128;
+                        match case % 4 {
+                            0 => f32::from(signed_byte) * 0.0625,
+                            1 if index.is_multiple_of(17) => -0.0,
+                            1 => f32::from(signed_byte) * 1.0e-35,
+                            2 => f32::from(signed_byte) * 1.0e32,
+                            _ if index == case % HEAD_DIM => f32::MAX / 64.0,
+                            _ => f32::from(signed_byte) * 0.125,
+                        }
+                    });
+                    let mut out_native = vec![0xaa_u8; native.encoded_len()];
+                    let mut out_scalar = vec![0x55_u8; scalar.encoded_len()];
+                    let res_native = native.encode(&input, &mut out_native);
+                    let res_scalar = scalar.encode(&input, &mut out_scalar);
+                    assert_eq!(res_native.is_ok(), res_scalar.is_ok(), "case={case}");
+                    if res_native.is_ok() {
+                        assert_eq!(
+                            out_native, out_scalar,
+                            "bits={bits:?} fitted={fitted} case={case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

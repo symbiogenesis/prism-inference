@@ -114,6 +114,89 @@ impl<'a, const G: usize> PreparedQueryGroup<'a, G> {
     }
 }
 
+/// An immutable pair of `G`-head query groups sharing a codebook for 2-token
+/// batched packed-key scans.
+///
+/// Unpacks each 4-bit or 3-bit packed KV code block once across both token groups
+/// (`2 * G` heads) while preserving identical per-lane binary64 rounding order.
+pub struct PreparedQueryPair<'a, const G: usize> {
+    bits: u8,
+    centroids: &'a [f32; 16],
+    queries: [[&'a [f32; DIMENSION]; G]; 2],
+    #[cfg(target_arch = "aarch64")]
+    neon: bool,
+}
+
+impl<'a, const G: usize> PreparedQueryPair<'a, G> {
+    /// Checks two `G`-head query groups and shared centroids without copying.
+    #[must_use]
+    pub fn new(
+        bits: u8,
+        centroids: &'a [f32; 16],
+        first: [&'a [f32; DIMENSION]; G],
+        second: [&'a [f32; DIMENSION]; G],
+    ) -> Option<Self> {
+        if G == 0
+            || !matches!(bits, 3 | 4)
+            || !centroids.iter().all(|value| value.is_finite())
+            || first
+                .iter()
+                .chain(second.iter())
+                .any(|query| !query.iter().all(|value| value.is_finite()))
+        {
+            return None;
+        }
+        Some(Self {
+            bits,
+            centroids,
+            queries: [first, second],
+            #[cfg(target_arch = "aarch64")]
+            neon: std::arch::is_aarch64_feature_detected!("neon"),
+        })
+    }
+
+    /// Computes code-only dots for both token groups from a single key row scan.
+    #[must_use]
+    pub fn dot_both(&self, packed: &[u8]) -> ([Option<f32>; G], [Option<f32>; G]) {
+        if packed.len() != DIMENSION * usize::from(self.bits) / 8 {
+            return ([None; G], [None; G]);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.neon {
+            let (first, second) = native::dot_group_pair(
+                packed,
+                self.bits,
+                self.centroids,
+                &self.queries[0],
+                &self.queries[1],
+            );
+            return (first.map(finite_binary32), second.map(finite_binary32));
+        }
+        let (first, second) = portable_dot_group_pair(
+            packed,
+            self.bits,
+            self.centroids,
+            &self.queries[0],
+            &self.queries[1],
+        );
+        (first.map(finite_binary32), second.map(finite_binary32))
+    }
+
+    /// Computes code-only dots for the second token group from one key row scan.
+    #[must_use]
+    pub fn dot_second(&self, packed: &[u8]) -> [Option<f32>; G] {
+        if packed.len() != DIMENSION * usize::from(self.bits) / 8 {
+            return [None; G];
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.neon {
+            return native::dot_group(packed, self.bits, self.centroids, &self.queries[1])
+                .map(finite_binary32);
+        }
+        portable_dot_group(packed, self.bits, self.centroids, &self.queries[1]).map(finite_binary32)
+    }
+}
+
 /// Computes a dot against one code-only rotated KV row, excluding its scale.
 ///
 /// Rejects unsupported widths, incorrect byte lengths, nonfinite centroids or
@@ -296,6 +379,196 @@ impl<'a, const G: usize> ValueGroupAccumulator<'a, G> {
     }
 }
 
+/// Exclusive running value sums for two consecutive tokens sharing `G` heads per KV head.
+///
+/// Unpacks each shared value row once across both tokens (`2 * G` heads) with exact
+/// per-head isolation and failure atomicity.
+pub struct ValueGroupPairAccumulator<'a, const G: usize> {
+    bits: u8,
+    centroids: &'a [f32; 16],
+    outputs: [[[f32; DIMENSION]; G]; 2],
+    failed: [[bool; G]; 2],
+    #[cfg(target_arch = "aarch64")]
+    neon: bool,
+}
+
+impl<'a, const G: usize> ValueGroupPairAccumulator<'a, G> {
+    /// Starts zeroed accumulators for two token groups of `G` heads each.
+    #[must_use]
+    pub fn new(bits: u8, centroids: &'a [f32; 16]) -> Option<Self> {
+        if G == 0 || !matches!(bits, 3 | 4) || !centroids.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        Some(Self {
+            bits,
+            centroids,
+            outputs: [[[0.0; DIMENSION]; G]; 2],
+            failed: [[false; G]; 2],
+            #[cfg(target_arch = "aarch64")]
+            neon: std::arch::is_aarch64_feature_detected!("neon"),
+        })
+    }
+
+    /// Accumulates one shared packed value row across both token groups.
+    #[must_use]
+    pub fn accumulate_both(
+        &mut self,
+        packed: &[u8],
+        scales0: [f32; G],
+        scales1: [f32; G],
+    ) -> ([bool; G], [bool; G]) {
+        if packed.len() != DIMENSION * usize::from(self.bits) / 8 {
+            self.failed = [[true; G]; 2];
+            return ([false; G], [false; G]);
+        }
+        let mut active0 = [false; G];
+        let mut active1 = [false; G];
+        let mut any_active = false;
+        for (head, (&scale, failed)) in scales0.iter().zip(self.failed[0].iter_mut()).enumerate() {
+            if !*failed && scale.is_finite() {
+                active0[head] = true;
+                any_active = true;
+            } else {
+                *failed = true;
+            }
+        }
+        for (head, (&scale, failed)) in scales1.iter().zip(self.failed[1].iter_mut()).enumerate() {
+            if !*failed && scale.is_finite() {
+                active1[head] = true;
+                any_active = true;
+            } else {
+                *failed = true;
+            }
+        }
+        if !any_active {
+            return ([false; G], [false; G]);
+        }
+        let scales = [scales0, scales1];
+        let active = [active0, active1];
+        #[cfg(target_arch = "aarch64")]
+        let (ok0, ok1) = if self.neon {
+            native::accumulate_group_pair(
+                packed,
+                self.bits,
+                self.centroids,
+                scales,
+                active,
+                &mut self.outputs,
+            )
+        } else {
+            portable_accumulate_group_pair(
+                packed,
+                self.bits,
+                self.centroids,
+                scales,
+                active,
+                &mut self.outputs,
+            )
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let (ok0, ok1) = portable_accumulate_group_pair(
+            packed,
+            self.bits,
+            self.centroids,
+            scales,
+            active,
+            &mut self.outputs,
+        );
+        for (head, &row_ok) in ok0.iter().enumerate() {
+            if !active0[head] || !row_ok {
+                self.failed[0][head] = true;
+            }
+        }
+        for (head, &row_ok) in ok1.iter().enumerate() {
+            if !active1[head] || !row_ok {
+                self.failed[1][head] = true;
+            }
+        }
+        (
+            std::array::from_fn(|head| !self.failed[0][head]),
+            std::array::from_fn(|head| !self.failed[1][head]),
+        )
+    }
+
+    /// Accumulates one packed value row across the second token group only.
+    #[must_use]
+    pub fn accumulate_second(&mut self, packed: &[u8], scales1: [f32; G]) -> [bool; G] {
+        if packed.len() != DIMENSION * usize::from(self.bits) / 8 {
+            self.failed[1] = [true; G];
+            return [false; G];
+        }
+        let mut active1 = [false; G];
+        let mut any_active = false;
+        for (head, (&scale, failed)) in scales1.iter().zip(self.failed[1].iter_mut()).enumerate() {
+            if !*failed && scale.is_finite() {
+                active1[head] = true;
+                any_active = true;
+            } else {
+                *failed = true;
+            }
+        }
+        if !any_active {
+            return [false; G];
+        }
+        #[cfg(target_arch = "aarch64")]
+        let ok1 = if self.neon {
+            native::accumulate_group(
+                packed,
+                self.bits,
+                self.centroids,
+                scales1,
+                active1,
+                &mut self.outputs[1],
+            )
+        } else {
+            portable_accumulate_group(
+                packed,
+                self.bits,
+                self.centroids,
+                scales1,
+                active1,
+                &mut self.outputs[1],
+            )
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let ok1 = portable_accumulate_group(
+            packed,
+            self.bits,
+            self.centroids,
+            scales1,
+            active1,
+            &mut self.outputs[1],
+        );
+        for (head, &row_ok) in ok1.iter().enumerate() {
+            if !active1[head] || !row_ok {
+                self.failed[1][head] = true;
+            }
+        }
+        std::array::from_fn(|head| !self.failed[1][head])
+    }
+
+    /// Publishes per-head sums for both token groups if their appends remained valid.
+    #[must_use]
+    pub fn finish(self) -> [[Option<[f32; DIMENSION]>; G]; 2] {
+        [
+            std::array::from_fn(|head| {
+                if self.failed[0][head] {
+                    None
+                } else {
+                    Some(self.outputs[0][head])
+                }
+            }),
+            std::array::from_fn(|head| {
+                if self.failed[1][head] {
+                    None
+                } else {
+                    Some(self.outputs[1][head])
+                }
+            }),
+        ]
+    }
+}
+
 /// Adds a scaled code-only rotated value row into the supplied accumulator.
 ///
 /// Every multiply and addition rounds separately to binary32. Invalid input or
@@ -416,6 +689,46 @@ pub fn rotate(
     true
 }
 
+/// Divides every coordinate by `scale` in binary64, rounding once to binary32.
+///
+/// Portable and NEON implementations use IEEE-754 binary64 division followed by
+/// round-to-nearest narrowing. Returns `false` without changing `values` when
+/// `scale` is nonfinite or nonpositive, or any input/normalized element is nonfinite.
+#[must_use]
+pub fn normalize(values: &mut [f32; DIMENSION], scale: f32) -> bool {
+    if !scale.is_finite() || scale <= 0.0 {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return native::normalize(values, scale);
+    }
+    portable_normalize(values, scale)
+}
+
+/// Quantizes 256 rotated coordinates to nearest centroids and packs 3-bit or 4-bit codes.
+///
+/// Uses exact binary32 rounded absolute-distance comparisons (`(value - centroid).abs()`)
+/// with lowest-code tie-breaking, producing bit-exact packed codes matching scalar encoding.
+/// Returns `false` without changing `packed` on unsupported width, mismatched slice length,
+/// or nonfinite input/codebook coordinates.
+#[must_use]
+pub fn quantize_pack(
+    values: &[f32; DIMENSION],
+    bits: u8,
+    centroids: &[f32; 16],
+    packed: &mut [u8],
+) -> bool {
+    if !valid(packed, bits, centroids) {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return native::quantize_pack(values, bits, centroids, packed);
+    }
+    portable_quantize_pack(values, bits, centroids, packed)
+}
+
 fn apply_signs(values: &mut [f32; DIMENSION], negative_signs: &[bool; DIMENSION]) {
     for (value, &negative) in values.iter_mut().zip(negative_signs) {
         *value = f32::from_bits(value.to_bits() ^ (u32::from(negative) << 31));
@@ -494,6 +807,34 @@ fn portable_dot_group<const G: usize>(
     sums.map(reduce)
 }
 
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Separate multiplication and addition preserve the deterministic scalar/NEON arithmetic contract."
+)]
+fn portable_dot_group_pair<const G: usize>(
+    packed: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    first_queries: &[&[f32; DIMENSION]; G],
+    second_queries: &[&[f32; DIMENSION]; G],
+) -> ([f64; G], [f64; G]) {
+    let mut first_sums = [[0.0_f64; 4]; G];
+    let mut second_sums = [[0.0_f64; 4]; G];
+    for index in 0..(DIMENSION / 4) {
+        let base = index * 4;
+        let values = tile(packed, bits, centroids, base);
+        for head in 0..G {
+            let query0 = &first_queries[head][base..base + 4];
+            let query1 = &second_queries[head][base..base + 4];
+            for (lane, &value) in values.iter().enumerate() {
+                first_sums[head][lane] += f64::from(value) * f64::from(query0[lane]);
+                second_sums[head][lane] += f64::from(value) * f64::from(query1[lane]);
+            }
+        }
+    }
+    (first_sums.map(reduce), second_sums.map(reduce))
+}
+
 fn reduce(sums: [f64; 4]) -> f64 {
     ((sums[0] + sums[1]) + sums[2]) + sums[3]
 }
@@ -549,6 +890,94 @@ fn portable_accumulate_group<const G: usize>(
     finite
 }
 
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Value accumulation intentionally retains separate binary32 multiply/add rounding."
+)]
+fn portable_accumulate_group_pair<const G: usize>(
+    packed: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    scales: [[f32; G]; 2],
+    active: [[bool; G]; 2],
+    outputs: &mut [[[f32; DIMENSION]; G]; 2],
+) -> ([bool; G], [bool; G]) {
+    let mut finite = active;
+    for tile_index in 0..(DIMENSION / 4) {
+        let base = tile_index * 4;
+        let values = tile(packed, bits, centroids, base);
+        for token in 0..2 {
+            for ((&is_active, &scale), (output, is_finite)) in active[token]
+                .iter()
+                .zip(&scales[token])
+                .zip(outputs[token].iter_mut().zip(finite[token].iter_mut()))
+            {
+                if is_active {
+                    for (target, value) in output[base..base + 4].iter_mut().zip(values) {
+                        *target += scale * value;
+                        *is_finite &= target.is_finite();
+                    }
+                }
+            }
+        }
+    }
+    finite.into()
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "Binary64 division is rounded once to binary32 and its finite range is checked immediately."
+)]
+fn portable_normalize(values: &mut [f32; DIMENSION], scale: f32) -> bool {
+    let mut staged = [0.0_f32; DIMENSION];
+    let scale_f64 = f64::from(scale);
+    for (dst, &value) in staged.iter_mut().zip(values.iter()) {
+        if !value.is_finite() {
+            return false;
+        }
+        let normalized = (f64::from(value) / scale_f64) as f32;
+        if !normalized.is_finite() {
+            return false;
+        }
+        *dst = normalized;
+    }
+    *values = staged;
+    true
+}
+
+fn portable_quantize_pack(
+    values: &[f32; DIMENSION],
+    bits: u8,
+    centroids: &[f32; 16],
+    packed: &mut [u8],
+) -> bool {
+    if !values.iter().all(|value| value.is_finite()) {
+        return false;
+    }
+    let levels = 1_u8 << bits;
+    packed.fill(0);
+    for (index, &value) in values.iter().enumerate() {
+        let mut best_code = 0_u8;
+        let mut best_dist = (value - centroids[0]).abs();
+        for candidate in 1..levels {
+            let dist = (value - centroids[usize::from(candidate)]).abs();
+            if dist < best_dist {
+                best_code = candidate;
+                best_dist = dist;
+            }
+        }
+        let offset = index * usize::from(bits);
+        let byte = offset / 8;
+        let shift = offset % 8;
+        packed[byte] |= best_code << shift;
+        if shift + usize::from(bits) > 8 {
+            packed[byte + 1] |= best_code >> (8 - shift);
+        }
+    }
+    true
+}
+
 fn butterfly(values: &mut [f32; DIMENSION], half: usize) {
     for block in values.chunks_exact_mut(half * 2) {
         let (left, right) = block.split_at_mut(half);
@@ -579,14 +1008,280 @@ fn portable_hadamard(values: &mut [f32; DIMENSION]) {
 )]
 mod native {
     use core::arch::aarch64::{
-        float32x4_t, float32x4x4_t, uint8x16x4_t, vaddq_f32, vaddq_f64, vandq_u32, vcltq_u32,
-        vcvt_f64_f32, vcvt_high_f64_f32, vdupq_n_f32, vdupq_n_f64, vdupq_n_u32, vget_low_f32,
-        vld1q_f32, vld1q_s32, vld1q_u8, vld1q_u8_x4, vld4q_f32, vminvq_u32, vmulq_f32, vmulq_f64,
-        vmulq_u32, vorrq_u8, vqtbl4q_u8, vreinterpretq_f32_u8, vreinterpretq_u8_u32,
-        vreinterpretq_u32_f32, vshlq_u32, vst1q_f32, vst1q_f64, vst4q_f32, vsubq_f32,
+        float32x4_t, float32x4x4_t, float64x2_t, uint8x16_t, uint8x16x2_t, uint8x16x4_t,
+        uint32x4_t, vabdq_f32, vaddq_f32, vaddq_f64, vaddvq_u32, vandq_u8, vandq_u32, vbslq_f32,
+        vbslq_u32, vcltq_f32, vcltq_u32, vcvt_f32_f64, vcvt_f64_f32, vcvt_high_f32_f64,
+        vcvt_high_f64_f32, vdivq_f64, vdupq_laneq_f32, vdupq_n_f32, vdupq_n_f64, vdupq_n_u8,
+        vdupq_n_u32, vget_low_f32, vld1q_f32, vld1q_s32, vld1q_u8, vld1q_u8_x2, vld1q_u8_x4,
+        vld3q_u8, vld4q_f32, vminvq_u32, vmulq_f32, vmulq_f64, vorrq_u8, vorrq_u32, vqtbl2q_u8,
+        vqtbl4q_u8, vreinterpretq_f32_u8, vreinterpretq_u8_u16, vreinterpretq_u16_u8,
+        vreinterpretq_u32_f32, vshlq_n_u8, vshlq_u32, vshrq_n_u8, vsliq_n_u8, vst1q_f32, vst1q_f64,
+        vst4q_f32, vsubq_f32, vzip1q_u8, vzip1q_u16, vzip2q_u8, vzip2q_u16,
     };
+    #[cfg(test)]
+    use core::arch::aarch64::{vmulq_u32, vreinterpretq_u8_u32};
 
     use super::DIMENSION;
+
+    const TILE_OFFSETS: [u8; 16] = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
+    const THREE_BIT_PACK_SHIFTS_LO: [i32; 4] = [0, 3, 6, 9];
+    const THREE_BIT_PACK_SHIFTS_HI: [i32; 4] = [12, 15, 18, 21];
+    const FOUR_BIT_PACK_SHIFTS_LO: [i32; 4] = [0, 4, 8, 12];
+    const FOUR_BIT_PACK_SHIFTS_HI: [i32; 4] = [16, 20, 24, 28];
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn codebook_bytes(centroids: &[f32; 16]) -> uint8x16x4_t {
+        // SAFETY: sixteen initialized binary32 centroids occupy exactly the
+        // sixty-four bytes required by the four unaligned vector loads.
+        unsafe { vld1q_u8_x4(centroids.as_ptr().cast()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn codebook_bytes_3(centroids: &[f32; 16]) -> uint8x16x2_t {
+        // SAFETY: the first eight initialized binary32 centroids occupy thirty-two
+        // bytes required by the two unaligned vector loads.
+        unsafe { vld1q_u8_x2(centroids.as_ptr().cast()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn tile_offsets() -> uint8x16_t {
+        // SAFETY: TILE_OFFSETS is a static sixteen-byte array.
+        unsafe { vld1q_u8(TILE_OFFSETS.as_ptr()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn expand_4bit_16(
+        scaled_codes: uint8x16_t,
+        table: uint8x16x4_t,
+        offsets: uint8x16_t,
+    ) -> [float32x4_t; 4] {
+        let dup_lo = vzip1q_u8(scaled_codes, scaled_codes);
+        let dup_hi = vzip2q_u8(scaled_codes, scaled_codes);
+        [
+            vreinterpretq_f32_u8(vqtbl4q_u8(
+                table,
+                vorrq_u8(vzip1q_u8(dup_lo, dup_lo), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl4q_u8(
+                table,
+                vorrq_u8(vzip2q_u8(dup_lo, dup_lo), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl4q_u8(
+                table,
+                vorrq_u8(vzip1q_u8(dup_hi, dup_hi), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl4q_u8(
+                table,
+                vorrq_u8(vzip2q_u8(dup_hi, dup_hi), offsets),
+            )),
+        ]
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn unpack_4bit_32(
+        chunk: &[u8; 16],
+        table: uint8x16x4_t,
+        mask_3c: uint8x16_t,
+        offsets: uint8x16_t,
+    ) -> [float32x4_t; 8] {
+        // SAFETY: chunk is a sixteen-byte array slice covering one NEON load.
+        let packed_bytes = unsafe { vld1q_u8(chunk.as_ptr()) };
+        let low_codes = vandq_u8(vshlq_n_u8::<2>(packed_bytes), mask_3c);
+        let high_codes = vandq_u8(vshrq_n_u8::<2>(packed_bytes), mask_3c);
+        let first_16 = expand_4bit_16(vzip1q_u8(low_codes, high_codes), table, offsets);
+        let second_16 = expand_4bit_16(vzip2q_u8(low_codes, high_codes), table, offsets);
+        [
+            first_16[0],
+            first_16[1],
+            first_16[2],
+            first_16[3],
+            second_16[0],
+            second_16[1],
+            second_16[2],
+            second_16[3],
+        ]
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn unpack_3bit_128(chunk: &[u8; 48], mask_1c: uint8x16_t) -> [[uint8x16_t; 2]; 4] {
+        // SAFETY: chunk is a forty-eight-byte array covering sixteen 3-byte tuples.
+        let tuples = unsafe { vld3q_u8(chunk.as_ptr()) };
+        let byte0 = tuples.0;
+        let byte1 = tuples.1;
+        let byte2 = tuples.2;
+
+        let c0 = vandq_u8(vshlq_n_u8::<2>(byte0), mask_1c);
+        let c1 = vandq_u8(vshrq_n_u8::<1>(byte0), mask_1c);
+        let c2 = vandq_u8(vsliq_n_u8::<4>(vshrq_n_u8::<4>(byte0), byte1), mask_1c);
+        let c3 = vandq_u8(vshlq_n_u8::<1>(byte1), mask_1c);
+        let c4 = vandq_u8(vshrq_n_u8::<2>(byte1), mask_1c);
+        let c5 = vandq_u8(vsliq_n_u8::<3>(vshrq_n_u8::<5>(byte1), byte2), mask_1c);
+        let c6 = vandq_u8(byte2, mask_1c);
+        let c7 = vandq_u8(vshrq_n_u8::<3>(byte2), mask_1c);
+
+        let p01_lo = vreinterpretq_u16_u8(vzip1q_u8(c0, c1));
+        let p01_hi = vreinterpretq_u16_u8(vzip2q_u8(c0, c1));
+        let p23_lo = vreinterpretq_u16_u8(vzip1q_u8(c2, c3));
+        let p23_hi = vreinterpretq_u16_u8(vzip2q_u8(c2, c3));
+        let p45_lo = vreinterpretq_u16_u8(vzip1q_u8(c4, c5));
+        let p45_hi = vreinterpretq_u16_u8(vzip2q_u8(c4, c5));
+        let p67_lo = vreinterpretq_u16_u8(vzip1q_u8(c6, c7));
+        let p67_hi = vreinterpretq_u16_u8(vzip2q_u8(c6, c7));
+
+        [
+            [
+                vreinterpretq_u8_u16(vzip1q_u16(p01_lo, p23_lo)),
+                vreinterpretq_u8_u16(vzip1q_u16(p45_lo, p67_lo)),
+            ],
+            [
+                vreinterpretq_u8_u16(vzip2q_u16(p01_lo, p23_lo)),
+                vreinterpretq_u8_u16(vzip2q_u16(p45_lo, p67_lo)),
+            ],
+            [
+                vreinterpretq_u8_u16(vzip1q_u16(p01_hi, p23_hi)),
+                vreinterpretq_u8_u16(vzip1q_u16(p45_hi, p67_hi)),
+            ],
+            [
+                vreinterpretq_u8_u16(vzip2q_u16(p01_hi, p23_hi)),
+                vreinterpretq_u8_u16(vzip2q_u16(p45_hi, p67_hi)),
+            ],
+        ]
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn expand_3bit_32(
+        pair: [uint8x16_t; 2],
+        table: uint8x16x2_t,
+        offsets: uint8x16_t,
+    ) -> [float32x4_t; 8] {
+        let low_dup0 = vzip1q_u8(pair[0], pair[0]);
+        let high_dup0 = vzip1q_u8(pair[1], pair[1]);
+        let low_dup1 = vzip2q_u8(pair[0], pair[0]);
+        let high_dup1 = vzip2q_u8(pair[1], pair[1]);
+        [
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                table,
+                vorrq_u8(vzip1q_u8(low_dup0, low_dup0), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                table,
+                vorrq_u8(vzip1q_u8(high_dup0, high_dup0), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                table,
+                vorrq_u8(vzip2q_u8(low_dup0, low_dup0), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                table,
+                vorrq_u8(vzip2q_u8(high_dup0, high_dup0), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                table,
+                vorrq_u8(vzip1q_u8(low_dup1, low_dup1), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                table,
+                vorrq_u8(vzip1q_u8(high_dup1, high_dup1), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                table,
+                vorrq_u8(vzip2q_u8(low_dup1, low_dup1), offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                table,
+                vorrq_u8(vzip2q_u8(high_dup1, high_dup1), offsets),
+            )),
+        ]
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn decode_row<const BITS: u8>(
+        packed: &[u8],
+        centroids: &[f32; 16],
+        out: &mut [f32; DIMENSION],
+    ) {
+        let offsets = tile_offsets();
+        if BITS == 4 {
+            let table = codebook_bytes(centroids);
+            let mask_3c = vdupq_n_u8(0x3c);
+            for (chunk, dst) in packed
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<32>().0)
+            {
+                let tiles = unpack_4bit_32(chunk, table, mask_3c, offsets);
+                for (tile, out_quad) in tiles.into_iter().zip(dst.as_chunks_mut::<4>().0) {
+                    // SAFETY: out_quad is a unique four-element slice in out.
+                    unsafe { vst1q_f32(out_quad.as_mut_ptr(), tile) };
+                }
+            }
+        } else {
+            let table = codebook_bytes_3(centroids);
+            let mask_1c = vdupq_n_u8(0x1c);
+            for (chunk, dst) in packed
+                .as_chunks::<48>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<128>().0)
+            {
+                let pairs = unpack_3bit_128(chunk, mask_1c);
+                for (pair, sub_dst) in pairs.into_iter().zip(dst.as_chunks_mut::<32>().0) {
+                    let tiles = expand_3bit_32(pair, table, offsets);
+                    for (tile, out_quad) in tiles.into_iter().zip(sub_dst.as_chunks_mut::<4>().0) {
+                        // SAFETY: out_quad is a unique four-element slice in out.
+                        unsafe { vst1q_f32(out_quad.as_mut_ptr(), tile) };
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn dot_tile_group<const G: usize>(
+        values: float32x4_t,
+        base: usize,
+        queries: &[&[f32; DIMENSION]; G],
+        low_sums: &mut [float64x2_t; G],
+        high_sums: &mut [float64x2_t; G],
+    ) {
+        let values_low = vcvt_f64_f32(vget_low_f32(values));
+        let values_high = vcvt_high_f64_f32(values);
+        for head in 0..G {
+            // SAFETY: callers only pass base offsets where base + 4 <= DIMENSION.
+            let query = unsafe { vld1q_f32(queries[head][base..].as_ptr()) };
+            let low = vmulq_f64(values_low, vcvt_f64_f32(vget_low_f32(query)));
+            let high = vmulq_f64(values_high, vcvt_high_f64_f32(query));
+            low_sums[head] = vaddq_f64(low_sums[head], low);
+            high_sums[head] = vaddq_f64(high_sums[head], high);
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn finish_dot_group<const G: usize>(
+        low_sums: &[float64x2_t; G],
+        high_sums: &[float64x2_t; G],
+    ) -> [f64; G] {
+        std::array::from_fn(|head| {
+            let mut low = [0.0; 2];
+            let mut high = [0.0; 2];
+            // SAFETY: low is a unique initialized two-element output array.
+            unsafe { vst1q_f64(low.as_mut_ptr(), low_sums[head]) };
+            // SAFETY: high is a disjoint unique two-element output array.
+            unsafe { vst1q_f64(high.as_mut_ptr(), high_sums[head]) };
+            super::reduce([low[0], low[1], high[0], high[1]])
+        })
+    }
 
     pub(super) fn dot(
         packed: &[u8],
@@ -594,52 +1289,7 @@ mod native {
         centroids: &[f32; 16],
         query: &[f32; DIMENSION],
     ) -> f64 {
-        if bits == 4 {
-            // SAFETY: the safe public caller proves baseline NEON at runtime and
-            // validates exactly 256 four-bit codes and finite fixed-array inputs.
-            unsafe { dot_neon::<4>(packed, centroids, query) }
-        } else {
-            // SAFETY: the same caller admits only three- or four-bit codes;
-            // this branch has exactly 256 three-bit codes and detected NEON.
-            unsafe { dot_neon::<3>(packed, centroids, query) }
-        }
-    }
-
-    #[target_feature(enable = "neon")]
-    fn dot_neon<const BITS: u8>(
-        packed: &[u8],
-        centroids: &[f32; 16],
-        query: &[f32; DIMENSION],
-    ) -> f64 {
-        let mut low_sum = vdupq_n_f64(0.0);
-        let mut high_sum = vdupq_n_f64(0.0);
-        let table = codebook_bytes(centroids);
-        for (index, query) in query.as_chunks::<4>().0.iter().enumerate() {
-            let values = if BITS == 4 {
-                four_bit_tile(packed, index, table)
-            } else {
-                let values = super::tile(packed, BITS, centroids, index * 4);
-                // SAFETY: values contains four initialized coordinates and NEON
-                // permits an unaligned load; the temporary outlives the load.
-                unsafe { vld1q_f32(values.as_ptr()) }
-            };
-            // SAFETY: the chunk contains exactly four initialized query values.
-            let query = unsafe { vld1q_f32(query.as_ptr()) };
-            let low = vmulq_f64(
-                vcvt_f64_f32(vget_low_f32(values)),
-                vcvt_f64_f32(vget_low_f32(query)),
-            );
-            let high = vmulq_f64(vcvt_high_f64_f32(values), vcvt_high_f64_f32(query));
-            low_sum = vaddq_f64(low_sum, low);
-            high_sum = vaddq_f64(high_sum, high);
-        }
-        let mut low = [0.0; 2];
-        let mut high = [0.0; 2];
-        // SAFETY: low is a unique initialized two-element output array.
-        unsafe { vst1q_f64(low.as_mut_ptr(), low_sum) };
-        // SAFETY: high is a disjoint unique two-element output array.
-        unsafe { vst1q_f64(high.as_mut_ptr(), high_sum) };
-        super::reduce([low[0], low[1], high[0], high[1]])
+        dot_group(packed, bits, centroids, &[query])[0]
     }
 
     pub(super) fn dot_group<const G: usize>(
@@ -667,37 +1317,151 @@ mod native {
     ) -> [f64; G] {
         let mut low_sums: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
         let mut high_sums: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
-        let table = codebook_bytes(centroids);
-        for index in 0..(DIMENSION / 4) {
-            let base = index * 4;
-            let values = if BITS == 4 {
-                four_bit_tile(packed, index, table)
-            } else {
-                let values = super::tile(packed, BITS, centroids, base);
-                // SAFETY: values contains four initialized coordinates and NEON
-                // permits an unaligned load; the temporary outlives the load.
-                unsafe { vld1q_f32(values.as_ptr()) }
-            };
-            let values_low = vcvt_f64_f32(vget_low_f32(values));
-            let values_high = vcvt_high_f64_f32(values);
-            for head in 0..G {
-                // SAFETY: `base + 4 <= DIMENSION`, covering all four query coordinates.
-                let query = unsafe { vld1q_f32(queries[head][base..].as_ptr()) };
-                let low = vmulq_f64(values_low, vcvt_f64_f32(vget_low_f32(query)));
-                let high = vmulq_f64(values_high, vcvt_high_f64_f32(query));
-                low_sums[head] = vaddq_f64(low_sums[head], low);
-                high_sums[head] = vaddq_f64(high_sums[head], high);
+        let offsets = tile_offsets();
+        if BITS == 4 {
+            let table = codebook_bytes(centroids);
+            let mask_3c = vdupq_n_u8(0x3c);
+            for (chunk_idx, chunk) in packed.as_chunks::<16>().0.iter().take(8).enumerate() {
+                let tiles = unpack_4bit_32(chunk, table, mask_3c, offsets);
+                let chunk_base = chunk_idx * 32;
+                for (tile_idx, values) in tiles.into_iter().enumerate() {
+                    dot_tile_group(
+                        values,
+                        chunk_base + tile_idx * 4,
+                        queries,
+                        &mut low_sums,
+                        &mut high_sums,
+                    );
+                }
+            }
+        } else {
+            let table = codebook_bytes_3(centroids);
+            let mask_1c = vdupq_n_u8(0x1c);
+            for (chunk_idx, chunk) in packed.as_chunks::<48>().0.iter().take(2).enumerate() {
+                let pairs = unpack_3bit_128(chunk, mask_1c);
+                let chunk_base = chunk_idx * 128;
+                for (pair_idx, pair) in pairs.into_iter().enumerate() {
+                    let tiles = expand_3bit_32(pair, table, offsets);
+                    let pair_base = chunk_base + pair_idx * 32;
+                    for (tile_idx, values) in tiles.into_iter().enumerate() {
+                        dot_tile_group(
+                            values,
+                            pair_base + tile_idx * 4,
+                            queries,
+                            &mut low_sums,
+                            &mut high_sums,
+                        );
+                    }
+                }
             }
         }
-        std::array::from_fn(|head| {
-            let mut low = [0.0; 2];
-            let mut high = [0.0; 2];
-            // SAFETY: low is a unique initialized two-element output array.
-            unsafe { vst1q_f64(low.as_mut_ptr(), low_sums[head]) };
-            // SAFETY: high is a disjoint unique two-element output array.
-            unsafe { vst1q_f64(high.as_mut_ptr(), high_sums[head]) };
-            super::reduce([low[0], low[1], high[0], high[1]])
-        })
+        finish_dot_group(&low_sums, &high_sums)
+    }
+
+    pub(super) fn dot_group_pair<const G: usize>(
+        packed: &[u8],
+        bits: u8,
+        centroids: &[f32; 16],
+        first_queries: &[&[f32; DIMENSION]; G],
+        second_queries: &[&[f32; DIMENSION]; G],
+    ) -> ([f64; G], [f64; G]) {
+        if bits == 4 {
+            // SAFETY: caller detects NEON and validates 256 four-bit codes and queries.
+            unsafe { dot_group_pair_neon::<4, G>(packed, centroids, first_queries, second_queries) }
+        } else {
+            // SAFETY: caller detects NEON and validates 256 three-bit codes and queries.
+            unsafe { dot_group_pair_neon::<3, G>(packed, centroids, first_queries, second_queries) }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn dot_decoded_group<const G: usize>(
+        decoded: &[f32; DIMENSION],
+        queries: &[&[f32; DIMENSION]; G],
+    ) -> [f64; G] {
+        let mut low_sums: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
+        let mut high_sums: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
+        for (tile_idx, quad) in decoded.as_chunks::<4>().0.iter().enumerate() {
+            // SAFETY: quad is a four-element array slice of decoded coordinates.
+            let values = unsafe { vld1q_f32(quad.as_ptr()) };
+            dot_tile_group(values, tile_idx * 4, queries, &mut low_sums, &mut high_sums);
+        }
+        finish_dot_group(&low_sums, &high_sums)
+    }
+
+    #[target_feature(enable = "neon")]
+    fn dot_group_pair_neon<const BITS: u8, const G: usize>(
+        packed: &[u8],
+        centroids: &[f32; 16],
+        first_queries: &[&[f32; DIMENSION]; G],
+        second_queries: &[&[f32; DIMENSION]; G],
+    ) -> ([f64; G], [f64; G]) {
+        if G > 4 {
+            let mut decoded = [0.0_f32; DIMENSION];
+            decode_row::<BITS>(packed, centroids, &mut decoded);
+            return (
+                dot_decoded_group(&decoded, first_queries),
+                dot_decoded_group(&decoded, second_queries),
+            );
+        }
+        let mut low0: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
+        let mut high0: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
+        let mut low1: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
+        let mut high1: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
+        let offsets = tile_offsets();
+        if BITS == 4 {
+            let table = codebook_bytes(centroids);
+            let mask_3c = vdupq_n_u8(0x3c);
+            for (chunk_idx, chunk) in packed.as_chunks::<16>().0.iter().take(8).enumerate() {
+                let tiles = unpack_4bit_32(chunk, table, mask_3c, offsets);
+                let chunk_base = chunk_idx * 32;
+                for (tile_idx, values) in tiles.into_iter().enumerate() {
+                    let base = chunk_base + tile_idx * 4;
+                    dot_tile_group(values, base, first_queries, &mut low0, &mut high0);
+                    dot_tile_group(values, base, second_queries, &mut low1, &mut high1);
+                }
+            }
+        } else {
+            let table = codebook_bytes_3(centroids);
+            let mask_1c = vdupq_n_u8(0x1c);
+            for (chunk_idx, chunk) in packed.as_chunks::<48>().0.iter().take(2).enumerate() {
+                let pairs = unpack_3bit_128(chunk, mask_1c);
+                let chunk_base = chunk_idx * 128;
+                for (pair_idx, pair) in pairs.into_iter().enumerate() {
+                    let tiles = expand_3bit_32(pair, table, offsets);
+                    let pair_base = chunk_base + pair_idx * 32;
+                    for (tile_idx, values) in tiles.into_iter().enumerate() {
+                        let base = pair_base + tile_idx * 4;
+                        dot_tile_group(values, base, first_queries, &mut low0, &mut high0);
+                        dot_tile_group(values, base, second_queries, &mut low1, &mut high1);
+                    }
+                }
+            }
+        }
+        (
+            finish_dot_group(&low0, &high0),
+            finish_dot_group(&low1, &high1),
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn accumulate_tile_single(
+        values: float32x4_t,
+        scale: float32x4_t,
+        magnitude: uint32x4_t,
+        infinity: uint32x4_t,
+        finite: &mut uint32x4_t,
+        dst: &mut [f32; 4],
+    ) {
+        // SAFETY: dst is a unique four-element chunk of the staging row.
+        let previous = unsafe { vld1q_f32(dst.as_ptr()) };
+        let product = vmulq_f32(scale, values);
+        let result = vaddq_f32(previous, product);
+        let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
+        *finite = vandq_u32(*finite, vcltq_u32(absolute, infinity));
+        // SAFETY: dst covers the same unique four-element destination.
+        unsafe { vst1q_f32(dst.as_mut_ptr(), result) };
     }
 
     pub(super) fn accumulate(
@@ -729,28 +1493,92 @@ mod native {
         let magnitude = vdupq_n_u32(0x7fff_ffff);
         let infinity = vdupq_n_u32(0x7f80_0000);
         let mut finite = vdupq_n_u32(u32::MAX);
-        let table = codebook_bytes(centroids);
-        for (index, output) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let values = if BITS == 4 {
-                four_bit_tile(packed, index, table)
-            } else {
-                let values = super::tile(packed, BITS, centroids, index * 4);
-                // SAFETY: values is a valid initialized four-element array.
-                unsafe { vld1q_f32(values.as_ptr()) }
-            };
-            // SAFETY: output is a unique four-element chunk of the staging row.
-            let previous = unsafe { vld1q_f32(output.as_ptr()) };
-            let product = vmulq_f32(scale, values);
-            let result = vaddq_f32(previous, product);
-            // Check each result while it is live, rather than reading the
-            // complete output row again. Infinity and every NaN encoding have
-            // magnitudes at least the binary32 infinity exponent pattern.
-            let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
-            finite = vandq_u32(finite, vcltq_u32(absolute, infinity));
-            // SAFETY: the same unique four-element chunk covers the store.
-            unsafe { vst1q_f32(output.as_mut_ptr(), result) };
+        let offsets = tile_offsets();
+        if BITS == 4 {
+            let table = codebook_bytes(centroids);
+            let mask_3c = vdupq_n_u8(0x3c);
+            for (chunk, out_chunk) in packed
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .zip(output.as_chunks_mut::<32>().0)
+            {
+                let tiles = unpack_4bit_32(chunk, table, mask_3c, offsets);
+                for (values, dst) in tiles.into_iter().zip(out_chunk.as_chunks_mut::<4>().0) {
+                    accumulate_tile_single(values, scale, magnitude, infinity, &mut finite, dst);
+                }
+            }
+        } else {
+            let table = codebook_bytes_3(centroids);
+            let mask_1c = vdupq_n_u8(0x1c);
+            for (chunk, out_chunk) in packed
+                .as_chunks::<48>()
+                .0
+                .iter()
+                .zip(output.as_chunks_mut::<128>().0)
+            {
+                let pairs = unpack_3bit_128(chunk, mask_1c);
+                for (pair, sub_out) in pairs.into_iter().zip(out_chunk.as_chunks_mut::<32>().0) {
+                    let tiles = expand_3bit_32(pair, table, offsets);
+                    for (values, dst) in tiles.into_iter().zip(sub_out.as_chunks_mut::<4>().0) {
+                        accumulate_tile_single(
+                            values,
+                            scale,
+                            magnitude,
+                            infinity,
+                            &mut finite,
+                            dst,
+                        );
+                    }
+                }
+            }
         }
         vminvq_u32(finite) != 0
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn accumulate_tile_group<const G: usize>(
+        values: float32x4_t,
+        base: usize,
+        active: Option<&[bool; G]>,
+        scale_vecs: &[float32x4_t; G],
+        finite: &mut [uint32x4_t; G],
+        outputs: &mut [[f32; DIMENSION]; G],
+    ) {
+        let magnitude = vdupq_n_u32(0x7fff_ffff);
+        let infinity = vdupq_n_u32(0x7f80_0000);
+        match active {
+            None => {
+                for head in 0..G {
+                    let chunk = &mut outputs[head][base..base + 4];
+                    // SAFETY: chunk has 4 initialized floats in the caller's row.
+                    let previous = unsafe { vld1q_f32(chunk.as_ptr()) };
+                    let product = vmulq_f32(scale_vecs[head], values);
+                    let result = vaddq_f32(previous, product);
+                    let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
+                    finite[head] = vandq_u32(finite[head], vcltq_u32(absolute, infinity));
+                    // SAFETY: chunk covers the same unique four-element destination.
+                    unsafe { vst1q_f32(chunk.as_mut_ptr(), result) };
+                }
+            }
+            Some(flags) => {
+                for head in 0..G {
+                    if !flags[head] {
+                        continue;
+                    }
+                    let chunk = &mut outputs[head][base..base + 4];
+                    // SAFETY: chunk has 4 initialized floats in the caller's row.
+                    let previous = unsafe { vld1q_f32(chunk.as_ptr()) };
+                    let product = vmulq_f32(scale_vecs[head], values);
+                    let result = vaddq_f32(previous, product);
+                    let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
+                    finite[head] = vandq_u32(finite[head], vcltq_u32(absolute, infinity));
+                    // SAFETY: chunk covers the same unique four-element destination.
+                    unsafe { vst1q_f32(chunk.as_mut_ptr(), result) };
+                }
+            }
+        }
     }
 
     pub(super) fn accumulate_group<const G: usize>(
@@ -784,60 +1612,357 @@ mod native {
         for (dst, &scale) in scale_vecs.iter_mut().zip(&scales) {
             *dst = vdupq_n_f32(scale);
         }
-        let magnitude = vdupq_n_u32(0x7fff_ffff);
-        let infinity = vdupq_n_u32(0x7f80_0000);
         let mut finite: [_; G] = std::array::from_fn(|_| vdupq_n_u32(u32::MAX));
-        let table = codebook_bytes(centroids);
-        let all_active = active.iter().all(|&flag| flag);
-        for index in 0..(DIMENSION / 4) {
-            let base = index * 4;
-            let values = if BITS == 4 {
-                four_bit_tile(packed, index, table)
-            } else {
-                let values = super::tile(packed, BITS, centroids, base);
-                // SAFETY: values is a valid initialized four-element array.
-                unsafe { vld1q_f32(values.as_ptr()) }
-            };
-            if all_active {
-                for head in 0..G {
-                    let chunk = &mut outputs[head][base..base + 4];
-                    // SAFETY: chunk has 4 initialized floats in the caller's row.
-                    let previous = unsafe { vld1q_f32(chunk.as_ptr()) };
-                    let product = vmulq_f32(scale_vecs[head], values);
-                    let result = vaddq_f32(previous, product);
-                    let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
-                    finite[head] = vandq_u32(finite[head], vcltq_u32(absolute, infinity));
-                    // SAFETY: chunk covers the same unique four-element destination.
-                    unsafe { vst1q_f32(chunk.as_mut_ptr(), result) };
+        let active_flags = (!active.iter().all(|&flag| flag)).then_some(&active);
+        let offsets = tile_offsets();
+        if BITS == 4 {
+            let table = codebook_bytes(centroids);
+            let mask_3c = vdupq_n_u8(0x3c);
+            for (chunk_idx, chunk) in packed.as_chunks::<16>().0.iter().take(8).enumerate() {
+                let tiles = unpack_4bit_32(chunk, table, mask_3c, offsets);
+                let chunk_base = chunk_idx * 32;
+                for (tile_idx, values) in tiles.into_iter().enumerate() {
+                    accumulate_tile_group(
+                        values,
+                        chunk_base + tile_idx * 4,
+                        active_flags,
+                        &scale_vecs,
+                        &mut finite,
+                        outputs,
+                    );
                 }
-            } else {
-                for head in 0..G {
-                    if !active[head] {
-                        continue;
+            }
+        } else {
+            let table = codebook_bytes_3(centroids);
+            let mask_1c = vdupq_n_u8(0x1c);
+            for (chunk_idx, chunk) in packed.as_chunks::<48>().0.iter().take(2).enumerate() {
+                let pairs = unpack_3bit_128(chunk, mask_1c);
+                let chunk_base = chunk_idx * 128;
+                for (pair_idx, pair) in pairs.into_iter().enumerate() {
+                    let tiles = expand_3bit_32(pair, table, offsets);
+                    let pair_base = chunk_base + pair_idx * 32;
+                    for (tile_idx, values) in tiles.into_iter().enumerate() {
+                        accumulate_tile_group(
+                            values,
+                            pair_base + tile_idx * 4,
+                            active_flags,
+                            &scale_vecs,
+                            &mut finite,
+                            outputs,
+                        );
                     }
-                    let chunk = &mut outputs[head][base..base + 4];
-                    // SAFETY: chunk has 4 initialized floats in the caller's row.
-                    let previous = unsafe { vld1q_f32(chunk.as_ptr()) };
-                    let product = vmulq_f32(scale_vecs[head], values);
-                    let result = vaddq_f32(previous, product);
-                    let absolute = vandq_u32(vreinterpretq_u32_f32(result), magnitude);
-                    finite[head] = vandq_u32(finite[head], vcltq_u32(absolute, infinity));
-                    // SAFETY: chunk covers the same unique four-element destination.
-                    unsafe { vst1q_f32(chunk.as_mut_ptr(), result) };
                 }
             }
         }
         std::array::from_fn(|head| active[head] && vminvq_u32(finite[head]) != 0)
     }
 
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn codebook_bytes(centroids: &[f32; 16]) -> uint8x16x4_t {
-        // SAFETY: sixteen initialized binary32 centroids occupy exactly the
-        // sixty-four bytes required by the four unaligned vector loads.
-        unsafe { vld1q_u8_x4(centroids.as_ptr().cast()) }
+    pub(super) fn accumulate_group_pair<const G: usize>(
+        packed: &[u8],
+        bits: u8,
+        centroids: &[f32; 16],
+        scales: [[f32; G]; 2],
+        active: [[bool; G]; 2],
+        outputs: &mut [[[f32; DIMENSION]; G]; 2],
+    ) -> ([bool; G], [bool; G]) {
+        if bits == 4 {
+            // SAFETY: caller detects NEON and validates 256 four-bit codes and outputs.
+            unsafe {
+                accumulate_group_pair_neon::<4, G>(packed, centroids, scales, active, outputs)
+            }
+        } else {
+            // SAFETY: caller detects NEON and validates 256 three-bit codes and outputs.
+            unsafe {
+                accumulate_group_pair_neon::<3, G>(packed, centroids, scales, active, outputs)
+            }
+        }
     }
 
+    #[target_feature(enable = "neon")]
+    fn accumulate_decoded_group<const G: usize>(
+        decoded: &[f32; DIMENSION],
+        scales: [f32; G],
+        active: [bool; G],
+        outputs: &mut [[f32; DIMENSION]; G],
+    ) -> [bool; G] {
+        let mut scale_vecs = [vdupq_n_f32(0.0); G];
+        for (dst, &scale) in scale_vecs.iter_mut().zip(&scales) {
+            *dst = vdupq_n_f32(scale);
+        }
+        let mut finite: [_; G] = std::array::from_fn(|_| vdupq_n_u32(u32::MAX));
+        let active_flags = (!active.iter().all(|&flag| flag)).then_some(&active);
+        for (tile_idx, quad) in decoded.as_chunks::<4>().0.iter().enumerate() {
+            // SAFETY: quad is a four-element slice of decoded coordinates.
+            let values = unsafe { vld1q_f32(quad.as_ptr()) };
+            accumulate_tile_group(
+                values,
+                tile_idx * 4,
+                active_flags,
+                &scale_vecs,
+                &mut finite,
+                outputs,
+            );
+        }
+        std::array::from_fn(|head| active[head] && vminvq_u32(finite[head]) != 0)
+    }
+
+    #[target_feature(enable = "neon")]
+    fn accumulate_group_pair_neon<const BITS: u8, const G: usize>(
+        packed: &[u8],
+        centroids: &[f32; 16],
+        scales: [[f32; G]; 2],
+        active: [[bool; G]; 2],
+        outputs: &mut [[[f32; DIMENSION]; G]; 2],
+    ) -> ([bool; G], [bool; G]) {
+        if G > 4 {
+            let mut decoded = [0.0_f32; DIMENSION];
+            decode_row::<BITS>(packed, centroids, &mut decoded);
+            let ok0 = accumulate_decoded_group(&decoded, scales[0], active[0], &mut outputs[0]);
+            let ok1 = accumulate_decoded_group(&decoded, scales[1], active[1], &mut outputs[1]);
+            return (ok0, ok1);
+        }
+        let mut first_scale_vecs = [vdupq_n_f32(0.0); G];
+        let mut second_scale_vecs = [vdupq_n_f32(0.0); G];
+        for (dst, &scale) in first_scale_vecs.iter_mut().zip(&scales[0]) {
+            *dst = vdupq_n_f32(scale);
+        }
+        for (dst, &scale) in second_scale_vecs.iter_mut().zip(&scales[1]) {
+            *dst = vdupq_n_f32(scale);
+        }
+        let mut finite0: [_; G] = std::array::from_fn(|_| vdupq_n_u32(u32::MAX));
+        let mut finite1: [_; G] = std::array::from_fn(|_| vdupq_n_u32(u32::MAX));
+        let active_flags0 = (!active[0].iter().all(|&flag| flag)).then_some(&active[0]);
+        let active_flags1 = (!active[1].iter().all(|&flag| flag)).then_some(&active[1]);
+        let offsets = tile_offsets();
+        if BITS == 4 {
+            let table = codebook_bytes(centroids);
+            let mask_3c = vdupq_n_u8(0x3c);
+            for (chunk_idx, chunk) in packed.as_chunks::<16>().0.iter().take(8).enumerate() {
+                let tiles = unpack_4bit_32(chunk, table, mask_3c, offsets);
+                let chunk_base = chunk_idx * 32;
+                for (tile_idx, values) in tiles.into_iter().enumerate() {
+                    let base = chunk_base + tile_idx * 4;
+                    accumulate_tile_group(
+                        values,
+                        base,
+                        active_flags0,
+                        &first_scale_vecs,
+                        &mut finite0,
+                        &mut outputs[0],
+                    );
+                    accumulate_tile_group(
+                        values,
+                        base,
+                        active_flags1,
+                        &second_scale_vecs,
+                        &mut finite1,
+                        &mut outputs[1],
+                    );
+                }
+            }
+        } else {
+            let table = codebook_bytes_3(centroids);
+            let mask_1c = vdupq_n_u8(0x1c);
+            for (chunk_idx, chunk) in packed.as_chunks::<48>().0.iter().take(2).enumerate() {
+                let pairs = unpack_3bit_128(chunk, mask_1c);
+                let chunk_base = chunk_idx * 128;
+                for (pair_idx, pair) in pairs.into_iter().enumerate() {
+                    let tiles = expand_3bit_32(pair, table, offsets);
+                    let pair_base = chunk_base + pair_idx * 32;
+                    for (tile_idx, values) in tiles.into_iter().enumerate() {
+                        let base = pair_base + tile_idx * 4;
+                        accumulate_tile_group(
+                            values,
+                            base,
+                            active_flags0,
+                            &first_scale_vecs,
+                            &mut finite0,
+                            &mut outputs[0],
+                        );
+                        accumulate_tile_group(
+                            values,
+                            base,
+                            active_flags1,
+                            &second_scale_vecs,
+                            &mut finite1,
+                            &mut outputs[1],
+                        );
+                    }
+                }
+            }
+        }
+        (
+            std::array::from_fn(|head| active[0][head] && vminvq_u32(finite0[head]) != 0),
+            std::array::from_fn(|head| active[1][head] && vminvq_u32(finite1[head]) != 0),
+        )
+    }
+
+    pub(super) fn normalize(values: &mut [f32; DIMENSION], scale: f32) -> bool {
+        // SAFETY: caller detects baseline NEON and passes a unique 256-float array.
+        unsafe { normalize_neon(values, scale) }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn normalize_neon(values: &mut [f32; DIMENSION], scale: f32) -> bool {
+        let mut staged = [0.0_f32; DIMENSION];
+        let scale_f64 = vdupq_n_f64(f64::from(scale));
+        let magnitude = vdupq_n_u32(0x7fff_ffff);
+        let infinity = vdupq_n_u32(0x7f80_0000);
+        let mut finite = vdupq_n_u32(u32::MAX);
+        for (src, dst) in values
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(staged.as_chunks_mut::<4>().0)
+        {
+            // SAFETY: src is a four-element array slice of initialized coordinates.
+            let vec = unsafe { vld1q_f32(src.as_ptr()) };
+            let in_abs = vandq_u32(vreinterpretq_u32_f32(vec), magnitude);
+            finite = vandq_u32(finite, vcltq_u32(in_abs, infinity));
+            let low = vdivq_f64(vcvt_f64_f32(vget_low_f32(vec)), scale_f64);
+            let high = vdivq_f64(vcvt_high_f64_f32(vec), scale_f64);
+            let narrowed = vcvt_high_f32_f64(vcvt_f32_f64(low), high);
+            let out_abs = vandq_u32(vreinterpretq_u32_f32(narrowed), magnitude);
+            finite = vandq_u32(finite, vcltq_u32(out_abs, infinity));
+            // SAFETY: dst is a unique four-element slice of the staging buffer.
+            unsafe { vst1q_f32(dst.as_mut_ptr(), narrowed) };
+        }
+        if vminvq_u32(finite) == 0 {
+            return false;
+        }
+        *values = staged;
+        true
+    }
+
+    pub(super) fn quantize_pack(
+        values: &[f32; DIMENSION],
+        bits: u8,
+        centroids: &[f32; 16],
+        packed: &mut [u8],
+    ) -> bool {
+        if bits == 4 {
+            // SAFETY: caller detects NEON and validates 128-byte output and finite codebook.
+            unsafe { quantize_pack_neon::<4>(values, centroids, packed) }
+        } else {
+            // SAFETY: caller detects NEON and validates 96-byte output and finite codebook.
+            unsafe { quantize_pack_neon::<3>(values, centroids, packed) }
+        }
+    }
+
+    struct NearestState {
+        dist0: float32x4_t,
+        dist1: float32x4_t,
+        code0: uint32x4_t,
+        code1: uint32x4_t,
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn step_nearest(
+        vals0: float32x4_t,
+        vals1: float32x4_t,
+        state: &mut NearestState,
+        centroid: float32x4_t,
+        code: u32,
+    ) {
+        let cand = vdupq_n_u32(code);
+        let dist0 = vabdq_f32(vals0, centroid);
+        let dist1 = vabdq_f32(vals1, centroid);
+        let lt0 = vcltq_f32(dist0, state.dist0);
+        let lt1 = vcltq_f32(dist1, state.dist1);
+        state.dist0 = vbslq_f32(lt0, dist0, state.dist0);
+        state.dist1 = vbslq_f32(lt1, dist1, state.dist1);
+        state.code0 = vbslq_u32(lt0, cand, state.code0);
+        state.code1 = vbslq_u32(lt1, cand, state.code1);
+    }
+
+    #[target_feature(enable = "neon")]
+    fn quantize_pack_neon<const BITS: u8>(
+        values: &[f32; DIMENSION],
+        centroids: &[f32; 16],
+        packed: &mut [u8],
+    ) -> bool {
+        let mut staged = [0_u8; DIMENSION / 2];
+        // SAFETY: centroids[0..16] holds sixteen initialized binary32 values.
+        let c0 = unsafe { vld1q_f32(centroids.as_ptr()) };
+        // SAFETY: centroids[4..8] is initialized within the sixteen-element array.
+        let c1 = unsafe { vld1q_f32(centroids[4..].as_ptr()) };
+        // SAFETY: centroids[8..12] is initialized within the sixteen-element array.
+        let c2 = unsafe { vld1q_f32(centroids[8..].as_ptr()) };
+        // SAFETY: centroids[12..16] is initialized within the sixteen-element array.
+        let c3 = unsafe { vld1q_f32(centroids[12..].as_ptr()) };
+        let sh_lo_arr = if BITS == 4 {
+            &FOUR_BIT_PACK_SHIFTS_LO
+        } else {
+            &THREE_BIT_PACK_SHIFTS_LO
+        };
+        let sh_hi_arr = if BITS == 4 {
+            &FOUR_BIT_PACK_SHIFTS_HI
+        } else {
+            &THREE_BIT_PACK_SHIFTS_HI
+        };
+        // SAFETY: static four-element shift array is initialized.
+        let sh_lo = unsafe { vld1q_s32(sh_lo_arr.as_ptr()) };
+        // SAFETY: static four-element shift array is initialized.
+        let sh_hi = unsafe { vld1q_s32(sh_hi_arr.as_ptr()) };
+        let magnitude = vdupq_n_u32(0x7fff_ffff);
+        let infinity = vdupq_n_u32(0x7f80_0000);
+        let mut finite = vdupq_n_u32(u32::MAX);
+        let c0_lane0 = vdupq_laneq_f32::<0>(c0);
+        let byte_stride = usize::from(BITS);
+
+        for (block_idx, block) in values.as_chunks::<8>().0.iter().enumerate() {
+            // SAFETY: block holds eight initialized coordinates; loading first four.
+            let vals0 = unsafe { vld1q_f32(block.as_ptr()) };
+            // SAFETY: block[4..8] holds the remaining four initialized coordinates.
+            let vals1 = unsafe { vld1q_f32(block[4..].as_ptr()) };
+            let abs0 = vandq_u32(vreinterpretq_u32_f32(vals0), magnitude);
+            let abs1 = vandq_u32(vreinterpretq_u32_f32(vals1), magnitude);
+            finite = vandq_u32(finite, vcltq_u32(abs0, infinity));
+            finite = vandq_u32(finite, vcltq_u32(abs1, infinity));
+
+            let mut state = NearestState {
+                dist0: vabdq_f32(vals0, c0_lane0),
+                dist1: vabdq_f32(vals1, c0_lane0),
+                code0: vdupq_n_u32(0),
+                code1: vdupq_n_u32(0),
+            };
+
+            step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<1>(c0), 1);
+            step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<2>(c0), 2);
+            step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<3>(c0), 3);
+            step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<0>(c1), 4);
+            step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<1>(c1), 5);
+            step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<2>(c1), 6);
+            step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<3>(c1), 7);
+            if BITS == 4 {
+                step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<0>(c2), 8);
+                step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<1>(c2), 9);
+                step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<2>(c2), 10);
+                step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<3>(c2), 11);
+                step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<0>(c3), 12);
+                step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<1>(c3), 13);
+                step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<2>(c3), 14);
+                step_nearest(vals0, vals1, &mut state, vdupq_laneq_f32::<3>(c3), 15);
+            }
+
+            let packed_word = vaddvq_u32(vorrq_u32(
+                vshlq_u32(state.code0, sh_lo),
+                vshlq_u32(state.code1, sh_hi),
+            ));
+            let bytes = packed_word.to_le_bytes();
+            let offset = block_idx * byte_stride;
+            staged[offset..offset + byte_stride].copy_from_slice(&bytes[..byte_stride]);
+        }
+        if vminvq_u32(finite) == 0 {
+            return false;
+        }
+        let expected_bytes = DIMENSION * usize::from(BITS) / 8;
+        packed.copy_from_slice(&staged[..expected_bytes]);
+        true
+    }
+
+    #[cfg(test)]
     #[inline]
     #[target_feature(enable = "neon")]
     fn four_bit_tile(packed: &[u8], index: usize, table: uint8x16x4_t) -> float32x4_t {
@@ -998,6 +2123,65 @@ mod native {
                         codes.map(|code| centroids[usize::from(code)].to_bits()),
                     );
                 }
+            }
+        }
+
+        #[test]
+        fn three_bit_and_four_bit_vector_unpackers_preserve_every_lane_and_centroid_bits() {
+            if !std::arch::is_aarch64_feature_detected!("neon") {
+                return;
+            }
+            let centroids = [
+                -f32::MAX,
+                -17.25,
+                -1.0,
+                -f32::MIN_POSITIVE,
+                -f32::from_bits(1),
+                -0.0,
+                0.0,
+                f32::MAX,
+                f32::MIN_POSITIVE,
+                0.125,
+                0.5,
+                1.0,
+                3.25,
+                17.25,
+                f32::MAX * 0.5,
+                -2.0,
+            ];
+            for offset in 0_u8..8 {
+                let codes: [u8; super::DIMENSION] =
+                    std::array::from_fn(|index| index.to_le_bytes()[0].wrapping_add(offset) & 7);
+                let mut packed = [0_u8; super::DIMENSION * 3 / 8];
+                for (index, code) in codes.iter().enumerate() {
+                    for bit in 0..3 {
+                        let position = index * 3 + bit;
+                        packed[position / 8] |= ((code >> bit) & 1) << (position % 8);
+                    }
+                }
+                let mut actual = [0.0_f32; super::DIMENSION];
+                // SAFETY: NEON was detected above and packed has 96 initialized bytes.
+                unsafe { super::decode_row::<3>(&packed, &centroids, &mut actual) };
+                let expected: [u32; super::DIMENSION] =
+                    std::array::from_fn(|index| centroids[usize::from(codes[index])].to_bits());
+                assert_eq!(actual.map(f32::to_bits), expected);
+            }
+            for offset in 0_u8..16 {
+                let codes: [u8; super::DIMENSION] =
+                    std::array::from_fn(|index| index.to_le_bytes()[0].wrapping_add(offset) & 15);
+                let mut packed = [0_u8; super::DIMENSION / 2];
+                for (index, code) in codes.iter().enumerate() {
+                    for bit in 0..4 {
+                        let position = index * 4 + bit;
+                        packed[position / 8] |= ((code >> bit) & 1) << (position % 8);
+                    }
+                }
+                let mut actual = [0.0_f32; super::DIMENSION];
+                // SAFETY: NEON was detected above and packed has 128 initialized bytes.
+                unsafe { super::decode_row::<4>(&packed, &centroids, &mut actual) };
+                let expected: [u32; super::DIMENSION] =
+                    std::array::from_fn(|index| centroids[usize::from(codes[index])].to_bits());
+                assert_eq!(actual.map(f32::to_bits), expected);
             }
         }
     }
@@ -1549,8 +2733,223 @@ mod tests {
         for bits in [3, 4] {
             verify_group_bit_exact::<2>(bits)?;
             verify_group_bit_exact::<3>(bits)?;
+            verify_group_bit_exact::<4>(bits)?;
             verify_group_bit_exact::<6>(bits)?;
         }
         Ok(())
+    }
+
+    fn make_pair_queries<const G: usize>(
+        mul_add: usize,
+        zero_mod: usize,
+        scale: f32,
+    ) -> [[f32; DIMENSION]; G] {
+        std::array::from_fn(|head| {
+            std::array::from_fn(|idx| {
+                let centered = f32::from(idx.wrapping_mul(head + mul_add).to_le_bytes()[0]) - 127.5;
+                if idx % zero_mod == 0 {
+                    -0.0
+                } else {
+                    centered * scale
+                }
+            })
+        })
+    }
+
+    fn verify_pair_bit_exact<const G: usize>(bits: u8) -> Result<(), &'static str> {
+        use super::{
+            PreparedQuery, PreparedQueryPair, ValueAccumulator, ValueGroupPairAccumulator,
+        };
+
+        let centroids = codebook();
+        let queries0: [[f32; DIMENSION]; G] = make_pair_queries(3, 7, 0.03125);
+        let queries1: [[f32; DIMENSION]; G] = make_pair_queries(9, 5, 0.0625);
+        let refs0: [&[f32; DIMENSION]; G] = std::array::from_fn(|head| &queries0[head]);
+        let refs1: [&[f32; DIMENSION]; G] = std::array::from_fn(|head| &queries1[head]);
+        let pair_query =
+            PreparedQueryPair::new(bits, &centroids, refs0, refs1).ok_or("finite pair query")?;
+        let mut single_queries0 = Vec::with_capacity(G);
+        let mut single_queries1 = Vec::with_capacity(G);
+        for head in 0..G {
+            single_queries0
+                .push(PreparedQuery::new(bits, &centroids, refs0[head]).ok_or("finite q0")?);
+            single_queries1
+                .push(PreparedQuery::new(bits, &centroids, refs1[head]).ok_or("finite q1")?);
+        }
+
+        let mut pair_acc =
+            ValueGroupPairAccumulator::<G>::new(bits, &centroids).ok_or("finite pair acc")?;
+        let mut single_acc0 = Vec::with_capacity(G);
+        let mut single_acc1 = Vec::with_capacity(G);
+        for _ in 0..G {
+            single_acc0.push(ValueAccumulator::new(bits, &centroids).ok_or("finite a0")?);
+            single_acc1.push(ValueAccumulator::new(bits, &centroids).ok_or("finite a1")?);
+        }
+
+        for step in 0..8_u8 {
+            let bytes = packed(&codes(bits, step), bits);
+            let (dots0, dots1) = pair_query.dot_both(&bytes);
+            let dots_sec = pair_query.dot_second(&bytes);
+            for head in 0..G {
+                assert_eq!(
+                    dots0[head].map(f32::to_bits),
+                    single_queries0[head].dot(&bytes).map(f32::to_bits)
+                );
+                assert_eq!(
+                    dots1[head].map(f32::to_bits),
+                    single_queries1[head].dot(&bytes).map(f32::to_bits)
+                );
+                assert_eq!(
+                    dots_sec[head].map(f32::to_bits),
+                    dots1[head].map(f32::to_bits)
+                );
+            }
+            let scales0: [f32; G] = std::array::from_fn(|head| {
+                if (usize::from(step) + head).is_multiple_of(4) {
+                    -0.0
+                } else {
+                    (f32::from(u8::try_from(head + 1).unwrap_or(1)) - 2.0) * 0.125
+                }
+            });
+            let scales1: [f32; G] = std::array::from_fn(|head| {
+                if (usize::from(step) + head + 1).is_multiple_of(3) {
+                    -0.0
+                } else {
+                    (f32::from(u8::try_from(head + 2).unwrap_or(2)) - 3.0) * 0.0625
+                }
+            });
+            let (ok0, ok1) = pair_acc.accumulate_both(&bytes, scales0, scales1);
+            for head in 0..G {
+                assert_eq!(
+                    ok0[head],
+                    single_acc0[head].accumulate(&bytes, scales0[head])
+                );
+                assert_eq!(
+                    ok1[head],
+                    single_acc1[head].accumulate(&bytes, scales1[head])
+                );
+            }
+        }
+        let extra = packed(&codes(bits, 3), bits);
+        let extra_scales1 = [0.25_f32; G];
+        let ok_extra = pair_acc.accumulate_second(&extra, extra_scales1);
+        for (head, single) in single_acc1.iter_mut().enumerate() {
+            assert_eq!(
+                ok_extra[head],
+                single.accumulate(&extra, extra_scales1[head])
+            );
+        }
+        let [out0, out1] = pair_acc.finish();
+        for (head, single) in single_acc0.into_iter().enumerate() {
+            assert_eq!(
+                out0[head].map(|row| row.map(f32::to_bits)),
+                single.finish().map(|row| row.map(f32::to_bits)),
+            );
+        }
+        for (head, single) in single_acc1.into_iter().enumerate() {
+            assert_eq!(
+                out1[head].map(|row| row.map(f32::to_bits)),
+                single.finish().map(|row| row.map(f32::to_bits)),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pair_group_query_and_value_match_single_head_bits_exactly() -> Result<(), &'static str> {
+        for bits in [3, 4] {
+            verify_pair_bit_exact::<1>(bits)?;
+            verify_pair_bit_exact::<2>(bits)?;
+            verify_pair_bit_exact::<3>(bits)?;
+            verify_pair_bit_exact::<4>(bits)?;
+            verify_pair_bit_exact::<6>(bits)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_and_quantize_pack_preserve_ties_and_atomicity() {
+        let mut values: [f32; DIMENSION] = std::array::from_fn(|index| {
+            let signed = f32::from(index.to_le_bytes()[0]) - 127.5;
+            if index == 0 {
+                -0.0
+            } else if index == 1 {
+                f32::from_bits(1)
+            } else {
+                signed * 0.25
+            }
+        });
+        let mut portable_norm = values;
+        assert!(super::normalize(&mut values, 1.375));
+        assert!(super::portable_normalize(&mut portable_norm, 1.375));
+        assert_eq!(values.map(f32::to_bits), portable_norm.map(f32::to_bits));
+        let before = values.map(f32::to_bits);
+        assert!(!super::normalize(&mut values, 0.0));
+        assert!(!super::normalize(&mut values, -0.0));
+        assert!(!super::normalize(&mut values, -1.0));
+        assert!(!super::normalize(&mut values, f32::NAN));
+        assert_eq!(values.map(f32::to_bits), before);
+        let mut huge = [f32::MAX; DIMENSION];
+        let huge_before = huge.map(f32::to_bits);
+        assert!(!super::normalize(&mut huge, 0.5));
+        assert_eq!(huge.map(f32::to_bits), huge_before);
+
+        let centroids = codebook();
+        let mut edge_cases = Vec::new();
+        for pair in centroids.windows(2) {
+            let mid = f32::midpoint(pair[0], pair[1]);
+            for delta in 0..=4 {
+                for candidate in [
+                    f32::from_bits(mid.to_bits().wrapping_add(delta)),
+                    f32::from_bits(mid.to_bits().wrapping_sub(delta)),
+                ] {
+                    if candidate.is_finite() {
+                        edge_cases.push(candidate);
+                    }
+                }
+            }
+        }
+        edge_cases.extend([
+            0.0,
+            -0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1.0e10,
+            -1.0e10,
+            f32::MAX,
+            -f32::MAX,
+        ]);
+        for bits in [3_u8, 4_u8] {
+            let byte_len = DIMENSION * usize::from(bits) / 8;
+            for chunk in edge_cases.chunks(DIMENSION) {
+                let mut row = [0.0_f32; DIMENSION];
+                for (dst, &val) in row.iter_mut().zip(chunk) {
+                    *dst = val;
+                }
+                let mut actual = vec![0xaa_u8; byte_len];
+                let mut expected = vec![0x55_u8; byte_len];
+                assert!(super::quantize_pack(&row, bits, &centroids, &mut actual));
+                assert!(super::portable_quantize_pack(
+                    &row,
+                    bits,
+                    &centroids,
+                    &mut expected,
+                ));
+                assert_eq!(actual, expected);
+            }
+            let mut bad_row = [0.0_f32; DIMENSION];
+            bad_row[DIMENSION - 1] = f32::NAN;
+            let mut out = vec![0x5a_u8; byte_len];
+            assert!(!super::quantize_pack(&bad_row, bits, &centroids, &mut out));
+            assert!(out.iter().all(|&byte| byte == 0x5a));
+            assert!(!super::quantize_pack(
+                &[0.0; DIMENSION],
+                bits,
+                &centroids,
+                &mut out[..byte_len - 1],
+            ));
+        }
     }
 }

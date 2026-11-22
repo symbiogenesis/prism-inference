@@ -1684,3 +1684,309 @@ fn balanced_parallel_tile_preserves_earliest_token_error_across_workers() -> Res
     }
     Ok(())
 }
+
+fn populated_long_caches(
+    policy: KvCachePolicy,
+    kv_heads: usize,
+    pages: usize,
+    extra_capacity: usize,
+    scalar: bool,
+) -> Result<(KvCache, KvCache)> {
+    let width = kv_heads * HEAD_DIM;
+    let page_tokens = super::super::KV_PAGE_TOKENS;
+    let base_tokens = pages * page_tokens;
+    let context = base_tokens + extra_capacity;
+    let mut keys = KvCache::with_policy(width, context, policy, true, scalar)?;
+    let mut values = KvCache::with_policy(width, context, policy, false, scalar)?;
+    for position in 0..page_tokens {
+        let salt = u16::try_from(position)?;
+        let key = input(width, salt)?;
+        let value = input(width, salt + 17)?;
+        keys.prepare_append(&key)?;
+        values.prepare_append(&value)?;
+        keys.append(&key);
+        values.append(&value);
+    }
+    if pages > 1 {
+        let key_packed = keys
+            .packed
+            .as_mut()
+            .ok_or_else(|| invalid("missing long keys"))?;
+        let key_page = Arc::clone(&key_packed.pages[0]);
+        for _ in 1..pages {
+            key_packed.pages.push(Arc::clone(&key_page));
+        }
+        key_packed.len = base_tokens * key_packed.row_bytes;
+        keys.len = base_tokens * width;
+
+        let value_packed = values
+            .packed
+            .as_mut()
+            .ok_or_else(|| invalid("missing long values"))?;
+        let value_page = Arc::clone(&value_packed.pages[0]);
+        for _ in 1..pages {
+            value_packed.pages.push(Arc::clone(&value_page));
+        }
+        value_packed.len = base_tokens * value_packed.row_bytes;
+        values.len = base_tokens * width;
+    }
+    Ok((keys, values))
+}
+
+#[test]
+fn grouped_unit_selection_scales_smoothly_across_scratch_capacities() {
+    assert_eq!(grouped_unit_with_capacity(6, 24, 12), 6);
+    assert_eq!(grouped_unit_with_capacity(6, 24, 6), 6);
+    assert_eq!(grouped_unit_with_capacity(6, 24, 5), 3);
+    assert_eq!(grouped_unit_with_capacity(6, 24, 3), 3);
+    assert_eq!(grouped_unit_with_capacity(6, 24, 2), 2);
+    assert_eq!(grouped_unit_with_capacity(6, 24, 1), 1);
+    assert_eq!(grouped_unit_with_capacity(4, 16, 8), 4);
+    assert_eq!(grouped_unit_with_capacity(4, 16, 4), 4);
+    assert_eq!(grouped_unit_with_capacity(4, 16, 3), 2);
+    assert_eq!(grouped_unit_with_capacity(8, 16, 6), 4);
+    assert_eq!(grouped_unit_with_capacity(1, 4, 8), 1);
+}
+
+struct LongTileCase<'a> {
+    policy: KvCachePolicy,
+    kv_heads: usize,
+    heads: usize,
+    pages: usize,
+    count: usize,
+    workers: &'a [usize],
+}
+
+impl<'a> LongTileCase<'a> {
+    const fn new(
+        policy: KvCachePolicy,
+        kv_heads: usize,
+        heads: usize,
+        pages: usize,
+        count: usize,
+        workers: &'a [usize],
+    ) -> Self {
+        Self {
+            policy,
+            kv_heads,
+            heads,
+            pages,
+            count,
+            workers,
+        }
+    }
+}
+
+fn verify_long_tile_case(case: &LongTileCase<'_>) -> Result<()> {
+    let base = case.pages * super::super::KV_PAGE_TOKENS;
+    let width = case.heads * HEAD_DIM;
+    let (mut scalar_keys, mut scalar_values) =
+        populated_long_caches(case.policy, case.kv_heads, case.pages, case.count, true)?;
+    let (mut native_keys, mut native_values) =
+        populated_long_caches(case.policy, case.kv_heads, case.pages, case.count, false)?;
+    let mut queries = Vec::with_capacity(case.count);
+    let mut projected = Vec::with_capacity(case.count);
+    let mut expected_bits = Vec::with_capacity(case.count * width);
+    let ref_parallelism = RowParallelism::new(if cfg!(feature = "parallel-rows") {
+        case.heads.min(4)
+    } else {
+        1
+    })?;
+    for token in 0..case.count {
+        let salt = u16::try_from(token)?;
+        let query = input(width, 13 + salt)?;
+        let proj = input(2 * width, 17 + salt)?;
+        let key = input(scalar_keys.width, 21 + salt)?;
+        let value = input(scalar_values.width, 31 + salt)?;
+
+        let mut single_out = vec![0.0_f32; width];
+        if token == 0 || token + 1 == case.count {
+            let mut single_scores = vec![0.0_f32; base + token + 1];
+            attend(
+                &mut scalar_keys,
+                &mut scalar_values,
+                &query,
+                &proj,
+                &key,
+                &value,
+                &mut single_out,
+                &mut single_scores,
+                case.heads,
+                1.0 / 16.0,
+                super::super::Arithmetic::PinnedSwift,
+                &RowParallelism::default(),
+            )?;
+        } else {
+            let mut single_scores =
+                vec![0.0_f32; score_rows(case.heads, &ref_parallelism) * (base + token + 1)];
+            attend(
+                &mut native_keys,
+                &mut native_values,
+                &query,
+                &proj,
+                &key,
+                &value,
+                &mut single_out,
+                &mut single_scores,
+                case.heads,
+                1.0 / 16.0,
+                super::super::Arithmetic::PinnedSwift,
+                &ref_parallelism,
+            )?;
+        }
+        expected_bits.extend(single_out.into_iter().map(f32::to_bits));
+        scalar_keys.prepare_staged_append(&key)?;
+        scalar_values.prepare_staged_append(&value)?;
+        scalar_keys.append(&key);
+        scalar_values.append(&value);
+
+        prepare_tile_append(&mut native_keys, &mut native_values, &key, &value)?;
+        native_keys.append(&key);
+        native_values.append(&value);
+
+        queries.push(query);
+        projected.push(proj);
+    }
+    for &workers in case.workers {
+        let parallelism = RowParallelism::new(workers)?;
+        let mut out = vec![vec![13.0_f32; width]; case.count];
+        let mut scores = vec![17.0_f32; case.count * (base + case.count)];
+        attend_tile(
+            &native_keys,
+            &native_values,
+            &queries,
+            &projected,
+            &mut out,
+            &mut scores,
+            base,
+            case.heads,
+            1.0 / 16.0,
+            super::super::Arithmetic::PinnedSwift,
+            &parallelism,
+        )?;
+        let actual_bits: Vec<u32> = out.into_iter().flatten().map(f32::to_bits).collect();
+        assert_eq!(
+            actual_bits, expected_bits,
+            "long-context tile mismatch policy={:?} base={base} count={} heads={} kv_heads={} workers={workers}",
+            case.policy, case.count, case.heads, case.kv_heads,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn long_context_attend_tile_preserves_g1_scalar_bits_above_4096_tokens() -> Result<()> {
+    let cases: &[LongTileCase<'_>] = if cfg!(feature = "parallel-rows") {
+        &[
+            LongTileCase::new(KvCachePolicy::Rotated4, 4, 24, 65, 13, &[1, 2, 3, 4, 5, 13]),
+            LongTileCase::new(
+                KvCachePolicy::Rotated4Keys3Values,
+                4,
+                24,
+                65,
+                13,
+                &[1, 2, 3, 4, 5, 13],
+            ),
+            LongTileCase::new(KvCachePolicy::Rotated4, 4, 16, 65, 9, &[1, 2, 4]),
+            LongTileCase::new(KvCachePolicy::Rotated4Keys3Values, 4, 16, 65, 9, &[1, 2, 4]),
+            LongTileCase::new(KvCachePolicy::Rotated4, 4, 4, 65, 3, &[1, 3]),
+            LongTileCase::new(
+                KvCachePolicy::Rotated4Keys3Values,
+                2,
+                12,
+                128,
+                13,
+                &[1, 4, 13],
+            ),
+        ]
+    } else {
+        &[
+            LongTileCase::new(KvCachePolicy::Rotated4, 4, 24, 65, 13, &[1]),
+            LongTileCase::new(KvCachePolicy::Rotated4Keys3Values, 4, 24, 65, 13, &[1]),
+            LongTileCase::new(KvCachePolicy::Rotated4, 4, 24, 65, 6, &[1]),
+            LongTileCase::new(KvCachePolicy::Rotated4Keys3Values, 4, 24, 65, 4, &[1]),
+            LongTileCase::new(KvCachePolicy::Rotated4, 4, 24, 65, 3, &[1]),
+            LongTileCase::new(KvCachePolicy::Rotated4Keys3Values, 4, 24, 65, 2, &[1]),
+            LongTileCase::new(KvCachePolicy::Rotated4, 4, 16, 65, 9, &[1]),
+            LongTileCase::new(KvCachePolicy::Rotated4, 4, 4, 65, 3, &[1]),
+            LongTileCase::new(KvCachePolicy::Rotated4Keys3Values, 2, 12, 128, 13, &[1]),
+        ]
+    };
+    for case in cases {
+        verify_long_tile_case(case)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn paired_tile_error_fallback_preserves_earliest_token_error() -> Result<()> {
+    let heads = 12;
+    let kv_heads = 2;
+    let base = 8;
+    let count = 2;
+    let (mut keys, mut values) =
+        populated_caches(KvCachePolicy::Rotated4Keys3Values, kv_heads, base, false)?;
+    for token in 0..count {
+        let salt = u16::try_from(token)?;
+        let key = input(keys.width, 21 + salt)?;
+        let value = input(values.width, 31 + salt)?;
+        prepare_tile_append(&mut keys, &mut values, &key, &value)?;
+        keys.append(&key);
+        values.append(&value);
+    }
+    let mut queries = vec![input(heads * HEAD_DIM, 13)?, input(heads * HEAD_DIM, 14)?];
+    let mut projected = vec![
+        input(2 * heads * HEAD_DIM, 17)?,
+        input(2 * heads * HEAD_DIM, 18)?,
+    ];
+    // Token 0 fails late on its last head's gate, while token 1 fails early on head 0's query.
+    // Paired execution must still surface token 0's error cleanly.
+    projected[0][(2 * (heads - 1) + 1) * HEAD_DIM + 3] = f32::NAN;
+    queries[1][0] = f32::NAN;
+
+    let mut serial_out = vec![vec![13.0_f32; heads * HEAD_DIM]; count];
+    let mut serial_scores = vec![17.0_f32; count * (base + count)];
+    let serial_err = attend_tile(
+        &keys,
+        &values,
+        &queries,
+        &projected,
+        &mut serial_out,
+        &mut serial_scores,
+        base,
+        heads,
+        1.0 / 16.0,
+        super::super::Arithmetic::PinnedSwift,
+        &RowParallelism::default(),
+    )
+    .err()
+    .ok_or_else(|| invalid("expected token 0 error"))?
+    .to_string();
+    assert!(serial_out.iter().all(Vec::is_empty));
+    assert!(serial_err.contains("packed attention output"));
+
+    #[cfg(feature = "parallel-rows")]
+    {
+        let mut parallel_out = vec![vec![13.0_f32; heads * HEAD_DIM]; count];
+        let mut parallel_scores = vec![17.0_f32; count * (base + count)];
+        let parallel_err = attend_tile(
+            &keys,
+            &values,
+            &queries,
+            &projected,
+            &mut parallel_out,
+            &mut parallel_scores,
+            base,
+            heads,
+            1.0 / 16.0,
+            super::super::Arithmetic::PinnedSwift,
+            &RowParallelism::new(2)?,
+        )
+        .err()
+        .ok_or_else(|| invalid("expected parallel token 0 error"))?
+        .to_string();
+        assert!(parallel_out.iter().all(Vec::is_empty));
+        assert_eq!(serial_err, parallel_err);
+    }
+    Ok(())
+}

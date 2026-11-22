@@ -504,9 +504,25 @@ pub(super) fn score_rows(heads: usize, parallelism: &RowParallelism) -> usize {
 const fn grouped_head_unit(heads_per_kv: usize, heads: usize) -> usize {
     if heads_per_kv.is_multiple_of(6) && heads.is_multiple_of(6) {
         6
+    } else if heads_per_kv.is_multiple_of(4) && heads.is_multiple_of(4) {
+        4
     } else if heads_per_kv.is_multiple_of(3) && heads.is_multiple_of(3) {
         3
     } else if heads_per_kv.is_multiple_of(2) && heads.is_multiple_of(2) {
+        2
+    } else {
+        1
+    }
+}
+
+const fn grouped_unit_with_capacity(heads_per_kv: usize, heads: usize, max_rows: usize) -> usize {
+    if max_rows >= 6 && heads_per_kv.is_multiple_of(6) && heads.is_multiple_of(6) {
+        6
+    } else if max_rows >= 4 && heads_per_kv.is_multiple_of(4) && heads.is_multiple_of(4) {
+        4
+    } else if max_rows >= 3 && heads_per_kv.is_multiple_of(3) && heads.is_multiple_of(3) {
+        3
+    } else if max_rows >= 2 && heads_per_kv.is_multiple_of(2) && heads.is_multiple_of(2) {
         2
     } else {
         1
@@ -918,6 +934,95 @@ fn dispatch_attend_tasks(
     })
 }
 
+struct TileContext<'a> {
+    keys: &'a PackedCache,
+    values: &'a PackedCache,
+    queries: &'a [Vec<f32>],
+    projected: &'a [Vec<f32>],
+    base: usize,
+    heads: usize,
+    heads_per_kv: usize,
+    scale: f32,
+    arithmetic: super::Arithmetic,
+}
+
+impl<'a> TileContext<'a> {
+    fn make_input(&self, token: usize) -> Result<PackedAttention<'a>> {
+        let position = self.base + token;
+        Ok(PackedAttention {
+            keys: self.keys,
+            values: self.values,
+            queries: &self.queries[token],
+            projected: &self.projected[token],
+            current_keys: self.keys.row(position)?,
+            current_values: self.values.row(position)?,
+            history_tokens: position,
+            heads_per_kv: self.heads_per_kv,
+            scale: self.scale,
+            arithmetic: self.arithmetic,
+        })
+    }
+
+    fn run_single(&self, token: usize, output: &mut [f32], scratch: &mut [f32]) -> Result<()> {
+        let input = self.make_input(token)?;
+        let stride = input.history_tokens + 1;
+        let max_rows = (scratch.len() / stride).saturating_add(STACK_GROUP_SCORES_LEN / stride);
+        let unit = grouped_unit_with_capacity(self.heads_per_kv, self.heads, max_rows);
+        input.attend_chunk_tile_scores(0, output, scratch, stride, unit)
+    }
+
+    fn run_chunk(
+        &self,
+        base_token: usize,
+        output_chunk: &mut [Vec<f32>],
+        scores_chunk: &mut [f32],
+    ) -> Result<()> {
+        let mut offset = 0;
+        while offset < output_chunk.len() {
+            let token0 = base_token + offset;
+            let pos0 = self.base + token0;
+            let stride0 = pos0 + 1;
+            let single_unit0 = grouped_unit_with_capacity(
+                self.heads_per_kv,
+                self.heads,
+                (scores_chunk.len() / stride0).saturating_add(STACK_GROUP_SCORES_LEN / stride0),
+            );
+            if offset + 1 < output_chunk.len() {
+                let token1 = token0 + 1;
+                let stride1 = pos0 + 2;
+                let pair_rows_cap = scores_chunk.len() / (stride0 + stride1);
+                let pair_unit =
+                    grouped_unit_with_capacity(self.heads_per_kv, self.heads, pair_rows_cap);
+                if pair_rows_cap >= 1 && 2 * pair_unit > single_unit0 {
+                    let [out0, out1] = &mut output_chunk[offset..offset + 2] else {
+                        return Err(invalid("invalid packed attention tile pair slice"));
+                    };
+                    let pair_result = (|| -> Result<()> {
+                        let input0 = self.make_input(token0)?;
+                        let input1 = self.make_input(token1)?;
+                        attend_pair_tokens(
+                            [&input0, &input1],
+                            [out0.as_mut_slice(), out1.as_mut_slice()],
+                            scores_chunk,
+                            pair_unit,
+                        )
+                    })();
+                    if pair_result.is_ok() {
+                        offset += 2;
+                        continue;
+                    }
+                    self.run_single(token0, out0, scores_chunk)?;
+                    self.run_single(token1, out1, scores_chunk)?;
+                    return pair_result;
+                }
+            }
+            self.run_single(token0, &mut output_chunk[offset], scores_chunk)?;
+            offset += 1;
+        }
+        Ok(())
+    }
+}
+
 struct TileTask<'a> {
     base_token: usize,
     attended: &'a mut [Vec<f32>],
@@ -974,43 +1079,20 @@ pub(super) fn attend_tile(
         {
             return Err(invalid("invalid packed attention tile geometry"));
         }
-        let run_tile_chunk = |base_token: usize,
-                              output_chunk: &mut [Vec<f32>],
-                              scores_chunk: &mut [f32]|
-         -> Result<()> {
-            let unit = grouped_head_unit(heads / keys.heads, heads);
-            for (offset, (output, scores)) in output_chunk
-                .iter_mut()
-                .zip(scores_chunk.chunks_exact_mut(end))
-                .enumerate()
-            {
-                let token = base_token + offset;
-                let position = base + token;
-                let input = PackedAttention {
-                    keys,
-                    values,
-                    queries: &queries[token],
-                    projected: &projected[token],
-                    current_keys: keys.row(position)?,
-                    current_values: values.row(position)?,
-                    history_tokens: position,
-                    heads_per_kv: heads / keys.heads,
-                    scale,
-                    arithmetic,
-                };
-                input.attend_chunk_stack_buffered(
-                    0,
-                    output,
-                    &mut scores[..=position],
-                    position + 1,
-                    unit,
-                )?;
-            }
-            Ok(())
+        let ctx = TileContext {
+            keys,
+            values,
+            queries,
+            projected,
+            base,
+            heads,
+            heads_per_kv: heads / keys.heads,
+            scale,
+            arithmetic,
         };
         let task_count = count.min(parallelism.workers().max(1)).min(MAX_ROW_WORKERS);
         if task_count == 1 {
-            return run_tile_chunk(0, attended, scores);
+            return ctx.run_chunk(0, attended, scores);
         }
         let base_tokens = count / task_count;
         let rem_tokens = count % task_count;
@@ -1033,7 +1115,7 @@ pub(super) fn attend_tile(
         }
         parallelism.update_chunks(&mut tasks[..task_count], 1, |_, tasks| {
             for task in tasks.iter_mut().flatten() {
-                run_tile_chunk(task.base_token, task.attended, task.scores)?;
+                ctx.run_chunk(task.base_token, task.attended, task.scores)?;
             }
             Ok(())
         })
@@ -1086,6 +1168,7 @@ impl PackedAttention<'_> {
     ) -> Result<()> {
         match unit {
             6 => self.attend_chunk_fixed_scores::<6>(base_head, attended, group_scores, stride),
+            4 => self.attend_chunk_fixed_scores::<4>(base_head, attended, group_scores, stride),
             3 => self.attend_chunk_fixed_scores::<3>(base_head, attended, group_scores, stride),
             2 => self.attend_chunk_fixed_scores::<2>(base_head, attended, group_scores, stride),
             _ => {
@@ -1102,6 +1185,76 @@ impl PackedAttention<'_> {
         }
     }
 
+    fn attend_chunk_tile_scores(
+        &self,
+        base_head: usize,
+        attended: &mut [f32],
+        scores_scratch: &mut [f32],
+        stride: usize,
+        unit: usize,
+    ) -> Result<()> {
+        match unit {
+            6 => self.attend_chunk_tile_fixed::<6>(base_head, attended, scores_scratch, stride),
+            4 => self.attend_chunk_tile_fixed::<4>(base_head, attended, scores_scratch, stride),
+            3 => self.attend_chunk_tile_fixed::<3>(base_head, attended, scores_scratch, stride),
+            2 => self.attend_chunk_tile_fixed::<2>(base_head, attended, scores_scratch, stride),
+            _ => {
+                let first_row = scores_scratch
+                    .get_mut(..stride)
+                    .ok_or_else(|| invalid("grouped attention slice length underflow"))?;
+                for (offset, result) in attended
+                    .as_chunks_mut::<HEAD_DIM>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
+                    self.attend_head(base_head + offset, result, first_row)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn attend_chunk_tile_fixed<const G: usize>(
+        &self,
+        base_head: usize,
+        attended: &mut [f32],
+        scores_scratch: &mut [f32],
+        stride: usize,
+    ) -> Result<()> {
+        if scores_scratch.len() >= G * stride {
+            return self.attend_chunk_fixed_scores::<G>(
+                base_head,
+                attended,
+                &mut scores_scratch[..G * stride],
+                stride,
+            );
+        }
+        let heap_rows = (scores_scratch.len() / stride).min(G);
+        if heap_rows == 0 {
+            return Err(invalid("grouped attention slice length underflow"));
+        }
+        let stack_rows = G - heap_rows;
+        if stack_rows * stride > STACK_GROUP_SCORES_LEN {
+            return Err(invalid("grouped attention slice length underflow"));
+        }
+        let mut stack_buf = [0.0_f32; STACK_GROUP_SCORES_LEN];
+        let mut score_rows: [&mut [f32]; G] = std::array::from_fn(|_| &mut [][..]);
+        let mut rest_heap = &mut scores_scratch[..heap_rows * stride];
+        for slot in &mut score_rows[..heap_rows] {
+            let (head, tail) = std::mem::take(&mut rest_heap).split_at_mut(stride);
+            *slot = head;
+            rest_heap = tail;
+        }
+        let mut rest_stack = &mut stack_buf[..stack_rows * stride];
+        for slot in &mut score_rows[heap_rows..] {
+            let (head, tail) = std::mem::take(&mut rest_stack).split_at_mut(stride);
+            *slot = head;
+            rest_stack = tail;
+        }
+        self.attend_chunk_with_score_rows::<G>(base_head, attended, &mut score_rows)
+    }
+
     fn attend_chunk_fixed_scores<const G: usize>(
         &self,
         base_head: usize,
@@ -1110,13 +1263,22 @@ impl PackedAttention<'_> {
         stride: usize,
     ) -> Result<()> {
         let mut score_rows = split_mut_slices::<G>(group_scores, stride)?;
+        self.attend_chunk_with_score_rows::<G>(base_head, attended, &mut score_rows)
+    }
+
+    fn attend_chunk_with_score_rows<const G: usize>(
+        &self,
+        base_head: usize,
+        attended: &mut [f32],
+        score_rows: &mut [&mut [f32]; G],
+    ) -> Result<()> {
         let (groups, remainder) =
             attended.split_at_mut((attended.len() / (G * HEAD_DIM)) * G * HEAD_DIM);
         for (group_index, out_chunk) in groups.chunks_exact_mut(G * HEAD_DIM).enumerate() {
             let group_base = base_head + group_index * G;
             if group_base / self.heads_per_kv == (group_base + G - 1) / self.heads_per_kv {
                 let mut results = split_mut_slices::<G>(out_chunk, HEAD_DIM)?;
-                self.attend_group::<G>(group_base, &mut results, &mut score_rows)?;
+                self.attend_group::<G>(group_base, &mut results, score_rows)?;
             } else {
                 for (offset, result) in out_chunk
                     .as_chunks_mut::<HEAD_DIM>()
@@ -1152,10 +1314,13 @@ impl PackedAttention<'_> {
             6 if 5 * stride <= STACK_GROUP_SCORES_LEN => {
                 self.attend_chunk_stack_fixed::<6>(base_head, attended, first_scores, stride)
             }
+            4 if 3 * stride <= STACK_GROUP_SCORES_LEN => {
+                self.attend_chunk_stack_fixed::<4>(base_head, attended, first_scores, stride)
+            }
             6 | 3 if 2 * stride <= STACK_GROUP_SCORES_LEN => {
                 self.attend_chunk_stack_fixed::<3>(base_head, attended, first_scores, stride)
             }
-            6 | 2 if stride <= STACK_GROUP_SCORES_LEN => {
+            6 | 4 | 2 if stride <= STACK_GROUP_SCORES_LEN => {
                 self.attend_chunk_stack_fixed::<2>(base_head, attended, first_scores, stride)
             }
             _ => {
@@ -1188,34 +1353,7 @@ impl PackedAttention<'_> {
             rest = tail;
         }
         score_rows[G - 1] = first_scores;
-        let (groups, remainder) =
-            attended.split_at_mut((attended.len() / (G * HEAD_DIM)) * G * HEAD_DIM);
-        for (group_index, out_chunk) in groups.chunks_exact_mut(G * HEAD_DIM).enumerate() {
-            let group_base = base_head + group_index * G;
-            if group_base / self.heads_per_kv == (group_base + G - 1) / self.heads_per_kv {
-                let mut results = split_mut_slices::<G>(out_chunk, HEAD_DIM)?;
-                self.attend_group::<G>(group_base, &mut results, &mut score_rows)?;
-            } else {
-                for (offset, result) in out_chunk
-                    .as_chunks_mut::<HEAD_DIM>()
-                    .0
-                    .iter_mut()
-                    .enumerate()
-                {
-                    self.attend_head(group_base + offset, result, score_rows[G - 1])?;
-                }
-            }
-        }
-        let rem_base = base_head + (groups.len() / HEAD_DIM);
-        for (offset, result) in remainder
-            .as_chunks_mut::<HEAD_DIM>()
-            .0
-            .iter_mut()
-            .enumerate()
-        {
-            self.attend_head(rem_base + offset, result, score_rows[G - 1])?;
-        }
-        Ok(())
+        self.attend_chunk_with_score_rows::<G>(base_head, attended, &mut score_rows)
     }
 
     fn attend_group<const G: usize>(
@@ -1345,6 +1483,217 @@ impl PackedAttention<'_> {
         result.copy_from_slice(&output);
         Ok(())
     }
+}
+
+fn attend_pair_tokens(
+    pair: [&PackedAttention<'_>; 2],
+    results: [&mut [f32]; 2],
+    scores_chunk: &mut [f32],
+    unit: usize,
+) -> Result<()> {
+    match unit {
+        6 => attend_pair_fixed::<6>(pair, results, scores_chunk),
+        4 => attend_pair_fixed::<4>(pair, results, scores_chunk),
+        3 => attend_pair_fixed::<3>(pair, results, scores_chunk),
+        2 => attend_pair_fixed::<2>(pair, results, scores_chunk),
+        _ => attend_pair_fixed::<1>(pair, results, scores_chunk),
+    }
+}
+
+fn attend_pair_fixed<const G: usize>(
+    pair: [&PackedAttention<'_>; 2],
+    results: [&mut [f32]; 2],
+    scores_chunk: &mut [f32],
+) -> Result<()> {
+    let stride0 = pair[0].history_tokens + 1;
+    let stride1 = pair[1].history_tokens + 1;
+    if stride1 != stride0 + 1
+        || results[0].len() != results[1].len()
+        || !results[0].len().is_multiple_of(HEAD_DIM)
+    {
+        return Err(invalid("invalid packed attention pair geometry"));
+    }
+    let needed0 = checked_product(&[G, stride0])?;
+    let needed1 = checked_product(&[G, stride1])?;
+    let total_needed = checked_sum(needed0, needed1)?;
+    if scores_chunk.len() < total_needed {
+        return Err(invalid("grouped attention slice length underflow"));
+    }
+    let (scores0_flat, tail) = scores_chunk.split_at_mut(needed0);
+    let scores1_flat = &mut tail[..needed1];
+    let mut score_rows0 = split_mut_slices::<G>(scores0_flat, stride0)?;
+    let mut score_rows1 = split_mut_slices::<G>(scores1_flat, stride1)?;
+
+    let [out0, out1] = results;
+    let group_elems = (out0.len() / (G * HEAD_DIM)) * G * HEAD_DIM;
+    let (groups0, rem0) = out0.split_at_mut(group_elems);
+    let (groups1, rem1) = out1.split_at_mut(group_elems);
+    let heads_per_kv = pair[0].heads_per_kv;
+    for (group_index, (chunk0, chunk1)) in groups0
+        .chunks_exact_mut(G * HEAD_DIM)
+        .zip(groups1.chunks_exact_mut(G * HEAD_DIM))
+        .enumerate()
+    {
+        let group_base = group_index * G;
+        if group_base / heads_per_kv == (group_base + G - 1) / heads_per_kv {
+            let mut head_outputs0 = split_mut_slices::<G>(chunk0, HEAD_DIM)?;
+            let mut head_outputs1 = split_mut_slices::<G>(chunk1, HEAD_DIM)?;
+            attend_group_pair::<G>(
+                pair,
+                group_base,
+                [&mut head_outputs0, &mut head_outputs1],
+                [&mut score_rows0, &mut score_rows1],
+            )?;
+        } else {
+            for (offset, res) in chunk0.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
+                pair[0].attend_head(group_base + offset, res, score_rows0[0])?;
+            }
+            for (offset, res) in chunk1.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
+                pair[1].attend_head(group_base + offset, res, score_rows1[0])?;
+            }
+        }
+    }
+    let rem_base = groups0.len() / HEAD_DIM;
+    for (offset, res) in rem0.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
+        pair[0].attend_head(rem_base + offset, res, score_rows0[0])?;
+    }
+    for (offset, res) in rem1.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
+        pair[1].attend_head(rem_base + offset, res, score_rows1[0])?;
+    }
+    Ok(())
+}
+
+fn score_pair_group<const G: usize>(
+    pair: [&PackedAttention<'_>; 2],
+    base_head: usize,
+    kv_head: usize,
+    score_rows: &mut [&mut [&mut [f32]; G]; 2],
+) -> Result<()> {
+    let pos0 = pair[0].history_tokens;
+    let pos1 = pair[1].history_tokens;
+    let mut rotated0 = [[0.0; HEAD_DIM]; G];
+    let mut rotated1 = [[0.0; HEAD_DIM]; G];
+    for offset in 0..G {
+        let head = base_head + offset;
+        let range = head * HEAD_DIM..(head + 1) * HEAD_DIM;
+        pair[0]
+            .keys
+            .quantizer
+            .rotate(&pair[0].queries[range.clone()], &mut rotated0[offset])?;
+        pair[1]
+            .keys
+            .quantizer
+            .rotate(&pair[1].queries[range], &mut rotated1[offset])?;
+    }
+    let refs0: [&[f32; HEAD_DIM]; G] = std::array::from_fn(|offset| &rotated0[offset]);
+    let refs1: [&[f32; HEAD_DIM]; G] = std::array::from_fn(|offset| &rotated1[offset]);
+    let prepared_pair = pair[0].keys.quantizer.prepare_query_pair(refs0, refs1)?;
+    for (token, row) in pair[0]
+        .keys
+        .rows()
+        .take(pos0)
+        .chain(std::iter::once(pair[0].current_keys))
+        .enumerate()
+    {
+        let (s0, s1) = prepared_pair.score_pair(pair[0].keys.record(row, kv_head))?;
+        for (probabilities, score) in score_rows[0].iter_mut().zip(s0) {
+            probabilities[token] = score * pair[0].scale;
+        }
+        for (probabilities, score) in score_rows[1].iter_mut().zip(s1) {
+            probabilities[token] = score * pair[1].scale;
+        }
+    }
+    let s1_last = prepared_pair.score_second(pair[1].keys.record(pair[1].current_keys, kv_head))?;
+    for (probabilities, score) in score_rows[1].iter_mut().zip(s1_last) {
+        probabilities[pos1] = score * pair[1].scale;
+    }
+    for token_rows in score_rows.iter_mut() {
+        for probabilities in token_rows.iter_mut() {
+            match pair[0].arithmetic {
+                super::Arithmetic::Source => crate::kernels::softmax_round_f16(probabilities)?,
+                super::Arithmetic::PinnedSwift => {
+                    crate::kernels::pinned_attention::softmax_rotated_kv(probabilities)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn attend_group_pair<const G: usize>(
+    pair: [&PackedAttention<'_>; 2],
+    base_head: usize,
+    results: [&mut [&mut [f32]; G]; 2],
+    mut score_rows: [&mut [&mut [f32]; G]; 2],
+) -> Result<()> {
+    const PROB_PACK_CHUNK: usize = 64;
+    let kv_head = base_head / pair[0].heads_per_kv;
+    let pos0 = pair[0].history_tokens;
+    let total0 = pos0 + 1;
+    let total1 = pair[1].history_tokens + 1;
+    if score_rows[0].iter().any(|row| row.len() != total0)
+        || score_rows[1].iter().any(|row| row.len() != total1)
+    {
+        return Err(invalid("packed attention score row length mismatch"));
+    }
+    score_pair_group::<G>(pair, base_head, kv_head, &mut score_rows)?;
+    let mut accumulator = pair[0]
+        .values
+        .quantizer
+        .value_group_pair_accumulator::<G>()?;
+    let mut packed_w0 = [[0.0_f32; G]; PROB_PACK_CHUNK];
+    let mut packed_w1 = [[0.0_f32; G]; PROB_PACK_CHUNK];
+    let mut value_rows = pair[0]
+        .values
+        .rows()
+        .take(pos0)
+        .chain(std::iter::once(pair[0].current_values));
+    for chunk_start in (0..total0).step_by(PROB_PACK_CHUNK) {
+        let chunk_len = (total0 - chunk_start).min(PROB_PACK_CHUNK);
+        for (head, (probs0, probs1)) in score_rows[0].iter().zip(score_rows[1].iter()).enumerate() {
+            for (slot, &w0) in packed_w0[..chunk_len]
+                .iter_mut()
+                .zip(&probs0[chunk_start..chunk_start + chunk_len])
+            {
+                slot[head] = w0;
+            }
+            for (slot, &w1) in packed_w1[..chunk_len]
+                .iter_mut()
+                .zip(&probs1[chunk_start..chunk_start + chunk_len])
+            {
+                slot[head] = w1;
+            }
+        }
+        for (&w0, &w1) in packed_w0[..chunk_len].iter().zip(&packed_w1[..chunk_len]) {
+            let row = value_rows
+                .next()
+                .ok_or_else(|| invalid("packed value cache row is short"))?;
+            accumulator.accumulate_pair(pair[0].values.record(row, kv_head), w0, w1)?;
+        }
+    }
+    let w1_last: [f32; G] = std::array::from_fn(|head| score_rows[1][head][total0]);
+    accumulator.accumulate_second(
+        pair[1].values.record(pair[1].current_values, kv_head),
+        w1_last,
+    )?;
+    let mut outputs = accumulator.finish()?;
+    for (token, (token_outputs, token_results)) in outputs.iter_mut().zip(results).enumerate() {
+        for (offset, (output, result)) in token_outputs
+            .iter_mut()
+            .zip(token_results.iter_mut())
+            .enumerate()
+        {
+            let head = base_head + offset;
+            pair[token].values.quantizer.inverse(output)?;
+            super::mul_sigmoid_in_place(
+                output,
+                super::attention_gate(pair[token].projected, head, HEAD_DIM),
+            );
+            super::finite(output, "packed attention output")?;
+            result.copy_from_slice(output);
+        }
+    }
+    Ok(())
 }
 
 fn resize_bytes(count: usize, output: &mut Vec<u8>) -> Result<()> {

@@ -17,10 +17,10 @@ use bonsai_prism_runtime::{
         validate_execution_capacity_with_reuse,
     },
 };
-use bonsai_windows_credentials::validate_read_path;
+use bonsai_windows_credentials::{validate_external_path, validate_read_path};
 
 use crate::{
-    native_backend::Placement,
+    native_backend::{Placement, WorkerOptions},
     service::bound_loopback_socket,
     startup::{self, Stage},
 };
@@ -64,6 +64,7 @@ struct Config {
     cpu_prefill: Option<CpuPrefill>,
     cpu_speculation: Option<CpuSpeculation>,
     capacity: Option<(usize, u64)>,
+    hexagon_arena_cache: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +117,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let (mut reuse_checkpoints, mut reuse_checkpoint_bytes) = (None, None);
     let mut kv_cache = None;
     let mut placement = None;
+    let mut hexagon_arena_cache = None;
     let (mut prefill_tokens, mut prefill_scratch, mut prefill_gdn) = (None, None, None);
     let (mut spec_type, mut draft_max) = (None, None);
     let (mut speculative_tokens, mut verification_scratch, mut speculative_checkpoint) =
@@ -270,6 +272,9 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                     _ => return Err(invalid()),
                 });
             }
+            Some("--hexagon-arena-cache") if hexagon_arena_cache.is_none() => {
+                hexagon_arena_cache = Some(PathBuf::from(value));
+            }
             _ => return Err(invalid()),
         }
     }
@@ -344,6 +349,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             resolved_kv_cache,
             resolved_policy,
         )?,
+        hexagon_arena_cache,
     };
     if let Some(expected_sections) = config.verified_sections {
         let configured_sections = 1_usize
@@ -418,7 +424,20 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     {
         validate_read_path(path)?;
     }
+    if let Some(ref cache_dir) = config.hexagon_arena_cache {
+        validate_hexagon_arena_cache_dir(cache_dir)?;
+    }
     Ok(config)
+}
+
+fn validate_hexagon_arena_cache_dir(dir: &std::path::Path) -> io::Result<()> {
+    validate_external_path(dir)?;
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(invalid()),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn resolve_daisyrose_config(
@@ -790,25 +809,27 @@ async fn serve_prepared(
     prepared_transport: PreparedTransport,
     session: SwiftSession,
     placement: Placement,
+    options: WorkerOptions,
 ) -> io::Result<()> {
     let served = match prepared_transport {
         PreparedTransport::Loopback { port, guard, key } => {
             let listener = bound_loopback_socket(port)
                 .and_then(|socket| socket.listen(1))
                 .map_err(|error| startup::at(Stage::Listener, &error))?;
-            let result = Box::pin(crate::native_backend::serve_with_placement(
-                listener, session, key, placement,
+            let result = Box::pin(crate::native_backend::serve_with_options(
+                listener, session, key, placement, options,
             ))
             .await;
             drop(guard);
             result
         }
         PreparedTransport::BrokerPipe { endpoint, key } => {
-            Box::pin(crate::native_backend::serve_broker_pipe_with_placement(
+            Box::pin(crate::native_backend::serve_broker_pipe_with_options(
                 endpoint,
                 session,
                 key.as_str(),
                 placement,
+                options,
             ))
             .await
         }
@@ -906,6 +927,9 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         prepared_transport,
         session,
         config.placement,
+        WorkerOptions {
+            hexagon_arena_cache: config.hexagon_arena_cache,
+        },
     ))
 }
 
@@ -2157,6 +2181,57 @@ mod tests {
             "4096".into(),
         ]);
         assert!(parse(partial).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_hexagon_arena_cache_flag_parsing_and_validation() -> io::Result<()> {
+        let (directory, [model, _key, _adapter]) = files()?;
+        let base: Vec<OsString> = vec![
+            "--native-engine-child".into(),
+            "--broker-pipe".into(),
+            "--model".into(),
+            model,
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        assert_eq!(parse(base.clone())?.hexagon_arena_cache, None);
+
+        let existing_dir = directory.path().join("arena-cache-existing");
+        std::fs::create_dir(&existing_dir)?;
+        let mut with_existing = base.clone();
+        with_existing.extend(["--hexagon-arena-cache".into(), existing_dir.clone().into()]);
+        assert_eq!(
+            parse(with_existing.clone())?.hexagon_arena_cache,
+            Some(existing_dir)
+        );
+
+        let leaf_dir = directory.path().join("arena-cache-leaf");
+        let mut with_leaf = base.clone();
+        with_leaf.extend(["--hexagon-arena-cache".into(), leaf_dir.clone().into()]);
+        assert_eq!(parse(with_leaf)?.hexagon_arena_cache, Some(leaf_dir));
+
+        let mut duplicate = with_existing;
+        duplicate.extend([
+            "--hexagon-arena-cache".into(),
+            directory.path().join("other").into(),
+        ]);
+        assert!(parse(duplicate).is_err());
+
+        let mut missing_value = base.clone();
+        missing_value.push("--hexagon-arena-cache".into());
+        assert!(parse(missing_value).is_err());
+
+        let existing_file = directory.path().join("not-a-directory");
+        std::fs::write(&existing_file, b"file")?;
+        let mut with_file = base.clone();
+        with_file.extend(["--hexagon-arena-cache".into(), existing_file.into()]);
+        assert!(parse(with_file).is_err());
+
+        let mut relative = base;
+        relative.extend(["--hexagon-arena-cache".into(), "relative-cache".into()]);
+        assert!(parse(relative).is_err());
         Ok(())
     }
 }

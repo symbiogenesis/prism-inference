@@ -1,7 +1,7 @@
 //! A single joined model owner and acknowledged one-event output lane.
 
 use super::{
-    NativeBackendError, PendingChat, Placement,
+    NativeBackendError, PendingChat, Placement, WorkerOptions,
     profile::{ModelProfile, ProjectionStartup},
 };
 use bonsai_prism_runtime::{
@@ -10,6 +10,7 @@ use bonsai_prism_runtime::{
     swift_session::{SwiftSession, TextEvent},
 };
 use std::{
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -60,13 +61,21 @@ pub(super) trait Engine: Send + 'static {
             }
         }
     }
+    fn initialize_worker_thread_with_options(
+        &mut self,
+        placement: Placement,
+        _options: &WorkerOptions,
+    ) -> Result<ProjectionStartup, NativeBackendError> {
+        self.initialize_worker_thread_for_placement(placement)
+    }
 }
 
-fn initialize_for_placement(
+fn initialize_with_options(
     engine: &mut impl Engine,
     placement: Placement,
+    options: &WorkerOptions,
 ) -> Result<ProjectionStartup, NativeBackendError> {
-    engine.initialize_worker_thread_for_placement(placement)
+    engine.initialize_worker_thread_with_options(placement, options)
 }
 
 impl Engine for SwiftSession {
@@ -155,36 +164,53 @@ impl Engine for SwiftSession {
         Self::reset(self)
     }
     fn initialize_worker_thread(&mut self) -> Result<ProjectionStartup, NativeBackendError> {
-        #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-        if let Some(startup) = install_default_hexagon_executor(self) {
-            return Ok(startup);
-        }
-        let Some(identity) = self.projection_executor_identity() else {
-            return Ok(ProjectionStartup::Cpu);
-        };
-        if identity.is_empty()
-            || identity.len() > 256
-            || !identity.bytes().all(|byte| byte.is_ascii_graphic())
-        {
-            return Err(NativeBackendError::Configuration);
-        }
-        Ok(ProjectionStartup::External(Arc::from(identity)))
+        initialize_auto_executor(self, None)
     }
     fn initialize_worker_thread_for_placement(
         &mut self,
         placement: Placement,
     ) -> Result<ProjectionStartup, NativeBackendError> {
+        self.initialize_worker_thread_with_options(placement, &WorkerOptions::default())
+    }
+    fn initialize_worker_thread_with_options(
+        &mut self,
+        placement: Placement,
+        options: &WorkerOptions,
+    ) -> Result<ProjectionStartup, NativeBackendError> {
+        let arena_cache_dir = options.hexagon_arena_cache.as_deref();
         match placement {
             Placement::Cpu => Ok(ProjectionStartup::Cpu),
-            Placement::Auto => self.initialize_worker_thread(),
+            Placement::Auto => initialize_auto_executor(self, arena_cache_dir),
             Placement::Vulkan => install_vulkan_executor(self),
-            Placement::Composite => install_composite_executor(self),
+            Placement::Composite => install_composite_executor(self, arena_cache_dir),
         }
     }
 }
 
+fn initialize_auto_executor(
+    session: &mut SwiftSession,
+    arena_cache_dir: Option<&Path>,
+) -> Result<ProjectionStartup, NativeBackendError> {
+    #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+    if let Some(startup) = install_default_hexagon_executor(session, arena_cache_dir) {
+        return Ok(startup);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")))]
+    let _ = arena_cache_dir;
+    let Some(identity) = session.projection_executor_identity() else {
+        return Ok(ProjectionStartup::Cpu);
+    };
+    if identity.is_empty()
+        || identity.len() > 256
+        || !identity.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(NativeBackendError::Configuration);
+    }
+    Ok(ProjectionStartup::External(Arc::from(identity)))
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-static HEXAGON_PACKAGE_HINT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static HEXAGON_PACKAGE_HINT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 type WorkerCompositeExecutor = bonsai_hexagon_runtime::OwnedCompositeProjectionExecutor<
@@ -635,7 +661,7 @@ impl_tls_pq2_executor!(
 );
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-fn has_signed_htp_module(dir: &std::path::Path) -> bool {
+fn has_signed_htp_module(dir: &Path) -> bool {
     dir.join("libggml-htp-v81.so").is_file() || dir.join("libggml-htp-v73.so").is_file()
 }
 
@@ -651,7 +677,7 @@ fn has_signed_htp_module(dir: &std::path::Path) -> bool {
         reason = "Non-ARM64 Windows stub matches the filesystem-probing ARM64 signature."
     )
 )]
-pub(crate) fn register_hexagon_model_path(model: &std::path::Path) {
+pub(crate) fn register_hexagon_model_path(model: &Path) {
     #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
     {
         for ancestor in model.ancestors() {
@@ -675,14 +701,14 @@ pub(crate) fn register_hexagon_model_path(model: &std::path::Path) {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
+fn discover_hexagon_package_directory() -> Option<PathBuf> {
     if let Some(hint) = HEXAGON_PACKAGE_HINT.get()
         && has_signed_htp_module(hint)
     {
         return Some(hint.clone());
     }
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let candidate = std::path::PathBuf::from(local_app_data)
+        let candidate = PathBuf::from(local_app_data)
             .join("SwiftBonsai2")
             .join("hexagon")
             .join("runtime");
@@ -701,23 +727,25 @@ fn discover_hexagon_package_directory() -> Option<std::path::PathBuf> {
 const VULKAN_WEIGHT_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 #[cfg(windows)]
+const LAYER_PROJECTION_SUFFIXES: [&str; 10] = [
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_qkv.weight",
+    "attn_gate.weight",
+    "attn_output.weight",
+    "ffn_gate.weight",
+    "ffn_up.weight",
+    "ffn_down.weight",
+    "ssm_out.weight",
+];
+
+#[cfg(windows)]
 fn collect_layer_projection_tensors(
     session: &SwiftSession,
     layers: std::ops::Range<usize>,
     include_output: bool,
 ) -> Vec<&bonsai_prism_runtime::model::Tensor> {
-    const LAYER_PROJECTION_SUFFIXES: [&str; 10] = [
-        "attn_q.weight",
-        "attn_k.weight",
-        "attn_v.weight",
-        "attn_qkv.weight",
-        "attn_gate.weight",
-        "attn_output.weight",
-        "ffn_gate.weight",
-        "ffn_up.weight",
-        "ffn_down.weight",
-        "ssm_out.weight",
-    ];
     let mut tensors = Vec::new();
     for layer in layers {
         for suffix in LAYER_PROJECTION_SUFFIXES {
@@ -732,45 +760,269 @@ fn collect_layer_projection_tensors(
     tensors
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-fn open_hexagon_native_q2_executor(
-    session: &SwiftSession,
-) -> Option<(
-    bonsai_hexagon_runtime::NativeQ2Executor<hexagon_native_rpc::NativeQ2Session>,
-    Vec<bonsai_prism_runtime::model::Tensor>,
-    bonsai_hexagon_runtime::NativeQ2ResidencyStatistics,
-)> {
-    if session.representation() != bonsai_prism_runtime::model::swift::Representation::Pq2
-        || session.cpu_speculation().is_some()
-    {
+#[cfg(any(
+    test,
+    all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
+))]
+pub(super) const fn supports_hexagon_native_q2_representation(
+    representation: bonsai_prism_runtime::model::swift::Representation,
+) -> bool {
+    match representation {
+        bonsai_prism_runtime::model::swift::Representation::Pq2 => true,
+        // `NativeQ2Executor`, `NativeQ2ArenaCache`, and `plan_native_q2_layers_for_budget`
+        // already support `PTQ1_KIND` (143) via `supports_f32`, but non-server runtime crates
+        // (`src/graph.rs`, `src/kernels/projection.rs`, `src/graph/prefill.rs`,
+        // `src/graph/projection.rs`) currently restrict `supports_f32` dispatch to `PQ2` (142).
+        bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1 => false,
+    }
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
+))]
+const fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
+))]
+pub(super) fn decode_model_identity_sha256(identity_hex: &str) -> Option<[u8; 32]> {
+    if identity_hex.len() != 64 {
         return None;
     }
-    let package_dir = discover_hexagon_package_directory()?;
-    let mut limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
+    let bytes = identity_hex.as_bytes();
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (slot, chunk) in digest.iter_mut().zip(chunks) {
+        let high = decode_hex_nibble(chunk[0])?;
+        let low = decode_hex_nibble(chunk[1])?;
+        *slot = (high << 4) | low;
+    }
+    Some(digest)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
+))]
+pub(super) fn hexagon_arena_cache_file_path(
+    cache_dir: &Path,
+    architecture: u32,
+    representation: bonsai_prism_runtime::model::swift::Representation,
+    model_identity_hex: &str,
+    tensor_count: usize,
+) -> PathBuf {
+    let repr_slug = match representation {
+        bonsai_prism_runtime::model::swift::Representation::Pq2 => "pq2",
+        bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1 => "ptq1",
+    };
+    let safe_identity: String = model_identity_hex
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    cache_dir.join(format!(
+        "hexagon-v{architecture}-{repr_slug}-{safe_identity}-n{tensor_count}.sb2hq2c1"
+    ))
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+pub(super) const fn default_or_reported_vtcm_bytes(
+    arch: u32,
+    reported_vtcm_bytes: Option<u32>,
+) -> u32 {
+    match reported_vtcm_bytes {
+        Some(bytes) if bytes >= 65_536 => bytes,
+        _ if arch == 81 => 8 * 1024 * 1024,
+        _ => 4 * 1024 * 1024,
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn query_driver_vtcm_bytes(driver: &mut hexagon_native_rpc::Driver, arch: u32) -> u32 {
+    let page = driver
+        .capability(hexagon_native_rpc::Capability::VtcmPage)
+        .ok();
+    let count = driver
+        .capability(hexagon_native_rpc::Capability::VtcmCount)
+        .ok();
+    default_or_reported_vtcm_bytes(arch, page.zip(count).and_then(|(p, c)| p.checked_mul(c)))
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+pub(super) fn mapped_arena_budget_for_capacity(capacity_bytes: usize) -> Option<(usize, usize)> {
+    if capacity_bytes == 0 {
+        return None;
+    }
+    let mut remaining = capacity_bytes;
+    let mut arena_caps = Vec::with_capacity(hexagon_native_rpc::NATIVE_Q2_MAX_WEIGHT_ARENAS);
+    for idx in 0..hexagon_native_rpc::NATIVE_Q2_MAX_WEIGHT_ARENAS {
+        if remaining == 0 {
+            break;
+        }
+        let step = if idx.is_multiple_of(2) {
+            hexagon_native_rpc::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+        } else {
+            hexagon_native_rpc::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES
+        };
+        let arena_cap = remaining.min(step);
+        arena_caps.push(arena_cap);
+        remaining -= arena_cap;
+    }
+    let full_arenas = arena_caps
+        .iter()
+        .filter(|&&cap| cap >= hexagon_native_rpc::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES)
+        .count();
+    if full_arenas > 0 {
+        let per_arena = if full_arenas == 1 {
+            arena_caps[0].min(hexagon_native_rpc::NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES)
+        } else {
+            hexagon_native_rpc::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES
+        };
+        Some((per_arena, full_arenas))
+    } else {
+        Some((
+            arena_caps[0].min(hexagon_native_rpc::NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES),
+            1,
+        ))
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+pub(super) fn plan_hexagon_vtcm_placement(
+    model: &bonsai_prism_runtime::model::Model,
+    arch: u32,
+    vtcm_bytes: u32,
+    capacity_limit_bytes: Option<usize>,
+) -> Option<bonsai_hexagon_runtime::VtcmPlacementPlan> {
+    if capacity_limit_bytes
+        .is_none_or(|cap| cap >= bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES)
+        && let Ok(plan) = bonsai_hexagon_runtime::plan_native_q2_layers_for_budget(
+            model,
+            arch,
+            hexagon_native_rpc::NATIVE_Q2_MAX_ARENA_WEIGHT_BYTES,
+            hexagon_native_rpc::NATIVE_Q2_MAX_WEIGHT_ARENAS,
+            vtcm_bytes,
+        )
+        && capacity_limit_bytes.is_none_or(|cap| plan.resident_bytes <= cap)
+    {
+        return Some(plan);
+    }
+    let limit = capacity_limit_bytes?;
+    let (max_arena_bytes, max_arenas) = mapped_arena_budget_for_capacity(limit)?;
+    let plan = bonsai_hexagon_runtime::plan_native_q2_layers_for_budget(
+        model,
+        arch,
+        max_arena_bytes,
+        max_arenas,
+        vtcm_bytes,
+    )
+    .ok()?;
+    (plan.resident_bytes <= limit).then_some(plan)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn collect_swift_placement_model(
+    session: &SwiftSession,
+) -> Option<bonsai_prism_runtime::model::Model> {
+    let mut tensors = std::collections::BTreeMap::new();
+    let mut layer = 0_usize;
+    loop {
+        let mut found_in_layer = false;
+        for suffix in LAYER_PROJECTION_SUFFIXES {
+            let name = format!("blk.{layer}.{suffix}");
+            if let Some(tensor) = session.projection_tensor(&name) {
+                tensors.insert(name, tensor.clone());
+                found_in_layer = true;
+            }
+        }
+        if !found_in_layer {
+            break;
+        }
+        layer += 1;
+    }
+    if tensors.is_empty() {
+        return None;
+    }
+    Some(bonsai_prism_runtime::model::Model {
+        metadata: std::collections::BTreeMap::new(),
+        tensors,
+        identity: session.model_identity().to_owned(),
+    })
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn collect_planned_tensors(
+    model: &bonsai_prism_runtime::model::Model,
+    plan: &bonsai_hexagon_runtime::VtcmPlacementPlan,
+) -> Option<Vec<bonsai_prism_runtime::model::Tensor>> {
+    let mut tensors = Vec::new();
+    tensors.try_reserve_exact(plan.npu_projections.len()).ok()?;
+    for name in &plan.npu_projections {
+        tensors.push(model.tensors.get(name)?.clone());
+    }
+    Some(tensors)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn build_native_q2_limits(
+    arch: u32,
+    resident_weight_bytes: usize,
+) -> Option<hexagon_native_rpc::NativeQ2ProjectionLimits> {
+    let limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
         hexagon_native_rpc::NATIVE_Q2_MAX_COLUMNS,
         hexagon_native_rpc::NATIVE_Q2_MAX_ROWS,
         24_000,
         Duration::from_mins(2),
     )
-    .and_then(|limits| {
-        limits
-            .with_resident_weights(bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES)
-    })
+    .and_then(|limits| limits.with_resident_weights(resident_weight_bytes))
     .map(hexagon_native_rpc::NativeQ2ProjectionLimits::with_persistent_session)
     .ok()?;
-    let q2_session = {
-        let mut driver = hexagon_native_rpc::Driver::open_system().ok()?;
-        let arch = driver
-            .capability(hexagon_native_rpc::Capability::Architecture)
-            .ok()
-            .and_then(hexagon_native_rpc::decode_architecture)
-            .unwrap_or(81);
-        if arch == 73 {
-            limits = limits.with_partial_secondary_arenas();
-        }
-        driver.open_native_q2_session(&package_dir, limits).ok()?
-    };
-    let mut executor =
+    Some(if arch == 73 {
+        limits.with_partial_secondary_arenas()
+    } else {
+        limits
+    })
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn probe_hexagon_hardware() -> Option<(u32, u32)> {
+    let mut driver = hexagon_native_rpc::Driver::open_system().ok()?;
+    let arch = driver
+        .capability(hexagon_native_rpc::Capability::Architecture)
+        .ok()
+        .and_then(hexagon_native_rpc::decode_architecture)
+        .unwrap_or(81);
+    let vtcm_bytes = query_driver_vtcm_bytes(&mut driver, arch);
+    drop(driver);
+    hexagon_native_rpc::is_supported_htp_architecture(arch).then_some((arch, vtcm_bytes))
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn open_native_q2_executor_once(
+    package_dir: &Path,
+    limits: hexagon_native_rpc::NativeQ2ProjectionLimits,
+    session: &SwiftSession,
+) -> Option<(
+    bonsai_hexagon_runtime::NativeQ2Executor<hexagon_native_rpc::NativeQ2Session>,
+    usize,
+)> {
+    let q2_session = hexagon_native_rpc::Driver::open_system()
+        .ok()?
+        .open_native_q2_session(package_dir, limits)
+        .ok()?;
+    let capacity = hexagon_native_rpc::NativeQ2Submitter::residency_capacity_bytes(&q2_session);
+    let executor =
         bonsai_hexagon_runtime::NativeQ2Executor::new(q2_session, limits, 64 * 1024 * 1024)
             .with_row_parallelism(session.clone_row_parallelism())
             .and_then(|executor| {
@@ -779,13 +1031,81 @@ fn open_hexagon_native_q2_executor(
                 )
             })
             .ok()?;
-    let mut tensors = Vec::new();
-    tensors
-        .try_reserve_exact(bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS.len())
-        .ok()?;
-    for &name in &bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS {
-        let tensor = session.projection_tensor(name)?;
-        tensors.push(tensor.clone());
+    Some((executor, capacity))
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn open_hexagon_native_q2_executor(
+    session: &SwiftSession,
+    arena_cache_dir: Option<&Path>,
+) -> Option<(
+    bonsai_hexagon_runtime::NativeQ2Executor<hexagon_native_rpc::NativeQ2Session>,
+    Vec<bonsai_prism_runtime::model::Tensor>,
+    bonsai_hexagon_runtime::NativeQ2ResidencyStatistics,
+    bonsai_hexagon_runtime::VtcmPlacementPlan,
+)> {
+    if !supports_hexagon_native_q2_representation(session.representation())
+        || session.cpu_speculation().is_some()
+    {
+        return None;
+    }
+    let package_dir = discover_hexagon_package_directory()?;
+    let model = collect_swift_placement_model(session)?;
+    let (arch, vtcm_bytes) = probe_hexagon_hardware()?;
+    let initial_plan = plan_hexagon_vtcm_placement(&model, arch, vtcm_bytes, None)?;
+    let requested_bytes = if initial_plan.resident_bytes
+        == bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES
+    {
+        bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES
+    } else {
+        initial_plan
+            .resident_bytes
+            .saturating_add(64 * 1024 * 1024)
+            .min(bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES)
+    };
+    let limits = build_native_q2_limits(arch, requested_bytes)?;
+    let (mut executor, mut actual_capacity) =
+        open_native_q2_executor_once(&package_dir, limits, session)?;
+    let mut plan = if actual_capacity >= initial_plan.resident_bytes {
+        initial_plan
+    } else {
+        plan_hexagon_vtcm_placement(&model, arch, vtcm_bytes, Some(actual_capacity))?
+    };
+    let mut tensors = collect_planned_tensors(&model, &plan)?;
+    let model_sha256 = decode_model_identity_sha256(session.model_identity());
+    if let Some(cache_dir) = arena_cache_dir
+        && let Some(sha256) = model_sha256
+    {
+        let cache_path = hexagon_arena_cache_file_path(
+            cache_dir,
+            arch,
+            session.representation(),
+            session.model_identity(),
+            tensors.len(),
+        );
+        if cache_path.is_file() {
+            if bonsai_hexagon_runtime::NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                &mut executor,
+                &cache_path,
+                sha256,
+                &tensors,
+            )
+            .is_ok()
+            {
+                let residency = executor.residency_statistics();
+                return Some((executor, tensors, residency, plan));
+            }
+            // Any load failure faults the executor; drop it and reopen cleanly.
+            drop(executor);
+            let _ = std::fs::remove_file(&cache_path);
+            (executor, actual_capacity) =
+                open_native_q2_executor_once(&package_dir, limits, session)?;
+            if actual_capacity < plan.resident_bytes {
+                plan =
+                    plan_hexagon_vtcm_placement(&model, arch, vtcm_bytes, Some(actual_capacity))?;
+                tensors = collect_planned_tensors(&model, &plan)?;
+            }
+        }
     }
     if executor.htp_architecture() == 73 {
         executor.select_prefix_and_prewarm_tensors(&tensors).ok()?;
@@ -793,14 +1113,42 @@ fn open_hexagon_native_q2_executor(
         executor.select_and_prewarm_tensors(&tensors).ok()?;
     }
     let residency = executor.residency_statistics();
-    Some((executor, tensors, residency))
+    if let Some(cache_dir) = arena_cache_dir
+        && let Some(sha256) = model_sha256
+        && usize::try_from(residency.tensors_prepared).ok() == Some(tensors.len())
+        && std::fs::create_dir_all(cache_dir).is_ok()
+    {
+        let cache_path = hexagon_arena_cache_file_path(
+            cache_dir,
+            arch,
+            session.representation(),
+            session.model_identity(),
+            tensors.len(),
+        );
+        let row_parallelism = session.clone_row_parallelism();
+        let _ = bonsai_hexagon_runtime::NativeQ2ArenaCache::save_verified_cache(
+            &cache_path,
+            arch,
+            sha256,
+            &tensors,
+            Some(&row_parallelism),
+        );
+    }
+    Some((executor, tensors, residency, plan))
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
-fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<ProjectionStartup> {
-    let (executor, _tensors, residency) = open_hexagon_native_q2_executor(session)?;
-    let startup = if residency.tensors_prepared == 168
-        && residency.weight_payload_bytes_prepared == 2_888_663_040
+fn install_default_hexagon_executor(
+    session: &mut SwiftSession,
+    arena_cache_dir: Option<&Path>,
+) -> Option<ProjectionStartup> {
+    let (executor, _tensors, residency, plan) =
+        open_hexagon_native_q2_executor(session, arena_cache_dir)?;
+    let startup = if residency.tensors_prepared
+        == u64::try_from(bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS.len()).ok()?
+        && residency.weight_payload_bytes_prepared
+            == u64::try_from(bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES)
+                .ok()?
     {
         ProjectionStartup::NativeQ2 {
             resident_tensors: residency.tensors_prepared,
@@ -809,7 +1157,7 @@ fn install_default_hexagon_executor(session: &mut SwiftSession) -> Option<Projec
         }
     } else {
         ProjectionStartup::NativeQ2Partial {
-            architecture: executor.htp_architecture(),
+            architecture: plan.architecture,
             resident_tensors: residency.tensors_prepared,
             resident_weight_bytes: residency.weight_payload_bytes_prepared,
             host_metadata_bytes: residency.metadata_payload_bytes,
@@ -878,21 +1226,25 @@ fn install_vulkan_executor(
 )]
 fn install_composite_executor(
     session: &mut SwiftSession,
+    arena_cache_dir: Option<&Path>,
 ) -> Result<ProjectionStartup, NativeBackendError> {
     #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
     {
-        let (npu, npu_tensors, npu_residency) =
-            open_hexagon_native_q2_executor(session).ok_or(NativeBackendError::Configuration)?;
+        let (npu, npu_tensors, npu_residency, vtcm_plan) =
+            open_hexagon_native_q2_executor(session, arena_cache_dir)
+                .ok_or(NativeBackendError::Configuration)?;
+        let total_layers = vtcm_plan.total_layers;
         let mut npu_layers = 0_usize;
-        for layer in 0..bonsai_hexagon_runtime::X1_V73_MAX_NPU_LAYERS {
+        for layer in 0..vtcm_plan.admitted_layers {
             let prefix = format!("blk.{layer}.");
             let mut found_any = false;
             let mut all_supported = true;
             for tensor in &npu_tensors {
                 if tensor.name.starts_with(&prefix) {
                     found_any = true;
-                    if !bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports(&npu, tensor)
-                    {
+                    if !bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::supports_f32(
+                        &npu, tensor,
+                    ) {
                         all_supported = false;
                         break;
                     }
@@ -904,13 +1256,13 @@ fn install_composite_executor(
                 break;
             }
         }
-        if npu_layers == 0 || npu_layers >= 64 {
+        if npu_layers == 0 || npu_layers >= total_layers {
             return Err(NativeBackendError::Configuration);
         }
         let plan = bonsai_hexagon_runtime::plan_three_processor_placement(
-            64,
+            total_layers,
             npu_layers,
-            64 - npu_layers,
+            total_layers - npu_layers,
             4,
             bonsai_hexagon_runtime::AcceleratorTarget::AdrenoGpuVulkan,
         )
@@ -918,7 +1270,8 @@ fn install_composite_executor(
         let mut gpu =
             bonsai_adreno_vulkan::VulkanPq2Executor::open_default(VULKAN_WEIGHT_BUDGET_BYTES)
                 .map_err(|_| NativeBackendError::Configuration)?;
-        let gpu_tensors = collect_layer_projection_tensors(session, npu_layers..64, false);
+        let gpu_tensors =
+            collect_layer_projection_tensors(session, npu_layers..total_layers, false);
         let gpu_warmed = gpu
             .prewarm_tensors(&gpu_tensors)
             .map_err(|_| NativeBackendError::Configuration)?;
@@ -950,7 +1303,7 @@ fn install_composite_executor(
     }
     #[cfg(not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")))]
     {
-        let _ = session;
+        let _ = (session, arena_cache_dir);
         Err(NativeBackendError::Configuration)
     }
 }
@@ -1072,10 +1425,20 @@ impl Worker {
         Self::with_placement(engine, seed, Placement::Auto)
     }
 
+    #[cfg(test)]
     pub(super) fn with_placement(
         engine: impl Engine,
         seed: u32,
         placement: Placement,
+    ) -> Result<Self, NativeBackendError> {
+        Self::with_options(engine, seed, placement, &WorkerOptions::default())
+    }
+
+    pub(super) fn with_options(
+        engine: impl Engine,
+        seed: u32,
+        placement: Placement,
+        options: &WorkerOptions,
     ) -> Result<Self, NativeBackendError> {
         let mut profile = engine.profile()?;
         profile.placement = placement;
@@ -1105,6 +1468,7 @@ impl Worker {
         let idle = Arc::new(Notify::new());
         let active = busy.clone();
         let notified = idle.clone();
+        let worker_options = options.clone();
         let thread = thread::Builder::new()
             .name("swift-native-model".into())
             .spawn(move || {
@@ -1115,15 +1479,15 @@ impl Worker {
                 };
                 // Publish no readiness until the model owner finishes native
                 // setup and verifies its complete immutable placement facts.
-                let observation = initialize_for_placement(&mut state.engine, placement).and_then(
-                    |observation| {
-                        if observation.valid(placement) {
-                            Ok(observation)
-                        } else {
-                            Err(NativeBackendError::Configuration)
-                        }
-                    },
-                );
+                let observation =
+                    initialize_with_options(&mut state.engine, placement, &worker_options)
+                        .and_then(|observation| {
+                            if observation.valid(placement) {
+                                Ok(observation)
+                            } else {
+                                Err(NativeBackendError::Configuration)
+                            }
+                        });
                 let succeeded = observation.is_ok();
                 if initialized.send(observation).is_err() || !succeeded {
                     return;

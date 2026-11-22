@@ -2742,3 +2742,361 @@ fn explicit_vulkan_and_composite_placements_reject_cpu_fallback_and_bad_profiles
         assert!(rejected.terminated.load(Ordering::Acquire));
     }
 }
+
+#[test]
+fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
+    use bonsai_prism_runtime::model::swift::Representation;
+    use std::path::Path;
+
+    assert!(worker::supports_hexagon_native_q2_representation(
+        Representation::Pq2
+    ));
+    assert!(!worker::supports_hexagon_native_q2_representation(
+        Representation::CurrentRepackedPtq1
+    ));
+
+    let pq2_hex = Representation::Pq2.model_sha256();
+    let ptq1_hex = Representation::CurrentRepackedPtq1.model_sha256();
+    let pq2_digest = worker::decode_model_identity_sha256(pq2_hex);
+    let ptq1_digest = worker::decode_model_identity_sha256(ptq1_hex);
+    assert!(pq2_digest.is_some());
+    assert!(ptq1_digest.is_some());
+    assert_ne!(pq2_digest, ptq1_digest);
+    assert_eq!(worker::decode_model_identity_sha256("short"), None);
+    assert_eq!(worker::decode_model_identity_sha256(&"zz".repeat(32)), None);
+
+    let root = Path::new("cache-root");
+    let pq2_v81 =
+        worker::hexagon_arena_cache_file_path(root, 81, Representation::Pq2, pq2_hex, 168);
+    let ptq1_v81 = worker::hexagon_arena_cache_file_path(
+        root,
+        81,
+        Representation::CurrentRepackedPtq1,
+        ptq1_hex,
+        168,
+    );
+    let pq2_v73 =
+        worker::hexagon_arena_cache_file_path(root, 73, Representation::Pq2, pq2_hex, 168);
+    let pq2_partial =
+        worker::hexagon_arena_cache_file_path(root, 81, Representation::Pq2, pq2_hex, 84);
+    assert_ne!(pq2_v81, ptq1_v81);
+    assert_ne!(pq2_v81, pq2_v73);
+    assert_ne!(pq2_v81, pq2_partial);
+}
+
+#[test]
+fn worker_with_options_propagates_hexagon_arena_cache_path() -> TestResult {
+    struct OptionCapturingEngine {
+        observed: Observation,
+        captured_cache: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    }
+
+    impl worker::Engine for OptionCapturingEngine {
+        type Prepared = <FakeEngine as worker::Engine>::Prepared;
+        fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
+            FakeEngine(self.observed.clone()).profile()
+        }
+        fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
+            FakeEngine(self.observed.clone()).prepare(pending)
+        }
+        fn properties(prepared: &Self::Prepared) -> (usize, bool, bool, &[u8]) {
+            FakeEngine::properties(prepared)
+        }
+        fn complete(
+            &mut self,
+            prepared: &Self::Prepared,
+            cancel: &Cancellation,
+            deadline: Option<std::time::Instant>,
+            emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+        ) -> bonsai_prism_runtime::Result<Completion> {
+            FakeEngine(self.observed.clone()).complete(prepared, cancel, deadline, emit)
+        }
+        fn reset(&mut self) -> bonsai_prism_runtime::Result<()> {
+            FakeEngine(self.observed.clone()).reset()
+        }
+        fn initialize_worker_thread_with_options(
+            &mut self,
+            placement: Placement,
+            options: &WorkerOptions,
+        ) -> Result<profile::ProjectionStartup, NativeBackendError> {
+            *self
+                .captured_cache
+                .lock()
+                .map_err(|_| NativeBackendError::Engine)? = options.hexagon_arena_cache.clone();
+            FakeEngine(self.observed.clone()).initialize_worker_thread_for_placement(placement)
+        }
+    }
+
+    let expected_dir = std::env::temp_dir().join("prism-hexagon-worker-options-test");
+    let captured_cache = Arc::new(std::sync::Mutex::new(None));
+    let observed = Observation {
+        startup_projection: Some(profile::ProjectionStartup::NativeQ2 {
+            resident_tensors: 168,
+            resident_weight_bytes: 2_888_663_040,
+            host_metadata_bytes: 8064,
+        }),
+        ..Observation::default()
+    };
+    let options = WorkerOptions {
+        hexagon_arena_cache: Some(expected_dir.clone()),
+    };
+    let worker = Worker::with_options(
+        OptionCapturingEngine {
+            observed: observed.clone(),
+            captured_cache: Arc::clone(&captured_cache),
+        },
+        42,
+        Placement::Auto,
+        &options,
+    )
+    .map_err(|err| format!("{err:?}"))?;
+    assert_eq!(
+        *captured_cache.lock().map_err(|_| "mutex poisoned")?,
+        Some(expected_dir)
+    );
+    drop(worker);
+    assert!(observed.terminated.load(Ordering::Acquire));
+    Ok(())
+}
+
+#[test]
+fn models_readiness_preserves_hexagon_and_ptq1_schema_keys() {
+    use bonsai_prism_runtime::model::swift::{self, Representation};
+    use profile::ProjectionStartup;
+
+    let pq2_full = ModelProfile {
+        placement: Placement::Auto,
+        projection_startup: ProjectionStartup::NativeQ2 {
+            resident_tensors: 168,
+            resident_weight_bytes: 2_888_663_040,
+            host_metadata_bytes: 8064,
+        },
+        representation: Representation::Pq2,
+        ..ModelProfile::default()
+    };
+    let pq2_json = pq2_full.readiness(42);
+    let pq2_entry = &pq2_json["data"][0];
+    assert_eq!(pq2_entry["id"], "Swift-Bonsai-2-PQ2_0");
+    assert_eq!(pq2_entry["model_sha256"], swift::MODEL_SHA256);
+    assert_eq!(
+        pq2_entry["startup_projection"]["effective"],
+        "hexagon-native-q2"
+    );
+    assert_eq!(pq2_entry["startup_projection"]["requested"], "auto");
+    assert_eq!(pq2_entry["startup_projection"]["resident_tensors"], 168);
+    assert_eq!(
+        pq2_entry["startup_projection"]["resident_weight_bytes"],
+        2_888_663_040_u64
+    );
+    assert_eq!(pq2_entry["startup_projection"]["schema_version"], 1);
+
+    let ptq1_partial = ModelProfile {
+        placement: Placement::Auto,
+        projection_startup: ProjectionStartup::NativeQ2Partial {
+            architecture: 73,
+            resident_tensors: 84,
+            resident_weight_bytes: 1_444_331_520,
+            host_metadata_bytes: 4032,
+        },
+        representation: Representation::CurrentRepackedPtq1,
+        ..ModelProfile::default()
+    };
+    let ptq1_json = ptq1_partial.readiness(42);
+    let ptq1_entry = &ptq1_json["data"][0];
+    assert_eq!(ptq1_entry["id"], "Swift-Bonsai-2-current-repacked-PTQ1_0");
+    assert_eq!(ptq1_entry["model_sha256"], swift::REPACKED_PTQ1_SHA256);
+    assert_eq!(
+        ptq1_entry["weight_representation"],
+        Representation::CurrentRepackedPtq1.name()
+    );
+    assert_eq!(
+        ptq1_entry["startup_projection"]["effective"],
+        "hexagon-native-q2-partial"
+    );
+    assert_eq!(ptq1_entry["startup_projection"]["resident_tensors"], 84);
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn synthetic_swift_placement_model(
+    layer_count: usize,
+    kind: u32,
+) -> bonsai_prism_runtime::model::Model {
+    use bonsai_prism_runtime::model::{Model, Tensor, TensorBytes};
+    use std::collections::BTreeMap;
+
+    let block_bytes = if kind == 142 { 34_usize } else { 28_usize };
+    let mut shape_cache: BTreeMap<(usize, usize), Arc<[u8]>> = BTreeMap::new();
+    let mut tensors = BTreeMap::new();
+    for layer_idx in 0..layer_count {
+        let specs: &[(&str, usize, usize)] = if (layer_idx + 1).is_multiple_of(4) {
+            &[
+                ("ffn_up.weight", 5120, 17_408),
+                ("ffn_gate.weight", 5120, 17_408),
+                ("ffn_down.weight", 17_408, 5120),
+                ("attn_q.weight", 5120, 12_288),
+                ("attn_k.weight", 5120, 1024),
+                ("attn_v.weight", 5120, 1024),
+                ("attn_output.weight", 6144, 5120),
+            ]
+        } else {
+            &[
+                ("ffn_up.weight", 5120, 17_408),
+                ("ffn_gate.weight", 5120, 17_408),
+                ("ffn_down.weight", 17_408, 5120),
+                ("attn_qkv.weight", 5120, 10_240),
+                ("attn_gate.weight", 5120, 6144),
+                ("ssm_out.weight", 6144, 5120),
+            ]
+        };
+        for &(suffix, columns, rows) in specs {
+            let shared = shape_cache
+                .entry((columns, rows))
+                .or_insert_with(|| {
+                    Arc::<[u8]>::from(vec![0_u8; rows * (columns / 128) * block_bytes])
+                })
+                .clone();
+            let name = format!("blk.{layer_idx}.{suffix}");
+            tensors.insert(
+                name.clone(),
+                Tensor {
+                    name,
+                    dimensions: vec![columns, rows],
+                    kind,
+                    data: TensorBytes::Shared(shared),
+                },
+            );
+        }
+    }
+    Model {
+        metadata: BTreeMap::new(),
+        tensors,
+        identity: "synthetic-swift-placement".to_owned(),
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+#[test]
+fn vtcm_placement_preserves_v81_fast_path_and_handles_ptq1_and_v73_partial_arenas() -> TestResult {
+    const PQ2_KIND: u32 = 142;
+    const PTQ1_KIND: u32 = 143;
+
+    let pq2_model = synthetic_swift_placement_model(64, PQ2_KIND);
+    let ptq1_model = synthetic_swift_placement_model(64, PTQ1_KIND);
+
+    assert_eq!(
+        worker::default_or_reported_vtcm_bytes(81, None),
+        8 * 1024 * 1024
+    );
+    assert_eq!(
+        worker::default_or_reported_vtcm_bytes(73, Some(4096)),
+        4 * 1024 * 1024
+    );
+    assert_eq!(
+        worker::default_or_reported_vtcm_bytes(73, Some(8 * 1024 * 1024)),
+        8 * 1024 * 1024
+    );
+
+    let pq2_v81 = worker::plan_hexagon_vtcm_placement(&pq2_model, 81, 8 * 1024 * 1024, None)
+        .ok_or("v81 PQ2 VTCM placement plan failed")?;
+    let ptq1_v81 = worker::plan_hexagon_vtcm_placement(&ptq1_model, 81, 8 * 1024 * 1024, None)
+        .ok_or("v81 PTQ1 VTCM placement plan failed")?;
+    assert_eq!(pq2_v81, ptq1_v81);
+    assert_eq!(pq2_v81.total_layers, 64);
+    assert_eq!(pq2_v81.admitted_layers, 27);
+    assert_eq!(
+        pq2_v81.resident_bytes,
+        bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_RESIDENT_WEIGHT_BYTES
+    );
+    assert_eq!(
+        pq2_v81.npu_projections,
+        bonsai_hexagon_runtime::DEFAULT_NATIVE_Q2_PROJECTIONS
+            .iter()
+            .map(|&name| name.to_owned())
+            .collect::<Vec<_>>()
+    );
+
+    assert_eq!(worker::mapped_arena_budget_for_capacity(0), None);
+    let two_arenas = hexagon_native_rpc::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES
+        + hexagon_native_rpc::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES;
+    assert_eq!(
+        worker::mapped_arena_budget_for_capacity(two_arenas),
+        Some((hexagon_native_rpc::NATIVE_Q2_ARENA_ODD_WEIGHT_STEP_BYTES, 2))
+    );
+    assert_eq!(
+        worker::mapped_arena_budget_for_capacity(
+            hexagon_native_rpc::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES + 64 * 1024 * 1024
+        ),
+        Some((hexagon_native_rpc::NATIVE_Q2_ARENA_WEIGHT_STEP_BYTES, 1))
+    );
+
+    let v73_partial = worker::plan_hexagon_vtcm_placement(
+        &ptq1_model,
+        73,
+        worker::default_or_reported_vtcm_bytes(73, None),
+        Some(two_arenas),
+    )
+    .ok_or("v73 partial arena VTCM plan failed")?;
+    assert!(v73_partial.admitted_layers > 0 && v73_partial.admitted_layers < 27);
+    assert!(v73_partial.resident_bytes <= two_arenas);
+    Ok(())
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+#[test]
+fn hexagon_arena_cache_save_writes_verified_header_for_pq2_and_ptq1() -> TestResult {
+    use bonsai_prism_runtime::model::{Tensor, TensorBytes, swift::Representation};
+
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let dir = TempDirGuard(
+        std::env::temp_dir().join(format!("prism-hexagon-cache-dir-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(&dir.0)?;
+    let mut pq2_block = vec![0_u8; 32 * 34];
+    let mut ptq1_block = vec![0_u8; 32 * 28];
+    for row in 0..32 {
+        pq2_block[row * 34..row * 34 + 2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        ptq1_block[row * 28 + 26..row * 28 + 28].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    }
+
+    let pq2_tensor = Tensor {
+        name: "blk.0.ffn_up.weight".to_owned(),
+        dimensions: vec![128, 32],
+        kind: 142,
+        data: TensorBytes::Shared(Arc::from(pq2_block)),
+    };
+    let ptq1_tensor = Tensor {
+        name: "blk.0.ffn_up.weight".to_owned(),
+        dimensions: vec![128, 32],
+        kind: 143,
+        data: TensorBytes::Shared(Arc::from(ptq1_block)),
+    };
+
+    for (arch, repr, tensor) in [
+        (81_u32, Representation::Pq2, pq2_tensor),
+        (73_u32, Representation::CurrentRepackedPtq1, ptq1_tensor),
+    ] {
+        let sha_hex = repr.model_sha256();
+        let sha_bytes = worker::decode_model_identity_sha256(sha_hex)
+            .ok_or("valid 64-char representation SHA-256")?;
+        let cache_path = worker::hexagon_arena_cache_file_path(&dir.0, arch, repr, sha_hex, 1);
+        let entries = bonsai_hexagon_runtime::NativeQ2ArenaCache::save_verified_cache(
+            &cache_path,
+            arch,
+            sha_bytes,
+            std::slice::from_ref(&tensor),
+            None,
+        )?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, tensor.kind);
+        let raw = std::fs::read(&cache_path)?;
+        assert_eq!(&raw[..8], b"SB2HQ2C1");
+        assert_eq!(&raw[8..12], &arch.to_le_bytes());
+    }
+    Ok(())
+}

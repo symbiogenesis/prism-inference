@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use std::{
     borrow::Cow,
     future::poll_fn,
+    path::PathBuf,
     pin::pin,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -38,6 +39,13 @@ use tokio::{
 #[cfg(windows)]
 pub(super) use worker::register_hexagon_model_path;
 use worker::{Event, Input, Output, Worker};
+
+/// Optional worker initialization controls supplied by the trusted private child CLI.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WorkerOptions {
+    /// Opt-in directory holding verified `"SB2HQ2C1"` Hexagon native Q2 arena caches.
+    pub(crate) hexagon_arena_cache: Option<PathBuf>,
+}
 
 /// Immutable projection placement requested by the trusted private child owner.
 ///
@@ -124,9 +132,26 @@ pub async fn serve(
 /// Rejects invalid listener/key configuration, worker startup or accept failure.
 pub async fn serve_with_placement(
     listener: TcpListener,
+    session: SwiftSession,
+    key: String,
+    placement: Placement,
+) -> Result<(), NativeBackendError> {
+    Box::pin(serve_with_options(
+        listener,
+        session,
+        key,
+        placement,
+        WorkerOptions::default(),
+    ))
+    .await
+}
+
+pub(crate) async fn serve_with_options(
+    listener: TcpListener,
     mut session: SwiftSession,
     key: String,
     placement: Placement,
+    options: WorkerOptions,
 ) -> Result<(), NativeBackendError> {
     let address = listener
         .local_addr()
@@ -142,7 +167,7 @@ pub async fn serve_with_placement(
         session.set_projection_executor(None);
     }
     let seed = session.seed();
-    let mut worker = Worker::with_placement(session, seed, placement)?;
+    let mut worker = Worker::with_options(session, seed, placement, &options)?;
     loop {
         let (client, peer) = listener
             .accept()
@@ -160,16 +185,12 @@ pub async fn serve_with_placement(
     }
 }
 
-/// Serve a verified session over parent-owned anonymous broker pipes.
-///
-/// Uses fixed host authority `127.0.0.1:1024` for request validation without
-/// binding any socket or reading a key file on disk, and signals
-/// `KIND_SERVER_READY` only after worker initialization completes.
-pub(crate) async fn serve_broker_pipe_with_placement(
+pub(crate) async fn serve_broker_pipe_with_options(
     endpoint: crate::broker_pipe::ServerEndpoint,
     mut session: SwiftSession,
     key: &str,
     placement: Placement,
+    options: WorkerOptions,
 ) -> Result<(), NativeBackendError> {
     let policy = RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, key)
         .map_err(|_| NativeBackendError::Configuration)?
@@ -178,7 +199,7 @@ pub(crate) async fn serve_broker_pipe_with_placement(
         session.set_projection_executor(None);
     }
     let seed = session.seed();
-    let worker = Worker::with_placement(session, seed, placement)?;
+    let worker = Worker::with_options(session, seed, placement, &options)?;
     serve_broker_pipe_with_worker(endpoint, &policy, worker).await
 }
 

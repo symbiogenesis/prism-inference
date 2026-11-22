@@ -1387,6 +1387,12 @@ impl SwiftSession {
         self.representation
     }
 
+    /// Lowercase hex SHA-256 model identity expected for this session's representation.
+    #[must_use]
+    pub const fn model_identity(&self) -> &'static str {
+        self.representation.model_sha256()
+    }
+
     /// Exact immutable KV-cache precision profile selected at session construction.
     #[must_use]
     pub const fn kv_cache_policy(&self) -> KvCachePolicy {
@@ -3262,5 +3268,27 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn swift_session_model_identity_exposes_64_char_representation_sha256() {
+        use super::{Representation, SwiftSession};
+        use crate::model::swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256};
+
+        let method: fn(&SwiftSession) -> &'static str = SwiftSession::model_identity;
+        let _ = method;
+        assert_eq!(Representation::Pq2.model_sha256(), MODEL_SHA256);
+        assert_eq!(
+            Representation::CurrentRepackedPtq1.model_sha256(),
+            REPACKED_PTQ1_SHA256
+        );
+        assert_ne!(MODEL_SHA256, REPACKED_PTQ1_SHA256);
+        for sha in [MODEL_SHA256, REPACKED_PTQ1_SHA256] {
+            assert_eq!(sha.len(), 64);
+            assert!(
+                sha.bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            );
+        }
     }
 }

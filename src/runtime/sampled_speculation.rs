@@ -5,6 +5,9 @@ use super::{
     MAX_SPECULATIVE_DRAFT_TOKENS, Prefill, PromptEndCapture, Result, Runtime, Sampler, Snapshot,
     SpeculativeStats, SuffixDraftConfig, VerifiedRound, check_deadline, invalid,
 };
+use crate::speculative::{
+    AdaptiveGateConfig, AdaptiveGateDecision, AdaptiveSpeculationGate, MovingSourceCursor,
+};
 
 struct SampledSuffixEffects<'a, S, E> {
     sampler: &'a mut S,
@@ -59,12 +62,48 @@ impl<D: Decoder> Runtime<D> {
         sampler: &mut S,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<(Completion, SpeculativeStats)> {
+        self.generate_sampled_speculative_with_gate_until(
+            prompt,
+            options,
+            prefill,
+            suffix_config,
+            AdaptiveGateConfig::default(),
+            cancellation,
+            deadline,
+            sampler,
+            emit,
+        )
+    }
+
+    /// Generate sampled tokens with bounded moving-cursor suffix proposals and an explicit
+    /// [`AdaptiveGateConfig`].
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::generate_sampled_speculative_until`] or an invalid
+    /// [`AdaptiveGateConfig`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Explicit adaptive gate selection extends the established sampled speculation API."
+    )]
+    pub fn generate_sampled_speculative_with_gate_until<S: Sampler + Clone>(
+        &mut self,
+        prompt: &[u32],
+        options: &Generation,
+        prefill: Prefill,
+        suffix_config: SuffixDraftConfig,
+        gate_config: AdaptiveGateConfig,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+        sampler: &mut S,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<(Completion, SpeculativeStats)> {
         let deadline = deadline.into();
         self.generate_sampled_speculative_checked(
             prompt,
             options,
             prefill,
             suffix_config,
+            gate_config,
             &|| check_deadline(cancellation, deadline, Instant::now()),
             sampler,
             emit,
@@ -73,7 +112,7 @@ impl<D: Decoder> Runtime<D> {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "The checked entry retains explicit suffix, sampler and callback ownership."
+        reason = "The checked entry retains explicit suffix, gate, sampler and callback ownership."
     )]
     fn generate_sampled_speculative_checked<S: Sampler + Clone>(
         &mut self,
@@ -81,6 +120,7 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         suffix_config: SuffixDraftConfig,
+        gate_config: AdaptiveGateConfig,
         check: &impl Fn() -> Result<()>,
         sampler: &mut S,
         emit: impl FnMut(u32) -> Result<()>,
@@ -91,6 +131,7 @@ impl<D: Decoder> Runtime<D> {
             options,
             prefill,
             suffix_config,
+            gate_config,
             check,
             &mut SampledSuffixEffects { sampler, emit },
         );
@@ -100,12 +141,17 @@ impl<D: Decoder> Runtime<D> {
         result
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep transactional rollback explicit around suffix, gate, and folded decoder state."
+    )]
     fn sampled_suffix_transaction(
         &mut self,
         prompt: &[u32],
         options: &Generation,
         prefill: Prefill,
         suffix_config: SuffixDraftConfig,
+        gate_config: AdaptiveGateConfig,
         check: &impl Fn() -> Result<()>,
         effects: &mut SampledSuffixEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
     ) -> Result<(Completion, SpeculativeStats)> {
@@ -115,6 +161,7 @@ impl<D: Decoder> Runtime<D> {
             ));
         }
         suffix_config.validate()?;
+        gate_config.validate()?;
         check()?;
         self.validate_request(prompt, options, prefill)?;
         check()?;
@@ -130,6 +177,7 @@ impl<D: Decoder> Runtime<D> {
                 options,
                 prefill,
                 suffix_config,
+                gate_config,
                 check,
                 effects,
                 &mut prompt_end_capture,
@@ -157,6 +205,7 @@ impl<D: Decoder> Runtime<D> {
             Err(error) => {
                 // A failed round restore is terminal. In particular, do not
                 // retry another restoration on the same provisional decoder.
+                self.decoder.discard_folded_verification();
                 let Snapshot {
                     state,
                     tokens,
@@ -188,6 +237,7 @@ impl<D: Decoder> Runtime<D> {
 
     #[expect(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "The request checkpoint reservation accompanies explicit generation effects."
     )]
     fn sampled_suffix_inner(
@@ -196,6 +246,7 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         suffix_config: SuffixDraftConfig,
+        gate_config: AdaptiveGateConfig,
         check: &impl Fn() -> Result<()>,
         effects: &mut SampledSuffixEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
         prompt_end: &mut PromptEndCapture<'_, D::Checkpoint>,
@@ -240,31 +291,126 @@ impl<D: Decoder> Runtime<D> {
         };
         let mut stats = SpeculativeStats::default();
         let mut storage = [0; MAX_SPECULATIVE_DRAFT_TOKENS];
+        let mut cursor = MovingSourceCursor::new();
+        let mut gate = AdaptiveSpeculationGate::new(gate_config)?;
+        let folded_enabled = self.decoder.supports_folded_verification() && capacity >= 2;
+        let mut pending_anchor: Option<u32> = None;
+        let mut carried_tokens = Vec::with_capacity(MAX_SPECULATIVE_DRAFT_TOKENS);
+
         while completion.generated_tokens < options.max_tokens {
             check()?;
             let remaining = options.max_tokens - completion.generated_tokens;
-            self.suffix_tree.sync(&self.tokens)?;
-            let proposed = self.suffix_tree.propose_into(
-                suffix_config,
-                remaining.min(capacity.max(1)),
-                &mut storage,
-            )?;
-            if proposed == 0 {
-                if self.sampled_suffix_single(options, check, effects, &mut stats)? {
+
+            if capacity >= 2 && gate.decide() == AdaptiveGateDecision::SerialBurst {
+                self.flush_folded_and_anchor(
+                    &mut pending_anchor,
+                    &mut carried_tokens,
+                    check,
+                    &mut stats,
+                    &mut gate,
+                )?;
+                let serial_start = Instant::now();
+                let stopped = self.sampled_suffix_single(options, check, effects, &mut stats)?;
+                gate.record_serial_step(serial_start.elapsed());
+                stats.record_adaptive_serial_burst(true);
+                cursor.observe_round(&self.tokens, 0, 0, false);
+                if stopped {
                     completion.finish = Finish::Stop;
                     break;
                 }
                 completion.generated_tokens += 1;
                 continue;
             }
-            let round = self.sampled_suffix_round(
-                &storage[..proposed],
+
+            self.suffix_tree.sync(&self.tokens)?;
+            let anchor_len = usize::from(pending_anchor.is_some());
+            let draft_limit = if folded_enabled {
+                remaining.min(capacity.saturating_sub(anchor_len))
+            } else {
+                remaining.min(capacity.max(1))
+            };
+            let cursor_draft = if draft_limit > 0 {
+                cursor.propose_with_tree(&self.suffix_tree, suffix_config, draft_limit, &mut storage)?
+            } else {
+                crate::speculative::CursorDraft::default()
+            };
+            if cursor_draft.cursor_tokens > 0 {
+                stats.record_cursor_draft(cursor_draft.cursor_tokens);
+            }
+
+            let block_len = anchor_len + cursor_draft.len;
+            if folded_enabled && cursor_draft.len > 0 && block_len >= 2 {
+                let mut block = [0_u32; MAX_SPECULATIVE_DRAFT_TOKENS];
+                if let Some(anchor) = pending_anchor.take() {
+                    block[0] = anchor;
+                }
+                block[anchor_len..block_len].copy_from_slice(&storage[..cursor_draft.len]);
+                let (round, accepted_draft) = self.sampled_folded_round(
+                    &mut carried_tokens,
+                    &mut pending_anchor,
+                    &block[..block_len],
+                    anchor_len,
+                    options,
+                    check,
+                    effects,
+                    &mut stats,
+                    &mut gate,
+                )?;
+                cursor.observe_round(&self.tokens, cursor_draft.len, accepted_draft, false);
+                completion.generated_tokens += round.emitted;
+                if round.stopped {
+                    self.flush_folded_and_anchor(
+                        &mut pending_anchor,
+                        &mut carried_tokens,
+                        check,
+                        &mut stats,
+                        &mut gate,
+                    )?;
+                    completion.finish = Finish::Stop;
+                    break;
+                }
+                continue;
+            }
+
+            self.flush_folded_and_anchor(
+                &mut pending_anchor,
+                &mut carried_tokens,
+                check,
+                &mut stats,
+                &mut gate,
+            )?;
+
+            if cursor_draft.len == 0 {
+                let serial_start = Instant::now();
+                let stopped = self.sampled_suffix_single(options, check, effects, &mut stats)?;
+                gate.record_serial_step(serial_start.elapsed());
+                cursor.observe_round(&self.tokens, 0, 0, false);
+                if stopped {
+                    completion.finish = Finish::Stop;
+                    break;
+                }
+                completion.generated_tokens += 1;
+                continue;
+            }
+
+            let verify_start = Instant::now();
+            let draft_slice = &storage[..cursor_draft.len];
+            let (round, accepted_draft) = self.sampled_suffix_round_with_outcome(
+                draft_slice,
                 options,
                 check,
                 effects,
                 &mut stats,
                 reserved,
             )?;
+            gate.record_verify_round(
+                cursor_draft.len,
+                accepted_draft,
+                round.emitted,
+                verify_start.elapsed(),
+                std::time::Duration::ZERO,
+            );
+            cursor.observe_round(&self.tokens, cursor_draft.len, accepted_draft, false);
             completion.generated_tokens += round.emitted;
             if round.stopped {
                 completion.finish = Finish::Stop;
@@ -274,7 +420,226 @@ impl<D: Decoder> Runtime<D> {
             // Let the next suffix absorb that next draw into another shared
             // tile instead of forcing an ordinary one-token weight pass.
         }
+        self.flush_folded_and_anchor(
+            &mut pending_anchor,
+            &mut carried_tokens,
+            check,
+            &mut stats,
+            &mut gate,
+        )?;
         Ok((completion, stats))
+    }
+
+    fn evaluate_committed_anchor(
+        &mut self,
+        token: u32,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        check()?;
+        let mut rows = self.take_batch_rows(1)?;
+        let Some(mut row) = rows.pop() else {
+            return Err(invalid("missing batch logit row for committed anchor"));
+        };
+        row.clear();
+        check()?;
+        let res = self
+            .decoder
+            .evaluate_finite_into(token, &mut row)
+            .map(|logits| (logits.as_slice().as_ptr(), logits.as_slice().len()));
+        match res {
+            Ok((pointer, length)) => {
+                if length != self.decoder.vocab_size()
+                    || length != row.len()
+                    || !std::ptr::eq(pointer, row.as_ptr())
+                {
+                    rows.push(row);
+                    self.recycle_batch_rows(rows);
+                    return Err(invalid("native decoder returned invalid anchor logits"));
+                }
+                check()?;
+                let prev = std::mem::replace(&mut self.logits, Arc::new(row));
+                self.recycle_logits(prev);
+                self.recycle_batch_rows(rows);
+                Ok(())
+            }
+            Err(error) => {
+                rows.push(row);
+                self.recycle_batch_rows(rows);
+                Err(error)
+            }
+        }
+    }
+
+    fn flush_folded_and_anchor(
+        &mut self,
+        pending_anchor: &mut Option<u32>,
+        carried_tokens: &mut Vec<u32>,
+        check: &impl Fn() -> Result<()>,
+        stats: &mut SpeculativeStats,
+        gate: &mut AdaptiveSpeculationGate,
+    ) -> Result<()> {
+        if self.decoder.has_pending_folded_verification() {
+            let flush_start = Instant::now();
+            self.decoder.flush_folded_verification(check)?;
+            let elapsed = flush_start.elapsed();
+            if !carried_tokens.is_empty() {
+                stats.record_folded_flush();
+                gate.charge_flush_overhead(elapsed);
+            }
+        }
+        carried_tokens.clear();
+        if let Some(anchor) = pending_anchor.take() {
+            let serial_start = Instant::now();
+            self.evaluate_committed_anchor(anchor, check)?;
+            gate.record_serial_step(serial_start.elapsed());
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "Folded verification round preserves exact token, sampler, carry, and gate invariants."
+    )]
+    fn sampled_folded_round(
+        &mut self,
+        carried_tokens: &mut Vec<u32>,
+        pending_anchor: &mut Option<u32>,
+        block: &[u32],
+        anchor_len: usize,
+        options: &Generation,
+        check: &impl Fn() -> Result<()>,
+        effects: &mut SampledSuffixEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
+        stats: &mut SpeculativeStats,
+        gate: &mut AdaptiveSpeculationGate,
+    ) -> Result<(SampledRound, usize)> {
+        let verify_start = Instant::now();
+        let draft = &block[anchor_len..];
+        let cap_before = self.tokens.capacity();
+        self.tokens.try_reserve(block.len())?;
+        if self.tokens.capacity() > cap_before {
+            self.reallocation_witness.growth_reallocations = self
+                .reallocation_witness
+                .growth_reallocations
+                .saturating_add(1);
+        }
+        let mut rows = self.take_batch_rows(block.len())?;
+        let mut row_caps_before = [0_usize; MAX_SPECULATIVE_DRAFT_TOKENS];
+        for (dst, row) in row_caps_before.iter_mut().zip(&rows) {
+            *dst = row.capacity();
+        }
+        check()?;
+        let eval_res = self.decoder.evaluate_verification_block_folded(
+            carried_tokens,
+            block,
+            &mut rows,
+            check,
+        );
+        if let Err(error) = eval_res {
+            self.recycle_batch_rows(rows);
+            return Err(error);
+        }
+        self.record_batch_row_witness(&row_caps_before, &rows);
+        if let Err(error) = check() {
+            self.recycle_batch_rows(rows);
+            return Err(error);
+        }
+        if rows.len() != block.len()
+            || rows.iter().any(|row| {
+                row.len() != self.decoder.vocab_size()
+                    || row.is_empty()
+                    || row.len() > 1_048_576
+                    || !crate::kernels::is_finite_slice(row)
+            })
+        {
+            self.recycle_batch_rows(rows);
+            return Err(invalid("folded batched decoder returned invalid logits"));
+        }
+
+        if anchor_len == 1 {
+            let prev = std::mem::replace(&mut self.logits, Arc::new(std::mem::take(&mut rows[0])));
+            self.recycle_logits(prev);
+        }
+
+        let mut accepted = 0_usize;
+        for (index, &candidate) in draft.iter().enumerate() {
+            let target = self.sampled_suffix_token(check, effects.sampler)?;
+            let stopped = options.stop_tokens.contains(&target);
+            if stopped || target != candidate {
+                let kept = anchor_len + accepted;
+                self.decoder.commit_folded_verification(kept)?;
+                carried_tokens.clear();
+                carried_tokens.extend_from_slice(&block[..kept]);
+                if kept > 0 {
+                    stats.record_folded_carry(kept);
+                }
+                self.recycle_batch_rows(rows);
+                if !stopped {
+                    self.tokens.push(target);
+                    *pending_anchor = Some(target);
+                    Self::sampled_suffix_emit(target, check, &mut effects.emit)?;
+                }
+                let emitted = accepted + usize::from(!stopped);
+                stats.record_verified_round(VerifiedRound {
+                    proposed: draft.len(),
+                    accepted,
+                    verified: draft.len(),
+                    target_evaluations: block.len(),
+                    rolled_back: false,
+                    bonus_tokens: 0,
+                    correction_tokens: u64::from(!stopped),
+                    fallback_tokens: 0,
+                    replay_tokens: 0,
+                });
+                gate.record_verify_round(
+                    draft.len(),
+                    accepted,
+                    emitted,
+                    verify_start.elapsed(),
+                    std::time::Duration::ZERO,
+                );
+                return Ok((SampledRound { emitted, stopped }, accepted));
+            }
+            self.tokens.push(candidate);
+            let prev = std::mem::replace(
+                &mut self.logits,
+                Arc::new(std::mem::take(&mut rows[anchor_len + index])),
+            );
+            self.recycle_logits(prev);
+            accepted += 1;
+            Self::sampled_suffix_emit(candidate, check, &mut effects.emit)?;
+        }
+
+        let kept = block.len();
+        self.decoder.commit_folded_verification(kept)?;
+        carried_tokens.clear();
+        carried_tokens.extend_from_slice(block);
+        self.recycle_batch_rows(rows);
+        stats.record_verified_round(VerifiedRound {
+            proposed: draft.len(),
+            accepted,
+            verified: draft.len(),
+            target_evaluations: block.len(),
+            rolled_back: false,
+            bonus_tokens: 0,
+            correction_tokens: 0,
+            fallback_tokens: 0,
+            replay_tokens: 0,
+        });
+        gate.record_verify_round(
+            draft.len(),
+            accepted,
+            draft.len(),
+            verify_start.elapsed(),
+            std::time::Duration::ZERO,
+        );
+        Ok((
+            SampledRound {
+                emitted: draft.len(),
+                stopped: false,
+            },
+            accepted,
+        ))
     }
 
     fn sampled_suffix_token(
@@ -372,7 +737,7 @@ impl<D: Decoder> Runtime<D> {
         Ok((draft.len(), Some((checkpoint, rows))))
     }
 
-    fn sampled_suffix_round(
+    fn sampled_suffix_round_with_outcome(
         &mut self,
         draft: &[u32],
         options: &Generation,
@@ -380,14 +745,15 @@ impl<D: Decoder> Runtime<D> {
         effects: &mut SampledSuffixEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
         stats: &mut SpeculativeStats,
         reserved: usize,
-    ) -> Result<SampledRound> {
+    ) -> Result<(SampledRound, usize)> {
         let (batch_evals, mut batch) = self.prepare_sampled_suffix_batch(draft, check, reserved)?;
         let mut sequential_evals = 0_usize;
         let mut accepted = 0_usize;
-        let mut verified = usize::from(batch.is_some()) * draft.len();
+        let verified = usize::from(batch.is_some()) * draft.len();
+        let mut seq_verified = 0_usize;
         for (index, &candidate) in draft.iter().enumerate() {
             if batch.is_none() {
-                verified += 1;
+                seq_verified += 1;
             }
             let target = self.sampled_suffix_token(check, effects.sampler)?;
             let stopped = options.stop_tokens.contains(&target);
@@ -411,7 +777,7 @@ impl<D: Decoder> Runtime<D> {
                 stats.record_verified_round(VerifiedRound {
                     proposed: draft.len(),
                     accepted,
-                    verified,
+                    verified: verified.max(seq_verified),
                     target_evaluations: batch_evals + sequential_evals,
                     rolled_back,
                     bonus_tokens: 0,
@@ -419,10 +785,13 @@ impl<D: Decoder> Runtime<D> {
                     fallback_tokens: 0,
                     replay_tokens,
                 });
-                return Ok(SampledRound {
-                    emitted: index + usize::from(!stopped),
-                    stopped,
-                });
+                return Ok((
+                    SampledRound {
+                        emitted: index + usize::from(!stopped),
+                        stopped,
+                    },
+                    accepted,
+                ));
             }
             if let Some((_, rows)) = &mut batch {
                 self.tokens.push(candidate);
@@ -443,7 +812,7 @@ impl<D: Decoder> Runtime<D> {
         stats.record_verified_round(VerifiedRound {
             proposed: draft.len(),
             accepted,
-            verified,
+            verified: verified.max(seq_verified),
             target_evaluations: batch_evals + sequential_evals,
             rolled_back: false,
             bonus_tokens: 0,
@@ -451,10 +820,13 @@ impl<D: Decoder> Runtime<D> {
             fallback_tokens: 0,
             replay_tokens: 0,
         });
-        Ok(SampledRound {
-            emitted: draft.len(),
-            stopped: false,
-        })
+        Ok((
+            SampledRound {
+                emitted: draft.len(),
+                stopped: false,
+            },
+            accepted,
+        ))
     }
 
     fn sampled_suffix_restore(
@@ -995,6 +1367,7 @@ mod tests {
             },
             Prefill::default(),
             suffix()?,
+            AdaptiveGateConfig::default(),
             &|| {
                 if draws.get() == 0 {
                     Ok(())
@@ -1017,6 +1390,354 @@ mod tests {
         assert_eq!(delivered, 0);
         assert_eq!(speculative.decoder.state, HybridState::default());
         assert!(!speculative.is_faulted());
+        Ok(())
+    }
+
+    fn advance_hybrid(state: &mut HybridState, token: u32) -> Result<Vec<f32>> {
+        state.tokens.push(token);
+        state.recurrent = state
+            .recurrent
+            .wrapping_mul(17)
+            .wrapping_add(u64::from(token) + 1);
+        state.convolution.rotate_left(1);
+        state.convolution[2] = token;
+        let value = f32::from(u8::try_from(state.recurrent & 255)?);
+        Ok(vec![value, value * 0.5, -value, value * -0.5])
+    }
+
+    #[derive(Clone, Debug)]
+    struct FoldedBatchControl {
+        kv_state: HybridState,
+        recurrent_state: HybridState,
+        pending: Vec<u32>,
+        carried: Vec<u32>,
+        capacity: usize,
+        folded_blocks: usize,
+        flushes: usize,
+        serial_evals: usize,
+        block_delay: Duration,
+        serial_delay: Duration,
+    }
+
+    impl FoldedBatchControl {
+        fn new(capacity: usize) -> Self {
+            Self {
+                kv_state: HybridState::default(),
+                recurrent_state: HybridState::default(),
+                pending: Vec::new(),
+                carried: Vec::new(),
+                capacity,
+                folded_blocks: 0,
+                flushes: 0,
+                serial_evals: 0,
+                block_delay: Duration::ZERO,
+                serial_delay: Duration::ZERO,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct FoldedCheckpoint {
+        kv_state: HybridState,
+        recurrent_state: HybridState,
+    }
+
+    impl Decoder for FoldedBatchControl {
+        type Checkpoint = FoldedCheckpoint;
+
+        fn identity(&self) -> &'static str {
+            "sampled-suffix-folded-control"
+        }
+
+        fn vocab_size(&self) -> usize {
+            4
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.discard_folded_verification();
+            self.kv_state = HybridState::default();
+            self.recurrent_state = HybridState::default();
+            Ok(())
+        }
+
+        fn evaluate(&mut self, token: u32) -> Result<Vec<f32>> {
+            if self.has_pending_folded_verification() {
+                return Err(invalid("pending folded verification forbids evaluate"));
+            }
+            if !self.serial_delay.is_zero() {
+                std::thread::sleep(self.serial_delay);
+            }
+            self.serial_evals += 1;
+            let _ = advance_hybrid(&mut self.recurrent_state, token)?;
+            advance_hybrid(&mut self.kv_state, token)
+        }
+
+        fn evaluate_into(&mut self, token: u32, output: &mut Vec<f32>) -> Result<()> {
+            let logits = self.evaluate(token)?;
+            output.clear();
+            output.extend_from_slice(&logits);
+            Ok(())
+        }
+
+        fn batched_evaluation_capacity(&self) -> usize {
+            self.capacity
+        }
+
+        fn supports_folded_verification(&self) -> bool {
+            true
+        }
+
+        fn has_pending_folded_verification(&self) -> bool {
+            !self.pending.is_empty() || !self.carried.is_empty()
+        }
+
+        fn evaluate_verification_block_folded(
+            &mut self,
+            carried_tokens: &[u32],
+            tokens: &[u32],
+            output: &mut Vec<Vec<f32>>,
+            _check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            if !self.pending.is_empty() {
+                return Err(invalid("folded block already pending commit"));
+            }
+            if self.carried.as_slice() != carried_tokens {
+                return Err(invalid("folded carry mismatch"));
+            }
+            if !self.block_delay.is_zero() {
+                std::thread::sleep(self.block_delay);
+            }
+            self.folded_blocks += 1;
+            for &tok in &self.carried {
+                let _ = advance_hybrid(&mut self.recurrent_state, tok)?;
+            }
+            self.carried.clear();
+            output.clear();
+            for &tok in tokens {
+                output.push(advance_hybrid(&mut self.kv_state, tok)?);
+            }
+            self.pending.extend_from_slice(tokens);
+            Ok(())
+        }
+
+        fn commit_folded_verification(&mut self, kept: usize) -> Result<()> {
+            let pending_len = self.pending.len();
+            if pending_len == 0 || kept > pending_len {
+                return Err(invalid("invalid folded commit count"));
+            }
+            let trim = pending_len - kept;
+            if trim > 0 {
+                let keep_total = self.kv_state.tokens.len() - trim;
+                let kept_tokens = self.kv_state.tokens[..keep_total].to_vec();
+                self.kv_state = HybridState::default();
+                for tok in kept_tokens {
+                    let _ = advance_hybrid(&mut self.kv_state, tok)?;
+                }
+            }
+            self.carried.clear();
+            self.carried.extend_from_slice(&self.pending[..kept]);
+            self.pending.clear();
+            Ok(())
+        }
+
+        fn flush_folded_verification(&mut self, _check: &dyn Fn() -> Result<()>) -> Result<()> {
+            if !self.pending.is_empty() {
+                return Err(invalid("cannot flush uncommitted folded block"));
+            }
+            if self.carried.is_empty() {
+                return Ok(());
+            }
+            self.flushes += 1;
+            for &tok in &self.carried {
+                let _ = advance_hybrid(&mut self.recurrent_state, tok)?;
+            }
+            self.carried.clear();
+            Ok(())
+        }
+
+        fn discard_folded_verification(&mut self) {
+            self.pending.clear();
+            self.carried.clear();
+        }
+
+        fn checkpoint_bytes(&self) -> usize {
+            64
+        }
+
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            if self.has_pending_folded_verification() {
+                return Err(invalid("cannot checkpoint with pending folded state"));
+            }
+            Ok(FoldedCheckpoint {
+                kv_state: self.kv_state.clone(),
+                recurrent_state: self.recurrent_state.clone(),
+            })
+        }
+
+        fn checkpoint_into(&self, target: &mut Self::Checkpoint) -> Result<()> {
+            *target = self.checkpoint()?;
+            Ok(())
+        }
+
+        fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+            self.discard_folded_verification();
+            self.kv_state = checkpoint.kv_state.clone();
+            self.recurrent_state = checkpoint.recurrent_state.clone();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn folded_speculation_preserves_exact_draws_logits_state_and_bridges_cursor() -> Result<()> {
+        for rejected in 0..=4 {
+            let limits = Limits {
+                context_tokens: 128,
+                checkpoints: 4,
+                checkpoint_bytes: 1024,
+            };
+            let mut ordinary = Runtime::new(FoldedBatchControl::new(0), limits)?;
+            let mut folded = Runtime::new(FoldedBatchControl::new(8), limits)?;
+            let mut script = (0..16).map(|index| MATCHED[index % 4]).collect::<Vec<_>>();
+            if rejected < 4 {
+                script[rejected] = 3;
+            }
+            let mut expected_sampler = ScriptSampler {
+                script,
+                ..ScriptSampler::default()
+            };
+            let mut actual_sampler = expected_sampler.clone();
+            let mut expected = Vec::new();
+            let mut actual = Vec::new();
+            let options = Generation {
+                max_tokens: 16,
+                stop_tokens: Vec::new(),
+            };
+            let gate_cfg = AdaptiveGateConfig {
+                enabled: false,
+                ..AdaptiveGateConfig::default()
+            };
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let exp_comp = ordinary.generate_sampled_until(
+                &PROMPT,
+                &options,
+                Prefill::default(),
+                &Cancellation::default(),
+                deadline,
+                &mut expected_sampler,
+                |t| {
+                    expected.push(t);
+                    Ok(())
+                },
+            )?;
+            let (act_comp, stats) = folded.generate_sampled_speculative_with_gate_until(
+                &PROMPT,
+                &options,
+                Prefill::default(),
+                suffix()?,
+                gate_cfg,
+                &Cancellation::default(),
+                deadline,
+                &mut actual_sampler,
+                |t| {
+                    actual.push(t);
+                    Ok(())
+                },
+            )?;
+            assert_eq!(act_comp, exp_comp);
+            assert_eq!(actual, expected);
+            assert_eq!(actual_sampler.draws, expected_sampler.draws);
+            assert_eq!(actual_sampler.observed, expected_sampler.observed);
+            assert_eq!(folded.tokens, ordinary.tokens);
+            assert_eq!(folded.logits, ordinary.logits);
+            assert_eq!(folded.decoder.kv_state, ordinary.decoder.kv_state);
+            assert_eq!(folded.decoder.recurrent_state, ordinary.decoder.recurrent_state);
+            assert!(!folded.decoder.has_pending_folded_verification());
+            assert_eq!(stats.replay_steps, 0);
+            assert_eq!(stats.rollback_restores, 0);
+            assert!(folded.decoder.folded_blocks > 0);
+            if rejected < 4 {
+                assert!(stats.cursor_draft_tokens > 0);
+                if rejected > 0 {
+                    assert!(stats.folded_replay_steps > 0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn folded_adaptive_gate_pauses_low_acceptance_prose_into_serial_burst() -> Result<()> {
+        let limits = Limits {
+            context_tokens: 128,
+            checkpoints: 4,
+            checkpoint_bytes: 1024,
+        };
+        let mut seq = FoldedBatchControl::new(0);
+        seq.serial_delay = Duration::from_micros(200);
+        let mut ordinary = Runtime::new(seq, limits)?;
+
+        let mut spec = FoldedBatchControl::new(8);
+        spec.serial_delay = Duration::from_micros(200);
+        spec.block_delay = Duration::from_micros(900);
+        let mut gated = Runtime::new(spec, limits)?;
+
+        let script = vec![3, 1, 2, 3, 2, 1, 3, 2, 1, 0, 3, 2, 1, 0, 2, 3, 1, 2, 0, 1];
+        let mut exp_sampler = ScriptSampler {
+            script,
+            ..ScriptSampler::default()
+        };
+        let mut act_sampler = exp_sampler.clone();
+        let options = Generation {
+            max_tokens: 20,
+            stop_tokens: Vec::new(),
+        };
+        let gate_cfg = AdaptiveGateConfig {
+            enabled: true,
+            warmup_rounds: 2,
+            smoothing: 0.5,
+            initial_verify_to_serial_ratio: 2.5,
+            break_even_margin: 1.0,
+            min_burst_tokens: 4,
+            max_burst_tokens: 8,
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        let _ = ordinary.generate_sampled_until(
+            &PROMPT,
+            &options,
+            Prefill::default(),
+            &Cancellation::default(),
+            deadline,
+            &mut exp_sampler,
+            |t| {
+                expected.push(t);
+                Ok(())
+            },
+        )?;
+        let (_, stats) = gated.generate_sampled_speculative_with_gate_until(
+            &PROMPT,
+            &options,
+            Prefill::default(),
+            suffix()?,
+            gate_cfg,
+            &Cancellation::default(),
+            deadline,
+            &mut act_sampler,
+            |t| {
+                actual.push(t);
+                Ok(())
+            },
+        )?;
+        assert_eq!(actual, expected);
+        assert_eq!(act_sampler.observed, exp_sampler.observed);
+        assert_eq!(gated.decoder.kv_state, ordinary.decoder.kv_state);
+        assert_eq!(
+            gated.decoder.recurrent_state,
+            ordinary.decoder.recurrent_state
+        );
+        assert!(stats.adaptive_gate_skips > 0);
+        assert!(stats.serial_burst_tokens > 0);
         Ok(())
     }
 }

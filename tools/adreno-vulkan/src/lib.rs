@@ -17,14 +17,19 @@ pub mod attention;
 )]
 pub mod device;
 pub mod executor;
+pub mod graph;
 pub mod spirv;
 
 pub use attention::{
     AttentionDescriptor, AttentionExecutionWitness, AttentionOutput, AttentionStageOutputs,
     AttentionTilePlan, attention_cache_key, cpu_attention_reference, select_attention_plan,
 };
-pub use device::AdrenoVulkanDevice;
+pub use device::{AdrenoVulkanDevice, CommandBatchRecorder, OwnedComputeStage};
 pub use executor::{VulkanAttentionExecutor, VulkanPq2Executor};
+pub use graph::{
+    TdrChunkPolicy, VulkanBatchedCheckpoint, VulkanBatchedConfig, VulkanBatchedGraphExecutor,
+    VulkanKvPrecision, VulkanLayerPipelines,
+};
 
 /// Error returned by native Adreno Vulkan initialization, planning, or execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -332,27 +337,27 @@ pub enum AttentionStrategy {
     ForceDecomposed,
 }
 
-fn hash_bytes(hasher: &mut Hasher, bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn hash_bytes(hasher: &mut Hasher, bytes: &[u8]) -> Result<(), Error> {
     hasher
         .update(bytes)
         .map_err(|err| Error::InvalidInput(err.to_string()))
 }
 
-fn hash_u32(hasher: &mut Hasher, value: u32) -> Result<(), Error> {
+pub(crate) fn hash_u32(hasher: &mut Hasher, value: u32) -> Result<(), Error> {
     hash_bytes(hasher, &value.to_le_bytes())
 }
 
-fn hash_u64(hasher: &mut Hasher, value: u64) -> Result<(), Error> {
+pub(crate) fn hash_u64(hasher: &mut Hasher, value: u64) -> Result<(), Error> {
     hash_bytes(hasher, &value.to_le_bytes())
 }
 
-fn hash_usize(hasher: &mut Hasher, value: usize) -> Result<(), Error> {
+pub(crate) fn hash_usize(hasher: &mut Hasher, value: usize) -> Result<(), Error> {
     let encoded = u64::try_from(value)
         .map_err(|err| Error::InvalidInput(format!("usize overflow during hash: {err}")))?;
     hash_u64(hasher, encoded)
 }
 
-fn hash_str(hasher: &mut Hasher, prefix: &[u8], text: &str) -> Result<(), Error> {
+pub(crate) fn hash_str(hasher: &mut Hasher, prefix: &[u8], text: &str) -> Result<(), Error> {
     if !prefix.is_empty() {
         hash_bytes(hasher, prefix)?;
     }

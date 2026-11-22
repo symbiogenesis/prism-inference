@@ -22,18 +22,18 @@ use crate::{
     select_attention_plan, spirv,
 };
 
-const KIND_PQ2: u32 = 142;
-const KIND_PTQ1: u32 = 143;
+pub(crate) const KIND_PQ2: u32 = 142;
+pub(crate) const KIND_PTQ1: u32 = 143;
 const PQ2_BLOCK_BYTES: usize = 34;
 const PTQ1_BLOCK_BYTES: usize = 28;
 const PQ2_COALESCED_TILE_WORDS: usize = 544;
 const PTQ1_COALESCED_TILE_WORDS: usize = 448;
 const Q8K_WORDS_PER_BLOCK: usize = 65;
-const Q8K_4PLANE_WORDS_PER_HALF: usize = 34;
-const Q8_0_WORDS_PER_BLOCK: usize = 9;
+pub(crate) const Q8K_4PLANE_WORDS_PER_HALF: usize = 34;
+pub(crate) const Q8_0_WORDS_PER_BLOCK: usize = 9;
 const DEFAULT_OPERATION_CAPACITY: u64 = 1_u64 << 40;
 const ARENA_BUDGET_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
-const MIN_SCRATCH_BYTES: u64 = 4096;
+pub(crate) const MIN_SCRATCH_BYTES: u64 = 4096;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct WeightCacheKey {
@@ -232,29 +232,30 @@ impl AttentionScratchSet {
     }
 }
 
-struct ProjectionPipelines {
-    pq2_q8k_fused: PipelineId,
-    pq2_q8k_unfused: PipelineId,
-    pq2_q8k_fused_res: PipelineId,
-    pq2_q8k_unfused_res: PipelineId,
-    pq2_q8k_4tok_fused: PipelineId,
-    pq2_q8k_4tok_unfused: PipelineId,
-    pq2_q8k_4tok_fused_res: PipelineId,
-    pq2_q8k_4tok_unfused_res: PipelineId,
-    pq2_q8_0: PipelineId,
-    ptq1_q8_0: PipelineId,
-    ptq1_q8_0_pinned: PipelineId,
-    ptq1_q8k: PipelineId,
-    quant_q8k_pinned: PipelineId,
-    quant_q8k_unpinned: PipelineId,
-    swiglu_pinned: PipelineId,
-    swiglu_unpinned: PipelineId,
-    hadamard: PipelineId,
-    dot_scalar: PipelineId,
+#[derive(Debug)]
+pub(crate) struct ProjectionPipelines {
+    pub(crate) pq2_q8k_fused: PipelineId,
+    pub(crate) pq2_q8k_unfused: PipelineId,
+    pub(crate) pq2_q8k_fused_res: PipelineId,
+    pub(crate) pq2_q8k_unfused_res: PipelineId,
+    pub(crate) pq2_q8k_4tok_fused: PipelineId,
+    pub(crate) pq2_q8k_4tok_unfused: PipelineId,
+    pub(crate) pq2_q8k_4tok_fused_res: PipelineId,
+    pub(crate) pq2_q8k_4tok_unfused_res: PipelineId,
+    pub(crate) pq2_q8_0: PipelineId,
+    pub(crate) ptq1_q8_0: PipelineId,
+    pub(crate) ptq1_q8_0_pinned: PipelineId,
+    pub(crate) ptq1_q8k: PipelineId,
+    pub(crate) quant_q8k_pinned: PipelineId,
+    pub(crate) quant_q8k_unpinned: PipelineId,
+    pub(crate) swiglu_pinned: PipelineId,
+    pub(crate) swiglu_unpinned: PipelineId,
+    pub(crate) hadamard: PipelineId,
+    pub(crate) dot_scalar: PipelineId,
 }
 
 impl ProjectionPipelines {
-    fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
+    pub(crate) fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         Ok(Self {
             pq2_q8k_fused: device.create_compute_pipeline(
                 &spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
@@ -333,7 +334,7 @@ impl ProjectionPipelines {
         })
     }
 
-    const fn select_pq2_q8k(
+    pub(crate) const fn select_pq2_q8k(
         &self,
         fused: bool,
         multi_token: bool,
@@ -2450,7 +2451,7 @@ fn checked_gemv_dims(
     Ok((rows_u32, blocks_u32, tokens_u32))
 }
 
-fn checked_grid(device: &AdrenoVulkanDevice, grid: [u32; 3]) -> Result<[u32; 3], Error> {
+pub(crate) fn checked_grid(device: &AdrenoVulkanDevice, grid: [u32; 3]) -> Result<[u32; 3], Error> {
     let max_wg = device
         .capabilities()
         .compute_limits
@@ -2469,28 +2470,28 @@ fn u32_slice_bytes_usize(word_count: usize) -> Result<usize, Error> {
         .ok_or_else(|| Error::ResourceLimit("u32 byte count overflow".to_owned()))
 }
 
-fn u32_slice_bytes(word_count: usize) -> Result<u64, Error> {
+pub(crate) fn u32_slice_bytes(word_count: usize) -> Result<u64, Error> {
     u64::try_from(word_count)
         .ok()
         .and_then(|w| w.checked_mul(4))
         .ok_or_else(|| Error::ResourceLimit("u32 byte length overflow".to_owned()))
 }
 
-fn f32_slice_bytes(elem_count: usize) -> Result<u64, Error> {
+pub(crate) fn f32_slice_bytes(elem_count: usize) -> Result<u64, Error> {
     u64::try_from(elem_count)
         .ok()
         .and_then(|e| e.checked_mul(4))
         .ok_or_else(|| Error::ResourceLimit("f32 byte length overflow".to_owned()))
 }
 
-fn ensure_finite_f32(values: &[f32], msg: &str) -> Result<(), Error> {
+pub(crate) fn ensure_finite_f32(values: &[f32], msg: &str) -> Result<(), Error> {
     if values.iter().any(|val| !val.is_finite()) {
         return Err(Error::InvalidInput(msg.to_owned()));
     }
     Ok(())
 }
 
-fn parse_hadamard_block(block: Option<u32>, cols: usize) -> Result<Option<u32>, Error> {
+pub(crate) fn parse_hadamard_block(block: Option<u32>, cols: usize) -> Result<Option<u32>, Error> {
     match block {
         None | Some(1) => Ok(None),
         Some(b)
@@ -2506,12 +2507,12 @@ fn parse_hadamard_block(block: Option<u32>, cols: usize) -> Result<Option<u32>, 
     }
 }
 
-fn hadamard_norm_bits(block_size: u32) -> u32 {
+pub(crate) fn hadamard_norm_bits(block_size: u32) -> u32 {
     let f = u16::try_from(block_size).map_or(1.0_f32, f32::from);
     (1.0_f32 / f.sqrt()).to_bits()
 }
 
-const fn attention_push_constants(desc: &AttentionDescriptor) -> [u32; 8] {
+pub(crate) const fn attention_push_constants(desc: &AttentionDescriptor) -> [u32; 8] {
     [
         desc.query_len,
         desc.total_seq,
@@ -2545,7 +2546,7 @@ fn validate_attention_inputs(
     Ok((q_elems, kv_elems, score_elems))
 }
 
-fn validate_matrix(
+pub(crate) fn validate_matrix(
     tensor: &Tensor,
     expected_kind: u32,
     col_alignment: usize,
@@ -2588,7 +2589,7 @@ fn validate_matrix(
     Ok((cols, rows))
 }
 
-fn validate_weight_scales(kind: u32, data: &[u8]) -> Result<(), Error> {
+pub(crate) fn validate_weight_scales(kind: u32, data: &[u8]) -> Result<(), Error> {
     match kind {
         KIND_PQ2 => {
             for block in data.as_chunks::<PQ2_BLOCK_BYTES>().0 {
@@ -2616,7 +2617,7 @@ fn check_f16_scale(bits: u16) -> Result<(), Error> {
     Ok(())
 }
 
-fn repack_coalesced_into(
+pub(crate) fn repack_coalesced_into(
     kind: u32,
     raw: &[u8],
     cols: usize,

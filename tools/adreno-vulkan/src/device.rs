@@ -7,21 +7,26 @@
 
 use std::collections::BTreeSet;
 use std::ffi::CStr;
+use std::ops::Range;
 use std::ptr::{NonNull, null_mut};
 use std::slice;
 
 use ash::vk;
+use bonsai_native_hash::Hasher;
 
 use crate::{
     AdrenoFamily, CoopMatShape, Error, MemoryHeapBudget, VulkanComputeLimits,
-    VulkanDeviceCapabilities,
+    VulkanDeviceCapabilities, hash_bytes, hash_u32, hash_u64, hash_usize,
 };
 
 const FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 const QUALCOMM_VENDOR_ID: u32 = 0x5143;
 const MAX_STAGE_BINDINGS: usize = 12;
 const MAX_PUSH_BYTES: usize = 128;
-const MAX_DESCRIPTOR_SETS_PER_SUBMIT: usize = 256;
+/// Maximum descriptor sets allocated inside one synchronous Vulkan command buffer submission.
+pub const MAX_DESCRIPTOR_SETS_PER_SUBMIT: usize = 4096;
+/// Maximum storage buffer descriptors allocated inside one synchronous Vulkan submission.
+pub const MAX_DESCRIPTORS_PER_SUBMIT: usize = 16_384;
 const ARENA_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
 const FORBIDDEN_VK_ENV_PREFIXES: [&str; 10] = [
@@ -40,6 +45,14 @@ const FORBIDDEN_VK_ENV_PREFIXES: [&str; 10] = [
 /// Opaque handle to a GPU buffer owned by [`AdrenoVulkanDevice`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct BufferId(usize);
+
+impl BufferId {
+    /// Returns the deterministic slot index for hashing or diagnostics.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
 
 /// Sub-allocated span within a GPU buffer bound cleanly to a descriptor slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -62,11 +75,51 @@ impl BufferSpan {
             range: vk::WHOLE_SIZE,
         }
     }
+
+    /// Creates a checked sub-span inside `self` starting at relative `byte_offset`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] on zero length, arithmetic overflow, or out-of-bounds sub-ranges.
+    pub fn subspan(self, byte_offset: u64, byte_len: u64) -> Result<Self, Error> {
+        if byte_len == 0 {
+            return Err(Error::InvalidInput(
+                "buffer subspan byte length must be >= 1".to_owned(),
+            ));
+        }
+        if self.range != vk::WHOLE_SIZE {
+            let rel_end = byte_offset
+                .checked_add(byte_len)
+                .ok_or_else(|| Error::InvalidInput("buffer subspan overflow".to_owned()))?;
+            if rel_end > self.range {
+                return Err(Error::InvalidInput(format!(
+                    "buffer subspan ({byte_offset}..{rel_end} B) exceeds span range ({} B)",
+                    self.range
+                )));
+            }
+        }
+        let abs_offset = self
+            .offset
+            .checked_add(byte_offset)
+            .ok_or_else(|| Error::InvalidInput("buffer subspan offset overflow".to_owned()))?;
+        Ok(Self {
+            buffer: self.buffer,
+            offset: abs_offset,
+            range: byte_len,
+        })
+    }
 }
 
 /// Opaque handle to a compiled compute pipeline owned by [`AdrenoVulkanDevice`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct PipelineId(usize);
+
+impl PipelineId {
+    /// Returns the deterministic pipeline index for hashing or diagnostics.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
 
 /// One compute dispatch stage queued into [`AdrenoVulkanDevice::submit_compute_stages`].
 #[derive(Clone, Copy, Debug)]
@@ -92,6 +145,214 @@ pub struct ComputeSpanStage<'a> {
     pub push_u32s: &'a [u32],
     /// Workgroup grid `[x, y, z]`.
     pub workgroups: [u32; 3],
+}
+
+/// One owned compute dispatch stage queued inside [`CommandBatchRecorder`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedComputeStage {
+    /// Compiled compute pipeline handle.
+    pub pipeline: PipelineId,
+    /// Storage buffer spans bound sequentially to set `0`, bindings `0..n`.
+    pub buffers: Vec<BufferSpan>,
+    /// Push constant `u32` words starting at byte offset `0`.
+    pub push_u32s: Vec<u32>,
+    /// Workgroup grid `[x, y, z]`.
+    pub workgroups: [u32; 3],
+    /// Whether an intra-batch `SHADER_WRITE -> SHADER_READ` memory barrier is emitted before this
+    /// stage when it is not the first dispatch in a command buffer submission.
+    pub barrier_before: bool,
+}
+
+/// Multi-stage compute batch recorder with optional intra-batch barriers and chunk planning.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CommandBatchRecorder {
+    stages: Vec<OwnedComputeStage>,
+}
+
+impl CommandBatchRecorder {
+    /// Creates an empty batch recorder.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { stages: Vec::new() }
+    }
+
+    /// Creates an empty batch recorder pre-sized for `capacity` stages.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            stages: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Appends a pre-built [`OwnedComputeStage`].
+    pub fn push_stage(&mut self, stage: OwnedComputeStage) {
+        self.stages.push(stage);
+    }
+
+    /// Appends a compute dispatch stage with explicit `barrier_before` synchronization control.
+    pub fn push(
+        &mut self,
+        pipeline: PipelineId,
+        buffers: &[BufferSpan],
+        push_u32s: &[u32],
+        workgroups: [u32; 3],
+        barrier_before: bool,
+    ) {
+        self.stages.push(OwnedComputeStage {
+            pipeline,
+            buffers: buffers.to_vec(),
+            push_u32s: push_u32s.to_vec(),
+            workgroups,
+            barrier_before,
+        });
+    }
+
+    /// Appends a compute dispatch stage that waits on prior compute shader writes.
+    pub fn push_barrier(
+        &mut self,
+        pipeline: PipelineId,
+        buffers: &[BufferSpan],
+        push_u32s: &[u32],
+        workgroups: [u32; 3],
+    ) {
+        self.push(pipeline, buffers, push_u32s, workgroups, true);
+    }
+
+    /// Appends a compute dispatch stage that runs concurrently with immediately preceding siblings.
+    pub fn push_concurrent(
+        &mut self,
+        pipeline: PipelineId,
+        buffers: &[BufferSpan],
+        push_u32s: &[u32],
+        workgroups: [u32; 3],
+    ) {
+        self.push(pipeline, buffers, push_u32s, workgroups, false);
+    }
+
+    /// Returns all recorded stages in submission order.
+    #[must_use]
+    pub fn stages(&self) -> &[OwnedComputeStage] {
+        &self.stages
+    }
+
+    /// Returns the number of queued compute stages.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.stages.len()
+    }
+
+    /// Returns `true` when no stages are currently queued.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
+
+    /// Clears all queued stages while preserving allocated capacity.
+    pub fn clear(&mut self) {
+        self.stages.clear();
+    }
+
+    /// Returns total descriptor bindings summed across all queued stages.
+    #[must_use]
+    pub fn total_descriptors(&self) -> usize {
+        self.stages.iter().map(|stage| stage.buffers.len()).sum()
+    }
+
+    /// Returns the number of intra-batch barriers that will be emitted inside a single submission.
+    #[must_use]
+    pub fn intra_batch_barrier_count(&self) -> usize {
+        self.stages
+            .iter()
+            .skip(1)
+            .filter(|stage| stage.barrier_before)
+            .count()
+    }
+
+    /// Partitions queued stages into contiguous submit ranges respecting both
+    /// `max_stages_per_submit` (capped at [`MAX_DESCRIPTOR_SETS_PER_SUBMIT`]) and
+    /// [`MAX_DESCRIPTORS_PER_SUBMIT`].
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if `max_stages_per_submit == 0`, or
+    /// [`Error::ResourceLimit`] if any individual stage exceeds [`MAX_STAGE_BINDINGS`].
+    pub fn split_chunks(&self, max_stages_per_submit: usize) -> Result<Vec<Range<usize>>, Error> {
+        plan_batch_chunks(&self.stages, max_stages_per_submit)
+    }
+
+    /// Computes a deterministic SHA-256 identity covering all queued stages and barriers.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if hashing or length conversion fails.
+    pub fn identity_sha256(&self) -> Result<String, Error> {
+        let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
+        hash_bytes(&mut hasher, b"bonsai-adreno-batch-v1\0")?;
+        hash_usize(&mut hasher, self.stages.len())?;
+        for stage in &self.stages {
+            hash_usize(&mut hasher, stage.pipeline.0)?;
+            hash_bytes(&mut hasher, &[u8::from(stage.barrier_before)])?;
+            for wg in stage.workgroups {
+                hash_u32(&mut hasher, wg)?;
+            }
+            hash_usize(&mut hasher, stage.buffers.len())?;
+            for span in &stage.buffers {
+                hash_usize(&mut hasher, span.buffer.0)?;
+                hash_u64(&mut hasher, span.offset)?;
+                hash_u64(&mut hasher, span.range)?;
+            }
+            hash_usize(&mut hasher, stage.push_u32s.len())?;
+            for &word in &stage.push_u32s {
+                hash_u32(&mut hasher, word)?;
+            }
+        }
+        let digest = hasher
+            .finish()
+            .map_err(|err| Error::InvalidInput(err.to_string()))?;
+        Ok(hex::encode(digest))
+    }
+}
+
+/// Computes contiguous submission ranges for `stages` within `max_stages_per_submit` and
+/// hardware descriptor pool ceilings.
+///
+/// # Errors
+/// Returns [`Error::InvalidInput`] if `max_stages_per_submit == 0`, or
+/// [`Error::ResourceLimit`] if any single stage binds more than [`MAX_STAGE_BINDINGS`] buffers.
+pub fn plan_batch_chunks(
+    stages: &[OwnedComputeStage],
+    max_stages_per_submit: usize,
+) -> Result<Vec<Range<usize>>, Error> {
+    if max_stages_per_submit == 0 {
+        return Err(Error::InvalidInput(
+            "max_stages_per_submit must be >= 1".to_owned(),
+        ));
+    }
+    if stages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stage_cap = max_stages_per_submit.min(MAX_DESCRIPTOR_SETS_PER_SUBMIT);
+    let mut chunks = Vec::new();
+    let mut chunk_start = 0_usize;
+    let mut chunk_descriptors = 0_usize;
+
+    for (idx, stage) in stages.iter().enumerate() {
+        let bindings = stage.buffers.len();
+        if bindings > MAX_STAGE_BINDINGS {
+            return Err(Error::ResourceLimit(format!(
+                "stage binding count ({bindings}) exceeds device ceiling ({MAX_STAGE_BINDINGS})"
+            )));
+        }
+        let chunk_len = idx - chunk_start;
+        if chunk_len > 0
+            && (chunk_len >= stage_cap || chunk_descriptors + bindings > MAX_DESCRIPTORS_PER_SUBMIT)
+        {
+            chunks.push(chunk_start..idx);
+            chunk_start = idx;
+            chunk_descriptors = 0;
+        }
+        chunk_descriptors += bindings;
+    }
+    chunks.push(chunk_start..stages.len());
+    Ok(chunks)
 }
 
 #[derive(Clone, Copy)]
@@ -469,11 +730,12 @@ impl AdrenoVulkanDevice {
         };
         let command_buffer = cmd_bufs[0];
 
+        let desc_count_u32 = u32::try_from(MAX_DESCRIPTORS_PER_SUBMIT).unwrap_or(16_384);
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 2048,
+            descriptor_count: desc_count_u32,
         }];
-        let max_sets_u32 = u32::try_from(MAX_DESCRIPTOR_SETS_PER_SUBMIT).unwrap_or(256);
+        let max_sets_u32 = u32::try_from(MAX_DESCRIPTOR_SETS_PER_SUBMIT).unwrap_or(4096);
         let desc_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::empty())
             .max_sets(max_sets_u32)
@@ -872,6 +1134,149 @@ impl AdrenoVulkanDevice {
         self.read_buffer_f32_at(id, 0, dst)
     }
 
+    /// Returns the allocated byte capacity of `id`.
+    ///
+    /// # Errors
+    /// Returns [`Error::DeviceFault`] if faulted or [`Error::InvalidInput`] for an invalid handle.
+    pub fn buffer_size_bytes(&self, id: BufferId) -> Result<u64, Error> {
+        self.ensure_healthy()?;
+        self.buffers
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|entry| entry.size_bytes)
+            .ok_or_else(|| Error::InvalidInput("invalid buffer handle".to_owned()))
+    }
+
+    /// Downloads raw bytes from a persistently mapped storage buffer starting at `byte_offset`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if `byte_offset + dst.len()` exceeds buffer bounds or
+    /// [`Error::DeviceFault`] if faulted.
+    pub fn read_buffer_bytes_at(
+        &self,
+        id: BufferId,
+        byte_offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), Error> {
+        self.with_mapped_slice_mut(id, byte_offset, dst.len(), false, true, |src| {
+            dst.copy_from_slice(src);
+        })
+    }
+
+    /// Downloads raw bytes from a persistently mapped storage buffer starting at byte offset `0`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::read_buffer_bytes_at`] bounds or fault errors.
+    pub fn read_buffer_bytes(&self, id: BufferId, dst: &mut [u8]) -> Result<(), Error> {
+        self.read_buffer_bytes_at(id, 0, dst)
+    }
+
+    /// Zero-fills `byte_len` bytes in a persistently mapped storage buffer starting at `byte_offset`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if `byte_offset + byte_len` overflows or exceeds buffer size,
+    /// or [`Error::DeviceFault`] if faulted.
+    pub fn fill_buffer_zero(
+        &self,
+        id: BufferId,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> Result<(), Error> {
+        let len_usize = usize::try_from(byte_len)
+            .map_err(|_| Error::InvalidInput("zero-fill byte length overflow".to_owned()))?;
+        self.with_mapped_slice_mut(id, byte_offset, len_usize, true, false, |dst| {
+            dst.fill(0);
+        })
+    }
+
+    /// Copies `byte_len` bytes between persistently mapped storage buffers (or within one buffer).
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] on invalid handles or out-of-bounds ranges, or
+    /// [`Error::DeviceFault`] if the device is faulted.
+    pub fn copy_buffer_bytes(
+        &self,
+        src: BufferId,
+        src_offset: u64,
+        dst: BufferId,
+        dst_offset: u64,
+        byte_len: u64,
+    ) -> Result<(), Error> {
+        self.ensure_healthy()?;
+        let src_entry = self
+            .buffers
+            .get(src.0)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| Error::InvalidInput("invalid source buffer handle".to_owned()))?;
+        let dst_entry = self
+            .buffers
+            .get(dst.0)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| Error::InvalidInput("invalid destination buffer handle".to_owned()))?;
+        let src_end = src_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| Error::InvalidInput("source buffer range overflow".to_owned()))?;
+        let dst_end = dst_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| Error::InvalidInput("destination buffer range overflow".to_owned()))?;
+        if src_end > src_entry.size_bytes {
+            return Err(Error::InvalidInput(format!(
+                "source copy range ({src_offset}..{src_end} B) exceeds buffer size ({} B)",
+                src_entry.size_bytes
+            )));
+        }
+        if dst_end > dst_entry.size_bytes {
+            return Err(Error::InvalidInput(format!(
+                "destination copy range ({dst_offset}..{dst_end} B) exceeds buffer size ({} B)",
+                dst_entry.size_bytes
+            )));
+        }
+        if byte_len == 0 {
+            return Ok(());
+        }
+        let len_u = usize::try_from(byte_len)
+            .map_err(|_| Error::InvalidInput("copy byte length overflow".to_owned()))?;
+        let src_off_u = usize::try_from(src_offset)
+            .map_err(|_| Error::InvalidInput("source offset overflow".to_owned()))?;
+        let dst_off_u = usize::try_from(dst_offset)
+            .map_err(|_| Error::InvalidInput("destination offset overflow".to_owned()))?;
+        if src == dst {
+            let total_u = usize::try_from(src_entry.size_bytes)
+                .map_err(|_| Error::InvalidInput("buffer size overflow".to_owned()))?;
+            return self.with_mapped_slice_mut(src, 0, total_u, true, true, |whole| {
+                whole.copy_within(src_off_u..src_off_u + len_u, dst_off_u);
+            });
+        }
+        let src_total_u = usize::try_from(src_entry.size_bytes)
+            .map_err(|_| Error::InvalidInput("source buffer size overflow".to_owned()))?;
+        let dst_total_u = usize::try_from(dst_entry.size_bytes)
+            .map_err(|_| Error::InvalidInput("destination buffer size overflow".to_owned()))?;
+        if !src_entry.host_coherent {
+            let range = [vk::MappedMemoryRange::default()
+                .memory(src_entry.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)];
+            // SAFETY: Invalidating persistently mapped non-coherent source range before host copy.
+            let _ = unsafe { self.device.invalidate_mapped_memory_ranges(&range) };
+        }
+        // SAFETY: `src_entry.mapped` is persistently mapped for `src_total_u` bytes while queue is idle.
+        let src_whole = unsafe { slice::from_raw_parts(src_entry.mapped.0.as_ptr(), src_total_u) };
+        // SAFETY: `dst_entry.mapped` belongs to a distinct `OwnedBuffer` (`src != dst`) for `dst_total_u` bytes.
+        let dst_whole =
+            unsafe { slice::from_raw_parts_mut(dst_entry.mapped.0.as_ptr(), dst_total_u) };
+        dst_whole[dst_off_u..dst_off_u + len_u]
+            .copy_from_slice(&src_whole[src_off_u..src_off_u + len_u]);
+        if !dst_entry.host_coherent {
+            let range = [vk::MappedMemoryRange::default()
+                .memory(dst_entry.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)];
+            // SAFETY: Flushing persistently mapped non-coherent destination range after host copy.
+            let _ = unsafe { self.device.flush_mapped_memory_ranges(&range) };
+        }
+        Ok(())
+    }
+
     /// Releases a buffer immediately when healthy, or retains it in uncertain storage when faulted.
     pub fn free_buffer(&mut self, id: BufferId) {
         let Some(slot) = self.buffers.get_mut(id.0) else {
@@ -1097,6 +1502,7 @@ impl AdrenoVulkanDevice {
                 "stage count exceeds descriptor pool capacity".to_owned(),
             ));
         }
+        let mut total_descriptors = 0_usize;
         for stage in stages {
             self.validate_span_stage(
                 stage.pipeline,
@@ -1104,6 +1510,7 @@ impl AdrenoVulkanDevice {
                 stage.push_u32s.len(),
                 stage.workgroups,
             )?;
+            total_descriptors += stage.buffers.len();
             for &buf_id in stage.buffers {
                 if self
                     .buffers
@@ -1115,6 +1522,43 @@ impl AdrenoVulkanDevice {
                         "invalid buffer handle in stage".to_owned(),
                     ));
                 }
+            }
+        }
+        if total_descriptors > MAX_DESCRIPTORS_PER_SUBMIT {
+            return Err(Error::ResourceLimit(format!(
+                "descriptor binding count ({total_descriptors}) exceeds pool capacity ({MAX_DESCRIPTORS_PER_SUBMIT})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_buffer_spans(&self, buffers: &[BufferSpan]) -> Result<(), Error> {
+        let align = self.min_storage_buffer_offset_alignment.max(1);
+        for span in buffers {
+            let entry = self
+                .buffers
+                .get(span.buffer.0)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| Error::InvalidInput("invalid buffer span handle".to_owned()))?;
+            if span.offset % align != 0 {
+                return Err(Error::InvalidInput(
+                    "unaligned buffer span offset".to_owned(),
+                ));
+            }
+            if span.range != vk::WHOLE_SIZE {
+                let end = span
+                    .offset
+                    .checked_add(span.range)
+                    .ok_or_else(|| Error::InvalidInput("buffer span overflow".to_owned()))?;
+                if span.range == 0 || end > entry.size_bytes {
+                    return Err(Error::InvalidInput(
+                        "buffer span exceeds backing buffer size".to_owned(),
+                    ));
+                }
+            } else if span.offset >= entry.size_bytes {
+                return Err(Error::InvalidInput(
+                    "buffer span offset exceeds backing buffer size".to_owned(),
+                ));
             }
         }
         Ok(())
@@ -1131,7 +1575,7 @@ impl AdrenoVulkanDevice {
                 "stage count exceeds descriptor pool capacity".to_owned(),
             ));
         }
-        let align = self.min_storage_buffer_offset_alignment.max(1);
+        let mut total_descriptors = 0_usize;
         for stage in stages {
             self.validate_span_stage(
                 stage.pipeline,
@@ -1139,33 +1583,47 @@ impl AdrenoVulkanDevice {
                 stage.push_u32s.len(),
                 stage.workgroups,
             )?;
-            for span in stage.buffers {
-                let entry = self
-                    .buffers
-                    .get(span.buffer.0)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| Error::InvalidInput("invalid buffer span handle".to_owned()))?;
-                if span.offset % align != 0 {
-                    return Err(Error::InvalidInput(
-                        "unaligned buffer span offset".to_owned(),
-                    ));
-                }
-                if span.range != vk::WHOLE_SIZE {
-                    let end = span
-                        .offset
-                        .checked_add(span.range)
-                        .ok_or_else(|| Error::InvalidInput("buffer span overflow".to_owned()))?;
-                    if span.range == 0 || end > entry.size_bytes {
-                        return Err(Error::InvalidInput(
-                            "buffer span exceeds backing buffer size".to_owned(),
-                        ));
-                    }
-                } else if span.offset >= entry.size_bytes {
-                    return Err(Error::InvalidInput(
-                        "buffer span offset exceeds backing buffer size".to_owned(),
-                    ));
-                }
-            }
+            total_descriptors += stage.buffers.len();
+            self.validate_buffer_spans(stage.buffers)?;
+        }
+        if total_descriptors > MAX_DESCRIPTORS_PER_SUBMIT {
+            return Err(Error::ResourceLimit(format!(
+                "descriptor binding count ({total_descriptors}) exceeds pool capacity ({MAX_DESCRIPTORS_PER_SUBMIT})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_owned_stages(
+        &self,
+        stages: &[OwnedComputeStage],
+        enforce_single_submit_bounds: bool,
+    ) -> Result<(), Error> {
+        if stages.is_empty() {
+            return Err(Error::InvalidInput(
+                "at least one compute stage is required".to_owned(),
+            ));
+        }
+        if enforce_single_submit_bounds && stages.len() > MAX_DESCRIPTOR_SETS_PER_SUBMIT {
+            return Err(Error::ResourceLimit(
+                "stage count exceeds descriptor pool capacity".to_owned(),
+            ));
+        }
+        let mut total_descriptors = 0_usize;
+        for stage in stages {
+            self.validate_span_stage(
+                stage.pipeline,
+                stage.buffers.len(),
+                stage.push_u32s.len(),
+                stage.workgroups,
+            )?;
+            total_descriptors += stage.buffers.len();
+            self.validate_buffer_spans(&stage.buffers)?;
+        }
+        if enforce_single_submit_bounds && total_descriptors > MAX_DESCRIPTORS_PER_SUBMIT {
+            return Err(Error::ResourceLimit(format!(
+                "descriptor binding count ({total_descriptors}) exceeds pool capacity ({MAX_DESCRIPTORS_PER_SUBMIT})"
+            )));
         }
         Ok(())
     }
@@ -1193,6 +1651,47 @@ impl AdrenoVulkanDevice {
         self.ensure_healthy()?;
         self.validate_span_stages(stages)?;
         self.prepare_and_submit_spans(stages)
+    }
+
+    /// Records and executes an entire [`CommandBatchRecorder`] in a single command buffer submit.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] on empty or malformed batches, [`Error::ResourceLimit`] if
+    /// stage or descriptor counts exceed single-submit limits, [`Error::DeviceFault`] on timeout or
+    /// `ERROR_DEVICE_LOST`, or [`Error::Vulkan`] on driver errors.
+    pub fn submit_compute_batch(&mut self, batch: &CommandBatchRecorder) -> Result<(), Error> {
+        self.ensure_healthy()?;
+        self.validate_owned_stages(batch.stages(), true)?;
+        self.prepare_and_submit_owned(batch.stages())
+    }
+
+    /// Records and executes a [`CommandBatchRecorder`] split into chunks of at most
+    /// `max_stages_per_submit` dispatches (bounded by device descriptor limits), returning the number
+    /// of synchronous Vulkan queue submits executed.
+    ///
+    /// Validates every stage before submitting the first chunk.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if `max_stages_per_submit == 0` or any stage is malformed,
+    /// [`Error::ResourceLimit`] if a stage exceeds device limits, [`Error::DeviceFault`] on timeout
+    /// or `ERROR_DEVICE_LOST`, or [`Error::Vulkan`] on driver errors.
+    pub fn submit_compute_batches_with_max_stages(
+        &mut self,
+        batch: &CommandBatchRecorder,
+        max_stages_per_submit: usize,
+    ) -> Result<u64, Error> {
+        self.ensure_healthy()?;
+        let chunks = batch.split_chunks(max_stages_per_submit)?;
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+        self.validate_owned_stages(batch.stages(), false)?;
+        let mut submits = 0_u64;
+        for range in chunks {
+            self.prepare_and_submit_owned(&batch.stages()[range])?;
+            submits += 1;
+        }
+        Ok(submits)
     }
 
     fn allocate_stage_sets(
@@ -1285,7 +1784,7 @@ impl AdrenoVulkanDevice {
         self.record_and_submit(
             stages
                 .iter()
-                .map(|s| (s.pipeline, s.push_u32s, s.workgroups)),
+                .map(|s| (s.pipeline, s.push_u32s, s.workgroups, true)),
         )
     }
 
@@ -1310,13 +1809,41 @@ impl AdrenoVulkanDevice {
         self.record_and_submit(
             stages
                 .iter()
-                .map(|s| (s.pipeline, s.push_u32s, s.workgroups)),
+                .map(|s| (s.pipeline, s.push_u32s, s.workgroups, true)),
         )
+    }
+
+    fn prepare_and_submit_owned(&mut self, stages: &[OwnedComputeStage]) -> Result<(), Error> {
+        self.allocate_stage_sets(stages.iter().map(|s| s.pipeline))?;
+        for (stage, &set) in stages.iter().zip(&self.scratch_sets) {
+            self.bind_stage_descriptors(
+                set,
+                stage.buffers.len(),
+                stage.buffers.iter().filter_map(|span| {
+                    self.buffers
+                        .get(span.buffer.0)
+                        .and_then(Option::as_ref)
+                        .map(|b| vk::DescriptorBufferInfo {
+                            buffer: b.buffer,
+                            offset: span.offset,
+                            range: span.range,
+                        })
+                }),
+            );
+        }
+        self.record_and_submit(stages.iter().map(|s| {
+            (
+                s.pipeline,
+                s.push_u32s.as_slice(),
+                s.workgroups,
+                s.barrier_before,
+            )
+        }))
     }
 
     fn record_and_submit<'a>(
         &mut self,
-        stages: impl Iterator<Item = (PipelineId, &'a [u32], [u32; 3])>,
+        stages: impl Iterator<Item = (PipelineId, &'a [u32], [u32; 3], bool)>,
     ) -> Result<(), Error> {
         let fences = [self.fence];
         // SAFETY: Fence is unsignaled after creation or prior completion.
@@ -1340,14 +1867,14 @@ impl AdrenoVulkanDevice {
             return Err(Error::Vulkan(format!("begin_command_buffer: {err:?}")));
         }
 
-        for (stage_idx, ((pipe_id, push_u32s, workgroups), &set)) in
+        for (stage_idx, ((pipe_id, push_u32s, workgroups, barrier_before), &set)) in
             stages.zip(&self.scratch_sets).enumerate()
         {
-            if stage_idx > 0 {
+            if stage_idx > 0 && barrier_before {
                 let barrier = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ)];
-                // SAFETY: Inserting explicit compute-to-compute memory barrier between stages.
+                // SAFETY: Inserting explicit compute-to-compute memory barrier before dependent stage.
                 unsafe {
                     self.device.cmd_pipeline_barrier(
                         self.command_buffer,
@@ -1365,13 +1892,13 @@ impl AdrenoVulkanDevice {
 
         let host_barrier = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)];
-        // SAFETY: Synchronizing final shader writes for host readback.
+            .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::SHADER_READ)];
+        // SAFETY: Synchronizing final shader writes for host readback and subsequent submits.
         unsafe {
             self.device.cmd_pipeline_barrier(
                 self.command_buffer,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &host_barrier,
                 &[],
@@ -1854,6 +2381,76 @@ mod tests {
         assert!(is_forbidden_vk_env("vk_icd_filenames"));
         assert!(is_forbidden_vk_env("VK_LAYER_PATH"));
         assert!(!is_forbidden_vk_env("SYSTEMROOT"));
+    }
+
+    #[test]
+    fn command_batch_recorder_validates_splits_and_hashes_deterministically() -> Result<(), Error> {
+        let mut batch = CommandBatchRecorder::new();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        assert_eq!(batch.total_descriptors(), 0);
+        assert_eq!(batch.intra_batch_barrier_count(), 0);
+        assert_eq!(batch.split_chunks(8)?, Vec::<Range<usize>>::new());
+
+        let p0 = PipelineId(0);
+        let p1 = PipelineId(1);
+        let span0 = BufferSpan::whole(BufferId(0));
+        let span1 = BufferSpan {
+            buffer: BufferId(1),
+            offset: 256,
+            range: 1024,
+        };
+        let sub = span1.subspan(128, 512)?;
+        assert_eq!(sub.offset, 384);
+        assert_eq!(sub.range, 512);
+        assert!(span1.subspan(600, 512).is_err());
+        assert!(span1.subspan(0, 0).is_err());
+
+        batch.push_barrier(p0, &[span0, span1], &[16, 1], [1, 1, 1]);
+        batch.push_concurrent(p1, &[span0, sub], &[32], [2, 1, 1]);
+        batch.push_concurrent(p1, &[span1, sub], &[64], [4, 1, 1]);
+        batch.push_barrier(p0, &[span0, span1, sub], &[8], [1, 1, 1]);
+
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 4);
+        assert_eq!(batch.stages().len(), 4);
+        assert_eq!(batch.total_descriptors(), 9);
+        assert_eq!(batch.intra_batch_barrier_count(), 1);
+
+        let digest_a = batch.identity_sha256()?;
+        let digest_b = batch.identity_sha256()?;
+        assert_eq!(digest_a.len(), 64);
+        assert_eq!(digest_a, digest_b);
+
+        let mut modified = batch.clone();
+        modified.stages[1].barrier_before = true;
+        assert_ne!(modified.identity_sha256()?, digest_a);
+
+        assert!(matches!(batch.split_chunks(0), Err(Error::InvalidInput(_))));
+        assert_eq!(batch.split_chunks(2)?, vec![0..2, 2..4]);
+        assert_eq!(batch.split_chunks(3)?, vec![0..3, 3..4]);
+        assert_eq!(batch.split_chunks(10)?, vec![0..4]);
+
+        let mut overbound = CommandBatchRecorder::new();
+        overbound.push_barrier(p0, &[span0; MAX_STAGE_BINDINGS + 1], &[1], [1, 1, 1]);
+        assert!(matches!(
+            overbound.split_chunks(4),
+            Err(Error::ResourceLimit(_))
+        ));
+
+        let mut pool_bound_batch = CommandBatchRecorder::with_capacity(4100);
+        for _ in 0..4100 {
+            pool_bound_batch.push_barrier(p0, &[span0; 5], &[1], [1, 1, 1]);
+        }
+        // 4100 stages * 5 descriptors = 20500 > MAX_DESCRIPTORS_PER_SUBMIT (16384):
+        // first chunk caps at floor(16384 / 5) = 3276 stages, second chunk gets 824 stages.
+        let desc_chunks = pool_bound_batch.split_chunks(usize::MAX)?;
+        assert_eq!(desc_chunks, vec![0..3276, 3276..4100]);
+
+        batch.clear();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        Ok(())
     }
 
     #[test]

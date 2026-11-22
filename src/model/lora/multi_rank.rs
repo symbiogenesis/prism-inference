@@ -239,6 +239,68 @@ impl MultiRankAdapter {
         Self::validate_scale(scale).is_ok() && scale != 0.0 && self.targets.contains_key(target)
     }
 
+    pub(crate) fn compact_ffn_down_layers(&self, layers: &[(usize, &[usize])]) -> Result<Self> {
+        const GROUP_WIDTH: usize = 1024;
+        const GROUPS: usize = 17;
+        const FULL_WIDTH: usize = GROUP_WIDTH * GROUPS;
+        let mut compacted = self.clone();
+        for &(layer, omitted_groups) in layers {
+            if omitted_groups.is_empty()
+                || omitted_groups.len() >= GROUPS
+                || omitted_groups.iter().any(|&group| group >= GROUPS)
+                || omitted_groups.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(invalid(
+                    "FFN compaction requires 1..=16 sorted distinct omitted groups in 0..17",
+                ));
+            }
+            if compacted
+                .targets
+                .contains_key(&format!("blk.{layer}.ffn_gate.weight"))
+                || compacted
+                    .targets
+                    .contains_key(&format!("blk.{layer}.ffn_up.weight"))
+            {
+                return Err(invalid(
+                    "multi-rank gate/up adapters are unsupported on compacted FFN layers",
+                ));
+            }
+            let target_name = format!("blk.{layer}.ffn_down.weight");
+            let Some(entry) = compacted.targets.get_mut(&target_name) else {
+                continue;
+            };
+            if entry.in_features != FULL_WIDTH {
+                return Err(invalid(format!(
+                    "multi-rank adapter {target_name} input width does not match Swift FFN"
+                )));
+            }
+            let new_in_features = (GROUPS - omitted_groups.len()) * GROUP_WIDTH;
+            match &mut entry.storage {
+                MultiRankStorage::F16 { a, .. } => {
+                    *a = compact_multi_a_rows(a, entry.rank, omitted_groups)?;
+                }
+                MultiRankStorage::F32 { a, .. } => {
+                    *a = compact_multi_a_rows(a, entry.rank, omitted_groups)?;
+                }
+            }
+            entry.in_features = new_in_features;
+        }
+        compacted.storage_bytes = compacted
+            .targets
+            .values()
+            .try_fold(0_usize, |acc, target| {
+                acc.checked_add(target.storage.retained_bytes())
+            })
+            .ok_or_else(|| invalid("multi-rank adapter retained byte overflow"))?;
+        compacted.execution_identity = compute_execution_identity(
+            &compacted.base_identity,
+            compacted.policy,
+            compacted.alpha,
+            &compacted.targets,
+        )?;
+        Ok(compacted)
+    }
+
     /// Applies this adapter in place onto a single token's projection `output`.
     ///
     /// Preserves `output` verbatim when `scale == 0.0` or when `target` is absent.
@@ -410,6 +472,30 @@ impl MultiRankAdapter {
         }
         Ok(())
     }
+}
+
+fn compact_multi_a_rows<T: Copy>(
+    old_a: &[T],
+    rank: usize,
+    omitted_groups: &[usize],
+) -> Result<Box<[T]>> {
+    const GROUP_WIDTH: usize = 1024;
+    const GROUPS: usize = 17;
+    const FULL_WIDTH: usize = GROUP_WIDTH * GROUPS;
+    let new_in = (GROUPS - omitted_groups.len()) * GROUP_WIDTH;
+    let total = rank
+        .checked_mul(new_in)
+        .ok_or_else(|| invalid("multi-rank LoRA compacted A size overflow"))?;
+    let mut compacted = Vec::new();
+    compacted.try_reserve_exact(total)?;
+    for row in old_a.as_chunks::<FULL_WIDTH>().0 {
+        for group in 0..GROUPS {
+            if !omitted_groups.contains(&group) {
+                compacted.extend_from_slice(&row[group * GROUP_WIDTH..(group + 1) * GROUP_WIDTH]);
+            }
+        }
+    }
+    Ok(compacted.into_boxed_slice())
 }
 
 fn collect_lora_pairs(adapter: &Model) -> Result<BTreeMap<&str, (&Tensor, &Tensor)>> {
@@ -1061,6 +1147,169 @@ mod tests {
         )?;
         for (actual, expected) in parallel_batch.iter().zip(&serial_batch) {
             assert_eq!(to_bits(actual), to_bits(expected));
+        }
+        Ok(())
+    }
+
+    fn make_compact_f32_adapter(
+        base: &Model,
+        dims: [usize; 3],
+        a_vals: &[f32],
+        b_vals: &[f32],
+        with_gate_on_layer1: bool,
+        with_up_on_layer0: bool,
+    ) -> Result<MultiRankAdapter> {
+        let [in_features, out_features, rank] = dims;
+        let down_name = "blk.0.ffn_down.weight";
+        let gate_name = "blk.1.ffn_gate.weight";
+        let up_name = "blk.0.ffn_up.weight";
+        let mut tensors = BTreeMap::from([
+            (
+                format!("{down_name}.lora_a"),
+                f32_tensor(&format!("{down_name}.lora_a"), &[in_features, rank], a_vals),
+            ),
+            (
+                format!("{down_name}.lora_b"),
+                f32_tensor(
+                    &format!("{down_name}.lora_b"),
+                    &[rank, out_features],
+                    b_vals,
+                ),
+            ),
+        ]);
+        for (enabled, target) in [
+            (with_gate_on_layer1, gate_name),
+            (with_up_on_layer0, up_name),
+        ] {
+            if enabled {
+                tensors.insert(
+                    format!("{target}.lora_a"),
+                    f32_tensor(
+                        &format!("{target}.lora_a"),
+                        &[out_features, rank],
+                        &vec![0.25; out_features * rank],
+                    ),
+                );
+                tensors.insert(
+                    format!("{target}.lora_b"),
+                    f32_tensor(
+                        &format!("{target}.lora_b"),
+                        &[rank, in_features],
+                        &vec![0.125; rank * in_features],
+                    ),
+                );
+            }
+        }
+        let mut metadata = adapter_metadata(2.0);
+        metadata.insert("general.architecture".into(), MetadataValue::from("qwen35"));
+        let adapter_model = Model {
+            metadata,
+            tensors,
+            identity: "mr-compact-f32".into(),
+        };
+        MultiRankAdapter::from_model(base, &adapter_model, MultiRankPolicy::AnyLinear)
+    }
+
+    fn make_compact_f16_adapter(
+        base: &Model,
+        dims: [usize; 3],
+        a_vals: &[f32],
+        b_vals: &[f32],
+    ) -> Result<MultiRankAdapter> {
+        let [in_features, out_features, rank] = dims;
+        let down_name = "blk.0.ffn_down.weight";
+        let f16_model = Model {
+            metadata: adapter_metadata(2.0),
+            tensors: BTreeMap::from([
+                (
+                    format!("{down_name}.lora_a"),
+                    f16_tensor(&format!("{down_name}.lora_a"), &[in_features, rank], a_vals),
+                ),
+                (
+                    format!("{down_name}.lora_b"),
+                    f16_tensor(
+                        &format!("{down_name}.lora_b"),
+                        &[rank, out_features],
+                        b_vals,
+                    ),
+                ),
+            ]),
+            identity: "mr-compact-f16".into(),
+        };
+        MultiRankAdapter::from_model(base, &f16_model, MultiRankPolicy::NpuFriendly)
+    }
+
+    #[test]
+    fn compact_ffn_down_layers_preserves_f16_f32_parity_and_rejects_gate_up() -> Result<()> {
+        let in_features = 17_408_usize;
+        let out_features = 8_usize;
+        let rank = 2_usize;
+        let down_name = "blk.0.ffn_down.weight";
+        let gate_name = "blk.1.ffn_gate.weight";
+        let up_name = "blk.0.ffn_up.weight";
+
+        let base = base_model(&[
+            (down_name, [in_features, out_features]),
+            (gate_name, [out_features, in_features]),
+            (up_name, [out_features, in_features]),
+        ]);
+
+        let a_vals: Vec<f32> = (0..rank * in_features)
+            .map(|i| [-0.125_f32, 0.25, -0.0625, 0.5][i % 4])
+            .collect();
+        let b_vals: Vec<f32> = (0..rank * out_features)
+            .map(|i| [0.5_f32, -0.25, 0.125, -0.375][i % 4])
+            .collect();
+
+        let dims = [in_features, out_features, rank];
+        let f16_adapter = make_compact_f16_adapter(&base, dims, &a_vals, &b_vals)?;
+        let f32_adapter = make_compact_f32_adapter(&base, dims, &a_vals, &b_vals, true, false)?;
+        let gate_up_adapter = make_compact_f32_adapter(&base, dims, &a_vals, &b_vals, false, true)?;
+
+        let omitted = [0_usize, 4, 10, 16];
+        assert!(
+            gate_up_adapter
+                .compact_ffn_down_layers(&[(0, &omitted)])
+                .is_err()
+        );
+        let f32_compacted = f32_adapter.compact_ffn_down_layers(&[(0, &omitted)])?;
+        let f16_compacted = f16_adapter.compact_ffn_down_layers(&[(0, &omitted)])?;
+        assert!(f32_compacted.storage_bytes() < f32_adapter.storage_bytes());
+        assert!(f16_compacted.storage_bytes() < f16_adapter.storage_bytes());
+        assert_ne!(
+            f32_compacted.execution_identity(),
+            f32_adapter.execution_identity()
+        );
+        assert_ne!(
+            f16_compacted.execution_identity(),
+            f16_adapter.execution_identity()
+        );
+
+        let mut full_input: Vec<f32> = (0..in_features)
+            .map(|i| [-0.5_f32, 1.25, -0.75, 0.25, 0.125][i % 5])
+            .collect();
+        let mut comp_input = Vec::new();
+        for g in 0..17 {
+            if omitted.contains(&g) {
+                full_input[g * 1024..(g + 1) * 1024].fill(0.0);
+            } else {
+                comp_input.extend_from_slice(&full_input[g * 1024..(g + 1) * 1024]);
+            }
+        }
+        for (orig, comp) in [
+            (&f32_adapter, &f32_compacted),
+            (&f16_adapter, &f16_compacted),
+        ] {
+            let mut s0 = Scratch::new(MatvecBackend::Scalar, true);
+            let mut s1 = Scratch::new(MatvecBackend::Scalar, true);
+            let mut out0 = vec![0.5_f32; out_features];
+            let mut out1 = out0.clone();
+            orig.linear(down_name, &full_input, 1.0, &mut out0, &mut s0)?;
+            comp.linear(down_name, &comp_input, 1.0, &mut out1, &mut s1)?;
+            assert_eq!(
+                out0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                out1.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
         }
         Ok(())
     }

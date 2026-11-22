@@ -12,6 +12,16 @@ use bonsai_native_hash::Hasher;
 use super::{MatvecBackend, Qwen35, Qwen35Checkpoint};
 use crate::{Decoder, Result, invalid};
 
+mod compaction;
+pub use compaction::{
+    COMPACTED_FFN_GROUP_COUNT, COMPACTED_FFN_GROUP_WIDTH, COMPACTED_FFN_HIDDEN_WIDTH,
+    COMPACTED_FFN_ORIGINAL_INTERMEDIATE_WIDTH, COMPACTED_FFN_PROFILE, CompactedFfnPlan,
+    LayerFfnCompaction,
+};
+pub(super) use compaction::{
+    CompactedFfnRuntime, compact_down_cols, compact_gate_up_rows, compact_signs,
+    plan_identity_sha256,
+};
 mod compensation;
 pub use compensation::{
     FACTOR_APPLICATION_ARITHMETIC, FfnCompensation, GROUP_COMPENSATION_PROFILE,
@@ -24,6 +34,45 @@ pub(super) fn push_sha256_hex(hash: Hasher, target: &mut String) -> Result<()> {
     target.try_reserve_exact(hex_bytes.len())?;
     for byte in hex_bytes {
         target.push(char::from(byte));
+    }
+    Ok(())
+}
+
+pub(super) fn swift_omission_signs_sha256(transforms: &super::Transforms) -> Result<String> {
+    let mut hash = Hasher::new()?;
+    // Swift's metadata order is [5120,6144,17408]. Hash canonical I32-LE
+    // +/-1 values, matching the complete sign_values evidence contract.
+    for width in [5_120, 6_144, 17_408] {
+        let signs = transforms
+            .signs
+            .get(&width)
+            .filter(|signs| signs.len() == width)
+            .ok_or_else(|| invalid("group omission requires complete explicit Swift signs"))?;
+        for &sign in signs {
+            let value: i32 = if sign.to_bits() == 1.0_f32.to_bits() {
+                1
+            } else if sign.to_bits() == (-1.0_f32).to_bits() {
+                -1
+            } else {
+                return Err(invalid("group omission signs must be exact +/-1"));
+            };
+            hash.update(&value.to_le_bytes())?;
+        }
+    }
+    let mut full_signs_sha256 = String::new();
+    push_sha256_hex(hash, &mut full_signs_sha256)?;
+    Ok(full_signs_sha256)
+}
+
+pub(super) fn validate_compensation_dimensions(
+    compensation: &FfnCompensation,
+    input: usize,
+    output: usize,
+) -> Result<()> {
+    if compensation.dimensions() != (input, output) {
+        return Err(invalid(
+            "compacted FFN recovery factors do not match layer hidden width",
+        ));
     }
     Ok(())
 }
@@ -242,9 +291,10 @@ impl FfnProbe {
             || graph.row_workers() != 1
             || graph.tiled_prefill.is_some()
             || graph.projection_executor.is_some()
+            || graph.compacted_ffn_saved_bytes() > 0
         {
             return Err(invalid(
-                "FFN probe requires an empty one-worker scalar CPU graph",
+                "FFN probe requires an empty uncompacted one-worker scalar CPU graph",
             ));
         }
         let selected = graph
@@ -311,30 +361,7 @@ impl FfnProbe {
                 "group omission requires the pinned Swift block-1024 FFN transform",
             ));
         }
-        let mut hash = Hasher::new()?;
-        // Swift's metadata order is [5120,6144,17408]. Hash canonical I32-LE
-        // +/-1 values, matching the complete sign_values evidence contract.
-        for width in [5_120, 6_144, 17_408] {
-            let signs = self
-                .graph
-                .transforms
-                .signs
-                .get(&width)
-                .filter(|signs| signs.len() == width)
-                .ok_or_else(|| invalid("group omission requires complete explicit Swift signs"))?;
-            for &sign in signs {
-                let value: i32 = if sign.to_bits() == 1.0_f32.to_bits() {
-                    1
-                } else if sign.to_bits() == (-1.0_f32).to_bits() {
-                    -1
-                } else {
-                    return Err(invalid("group omission signs must be exact +/-1"));
-                };
-                hash.update(&value.to_le_bytes())?;
-            }
-        }
-        let mut full_signs_sha256 = String::new();
-        push_sha256_hex(hash, &mut full_signs_sha256)?;
+        let full_signs_sha256 = swift_omission_signs_sha256(&self.graph.transforms)?;
         self.graph.reset()?;
         write!(
             self.graph.identity,

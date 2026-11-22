@@ -1614,6 +1614,14 @@ struct Evaluation<'a, 'executor, 'obj> {
     executor: Option<&'executor mut (dyn crate::kernels::Pq2ProjectionExecutor + 'obj)>,
 }
 
+struct StagedFfnCompaction {
+    layer: usize,
+    gate: Tensor,
+    up: Tensor,
+    down: Tensor,
+    signs: Vec<f32>,
+}
+
 #[derive(Default)]
 struct Transforms {
     block: usize,
@@ -1621,6 +1629,8 @@ struct Transforms {
     inverse_embedding: bool,
     grouped_values: bool,
     signs: BTreeMap<usize, Vec<f32>>,
+    tensor_signs: BTreeMap<String, Vec<f32>>,
+    compacted_ffn: weight_patch::CompactedFfnRuntime,
 }
 
 impl Transforms {
@@ -1773,6 +1783,8 @@ impl Transforms {
             inverse_embedding,
             grouped_values,
             signs,
+            tensor_signs: BTreeMap::new(),
+            compacted_ffn: weight_patch::CompactedFfnRuntime::default(),
         })
     }
 
@@ -1796,11 +1808,46 @@ impl Transforms {
         )
     }
 
-    fn can_block_hadamard(&self, len: usize) -> bool {
+    #[cfg(test)]
+    pub(super) fn can_block_hadamard(&self, len: usize) -> bool {
         self.block >= 16
             && self.block.is_power_of_two()
             && len.is_multiple_of(self.block)
             && self.signs.get(&len).is_none_or(|signs| signs.len() >= len)
+    }
+
+    pub(super) fn signs_for(&self, weight: &Tensor, len: usize) -> Option<&[f32]> {
+        if let Some(signs) = self.tensor_signs.get(&weight.name) {
+            return Some(signs.as_slice());
+        }
+        self.signs.get(&len).map(Vec::as_slice)
+    }
+
+    pub(super) fn can_block_hadamard_for(&self, weight: &Tensor, len: usize) -> bool {
+        self.block >= 16
+            && self.block.is_power_of_two()
+            && len.is_multiple_of(self.block)
+            && self
+                .signs_for(weight, len)
+                .is_none_or(|signs| signs.len() >= len)
+    }
+
+    pub(super) fn is_compacted_layer(&self, layer: usize) -> bool {
+        self.compacted_ffn.compensations.contains_key(&layer)
+    }
+
+    pub(super) fn is_compacted_down(&self, down_weight: &Tensor) -> bool {
+        self.tensor_signs.contains_key(&down_weight.name)
+    }
+
+    pub(super) fn compaction_compensation(
+        &self,
+        layer: usize,
+    ) -> Option<&weight_patch::FfnCompensation> {
+        self.compacted_ffn
+            .compensations
+            .get(&layer)
+            .and_then(Option::as_ref)
     }
 
     #[expect(
@@ -1808,6 +1855,9 @@ impl Transforms {
         reason = "Outer Option indicates whether the FFN chain is eligible; inner Option<u32> carries the optional down-projection Hadamard block size."
     )]
     pub(super) fn ffn_chain_hadamard_block_for(&self, down_weight: &Tensor) -> Option<Option<u32>> {
+        if self.is_compacted_down(down_weight) {
+            return None;
+        }
         let (rotated, grouped) = self.basis(down_weight);
         if !rotated {
             return Some(None);
@@ -1816,10 +1866,10 @@ impl Transforms {
             return None;
         }
         let len = down_weight.dimensions.first().copied()?;
-        if !self.can_block_hadamard(len) || self.block < 32 {
+        if !self.can_block_hadamard_for(down_weight, len) || self.block < 32 {
             return None;
         }
-        if self.signs.get(&len).is_some_and(|signs| {
+        if self.signs_for(down_weight, len).is_some_and(|signs| {
             signs[..len]
                 .iter()
                 .any(|&s| s.to_bits() != 1.0_f32.to_bits())
@@ -2160,12 +2210,11 @@ impl Transforms {
         } else if self.block > 0
             && input.len().is_multiple_of(self.block)
             && self
-                .signs
-                .get(&input.len())
+                .signs_for(weight, input.len())
                 .is_none_or(|signs| signs.len() >= input.len())
         {
             resize_into(input.len(), transformed)?;
-            let signs = self.signs.get(&input.len()).map(Vec::as_slice);
+            let signs = self.signs_for(weight, input.len());
             if parallelism.workers() > 1
                 && self.block >= 256
                 && input.len() >= self.block.saturating_mul(16)
@@ -2187,7 +2236,7 @@ impl Transforms {
                 crate::kernels::hadamard_into(in_block, sign_block, out_block)?;
             }
             return Ok(());
-        } else if let Some(signs) = self.signs.get(&input.len()) {
+        } else if let Some(signs) = self.signs_for(weight, input.len()) {
             resize_into(input.len(), transformed)?;
             let overlap = input.len().min(signs.len());
             mul_slice_into(
@@ -2684,6 +2733,228 @@ impl Qwen35 {
         }
     }
 
+    /// Net packed FFN weight bytes reclaimed by [`Self::with_compacted_ffn`].
+    #[must_use]
+    pub const fn compacted_ffn_saved_bytes(&self) -> usize {
+        self.transforms.compacted_ffn.saved_bytes
+    }
+
+    fn base_identity_before_extensions(&self) -> Result<&str> {
+        if self.adapter.is_some() && !self.identity.contains(":rank-one-lora-v1:") {
+            return Err(invalid(
+                "rank-one graph identity is missing its adapter contract",
+            ));
+        }
+        if self.multi_rank_adapter.is_some() && !self.identity.contains(":multi-rank-lora-v1:") {
+            return Err(invalid(
+                "multi-rank graph identity is missing its adapter contract",
+            ));
+        }
+        let cutoff = [
+            ":rank-one-lora-v1:",
+            ":multi-rank-lora-v1:",
+            ":w8-compacted-ffn-v1:",
+            ":cpu-tiled-ffn-v1:",
+        ]
+        .into_iter()
+        .filter_map(|marker| self.identity.find(marker))
+        .min()
+        .unwrap_or(self.identity.len());
+        Ok(&self.identity[..cutoff])
+    }
+
+    fn build_extended_identity(
+        &self,
+        rank_one: Option<(&RankOneAdapter, f32)>,
+        multi_rank: Option<(&MultiRankAdapter, f32)>,
+        compacted_suffix: Option<&str>,
+    ) -> Result<String> {
+        let base_identity = self.base_identity_before_extensions()?;
+        let r1_extra = rank_one.map_or(0, |(adapter, _)| adapter.execution_identity().len() + 32);
+        let mr_extra = multi_rank.map_or(0, |(adapter, _)| adapter.execution_identity().len() + 32);
+        let compact_extra = compacted_suffix.map_or(0, str::len);
+        let mut identity = String::new();
+        identity.try_reserve_exact(base_identity.len() + r1_extra + mr_extra + compact_extra)?;
+        identity.push_str(base_identity);
+        if let Some((adapter, scale)) = rank_one {
+            write!(
+                identity,
+                ":rank-one-lora-v1:{}:{:08x}",
+                adapter.execution_identity(),
+                scale.to_bits()
+            )?;
+        }
+        if let Some((adapter, scale)) = multi_rank {
+            write!(
+                identity,
+                ":multi-rank-lora-v1:{}:{:08x}",
+                adapter.execution_identity(),
+                scale.to_bits()
+            )?;
+        }
+        if let Some(suffix) = compacted_suffix {
+            identity.push_str(suffix);
+        }
+        self.append_tiled_prefill_identity(&mut identity)?;
+        Ok(identity)
+    }
+
+    fn stage_compacted_ffn_layers(
+        &self,
+        plan: &weight_patch::CompactedFfnPlan,
+        full_ffn_signs: &[f32],
+    ) -> Result<(Vec<StagedFfnCompaction>, usize)> {
+        let mut staged = Vec::new();
+        staged.try_reserve_exact(plan.layers().len())?;
+        let mut saved_bytes = 0_usize;
+
+        for entry in plan.layers() {
+            let layer = self
+                .layers
+                .get(entry.layer)
+                .ok_or_else(|| invalid("compacted FFN layer is outside the graph"))?;
+            if layer.gate.dimensions
+                != [
+                    weight_patch::COMPACTED_FFN_HIDDEN_WIDTH,
+                    weight_patch::COMPACTED_FFN_ORIGINAL_INTERMEDIATE_WIDTH,
+                ]
+                || layer.up.dimensions
+                    != [
+                        weight_patch::COMPACTED_FFN_HIDDEN_WIDTH,
+                        weight_patch::COMPACTED_FFN_ORIGINAL_INTERMEDIATE_WIDTH,
+                    ]
+                || layer.down.dimensions
+                    != [
+                        weight_patch::COMPACTED_FFN_ORIGINAL_INTERMEDIATE_WIDTH,
+                        weight_patch::COMPACTED_FFN_HIDDEN_WIDTH,
+                    ]
+                || self.transforms.basis(&layer.down) != (true, false)
+            {
+                return Err(invalid(
+                    "compacted FFN layer weights do not match Swift block-1024 geometry",
+                ));
+            }
+            if let Some(compensation) = &entry.compensation {
+                weight_patch::validate_compensation_dimensions(
+                    compensation,
+                    layer.up.dimensions[0],
+                    layer.down.dimensions[1],
+                )?;
+            }
+            let gate = weight_patch::compact_gate_up_rows(&layer.gate, &entry.omitted_groups)?;
+            let up = weight_patch::compact_gate_up_rows(&layer.up, &entry.omitted_groups)?;
+            let down = weight_patch::compact_down_cols(&layer.down, &entry.omitted_groups)?;
+            let signs = weight_patch::compact_signs(full_ffn_signs, &entry.omitted_groups)?;
+            let original_bytes =
+                layer.gate.data.len() + layer.up.data.len() + layer.down.data.len();
+            let compacted_bytes = gate.data.len() + up.data.len() + down.data.len();
+            saved_bytes = saved_bytes
+                .checked_add(original_bytes.saturating_sub(compacted_bytes))
+                .ok_or_else(|| invalid("compacted FFN saved byte count overflow"))?;
+            staged.push(StagedFfnCompaction {
+                layer: entry.layer,
+                gate,
+                up,
+                down,
+                signs,
+            });
+        }
+
+        Ok((staged, saved_bytes))
+    }
+
+    /// Consumes an empty decoder and physically compacts selected Swift FFN layers.
+    ///
+    /// For each layer in `plan`, removes `1..=16` `1,024`-element Hadamard groups
+    /// from `ffn_gate.weight`, `ffn_up.weight`, and `ffn_down.weight`, slices the
+    /// per-layer `17,408`-element Hadamard signs to the retained width, compacts any
+    /// surviving `ffn_down` low-rank adapters, and optionally installs normalized
+    /// recovery factors [`weight_patch::FfnCompensation`]. Original full-layer FFN
+    /// buffers are dropped and `identity` / checkpoint provenance are invalidated.
+    ///
+    /// # Errors
+    /// Rejects nonempty, already-compacted, or executor-attached graphs, layers
+    /// outside the graph, non-Swift FFN geometry/transforms, unsupported adapter
+    /// targets on compacted layers, and allocation or hashing failures.
+    pub fn with_compacted_ffn(mut self, plan: weight_patch::CompactedFfnPlan) -> Result<Self> {
+        if self.position != 0
+            || !self.state_consistent
+            || self.transforms.compacted_ffn.identity_suffix.is_some()
+            || self.projection_executor.is_some()
+        {
+            return Err(invalid(
+                "compacted FFN requires an empty uncompacted graph without a projection executor",
+            ));
+        }
+        if self.geometry.embedding != weight_patch::COMPACTED_FFN_HIDDEN_WIDTH
+            || self.geometry.feed_forward != weight_patch::COMPACTED_FFN_ORIGINAL_INTERMEDIATE_WIDTH
+            || self.transforms.block != weight_patch::COMPACTED_FFN_GROUP_WIDTH
+        {
+            return Err(invalid(
+                "compacted FFN requires the pinned Swift block-1024 FFN architecture",
+            ));
+        }
+        let full_signs_sha256 = weight_patch::swift_omission_signs_sha256(&self.transforms)?;
+        let full_ffn_signs = self
+            .transforms
+            .signs
+            .get(&weight_patch::COMPACTED_FFN_ORIGINAL_INTERMEDIATE_WIDTH)
+            .ok_or_else(|| invalid("compacted FFN requires complete Swift 17,408 FFN signs"))?;
+        let (staged, saved_bytes) = self.stage_compacted_ffn_layers(&plan, full_ffn_signs)?;
+        let layer_omissions: Vec<(usize, &[usize])> = plan
+            .layers()
+            .iter()
+            .map(|entry| (entry.layer, entry.omitted_groups.as_slice()))
+            .collect();
+
+        let compacted_r1 = self
+            .adapter
+            .as_ref()
+            .map(|adapter| adapter.compact_ffn_down_layers(&layer_omissions))
+            .transpose()?;
+        let compacted_mr = self
+            .multi_rank_adapter
+            .as_ref()
+            .map(|adapter| adapter.compact_ffn_down_layers(&layer_omissions))
+            .transpose()?;
+        let plan_digest = weight_patch::plan_identity_sha256(&plan, &full_signs_sha256)?;
+        let compacted_suffix = format!(":{}:{plan_digest}", weight_patch::COMPACTED_FFN_PROFILE);
+        let new_identity = self.build_extended_identity(
+            compacted_r1
+                .as_ref()
+                .map(|adapter| (adapter, self.adapter_scale)),
+            compacted_mr
+                .as_ref()
+                .map(|adapter| (adapter, self.multi_rank_adapter_scale)),
+            Some(&compacted_suffix),
+        )?;
+
+        let mut compensations = BTreeMap::new();
+        for (item, entry) in staged.into_iter().zip(plan.into_layers()) {
+            let layer = &mut self.layers[item.layer];
+            let down_name = layer.down.name.clone();
+            layer.gate = item.gate;
+            layer.up = item.up;
+            layer.down = item.down;
+            self.transforms.tensor_signs.insert(down_name, item.signs);
+            compensations.insert(item.layer, entry.compensation);
+        }
+        self.transforms.compacted_ffn = weight_patch::CompactedFfnRuntime {
+            saved_bytes,
+            identity_suffix: Some(compacted_suffix),
+            compensations,
+        };
+        if let Some(adapter) = compacted_r1 {
+            self.adapter = Some(adapter);
+        }
+        if let Some(adapter) = compacted_mr {
+            self.multi_rank_adapter = Some(adapter);
+        }
+        self.identity = new_identity;
+        self.provenance = Arc::new(());
+        Ok(self)
+    }
+
     /// Clear all live state and establish a fresh rank-one scale identity.
     ///
     /// Immutable weights and factors remain shared. Every successful call renews
@@ -2754,47 +3025,11 @@ impl Qwen35 {
             }
         };
 
-        let base_identity = if self.adapter.is_some() {
-            self.identity
-                .split_once(":rank-one-lora-v1:")
-                .ok_or_else(|| invalid("rank-one graph identity is missing its adapter contract"))?
-                .0
-        } else {
-            self.identity
-                .split_once(":multi-rank-lora-v1:")
-                .ok_or_else(|| {
-                    invalid("multi-rank graph identity is missing its adapter contract")
-                })?
-                .0
-        };
-        let r1_extra = self
-            .adapter
-            .as_ref()
-            .map_or(0, |adapter| adapter.execution_identity().len() + 32);
-        let mr_extra = self
-            .multi_rank_adapter
-            .as_ref()
-            .map_or(0, |adapter| adapter.execution_identity().len() + 32);
-        let mut identity = String::new();
-        identity.try_reserve_exact(base_identity.len() + r1_extra + mr_extra)?;
-        identity.push_str(base_identity);
-        if let (Some(adapter), Some(scale)) = (&self.adapter, resolved_r1) {
-            write!(
-                identity,
-                ":rank-one-lora-v1:{}:{:08x}",
-                adapter.execution_identity(),
-                scale.to_bits()
-            )?;
-        }
-        if let (Some(adapter), Some(scale)) = (&self.multi_rank_adapter, resolved_mr) {
-            write!(
-                identity,
-                ":multi-rank-lora-v1:{}:{:08x}",
-                adapter.execution_identity(),
-                scale.to_bits()
-            )?;
-        }
-        self.append_tiled_prefill_identity(&mut identity)?;
+        let identity = self.build_extended_identity(
+            self.adapter.as_ref().zip(resolved_r1),
+            self.multi_rank_adapter.as_ref().zip(resolved_mr),
+            self.transforms.compacted_ffn.identity_suffix.as_deref(),
+        )?;
         let provenance = Arc::new(());
         self.reset()?;
         self.identity = identity;
@@ -3937,7 +4172,9 @@ impl Qwen35 {
             let up = &mut attention_scratch.projected;
             let gate = &mut attention_scratch.gate;
             let selected_probe = probe.as_mut().filter(|probe| probe.layer == layer_idx);
+            let compacted_layer = evaluation.transforms.is_compacted_layer(layer_idx);
             if selected_probe.is_none()
+                && !compacted_layer
                 && evaluation.try_project_ffn_chain_into(
                     &layer.gate,
                     &layer.up,
@@ -4002,6 +4239,10 @@ impl Qwen35 {
                     })?;
                     timing::complete(ffn_timer);
                     continue;
+                }
+                if let Some(compensation) = evaluation.transforms.compaction_compensation(layer_idx)
+                {
+                    compensation.apply(normalized, attention)?;
                 }
                 add_finite(hidden, attention, "decoder layer output")?;
             }
@@ -4109,10 +4350,12 @@ impl Evaluation<'_, '_, '_> {
     ) -> Result<()> {
         self.projection.pre_transformed_len = None;
         if self.transforms.basis(first_target) == (true, false)
-            && self.transforms.can_block_hadamard(input.len())
+            && self
+                .transforms
+                .can_block_hadamard_for(first_target, input.len())
             && first_target.dimensions.first().copied() == Some(input.len())
         {
-            let signs = self.transforms.signs.get(&input.len()).map(Vec::as_slice);
+            let signs = self.transforms.signs_for(first_target, input.len());
             let parallelism = self.projection.matvec.clone_row_parallelism();
             self.projection.fusions.norm_hadamard.attempt();
             if self
@@ -4149,10 +4392,12 @@ impl Evaluation<'_, '_, '_> {
     ) -> Result<()> {
         self.projection.pre_transformed_len = None;
         if self.transforms.basis(first_target) == (true, false)
-            && self.transforms.can_block_hadamard(values.len())
+            && self
+                .transforms
+                .can_block_hadamard_for(first_target, values.len())
             && first_target.dimensions.first().copied() == Some(values.len())
         {
-            let signs = self.transforms.signs.get(&values.len()).map(Vec::as_slice);
+            let signs = self.transforms.signs_for(first_target, values.len());
             let parallelism = self.projection.matvec.clone_row_parallelism();
             self.projection.fusions.add_norm_hadamard.attempt();
             if self
@@ -4302,6 +4547,7 @@ impl Evaluation<'_, '_, '_> {
         up: &mut Vec<f32>,
     ) -> Result<()> {
         if !self.adapter_affects_any(&[gate_weight, up_weight])
+            && !self.transforms.is_compacted_down(down_weight)
             && self.transforms.basis(gate_weight) == self.transforms.basis(up_weight)
             && self
                 .executor
@@ -4345,10 +4591,12 @@ impl Evaluation<'_, '_, '_> {
         self.project_group_into([up_weight, gate_weight], input, [up, gate])?;
         if self.adapters.is_any_loaded()
             && self.transforms.basis(down_weight) == (true, false)
-            && self.transforms.can_block_hadamard(up.len())
+            && self
+                .transforms
+                .can_block_hadamard_for(down_weight, up.len())
             && down_weight.dimensions.first().copied() == Some(up.len())
         {
-            let signs = self.transforms.signs.get(&up.len()).map(Vec::as_slice);
+            let signs = self.transforms.signs_for(down_weight, up.len());
             self.projection.fusions.adapter_swiglu_hadamard.attempt();
             self.arithmetic.swiglu_hadamard_preserving_up_into(
                 gate,
@@ -4364,10 +4612,12 @@ impl Evaluation<'_, '_, '_> {
         }
         if !self.adapters.is_any_loaded()
             && self.transforms.basis(down_weight) == (true, false)
-            && self.transforms.can_block_hadamard(up.len())
+            && self
+                .transforms
+                .can_block_hadamard_for(down_weight, up.len())
             && down_weight.dimensions.first().copied() == Some(up.len())
         {
-            let signs = self.transforms.signs.get(&up.len()).map(Vec::as_slice);
+            let signs = self.transforms.signs_for(down_weight, up.len());
             self.projection.fusions.swiglu_hadamard.attempt();
             if self
                 .arithmetic
@@ -6756,6 +7006,7 @@ mod tests {
                         .map(|index| if index % 3 == 0 { -1.0 } else { 1.0 })
                         .collect(),
                 )]),
+                ..Transforms::default()
             };
             let input: Vec<f32> = (0..width)
                 .map(|index| [127.0, 0.5, 1.5, -63.5, 2.5, -0.5, 4.0, -16.0][index % 8])
@@ -6947,6 +7198,7 @@ mod tests {
             inverse_embedding: false,
             grouped_values: false,
             signs: BTreeMap::from([(width, vec![1.0; width])]),
+            ..Transforms::default()
         };
         let input: Vec<f32> = (0..width)
             .map(|index| [1.0, -0.5, 0.25, -0.125][index % 4])
@@ -7033,6 +7285,7 @@ mod tests {
             inverse_embedding: false,
             grouped_values: false,
             signs: BTreeMap::from([(width, vec![1.0; width])]),
+            ..Transforms::default()
         };
         let input: Vec<f32> = (0..width)
             .map(|index| [1.0, -0.5, 0.25, -0.125][index % 4])
@@ -7112,6 +7365,7 @@ mod tests {
             inverse_embedding: false,
             grouped_values: true,
             signs: BTreeMap::new(),
+            ..Transforms::default()
         };
         let input: Vec<f32> = (0..width)
             .map(|idx| [1.25, -0.75, 0.5, -2.0, 0.125, -0.375][idx % 6])

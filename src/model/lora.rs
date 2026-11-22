@@ -84,12 +84,14 @@ pub struct AdapterStorage {
     pub sparse_sites: usize,
 }
 
+#[derive(Clone)]
 struct SparseA {
     width: usize,
     indices: Vec<u16>,
     values: Vec<f32>,
 }
 
+#[derive(Clone)]
 struct Factors {
     a_values: Vec<f32>,
     sparse_a: Option<SparseA>,
@@ -522,6 +524,65 @@ impl RankOneAdapter {
         self.factors.keys().map(String::as_str)
     }
 
+    pub(crate) fn compact_ffn_down_layers(&self, layers: &[(usize, &[usize])]) -> Result<Self> {
+        const GROUPS: usize = 17;
+        let mut factors = self.factors.clone();
+        for &(layer, omitted_groups) in layers {
+            if omitted_groups.is_empty()
+                || omitted_groups.len() >= GROUPS
+                || omitted_groups.iter().any(|&group| group >= GROUPS)
+                || omitted_groups.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(invalid(
+                    "FFN compaction requires 1..=16 sorted distinct omitted groups in 0..17",
+                ));
+            }
+            if factors.contains_key(&format!("blk.{layer}.ffn_gate.weight"))
+                || factors.contains_key(&format!("blk.{layer}.ffn_up.weight"))
+            {
+                return Err(invalid(
+                    "rank-one gate/up adapters are unsupported on compacted FFN layers",
+                ));
+            }
+            let target = format!("blk.{layer}.ffn_down.weight");
+            if let Some(entry) = factors.get_mut(&target) {
+                compact_rank_one_ffn_down_entry(entry, omitted_groups)?;
+            }
+        }
+        let mut execution_identity = adapter_execution_identity(
+            &self.identity,
+            &self.base_identity,
+            self.alpha,
+            self.embedding.as_ref().map(|(tensor, _)| tensor),
+            &factors,
+        )?;
+        if factors.values().any(|factor| factor.sparse_a.is_some()) {
+            let mut hasher = bonsai_native_hash::Hasher::new()?;
+            hasher.update(b"prism-rank-one-sparse-compacted-v1\0")?;
+            for (target, factor) in &factors {
+                if let Some(sparse) = &factor.sparse_a {
+                    hash_len_bytes(&mut hasher, target.as_bytes())?;
+                    hasher.update(&u64::try_from(sparse.width)?.to_le_bytes())?;
+                    hasher.update(&u64::try_from(sparse.indices.len())?.to_le_bytes())?;
+                    for (&index, &value) in sparse.indices.iter().zip(&sparse.values) {
+                        hasher.update(&index.to_le_bytes())?;
+                        hasher.update(&value.to_bits().to_le_bytes())?;
+                    }
+                }
+            }
+            execution_identity.push_str(":edited-sparse-a-u16-f64-v1:compacted=");
+            execution_identity.push_str(&hex::encode(hasher.finish()?));
+        }
+        Ok(Self {
+            identity: self.identity.clone(),
+            execution_identity,
+            base_identity: self.base_identity.clone(),
+            alpha: self.alpha,
+            embedding: self.embedding.clone(),
+            factors,
+        })
+    }
+
     pub(crate) fn validate_scale(scale: f32) -> Result<()> {
         if scale.is_finite() && (0.0..=2.0).contains(&scale) {
             Ok(())
@@ -730,6 +791,62 @@ impl RankOneAdapter {
             &mut scratch.correction,
         )
     }
+}
+
+fn compact_rank_one_ffn_down_entry(entry: &mut Factors, omitted_groups: &[usize]) -> Result<()> {
+    const GROUP_WIDTH: usize = 1024;
+    const GROUPS: usize = 17;
+    const FULL_WIDTH: usize = GROUP_WIDTH * GROUPS;
+    let retained = GROUPS - omitted_groups.len();
+    let new_width = retained * GROUP_WIDTH;
+    if let Some(sparse) = &mut entry.sparse_a {
+        if sparse.width != FULL_WIDTH {
+            return Err(invalid(
+                "rank-one FFN down sparse A width does not match Swift intermediate width",
+            ));
+        }
+        let mut remap = [None; GROUPS];
+        let mut next_group = 0_usize;
+        for (group, slot) in remap.iter_mut().enumerate() {
+            if !omitted_groups.contains(&group) {
+                *slot = Some(next_group);
+                next_group += 1;
+            }
+        }
+        let mut new_indices = Vec::new();
+        let mut new_values = Vec::new();
+        for (&index, &value) in sparse.indices.iter().zip(&sparse.values) {
+            let coord = usize::from(index);
+            let group = coord / GROUP_WIDTH;
+            let offset = coord % GROUP_WIDTH;
+            if let Some(Some(mapped_group)) = remap.get(group).copied() {
+                new_indices.try_reserve(1)?;
+                new_values.try_reserve(1)?;
+                new_indices.push(u16::try_from(mapped_group * GROUP_WIDTH + offset)?);
+                new_values.push(value);
+            }
+        }
+        sparse.width = new_width;
+        sparse.indices = new_indices;
+        sparse.values = new_values;
+    } else {
+        if entry.a_values.len() != FULL_WIDTH {
+            return Err(invalid(
+                "rank-one FFN down A width does not match Swift intermediate width",
+            ));
+        }
+        let mut new_a = Vec::new();
+        new_a.try_reserve_exact(new_width)?;
+        for group in 0..GROUPS {
+            if !omitted_groups.contains(&group) {
+                new_a.extend_from_slice(
+                    &entry.a_values[group * GROUP_WIDTH..(group + 1) * GROUP_WIDTH],
+                );
+            }
+        }
+        entry.a_values = new_a;
+    }
+    Ok(())
 }
 
 #[inline]
@@ -1303,6 +1420,129 @@ mod tests {
         assert_eq!(b, &b_vals);
         adapter.enable_sparse_a()?;
         assert!(adapter.dense_rank_one_factor(linear, Some(1.3)).is_none());
+        Ok(())
+    }
+
+    fn build_compact_rank_one_adapters(
+        target: &str,
+        width: usize,
+        out_width: usize,
+    ) -> Result<(RankOneAdapter, RankOneAdapter)> {
+        let base = Model {
+            identity: "swift-r1-compact-base".into(),
+            metadata: BTreeMap::from([(
+                "general.architecture".into(),
+                MetadataValue::from("qwen35"),
+            )]),
+            tensors: BTreeMap::from([(
+                target.into(),
+                Tensor {
+                    name: target.into(),
+                    dimensions: vec![width, out_width],
+                    kind: 0,
+                    data: Arc::<[u8]>::from(vec![0_u8; width * out_width * 4]).into(),
+                },
+            )]),
+        };
+        let a_vals: Vec<f32> = (0..width)
+            .map(|i| match i % 17 {
+                0 => 0.125,
+                5 => -0.0625,
+                _ => 0.0,
+            })
+            .collect();
+        let b_vals = [0.5_f32, -0.25, 0.75, -0.125];
+        let model = Model {
+            identity: "swift-r1-compact-adapter".into(),
+            metadata: BTreeMap::from([
+                ("general.architecture".into(), MetadataValue::from("qwen35")),
+                ("general.type".into(), MetadataValue::from("adapter")),
+                ("adapter.type".into(), MetadataValue::from("lora")),
+                ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
+            ]),
+            tensors: BTreeMap::from([
+                (
+                    format!("{target}.lora_a"),
+                    Tensor {
+                        name: format!("{target}.lora_a"),
+                        dimensions: vec![width, 1],
+                        kind: 0,
+                        data: Arc::<[u8]>::from(
+                            a_vals
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<_>>(),
+                        )
+                        .into(),
+                    },
+                ),
+                (
+                    format!("{target}.lora_b"),
+                    tensor(&format!("{target}.lora_b"), &b_vals),
+                ),
+            ]),
+        };
+        let dense = RankOneAdapter::from_model(model, &base)?;
+        let mut sparse = RankOneAdapter {
+            identity: dense.identity.clone(),
+            execution_identity: dense.execution_identity.clone(),
+            base_identity: dense.base_identity.clone(),
+            alpha: dense.alpha,
+            embedding: None,
+            factors: dense.factors.clone(),
+        };
+        sparse.enable_sparse_a()?;
+        Ok((dense, sparse))
+    }
+
+    #[test]
+    fn compact_ffn_down_layers_preserves_dense_and_sparse_zero_masked_dots() -> Result<()> {
+        let target = "blk.0.ffn_down.weight";
+        let width = 17_408_usize;
+        let (dense, sparse) = build_compact_rank_one_adapters(target, width, 4)?;
+
+        let omitted = [0_usize, 3, 8, 16];
+        let dense_compacted = dense.compact_ffn_down_layers(&[(0, &omitted)])?;
+        let sparse_compacted = sparse.compact_ffn_down_layers(&[(0, &omitted)])?;
+        assert_ne!(
+            dense.execution_identity(),
+            dense_compacted.execution_identity()
+        );
+        assert_ne!(
+            sparse.execution_identity(),
+            sparse_compacted.execution_identity()
+        );
+        assert!(dense.compact_ffn_down_layers(&[(0, &[])]).is_err());
+        assert!(
+            dense
+                .compact_ffn_down_layers(&[(0, &(0..17).collect::<Vec<_>>())])
+                .is_err()
+        );
+        assert!(dense.compact_ffn_down_layers(&[(0, &[2, 1])]).is_err());
+
+        let mut full_input: Vec<f32> = (0..width)
+            .map(|i| [-0.5_f32, 0.25, 1.0, -0.125, 0.75][i % 5])
+            .collect();
+        let mut compacted_input = Vec::new();
+        for g in 0..17 {
+            if omitted.contains(&g) {
+                full_input[g * 1024..(g + 1) * 1024].fill(0.0);
+            } else {
+                compacted_input.extend_from_slice(&full_input[g * 1024..(g + 1) * 1024]);
+            }
+        }
+        for (orig, comp) in [(&dense, &dense_compacted), (&sparse, &sparse_compacted)] {
+            let mut scratch_a = Scratch::new(MatvecBackend::Scalar, true);
+            let mut scratch_b = Scratch::new(MatvecBackend::Scalar, true);
+            let mut out_orig = [0.25_f32, -0.5, 1.0, -0.125];
+            let mut out_comp = out_orig;
+            orig.linear(target, &full_input, 1.3, &mut out_orig, &mut scratch_a)?;
+            comp.linear(target, &compacted_input, 1.3, &mut out_comp, &mut scratch_b)?;
+            assert_eq!(
+                out_orig.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                out_comp.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
         Ok(())
     }
 }

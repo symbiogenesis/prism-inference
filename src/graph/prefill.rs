@@ -1267,21 +1267,26 @@ impl Qwen35 {
                 tile.projector.row_parallelism(),
             )?;
             check()?;
-            if try_project_tile_ffn_chain(
-                &self.transforms,
-                &self.geometry,
-                self.arithmetic,
-                adapters,
-                post_norm_reuse,
-                [&layer.gate, &layer.up, &layer.down],
-                &tile.normalized[..count],
-                Some(&tile.hidden[..count]),
-                &mut tile.attention[..count],
-                &mut tile.transformed[..count],
-                &tile.projector,
-                executor.as_deref_mut(),
-                check,
-            )? {
+            let compacted_layer = self.transforms.is_compacted_layer(layer_idx);
+            let ffn_compensation = self.transforms.compaction_compensation(layer_idx);
+            if !compacted_layer
+                && ffn_compensation.is_none()
+                && try_project_tile_ffn_chain(
+                    &self.transforms,
+                    &self.geometry,
+                    self.arithmetic,
+                    adapters,
+                    post_norm_reuse,
+                    [&layer.gate, &layer.up, &layer.down],
+                    &tile.normalized[..count],
+                    Some(&tile.hidden[..count]),
+                    &mut tile.attention[..count],
+                    &mut tile.transformed[..count],
+                    &tile.projector,
+                    executor.as_deref_mut(),
+                    check,
+                )?
+            {
                 for (hidden, output) in tile.hidden[..count]
                     .iter_mut()
                     .zip(&mut tile.attention[..count])
@@ -1310,26 +1315,44 @@ impl Qwen35 {
                     check,
                 )?;
                 check()?;
-                let _ = project_tile(
-                    &self.transforms,
-                    &self.geometry,
-                    self.arithmetic,
-                    adapters,
-                    &mut self.workspace.adapter,
-                    &mut self.workspace.projection.matvec,
-                    ffn_reuse,
-                    &layer.down,
-                    &tile.up[..count],
-                    &mut tile.normalized[..count],
-                    &mut tile.transformed[..count],
-                    &mut tile.projector,
-                    executor.as_deref_mut(),
-                    check,
-                )?;
-                for (hidden, output) in tile.hidden[..count]
-                    .iter_mut()
-                    .zip(&tile.normalized[..count])
+                let use_attention_scratch = ffn_compensation.is_some();
                 {
+                    let branch_outputs = if use_attention_scratch {
+                        &mut tile.attention[..count]
+                    } else {
+                        &mut tile.normalized[..count]
+                    };
+                    let _ = project_tile(
+                        &self.transforms,
+                        &self.geometry,
+                        self.arithmetic,
+                        adapters,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.projection.matvec,
+                        ffn_reuse,
+                        &layer.down,
+                        &tile.up[..count],
+                        branch_outputs,
+                        &mut tile.transformed[..count],
+                        &mut tile.projector,
+                        executor.as_deref_mut(),
+                        check,
+                    )?;
+                }
+                if let Some(compensation) = ffn_compensation {
+                    for (norm_in, branch) in tile.normalized[..count]
+                        .iter()
+                        .zip(&mut tile.attention[..count])
+                    {
+                        compensation.apply(norm_in, branch)?;
+                    }
+                }
+                let branch_outputs = if use_attention_scratch {
+                    &tile.attention[..count]
+                } else {
+                    &tile.normalized[..count]
+                };
+                for (hidden, output) in tile.hidden[..count].iter_mut().zip(branch_outputs) {
                     add_finite(hidden, output, "CPU tiled decoder layer output")?;
                 }
             }
@@ -2458,10 +2481,10 @@ fn normalize_for_tile_into<'a>(
     if count > 0
         && len > 0
         && transforms.basis(first_target) == (true, false)
-        && transforms.can_block_hadamard(len)
+        && transforms.can_block_hadamard_for(first_target, len)
         && first_target.dimensions.first().copied() == Some(len)
     {
-        let signs = transforms.signs.get(&len).map(Vec::as_slice);
+        let signs = transforms.signs_for(first_target, len);
         let block = transforms.block;
         let epsilon = geometry.epsilon;
         let fused_ok = if count > 1 && parallelism.workers() > 1 {
@@ -2564,10 +2587,10 @@ fn add_normalize_for_tile_into<'a>(
     let can_hadamard = count > 0
         && len > 0
         && transforms.basis(first_target) == (true, false)
-        && transforms.can_block_hadamard(len)
+        && transforms.can_block_hadamard_for(first_target, len)
         && first_target.dimensions.first().copied() == Some(len);
     if can_hadamard {
-        let signs = transforms.signs.get(&len).map(Vec::as_slice);
+        let signs = transforms.signs_for(first_target, len);
         let block = transforms.block;
         let epsilon = geometry.epsilon;
         let fused_ok = if count > 1 && parallelism.workers() > 1 {
@@ -2974,6 +2997,7 @@ fn project_tile_ffn_swiglu<'a>(
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
     if !adapters.affects_any(&[gate, up])
+        && !transforms.is_compacted_down(down)
         && let Some(exec) = executor.as_deref_mut()
         && gate.kind == 142
         && up.kind == 142
@@ -3034,10 +3058,10 @@ fn project_tile_ffn_swiglu<'a>(
     if adapters.is_any_loaded()
         && up_len > 0
         && transforms.basis(down) == (true, false)
-        && transforms.can_block_hadamard(up_len)
+        && transforms.can_block_hadamard_for(down, up_len)
         && down.dimensions.first().copied() == Some(up_len)
     {
-        let signs = transforms.signs.get(&up_len).map(Vec::as_slice);
+        let signs = transforms.signs_for(down, up_len);
         let block = transforms.block;
         if count > 1 && projector.row_parallelism().workers() > 1 {
             let single_worker = RowParallelism::default();
@@ -3085,10 +3109,10 @@ fn project_tile_ffn_swiglu<'a>(
     if !adapters.is_any_loaded()
         && up_len > 0
         && transforms.basis(down) == (true, false)
-        && transforms.can_block_hadamard(up_len)
+        && transforms.can_block_hadamard_for(down, up_len)
         && down.dimensions.first().copied() == Some(up_len)
     {
-        let signs = transforms.signs.get(&up_len).map(Vec::as_slice);
+        let signs = transforms.signs_for(down, up_len);
         let block = transforms.block;
         let fused_ok = if count > 1 && projector.row_parallelism().workers() > 1 {
             let gate_ref = &gate_outputs[..count];

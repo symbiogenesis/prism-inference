@@ -27,8 +27,9 @@ pub use attention::{
 pub use device::{AdrenoVulkanDevice, CommandBatchRecorder, OwnedComputeStage};
 pub use executor::{VulkanAttentionExecutor, VulkanPq2Executor};
 pub use graph::{
-    TdrChunkPolicy, VulkanBatchedCheckpoint, VulkanBatchedConfig, VulkanBatchedGraphExecutor,
-    VulkanKvPrecision, VulkanLayerPipelines,
+    TdrChunkPolicy, VulkanBatchedAdapters, VulkanBatchedCheckpoint, VulkanBatchedConfig,
+    VulkanBatchedGraphExecutor, VulkanKvPrecision, VulkanLayerPipelines,
+    VulkanMultiRankAdapterSpec, VulkanRankOneAdapterSpec,
 };
 
 /// Error returned by native Adreno Vulkan initialization, planning, or execution.

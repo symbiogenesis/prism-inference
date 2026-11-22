@@ -5,14 +5,20 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use bonsai_adreno_vulkan::{
-    CommandBatchRecorder, TdrChunkPolicy, VulkanBatchedConfig, VulkanBatchedGraphExecutor,
-    VulkanKvPrecision, spirv,
+    AttentionStrategy, CommandBatchRecorder, TdrChunkPolicy, VulkanBatchedAdapters,
+    VulkanBatchedConfig, VulkanBatchedGraphExecutor, VulkanKvPrecision, VulkanMultiRankAdapterSpec,
+    VulkanRankOneAdapterSpec, spirv,
 };
 use bonsai_gguf::MetadataValue;
 use bonsai_prism_runtime::{
-    Decoder as _,
-    graph::Qwen35,
-    model::{Model, Tensor},
+    Decoder,
+    graph::{KvCachePolicy, Qwen35},
+    kernels::MatvecBackend,
+    model::{
+        Model, Tensor,
+        lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
+    },
+    runtime::{Limits, Runtime},
 };
 use bonsai_ternary::{float_to_half, pack_ptq};
 
@@ -34,6 +40,136 @@ fn f32_tensor(name: &str, dims: &[usize], values: &[f32]) -> Tensor {
         kind: 0,
         data: Arc::<[u8]>::from(data).into(),
     }
+}
+
+fn f16_tensor(name: &str, dims: &[usize], values: &[f32]) -> Tensor {
+    let mut data = Vec::with_capacity(values.len() * 2);
+    for &v in values {
+        data.extend_from_slice(&float_to_half(v).to_le_bytes());
+    }
+    Tensor {
+        name: name.to_owned(),
+        dimensions: dims.to_vec(),
+        kind: 1,
+        data: Arc::<[u8]>::from(data).into(),
+    }
+}
+
+fn adapter_tensor(name: &str, dims: &[usize], kind: u32, values: &[f32]) -> Result<Tensor, String> {
+    match kind {
+        0 => Ok(f32_tensor(name, dims, values)),
+        1 => Ok(f16_tensor(name, dims, values)),
+        other => Err(format!("unsupported adapter test tensor kind {other}")),
+    }
+}
+
+fn base_adapter_metadata(alpha: f32) -> BTreeMap<String, MetadataValue> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "general.architecture".to_owned(),
+        MetadataValue::from("qwen35"),
+    );
+    metadata.insert("general.type".to_owned(), MetadataValue::from("adapter"));
+    metadata.insert("adapter.type".to_owned(), MetadataValue::from("lora"));
+    metadata.insert("adapter.lora_alpha".to_owned(), MetadataValue::from(alpha));
+    metadata
+}
+
+fn synthetic_rank_one_adapter(
+    base: &Model,
+    identity: &str,
+    alpha: f32,
+    include_embed: bool,
+    kind: u32,
+) -> ModelResult {
+    let mut tensors = BTreeMap::new();
+    let targets = [
+        "token_embd.weight",
+        "blk.0.ssm_out.weight",
+        "blk.2.attn_output.weight",
+        "blk.2.ffn_down.weight",
+    ];
+    for (idx, target) in targets.into_iter().enumerate() {
+        if target == "token_embd.weight" && !include_embed {
+            continue;
+        }
+        let base_tensor = base
+            .tensors
+            .get(target)
+            .ok_or_else(|| format!("missing base tensor {target}"))?;
+        let [input_dim, output_dim] = base_tensor.dimensions.as_slice() else {
+            return Err(format!("base tensor {target} is not 2D").into());
+        };
+        let (a_dims, b_dims) = if target == "token_embd.weight" {
+            ([1_usize, *output_dim], [1_usize, *input_dim])
+        } else {
+            ([*input_dim, 1_usize], [1_usize, *output_dim])
+        };
+        let a_len = a_dims[0] * a_dims[1];
+        let b_len = b_dims[0] * b_dims[1];
+        let a_vals = fill_pattern(a_len, 0.013, 100 + idx * 2);
+        let b_vals = fill_pattern(b_len, 0.011, 101 + idx * 2);
+        let a_name = format!("{target}.lora_a");
+        let b_name = format!("{target}.lora_b");
+        tensors.insert(
+            a_name.clone(),
+            adapter_tensor(&a_name, &a_dims, kind, &a_vals)?,
+        );
+        tensors.insert(
+            b_name.clone(),
+            adapter_tensor(&b_name, &b_dims, kind, &b_vals)?,
+        );
+    }
+    Ok(Model {
+        metadata: base_adapter_metadata(alpha),
+        tensors,
+        identity: identity.to_owned(),
+    })
+}
+
+fn synthetic_multi_rank_adapter(
+    base: &Model,
+    identity: &str,
+    alpha: f32,
+    rank: usize,
+    kind: u32,
+) -> ModelResult {
+    let mut metadata = base_adapter_metadata(alpha);
+    metadata.insert("adapter.lora.alpha".to_owned(), MetadataValue::from(alpha));
+    let mut tensors = BTreeMap::new();
+    let targets = [
+        "blk.2.attn_q.weight",
+        "blk.2.ffn_gate.weight",
+        "blk.2.ffn_down.weight",
+    ];
+    for (idx, target) in targets.into_iter().enumerate() {
+        let base_tensor = base
+            .tensors
+            .get(target)
+            .ok_or_else(|| format!("missing base tensor {target}"))?;
+        let [input_dim, output_dim] = base_tensor.dimensions.as_slice() else {
+            return Err(format!("base tensor {target} is not 2D").into());
+        };
+        let a_dims = [*input_dim, rank];
+        let b_dims = [rank, *output_dim];
+        let a_vals = fill_pattern(input_dim * rank, 0.009, 200 + idx * 2);
+        let b_vals = fill_pattern(rank * output_dim, 0.008, 201 + idx * 2);
+        let a_name = format!("{target}.lora_a");
+        let b_name = format!("{target}.lora_b");
+        tensors.insert(
+            a_name.clone(),
+            adapter_tensor(&a_name, &a_dims, kind, &a_vals)?,
+        );
+        tensors.insert(
+            b_name.clone(),
+            adapter_tensor(&b_name, &b_dims, kind, &b_vals)?,
+        );
+    }
+    Ok(Model {
+        metadata,
+        tensors,
+        identity: identity.to_owned(),
+    })
 }
 
 fn fill_pattern(len: usize, freq: f32, seed: usize) -> Vec<f32> {
@@ -438,9 +574,16 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         ("permute_ssm_heads_f32", spirv::permute_ssm_heads_f32()),
         ("copy_slice_f32", spirv::copy_slice_f32()),
         ("attn_fused_f16prob", spirv::attn_fused_f16prob()),
+        (
+            "attn_fused_f16prob_f16kv",
+            spirv::attn_fused_f16prob_f16kv(),
+        ),
         ("attn_qk_scores", spirv::attn_qk_scores()),
+        ("attn_qk_scores_f16kv", spirv::attn_qk_scores_f16kv()),
         ("attn_softmax_f16", spirv::attn_softmax_f16()),
         ("attn_pv_accum", spirv::attn_pv_accum()),
+        ("attn_pv_accum_f16kv", spirv::attn_pv_accum_f16kv()),
+        ("lora_b_accum_f32", spirv::lora_b_accum_f32()),
     ];
     for (name, words) in portable_modules {
         assert_eq!(
@@ -589,5 +732,274 @@ fn live_batched_hybrid_graph_matches_cpu_qwen35_and_controls_submit_count() -> T
     assert_close(&fp32_t0, &cpu_t0, 1e-4, "fp32 kv token 0");
     assert_eq!(fp32_kv.submits_completed(), 1);
 
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_direct_f16kv_attention_strategies_match_cpu_qwen35() -> TestResult {
+    for (label, strategy) in [
+        ("direct-f16kv-fused", AttentionStrategy::ForceFused),
+        (
+            "direct-f16kv-decomposed",
+            AttentionStrategy::ForceDecomposed,
+        ),
+    ] {
+        let cpu_model = synthetic_hybrid_qwen35_model(label)?;
+        let gpu_model = synthetic_hybrid_qwen35_model(label)?;
+        let mut cpu = Qwen35::with_adapters_and_kv(
+            cpu_model,
+            16,
+            64 * 1024 * 1024,
+            MatvecBackend::Auto,
+            None,
+            None,
+            KvCachePolicy::F16,
+        )?;
+        let mut gpu = VulkanBatchedGraphExecutor::open(
+            &gpu_model,
+            VulkanBatchedConfig {
+                kv_precision: VulkanKvPrecision::Fp16,
+                attention_strategy: strategy,
+                ..VulkanBatchedConfig::default()
+            },
+        )?;
+        let cpu_t0 = cpu.evaluate(0)?;
+        let gpu_t0 = gpu.evaluate_token(0)?;
+        assert_close(&gpu_t0, &cpu_t0, 1e-4, &format!("{label} token 0"));
+
+        cpu.ingest(1)?;
+        gpu.ingest_token(1)?;
+        cpu.ingest(2)?;
+        gpu.ingest_token(2)?;
+
+        let cpu_t3 = cpu.evaluate(3)?;
+        let gpu_t3 = gpu.evaluate_token(3)?;
+        assert_close(&gpu_t3, &cpu_t3, 1e-4, &format!("{label} token 3"));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Tests stacked RankOne + MultiRank GPU LoRA parity, 0.0 bypass, scale invalidation, and F32 multi-rank."
+)]
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestResult {
+    let base_id = "live-lora-parity";
+    let cpu_model_adapted = synthetic_hybrid_qwen35_model(base_id)?;
+    let gpu_model_adapted = synthetic_hybrid_qwen35_model(base_id)?;
+    let r1_model = synthetic_rank_one_adapter(&cpu_model_adapted, "r1-lora-id", 1.5, true, 0)?;
+    let r1_gpu_model = synthetic_rank_one_adapter(&gpu_model_adapted, "r1-lora-id", 1.5, true, 0)?;
+    let mr_model = synthetic_multi_rank_adapter(&cpu_model_adapted, "mr-f16-lora-id", 2.0, 4, 1)?;
+    let mr_gpu_model =
+        synthetic_multi_rank_adapter(&gpu_model_adapted, "mr-f16-lora-id", 2.0, 4, 1)?;
+
+    let cpu_r1 = RankOneAdapter::from_model(r1_model, &cpu_model_adapted)?;
+    let cpu_mr =
+        MultiRankAdapter::from_model(&cpu_model_adapted, &mr_model, MultiRankPolicy::AnyLinear)?;
+    let mut cpu_adapted = Qwen35::with_adapters_and_kv(
+        cpu_model_adapted,
+        16,
+        64 * 1024 * 1024,
+        MatvecBackend::Auto,
+        Some((cpu_r1, 0.75)),
+        Some((cpu_mr, 1.25)),
+        KvCachePolicy::F16,
+    )?;
+
+    let mut gpu = VulkanBatchedGraphExecutor::open_with_adapters(
+        &gpu_model_adapted,
+        VulkanBatchedConfig::default(),
+        VulkanBatchedAdapters {
+            rank_one: Some(VulkanRankOneAdapterSpec {
+                adapter: &r1_gpu_model,
+                scale: 0.75,
+            }),
+            multi_rank: Some(VulkanMultiRankAdapterSpec {
+                adapter: &mr_gpu_model,
+                policy: MultiRankPolicy::AnyLinear,
+                scale: 1.25,
+            }),
+        },
+    )?;
+    assert_eq!(gpu.rank_one_scale(), Some(0.75));
+    assert_eq!(gpu.multi_rank_scale(), Some(1.25));
+    let id_adapted = gpu.identity_sha256().to_owned();
+
+    let ref_t0 = cpu_adapted.evaluate(0)?;
+    let gpu_t0 = gpu.evaluate_token(0)?;
+    assert_close(&gpu_t0, &ref_t0, 2e-4, "stacked lora token 0");
+    let saved_snap = gpu.checkpoint()?;
+
+    cpu_adapted.ingest(1)?;
+    gpu.ingest_token(1)?;
+    let ref_t2 = cpu_adapted.evaluate(2)?;
+    let gpu_t2 = gpu.evaluate_token(2)?;
+    assert_close(&gpu_t2, &ref_t2, 2e-4, "stacked lora token 2");
+
+    // Fast-path `scale == 0.0` bypass must change identity, invalidate stale checkpoints,
+    // and match unadapted base CPU logits cleanly.
+    gpu.reset_with_adapter_scales(Some(0.0), Some(0.0))?;
+    assert_eq!(gpu.rank_one_scale(), Some(0.0));
+    assert_eq!(gpu.multi_rank_scale(), Some(0.0));
+    let id_zero = gpu.identity_sha256().to_owned();
+    assert_ne!(id_zero, id_adapted);
+    assert!(gpu.restore(&saved_snap).is_err());
+
+    let mut cpu_base = Qwen35::with_adapters_and_kv(
+        synthetic_hybrid_qwen35_model(base_id)?,
+        16,
+        64 * 1024 * 1024,
+        MatvecBackend::Auto,
+        None,
+        None,
+        KvCachePolicy::F16,
+    )?;
+    let cpu_base_t0 = cpu_base.evaluate(0)?;
+    let gpu_zero_t0 = gpu.evaluate_token(0)?;
+    assert_close(&gpu_zero_t0, &cpu_base_t0, 1e-4, "scale 0.0 bypass token 0");
+    let cpu_base_t1 = cpu_base.evaluate(1)?;
+    let gpu_zero_t1 = gpu.evaluate_token(1)?;
+    assert_close(&gpu_zero_t1, &cpu_base_t1, 1e-4, "scale 0.0 bypass token 1");
+
+    // Dynamic scale updates invalidate identity and reproduce updated CPU reference after reset.
+    gpu.set_rank_one_scale(0.5)?;
+    let id_half_zero = gpu.identity_sha256().to_owned();
+    assert_ne!(id_half_zero, id_zero);
+    assert_ne!(id_half_zero, id_adapted);
+    gpu.set_multi_rank_scale(1.0)?;
+    let id_half_one = gpu.identity_sha256().to_owned();
+    assert_ne!(id_half_one, id_half_zero);
+    gpu.reset()?;
+    assert_eq!(gpu.identity_sha256(), id_half_one);
+
+    // Reject invalid scales and verify error does not mutate configured scales.
+    assert!(gpu.set_rank_one_scale(-0.1).is_err());
+    assert!(gpu.set_rank_one_scale(2.5).is_err());
+    assert!(gpu.set_multi_rank_scale(f32::NAN).is_err());
+    assert_eq!(gpu.rank_one_scale(), Some(0.5));
+    assert_eq!(gpu.multi_rank_scale(), Some(1.0));
+
+    let base_cpu2 = synthetic_hybrid_qwen35_model(base_id)?;
+    let r1_2 = synthetic_rank_one_adapter(&base_cpu2, "r1-lora-id", 1.5, true, 0)?;
+    let mr_2 = synthetic_multi_rank_adapter(&base_cpu2, "mr-f16-lora-id", 2.0, 4, 1)?;
+    let mut cpu_updated = Qwen35::with_adapters_and_kv(
+        base_cpu2,
+        16,
+        64 * 1024 * 1024,
+        MatvecBackend::Auto,
+        Some((RankOneAdapter::from_model(r1_2, &gpu_model_adapted)?, 0.5)),
+        Some((
+            MultiRankAdapter::from_model(&gpu_model_adapted, &mr_2, MultiRankPolicy::AnyLinear)?,
+            1.0,
+        )),
+        KvCachePolicy::F16,
+    )?;
+    let cpu_upd_t0 = cpu_updated.evaluate(0)?;
+    let gpu_upd_t0 = gpu.evaluate_token(0)?;
+    assert_close(&gpu_upd_t0, &cpu_upd_t0, 2e-4, "rescaled lora token 0");
+
+    // Verify F32 multi-rank adapter path and error when setting rank-one on multi-rank-only executor.
+    let f32_host_model = synthetic_hybrid_qwen35_model("mr-f32-base")?;
+    let f32_device_model = synthetic_hybrid_qwen35_model("mr-f32-base")?;
+    let mr_f32 = synthetic_multi_rank_adapter(&f32_host_model, "mr-f32-lora-id", 3.0, 4, 0)?;
+    let mut cpu_mr_f32 = Qwen35::with_adapters_and_kv(
+        f32_host_model,
+        16,
+        64 * 1024 * 1024,
+        MatvecBackend::Auto,
+        None,
+        Some((
+            MultiRankAdapter::from_model(&f32_device_model, &mr_f32, MultiRankPolicy::AnyLinear)?,
+            1.25,
+        )),
+        KvCachePolicy::F16,
+    )?;
+    let mut gpu_mr_f32 = VulkanBatchedGraphExecutor::open_with_adapters(
+        &f32_device_model,
+        VulkanBatchedConfig::default(),
+        VulkanBatchedAdapters {
+            rank_one: None,
+            multi_rank: Some(VulkanMultiRankAdapterSpec {
+                adapter: &mr_f32,
+                policy: MultiRankPolicy::AnyLinear,
+                scale: 1.25,
+            }),
+        },
+    )?;
+    assert!(gpu_mr_f32.set_rank_one_scale(1.0).is_err());
+    let cpu_f32_t0 = cpu_mr_f32.evaluate(0)?;
+    let gpu_f32_t0 = gpu_mr_f32.evaluate_token(0)?;
+    assert_close(&gpu_f32_t0, &cpu_f32_t0, 2e-4, "f32 multi-rank token 0");
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_decoder_trait_and_runtime_parity() -> TestResult {
+    let cpu_model = synthetic_hybrid_qwen35_model("decoder-trait-parity")?;
+    let gpu_model = synthetic_hybrid_qwen35_model("decoder-trait-parity")?;
+    let limited_model = synthetic_hybrid_qwen35_model("decoder-trait-limit")?;
+
+    let mut cpu = Qwen35::new(cpu_model, 16)?;
+    let mut gpu = VulkanBatchedGraphExecutor::open(&gpu_model, VulkanBatchedConfig::default())?;
+
+    assert_eq!(Decoder::vocab_size(&gpu), 16);
+    assert_ne!(Decoder::identity(&gpu), "");
+    Decoder::admit_work(&gpu, 2, 1)?;
+
+    let mut gpu_logits = Vec::new();
+    Decoder::evaluate_into(&mut gpu, 0, &mut gpu_logits)?;
+    let cpu_t0 = cpu.evaluate(0)?;
+    assert_close(&gpu_logits, &cpu_t0, 1e-4, "Decoder::evaluate_into token 0");
+
+    let mut cp = Decoder::checkpoint(&gpu)?;
+    Decoder::ingest_block(&mut gpu, &[1, 2], &|| Ok(()))?;
+    cpu.ingest(1)?;
+    cpu.ingest(2)?;
+
+    let mut finite_logits = Vec::new();
+    Decoder::evaluate_finite_into(&mut gpu, 3, &mut finite_logits)?;
+    let cpu_t3 = cpu.evaluate(3)?;
+    assert_close(
+        &finite_logits,
+        &cpu_t3,
+        1e-4,
+        "Decoder::ingest_block + evaluate_finite_into",
+    );
+
+    Decoder::checkpoint_into(&gpu, &mut cp)?;
+    assert!(Decoder::checkpoint_bytes(&gpu) > 0);
+    Decoder::restore(&mut gpu, &cp)?;
+    Decoder::reset(&mut gpu)?;
+    let reset_logits = Decoder::evaluate(&mut gpu, 0)?;
+    assert_close(&reset_logits, &cpu_t0, 1e-4, "Decoder::reset + evaluate");
+
+    // Verify Runtime::new accepts VulkanBatchedGraphExecutor cleanly.
+    Decoder::reset(&mut gpu)?;
+    let cp_bytes = Decoder::checkpoint_bytes(&gpu).max(4096);
+    let _runtime = Runtime::new(
+        gpu,
+        Limits {
+            context_tokens: 16,
+            checkpoints: 2,
+            checkpoint_bytes: cp_bytes.saturating_mul(8),
+        },
+    )?;
+
+    // Verify `evaluate_into` clears stale output buffer when exceeding `context_limit`.
+    let mut limited = VulkanBatchedGraphExecutor::open(
+        &limited_model,
+        VulkanBatchedConfig {
+            context_limit: Some(1),
+            ..VulkanBatchedConfig::default()
+        },
+    )?;
+    let mut err_logits = vec![42.0_f32; 4];
+    Decoder::evaluate_into(&mut limited, 0, &mut err_logits)?;
+    assert!(Decoder::evaluate_into(&mut limited, 1, &mut err_logits).is_err());
+    assert_eq!(err_logits, Vec::<f32>::new());
     Ok(())
 }

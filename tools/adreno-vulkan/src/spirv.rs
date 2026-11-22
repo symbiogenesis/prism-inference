@@ -3335,10 +3335,26 @@ pub fn dot_f32_scalar() -> Vec<u32> {
 /// Dispatch: `(ceil(total_seq / 64), num_heads, query_len)`.
 #[must_use]
 pub fn attn_qk_scores() -> Vec<u32> {
+    emit_attn_qk_scores(false)
+}
+
+/// Emits `#40` Stage 1 (`QK^T` scaled causal scores) SPIR-V 1.6 words reading packed-FP16 `K`.
+///
+/// Bindings: `0` read-only `Q` (`f32`), `1` read-only `K` (`u32`, `2 × f16` via `UnpackHalf2x16`),
+/// `2` writable `scores` (`f32`).
+/// Push constants (`8 × u32`): `[query_len, total_seq, past_len, num_heads, num_kv_heads, head_dim, scale_bits, causal]`.
+/// Dispatch: `(ceil(total_seq / 64), num_heads, query_len)`.
+#[must_use]
+pub fn attn_qk_scores_f16kv() -> Vec<u32> {
+    emit_attn_qk_scores(true)
+}
+
+fn emit_attn_qk_scores(f16_kv: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(false, 8);
     let push_var = push_var.unwrap_or(0);
     let q_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
-    let k_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let k_elem_ty = if f16_kv { ElemType::U32 } else { ElemType::F32 };
+    let k_buf = b.storage_buffer(1, k_elem_ty, AccessMode::ReadOnly);
     let s_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
 
     let gid = b.global_invocation_id();
@@ -3381,24 +3397,8 @@ pub fn attn_qk_scores() -> Vec<u32> {
                 let k_row = b.uadd(k_seq_off, kv_h);
                 let k_base = b.umul(k_row, head_dim);
 
-                let acc_var = b.local_f32_var();
-                b.store_var(acc_var, f_zero);
-
-                let c0 = b.const_u32(0);
-                let c1 = b.const_u32(1);
-                b.emit_for_range(c0, head_dim, c1, |b, d| {
-                    let q_idx = b.uadd(q_base, d);
-                    let k_idx = b.uadd(k_base, d);
-                    let qv = b.load_sb_f32(q_buf, q_idx);
-                    let kv = b.load_sb_f32(k_buf, k_idx);
-                    let prod = b.fmul_nc(qv, kv);
-                    let prev = b.load_var_f32(acc_var);
-                    let next = b.fadd_nc(prev, prod);
-                    b.store_var(acc_var, next);
-                });
-
-                let dot = b.load_var_f32(acc_var);
-                let scaled = b.fmul_nc(scale, dot);
+                let scaled =
+                    emit_dot_qk_row(b, q_buf, q_base, k_buf, k_base, head_dim, scale, f16_kv);
                 b.store_sb_f32(s_buf, s_idx, scaled);
             },
             |b| {
@@ -3527,10 +3527,26 @@ pub fn attn_softmax_f16() -> Vec<u32> {
 /// Dispatch: `(ceil(head_dim / 64), num_heads, query_len)`.
 #[must_use]
 pub fn attn_pv_accum() -> Vec<u32> {
+    emit_attn_pv_accum(false)
+}
+
+/// Emits `#40` Stage 3 (`probs × V` accumulation) SPIR-V 1.6 words reading packed-FP16 `V`.
+///
+/// Bindings: `0` read-only `probs` (`f32`), `1` read-only `V` (`u32`, `2 × f16` via `UnpackHalf2x16`),
+/// `2` writable `out` (`f32`).
+/// Push constants (`8 × u32`): `[query_len, total_seq, past_len, num_heads, num_kv_heads, head_dim, scale_bits, causal]`.
+/// Dispatch: `(ceil(head_dim / 64), num_heads, query_len)`.
+#[must_use]
+pub fn attn_pv_accum_f16kv() -> Vec<u32> {
+    emit_attn_pv_accum(true)
+}
+
+fn emit_attn_pv_accum(f16_kv: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(false, 8);
     let push_var = push_var.unwrap_or(0);
     let p_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
-    let v_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let v_elem_ty = if f16_kv { ElemType::U32 } else { ElemType::F32 };
+    let v_buf = b.storage_buffer(1, v_elem_ty, AccessMode::ReadOnly);
     let o_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
 
     let gid = b.global_invocation_id();
@@ -3576,7 +3592,7 @@ pub fn attn_pv_accum() -> Vec<u32> {
             let p = b.load_sb_f32(p_buf, p_idx);
             let k_stride = b.umul(k, v_kv_stride);
             let v_idx = b.uadd(k_stride, v_head_d);
-            let vv = b.load_sb_f32(v_buf, v_idx);
+            let vv = emit_load_kv_f32(b, v_buf, v_idx, f16_kv);
             let prod = b.fmul_nc(p, vv);
             let prev = b.load_var_f32(acc_var);
             let next = b.fadd_nc(prev, prod);
@@ -3619,11 +3635,27 @@ fn emit_wg_reduce_64(b: &mut ShaderBuilder, wg_reduce: u32, lid: u32, is_max: bo
 /// Dispatch: `(1, num_heads, query_len)`.
 #[must_use]
 pub fn attn_fused_f16prob() -> Vec<u32> {
+    emit_attn_fused_f16prob(false)
+}
+
+/// Emits `#40` single-dispatch fused attention reading packed-FP16 `K` and `V` directly via `UnpackHalf2x16`.
+///
+/// Requires `total_seq <= 512` (`2304` bytes of workgroup shared storage).
+/// Bindings: `0` read-only `Q` (`f32`), `1` read-only `K` (`u32`), `2` read-only `V` (`u32`),
+/// `3` writable `out` (`f32`).
+/// Dispatch: `(1, num_heads, query_len)`.
+#[must_use]
+pub fn attn_fused_f16prob_f16kv() -> Vec<u32> {
+    emit_attn_fused_f16prob(true)
+}
+
+fn emit_attn_fused_f16prob(f16_kv: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(false, 8);
     let push_var = push_var.unwrap_or(0);
     let q_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
-    let k_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
-    let v_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let kv_elem_ty = if f16_kv { ElemType::U32 } else { ElemType::F32 };
+    let k_buf = b.storage_buffer(1, kv_elem_ty, AccessMode::ReadOnly);
+    let v_buf = b.storage_buffer(2, kv_elem_ty, AccessMode::ReadOnly);
     let o_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
 
     let wg_scores = b.workgroup_f32_array(512);
@@ -3662,7 +3694,7 @@ pub fn attn_fused_f16prob() -> Vec<u32> {
     b.emit_for_range(lid, valid_len, c64, |b, k| {
         let k_off = b.umul(k, kv_stride);
         let k_base = b.uadd(k_off, kv_head_off);
-        let s = emit_dot_qk_row(b, q_buf, q_base, k_buf, k_base, head_dim, scale);
+        let s = emit_dot_qk_row(b, q_buf, q_base, k_buf, k_base, head_dim, scale, f16_kv);
         b.store_wg_f32(wg_scores, k, s);
     });
     b.workgroup_barrier();
@@ -3717,7 +3749,7 @@ pub fn attn_fused_f16prob() -> Vec<u32> {
             let p = b.load_wg_f32(wg_scores, k);
             let k_off = b.umul(k, kv_stride);
             let v_idx = b.uadd(k_off, v_head_d);
-            let vv = b.load_sb_f32(v_buf, v_idx);
+            let vv = emit_load_kv_f32(b, v_buf, v_idx, f16_kv);
             let prod = b.fmul_nc(p, vv);
             let prev = b.load_var_f32(acc_var);
             let next = b.fadd_nc(prev, prod);
@@ -3731,6 +3763,24 @@ pub fn attn_fused_f16prob() -> Vec<u32> {
     b.finish()
 }
 
+fn emit_load_kv_f32(b: &mut ShaderBuilder, buf: u32, elem_idx: u32, f16_kv: bool) -> u32 {
+    if !f16_kv {
+        return b.load_sb_f32(buf, elem_idx);
+    }
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let word_idx = b.ushr(elem_idx, c1);
+    let lane = b.uand(elem_idx, c1);
+    let is_hi = b.u_ne(lane, c0);
+    let packed = b.load_sb_u32(buf, word_idx);
+    let (lo, hi) = b.unpack_half_pair(packed);
+    b.select(b.f32_t, is_hi, hi, lo)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shares F32 and packed-FP16 QK^T dot product emission cleanly."
+)]
 fn emit_dot_qk_row(
     b: &mut ShaderBuilder,
     q_buf: u32,
@@ -3739,22 +3789,75 @@ fn emit_dot_qk_row(
     k_base: u32,
     head_dim: u32,
     scale: u32,
+    f16_kv: bool,
 ) -> u32 {
     let c0 = b.const_u32(0);
     let c1 = b.const_u32(1);
     let f_zero = b.const_f32(0.0);
     let acc_var = b.local_f32_var();
     b.store_var(acc_var, f_zero);
-    b.emit_for_range(c0, head_dim, c1, |b, d| {
-        let q_idx = b.uadd(q_base, d);
-        let k_idx = b.uadd(k_base, d);
-        let qv = b.load_sb_f32(q_buf, q_idx);
-        let kv = b.load_sb_f32(k_buf, k_idx);
-        let prod = b.fmul_nc(qv, kv);
-        let prev = b.load_var_f32(acc_var);
-        let next = b.fadd_nc(prev, prod);
-        b.store_var(acc_var, next);
-    });
+    if f16_kv {
+        let c2 = b.const_u32(2);
+        let c_even_mask = b.const_u32(!1_u32);
+        let k_odd_bit = b.uand(k_base, c1);
+        let k_even_aligned = b.u_eq(k_odd_bit, c0);
+        let even_end = b.uand(head_dim, c_even_mask);
+        b.emit_if_else(
+            k_even_aligned,
+            |b| {
+                b.emit_for_range(c0, even_end, c2, |b, d| {
+                    let q_idx0 = b.uadd(q_base, d);
+                    let q_idx1 = b.uadd(q_idx0, c1);
+                    let k_elem0 = b.uadd(k_base, d);
+                    let k_word = b.ushr(k_elem0, c1);
+                    let packed = b.load_sb_u32(k_buf, k_word);
+                    let (k0, k1) = b.unpack_half_pair(packed);
+                    let q0 = b.load_sb_f32(q_buf, q_idx0);
+                    let q1 = b.load_sb_f32(q_buf, q_idx1);
+                    let prod0 = b.fmul_nc(q0, k0);
+                    let acc0 = b.load_var_f32(acc_var);
+                    let acc1 = b.fadd_nc(acc0, prod0);
+                    let prod1 = b.fmul_nc(q1, k1);
+                    let acc2 = b.fadd_nc(acc1, prod1);
+                    b.store_var(acc_var, acc2);
+                });
+                let has_tail = b.u_lt(even_end, head_dim);
+                b.emit_if(has_tail, |b| {
+                    let q_idx = b.uadd(q_base, even_end);
+                    let k_elem = b.uadd(k_base, even_end);
+                    let qv = b.load_sb_f32(q_buf, q_idx);
+                    let kv = emit_load_kv_f32(b, k_buf, k_elem, true);
+                    let prod = b.fmul_nc(qv, kv);
+                    let prev = b.load_var_f32(acc_var);
+                    let next = b.fadd_nc(prev, prod);
+                    b.store_var(acc_var, next);
+                });
+            },
+            |b| {
+                b.emit_for_range(c0, head_dim, c1, |b, d| {
+                    let q_idx = b.uadd(q_base, d);
+                    let k_elem = b.uadd(k_base, d);
+                    let qv = b.load_sb_f32(q_buf, q_idx);
+                    let kv = emit_load_kv_f32(b, k_buf, k_elem, true);
+                    let prod = b.fmul_nc(qv, kv);
+                    let prev = b.load_var_f32(acc_var);
+                    let next = b.fadd_nc(prev, prod);
+                    b.store_var(acc_var, next);
+                });
+            },
+        );
+    } else {
+        b.emit_for_range(c0, head_dim, c1, |b, d| {
+            let q_idx = b.uadd(q_base, d);
+            let k_idx = b.uadd(k_base, d);
+            let qv = b.load_sb_f32(q_buf, q_idx);
+            let kv = b.load_sb_f32(k_buf, k_idx);
+            let prod = b.fmul_nc(qv, kv);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.fadd_nc(prev, prod);
+            b.store_var(acc_var, next);
+        });
+    }
     let acc_v = b.load_var_f32(acc_var);
     b.fmul_nc(scale, acc_v)
 }
@@ -4677,6 +4780,56 @@ pub fn f32_matvec() -> Vec<u32> {
     b.finish()
 }
 
+/// Emits dense `F32` `LoRA` B accumulation SPIR-V 1.6 words (`output[row] += scale * dot(B[row], ranks)`).
+///
+/// Bindings: `0` read-only `b_weights` (`f32`, `[out_features, rank]` row-major),
+/// `1` read-only `ranks` (`f32`, `[rank]`), `2` read-write `output` (`f32`, `[out_features]`).
+/// Push constants (`3 × u32`): `[out_features, rank, scale_bits]`.
+/// Dispatch: `(out_features.div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn lora_b_accum_f32() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 3);
+    let push_var = push_var.unwrap_or(0);
+    let b_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let ranks_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let row = b.load_input_component(gid, 0);
+    let out_features = b.load_push(push_var, 0);
+    let rank = b.load_push(push_var, 1);
+    let scale_bits = b.load_push(push_var, 2);
+    let scale = b.bitcast(b.f32_t, scale_bits);
+
+    let in_bounds = b.u_lt(row, out_features);
+    b.emit_if(in_bounds, |b| {
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let f_zero = b.const_f32(0.0);
+        let row_base = b.umul(row, rank);
+
+        let acc_var = b.local_f32_var();
+        b.store_var(acc_var, f_zero);
+        b.emit_for_range(c0, rank, c1, |b, r| {
+            let b_idx = b.uadd(row_base, r);
+            let bv = b.load_sb_f32(b_buf, b_idx);
+            let rv = b.load_sb_f32(ranks_buf, r);
+            let prod = b.fmul_nc(bv, rv);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.fadd_nc(prev, prod);
+            b.store_var(acc_var, next);
+        });
+
+        let dot = b.load_var_f32(acc_var);
+        let scaled = b.fmul_nc(dot, scale);
+        let cur = b.load_sb_f32(out_buf, row);
+        let updated = b.fadd_nc(cur, scaled);
+        b.store_sb_f32(out_buf, row, updated);
+    });
+
+    b.finish()
+}
+
 /// Emits elementwise `F32` product SPIR-V 1.6 words (`out[i] = a[i] * b[i]`).
 ///
 /// Bindings: `0` read-only `a` (`f32`), `1` read-only `b` (`f32`), `2` writable `out` (`f32`).
@@ -5353,9 +5506,12 @@ mod tests {
             (ffn_hadamard_f32(), Some(false)),
             (dot_f32_scalar(), Some(false)),
             (attn_qk_scores(), Some(false)),
+            (attn_qk_scores_f16kv(), Some(false)),
             (attn_softmax_f16(), Some(false)),
             (attn_pv_accum(), Some(false)),
+            (attn_pv_accum_f16kv(), Some(false)),
             (attn_fused_f16prob(), Some(false)),
+            (attn_fused_f16prob_f16kv(), Some(false)),
             (rms_norm_f32(), Some(false)),
             (add_rms_norm_f32(), Some(false)),
             (residual_add_f32(), Some(false)),
@@ -5371,6 +5527,7 @@ mod tests {
             (kv_append_f16(), Some(false)),
             (kv_unpack_f16_to_f32(), Some(false)),
             (f32_matvec(), Some(false)),
+            (lora_b_accum_f32(), Some(false)),
             (mul_f32_elemwise(), Some(false)),
             (permute_ssm_heads_f32(), Some(false)),
             (copy_slice_f32(), Some(false)),

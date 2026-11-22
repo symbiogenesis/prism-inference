@@ -13,12 +13,15 @@ use std::{
 
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
+    Decoder, MAX_PREFILL_BLOCK_TOKENS, Result as RuntimeResult,
     kernels::{row_into, validate_tensor},
     model::{
         Model, Tensor,
+        lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
         swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256},
     },
 };
+use bonsai_ternary::half_to_float;
 
 use crate::{
     AdrenoAttentionPath, AttentionDescriptor, AttentionStrategy, Error, ProjectionKernelPath,
@@ -141,7 +144,7 @@ impl Default for TdrChunkPolicy {
 /// GPU KV-cache storage representation for full-attention layers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum VulkanKvPrecision {
-    /// Packed IEEE binary16 words (`2 × f16` per `u32`), unpacked to `F32` before `#40` attention.
+    /// Packed IEEE binary16 words (`2 × f16` per `u32`), consumed directly by `#40` attention via `UnpackHalf2x16`.
     #[default]
     Fp16,
     /// Uncompressed `F32` storage holding binary16-rounded values directly consumable by `#40`.
@@ -157,6 +160,41 @@ impl VulkanKvPrecision {
             Self::Fp32 => "fp32",
         }
     }
+}
+
+/// Rank-one `LoRA` adapter input for [`VulkanBatchedGraphExecutor`].
+///
+/// Accepts a GGUF adapter [`Model`] validated through [`RankOneAdapter::from_model`] and uploads
+/// all linear and embedding `F32` factors directly into GPU resident memory.
+#[derive(Debug)]
+pub struct VulkanRankOneAdapterSpec<'a> {
+    /// Loaded GGUF adapter [`Model`] conforming to [`RankOneAdapter`].
+    pub adapter: &'a Model,
+    /// Initial adapter scale multiplier (`0.0..=2.0`, finite; `0.0` bypasses execution).
+    pub scale: f32,
+}
+
+/// Multi-rank `LoRA` adapter input (`F16`/`F32`) for [`VulkanBatchedGraphExecutor`].
+///
+/// Accepts a GGUF adapter [`Model`] validated through [`MultiRankAdapter::from_model`] under
+/// `policy` and uploads all `LoRA` `A` and `B` matrices into GPU resident memory.
+#[derive(Debug)]
+pub struct VulkanMultiRankAdapterSpec<'a> {
+    /// Loaded GGUF adapter [`Model`] conforming to [`MultiRankAdapter`].
+    pub adapter: &'a Model,
+    /// Target admission policy enforced by [`MultiRankAdapter::from_model`].
+    pub policy: MultiRankPolicy,
+    /// Initial adapter scale multiplier (`0.0..=2.0`, finite; `0.0` bypasses execution).
+    pub scale: f32,
+}
+
+/// Optional GPU-resident rank-one and multi-rank `LoRA` adapters attached at executor construction.
+#[derive(Debug, Default)]
+pub struct VulkanBatchedAdapters<'a> {
+    /// Optional rank-one `LoRA` adapter (`token_embd`, `attn_output`, `ssm_out`, `ffn_down`).
+    pub rank_one: Option<VulkanRankOneAdapterSpec<'a>>,
+    /// Optional stackable multi-rank `LoRA` adapter (`F16`/`F32`).
+    pub multi_rank: Option<VulkanMultiRankAdapterSpec<'a>>,
 }
 
 /// Configuration for constructing [`VulkanBatchedGraphExecutor`].
@@ -198,15 +236,19 @@ impl Default for VulkanBatchedConfig {
 
 /// Compiled SPIR-V 1.6 compute pipelines used by [`VulkanBatchedGraphExecutor`].
 ///
-/// Bundles `#39` projection pipelines, `#40` attention pipelines, and whole-layer intra-GPU
-/// transformation/state pipelines alongside a deterministic digest over all emitted SPIR-V words.
+/// Bundles `#39` projection pipelines, `#40` `F32` and direct packed-`FP16` attention pipelines,
+/// `LoRA` accumulation pipelines, and whole-layer intra-GPU transformation/state pipelines alongside
+/// a deterministic digest over all emitted SPIR-V words.
 #[derive(Debug)]
 pub struct VulkanLayerPipelines {
     proj: ProjectionPipelines,
     attn_qk_scores: PipelineId,
+    attn_qk_scores_f16kv: PipelineId,
     attn_softmax_f16: PipelineId,
     attn_pv_accum: PipelineId,
+    attn_pv_accum_f16kv: PipelineId,
     attn_fused_f16prob: PipelineId,
+    attn_fused_f16prob_f16kv: PipelineId,
     rms_norm: PipelineId,
     add_rms_norm: PipelineId,
     residual_add: PipelineId,
@@ -220,36 +262,39 @@ pub struct VulkanLayerPipelines {
     round_f16: PipelineId,
     kv_append_f32: PipelineId,
     kv_append_f16: PipelineId,
-    kv_unpack_f16: PipelineId,
     quant_q8_0_source: PipelineId,
     quant_q8_0_pinned: PipelineId,
     quant_q8_0_pinned_native: PipelineId,
     f32_matvec: PipelineId,
+    lora_b_accum: PipelineId,
     mul_f32_elemwise: PipelineId,
     permute_ssm_heads: PipelineId,
     copy_slice: PipelineId,
     use_sdot: bool,
     attn_qk_digest: String,
+    attn_qk_f16kv_digest: String,
     attn_softmax_digest: String,
     attn_pv_digest: String,
+    attn_pv_f16kv_digest: String,
     attn_fused_digest: String,
+    attn_fused_f16kv_digest: String,
     shader_digests_sha256: String,
 }
 
 impl VulkanLayerPipelines {
-    /// Compiles every layer, projection, and attention SPIR-V 1.6 pipeline on `device`.
+    /// Compiles every layer, projection, `LoRA`, and attention SPIR-V 1.6 pipeline on `device`.
     ///
     /// # Errors
     /// Returns [`Error::Unsupported`], [`Error::Vulkan`], or [`Error::InvalidInput`] if pipeline
     /// creation or digest calculation fails.
     #[expect(
         clippy::too_many_lines,
-        reason = "Compiles and digests all 25 whole-layer, projection, and attention SPIR-V pipelines sequentially."
+        reason = "Compiles and digests all whole-layer, projection, LoRA, and F32/packed-FP16 attention SPIR-V pipelines sequentially."
     )]
     pub fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         let proj = ProjectionPipelines::compile(device, use_sdot)?;
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v1:")?;
+        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v2:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
 
         let mut make_pipe = |tag: &[u8],
@@ -266,12 +311,22 @@ impl VulkanLayerPipelines {
 
         let (attn_qk_scores, attn_qk_digest) =
             make_pipe(b"attn_qk_scores", spirv::attn_qk_scores(), 3, 8)?;
+        let (attn_qk_scores_f16kv, attn_qk_f16kv_digest) =
+            make_pipe(b"attn_qk_scores_f16kv", spirv::attn_qk_scores_f16kv(), 3, 8)?;
         let (attn_softmax_f16, attn_softmax_digest) =
             make_pipe(b"attn_softmax_f16", spirv::attn_softmax_f16(), 2, 8)?;
         let (attn_pv_accum, attn_pv_digest) =
             make_pipe(b"attn_pv_accum", spirv::attn_pv_accum(), 3, 8)?;
+        let (attn_pv_accum_f16kv, attn_pv_f16kv_digest) =
+            make_pipe(b"attn_pv_accum_f16kv", spirv::attn_pv_accum_f16kv(), 3, 8)?;
         let (attn_fused_f16prob, attn_fused_digest) =
             make_pipe(b"attn_fused_f16prob", spirv::attn_fused_f16prob(), 4, 8)?;
+        let (attn_fused_f16prob_f16kv, attn_fused_f16kv_digest) = make_pipe(
+            b"attn_fused_f16prob_f16kv",
+            spirv::attn_fused_f16prob_f16kv(),
+            4,
+            8,
+        )?;
 
         let (rms_norm, _) = make_pipe(b"rms_norm_f32", spirv::rms_norm_f32(), 3, 2)?;
         let (add_rms_norm, _) = make_pipe(b"add_rms_norm_f32", spirv::add_rms_norm_f32(), 4, 2)?;
@@ -291,8 +346,6 @@ impl VulkanLayerPipelines {
         let (round_f16, _) = make_pipe(b"round_f16_f32", spirv::round_f16_f32(), 1, 1)?;
         let (kv_append_f32, _) = make_pipe(b"kv_append_f32", spirv::kv_append_f32(), 2, 2)?;
         let (kv_append_f16, _) = make_pipe(b"kv_append_f16", spirv::kv_append_f16(), 2, 2)?;
-        let (kv_unpack_f16, _) =
-            make_pipe(b"kv_unpack_f16_to_f32", spirv::kv_unpack_f16_to_f32(), 2, 1)?;
         let (quant_q8_0_source, _) = make_pipe(
             b"quant_q8_0_source",
             spirv::quantize_f32_to_q8_0(false, false),
@@ -312,6 +365,7 @@ impl VulkanLayerPipelines {
             1,
         )?;
         let (f32_matvec, _) = make_pipe(b"f32_matvec", spirv::f32_matvec(), 3, 2)?;
+        let (lora_b_accum, _) = make_pipe(b"lora_b_accum_f32", spirv::lora_b_accum_f32(), 3, 3)?;
         let (mul_f32_elemwise, _) =
             make_pipe(b"mul_f32_elemwise", spirv::mul_f32_elemwise(), 3, 1)?;
         let (permute_ssm_heads, _) = make_pipe(
@@ -330,9 +384,12 @@ impl VulkanLayerPipelines {
         Ok(Self {
             proj,
             attn_qk_scores,
+            attn_qk_scores_f16kv,
             attn_softmax_f16,
             attn_pv_accum,
+            attn_pv_accum_f16kv,
             attn_fused_f16prob,
+            attn_fused_f16prob_f16kv,
             rms_norm,
             add_rms_norm,
             residual_add,
@@ -346,19 +403,22 @@ impl VulkanLayerPipelines {
             round_f16,
             kv_append_f32,
             kv_append_f16,
-            kv_unpack_f16,
             quant_q8_0_source,
             quant_q8_0_pinned,
             quant_q8_0_pinned_native,
             f32_matvec,
+            lora_b_accum,
             mul_f32_elemwise,
             permute_ssm_heads,
             copy_slice,
             use_sdot,
             attn_qk_digest,
+            attn_qk_f16kv_digest,
             attn_softmax_digest,
             attn_pv_digest,
+            attn_pv_f16kv_digest,
             attn_fused_digest,
+            attn_fused_f16kv_digest,
             shader_digests_sha256,
         })
     }
@@ -380,6 +440,7 @@ impl VulkanLayerPipelines {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VulkanBatchedCheckpoint {
     executor_identity_sha256: String,
+    provenance_nonce: u64,
     position: usize,
     mrope_positions: [usize; 4],
     layers: Vec<LayerStateCheckpoint>,
@@ -429,6 +490,7 @@ impl VulkanBatchedCheckpoint {
             b"vk-batched-checkpoint-v1:",
             &self.executor_identity_sha256,
         )?;
+        hash_u64(&mut hasher, self.provenance_nonce)?;
         hash_usize(&mut hasher, self.position)?;
         for pos in self.mrope_positions {
             hash_usize(&mut hasher, pos)?;
@@ -545,6 +607,34 @@ enum WeightEncoding {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct GpuLoraFactor {
+    a_span: BufferSpan,
+    b_span: BufferSpan,
+    in_features: usize,
+    out_features: usize,
+    rank: usize,
+    scaling: f32,
+}
+
+#[derive(Clone, Debug)]
+struct GpuRankOneEmbed {
+    a_values: Vec<f32>,
+    b_span: BufferSpan,
+    alpha: f32,
+}
+
+#[derive(Default)]
+struct UploadedAdapters {
+    rank_one_linear: BTreeMap<String, GpuLoraFactor>,
+    rank_one_embed: Option<GpuRankOneEmbed>,
+    multi_rank_linear: BTreeMap<String, GpuLoraFactor>,
+    max_rank: usize,
+    content_sha256: String,
+    rank_one_scale: Option<f32>,
+    multi_rank_scale: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct GpuMatrixWeight {
     span: BufferSpan,
     encoding: WeightEncoding,
@@ -552,6 +642,8 @@ struct GpuMatrixWeight {
     rows: usize,
     rotated: bool,
     grouped_ssm: bool,
+    rank_one: Option<GpuLoraFactor>,
+    multi_rank: Option<GpuLoraFactor>,
 }
 
 impl GpuMatrixWeight {
@@ -560,6 +652,10 @@ impl GpuMatrixWeight {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Allocated once per layer during executor construction."
+)]
 enum GpuLayerAttention {
     Recurrent {
         qkv: GpuMatrixWeight,
@@ -614,8 +710,7 @@ struct GpuGraphScratch {
     gdn_k: BufferId,
     gdn_v: BufferId,
     rope_freqs: BufferId,
-    k_unpacked: BufferId,
-    v_unpacked: BufferId,
+    lora_ranks: BufferId,
     attn_scores: BufferId,
     attn_probs: BufferId,
     logits: BufferId,
@@ -696,6 +791,11 @@ pub struct VulkanBatchedGraphExecutor {
     batch_recorder: CommandBatchRecorder,
     host_embed_scratch: Vec<f32>,
     host_rope_freqs: Vec<f32>,
+    rank_one_embed: Option<GpuRankOneEmbed>,
+    rank_one_scale: Option<f32>,
+    multi_rank_scale: Option<f32>,
+    base_provenance_sha256: String,
+    provenance_nonce: u64,
     position: usize,
     mrope_positions: [usize; 4],
     submits_completed: u64,
@@ -719,8 +819,22 @@ impl VulkanBatchedGraphExecutor {
     /// Returns [`Error::Unsupported`], [`Error::InvalidInput`], [`Error::ResourceLimit`],
     /// [`Error::DeviceFault`], or [`Error::Vulkan`].
     pub fn open(model: &Model, config: VulkanBatchedConfig) -> Result<Self, Error> {
+        Self::open_with_adapters(model, config, VulkanBatchedAdapters::default())
+    }
+
+    /// Opens the native Adreno Vulkan device and uploads `model` together with GPU-resident
+    /// `LoRA` adapters (`RankOneAdapter` / `MultiRankAdapter`).
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`], [`Error::InvalidInput`], [`Error::ResourceLimit`],
+    /// [`Error::DeviceFault`], or [`Error::Vulkan`].
+    pub fn open_with_adapters(
+        model: &Model,
+        config: VulkanBatchedConfig,
+        adapters: VulkanBatchedAdapters<'_>,
+    ) -> Result<Self, Error> {
         let device = AdrenoVulkanDevice::open()?;
-        Self::from_device(device, model, config)
+        Self::from_device_with_adapters(device, model, config, adapters)
     }
 
     /// Uploads `model` onto an already-opened [`AdrenoVulkanDevice`] with `config`.
@@ -728,14 +842,28 @@ impl VulkanBatchedGraphExecutor {
     /// # Errors
     /// Returns [`Error::Unsupported`], [`Error::InvalidInput`], [`Error::ResourceLimit`],
     /// [`Error::DeviceFault`], or [`Error::Vulkan`].
+    pub fn from_device(
+        device: AdrenoVulkanDevice,
+        model: &Model,
+        config: VulkanBatchedConfig,
+    ) -> Result<Self, Error> {
+        Self::from_device_with_adapters(device, model, config, VulkanBatchedAdapters::default())
+    }
+
+    /// Uploads `model` and GPU-resident `LoRA` adapters onto an already-opened [`AdrenoVulkanDevice`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`], [`Error::InvalidInput`], [`Error::ResourceLimit`],
+    /// [`Error::DeviceFault`], or [`Error::Vulkan`].
     #[expect(
         clippy::too_many_lines,
-        reason = "Coordinates single-pass model metadata parsing, GPU weight upload, state/scratch allocation, and deterministic identity hashing."
+        reason = "Coordinates single-pass model/adapter validation, GPU weight upload, state/scratch allocation, and deterministic identity hashing."
     )]
-    pub fn from_device(
+    pub fn from_device_with_adapters(
         mut device: AdrenoVulkanDevice,
         model: &Model,
         config: VulkanBatchedConfig,
+        adapters: VulkanBatchedAdapters<'_>,
     ) -> Result<Self, Error> {
         config.tdr_policy.validate()?;
         let preferred_path = if device.capabilities().supports_integer_dot_4x8() {
@@ -774,6 +902,15 @@ impl VulkanBatchedGraphExecutor {
 
         let mut guard = BufferCleanupGuard::new(&mut device);
         let transforms = parse_and_upload_transforms(model, &geometry, &mut guard)?;
+        let has_separate_output = model.tensors.contains_key("output.weight");
+        let uploaded_adapters = parse_and_upload_adapters(
+            model,
+            &geometry,
+            &recurrent_flags,
+            has_separate_output,
+            adapters,
+            &mut guard,
+        )?;
 
         let mut repack_scratch = Vec::<u32>::new();
         let mut row_scratch = Vec::<f32>::new();
@@ -802,6 +939,7 @@ impl VulkanBatchedGraphExecutor {
                     &prefix,
                     &geometry,
                     &transforms,
+                    &uploaded_adapters,
                     &mut repack_scratch,
                     &mut row_scratch,
                     &mut guard,
@@ -813,6 +951,7 @@ impl VulkanBatchedGraphExecutor {
                     &geometry,
                     config.kv_precision,
                     &transforms,
+                    &uploaded_adapters,
                     &mut repack_scratch,
                     &mut row_scratch,
                     &mut guard,
@@ -825,6 +964,7 @@ impl VulkanBatchedGraphExecutor {
                 geometry.embedding,
                 geometry.feed_forward,
                 &transforms,
+                &uploaded_adapters,
                 &mut repack_scratch,
                 &mut row_scratch,
                 &mut guard,
@@ -835,6 +975,7 @@ impl VulkanBatchedGraphExecutor {
                 geometry.embedding,
                 geometry.feed_forward,
                 &transforms,
+                &uploaded_adapters,
                 &mut repack_scratch,
                 &mut row_scratch,
                 &mut guard,
@@ -845,6 +986,7 @@ impl VulkanBatchedGraphExecutor {
                 geometry.feed_forward,
                 geometry.embedding,
                 &transforms,
+                &uploaded_adapters,
                 &mut repack_scratch,
                 &mut row_scratch,
                 &mut guard,
@@ -867,7 +1009,7 @@ impl VulkanBatchedGraphExecutor {
             &mut row_scratch,
             &mut guard,
         )?;
-        let output_tensor = if model.tensors.contains_key("output.weight") {
+        let output_tensor = if has_separate_output {
             lookup_tensor(
                 model,
                 "output.weight",
@@ -879,6 +1021,7 @@ impl VulkanBatchedGraphExecutor {
         let output_weight = upload_matrix_tensor(
             &output_tensor,
             &transforms,
+            &uploaded_adapters,
             &mut repack_scratch,
             &mut row_scratch,
             &mut guard,
@@ -886,13 +1029,14 @@ impl VulkanBatchedGraphExecutor {
 
         let scratch = allocate_scratch(
             &geometry,
+            uploaded_adapters.max_rank,
             config.scratch_budget_bytes,
             max_storage_range,
             &mut guard,
         )?;
 
         let (arena, owned_buffers) = guard.defuse();
-        let identity_sha256 = compute_executor_identity(
+        let base_provenance_sha256 = compute_base_provenance(
             &device,
             model,
             &config,
@@ -901,6 +1045,12 @@ impl VulkanBatchedGraphExecutor {
             kernel_path,
             layer_count,
             &pipelines,
+            &uploaded_adapters.content_sha256,
+        )?;
+        let identity_sha256 = compute_executor_identity(
+            &base_provenance_sha256,
+            uploaded_adapters.rank_one_scale,
+            uploaded_adapters.multi_rank_scale,
         )?;
 
         let _ = min_align;
@@ -924,6 +1074,11 @@ impl VulkanBatchedGraphExecutor {
             batch_recorder: CommandBatchRecorder::with_capacity(256),
             host_embed_scratch: Vec::with_capacity(geometry.embedding),
             host_rope_freqs,
+            rank_one_embed: uploaded_adapters.rank_one_embed,
+            rank_one_scale: uploaded_adapters.rank_one_scale,
+            multi_rank_scale: uploaded_adapters.multi_rank_scale,
+            base_provenance_sha256,
+            provenance_nonce: 0,
             position: 0,
             mrope_positions: [0; 4],
             submits_completed: 0,
@@ -950,7 +1105,11 @@ impl VulkanBatchedGraphExecutor {
     /// [`Error::Unsupported`], or [`Error::Vulkan`].
     pub fn evaluate_token_into(&mut self, token: u32, logits: &mut Vec<f32>) -> Result<(), Error> {
         logits.clear();
-        self.step_token_impl(token, Some(logits))
+        let res = self.step_token_impl(token, Some(logits));
+        if res.is_err() {
+            logits.clear();
+        }
+        res
     }
 
     /// Advances model recurrent/KV state on GPU by ingesting one prompt token without reading logits.
@@ -1006,20 +1165,207 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
+    /// Returns the active rank-one `LoRA` adapter scale, or `None` when none is loaded.
+    #[must_use]
+    pub const fn rank_one_scale(&self) -> Option<f32> {
+        self.rank_one_scale
+    }
+
+    /// Returns the active multi-rank `LoRA` adapter scale, or `None` when none is loaded.
+    #[must_use]
+    pub const fn multi_rank_scale(&self) -> Option<f32> {
+        self.multi_rank_scale
+    }
+
+    /// Dynamically updates the rank-one `LoRA` scale (`0.0..=2.0`) and invalidates executor identity
+    /// and prior checkpoints without freeing or re-uploading GPU weights.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if no rank-one adapter is loaded, `scale` is outside finite
+    /// `0.0..=2.0`, or identity hashing fails.
+    pub fn set_rank_one_scale(&mut self, scale: f32) -> Result<(), Error> {
+        if self.rank_one_scale.is_none() {
+            return Err(Error::InvalidInput(
+                "rank-one adapter scale update requires a loaded rank-one adapter".to_owned(),
+            ));
+        }
+        self.set_adapter_scales(Some(scale), self.multi_rank_scale)
+    }
+
+    /// Dynamically updates the multi-rank `LoRA` scale (`0.0..=2.0`) and invalidates executor
+    /// identity and prior checkpoints without freeing or re-uploading GPU weights.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if no multi-rank adapter is loaded, `scale` is outside
+    /// finite `0.0..=2.0`, or identity hashing fails.
+    pub fn set_multi_rank_scale(&mut self, scale: f32) -> Result<(), Error> {
+        if self.multi_rank_scale.is_none() {
+            return Err(Error::InvalidInput(
+                "multi-rank adapter scale update requires a loaded multi-rank adapter".to_owned(),
+            ));
+        }
+        self.set_adapter_scales(self.rank_one_scale, Some(scale))
+    }
+
+    /// Atomically updates loaded rank-one and multi-rank `LoRA` scales and invalidates identity and
+    /// prior checkpoints.
+    ///
+    /// # Errors
+    /// Rejects scale mismatches against the loaded adapters, scales outside finite `0.0..=2.0`,
+    /// or identity hashing failures without mutating existing scales.
+    pub fn set_adapter_scales(
+        &mut self,
+        rank_one_scale: Option<f32>,
+        multi_rank_scale: Option<f32>,
+    ) -> Result<(), Error> {
+        let (resolved_r1, resolved_mr) =
+            self.validate_adapter_scale_update(rank_one_scale, multi_rank_scale)?;
+        let new_identity =
+            compute_executor_identity(&self.base_provenance_sha256, resolved_r1, resolved_mr)?;
+        self.rank_one_scale = resolved_r1;
+        self.multi_rank_scale = resolved_mr;
+        self.identity_sha256 = new_identity;
+        self.provenance_nonce = self.provenance_nonce.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Resets all GPU recurrent/KV state to position `0` and updates the rank-one `LoRA` scale.
+    ///
+    /// # Errors
+    /// Rejects missing adapters, invalid scales, or Vulkan reset failures.
+    pub fn reset_with_rank_one_scale(&mut self, scale: f32) -> Result<(), Error> {
+        if self.rank_one_scale.is_none() {
+            return Err(Error::InvalidInput(
+                "rank-one adapter scale update requires a loaded rank-one adapter".to_owned(),
+            ));
+        }
+        self.reset_with_adapter_scales(Some(scale), self.multi_rank_scale)
+    }
+
+    /// Resets all GPU recurrent/KV state to position `0` and updates the multi-rank `LoRA` scale.
+    ///
+    /// # Errors
+    /// Rejects missing adapters, invalid scales, or Vulkan reset failures.
+    pub fn reset_with_multi_rank_scale(&mut self, scale: f32) -> Result<(), Error> {
+        if self.multi_rank_scale.is_none() {
+            return Err(Error::InvalidInput(
+                "multi-rank adapter scale update requires a loaded multi-rank adapter".to_owned(),
+            ));
+        }
+        self.reset_with_adapter_scales(self.rank_one_scale, Some(scale))
+    }
+
+    /// Atomically resets all GPU recurrent/KV state to position `0`, updates loaded adapter scales,
+    /// and invalidates prior checkpoints.
+    ///
+    /// # Errors
+    /// Rejects scale mismatches against loaded adapters, scales outside finite `0.0..=2.0`,
+    /// identity hashing failures, or Vulkan reset errors.
+    pub fn reset_with_adapter_scales(
+        &mut self,
+        rank_one_scale: Option<f32>,
+        multi_rank_scale: Option<f32>,
+    ) -> Result<(), Error> {
+        let (resolved_r1, resolved_mr) =
+            self.validate_adapter_scale_update(rank_one_scale, multi_rank_scale)?;
+        let new_identity =
+            compute_executor_identity(&self.base_provenance_sha256, resolved_r1, resolved_mr)?;
+        self.reset()?;
+        self.rank_one_scale = resolved_r1;
+        self.multi_rank_scale = resolved_mr;
+        self.identity_sha256 = new_identity;
+        self.provenance_nonce = self.provenance_nonce.wrapping_add(1);
+        Ok(())
+    }
+
+    fn validate_adapter_scale_update(
+        &self,
+        rank_one_scale: Option<f32>,
+        multi_rank_scale: Option<f32>,
+    ) -> Result<(Option<f32>, Option<f32>), Error> {
+        if self.rank_one_scale.is_none() && self.multi_rank_scale.is_none() {
+            return Err(Error::InvalidInput(
+                "adapter scale update requires at least one loaded LoRA adapter".to_owned(),
+            ));
+        }
+        let resolved_r1 = match (self.rank_one_scale, rank_one_scale) {
+            (Some(_), Some(scale)) => {
+                validate_rank_one_scale(scale)?;
+                Some(scale)
+            }
+            (Some(_), None) => {
+                return Err(Error::InvalidInput(
+                    "rank-one adapter requires a rank-one scale".to_owned(),
+                ));
+            }
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(Error::InvalidInput(
+                    "rank-one scale provided without a loaded rank-one adapter".to_owned(),
+                ));
+            }
+        };
+        let resolved_mr = match (self.multi_rank_scale, multi_rank_scale) {
+            (Some(_), Some(scale)) => {
+                MultiRankAdapter::validate_scale(scale)
+                    .map_err(|err| Error::InvalidInput(err.to_string()))?;
+                Some(MultiRankAdapter::normalize_scale(scale))
+            }
+            (Some(_), None) => {
+                return Err(Error::InvalidInput(
+                    "multi-rank adapter requires a multi-rank scale".to_owned(),
+                ));
+            }
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(Error::InvalidInput(
+                    "multi-rank scale provided without a loaded multi-rank adapter".to_owned(),
+                ));
+            }
+        };
+        Ok((resolved_r1, resolved_mr))
+    }
+
     /// Captures a host-side snapshot of all mutable GPU recurrent and KV-cache state.
     ///
     /// # Errors
     /// Returns [`Error::DeviceFault`], [`Error::InvalidInput`], or [`Error::Vulkan`].
     pub fn checkpoint(&self) -> Result<VulkanBatchedCheckpoint, Error> {
+        let mut snapshot = VulkanBatchedCheckpoint {
+            executor_identity_sha256: String::new(),
+            provenance_nonce: 0,
+            position: 0,
+            mrope_positions: [0; 4],
+            layers: Vec::new(),
+        };
+        self.checkpoint_into(&mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// Captures a host-side snapshot of all mutable GPU state into `target`, reusing compatible
+    /// host allocations when possible.
+    ///
+    /// # Errors
+    /// Returns [`Error::DeviceFault`], [`Error::InvalidInput`], or [`Error::Vulkan`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Reads recurrent conv/matrix buffers and KV slices into existing or freshly sized checkpoint vectors."
+    )]
+    pub fn checkpoint_into(&self, target: &mut VulkanBatchedCheckpoint) -> Result<(), Error> {
         if self.device.is_faulted() || !self.state_consistent {
             return Err(Error::DeviceFault(
                 "cannot checkpoint faulted or inconsistent Vulkan graph executor".to_owned(),
             ));
         }
         let kv_width = self.geometry.kv_width();
-        let mut layer_states = Vec::with_capacity(self.layers.len());
-        for layer in &self.layers {
-            let snap = match &layer.attention {
+        let reuse = target.layers.len() == self.layers.len();
+        if !reuse {
+            target.layers.clear();
+            target.layers.reserve(self.layers.len());
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            match &layer.attention {
                 GpuLayerAttention::Recurrent {
                     conv_state,
                     conv_state_elems,
@@ -1027,23 +1373,44 @@ impl VulkanBatchedGraphExecutor {
                     matrix_state_elems,
                     ..
                 } => {
-                    let convolution = if *conv_state_elems > 0 {
-                        let mut buf = vec![0.0_f32; *conv_state_elems];
-                        self.device.read_buffer_f32(*conv_state, &mut buf)?;
-                        buf
+                    if reuse
+                        && let Some(LayerStateCheckpoint::Recurrent {
+                            convolution,
+                            matrix,
+                        }) = target.layers.get_mut(layer_idx)
+                    {
+                        convolution.resize(*conv_state_elems, 0.0_f32);
+                        if *conv_state_elems > 0 {
+                            self.device.read_buffer_f32(*conv_state, convolution)?;
+                        }
+                        matrix.resize(*matrix_state_elems, 0.0_f32);
+                        if *matrix_state_elems > 0 {
+                            self.device.read_buffer_f32(*matrix_state, matrix)?;
+                        }
                     } else {
-                        Vec::new()
-                    };
-                    let matrix = if *matrix_state_elems > 0 {
-                        let mut buf = vec![0.0_f32; *matrix_state_elems];
-                        self.device.read_buffer_f32(*matrix_state, &mut buf)?;
-                        buf
-                    } else {
-                        Vec::new()
-                    };
-                    LayerStateCheckpoint::Recurrent {
-                        convolution,
-                        matrix,
+                        let convolution = if *conv_state_elems > 0 {
+                            let mut buf = vec![0.0_f32; *conv_state_elems];
+                            self.device.read_buffer_f32(*conv_state, &mut buf)?;
+                            buf
+                        } else {
+                            Vec::new()
+                        };
+                        let matrix = if *matrix_state_elems > 0 {
+                            let mut buf = vec![0.0_f32; *matrix_state_elems];
+                            self.device.read_buffer_f32(*matrix_state, &mut buf)?;
+                            buf
+                        } else {
+                            Vec::new()
+                        };
+                        let snap = LayerStateCheckpoint::Recurrent {
+                            convolution,
+                            matrix,
+                        };
+                        if reuse {
+                            target.layers[layer_idx] = snap;
+                        } else {
+                            target.layers.push(snap);
+                        }
                     }
                 }
                 GpuLayerAttention::Full {
@@ -1058,36 +1425,65 @@ impl VulkanBatchedGraphExecutor {
                         usize::try_from(u32_slice_bytes(total_words)?).map_err(|_| {
                             Error::ResourceLimit("KV checkpoint byte length overflow".to_owned())
                         })?;
-                    let mut keys_words = vec![0_u32; total_words];
-                    let mut values_words = vec![0_u32; total_words];
+                    let mut raw_k = Vec::new();
+                    let mut raw_v = Vec::new();
                     if total_bytes > 0 {
-                        let mut raw_k = vec![0_u8; total_bytes];
-                        let mut raw_v = vec![0_u8; total_bytes];
+                        raw_k.resize(total_bytes, 0_u8);
+                        raw_v.resize(total_bytes, 0_u8);
                         self.device.read_buffer_bytes_at(*k_cache, 0, &mut raw_k)?;
                         self.device.read_buffer_bytes_at(*v_cache, 0, &mut raw_v)?;
+                    }
+                    if reuse
+                        && let Some(LayerStateCheckpoint::Full {
+                            precision,
+                            width,
+                            keys_words,
+                            values_words,
+                        }) = target.layers.get_mut(layer_idx)
+                    {
+                        *precision = self.config.kv_precision;
+                        *width = kv_width;
+                        keys_words.resize(total_words, 0_u32);
+                        values_words.resize(total_words, 0_u32);
                         for (dst, chunk) in keys_words.iter_mut().zip(raw_k.as_chunks::<4>().0) {
                             *dst = u32::from_le_bytes(*chunk);
                         }
                         for (dst, chunk) in values_words.iter_mut().zip(raw_v.as_chunks::<4>().0) {
                             *dst = u32::from_le_bytes(*chunk);
                         }
-                    }
-                    LayerStateCheckpoint::Full {
-                        precision: self.config.kv_precision,
-                        width: kv_width,
-                        keys_words,
-                        values_words,
+                    } else {
+                        let mut keys_words = vec![0_u32; total_words];
+                        let mut values_words = vec![0_u32; total_words];
+                        for (dst, chunk) in keys_words.iter_mut().zip(raw_k.as_chunks::<4>().0) {
+                            *dst = u32::from_le_bytes(*chunk);
+                        }
+                        for (dst, chunk) in values_words.iter_mut().zip(raw_v.as_chunks::<4>().0) {
+                            *dst = u32::from_le_bytes(*chunk);
+                        }
+                        let snap = LayerStateCheckpoint::Full {
+                            precision: self.config.kv_precision,
+                            width: kv_width,
+                            keys_words,
+                            values_words,
+                        };
+                        if reuse {
+                            target.layers[layer_idx] = snap;
+                        } else {
+                            target.layers.push(snap);
+                        }
                     }
                 }
-            };
-            layer_states.push(snap);
+            }
         }
-        Ok(VulkanBatchedCheckpoint {
-            executor_identity_sha256: self.identity_sha256.clone(),
-            position: self.position,
-            mrope_positions: self.mrope_positions,
-            layers: layer_states,
-        })
+
+        target.executor_identity_sha256.clear();
+        target
+            .executor_identity_sha256
+            .push_str(&self.identity_sha256);
+        target.provenance_nonce = self.provenance_nonce;
+        target.position = self.position;
+        target.mrope_positions = self.mrope_positions;
+        Ok(())
     }
 
     /// Restores GPU recurrent and KV-cache state from a checkpoint produced by this executor.
@@ -1105,7 +1501,13 @@ impl VulkanBatchedGraphExecutor {
                 "Vulkan batched executor faulted and cannot restore".to_owned(),
             ));
         }
-        if checkpoint.executor_identity_sha256 != self.identity_sha256 {
+        #[expect(
+            clippy::suspicious_operation_groupings,
+            reason = "Checkpoint stores the target executor digest in `executor_identity_sha256` while executor holds `identity_sha256`."
+        )]
+        let provenance_matches = checkpoint.executor_identity_sha256 == self.identity_sha256
+            && checkpoint.provenance_nonce == self.provenance_nonce;
+        if !provenance_matches {
             return Err(Error::InvalidInput(
                 "checkpoint executor identity does not match this VulkanBatchedGraphExecutor"
                     .to_owned(),
@@ -1229,6 +1631,12 @@ impl VulkanBatchedGraphExecutor {
         self.position
     }
 
+    /// Returns the model output vocabulary extent.
+    #[must_use]
+    pub const fn vocab_size(&self) -> usize {
+        self.geometry.vocabulary
+    }
+
     /// Returns the resolved context limit in tokens.
     #[must_use]
     pub const fn context_limit(&self) -> usize {
@@ -1247,7 +1655,7 @@ impl VulkanBatchedGraphExecutor {
         self.resolved_pinned_arithmetic
     }
 
-    /// Returns the deterministic SHA-256 identity binding model, TDR policy, shaders, and GPU.
+    /// Returns the deterministic SHA-256 identity binding model, TDR policy, shaders, adapters, and GPU.
     #[must_use]
     pub fn identity_sha256(&self) -> &str {
         &self.identity_sha256
@@ -1265,6 +1673,10 @@ impl VulkanBatchedGraphExecutor {
         self.device.is_faulted()
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Orchestrates token embedding upload, optional embedding LoRA, RoPE frequencies, chunked GPU execution, and finite logits readback."
+    )]
     fn step_token_impl(
         &mut self,
         token: u32,
@@ -1305,6 +1717,26 @@ impl VulkanBatchedGraphExecutor {
         self.device
             .write_buffer_f32(self.scratch.hidden, &self.host_embed_scratch)?;
 
+        let active_embed_lora = if let (Some(embed_lora), Some(scale)) =
+            (&self.rank_one_embed, self.rank_one_scale)
+            && scale != 0.0
+        {
+            let a_val = embed_lora.a_values.get(token_idx).copied().ok_or_else(|| {
+                Error::InvalidInput("embedding LoRA token out of bounds".to_owned())
+            })?;
+            let effective_scale = scale * embed_lora.alpha;
+            if !a_val.is_finite() || !effective_scale.is_finite() {
+                return Err(Error::InvalidInput(
+                    "embedding LoRA scalar or scale is non-finite".to_owned(),
+                ));
+            }
+            self.device
+                .write_buffer_f32(self.scratch.lora_ranks, &[a_val])?;
+            Some((embed_lora.b_span, effective_scale))
+        } else {
+            None
+        };
+
         let has_full_layers = self
             .layers
             .iter()
@@ -1331,8 +1763,25 @@ impl VulkanBatchedGraphExecutor {
         let run_result = (|| -> Result<(), Error> {
             for (chunk_idx, range) in chunks.iter().enumerate() {
                 self.batch_recorder.clear();
-                if chunk_idx == 0 && self.transforms.inverse_embedding {
-                    self.record_inverse_embedding_transform()?;
+                if chunk_idx == 0 {
+                    if self.transforms.inverse_embedding {
+                        self.record_inverse_embedding_transform()?;
+                    }
+                    if let Some((b_span, eff_scale)) = active_embed_lora {
+                        let embed_u32 = u32::try_from(self.geometry.embedding).map_err(|_| {
+                            Error::ResourceLimit("embedding exceeds u32".to_owned())
+                        })?;
+                        self.batch_recorder.push_barrier(
+                            self.pipelines.lora_b_accum,
+                            &[
+                                b_span,
+                                BufferSpan::whole(self.scratch.lora_ranks),
+                                BufferSpan::whole(self.scratch.hidden),
+                            ],
+                            &[embed_u32, 1, eff_scale.to_bits()],
+                            checked_grid(&self.device, [embed_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                        );
+                    }
                 }
                 for layer_idx in range.clone() {
                     let narrow_final = !need_logits && layer_idx + 1 == total_layers;
@@ -1913,38 +2362,19 @@ impl VulkanBatchedGraphExecutor {
 
         self.record_kv_append(key_buf, val_buf, k_cache, v_cache, kv_width_u32, pos_u32)?;
 
-        let (k_attn_span, v_attn_span) = match self.config.kv_precision {
-            VulkanKvPrecision::Fp16 => {
-                let unpack_words = total_seq.checked_mul(kv_width / 2).ok_or_else(|| {
-                    Error::ResourceLimit("KV unpack word count overflow".to_owned())
-                })?;
-                let unpack_u32 = u32::try_from(unpack_words)
-                    .map_err(|_| Error::ResourceLimit("KV unpack words exceed u32".to_owned()))?;
-                let grid = checked_grid(&self.device, [unpack_u32.div_ceil(WORKGROUP_X), 1, 1])?;
-                self.batch_recorder.push_barrier(
-                    self.pipelines.kv_unpack_f16,
-                    &[
-                        BufferSpan::whole(k_cache),
-                        BufferSpan::whole(self.scratch.k_unpacked),
-                    ],
-                    &[unpack_u32],
-                    grid,
-                );
-                self.batch_recorder.push_concurrent(
-                    self.pipelines.kv_unpack_f16,
-                    &[
-                        BufferSpan::whole(v_cache),
-                        BufferSpan::whole(self.scratch.v_unpacked),
-                    ],
-                    &[unpack_u32],
-                    grid,
-                );
-                (
-                    BufferSpan::whole(self.scratch.k_unpacked),
-                    BufferSpan::whole(self.scratch.v_unpacked),
-                )
-            }
-            VulkanKvPrecision::Fp32 => (BufferSpan::whole(k_cache), BufferSpan::whole(v_cache)),
+        let k_attn_span = BufferSpan::whole(k_cache);
+        let v_attn_span = BufferSpan::whole(v_cache);
+        let (fused_pipe, qk_pipe, pv_pipe) = match self.config.kv_precision {
+            VulkanKvPrecision::Fp16 => (
+                self.pipelines.attn_fused_f16prob_f16kv,
+                self.pipelines.attn_qk_scores_f16kv,
+                self.pipelines.attn_pv_accum_f16kv,
+            ),
+            VulkanKvPrecision::Fp32 => (
+                self.pipelines.attn_fused_f16prob,
+                self.pipelines.attn_qk_scores,
+                self.pipelines.attn_pv_accum,
+            ),
         };
 
         let head_f32 = u16::try_from(self.geometry.head).map_or(1.0_f32, f32::from);
@@ -1970,7 +2400,7 @@ impl VulkanBatchedGraphExecutor {
         match plan.path {
             AdrenoAttentionPath::Fused => {
                 self.batch_recorder.push_barrier(
-                    self.pipelines.attn_fused_f16prob,
+                    fused_pipe,
                     &[
                         BufferSpan::whole(query_buf),
                         k_attn_span,
@@ -1983,7 +2413,7 @@ impl VulkanBatchedGraphExecutor {
             }
             AdrenoAttentionPath::Decomposed3Stage => {
                 self.batch_recorder.push_barrier(
-                    self.pipelines.attn_qk_scores,
+                    qk_pipe,
                     &[
                         BufferSpan::whole(query_buf),
                         k_attn_span,
@@ -2005,7 +2435,7 @@ impl VulkanBatchedGraphExecutor {
                     checked_grid(&self.device, [1, num_heads_u32, 1])?,
                 );
                 self.batch_recorder.push_barrier(
-                    self.pipelines.attn_pv_accum,
+                    pv_pipe,
                     &[
                         BufferSpan::whole(self.scratch.attn_probs),
                         v_attn_span,
@@ -2174,6 +2604,71 @@ impl VulkanBatchedGraphExecutor {
                 .collect();
             self.record_basis_projection_subgroup(src_buf, basis, &group)?;
         }
+        self.record_projection_group_adapters(src_buf, targets)
+    }
+
+    fn record_projection_group_adapters(
+        &mut self,
+        src_buf: BufferId,
+        targets: &[(GpuMatrixWeight, BufferId)],
+    ) -> Result<(), Error> {
+        let r1_scale = self.rank_one_scale.filter(|&s| s != 0.0);
+        let mr_scale = self.multi_rank_scale.filter(|&s| s != 0.0);
+        if r1_scale.is_none() && mr_scale.is_none() {
+            return Ok(());
+        }
+        for &(weight, out_buf) in targets {
+            if let (Some(scale), Some(lora)) = (r1_scale, weight.rank_one) {
+                self.record_linear_lora(src_buf, out_buf, lora, scale)?;
+            }
+            if let (Some(scale), Some(lora)) = (mr_scale, weight.multi_rank) {
+                self.record_linear_lora(src_buf, out_buf, lora, scale)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_linear_lora(
+        &mut self,
+        src_buf: BufferId,
+        out_buf: BufferId,
+        lora: GpuLoraFactor,
+        user_scale: f32,
+    ) -> Result<(), Error> {
+        let effective_scale = user_scale * lora.scaling;
+        if !effective_scale.is_finite() {
+            return Err(Error::InvalidInput(
+                "non-finite effective GPU LoRA scale".to_owned(),
+            ));
+        }
+        let in_u32 = u32::try_from(lora.in_features)
+            .map_err(|_| Error::ResourceLimit("LoRA in_features exceeds u32".to_owned()))?;
+        let out_u32 = u32::try_from(lora.out_features)
+            .map_err(|_| Error::ResourceLimit("LoRA out_features exceeds u32".to_owned()))?;
+        let rank_u32 = u32::try_from(lora.rank)
+            .map_err(|_| Error::ResourceLimit("LoRA rank exceeds u32".to_owned()))?;
+
+        // `src_buf` holds unrotated original activations across the whole projection group.
+        self.batch_recorder.push_barrier(
+            self.pipelines.f32_matvec,
+            &[
+                lora.a_span,
+                BufferSpan::whole(src_buf),
+                BufferSpan::whole(self.scratch.lora_ranks),
+            ],
+            &[in_u32, rank_u32],
+            checked_grid(&self.device, [rank_u32, 1, 1])?,
+        );
+        self.batch_recorder.push_barrier(
+            self.pipelines.lora_b_accum,
+            &[
+                lora.b_span,
+                BufferSpan::whole(self.scratch.lora_ranks),
+                BufferSpan::whole(out_buf),
+            ],
+            &[out_u32, rank_u32, effective_scale.to_bits()],
+            checked_grid(&self.device, [out_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+        );
         Ok(())
     }
 
@@ -2418,6 +2913,138 @@ impl VulkanBatchedGraphExecutor {
             }
         }
         Ok(())
+    }
+}
+
+impl Decoder for VulkanBatchedGraphExecutor {
+    type Checkpoint = VulkanBatchedCheckpoint;
+
+    fn identity(&self) -> &str {
+        &self.identity_sha256
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.geometry.vocabulary
+    }
+
+    fn checkpoint_bytes(&self) -> usize {
+        let words_per_tok = match self.config.kv_precision {
+            VulkanKvPrecision::Fp16 => self.geometry.kv_width() / 2,
+            VulkanKvPrecision::Fp32 => self.geometry.kv_width(),
+        };
+        let kv_bytes_per_layer = self
+            .position
+            .saturating_mul(words_per_tok)
+            .saturating_mul(2 * size_of::<u32>());
+        let mut payload_bytes = 0_usize;
+        for layer in &self.layers {
+            payload_bytes = payload_bytes.saturating_add(match &layer.attention {
+                GpuLayerAttention::Recurrent {
+                    conv_state_elems,
+                    matrix_state_elems,
+                    ..
+                } => conv_state_elems
+                    .saturating_add(*matrix_state_elems)
+                    .saturating_mul(size_of::<f32>()),
+                GpuLayerAttention::Full { .. } => kv_bytes_per_layer,
+            });
+        }
+        size_of::<VulkanBatchedCheckpoint>()
+            .saturating_add(self.identity_sha256.capacity())
+            .saturating_add(
+                self.layers
+                    .len()
+                    .saturating_mul(size_of::<LayerStateCheckpoint>()),
+            )
+            .saturating_add(payload_bytes)
+    }
+
+    fn admit_work(&self, ingest_tokens: usize, evaluate_tokens: usize) -> RuntimeResult<()> {
+        if self.device.is_faulted() {
+            return Err(Error::DeviceFault(
+                "Vulkan batched executor faulted and requires terminal teardown".to_owned(),
+            )
+            .into_runtime_error());
+        }
+        if !self.state_consistent {
+            return Err(Error::InvalidInput(
+                "executor state is inconsistent after failed evaluation and requires reset or restore"
+                    .to_owned(),
+            )
+            .into_runtime_error());
+        }
+        ingest_tokens.checked_add(evaluate_tokens).ok_or_else(|| {
+            Error::ResourceLimit("requested token work count overflow".to_owned())
+                .into_runtime_error()
+        })?;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> RuntimeResult<()> {
+        Self::reset(self).map_err(Error::into_runtime_error)
+    }
+
+    fn evaluate(&mut self, token: u32) -> RuntimeResult<Vec<f32>> {
+        self.evaluate_token(token)
+            .map_err(Error::into_runtime_error)
+    }
+
+    fn evaluate_into(&mut self, token: u32, output: &mut Vec<f32>) -> RuntimeResult<()> {
+        self.evaluate_token_into(token, output)
+            .map_err(Error::into_runtime_error)
+    }
+
+    fn ingest(&mut self, token: u32) -> RuntimeResult<()> {
+        self.ingest_token(token).map_err(Error::into_runtime_error)
+    }
+
+    fn ingest_block(
+        &mut self,
+        tokens: &[u32],
+        check: &dyn Fn() -> RuntimeResult<()>,
+    ) -> RuntimeResult<()> {
+        if tokens.is_empty()
+            || tokens.len() > MAX_PREFILL_BLOCK_TOKENS
+            || tokens
+                .iter()
+                .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocab_size()))
+        {
+            return Err(Error::InvalidInput(
+                "invalid native prefill block bounds or tokens".to_owned(),
+            )
+            .into_runtime_error());
+        }
+        if self.device.is_faulted() {
+            return Err(Error::DeviceFault(
+                "Vulkan batched executor faulted and cannot ingest block".to_owned(),
+            )
+            .into_runtime_error());
+        }
+        if !self.state_consistent {
+            return Err(Error::InvalidInput(
+                "executor state is inconsistent after failed evaluation and requires reset or restore"
+                    .to_owned(),
+            )
+            .into_runtime_error());
+        }
+        for &token in tokens {
+            check()?;
+            self.ingest(token)?;
+            check()?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint(&self) -> RuntimeResult<Self::Checkpoint> {
+        Self::checkpoint(self).map_err(Error::into_runtime_error)
+    }
+
+    fn checkpoint_into(&self, target: &mut Self::Checkpoint) -> RuntimeResult<()> {
+        Self::checkpoint_into(self, target).map_err(Error::into_runtime_error)
+    }
+
+    fn restore(&mut self, checkpoint: &Self::Checkpoint) -> RuntimeResult<()> {
+        Self::restore(self, checkpoint).map_err(Error::into_runtime_error)
     }
 }
 
@@ -2905,6 +3532,327 @@ fn load_and_upload_vector(
     guard.alloc_f32_buffer(row_scratch)
 }
 
+fn clone_model(model: &Model) -> Model {
+    Model {
+        metadata: model.metadata.clone(),
+        tensors: model.tensors.clone(),
+        identity: model.identity.clone(),
+    }
+}
+
+fn validate_rank_one_scale(scale: f32) -> Result<(), Error> {
+    if scale.is_finite() && (0.0..=2.0).contains(&scale) {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(
+            "rank-one adapter scale must be finite and in 0..=2".to_owned(),
+        ))
+    }
+}
+
+fn parse_blk_target(target: &str) -> Option<(usize, &str)> {
+    let rest = target.strip_prefix("blk.")?;
+    let (layer_str, suffix) = rest.split_once('.')?;
+    if layer_str.is_empty() || !layer_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let layer_idx = layer_str.parse::<usize>().ok()?;
+    Some((layer_idx, suffix))
+}
+
+fn is_live_rank_one_target(
+    target: &str,
+    recurrent_flags: &[bool],
+    has_separate_output: bool,
+) -> Result<bool, Error> {
+    if target == "token_embd.weight" {
+        if !has_separate_output {
+            return Err(Error::InvalidInput(
+                "rank-one embedding adapter requires a separate output head".to_owned(),
+            ));
+        }
+        return Ok(true);
+    }
+    let Some((layer_idx, suffix)) = parse_blk_target(target) else {
+        return Ok(false);
+    };
+    let Some(&is_recurrent) = recurrent_flags.get(layer_idx) else {
+        return Ok(false);
+    };
+    Ok(match suffix {
+        "ffn_down.weight" => true,
+        "ssm_out.weight" => is_recurrent,
+        "attn_output.weight" => !is_recurrent,
+        _ => false,
+    })
+}
+
+fn is_live_multi_rank_target(target: &str, recurrent_flags: &[bool]) -> bool {
+    let Some((layer_idx, suffix)) = parse_blk_target(target) else {
+        return false;
+    };
+    let Some(&is_recurrent) = recurrent_flags.get(layer_idx) else {
+        return false;
+    };
+    match suffix {
+        "ffn_down.weight" | "ffn_gate.weight" | "ffn_up.weight" => true,
+        "attn_qkv.weight" | "attn_gate.weight" | "ssm_beta.weight" | "ssm_alpha.weight" => {
+            is_recurrent
+        }
+        "attn_q.weight" | "attn_k.weight" | "attn_v.weight" | "attn_output.weight" => !is_recurrent,
+        _ => false,
+    }
+}
+
+fn decode_lora_words(tensor: &Tensor) -> Result<Vec<u32>, Error> {
+    match tensor.kind {
+        0 => {
+            if !tensor.data.len().is_multiple_of(4) {
+                return Err(Error::InvalidInput(format!(
+                    "F32 LoRA tensor '{}' byte length is not a multiple of 4",
+                    tensor.name
+                )));
+            }
+            let mut words = Vec::with_capacity(tensor.data.len() / 4);
+            for chunk in tensor.data.as_chunks::<4>().0 {
+                let v = f32::from_le_bytes(*chunk);
+                if !v.is_finite() {
+                    return Err(Error::InvalidInput(format!(
+                        "F32 LoRA tensor '{}' contains non-finite value",
+                        tensor.name
+                    )));
+                }
+                words.push(v.to_bits());
+            }
+            Ok(words)
+        }
+        1 => {
+            if !tensor.data.len().is_multiple_of(2) {
+                return Err(Error::InvalidInput(format!(
+                    "F16 LoRA tensor '{}' byte length is not even",
+                    tensor.name
+                )));
+            }
+            let mut words = Vec::with_capacity(tensor.data.len() / 2);
+            for chunk in tensor.data.as_chunks::<2>().0 {
+                let v = half_to_float(u16::from_le_bytes(*chunk));
+                if !v.is_finite() || v.abs() >= 65_520.0 {
+                    return Err(Error::InvalidInput(format!(
+                        "F16 LoRA tensor '{}' contains non-finite or overflowed value",
+                        tensor.name
+                    )));
+                }
+                words.push(v.to_bits());
+            }
+            Ok(words)
+        }
+        kind => Err(Error::InvalidInput(format!(
+            "unsupported LoRA tensor '{}' encoding {kind}",
+            tensor.name
+        ))),
+    }
+}
+
+fn upload_arena_words(
+    words: &[u32],
+    guard: &mut BufferCleanupGuard<'_>,
+) -> Result<BufferSpan, Error> {
+    let bytes = u32_slice_bytes(words.len())?;
+    let span = guard.arena.alloc(guard.device, bytes)?;
+    guard
+        .device
+        .write_buffer_u32_at(span.buffer, span.offset, words)?;
+    Ok(span)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Validates RankOneAdapter and MultiRankAdapter contracts, uploads factors to GPU WeightArena, and hashes deterministic adapter provenance."
+)]
+fn parse_and_upload_adapters(
+    base_model: &Model,
+    geometry: &GraphGeometry,
+    recurrent_flags: &[bool],
+    has_separate_output: bool,
+    adapters: VulkanBatchedAdapters<'_>,
+    guard: &mut BufferCleanupGuard<'_>,
+) -> Result<UploadedAdapters, Error> {
+    let mut uploaded = UploadedAdapters::default();
+    let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
+    hash_bytes(&mut hasher, b"vk-batched-adapters-v1:")?;
+
+    if let Some(spec) = adapters.rank_one {
+        validate_rank_one_scale(spec.scale)?;
+        let validated = RankOneAdapter::from_model(clone_model(spec.adapter), base_model)
+            .map_err(|err| Error::InvalidInput(err.to_string()))?;
+        let alpha = meta_f32(spec.adapter, "adapter.lora_alpha")?;
+        hash_str(&mut hasher, b"r1-id:", validated.identity())?;
+        hash_u32(&mut hasher, alpha.to_bits())?;
+        hash_usize(&mut hasher, validated.target_count())?;
+
+        for (name, a_tensor) in &spec.adapter.tensors {
+            let Some(target) = name.strip_suffix(".lora_a") else {
+                continue;
+            };
+            if !is_live_rank_one_target(target, recurrent_flags, has_separate_output)? {
+                return Err(Error::InvalidInput(
+                    "rank-one adapter target is outside the live GPU graph".to_owned(),
+                ));
+            }
+            let b_tensor = spec
+                .adapter
+                .tensors
+                .get(&format!("{target}.lora_b"))
+                .ok_or_else(|| {
+                    Error::InvalidInput("rank-one adapter B factor missing".to_owned())
+                })?;
+            let base_tensor = base_model
+                .tensors
+                .get(target)
+                .ok_or_else(|| Error::InvalidInput("rank-one base target missing".to_owned()))?;
+            let [in_features, out_features] = base_tensor.dimensions.as_slice() else {
+                return Err(Error::InvalidInput(
+                    "rank-one base target must be rank 2".to_owned(),
+                ));
+            };
+            let a_words = decode_lora_words(a_tensor)?;
+            let b_words = decode_lora_words(b_tensor)?;
+            hash_str(&mut hasher, b"r1-tgt:", target)?;
+            hash_usize(&mut hasher, a_words.len())?;
+            for &w in &a_words {
+                hash_u32(&mut hasher, w)?;
+            }
+            hash_usize(&mut hasher, b_words.len())?;
+            for &w in &b_words {
+                hash_u32(&mut hasher, w)?;
+            }
+
+            if target == "token_embd.weight" {
+                let a_values: Vec<f32> = a_words.into_iter().map(f32::from_bits).collect();
+                if a_values.len() != geometry.vocabulary || b_words.len() != geometry.embedding {
+                    return Err(Error::InvalidInput(
+                        "rank-one embedding adapter shape mismatch".to_owned(),
+                    ));
+                }
+                let b_span = upload_arena_words(&b_words, guard)?;
+                uploaded.rank_one_embed = Some(GpuRankOneEmbed {
+                    a_values,
+                    b_span,
+                    alpha,
+                });
+            } else {
+                let a_span = upload_arena_words(&a_words, guard)?;
+                let b_span = upload_arena_words(&b_words, guard)?;
+                uploaded.rank_one_linear.insert(
+                    target.to_owned(),
+                    GpuLoraFactor {
+                        a_span,
+                        b_span,
+                        in_features: *in_features,
+                        out_features: *out_features,
+                        rank: 1,
+                        scaling: alpha,
+                    },
+                );
+                uploaded.max_rank = uploaded.max_rank.max(1);
+            }
+        }
+        uploaded.rank_one_scale = Some(spec.scale);
+    } else {
+        hash_bytes(&mut hasher, b"r1-none")?;
+    }
+
+    if let Some(spec) = adapters.multi_rank {
+        MultiRankAdapter::validate_scale(spec.scale)
+            .map_err(|err| Error::InvalidInput(err.to_string()))?;
+        let mr_scale = MultiRankAdapter::normalize_scale(spec.scale);
+        let validated = MultiRankAdapter::from_model(base_model, spec.adapter, spec.policy)
+            .map_err(|err| Error::InvalidInput(err.to_string()))?;
+        let alpha = validated.alpha();
+        let policy_tag = match spec.policy {
+            MultiRankPolicy::NpuFriendly => "npu-friendly",
+            MultiRankPolicy::AnyLinear => "any-linear",
+        };
+        hash_str(&mut hasher, b"mr-id:", validated.identity())?;
+        hash_str(&mut hasher, b"mr-pol:", policy_tag)?;
+        hash_u32(&mut hasher, alpha.to_bits())?;
+        hash_usize(&mut hasher, validated.target_count())?;
+
+        for target in validated.targets() {
+            if !is_live_multi_rank_target(target, recurrent_flags) {
+                return Err(Error::InvalidInput(
+                    "multi-rank adapter target is outside the supported live GPU graph".to_owned(),
+                ));
+            }
+            let a_tensor = spec
+                .adapter
+                .tensors
+                .get(&format!("{target}.lora_a"))
+                .ok_or_else(|| Error::InvalidInput("multi-rank lora_a missing".to_owned()))?;
+            let b_tensor = spec
+                .adapter
+                .tensors
+                .get(&format!("{target}.lora_b"))
+                .ok_or_else(|| Error::InvalidInput("multi-rank lora_b missing".to_owned()))?;
+            let [in_features, rank] = a_tensor.dimensions.as_slice() else {
+                return Err(Error::InvalidInput(
+                    "multi-rank lora_a must be rank 2".to_owned(),
+                ));
+            };
+            let [b_rank, out_features] = b_tensor.dimensions.as_slice() else {
+                return Err(Error::InvalidInput(
+                    "multi-rank lora_b must be rank 2".to_owned(),
+                ));
+            };
+            if *b_rank != *rank {
+                return Err(Error::InvalidInput(
+                    "multi-rank lora_a/lora_b rank mismatch".to_owned(),
+                ));
+            }
+            let rank_u16 = u16::try_from(*rank).map_err(|_| {
+                Error::ResourceLimit("multi-rank adapter rank exceeds u16".to_owned())
+            })?;
+            let scaling = alpha / f32::from(rank_u16);
+            let a_words = decode_lora_words(a_tensor)?;
+            let b_words = decode_lora_words(b_tensor)?;
+            hash_str(&mut hasher, b"mr-tgt:", target)?;
+            hash_usize(&mut hasher, *in_features)?;
+            hash_usize(&mut hasher, *out_features)?;
+            hash_usize(&mut hasher, *rank)?;
+            hash_u32(&mut hasher, a_tensor.kind)?;
+            for &w in &a_words {
+                hash_u32(&mut hasher, w)?;
+            }
+            for &w in &b_words {
+                hash_u32(&mut hasher, w)?;
+            }
+            let a_span = upload_arena_words(&a_words, guard)?;
+            let b_span = upload_arena_words(&b_words, guard)?;
+            uploaded.multi_rank_linear.insert(
+                target.to_owned(),
+                GpuLoraFactor {
+                    a_span,
+                    b_span,
+                    in_features: *in_features,
+                    out_features: *out_features,
+                    rank: *rank,
+                    scaling,
+                },
+            );
+            uploaded.max_rank = uploaded.max_rank.max(*rank);
+        }
+        uploaded.multi_rank_scale = Some(mr_scale);
+    } else {
+        hash_bytes(&mut hasher, b"mr-none")?;
+    }
+
+    let digest = hasher
+        .finish()
+        .map_err(|err| Error::InvalidInput(err.to_string()))?;
+    uploaded.content_sha256 = hex::encode(digest);
+    Ok(uploaded)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Shares reusable host repack and row scratch buffers across all layer matrix uploads."
@@ -2915,17 +3863,26 @@ fn upload_matrix_by_name(
     cols: usize,
     rows: usize,
     transforms: &GraphTransforms,
+    adapters: &UploadedAdapters,
     repack_scratch: &mut Vec<u32>,
     row_scratch: &mut Vec<f32>,
     guard: &mut BufferCleanupGuard<'_>,
 ) -> Result<GpuMatrixWeight, Error> {
     let tensor = lookup_tensor(model, name, &[cols, rows])?;
-    upload_matrix_tensor(&tensor, transforms, repack_scratch, row_scratch, guard)
+    upload_matrix_tensor(
+        &tensor,
+        transforms,
+        adapters,
+        repack_scratch,
+        row_scratch,
+        guard,
+    )
 }
 
 fn upload_matrix_tensor(
     tensor: &Tensor,
     transforms: &GraphTransforms,
+    adapters: &UploadedAdapters,
     repack_scratch: &mut Vec<u32>,
     row_scratch: &mut Vec<f32>,
     guard: &mut BufferCleanupGuard<'_>,
@@ -2981,6 +3938,16 @@ fn upload_matrix_tensor(
     guard
         .device
         .write_buffer_u32_at(span.buffer, span.offset, repack_scratch)?;
+    let rank_one = adapters
+        .rank_one_linear
+        .get(&tensor.name)
+        .copied()
+        .filter(|lora| lora.in_features == cols && lora.out_features == rows);
+    let multi_rank = adapters
+        .multi_rank_linear
+        .get(&tensor.name)
+        .copied()
+        .filter(|lora| lora.in_features == cols && lora.out_features == rows);
     Ok(GpuMatrixWeight {
         span,
         encoding,
@@ -2988,10 +3955,13 @@ fn upload_matrix_tensor(
         rows,
         rotated,
         grouped_ssm,
+        rank_one,
+        multi_rank,
     })
 }
 
 #[expect(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "Uploads all tensors and initial zeroed GPU state buffers for one recurrent GDN layer."
 )]
@@ -3000,6 +3970,7 @@ fn upload_recurrent_attention(
     prefix: &str,
     geometry: &GraphGeometry,
     transforms: &GraphTransforms,
+    adapters: &UploadedAdapters,
     repack_scratch: &mut Vec<u32>,
     row_scratch: &mut Vec<f32>,
     guard: &mut BufferCleanupGuard<'_>,
@@ -3011,6 +3982,7 @@ fn upload_recurrent_attention(
         geometry.embedding,
         channels,
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3021,6 +3993,7 @@ fn upload_recurrent_attention(
         geometry.embedding,
         geometry.value_width(),
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3031,6 +4004,7 @@ fn upload_recurrent_attention(
         geometry.embedding,
         geometry.ssm_values,
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3041,6 +4015,7 @@ fn upload_recurrent_attention(
         geometry.embedding,
         geometry.ssm_values,
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3090,6 +4065,7 @@ fn upload_recurrent_attention(
         geometry.value_width(),
         geometry.embedding,
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3139,6 +4115,7 @@ fn upload_full_attention(
     geometry: &GraphGeometry,
     kv_precision: VulkanKvPrecision,
     transforms: &GraphTransforms,
+    adapters: &UploadedAdapters,
     repack_scratch: &mut Vec<u32>,
     row_scratch: &mut Vec<f32>,
     guard: &mut BufferCleanupGuard<'_>,
@@ -3149,6 +4126,7 @@ fn upload_full_attention(
         geometry.embedding,
         geometry.head * geometry.heads * 2,
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3159,6 +4137,7 @@ fn upload_full_attention(
         geometry.embedding,
         geometry.kv_width(),
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3169,6 +4148,7 @@ fn upload_full_attention(
         geometry.embedding,
         geometry.kv_width(),
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3179,6 +4159,7 @@ fn upload_full_attention(
         geometry.q_width(),
         geometry.embedding,
         transforms,
+        adapters,
         repack_scratch,
         row_scratch,
         guard,
@@ -3224,12 +4205,9 @@ fn upload_full_attention(
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Computes exact scratch sizes, checks total against scratch_budget_bytes and maxStorageBufferRange, and allocates reusable buffers."
-)]
 fn allocate_scratch(
     geometry: &GraphGeometry,
+    max_adapter_rank: usize,
     scratch_budget_bytes: u64,
     max_storage_range: u32,
     guard: &mut BufferCleanupGuard<'_>,
@@ -3265,11 +4243,7 @@ fn allocate_scratch(
     let act_q8_0_words = max_proj_in.div_ceil(32) * Q8_0_WORDS_PER_BLOCK;
     let act_q8_0_bytes = u32_slice_bytes(act_q8_0_words)?.max(MIN_SCRATCH_BYTES);
 
-    let kv_unpack_elems = geometry
-        .context_limit
-        .checked_mul(geometry.kv_width())
-        .ok_or_else(|| Error::ResourceLimit("KV unpack buffer overflow".to_owned()))?;
-    let kv_unpack_bytes = f32_slice_bytes(kv_unpack_elems)?.max(MIN_SCRATCH_BYTES);
+    let lora_ranks_bytes = f32_slice_bytes(max_adapter_rank.max(1))?.max(MIN_SCRATCH_BYTES);
     let score_elems = geometry
         .context_limit
         .checked_mul(geometry.heads)
@@ -3297,8 +4271,7 @@ fn allocate_scratch(
         key_scratch_bytes,
         val_scratch_bytes,
         rope_bytes,
-        kv_unpack_bytes,
-        kv_unpack_bytes,
+        lora_ranks_bytes,
         score_bytes,
         score_bytes,
         logits_bytes,
@@ -3336,12 +4309,11 @@ fn allocate_scratch(
         gdn_k: guard.alloc_storage(sizes[13])?,
         gdn_v: guard.alloc_storage(sizes[14])?,
         rope_freqs: guard.alloc_storage(sizes[15])?,
-        k_unpacked: guard.alloc_storage(sizes[16])?,
-        v_unpacked: guard.alloc_storage(sizes[17])?,
-        attn_scores: guard.alloc_storage(sizes[18])?,
-        attn_probs: guard.alloc_storage(sizes[19])?,
-        logits: guard.alloc_storage(sizes[20])?,
-        dummy_state: guard.alloc_storage(sizes[21])?,
+        lora_ranks: guard.alloc_storage(sizes[16])?,
+        attn_scores: guard.alloc_storage(sizes[17])?,
+        attn_probs: guard.alloc_storage(sizes[18])?,
+        logits: guard.alloc_storage(sizes[19])?,
+        dummy_state: guard.alloc_storage(sizes[20])?,
     })
 }
 
@@ -3361,23 +4333,12 @@ fn fill_rope_frequencies(
             .map_err(|_| Error::ResourceLimit("rope_dim exceeds u32".to_owned()))?,
     );
     let base_f64 = f64::from(geometry.rope_base);
-    let [s0, s1, s2, _] = geometry.rope_sections;
     for pair in 0..half {
-        let axis_idx = if mrope_positions[0] == mrope_positions[1]
-            && mrope_positions[1] == mrope_positions[2]
-        {
-            0
+        let sector = pair % 3;
+        let axis_idx = if pair < 3 * geometry.rope_sections[sector] {
+            sector
         } else {
-            let p3 = pair / 3;
-            let rem = pair % 3;
-            match rem {
-                1 if p3 < s1 => 1,
-                2 if p3 < s2 => 2,
-                _ => {
-                    let _ = s0;
-                    0
-                }
-            }
+            3
         };
         let pos_u32 = u32::try_from(mrope_positions[axis_idx])
             .map_err(|_| Error::ResourceLimit("mrope position exceeds u32".to_owned()))?;
@@ -3395,9 +4356,9 @@ fn fill_rope_frequencies(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Binds all static provenance inputs (device, model, chunk policy, kernel path, shaders) into one SHA-256."
+    reason = "Binds all static provenance inputs (device, model, chunk policy, kernel path, shaders, adapters) into one SHA-256."
 )]
-fn compute_executor_identity(
+fn compute_base_provenance(
     device: &AdrenoVulkanDevice,
     model: &Model,
     config: &VulkanBatchedConfig,
@@ -3406,9 +4367,10 @@ fn compute_executor_identity(
     kernel_path: ProjectionKernelPath,
     layer_count: usize,
     pipelines: &VulkanLayerPipelines,
+    adapter_content_sha256: &str,
 ) -> Result<String, Error> {
     let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-    hash_str(&mut hasher, b"vk-batched-graph-v1:", &model.identity)?;
+    hash_str(&mut hasher, b"vk-batched-graph-v2:", &model.identity)?;
     hash_str(&mut hasher, b"dev:", &device.capabilities().identity_sha256)?;
     hash_str(&mut hasher, b"shaders:", pipelines.shader_digests_sha256())?;
     hash_str(&mut hasher, b"path:", kernel_path.as_tag())?;
@@ -3425,6 +4387,7 @@ fn compute_executor_identity(
     hash_usize(&mut hasher, layer_count)?;
     hash_u32(&mut hasher, u32::from(resolved_pinned_arithmetic))?;
     hash_u64(&mut hasher, config.scratch_budget_bytes)?;
+    hash_str(&mut hasher, b"adapters:", adapter_content_sha256)?;
 
     // Also include sample attention cache key to tie planner geometry/limits cleanly.
     let sample_desc = AttentionDescriptor {
@@ -3443,17 +4406,60 @@ fn compute_executor_identity(
         config.attention_strategy,
         config.scratch_budget_bytes,
     )?;
+    let (qk_digest, pv_digest, fused_digest) = match config.kv_precision {
+        VulkanKvPrecision::Fp16 => (
+            &pipelines.attn_qk_f16kv_digest,
+            &pipelines.attn_pv_f16kv_digest,
+            &pipelines.attn_fused_f16kv_digest,
+        ),
+        VulkanKvPrecision::Fp32 => (
+            &pipelines.attn_qk_digest,
+            &pipelines.attn_pv_digest,
+            &pipelines.attn_fused_digest,
+        ),
+    };
     let sample_key = attention_cache_key(
         &sample_desc,
         &sample_plan,
         device.capabilities(),
-        &pipelines.attn_qk_digest,
+        qk_digest,
         &pipelines.attn_softmax_digest,
-        &pipelines.attn_pv_digest,
-        &pipelines.attn_fused_digest,
+        pv_digest,
+        fused_digest,
     )?;
     hash_str(&mut hasher, b"attn_sample:", &sample_key)?;
 
+    let digest = hasher
+        .finish()
+        .map_err(|err| Error::InvalidInput(err.to_string()))?;
+    Ok(hex::encode(digest))
+}
+
+fn compute_executor_identity(
+    base_provenance_sha256: &str,
+    rank_one_scale: Option<f32>,
+    multi_rank_scale: Option<f32>,
+) -> Result<String, Error> {
+    let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
+    hash_str(
+        &mut hasher,
+        b"vk-batched-exec-id-v1:",
+        base_provenance_sha256,
+    )?;
+    match rank_one_scale {
+        Some(scale) => {
+            hash_bytes(&mut hasher, &[1])?;
+            hash_u32(&mut hasher, scale.to_bits())?;
+        }
+        None => hash_bytes(&mut hasher, &[0])?,
+    }
+    match multi_rank_scale {
+        Some(scale) => {
+            hash_bytes(&mut hasher, &[1])?;
+            hash_u32(&mut hasher, scale.to_bits())?;
+        }
+        None => hash_bytes(&mut hasher, &[0])?,
+    }
     let digest = hasher
         .finish()
         .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -3565,8 +4571,9 @@ mod tests {
 
     #[test]
     fn batched_checkpoint_identity_is_deterministic_and_sensitive_to_state() -> Result<(), Error> {
-        let make = |pos: usize, val: f32| VulkanBatchedCheckpoint {
+        let make = |pos: usize, val: f32, nonce: u64| VulkanBatchedCheckpoint {
             executor_identity_sha256: "exec-abc".to_owned(),
+            provenance_nonce: nonce,
             position: pos,
             mrope_positions: [pos, pos, pos, 0],
             layers: vec![
@@ -3582,13 +4589,35 @@ mod tests {
                 },
             ],
         };
-        let a = make(1, 0.25);
-        let b = make(1, 0.25);
-        let c = make(2, 0.25);
-        let d = make(1, 0.50);
-        assert_eq!(a.identity_sha256()?, b.identity_sha256()?);
-        assert_ne!(a.identity_sha256()?, c.identity_sha256()?);
-        assert_ne!(a.identity_sha256()?, d.identity_sha256()?);
+        let snap_base = make(1, 0.25, 0);
+        let snap_repeat = make(1, 0.25, 0);
+        let snap_pos2 = make(2, 0.25, 0);
+        let snap_val_half = make(1, 0.50, 0);
+        let snap_layer_one = make(1, 0.25, 1);
+        assert_eq!(snap_base.identity_sha256()?, snap_repeat.identity_sha256()?);
+        assert_ne!(snap_base.identity_sha256()?, snap_pos2.identity_sha256()?);
+        assert_ne!(
+            snap_base.identity_sha256()?,
+            snap_val_half.identity_sha256()?
+        );
+        assert_ne!(
+            snap_base.identity_sha256()?,
+            snap_layer_one.identity_sha256()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn executor_identity_changes_with_adapter_scales() -> Result<(), Error> {
+        let base = "base-prov-123";
+        let id_none = compute_executor_identity(base, None, None)?;
+        let id_r1_1 = compute_executor_identity(base, Some(1.0), None)?;
+        let id_r1_0 = compute_executor_identity(base, Some(0.0), None)?;
+        let id_r1_mr = compute_executor_identity(base, Some(1.0), Some(0.5))?;
+        assert_ne!(id_none, id_r1_1);
+        assert_ne!(id_r1_1, id_r1_0);
+        assert_ne!(id_r1_1, id_r1_mr);
+        assert_eq!(id_r1_1, compute_executor_identity(base, Some(1.0), None)?);
         Ok(())
     }
 }

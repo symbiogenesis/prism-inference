@@ -337,6 +337,92 @@ fn hybrid_model_with_identity(cfg: &HybridConfig, arithmetic: Arithmetic) -> Mod
     model
 }
 
+fn build_folded_test_adapters(
+    model: &Model,
+    cfg: &HybridConfig,
+) -> Result<(RankOneAdapter, MultiRankAdapter)> {
+    let mut rank_one_tensors = BTreeMap::new();
+    let target_r1 = "blk.0.ffn_down.weight";
+    rank_one_tensors.insert(
+        format!("{target_r1}.lora_a"),
+        f32_tensor(
+            &format!("{target_r1}.lora_a"),
+            &[cfg.ffn, 1],
+            &pattern(cfg.ffn, 21, 0.125),
+        ),
+    );
+    rank_one_tensors.insert(
+        format!("{target_r1}.lora_b"),
+        f32_tensor(
+            &format!("{target_r1}.lora_b"),
+            &[1, cfg.embedding],
+            &pattern(cfg.embedding, 22, 0.125),
+        ),
+    );
+    let r1_model = Model {
+        metadata: BTreeMap::from([
+            (
+                "general.architecture".to_owned(),
+                MetadataValue::from("qwen35"),
+            ),
+            ("general.type".to_owned(), MetadataValue::from("adapter")),
+            ("adapter.type".to_owned(), MetadataValue::from("lora")),
+            (
+                "adapter.lora_alpha".to_owned(),
+                MetadataValue::from(1.0_f32),
+            ),
+        ]),
+        tensors: rank_one_tensors,
+        identity: "r1-folded-test".to_owned(),
+    };
+    let r1 = RankOneAdapter::from_model(r1_model, model)?;
+
+    let mut mr_tensors = BTreeMap::new();
+    let val_w = cfg.ssm_values * cfg.ssm_head;
+    let conv_w = 2 * cfg.ssm_keys * cfg.ssm_head + val_w;
+    let q_gate_w = cfg.heads * cfg.head * 2;
+    for (target, in_f, out_f, seed) in [
+        ("blk.0.attn_qkv.weight", cfg.embedding, conv_w, 31),
+        ("blk.1.attn_q.weight", cfg.embedding, q_gate_w, 32),
+    ] {
+        let rank = 2;
+        mr_tensors.insert(
+            format!("{target}.lora_a"),
+            f32_tensor(
+                &format!("{target}.lora_a"),
+                &[in_f, rank],
+                &pattern(in_f * rank, seed, 0.125),
+            ),
+        );
+        mr_tensors.insert(
+            format!("{target}.lora_b"),
+            f32_tensor(
+                &format!("{target}.lora_b"),
+                &[rank, out_f],
+                &pattern(rank * out_f, seed + 5, 0.125),
+            ),
+        );
+    }
+    let mr_model = Model {
+        metadata: BTreeMap::from([
+            (
+                "general.architecture".to_owned(),
+                MetadataValue::from("qwen35"),
+            ),
+            ("general.type".to_owned(), MetadataValue::from("adapter")),
+            ("adapter.type".to_owned(), MetadataValue::from("lora")),
+            (
+                "adapter.lora_alpha".to_owned(),
+                MetadataValue::from(2.0_f32),
+            ),
+        ]),
+        tensors: mr_tensors,
+        identity: "mr-folded-test".to_owned(),
+    };
+    let mr = MultiRankAdapter::from_model(model, &mr_model, MultiRankPolicy::AnyLinear)?;
+    Ok((r1, mr))
+}
+
 fn configure_folded(
     model: Model,
     cfg: &HybridConfig,
@@ -346,85 +432,7 @@ fn configure_folded(
     with_stacked_adapters: bool,
 ) -> Result<Qwen35> {
     let mut decoder = if with_stacked_adapters {
-        let mut rank_one_tensors = BTreeMap::new();
-        let target_r1 = "blk.0.ffn_down.weight";
-        rank_one_tensors.insert(
-            format!("{target_r1}.lora_a"),
-            f32_tensor(
-                &format!("{target_r1}.lora_a"),
-                &[cfg.ffn, 1],
-                &pattern(cfg.ffn, 21, 0.125),
-            ),
-        );
-        rank_one_tensors.insert(
-            format!("{target_r1}.lora_b"),
-            f32_tensor(
-                &format!("{target_r1}.lora_b"),
-                &[1, cfg.embedding],
-                &pattern(cfg.embedding, 22, 0.125),
-            ),
-        );
-        let r1_model = Model {
-            metadata: BTreeMap::from([
-                (
-                    "general.architecture".to_owned(),
-                    MetadataValue::from("qwen35"),
-                ),
-                ("general.type".to_owned(), MetadataValue::from("adapter")),
-                ("adapter.type".to_owned(), MetadataValue::from("lora")),
-                (
-                    "adapter.lora_alpha".to_owned(),
-                    MetadataValue::from(1.0_f32),
-                ),
-            ]),
-            tensors: rank_one_tensors,
-            identity: "r1-folded-test".to_owned(),
-        };
-        let r1 = RankOneAdapter::from_model(r1_model, &model)?;
-
-        let mut mr_tensors = BTreeMap::new();
-        let val_w = cfg.ssm_values * cfg.ssm_head;
-        let conv_w = 2 * cfg.ssm_keys * cfg.ssm_head + val_w;
-        let q_gate_w = cfg.heads * cfg.head * 2;
-        for (target, in_f, out_f, seed) in [
-            ("blk.0.attn_qkv.weight", cfg.embedding, conv_w, 31),
-            ("blk.1.attn_q.weight", cfg.embedding, q_gate_w, 32),
-        ] {
-            let rank = 2;
-            mr_tensors.insert(
-                format!("{target}.lora_a"),
-                f32_tensor(
-                    &format!("{target}.lora_a"),
-                    &[in_f, rank],
-                    &pattern(in_f * rank, seed, 0.125),
-                ),
-            );
-            mr_tensors.insert(
-                format!("{target}.lora_b"),
-                f32_tensor(
-                    &format!("{target}.lora_b"),
-                    &[rank, out_f],
-                    &pattern(rank * out_f, seed + 5, 0.125),
-                ),
-            );
-        }
-        let mr_model = Model {
-            metadata: BTreeMap::from([
-                (
-                    "general.architecture".to_owned(),
-                    MetadataValue::from("qwen35"),
-                ),
-                ("general.type".to_owned(), MetadataValue::from("adapter")),
-                ("adapter.type".to_owned(), MetadataValue::from("lora")),
-                (
-                    "adapter.lora_alpha".to_owned(),
-                    MetadataValue::from(2.0_f32),
-                ),
-            ]),
-            tensors: mr_tensors,
-            identity: "mr-folded-test".to_owned(),
-        };
-        let mr = MultiRankAdapter::from_model(&model, &mr_model, MultiRankPolicy::AnyLinear)?;
+        let (r1, mr) = build_folded_test_adapters(&model, cfg)?;
         Qwen35::with_adapters_and_kv(
             model,
             cfg.context,

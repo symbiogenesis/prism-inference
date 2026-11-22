@@ -1798,12 +1798,54 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
     decoded_blocks: &mut u64,
 ) -> Option<crate::Result<[[f32; TOKENS]; 8]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let use_ptq1_dotprod = is_ptq1 && bonsai_neon_dot::has_dotprod();
     let mut sums = [[0.0_f32; TOKENS]; 8];
-    let mut lanes = [[f32x4::splat(neon, 0.0); TOKENS]; 8];
     let block_bytes = if is_ptq1 { 28 } else { 34 };
-    let scale_offset = if is_ptq1 { 26 } else { 0 };
     let block_count = rows[0].len() / block_bytes;
+    if is_ptq1
+        && !preparations.is_empty()
+        && preparations.len() <= TOKENS
+        && block_count != 0
+        && rows.iter().all(|row| row.len() == block_count * 28)
+        && preparations
+            .iter()
+            .all(|scratch| scratch.q8.len() >= block_count * 4)
+        && let Some(dotprod) = bonsai_neon_dot::Ptq1Dotprod::detect()
+    {
+        let q8_len = block_count * 4;
+        for (chunk_idx, chunk) in preparations.chunks(8).enumerate() {
+            let mut tok_refs: [&[crate::kernels::Q8Block]; 8] = [&[]; 8];
+            for (t, scratch) in chunk.iter().enumerate() {
+                tok_refs[t] = &scratch.q8[..q8_len];
+            }
+            let mut out_chunk = [[0.0_f32; 8]; 8];
+            let result = if pinned {
+                dotprod.dot_scaled_8x_tokens_view::<true, _>(
+                    rows,
+                    &tok_refs[..chunk.len()],
+                    &mut out_chunk,
+                )
+            } else {
+                dotprod.dot_scaled_8x_tokens_view::<false, _>(
+                    rows,
+                    &tok_refs[..chunk.len()],
+                    &mut out_chunk,
+                )
+            };
+            let Some(()) = result else {
+                return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+            };
+            let base = chunk_idx * 8;
+            for r in 0..8 {
+                sums[r][base..base + chunk.len()].copy_from_slice(&out_chunk[r][..chunk.len()]);
+            }
+        }
+        let block_count_u64 = u64::try_from(block_count).ok()?;
+        *decoded_blocks = decoded_blocks.saturating_add(block_count_u64.saturating_mul(8));
+        return Some(Ok(sums));
+    }
+    let use_ptq1_dotprod = is_ptq1 && bonsai_neon_dot::has_dotprod();
+    let mut lanes = [[f32x4::splat(neon, 0.0); TOKENS]; 8];
+    let scale_offset = if is_ptq1 { 26 } else { 0 };
     for index in 0..block_count {
         let start_byte = index * block_bytes;
         let end_byte = start_byte + block_bytes;
@@ -2319,7 +2361,7 @@ mod tests {
 
     use crate::Result;
     use crate::kernels::prefill::MAX_TILE_TOKENS;
-    use crate::kernels::{MatvecBackend, MatvecScratch, PQ2, matvec_into, quantize_row};
+    use crate::kernels::{MatvecBackend, MatvecScratch, PQ2, PTQ1, matvec_into, quantize_row};
     use crate::model::Tensor;
 
     fn build_pq2_test_fixture(
@@ -2458,6 +2500,151 @@ mod tests {
             .ok_or_else(|| crate::invalid("missing neon prefill 8-row kernel"))?;
             assert!(res.is_err());
         }
+        Ok(())
+    }
+
+    fn sample_ptq1_eight_row_tensor(
+        columns: usize,
+        max_tokens: usize,
+    ) -> Result<(Tensor, Vec<Vec<f32>>)> {
+        let block_count = columns / 128;
+        let row_bytes = block_count * 28;
+        let mut data = Vec::with_capacity(8 * row_bytes);
+        for row in 0..8_usize {
+            let values: Vec<f32> = (0..columns)
+                .map(|col| {
+                    [
+                        0.0_f32,
+                        -0.0,
+                        f32::from_bits(1),
+                        -f32::from_bits(1),
+                        1.25,
+                        -2.5,
+                        0.375,
+                        -0.0625,
+                    ][(col * 3 + row * 5) % 8]
+                })
+                .collect();
+            let mut encoded = quantize_row(PTQ1, &values)?;
+            if row == 0 {
+                encoded[26..28].copy_from_slice(&0x8000_u16.to_le_bytes());
+            } else if row == 1 {
+                encoded[28 + 26..28 + 28].copy_from_slice(&0x0001_u16.to_le_bytes());
+            } else if row == 2 {
+                encoded[56 + 26..56 + 28].copy_from_slice(&0x8001_u16.to_le_bytes());
+            }
+            data.extend_from_slice(&encoded);
+        }
+        let tensor = Tensor {
+            name: "prefill-ptq1-8x-tokens".into(),
+            dimensions: vec![columns, 8],
+            kind: PTQ1,
+            data: Arc::<[u8]>::from(data).into(),
+        };
+        let inputs: Vec<Vec<f32>> = (0..max_tokens)
+            .map(|tok| {
+                (0..columns)
+                    .map(|col| {
+                        [
+                            0.0_f32,
+                            -0.0,
+                            f32::from_bits(1),
+                            -128.0,
+                            127.0,
+                            63.5,
+                            -31.25,
+                            0.5,
+                        ][(col + tok * 7) % 8]
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok((tensor, inputs))
+    }
+
+    fn verify_ptq1_eight_rows_mode(
+        tensor: &Tensor,
+        row_refs: [&[u8]; 8],
+        inputs: &[Vec<f32>],
+        block_count: usize,
+        pinned: bool,
+    ) -> Result<()> {
+        let mut scalar_outputs: Vec<Vec<u32>> = Vec::with_capacity(inputs.len());
+        let mut preps: Vec<MatvecScratch> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let mut scalar_scratch = if pinned {
+                MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+            } else {
+                MatvecScratch::with_backend(MatvecBackend::Scalar)
+            };
+            let mut out = Vec::new();
+            matvec_into(tensor, input, &mut out, &mut scalar_scratch)?;
+            scalar_outputs.push(out.into_iter().map(f32::to_bits).collect());
+
+            let mut neon_scratch = if pinned {
+                MatvecScratch::with_pinned_backend(MatvecBackend::ExperimentalNeon)
+            } else {
+                MatvecScratch::with_backend(MatvecBackend::ExperimentalNeon)
+            };
+            let _ = neon_scratch.prepare(tensor, input)?;
+            preps.push(neon_scratch);
+        }
+
+        for count in [1_usize, 2, 3, 4, 5, 7, 8, 9, 16] {
+            let mut decoded = 0_u64;
+            let actual = super::dot_q8_eight_rows::<MAX_TILE_TOKENS>(
+                row_refs,
+                &preps[..count],
+                true,
+                pinned,
+                &mut decoded,
+            )
+            .ok_or_else(|| crate::invalid("missing neon prefill ptq1 8-row kernel"))??;
+            assert_eq!(decoded, u64::try_from(block_count * 8)?);
+            for (row, out_row) in actual.iter().enumerate() {
+                let got: Vec<u32> = out_row[..count].iter().copied().map(f32::to_bits).collect();
+                let expected: Vec<u32> =
+                    scalar_outputs[..count].iter().map(|tok| tok[row]).collect();
+                assert_eq!(
+                    got, expected,
+                    "ptq1 count={count} pinned={pinned} row={row}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_ptq1_eight_rows_full_k_matches_scalar_bits() -> Result<()> {
+        let columns = 384_usize;
+        let block_count = columns / 128;
+        let row_bytes = block_count * 28;
+        let (tensor, inputs) = sample_ptq1_eight_row_tensor(columns, 16)?;
+        let row_refs: [&[u8]; 8] =
+            std::array::from_fn(|r| &tensor.data[r * row_bytes..(r + 1) * row_bytes]);
+        for pinned in [false, true] {
+            verify_ptq1_eight_rows_mode(&tensor, row_refs, &inputs, block_count, pinned)?;
+        }
+
+        let mut bad_data = tensor.data.to_vec();
+        bad_data[6 * row_bytes + 2 * 28 + 26..6 * row_bytes + 2 * 28 + 28]
+            .copy_from_slice(&0x7e00_u16.to_le_bytes());
+        let bad_rows: [&[u8]; 8] =
+            std::array::from_fn(|r| &bad_data[r * row_bytes..(r + 1) * row_bytes]);
+        let mut bad_prep = MatvecScratch::with_pinned_backend(MatvecBackend::ExperimentalNeon);
+        let _ = bad_prep.prepare(&tensor, &inputs[0])?;
+        let mut decoded = 0_u64;
+        assert!(
+            super::dot_q8_eight_rows::<MAX_TILE_TOKENS>(
+                bad_rows,
+                &[bad_prep],
+                true,
+                true,
+                &mut decoded,
+            )
+            .ok_or_else(|| crate::invalid("missing neon prefill ptq1 8-row kernel"))?
+            .is_err()
+        );
         Ok(())
     }
 }

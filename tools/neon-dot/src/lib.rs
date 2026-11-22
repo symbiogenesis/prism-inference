@@ -10,7 +10,7 @@
 #![deny(unsafe_code)]
 
 mod scaled;
-pub use scaled::Pq2Activation;
+pub use scaled::{Pq2Activation, Q8ActivationBlock, Q8ActivationView};
 
 pub use bonsai_ternary::{
     checked_float_to_half, float_to_half, half_to_float, unpack_q4_k_scale_min,
@@ -385,6 +385,118 @@ impl Pq2Dotprod {
         {
             let _ = self;
             scaled::portable_scaled_8x_tokens::<FUSED>(rows, tokens, out)
+        }
+    }
+}
+
+/// Detected `SDOT` support and optional `I8MM` selection reusable across `PTQ1_0` blocks.
+///
+/// Construction checks CPU/OS eligibility once. Private fields prevent safe
+/// callers from creating a capability without that check.
+#[derive(Clone, Copy, Debug)]
+pub struct Ptq1Dotprod {
+    _detected: (),
+    #[cfg(target_arch = "aarch64")]
+    i8mm: bool,
+}
+
+impl Ptq1Dotprod {
+    /// Detects `PTQ1_0` `SDOT` and optional `I8MM` capability once.
+    #[inline]
+    #[must_use]
+    pub fn detect() -> Option<Self> {
+        let detected = has_dotprod();
+        #[cfg(target_arch = "aarch64")]
+        let i8mm = detected && has_i8mm();
+        detected.then_some(Self {
+            _detected: (),
+            #[cfg(target_arch = "aarch64")]
+            i8mm,
+        })
+    }
+
+    /// Consumes `1`, `4`, `8`, or `16` complete 28-byte `PTQ1_0` rows inside one
+    /// full-K invocation using [`Q8ActivationBlock`] slices.
+    ///
+    /// Preserves exact `0 ULP` parity for both `PINNED = true` (4-lane FMA
+    /// reduction) and `PINNED = false` (`SOURCE` non-FMA group reduction).
+    /// Returns `None` for unsupported geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows<const ROWS: usize, const PINNED: bool>(
+        self,
+        rows: [&[u8]; ROWS],
+        activation: &[Q8ActivationBlock],
+    ) -> Option<[f32; ROWS]> {
+        self.dot_scaled_rows_view::<ROWS, PINNED, Q8ActivationBlock>(rows, activation)
+    }
+
+    /// Consumes `1`, `4`, `8`, or `16` complete 28-byte `PTQ1_0` rows inside one
+    /// full-K invocation over any [`Q8ActivationView`] slice.
+    ///
+    /// Preserves exact `0 ULP` parity for both `PINNED = true` and `PINNED = false`.
+    /// Returns `None` for unsupported geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows_view<const ROWS: usize, const PINNED: bool, A: Q8ActivationView>(
+        self,
+        rows: [&[u8]; ROWS],
+        activation: &[A],
+    ) -> Option<[f32; ROWS]> {
+        if !scaled::valid_ptq1_rows(rows, activation) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::ptq1_detected_dot_scaled_rows::<ROWS, PINNED, A>(self, rows, activation)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            scaled::portable_ptq1_rows_validated::<ROWS, PINNED, A>(rows, activation)
+        }
+    }
+
+    /// Consumes `8` complete 28-byte `PTQ1_0` rows across `1..=8` tokens inside
+    /// one full-K invocation using [`Q8ActivationBlock`] token slices.
+    ///
+    /// Columns `tokens.len()..8` in `out` are zeroed. Returns `None` for empty
+    /// or `> 8` token slices, unsupported geometry, or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x_tokens<const PINNED: bool>(
+        &self,
+        rows: [&[u8]; 8],
+        tokens: &[&[Q8ActivationBlock]],
+        out: &mut [[f32; 8]; 8],
+    ) -> Option<()> {
+        self.dot_scaled_8x_tokens_view::<PINNED, Q8ActivationBlock>(rows, tokens, out)
+    }
+
+    /// Consumes `8` complete 28-byte `PTQ1_0` rows across `1..=8` tokens inside
+    /// one full-K invocation over any [`Q8ActivationView`] token slices.
+    ///
+    /// Columns `tokens.len()..8` in `out` are zeroed. Returns `None` for empty
+    /// or `> 8` token slices, unsupported geometry, or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x_tokens_view<const PINNED: bool, A: Q8ActivationView>(
+        &self,
+        rows: [&[u8]; 8],
+        tokens: &[&[A]],
+        out: &mut [[f32; 8]; 8],
+    ) -> Option<()> {
+        if !scaled::valid_ptq1_8x_tokens(rows, tokens) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::ptq1_detected_dot_scaled_8x_tokens::<PINNED, A>(*self, rows, tokens, out)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            scaled::portable_ptq1_8x_tokens_validated::<PINNED, A>(rows, tokens, out)
         }
     }
 }

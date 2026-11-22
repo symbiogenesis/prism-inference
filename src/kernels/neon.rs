@@ -3477,8 +3477,43 @@ pub(super) fn dot_ptq1_groups(packed: &[u8; 28], activations: [&[i8; 32]; 4]) ->
     }))
 }
 
+impl bonsai_neon_dot::Q8ActivationView for super::Q8Block {
+    #[inline]
+    fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    #[inline]
+    fn values(&self) -> &[i8; 32] {
+        &self.values
+    }
+}
+
+#[inline]
+fn try_dot_ptq1_rows_dotprod<const ROWS: usize, const PINNED: bool>(
+    rows: [&[u8]; ROWS],
+    input: &[super::Q8Block],
+) -> Option<Result<[f32; ROWS]>> {
+    let block_count = rows[0].len() / 28;
+    if block_count == 0
+        || !rows.iter().all(|row| row.len() == block_count * 28)
+        || input.len() < block_count * 4
+    {
+        return None;
+    }
+    let dotprod = bonsai_neon_dot::Ptq1Dotprod::detect()?;
+    Some(
+        dotprod
+            .dot_scaled_rows_view::<ROWS, PINNED, _>(rows, &input[..block_count * 4])
+            .ok_or_else(|| crate::invalid("nonfinite tensor or activation value")),
+    )
+}
+
 #[inline]
 pub(super) fn dot_ptq1_row_pinned(bytes: &[u8], input: &[super::Q8Block]) -> Result<f32> {
+    if let Some(res) = try_dot_ptq1_rows_dotprod::<1, true>([bytes], input) {
+        return res.map(|[v]| v);
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return super::dot_q8_groups_pinned::<false>(super::PTQ1, bytes, input);
     };
@@ -3554,6 +3589,9 @@ pub(super) fn dot_ptq1_four_rows_pinned(
     rows: [&[u8]; 4],
     input: &[super::Q8Block],
 ) -> Result<[f32; 4]> {
+    if let Some(res) = try_dot_ptq1_rows_dotprod::<4, true>(rows, input) {
+        return res;
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return Ok([
             super::dot_q8_groups_pinned::<false>(super::PTQ1, rows[0], input)?,
@@ -3666,6 +3704,9 @@ pub(super) fn dot_ptq1_eight_rows_pinned(
     rows: [&[u8]; 8],
     input: &[super::Q8Block],
 ) -> Result<[f32; 8]> {
+    if let Some(res) = try_dot_ptq1_rows_dotprod::<8, true>(rows, input) {
+        return res;
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let first = dot_ptq1_four_rows_pinned([rows[0], rows[1], rows[2], rows[3]], input)?;
         let second = dot_ptq1_four_rows_pinned([rows[4], rows[5], rows[6], rows[7]], input)?;
@@ -3870,6 +3911,9 @@ fn accumulate_ptq1_block_source_dotprod(
 
 #[inline]
 pub(super) fn dot_ptq1_row_source(bytes: &[u8], input: &[super::Q8Block]) -> Result<f32> {
+    if let Some(res) = try_dot_ptq1_rows_dotprod::<1, false>([bytes], input) {
+        return res.map(|[v]| v);
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return super::dot_q8_groups(super::PTQ1, bytes, input);
     };
@@ -3947,6 +3991,9 @@ pub(super) fn dot_ptq1_four_rows_source(
     rows: [&[u8]; 4],
     input: &[super::Q8Block],
 ) -> Result<[f32; 4]> {
+    if let Some(res) = try_dot_ptq1_rows_dotprod::<4, false>(rows, input) {
+        return res;
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return Ok([
             super::dot_q8_groups(super::PTQ1, rows[0], input)?,
@@ -4054,6 +4101,9 @@ pub(super) fn dot_ptq1_eight_rows_source(
     rows: [&[u8]; 8],
     input: &[super::Q8Block],
 ) -> Result<[f32; 8]> {
+    if let Some(res) = try_dot_ptq1_rows_dotprod::<8, false>(rows, input) {
+        return res;
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let first = dot_ptq1_four_rows_source([rows[0], rows[1], rows[2], rows[3]], input)?;
         let second = dot_ptq1_four_rows_source([rows[4], rows[5], rows[6], rows[7]], input)?;
@@ -4180,6 +4230,9 @@ pub(super) fn dot_ptq1_sixteen_rows_pinned(
     rows: [&[u8]; 16],
     input: &[super::Q8Block],
 ) -> Result<[f32; 16]> {
+    if let Some(res) = try_dot_ptq1_rows_dotprod::<16, true>(rows, input) {
+        return res;
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let lo = dot_ptq1_eight_rows_pinned(
             [
@@ -4312,6 +4365,9 @@ pub(super) fn dot_ptq1_sixteen_rows_source(
     rows: [&[u8]; 16],
     input: &[super::Q8Block],
 ) -> Result<[f32; 16]> {
+    if let Some(res) = try_dot_ptq1_rows_dotprod::<16, false>(rows, input) {
+        return res;
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let lo = dot_ptq1_eight_rows_source(
             [
@@ -7862,6 +7918,142 @@ mod tests {
             assert_eq!(act_source_in_place[i].to_bits(), exp_source[i].to_bits());
             assert_eq!(act_source_into[i].to_bits(), exp_source[i].to_bits());
         }
+        Ok(())
+    }
+
+    fn sample_ptq1_full_k_fixture(
+        block_count: usize,
+    ) -> crate::Result<(Vec<u8>, Vec<super::super::Q8Block>)> {
+        let columns = block_count * 128;
+        let mut data = Vec::with_capacity(16 * block_count * 28);
+        for r in 0..16_usize {
+            let vals: Vec<f32> = (0..columns)
+                .map(|c| [0.0_f32, -0.0, 0.5, -1.25, 2.0, -0.25, 1.5, -3.0][(c * 3 + r * 5) % 8])
+                .collect();
+            let mut row = super::super::quantize_row(super::super::PTQ1, &vals)?;
+            let scale_slot = (r % block_count) * 28 + 26;
+            let f16_override = [0x8000_u16, 0x0001, 0x8001, 0x3c01][r % 4];
+            row[scale_slot..scale_slot + 2].copy_from_slice(&f16_override.to_le_bytes());
+            data.extend_from_slice(&row);
+        }
+        let input: Vec<super::super::Q8Block> = (0..block_count * 4)
+            .map(|g| super::super::Q8Block {
+                scale: [
+                    0.0_f32,
+                    -0.0,
+                    f32::from_bits(1),
+                    -f32::from_bits(1),
+                    0.125,
+                    -0.25,
+                ][g % 6],
+                sum: 0.0,
+                values: std::array::from_fn(|j| {
+                    i8::from_ne_bytes([j.to_le_bytes()[0]
+                        .wrapping_mul(53)
+                        .wrapping_add(g.to_le_bytes()[0].wrapping_mul(19))])
+                }),
+            })
+            .collect();
+        Ok((data, input))
+    }
+
+    fn verify_ptq1_full_k_rows(
+        row_refs: [&[u8]; 16],
+        input: &[super::super::Q8Block],
+        exp_pinned: &[u32],
+        exp_source: &[u32],
+    ) -> TestResult {
+        for r in 0..16 {
+            assert_eq!(
+                super::dot_ptq1_row_pinned(row_refs[r], input)?.to_bits(),
+                exp_pinned[r]
+            );
+            assert_eq!(
+                super::dot_ptq1_row_source(row_refs[r], input)?.to_bits(),
+                exp_source[r]
+            );
+        }
+        assert_eq!(
+            super::dot_ptq1_four_rows_pinned(
+                [row_refs[0], row_refs[1], row_refs[2], row_refs[3]],
+                input
+            )?
+            .map(f32::to_bits),
+            exp_pinned[..4]
+        );
+        assert_eq!(
+            super::dot_ptq1_four_rows_source(
+                [row_refs[0], row_refs[1], row_refs[2], row_refs[3]],
+                input
+            )?
+            .map(f32::to_bits),
+            exp_source[..4]
+        );
+        assert_eq!(
+            super::dot_ptq1_eight_rows_pinned(std::array::from_fn(|r| row_refs[r]), input)?
+                .map(f32::to_bits),
+            exp_pinned[..8]
+        );
+        assert_eq!(
+            super::dot_ptq1_eight_rows_source(std::array::from_fn(|r| row_refs[r]), input)?
+                .map(f32::to_bits),
+            exp_source[..8]
+        );
+        assert_eq!(
+            super::dot_ptq1_sixteen_rows_pinned(row_refs, input)?.map(f32::to_bits),
+            exp_pinned
+        );
+        assert_eq!(
+            super::dot_ptq1_sixteen_rows_source(row_refs, input)?.map(f32::to_bits),
+            exp_source
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simd_neon_ptq1_full_k_rows_match_scalar_bits() -> TestResult {
+        let block_count = 3_usize;
+        let row_bytes = block_count * 28;
+        let (data, input) = sample_ptq1_full_k_fixture(block_count)?;
+        let row_refs: [&[u8]; 16] =
+            std::array::from_fn(|r| &data[r * row_bytes..(r + 1) * row_bytes]);
+        let exp_pinned: Vec<u32> = (0..16)
+            .map(|r| {
+                Ok(super::super::dot_q8_groups_pinned::<false>(
+                    super::super::PTQ1,
+                    row_refs[r],
+                    &input,
+                )?
+                .to_bits())
+            })
+            .collect::<crate::Result<_>>()?;
+        let exp_source: Vec<u32> = (0..16)
+            .map(|r| {
+                Ok(super::super::dot_q8_groups(super::super::PTQ1, row_refs[r], &input)?.to_bits())
+            })
+            .collect::<crate::Result<_>>()?;
+        verify_ptq1_full_k_rows(row_refs, &input, &exp_pinned, &exp_source)?;
+
+        let mut bad_data = data;
+        bad_data[13 * row_bytes + 2 * 28 + 26..13 * row_bytes + 2 * 28 + 28]
+            .copy_from_slice(&0x7e00_u16.to_le_bytes());
+        let bad_refs: [&[u8]; 16] =
+            std::array::from_fn(|r| &bad_data[r * row_bytes..(r + 1) * row_bytes]);
+        assert!(super::dot_ptq1_row_pinned(bad_refs[13], &input).is_err());
+        assert!(super::dot_ptq1_row_source(bad_refs[13], &input).is_err());
+        assert!(
+            super::dot_ptq1_four_rows_pinned(
+                [bad_refs[12], bad_refs[13], bad_refs[14], bad_refs[15]],
+                &input
+            )
+            .is_err()
+        );
+        assert!(
+            super::dot_ptq1_eight_rows_source(std::array::from_fn(|r| bad_refs[8 + r]), &input)
+                .is_err()
+        );
+        assert!(super::dot_ptq1_sixteen_rows_pinned(bad_refs, &input).is_err());
+        assert!(super::dot_ptq1_sixteen_rows_source(bad_refs, &input).is_err());
         Ok(())
     }
 }

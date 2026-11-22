@@ -2334,6 +2334,11 @@ impl Qwen35 {
         &self,
         observer: &mut impl FnMut(usize, StateComponent, &[f32]) -> Result<()>,
     ) -> Result<()> {
+        if self.has_pending_folded_verification() {
+            return Err(invalid(
+                "cannot observe decoder state with pending folded verification",
+            ));
+        }
         let mut row = Vec::new();
         for (index, state) in self.state.iter().enumerate() {
             match state {
@@ -3629,6 +3634,11 @@ impl Qwen35 {
         if let Some(buffer) = logits.as_deref_mut() {
             buffer.clear();
         }
+        if self.has_pending_folded_verification() {
+            return Err(invalid(
+                "folded verification state must be committed or flushed before image chunk evaluation",
+            ));
+        }
         if !self.state_consistent {
             return Err(invalid(
                 "decoder state is inconsistent after failed evaluation and requires reset or restore",
@@ -3745,6 +3755,14 @@ impl Qwen35 {
         probe: Option<&mut weight_patch::Intervention<'_>>,
         timings: Option<&mut TokenTimings>,
     ) -> Result<()> {
+        if self.has_pending_folded_verification() {
+            if let Some(buffer) = logits {
+                buffer.clear();
+            }
+            return Err(invalid(
+                "folded verification state must be committed or flushed before serial evaluation",
+            ));
+        }
         if !self.state_consistent {
             return Err(invalid(
                 "decoder state is inconsistent after failed evaluation and requires reset or restore",
@@ -5406,6 +5424,7 @@ impl Decoder for Qwen35 {
         // advances position, and failed restore staging never changes live state.
         // Avoid refilling the recurrent buffers when callers reset twice (for
         // example request-boundary reset followed by runtime prefix preparation).
+        self.discard_folded_verification();
         if self.position == 0 && self.mrope_position == 0 && self.state_consistent {
             return Ok(());
         }
@@ -5480,6 +5499,30 @@ impl Decoder for Qwen35 {
     ) -> Result<()> {
         Self::evaluate_image_chunk(self, embeddings, grid_width, grid_height, logits, check)
     }
+    fn supports_folded_verification(&self) -> bool {
+        Self::supports_folded_verification(self)
+    }
+    fn has_pending_folded_verification(&self) -> bool {
+        Self::has_pending_folded_verification(self)
+    }
+    fn evaluate_verification_block_folded(
+        &mut self,
+        carried_tokens: &[u32],
+        tokens: &[u32],
+        output: &mut Vec<Vec<f32>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        Self::evaluate_verification_block_folded(self, carried_tokens, tokens, output, check)
+    }
+    fn commit_folded_verification(&mut self, kept: usize) -> Result<()> {
+        Self::commit_folded_verification(self, kept)
+    }
+    fn flush_folded_verification(&mut self, check: &dyn Fn() -> Result<()>) -> Result<()> {
+        Self::flush_folded_verification(self, check)
+    }
+    fn discard_folded_verification(&mut self) {
+        Self::discard_folded_verification(self);
+    }
     fn checkpoint_bytes(&self) -> usize {
         // Deliberately charge each referenced page in full for every snapshot,
         // including its Arc header and page table. Runtime admission therefore
@@ -5501,6 +5544,11 @@ impl Decoder for Qwen35 {
     }
 
     fn checkpoint(&self) -> Result<Self::Checkpoint> {
+        if self.has_pending_folded_verification() {
+            return Err(invalid(
+                "cannot capture checkpoint with pending folded verification",
+            ));
+        }
         if !self.state_consistent {
             return Err(invalid(
                 "decoder state is inconsistent after failed evaluation and requires reset or restore",
@@ -5525,6 +5573,11 @@ impl Decoder for Qwen35 {
     }
 
     fn checkpoint_into(&self, target: &mut Self::Checkpoint) -> Result<()> {
+        if self.has_pending_folded_verification() {
+            return Err(invalid(
+                "cannot capture checkpoint with pending folded verification",
+            ));
+        }
         if !self.state_consistent {
             return Err(invalid(
                 "decoder state is inconsistent after failed evaluation and requires reset or restore",
@@ -5545,6 +5598,7 @@ impl Decoder for Qwen35 {
     }
 
     fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+        self.discard_folded_verification();
         if !Arc::ptr_eq(&checkpoint.provenance, &self.provenance)
             || checkpoint.identity != self.identity
             || checkpoint.context_limit != self.context_limit

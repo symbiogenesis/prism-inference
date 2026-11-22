@@ -1,6 +1,7 @@
 //! Opt-in bounded triangular GDN chunks; no cumulative-decay division.
 
 use super::{TileReuse, TiledPrefill, project_tile, project_tile_pair};
+use crate::kernels::prefill::ProjectionTile;
 use crate::graph::{
     ActiveAdapters, Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms,
     copy_into, finite, l2_norm, resize_into, sigmoid, small_float,
@@ -455,11 +456,427 @@ fn head_into(
     finite(output, "chunkwise GDN output")
 }
 
+/// Preallocated per-layer input tape for folded speculative verification replay.
+#[derive(Clone, Debug, Default)]
+pub(super) struct FoldedRecurrentLayerTape {
+    conv_width: usize,
+    key_width: usize,
+    value_width: usize,
+    ssm_keys: usize,
+    ssm_values: usize,
+    ssm_head: usize,
+    pending_len: usize,
+    pending_raw_conv: Vec<f32>,
+    pending_keys: Vec<f32>,
+    pending_values: Vec<f32>,
+    pending_decay: Vec<f32>,
+    pending_beta: Vec<f32>,
+    carried_len: usize,
+    carried_raw_conv: Vec<f32>,
+    carried_keys: Vec<f32>,
+    carried_values: Vec<f32>,
+    carried_decay: Vec<f32>,
+    carried_beta: Vec<f32>,
+}
+
+impl FoldedRecurrentLayerTape {
+    /// Conservative heap byte footprint of one layer's folded verification tape.
+    pub(super) fn bytes_for_capacity(max_tokens: usize, geometry: &Geometry) -> Result<usize> {
+        let per_token_floats = geometry
+            .convolution_width()
+            .checked_add(geometry.key_width())
+            .and_then(|v| v.checked_add(geometry.value_width()))
+            .and_then(|v| v.checked_add(geometry.ssm_values.saturating_mul(2)))
+            .ok_or_else(|| invalid("folded GDN tape float count overflow"))?;
+        let total_floats = per_token_floats
+            .checked_mul(max_tokens)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| invalid("folded GDN tape token capacity overflow"))?;
+        total_floats
+            .checked_mul(size_of::<f32>())
+            .and_then(|v| v.checked_add(size_of::<Self>()))
+            .ok_or_else(|| invalid("folded GDN tape byte size overflow"))
+    }
+
+    pub(super) fn new(max_tokens: usize, geometry: &Geometry) -> Result<Self> {
+        let conv_width = geometry.convolution_width();
+        let key_width = geometry.key_width();
+        let value_width = geometry.value_width();
+        let ssm_values = geometry.ssm_values;
+        let alloc = |width: usize| -> Result<Vec<f32>> {
+            let mut vec = Vec::new();
+            let cap = width
+                .checked_mul(max_tokens)
+                .ok_or_else(|| invalid("folded GDN tape buffer overflow"))?;
+            vec.try_reserve_exact(cap)?;
+            Ok(vec)
+        };
+        Ok(Self {
+            conv_width,
+            key_width,
+            value_width,
+            ssm_keys: geometry.ssm_keys,
+            ssm_values,
+            ssm_head: geometry.ssm_head,
+            pending_len: 0,
+            pending_raw_conv: alloc(conv_width)?,
+            pending_keys: alloc(key_width)?,
+            pending_values: alloc(value_width)?,
+            pending_decay: alloc(ssm_values)?,
+            pending_beta: alloc(ssm_values)?,
+            carried_len: 0,
+            carried_raw_conv: alloc(conv_width)?,
+            carried_keys: alloc(key_width)?,
+            carried_values: alloc(value_width)?,
+            carried_decay: alloc(ssm_values)?,
+            carried_beta: alloc(ssm_values)?,
+        })
+    }
+
+    pub(super) const fn has_pending(&self) -> bool {
+        self.pending_len > 0
+    }
+
+    pub(super) const fn has_carried(&self) -> bool {
+        self.carried_len > 0
+    }
+
+    pub(super) fn clear_pending(&mut self) {
+        self.pending_len = 0;
+        self.pending_raw_conv.clear();
+        self.pending_keys.clear();
+        self.pending_values.clear();
+        self.pending_decay.clear();
+        self.pending_beta.clear();
+    }
+
+    pub(super) fn clear_carried(&mut self) {
+        self.carried_len = 0;
+        self.carried_raw_conv.clear();
+        self.carried_keys.clear();
+        self.carried_values.clear();
+        self.carried_decay.clear();
+        self.carried_beta.clear();
+    }
+
+    pub(super) fn clear_all(&mut self) {
+        self.clear_pending();
+        self.clear_carried();
+    }
+
+    pub(super) fn promote_pending_to_carried(&mut self, kept: usize) -> Result<()> {
+        if self.carried_len != 0 {
+            return Err(invalid(
+                "cannot commit pending folded verification before flushing prior carry",
+            ));
+        }
+        if kept > self.pending_len {
+            return Err(invalid(
+                "folded verification kept token count exceeds pending block length",
+            ));
+        }
+        if kept > 0 {
+            copy_into(
+                &self.pending_raw_conv[..kept * self.conv_width],
+                &mut self.carried_raw_conv,
+            )?;
+            copy_into(
+                &self.pending_keys[..kept * self.key_width],
+                &mut self.carried_keys,
+            )?;
+            copy_into(
+                &self.pending_values[..kept * self.value_width],
+                &mut self.carried_values,
+            )?;
+            copy_into(
+                &self.pending_decay[..kept * self.ssm_values],
+                &mut self.carried_decay,
+            )?;
+            copy_into(
+                &self.pending_beta[..kept * self.ssm_values],
+                &mut self.carried_beta,
+            )?;
+            self.carried_len = kept;
+        }
+        self.clear_pending();
+        Ok(())
+    }
+
+    fn capture_raw_conv(&mut self, mixed: &[Vec<f32>]) -> Result<()> {
+        self.clear_pending();
+        let count = mixed.len();
+        let needed = count
+            .checked_mul(self.conv_width)
+            .ok_or_else(|| invalid("folded raw convolution tape overflow"))?;
+        if needed > self.pending_raw_conv.capacity() {
+            self.pending_raw_conv
+                .try_reserve(needed - self.pending_raw_conv.capacity())?;
+        }
+        for row in mixed {
+            let slice = row
+                .get(..self.conv_width)
+                .ok_or_else(|| invalid("folded raw convolution width mismatch"))?;
+            self.pending_raw_conv.extend_from_slice(slice);
+        }
+        Ok(())
+    }
+
+    fn capture_gdn_inputs(
+        &mut self,
+        count: usize,
+        conv_head_major: bool,
+        gdn_conv_outputs: &[f32],
+        mixed: &[Vec<f32>],
+        alpha: &[Vec<f32>],
+        beta: &[Vec<f32>],
+    ) -> Result<()> {
+        self.pending_keys.clear();
+        self.pending_values.clear();
+        self.pending_decay.clear();
+        self.pending_beta.clear();
+        if self.ssm_keys.checked_mul(self.ssm_head) != Some(self.key_width)
+            || self.ssm_values.checked_mul(self.ssm_head) != Some(self.value_width)
+        {
+            return Err(invalid("folded GDN key/value geometry mismatch"));
+        }
+        let head_out_len = count * self.ssm_head;
+        for token in 0..count {
+            if conv_head_major {
+                for key_head in 0..self.ssm_keys {
+                    let conv_head = self.ssm_keys + key_head;
+                    let start = conv_head * head_out_len + token * self.ssm_head;
+                    let slice = gdn_conv_outputs
+                        .get(start..start + self.ssm_head)
+                        .ok_or_else(|| invalid("folded head-major key slice out of bounds"))?;
+                    self.pending_keys.extend_from_slice(slice);
+                }
+                for val_head in 0..self.ssm_values {
+                    let conv_head = 2 * self.ssm_keys + val_head;
+                    let start = conv_head * head_out_len + token * self.ssm_head;
+                    let slice = gdn_conv_outputs
+                        .get(start..start + self.ssm_head)
+                        .ok_or_else(|| invalid("folded head-major value slice out of bounds"))?;
+                    self.pending_values.extend_from_slice(slice);
+                }
+            } else {
+                let row = mixed
+                    .get(token)
+                    .ok_or_else(|| invalid("folded token mixed row missing"))?;
+                let keys = row
+                    .get(self.key_width..2 * self.key_width)
+                    .ok_or_else(|| invalid("folded token-major key slice out of bounds"))?;
+                let values = row
+                    .get(2 * self.key_width..2 * self.key_width + self.value_width)
+                    .ok_or_else(|| invalid("folded token-major value slice out of bounds"))?;
+                self.pending_keys.extend_from_slice(keys);
+                self.pending_values.extend_from_slice(values);
+            }
+            let decay_row = alpha
+                .get(token)
+                .and_then(|row| row.get(..self.ssm_values))
+                .ok_or_else(|| invalid("folded GDN decay row out of bounds"))?;
+            let beta_row = beta
+                .get(token)
+                .and_then(|row| row.get(..self.ssm_values))
+                .ok_or_else(|| invalid("folded GDN beta row out of bounds"))?;
+            self.pending_decay.extend_from_slice(decay_row);
+            self.pending_beta.extend_from_slice(beta_row);
+        }
+        self.pending_len = count;
+        Ok(())
+    }
+}
+
+fn advance_convolution_history(
+    history: &mut [f32],
+    raw_tokens: &[f32],
+    conv_width: usize,
+    hist_width: usize,
+    kept: usize,
+) -> Result<()> {
+    if hist_width == 0 || kept == 0 {
+        return Ok(());
+    }
+    if history.len() != conv_width * hist_width || raw_tokens.len() < kept * conv_width {
+        return Err(invalid("folded convolution history dimension mismatch"));
+    }
+    for channel in 0..conv_width {
+        let slot = &mut history[channel * hist_width..(channel + 1) * hist_width];
+        if kept >= hist_width {
+            let start = kept - hist_width;
+            for (offset, dest) in slot.iter_mut().enumerate() {
+                *dest = raw_tokens[(start + offset) * conv_width + channel];
+            }
+        } else {
+            slot.rotate_left(kept);
+            for offset in 0..kept {
+                slot[hist_width - kept + offset] = raw_tokens[offset * conv_width + channel];
+            }
+        }
+    }
+    Ok(())
+}
+
+const EMPTY_GDN_INPUT: Input<'static> = Input {
+    query: &[],
+    key: &[],
+    value: &[],
+    decay: 0.0,
+    beta: 0.0,
+};
+
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::imprecise_flops,
-    reason = "Keep unchanged graph preprocessing and the separately identified chunk algebra auditable."
+    reason = "Head replay consumes disjoint slices from the folded layer tape and parallel worker pool."
+)]
+fn flush_carry_heads(
+    layer_tape: &FoldedRecurrentLayerTape,
+    previous: &[f32],
+    matrix: &mut [f32],
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    projector: &ProjectionTile,
+    head_outputs: &mut Vec<f32>,
+    kept: usize,
+) -> Result<()> {
+    let width = geometry.ssm_head;
+    let head_state_len = width * width;
+    let num_heads = geometry.ssm_values;
+    let num_keys = geometry.ssm_keys;
+    let key_width = layer_tape.key_width;
+    let value_width = layer_tape.value_width;
+
+    if projector.row_parallelism().workers() > 1 && num_heads > 1 {
+        let head_out_len = kept * width;
+        resize_into(num_heads * head_out_len, head_outputs)?;
+        let keys_ref: &[f32] = &layer_tape.carried_keys;
+        let values_ref: &[f32] = &layer_tape.carried_values;
+        let decay_ref: &[f32] = &layer_tape.carried_decay;
+        let beta_ref: &[f32] = &layer_tape.carried_beta;
+        projector.row_parallelism().update_paired_chunks(
+            matrix,
+            head_state_len,
+            head_outputs,
+            head_out_len,
+            |base_head, matrix_chunk, out_chunk| {
+                let mut inputs = [EMPTY_GDN_INPUT; crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS];
+                for (offset, (head_matrix, head_out)) in matrix_chunk
+                    .chunks_exact_mut(head_state_len)
+                    .zip(out_chunk.chunks_exact_mut(head_out_len))
+                    .enumerate()
+                {
+                    let head_index = base_head + offset;
+                    let key_head = head_index % num_keys;
+                    for (token, slot) in inputs[..kept].iter_mut().enumerate() {
+                        let k_start = token * key_width + key_head * width;
+                        let v_start = token * value_width + head_index * width;
+                        let k = &keys_ref[k_start..k_start + width];
+                        let v = &values_ref[v_start..v_start + width];
+                        *slot = Input {
+                            query: k,
+                            key: k,
+                            value: v,
+                            decay: decay_ref[token * num_heads + head_index],
+                            beta: beta_ref[token * num_heads + head_index],
+                        };
+                    }
+                    let prev_head =
+                        &previous[head_index * head_state_len..(head_index + 1) * head_state_len];
+                    exact_head_into(arithmetic, prev_head, &inputs[..kept], head_matrix, head_out)?;
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        resize_into(kept * width, head_outputs)?;
+        let mut inputs = [EMPTY_GDN_INPUT; crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS];
+        for head_index in 0..num_heads {
+            let key_head = head_index % num_keys;
+            for (token, slot) in inputs[..kept].iter_mut().enumerate() {
+                let k_start = token * key_width + key_head * width;
+                let v_start = token * value_width + head_index * width;
+                let k = &layer_tape.carried_keys[k_start..k_start + width];
+                let v = &layer_tape.carried_values[v_start..v_start + width];
+                *slot = Input {
+                    query: k,
+                    key: k,
+                    value: v,
+                    decay: layer_tape.carried_decay[token * num_heads + head_index],
+                    beta: layer_tape.carried_beta[token * num_heads + head_index],
+                };
+            }
+            let range = head_index * head_state_len..(head_index + 1) * head_state_len;
+            exact_head_into(
+                arithmetic,
+                &previous[range.clone()],
+                &inputs[..kept],
+                &mut matrix[range],
+                head_outputs,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Replay deferred carried recurrent tokens into `state` without running layer projections.
+pub(super) fn flush_recurrent_carry_layer(
+    layer_tape: &mut FoldedRecurrentLayerTape,
+    state: &mut LayerState,
+    delta: &mut LayerDelta,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    projector: &ProjectionTile,
+    head_outputs: &mut Vec<f32>,
+) -> Result<()> {
+    let kept = layer_tape.carried_len;
+    if kept == 0 {
+        return Ok(());
+    }
+    if kept > crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS {
+        return Err(invalid("folded carried token count exceeds draft limit"));
+    }
+    let (
+        LayerState::Recurrent {
+            convolution: history,
+            matrix: previous,
+        },
+        LayerDelta::Recurrent {
+            convolution: _,
+            matrix,
+        },
+    ) = (state, delta)
+    else {
+        return Err(invalid("folded GDN carry flush requires recurrent state"));
+    };
+    let hist_width = geometry.convolution.saturating_sub(1);
+    advance_convolution_history(
+        history,
+        &layer_tape.carried_raw_conv,
+        geometry.convolution_width(),
+        hist_width,
+        kept,
+    )?;
+    finite(history, "folded convolution history")?;
+    resize_into(previous.len(), matrix)?;
+    flush_carry_heads(
+        layer_tape,
+        previous,
+        matrix,
+        geometry,
+        arithmetic,
+        projector,
+        head_outputs,
+        kept,
+    )?;
+    finite(matrix, "folded GDN state matrix")?;
+    std::mem::swap(previous, matrix);
+    layer_tape.clear_carried();
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep tiled recurrent forward signature explicit alongside folded replay tape."
 )]
 pub(super) fn recurrent_tile<'a>(
     layer: &'a RecurrentAttention,
@@ -475,7 +892,89 @@ pub(super) fn recurrent_tile<'a>(
     count: usize,
     check: &dyn Fn() -> Result<()>,
     tile: &mut TiledPrefill,
+    executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+) -> Result<()> {
+    recurrent_tile_with_tape(
+        layer,
+        state,
+        delta,
+        geometry,
+        arithmetic,
+        transforms,
+        adapters,
+        adapter_scratch,
+        projection_scratch,
+        previous_norm,
+        count,
+        check,
+        tile,
+        executor,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep folded recurrent forward aligned with standard tiled GDN execution."
+)]
+pub(super) fn recurrent_tile_folded<'a>(
+    layer: &'a RecurrentAttention,
+    state: &mut LayerState,
+    delta: &mut LayerDelta,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    transforms: &Transforms,
+    adapters: ActiveAdapters<'_>,
+    adapter_scratch: &mut AdapterScratch,
+    projection_scratch: &mut crate::kernels::MatvecScratch,
+    previous_norm: TileReuse<'a>,
+    count: usize,
+    check: &dyn Fn() -> Result<()>,
+    tile: &mut TiledPrefill,
+    executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+    folded: &mut FoldedRecurrentLayerTape,
+) -> Result<()> {
+    recurrent_tile_with_tape(
+        layer,
+        state,
+        delta,
+        geometry,
+        arithmetic,
+        transforms,
+        adapters,
+        adapter_scratch,
+        projection_scratch,
+        previous_norm,
+        count,
+        check,
+        tile,
+        executor,
+        Some(folded),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::imprecise_flops,
+    reason = "Share exact GDN convolution, gating, and state stepping between standard and folded tiles."
+)]
+fn recurrent_tile_with_tape<'a>(
+    layer: &'a RecurrentAttention,
+    state: &mut LayerState,
+    delta: &mut LayerDelta,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    transforms: &Transforms,
+    adapters: ActiveAdapters<'_>,
+    adapter_scratch: &mut AdapterScratch,
+    projection_scratch: &mut crate::kernels::MatvecScratch,
+    previous_norm: TileReuse<'a>,
+    count: usize,
+    check: &dyn Fn() -> Result<()>,
+    tile: &mut TiledPrefill,
     mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+    mut folded: Option<&mut FoldedRecurrentLayerTape>,
 ) -> Result<()> {
     let (
         LayerState::Recurrent {
@@ -534,6 +1033,9 @@ pub(super) fn recurrent_tile<'a>(
     let parallelize_conv = conv_aligned && tile.projector.row_parallelism().workers() > 1;
     let parallelize_post_conv = tile.projector.row_parallelism().workers() > 1 && count > 1;
     let conv_head_major = conv_aligned && count > 1;
+    if let Some(layer_tape) = folded.as_deref_mut() {
+        layer_tape.capture_raw_conv(&tile.mixed[..count])?;
+    }
     if conv_head_major && matches!(arithmetic, Arithmetic::PinnedSwift) {
         resize_into(history.len(), convolution)?;
     } else {
@@ -759,7 +1261,17 @@ pub(super) fn recurrent_tile<'a>(
             },
         )?;
     }
-    let chunkwise = tile.chunkwise_gdn;
+    if let Some(layer_tape) = folded.as_deref_mut() {
+        layer_tape.capture_gdn_inputs(
+            count,
+            conv_head_major,
+            &tile.gdn_conv_outputs,
+            &tile.mixed[..count],
+            &tile.alpha[..count],
+            &tile.beta[..count],
+        )?;
+    }
+    let chunkwise = tile.chunkwise_gdn && folded.is_none();
     let use_shared_key_dots = chunkwise
         && count <= 32
         && width > 0
@@ -1080,9 +1592,11 @@ pub(super) fn recurrent_tile<'a>(
         executor,
         check,
     )?;
-    finite(convolution, "convolution state")?;
-    std::mem::swap(history, convolution);
-    std::mem::swap(previous, matrix);
+    if folded.is_none() {
+        finite(convolution, "convolution state")?;
+        std::mem::swap(history, convolution);
+        std::mem::swap(previous, matrix);
+    }
     Ok(())
 }
 

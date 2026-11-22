@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use super::{
-    ActiveAdapters, Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache,
+    ActiveAdapters, Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, Layer,
     LayerDelta, LayerState, Qwen35, RecurrentAttention, Transforms, add, add_finite,
     attention_gate, checked_product, finite, l2_norm, recurrent_decay, resize_attention_scores,
     resize_into, rope_frequencies, row_into, sigmoid, small_float,
@@ -98,8 +98,75 @@ pub(super) struct TiledPrefill {
     gdn_key_dots: Vec<f32>,
     chunkwise_gdn: bool,
     verification: bool,
+    folded: Option<FoldedVerificationState>,
     projector: ProjectionTile,
     statistics: TiledPrefillStatistics,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FoldedVerificationState {
+    pending_tokens: Vec<u32>,
+    carried_tokens: Vec<u32>,
+    layers: Vec<gdn::FoldedRecurrentLayerTape>,
+}
+
+impl FoldedVerificationState {
+    fn bytes_for_model(max_tokens: usize, layers: &[Layer], geometry: &Geometry) -> Result<usize> {
+        let recurrent_layers = layers
+            .iter()
+            .filter(|layer| matches!(layer.attention, Attention::Recurrent(_)))
+            .count();
+        let per_layer = gdn::FoldedRecurrentLayerTape::bytes_for_capacity(max_tokens, geometry)?;
+        let token_bytes = max_tokens
+            .checked_mul(2)
+            .and_then(|v| v.checked_mul(size_of::<u32>()))
+            .ok_or_else(|| invalid("folded verification token buffer size overflow"))?;
+        recurrent_layers
+            .checked_mul(per_layer)
+            .and_then(|v| v.checked_add(token_bytes))
+            .and_then(|v| v.checked_add(size_of::<Self>()))
+            .ok_or_else(|| invalid("folded verification state size overflow"))
+    }
+
+    fn new(max_tokens: usize, layers: &[Layer], geometry: &Geometry) -> Result<Self> {
+        let recurrent_layers = layers
+            .iter()
+            .filter(|layer| matches!(layer.attention, Attention::Recurrent(_)))
+            .count();
+        let mut tapes = Vec::new();
+        tapes.try_reserve_exact(recurrent_layers)?;
+        for layer in layers {
+            if matches!(layer.attention, Attention::Recurrent(_)) {
+                tapes.push(gdn::FoldedRecurrentLayerTape::new(max_tokens, geometry)?);
+            }
+        }
+        let mut pending_tokens = Vec::new();
+        pending_tokens.try_reserve_exact(max_tokens)?;
+        let mut carried_tokens = Vec::new();
+        carried_tokens.try_reserve_exact(max_tokens)?;
+        Ok(Self {
+            pending_tokens,
+            carried_tokens,
+            layers: tapes,
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        !self.pending_tokens.is_empty()
+            || !self.carried_tokens.is_empty()
+            || self
+                .layers
+                .iter()
+                .any(|tape| tape.has_pending() || tape.has_carried())
+    }
+
+    fn clear_all(&mut self) {
+        self.pending_tokens.clear();
+        self.carried_tokens.clear();
+        for tape in &mut self.layers {
+            tape.clear_all();
+        }
+    }
 }
 
 impl TiledPrefill {
@@ -158,6 +225,7 @@ impl TiledPrefill {
             gdn_key_dots: Vec::new(),
             chunkwise_gdn: false,
             verification: false,
+            folded: None,
             projector,
             statistics: TiledPrefillStatistics::default(),
         })
@@ -385,15 +453,24 @@ impl Qwen35 {
             ));
         }
         let required = self.tiled_verification_scratch_bytes()?;
+        let verify_capacity = {
+            let tile = self
+                .tiled_prefill
+                .as_ref()
+                .ok_or_else(|| invalid("verification requires CPU tiled prefill"))?;
+            if self.position != 0 || tile.verification || additional_bytes < required {
+                return Err(invalid(
+                    "tiled verification requires an empty graph and admitted logits",
+                ));
+            }
+            tile.tokens
+                .min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS)
+        };
+        let folded_state = FoldedVerificationState::new(verify_capacity, &self.layers, &self.geometry)?;
         let tile = self
             .tiled_prefill
             .as_mut()
             .ok_or_else(|| invalid("verification requires CPU tiled prefill"))?;
-        if self.position != 0 || tile.verification || additional_bytes < required {
-            return Err(invalid(
-                "tiled verification requires an empty graph and admitted logits",
-            ));
-        }
         let total = tile
             .scratch_bytes
             .checked_add(required)
@@ -403,8 +480,24 @@ impl Qwen35 {
         self.identity.push_str(suffix);
         self.provenance = std::sync::Arc::new(());
         tile.scratch_bytes = total;
+        tile.folded = Some(folded_state);
         tile.verification = true;
         Ok(self)
+    }
+
+    /// Preallocated heap byte footprint for folded verification recurrent replay tapes.
+    ///
+    /// # Errors
+    /// Rejects models without CPU tiled prefill configured or on arithmetic overflow.
+    pub fn folded_verification_tape_bytes(&self) -> Result<usize> {
+        let tile = self
+            .tiled_prefill
+            .as_ref()
+            .ok_or_else(|| invalid("folded verification requires CPU tiled prefill"))?;
+        let cap = tile
+            .tokens
+            .min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS);
+        FoldedVerificationState::bytes_for_model(cap, &self.layers, &self.geometry)
     }
 
     pub(super) fn verification_capacity(&self) -> usize {
@@ -417,12 +510,71 @@ impl Qwen35 {
             })
     }
 
+    pub(super) fn supports_folded_verification(&self) -> bool {
+        self.tiled_prefill
+            .as_ref()
+            .is_some_and(|tile| tile.verification && tile.folded.is_some())
+    }
+
+    pub(super) fn has_pending_folded_verification(&self) -> bool {
+        self.tiled_prefill
+            .as_ref()
+            .and_then(|tile| tile.folded.as_ref())
+            .is_some_and(FoldedVerificationState::is_active)
+    }
+
+    pub(super) fn discard_folded_verification(&mut self) {
+        if let Some(tile) = self.tiled_prefill.as_mut()
+            && let Some(folded) = tile.folded.as_mut()
+        {
+            folded.clear_all();
+        }
+    }
+
+    fn prepare_verification_output(
+        vocabulary: usize,
+        count: usize,
+        output: &mut Vec<Vec<f32>>,
+    ) -> Result<()> {
+        let allocation = (|| -> Result<()> {
+            if output.len() > count {
+                output.truncate(count);
+            }
+            for row in &mut *output {
+                row.clear();
+                if vocabulary > row.capacity() {
+                    row.try_reserve_exact(vocabulary)?;
+                }
+            }
+            if count > output.capacity() {
+                output.try_reserve_exact(count - output.len())?;
+            }
+            while output.len() < count {
+                let mut row = Vec::new();
+                row.try_reserve_exact(vocabulary)?;
+                output.push(row);
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation {
+            output.clear();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(super) fn evaluate_verification_block(
         &mut self,
         tokens: &[u32],
         output: &mut Vec<Vec<f32>>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        if self.has_pending_folded_verification() {
+            output.clear();
+            return Err(invalid(
+                "folded verification state must be committed or flushed before standard verification",
+            ));
+        }
         if !self.state_consistent {
             output.clear();
             return Err(invalid(
@@ -448,32 +600,7 @@ impl Qwen35 {
                 "invalid tiled verification bounds, tokens or context",
             ));
         }
-        // Reuse existing caller row capacities when available, allocating only
-        // missing rows before layer-major state can change.
-        let allocation = (|| -> Result<()> {
-            if output.len() > tokens.len() {
-                output.truncate(tokens.len());
-            }
-            for row in &mut *output {
-                row.clear();
-                if self.vocabulary > row.capacity() {
-                    row.try_reserve_exact(self.vocabulary)?;
-                }
-            }
-            if tokens.len() > output.capacity() {
-                output.try_reserve_exact(tokens.len() - output.len())?;
-            }
-            while output.len() < tokens.len() {
-                let mut row = Vec::new();
-                row.try_reserve_exact(self.vocabulary)?;
-                output.push(row);
-            }
-            Ok(())
-        })();
-        if let Err(error) = allocation {
-            output.clear();
-            return Err(error);
-        }
+        Self::prepare_verification_output(self.vocabulary, tokens.len(), output)?;
         let mut tile = self
             .tiled_prefill
             .take()
@@ -482,10 +609,11 @@ impl Qwen35 {
         let result = (|| {
             check()?;
             let prefill_executor = executor.as_mut().map(Self::coerce_executor);
-            self.ingest_cpu_tile(
+            self.ingest_cpu_tile_with_folded(
                 tokens,
                 check,
                 &mut tile,
+                None,
                 prefill_executor,
                 Some(output.as_mut_slice()),
             )?;
@@ -496,6 +624,304 @@ impl Qwen35 {
         if result.is_err() {
             output.clear();
         }
+        result
+    }
+
+    fn validate_folded_block_inputs(
+        &self,
+        carried_tokens: &[u32],
+        tokens: &[u32],
+        output: &mut Vec<Vec<f32>>,
+    ) -> Result<bool> {
+        if !self.state_consistent {
+            output.clear();
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
+        if !self.supports_folded_verification() {
+            output.clear();
+            return Err(invalid(
+                "folded verification requires CPU tiled verification support",
+            ));
+        }
+        if tokens.is_empty()
+            || tokens.len() > self.verification_capacity()
+            || self
+                .projection_executor
+                .as_ref()
+                .is_some_and(|exec| !exec.supports_tile_tokens())
+            || tokens
+                .iter()
+                .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
+            || carried_tokens
+                .iter()
+                .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
+        {
+            output.clear();
+            return Err(invalid(
+                "invalid folded verification bounds, carried tokens, or vocabulary",
+            ));
+        }
+        let folded = self
+            .tiled_prefill
+            .as_ref()
+            .and_then(|tile| tile.folded.as_ref())
+            .ok_or_else(|| invalid("missing folded verification state"))?;
+        if !folded.pending_tokens.is_empty() {
+            output.clear();
+            return Err(invalid(
+                "folded verification block already awaits commit_folded_verification",
+            ));
+        }
+        if folded.carried_tokens.is_empty() {
+            return Ok(false);
+        }
+        if folded.carried_tokens.as_slice() != carried_tokens {
+            output.clear();
+            return Err(invalid(
+                "folded verification carried tokens do not match deferred replay tape",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn rollback_failed_folded_block(
+        &mut self,
+        folded: &mut FoldedVerificationState,
+        tile: &mut TiledPrefill,
+        start_position: usize,
+        start_mrope: usize,
+    ) {
+        let rollback = (|| -> Result<()> {
+            let mut rec_idx = 0_usize;
+            for ((layer, state), delta) in self
+                .layers
+                .iter()
+                .zip(&mut self.state)
+                .zip(&mut self.workspace.deltas)
+            {
+                match (&layer.attention, state) {
+                    (Attention::Full(_), LayerState::Full { keys, values }) => {
+                        keys.truncate_to(start_position)?;
+                        values.truncate_to(start_position)?;
+                    }
+                    (Attention::Recurrent(_), rec_state @ LayerState::Recurrent { .. }) => {
+                        if let Some(layer_tape) = folded.layers.get_mut(rec_idx) {
+                            gdn::flush_recurrent_carry_layer(
+                                layer_tape,
+                                rec_state,
+                                delta,
+                                &self.geometry,
+                                self.arithmetic,
+                                &tile.projector,
+                                &mut tile.gdn_head_outputs,
+                            )?;
+                        }
+                        rec_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+            folded.clear_all();
+            self.position = start_position;
+            self.mrope_position = start_mrope;
+            self.state_consistent = true;
+            Ok(())
+        })();
+        if rollback.is_err() {
+            folded.clear_all();
+            self.state_consistent = false;
+        }
+    }
+
+    pub(super) fn evaluate_verification_block_folded(
+        &mut self,
+        carried_tokens: &[u32],
+        tokens: &[u32],
+        output: &mut Vec<Vec<f32>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let has_carried_tape = self.validate_folded_block_inputs(carried_tokens, tokens, output)?;
+        if !has_carried_tape && !carried_tokens.is_empty() {
+            if self
+                .position
+                .checked_add(carried_tokens.len() + tokens.len())
+                .is_none_or(|end| end > self.context_limit)
+            {
+                output.clear();
+                return Err(invalid("folded verification exceeds remaining context"));
+            }
+            self.ingest_prefill_block(carried_tokens, check)?;
+        } else if self
+            .position
+            .checked_add(tokens.len())
+            .is_none_or(|end| end > self.context_limit)
+        {
+            output.clear();
+            return Err(invalid("folded verification exceeds remaining context"));
+        }
+
+        Self::prepare_verification_output(self.vocabulary, tokens.len(), output)?;
+        let start_position = self.position;
+        let start_mrope = self.mrope_position;
+        let mut tile = self
+            .tiled_prefill
+            .take()
+            .ok_or_else(|| invalid("missing verification tile"))?;
+        let mut folded = tile
+            .folded
+            .take()
+            .ok_or_else(|| invalid("missing folded verification state"))?;
+        let mut executor = self.projection_executor.take();
+        let result = (|| {
+            check()?;
+            let prefill_executor = executor.as_mut().map(Self::coerce_executor);
+            self.ingest_cpu_tile_with_folded(
+                tokens,
+                check,
+                &mut tile,
+                Some(&mut folded),
+                prefill_executor,
+                Some(output.as_mut_slice()),
+            )?;
+            check()?;
+            folded.carried_tokens.clear();
+            folded.pending_tokens.clear();
+            folded.pending_tokens.extend_from_slice(tokens);
+            Ok(())
+        })();
+        if result.is_err() {
+            output.clear();
+            self.rollback_failed_folded_block(&mut folded, &mut tile, start_position, start_mrope);
+        }
+        tile.folded = Some(folded);
+        self.projection_executor = executor;
+        self.tiled_prefill = Some(tile);
+        result
+    }
+
+    pub(super) fn commit_folded_verification(&mut self, kept: usize) -> Result<()> {
+        if !self.state_consistent {
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
+        let tile = self
+            .tiled_prefill
+            .as_mut()
+            .ok_or_else(|| invalid("missing verification tile"))?;
+        let folded = tile
+            .folded
+            .as_mut()
+            .ok_or_else(|| invalid("missing folded verification state"))?;
+        let pending = folded.pending_tokens.len();
+        if pending == 0 {
+            return Err(invalid("no pending folded verification block to commit"));
+        }
+        if kept > pending {
+            return Err(invalid(
+                "folded verification kept token count exceeds pending block length",
+            ));
+        }
+        if !folded.carried_tokens.is_empty() {
+            return Err(invalid(
+                "folded verification carry tape was not consumed before commit",
+            ));
+        }
+        let start_position = self
+            .position
+            .checked_sub(pending)
+            .ok_or_else(|| invalid("folded verification position underflow"))?;
+        let start_mrope = self
+            .mrope_position
+            .checked_sub(pending)
+            .ok_or_else(|| invalid("folded verification MRoPE underflow"))?;
+        let target_position = start_position + kept;
+        let target_mrope = start_mrope + kept;
+        for state in &mut self.state {
+            if let LayerState::Full { keys, values } = state {
+                keys.truncate_to(target_position)?;
+                values.truncate_to(target_position)?;
+            }
+        }
+        self.position = target_position;
+        self.mrope_position = target_mrope;
+        for layer_tape in &mut folded.layers {
+            layer_tape.promote_pending_to_carried(kept)?;
+        }
+        folded.carried_tokens.clear();
+        if kept > 0 {
+            folded
+                .carried_tokens
+                .extend_from_slice(&folded.pending_tokens[..kept]);
+        }
+        folded.pending_tokens.clear();
+        Ok(())
+    }
+
+    pub(super) fn flush_folded_verification(&mut self, check: &dyn Fn() -> Result<()>) -> Result<()> {
+        if !self.state_consistent {
+            return Err(invalid(
+                "decoder state is inconsistent after failed evaluation and requires reset or restore",
+            ));
+        }
+        if !self.has_pending_folded_verification() {
+            return Ok(());
+        }
+        if self
+            .tiled_prefill
+            .as_ref()
+            .and_then(|tile| tile.folded.as_ref())
+            .is_some_and(|folded| !folded.pending_tokens.is_empty())
+        {
+            return Err(invalid(
+                "cannot flush uncommitted folded verification block before commit",
+            ));
+        }
+        check()?;
+        let mut tile = self
+            .tiled_prefill
+            .take()
+            .ok_or_else(|| invalid("missing verification tile"))?;
+        let mut folded = tile
+            .folded
+            .take()
+            .ok_or_else(|| invalid("missing folded verification state"))?;
+        let result = (|| -> Result<()> {
+            let mut rec_idx = 0_usize;
+            for ((layer, state), delta) in self
+                .layers
+                .iter()
+                .zip(&mut self.state)
+                .zip(&mut self.workspace.deltas)
+            {
+                if matches!(layer.attention, Attention::Recurrent(_)) {
+                    let layer_tape = folded
+                        .layers
+                        .get_mut(rec_idx)
+                        .ok_or_else(|| invalid("folded verification recurrent layer tape missing"))?;
+                    rec_idx += 1;
+                    gdn::flush_recurrent_carry_layer(
+                        layer_tape,
+                        state,
+                        delta,
+                        &self.geometry,
+                        self.arithmetic,
+                        &tile.projector,
+                        &mut tile.gdn_head_outputs,
+                    )?;
+                }
+            }
+            folded.carried_tokens.clear();
+            Ok(())
+        })();
+        if result.is_err() {
+            folded.clear_all();
+            self.state_consistent = false;
+        }
+        tile.folded = Some(folded);
+        self.tiled_prefill = Some(tile);
         result
     }
 
@@ -524,6 +950,11 @@ impl Qwen35 {
         check: &dyn Fn() -> Result<()>,
         mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     ) -> Result<()> {
+        if self.has_pending_folded_verification() {
+            return Err(invalid(
+                "folded verification state must be committed or flushed before prefill",
+            ));
+        }
         if !self.state_consistent {
             return Err(invalid(
                 "decoder state is inconsistent after failed evaluation and requires reset or restore",
@@ -556,7 +987,14 @@ impl Qwen35 {
         let result = (|| {
             for tokens in tokens.chunks(tile.tokens) {
                 check()?;
-                self.ingest_cpu_tile(tokens, check, &mut tile, executor.as_deref_mut(), None)?;
+                self.ingest_cpu_tile_with_folded(
+                    tokens,
+                    check,
+                    &mut tile,
+                    None,
+                    executor.as_deref_mut(),
+                    None,
+                )?;
                 tile.statistics.completed_tiles = tile.statistics.completed_tiles.saturating_add(1);
                 tile.statistics.completed_tokens = tile
                     .statistics
@@ -574,11 +1012,12 @@ impl Qwen35 {
         clippy::too_many_lines,
         reason = "Keep causal attention commits, FFN tile consumption and cancellation visibly ordered."
     )]
-    fn ingest_cpu_tile(
+    fn ingest_cpu_tile_with_folded(
         &mut self,
         tokens: &[u32],
         check: &dyn Fn() -> Result<()>,
         tile: &mut TiledPrefill,
+        mut folded: Option<&mut FoldedVerificationState>,
         mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
         logits: Option<&mut [Vec<f32>]>,
     ) -> Result<()> {
@@ -615,6 +1054,7 @@ impl Qwen35 {
         let mut frequencies_ready = false;
         let total_layers = self.layers.len();
         let narrow_final = logits.is_none() && self.narrow_last_layer;
+        let mut recurrent_layer_idx = 0_usize;
         for (layer_idx, ((layer, state), delta)) in self
             .layers
             .iter()
@@ -699,22 +1139,56 @@ impl Qwen35 {
             }
             match (&layer.attention, &mut *state) {
                 (Attention::Recurrent(weights), _) => {
-                    gdn::recurrent_tile(
-                        weights,
-                        state,
-                        delta,
-                        &self.geometry,
-                        self.arithmetic,
-                        &self.transforms,
-                        adapters,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.projection.matvec,
-                        norm_reuse,
-                        count,
-                        check,
-                        tile,
-                        executor.as_deref_mut(),
-                    )?;
+                    if let Some(folded_state) = folded.as_deref_mut() {
+                        let layer_tape = folded_state
+                            .layers
+                            .get_mut(recurrent_layer_idx)
+                            .ok_or_else(|| invalid("folded verification layer tape missing"))?;
+                        recurrent_layer_idx += 1;
+                        gdn::flush_recurrent_carry_layer(
+                            layer_tape,
+                            state,
+                            delta,
+                            &self.geometry,
+                            self.arithmetic,
+                            &tile.projector,
+                            &mut tile.gdn_head_outputs,
+                        )?;
+                        gdn::recurrent_tile_folded(
+                            weights,
+                            state,
+                            delta,
+                            &self.geometry,
+                            self.arithmetic,
+                            &self.transforms,
+                            adapters,
+                            &mut self.workspace.adapter,
+                            &mut self.workspace.projection.matvec,
+                            norm_reuse,
+                            count,
+                            check,
+                            tile,
+                            executor.as_deref_mut(),
+                            layer_tape,
+                        )?;
+                    } else {
+                        gdn::recurrent_tile(
+                            weights,
+                            state,
+                            delta,
+                            &self.geometry,
+                            self.arithmetic,
+                            &self.transforms,
+                            adapters,
+                            &mut self.workspace.adapter,
+                            &mut self.workspace.projection.matvec,
+                            norm_reuse,
+                            count,
+                            check,
+                            tile,
+                            executor.as_deref_mut(),
+                        )?;
+                    }
                 }
                 (Attention::Full(weights), LayerState::Full { keys, values }) => {
                     check()?;
@@ -901,6 +1375,10 @@ impl Qwen35 {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "prefill_folded_tests.rs"]
+mod folded_tests;
 
 fn step_recurrent_state_only_conv(
     layer: &RecurrentAttention,

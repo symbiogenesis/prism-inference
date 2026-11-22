@@ -317,4 +317,54 @@ pub trait Decoder {
     /// # Errors
     /// Rejects foreign or malformed snapshots and allocation failures.
     fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()>;
+
+    /// Return whether this decoder can fold accepted-prefix recurrent replay into the next block.
+    #[must_use]
+    fn supports_folded_verification(&self) -> bool {
+        false
+    }
+
+    /// Return whether folded verification state currently awaits commit, flush, or discard.
+    #[must_use]
+    fn has_pending_folded_verification(&self) -> bool {
+        false
+    }
+
+    /// Evaluate a speculative verification block while folding `carried_tokens` replay ahead of `tokens`.
+    ///
+    /// # Errors
+    /// Rejects invalid state transitions, cancellation, or underlying decoder failures.
+    fn evaluate_verification_block_folded(
+        &mut self,
+        carried_tokens: &[u32],
+        tokens: &[u32],
+        output: &mut Vec<Vec<f32>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if !carried_tokens.is_empty() {
+            self.evaluate_batch_into(carried_tokens, output, check)?;
+        }
+        self.evaluate_batch_into(tokens, output, check)
+    }
+
+    /// Commit `kept` accepted draft tokens from the active folded verification block (`kept <= block_len`).
+    ///
+    /// # Errors
+    /// Rejects invalid commit bounds or missing pending folded state.
+    fn commit_folded_verification(&mut self, kept: usize) -> Result<()> {
+        let _ = kept;
+        Ok(())
+    }
+
+    /// Eagerly flush any deferred folded replay state so recurrent layers reach exact serial parity.
+    ///
+    /// # Errors
+    /// Rejects pending uncommitted verification state or replay execution failures.
+    fn flush_folded_verification(&mut self, check: &dyn Fn() -> Result<()>) -> Result<()> {
+        let _ = check;
+        Ok(())
+    }
+
+    /// Discard any uncommitted or deferred folded verification buffers on rollback or error.
+    fn discard_folded_verification(&mut self) {}
 }

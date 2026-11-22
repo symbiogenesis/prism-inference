@@ -2757,14 +2757,15 @@ impl PreparedMatvec<'_> {
                 ))]
                 if !matches!(scratch.requested_backend(), MatvecBackend::Scalar) {
                     if tensor.kind == Q8_0 {
-                        return scratch.row_parallelism.fill_four_rows(
+                        return scratch.row_parallelism.fill_sixteen_rows(
                             &tensor.data,
                             row_bytes,
                             output,
                             &mut scratch.row_errors,
+                            |rows| neon::dot_q8_0_sixteen_rows(rows, q8),
                             |rows| neon::dot_q8_0_eight_rows(rows, q8),
                             |rows| neon::dot_q8_0_four_rows(rows, q8),
-                            |bytes| dot_legacy(Q8_0, bytes, q8),
+                            |bytes| neon::dot_q8_0_row(bytes, q8),
                         );
                     }
                     if tensor.kind == Q4_0 {
@@ -6742,6 +6743,129 @@ mod tests {
             .is_err()
         );
         assert_eq!(output, before);
+        Ok(())
+    }
+
+    fn build_q8_0_matvec_fixture(
+        rows: usize,
+        blocks: usize,
+    ) -> crate::Result<(Tensor, Vec<f32>, Vec<u32>)> {
+        let columns = blocks * 32;
+        let row_bytes = blocks * 34;
+        let f16_scales = [
+            0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3555, 0xb787, 0x3c00, 0xbc00,
+        ];
+        let mut raw = vec![0_u8; rows * row_bytes];
+        for r in 0..rows {
+            for b in 0..blocks {
+                let off = r * row_bytes + b * 34;
+                raw[off..off + 2]
+                    .copy_from_slice(&f16_scales[(r * 7 + b * 3) % f16_scales.len()].to_le_bytes());
+                for i in 0..32 {
+                    raw[off + 2 + i] = ((r * 37 + b * 19 + i * 11) % 256).to_le_bytes()[0];
+                }
+            }
+        }
+        let input: Vec<f32> = (0..columns)
+            .map(|col| {
+                let signed = match col % 7 {
+                    0 => 1.5,
+                    1 => -2.25,
+                    2 => 0.75,
+                    3 => -1.125,
+                    4 => 3.0,
+                    5 => -0.5,
+                    _ => 0.0,
+                };
+                signed * f32::from(u8::try_from(col % 5).unwrap_or(0)).mul_add(0.125, 1.0)
+            })
+            .collect();
+        let mut q8 = Vec::new();
+        q8_into(&input, &mut q8)?;
+        let expected_bits = (0..rows)
+            .map(|r| {
+                super::dot_legacy(super::Q8_0, &raw[r * row_bytes..(r + 1) * row_bytes], &q8)
+                    .map(f32::to_bits)
+            })
+            .collect::<crate::Result<Vec<u32>>>()?;
+        let tensor = Tensor {
+            name: format!("q8_0_{columns}x{rows}"),
+            dimensions: vec![columns, rows],
+            kind: super::Q8_0,
+            data: Arc::<[u8]>::from(raw).into(),
+        };
+        Ok((tensor, input, expected_bits))
+    }
+
+    #[test]
+    fn q8_0_matvec_fill_sixteen_rows_matches_scalar_zero_ulp() -> crate::Result<()> {
+        let row_counts = [
+            1_usize, 2, 3, 4, 5, 7, 8, 9, 12, 13, 15, 16, 17, 20, 24, 28, 29, 31, 32, 33, 63,
+        ];
+        for blocks in [1_usize, 2, 3, 7, 64] {
+            let max_rows = *row_counts
+                .last()
+                .ok_or_else(|| crate::invalid("nonempty"))?;
+            let (full_tensor, input, full_expected) = build_q8_0_matvec_fixture(max_rows, blocks)?;
+            let columns = blocks * 32;
+            let row_bytes = blocks * 34;
+
+            for rows in row_counts {
+                let tensor = Tensor {
+                    name: format!("q8_0_{columns}x{rows}"),
+                    dimensions: vec![columns, rows],
+                    kind: super::Q8_0,
+                    data: Arc::<[u8]>::from(full_tensor.data[..rows * row_bytes].to_vec()).into(),
+                };
+                for backend in [
+                    super::MatvecBackend::Scalar,
+                    super::MatvecBackend::Auto,
+                    super::MatvecBackend::ExperimentalNeon,
+                ] {
+                    let mut scratch = MatvecScratch::with_backend(backend);
+                    let mut out = Vec::new();
+                    matvec_into(&tensor, &input, &mut out, &mut scratch)?;
+                    let bits: Vec<u32> = out.iter().copied().map(f32::to_bits).collect();
+                    assert_eq!(bits, full_expected[..rows]);
+                }
+            }
+
+            #[cfg(feature = "parallel-rows")]
+            {
+                let mut par_scratch = MatvecScratch::with_backend(super::MatvecBackend::Auto);
+                par_scratch.set_row_parallelism(super::RowParallelism::new(4)?);
+                let mut par_out = Vec::new();
+                matvec_into(&full_tensor, &input, &mut par_out, &mut par_scratch)?;
+                let par_bits: Vec<u32> = par_out.iter().copied().map(f32::to_bits).collect();
+                assert_eq!(par_bits, full_expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q8_0_matvec_rejects_nonfinite_scale_and_clears_output() -> crate::Result<()> {
+        let (mut tensor, input, _) = build_q8_0_matvec_fixture(31, 7)?;
+        let row_bytes = 7 * 34;
+        let mut raw = tensor.data.to_vec();
+        let bad_off = 19 * row_bytes + 4 * 34;
+        raw[bad_off..bad_off + 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
+        tensor.data = Arc::<[u8]>::from(raw).into();
+
+        let empty: [f32; 0] = [];
+        let mut scratch = MatvecScratch::with_backend(super::MatvecBackend::Auto);
+        let mut out = vec![123.0_f32; 31];
+        assert!(matvec_into(&tensor, &input, &mut out, &mut scratch).is_err());
+        assert_eq!(out, empty);
+
+        #[cfg(feature = "parallel-rows")]
+        {
+            let mut par_scratch = MatvecScratch::with_backend(super::MatvecBackend::Auto);
+            par_scratch.set_row_parallelism(super::RowParallelism::new(4)?);
+            let mut par_out = vec![123.0_f32; 31];
+            assert!(matvec_into(&tensor, &input, &mut par_out, &mut par_scratch).is_err());
+            assert_eq!(par_out, empty);
+        }
         Ok(())
     }
 }

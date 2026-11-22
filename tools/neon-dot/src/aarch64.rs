@@ -5098,6 +5098,373 @@ fn q8_0_scaled_8x_tokens_dotprod<A: super::Q8ActivationView>(
 }
 
 #[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn reduce4_s32x4_addp(v0: int32x4_t, v1: int32x4_t, v2: int32x4_t, v3: int32x4_t) -> int32x4_t {
+    use core::arch::aarch64::vpaddq_s32;
+    vpaddq_s32(vpaddq_s32(v0, v1), vpaddq_s32(v2, v3))
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn load_f16_scales_x4(blocks: [&[u8; 34]; 4]) -> core::arch::aarch64::uint16x4_t {
+    use core::arch::aarch64::{vdup_n_u16, vset_lane_u16};
+    let v = vdup_n_u16(u16::from_le_bytes([blocks[0][0], blocks[0][1]]));
+    let v = vset_lane_u16::<1>(u16::from_le_bytes([blocks[1][0], blocks[1][1]]), v);
+    let v = vset_lane_u16::<2>(u16::from_le_bytes([blocks[2][0], blocks[2][1]]), v);
+    vset_lane_u16::<3>(u16::from_le_bytes([blocks[3][0], blocks[3][1]]), v)
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn widen_f16_one_finite(bits: u16) -> Option<f32> {
+    use core::arch::aarch64::{vcvt_f32_f16, vdup_n_u16, vgetq_lane_f32, vreinterpret_f16_u16};
+    if (bits & 0x7fff) >= 0x7c00 {
+        return None;
+    }
+    let v = vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(bits)));
+    Some(vgetq_lane_f32::<0>(v))
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_block_sdot<A: super::Q8ActivationView>(block: &[u8; 34], act: &A) -> int32x4_t {
+    let wh = block[2..34].as_chunks::<16>().0;
+    let ah = act.values().as_chunks::<16>().0;
+    sdot32_vec(
+        vreinterpretq_s8_u8(load_u8x16(&wh[0])),
+        vreinterpretq_s8_u8(load_u8x16(&wh[1])),
+        load_s8x16(&ah[0]),
+        load_s8x16(&ah[1]),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_quad_sdot_step(
+    blocks: [&[u8; 34]; 4],
+    a0: int8x16_t,
+    a1: int8x16_t,
+    rs_vec: core::arch::aarch64::float32x4_t,
+    act_scale_vec: core::arch::aarch64::float32x4_t,
+    sum: core::arch::aarch64::float32x4_t,
+) -> core::arch::aarch64::float32x4_t {
+    use core::arch::aarch64::{vcvtq_f32_s32, vmulq_f32};
+    let w0 = blocks[0][2..34].as_chunks::<16>().0;
+    let w1 = blocks[1][2..34].as_chunks::<16>().0;
+    let w2 = blocks[2][2..34].as_chunks::<16>().0;
+    let w3 = blocks[3][2..34].as_chunks::<16>().0;
+    let mut d0 = vdotq_s32(vdupq_n_s32(0), vreinterpretq_s8_u8(load_u8x16(&w0[0])), a0);
+    let mut d1 = vdotq_s32(vdupq_n_s32(0), vreinterpretq_s8_u8(load_u8x16(&w1[0])), a0);
+    let mut d2 = vdotq_s32(vdupq_n_s32(0), vreinterpretq_s8_u8(load_u8x16(&w2[0])), a0);
+    let mut d3 = vdotq_s32(vdupq_n_s32(0), vreinterpretq_s8_u8(load_u8x16(&w3[0])), a0);
+    d0 = vdotq_s32(d0, vreinterpretq_s8_u8(load_u8x16(&w0[1])), a1);
+    d1 = vdotq_s32(d1, vreinterpretq_s8_u8(load_u8x16(&w1[1])), a1);
+    d2 = vdotq_s32(d2, vreinterpretq_s8_u8(load_u8x16(&w2[1])), a1);
+    d3 = vdotq_s32(d3, vreinterpretq_s8_u8(load_u8x16(&w3[1])), a1);
+    let dots = vcvtq_f32_s32(reduce4_s32x4_addp(d0, d1, d2, d3));
+    let d = vmulq_f32(rs_vec, act_scale_vec);
+    f32x4_scale_step::<false>(sum, d, dots)
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_1row_sdot<A: super::Q8ActivationView>(row: &[u8], activation: &[A]) -> Option<[f32; 1]> {
+    use core::arch::aarch64::{
+        vand_u16, vcvt_f32_f16, vcvtq_f32_s32, vdup_n_u16, vgetq_lane_f32, vmaxv_u16, vmulq_f32,
+        vreinterpret_f16_u16,
+    };
+    let row_chunks = row.as_chunks::<34>().0;
+    let block_count = activation.len();
+    if block_count == 0 || row_chunks.len() != block_count {
+        return None;
+    }
+    let (row_quads, row_tail) = row_chunks.as_chunks::<4>();
+    let (act_quads, act_tail) = activation.as_chunks::<4>();
+    let mask_7fff = vdup_n_u16(0x7fff);
+    let mut sum = 0.0_f32;
+    for (w_quad, a_quad) in row_quads.iter().zip(act_quads.iter()) {
+        let s = load_f16_scales_x4([&w_quad[0], &w_quad[1], &w_quad[2], &w_quad[3]]);
+        if vmaxv_u16(vand_u16(s, mask_7fff)) >= 0x7c00 {
+            return None;
+        }
+        let rs = vcvt_f32_f16(vreinterpret_f16_u16(s));
+        let as_vec = load_f32x4_neon(&[
+            a_quad[0].scale(),
+            a_quad[1].scale(),
+            a_quad[2].scale(),
+            a_quad[3].scale(),
+        ]);
+        let d_vec = vmulq_f32(rs, as_vec);
+        let d0 = q8_0_block_sdot(&w_quad[0], &a_quad[0]);
+        let d1 = q8_0_block_sdot(&w_quad[1], &a_quad[1]);
+        let d2 = q8_0_block_sdot(&w_quad[2], &a_quad[2]);
+        let d3 = q8_0_block_sdot(&w_quad[3], &a_quad[3]);
+        let dots = vcvtq_f32_s32(reduce4_s32x4_addp(d0, d1, d2, d3));
+        let prods = vmulq_f32(d_vec, dots);
+        sum = (((sum + vgetq_lane_f32::<0>(prods)) + vgetq_lane_f32::<1>(prods))
+            + vgetq_lane_f32::<2>(prods))
+            + vgetq_lane_f32::<3>(prods);
+    }
+    for (wb, ab) in row_tail.iter().zip(act_tail.iter()) {
+        let bits = u16::from_le_bytes([wb[0], wb[1]]);
+        let rs = widen_f16_one_finite(bits)?;
+        let dot = vaddvq_s32(q8_0_block_sdot(wb, ab));
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::as_conversions,
+            clippy::suboptimal_flops,
+            reason = "32-element i8 dot fits exactly in f32 and non-FMA order matches dot_legacy."
+        )]
+        {
+            sum += (rs * ab.scale()) * (dot as f32);
+        }
+    }
+    sum.is_finite().then_some([sum])
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_4rows_pair_step<A: super::Q8ActivationView>(
+    b0: [&[u8; 34]; 4],
+    b1: [&[u8; 34]; 4],
+    act0: &A,
+    act1: &A,
+    mask_7fff: core::arch::aarch64::uint16x8_t,
+    mut sum0: core::arch::aarch64::float32x4_t,
+) -> Option<core::arch::aarch64::float32x4_t> {
+    use core::arch::aarch64::{
+        vandq_u16, vcombine_u16, vcvt_f32_f16, vcvt_high_f32_f16, vdupq_n_f32, vget_low_u16,
+        vmaxvq_u16, vreinterpret_f16_u16, vreinterpretq_f16_u16,
+    };
+    let s_pair = vcombine_u16(load_f16_scales_x4(b0), load_f16_scales_x4(b1));
+    if vmaxvq_u16(vandq_u16(s_pair, mask_7fff)) >= 0x7c00 {
+        return None;
+    }
+    let rs0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(s_pair)));
+    let rs1 = vcvt_high_f32_f16(vreinterpretq_f16_u16(s_pair));
+
+    let a0_h = act0.values().as_chunks::<16>().0;
+    let a1_h = act1.values().as_chunks::<16>().0;
+    let a00 = load_s8x16(&a0_h[0]);
+    let a01 = load_s8x16(&a0_h[1]);
+    let a10 = load_s8x16(&a1_h[0]);
+    let a11 = load_s8x16(&a1_h[1]);
+
+    sum0 = q8_0_quad_sdot_step(b0, a00, a01, rs0, vdupq_n_f32(act0.scale()), sum0);
+    sum0 = q8_0_quad_sdot_step(b1, a10, a11, rs1, vdupq_n_f32(act1.scale()), sum0);
+    Some(sum0)
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_4rows_sdot_full<A: super::Q8ActivationView>(
+    rows: [&[u8]; 4],
+    activation: &[A],
+) -> Option<[f32; 4]> {
+    use core::arch::aarch64::{
+        vand_u16, vcvt_f32_f16, vdup_n_u16, vdupq_n_f32, vdupq_n_u16, vmaxv_u16,
+        vreinterpret_f16_u16,
+    };
+    let block_count = activation.len();
+    let row_chunks: [&[[u8; 34]]; 4] = rows.map(|row| row.as_chunks::<34>().0);
+    if block_count == 0 || row_chunks.iter().any(|c| c.len() != block_count) {
+        return None;
+    }
+    let (act_pairs, act_tail) = activation.as_chunks::<2>();
+    let r0 = row_chunks[0].as_chunks::<2>();
+    let r1 = row_chunks[1].as_chunks::<2>();
+    let r2 = row_chunks[2].as_chunks::<2>();
+    let r3 = row_chunks[3].as_chunks::<2>();
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mask_7fff = vdupq_n_u16(0x7fff);
+    for ((((p0, p1), p2), p3), act_pair) in r0.0.iter().zip(r1.0).zip(r2.0).zip(r3.0).zip(act_pairs)
+    {
+        sum0 = q8_0_4rows_pair_step(
+            [&p0[0], &p1[0], &p2[0], &p3[0]],
+            [&p0[1], &p1[1], &p2[1], &p3[1]],
+            &act_pair[0],
+            &act_pair[1],
+            mask_7fff,
+            sum0,
+        )?;
+    }
+    if let (Some(b0), Some(b1), Some(b2), Some(b3), Some(act0)) = (
+        r0.1.first(),
+        r1.1.first(),
+        r2.1.first(),
+        r3.1.first(),
+        act_tail.first(),
+    ) {
+        let blocks = [b0, b1, b2, b3];
+        let s = load_f16_scales_x4(blocks);
+        if vmaxv_u16(vand_u16(s, vdup_n_u16(0x7fff))) >= 0x7c00 {
+            return None;
+        }
+        let rs0 = vcvt_f32_f16(vreinterpret_f16_u16(s));
+        let a0_h = act0.values().as_chunks::<16>().0;
+        sum0 = q8_0_quad_sdot_step(
+            blocks,
+            load_s8x16(&a0_h[0]),
+            load_s8x16(&a0_h[1]),
+            rs0,
+            vdupq_n_f32(act0.scale()),
+            sum0,
+        );
+    }
+    let mut out = [0.0_f32; 4];
+    store_f32x4_neon(sum0, &mut out);
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_8rows_step<A: super::Q8ActivationView>(
+    blocks: [&[u8; 34]; 8],
+    act: &A,
+    mask_7fff: core::arch::aarch64::uint16x8_t,
+    sum0: core::arch::aarch64::float32x4_t,
+    sum1: core::arch::aarch64::float32x4_t,
+) -> Option<(
+    core::arch::aarch64::float32x4_t,
+    core::arch::aarch64::float32x4_t,
+)> {
+    use core::arch::aarch64::{
+        vandq_u16, vcombine_u16, vcvt_f32_f16, vcvt_high_f32_f16, vdupq_n_f32, vget_low_u16,
+        vmaxvq_u16, vreinterpret_f16_u16, vreinterpretq_f16_u16,
+    };
+    let s0 = vcombine_u16(
+        load_f16_scales_x4([blocks[0], blocks[1], blocks[2], blocks[3]]),
+        load_f16_scales_x4([blocks[4], blocks[5], blocks[6], blocks[7]]),
+    );
+    if vmaxvq_u16(vandq_u16(s0, mask_7fff)) >= 0x7c00 {
+        return None;
+    }
+    let rs_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(s0)));
+    let rs_hi = vcvt_high_f32_f16(vreinterpretq_f16_u16(s0));
+    let a_h = act.values().as_chunks::<16>().0;
+    let a0 = load_s8x16(&a_h[0]);
+    let a1 = load_s8x16(&a_h[1]);
+    let act_scale = vdupq_n_f32(act.scale());
+    Some((
+        q8_0_quad_sdot_step(
+            [blocks[0], blocks[1], blocks[2], blocks[3]],
+            a0,
+            a1,
+            rs_lo,
+            act_scale,
+            sum0,
+        ),
+        q8_0_quad_sdot_step(
+            [blocks[4], blocks[5], blocks[6], blocks[7]],
+            a0,
+            a1,
+            rs_hi,
+            act_scale,
+            sum1,
+        ),
+    ))
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_8rows_sdot_full<A: super::Q8ActivationView>(
+    rows: [&[u8]; 8],
+    activation: &[A],
+) -> Option<[f32; 8]> {
+    use core::arch::aarch64::{vdupq_n_f32, vdupq_n_u16};
+    let block_count = activation.len();
+    let row_chunks: [&[[u8; 34]]; 8] = rows.map(|row| row.as_chunks::<34>().0);
+    if block_count == 0 || row_chunks.iter().any(|c| c.len() != block_count) {
+        return None;
+    }
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mask_7fff = vdupq_n_u16(0x7fff);
+    for ((((((((b0, b1), b2), b3), b4), b5), b6), b7), act) in row_chunks[0]
+        .iter()
+        .zip(row_chunks[1])
+        .zip(row_chunks[2])
+        .zip(row_chunks[3])
+        .zip(row_chunks[4])
+        .zip(row_chunks[5])
+        .zip(row_chunks[6])
+        .zip(row_chunks[7])
+        .zip(activation)
+    {
+        (sum0, sum1) =
+            q8_0_8rows_step([b0, b1, b2, b3, b4, b5, b6, b7], act, mask_7fff, sum0, sum1)?;
+    }
+    let mut lo = [0.0_f32; 4];
+    let mut hi = [0.0_f32; 4];
+    store_f32x4_neon(sum0, &mut lo);
+    store_f32x4_neon(sum1, &mut hi);
+    let out = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_16rows_sdot_full<A: super::Q8ActivationView>(
+    rows: [&[u8]; 16],
+    activation: &[A],
+) -> Option<[f32; 16]> {
+    let lo = q8_0_8rows_sdot_full(
+        [
+            rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
+        ],
+        activation,
+    )?;
+    let hi = q8_0_8rows_sdot_full(
+        [
+            rows[8], rows[9], rows[10], rows[11], rows[12], rows[13], rows[14], rows[15],
+        ],
+        activation,
+    )?;
+    Some([
+        lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3], hi[4],
+        hi[5], hi[6], hi[7],
+    ])
+}
+
+#[inline]
+pub(super) fn q8_0_detected_dot_scaled_rows<const ROWS: usize, A: super::Q8ActivationView>(
+    detected: super::Q8Dotprod,
+    rows: [&[u8]; ROWS],
+    activation: &[A],
+) -> Option<[f32; ROWS]> {
+    if !detected.dotprod {
+        return super::scaled::portable_q8_0_rows_validated::<ROWS, A>(rows, activation);
+    }
+    match ROWS {
+        1 => {
+            let r1: [&[u8]; 1] = rows.as_slice().try_into().ok()?;
+            // SAFETY: `detected.dotprod` was established by `has_dotprod()` and baseline `neon`
+            // on AArch64; the safe caller validated row/activation extents and finite scales.
+            let res = unsafe { q8_0_1row_sdot::<A>(r1[0], activation)? };
+            res.as_slice().try_into().ok()
+        }
+        4 => {
+            let r4: [&[u8]; 4] = rows.as_slice().try_into().ok()?;
+            // SAFETY: `detected.dotprod` was established by `has_dotprod()` and baseline `neon`
+            // on AArch64; the safe caller validated row/activation extents and finite scales.
+            let res = unsafe { q8_0_4rows_sdot_full::<A>(r4, activation)? };
+            res.as_slice().try_into().ok()
+        }
+        8 => {
+            let r8: [&[u8]; 8] = rows.as_slice().try_into().ok()?;
+            // SAFETY: `detected.dotprod` was established by `has_dotprod()` and baseline `neon`
+            // on AArch64; the safe caller validated row/activation extents and finite scales.
+            let res = unsafe { q8_0_8rows_sdot_full::<A>(r8, activation)? };
+            res.as_slice().try_into().ok()
+        }
+        16 => {
+            let r16: [&[u8]; 16] = rows.as_slice().try_into().ok()?;
+            // SAFETY: `detected.dotprod` was established by `has_dotprod()` and baseline `neon`
+            // on AArch64; the safe caller validated row/activation extents and finite scales.
+            let res = unsafe { q8_0_16rows_sdot_full::<A>(r16, activation)? };
+            res.as_slice().try_into().ok()
+        }
+        _ => None,
+    }
+}
+
+#[inline]
 pub(super) fn q8_0_detected_dot_scaled_8x_tokens<A: super::Q8ActivationView>(
     detected: super::Q8Dotprod,
     rows: [&[u8]; 8],

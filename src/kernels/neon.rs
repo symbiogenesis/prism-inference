@@ -4486,11 +4486,56 @@ pub(super) fn dot_ptq1_sixteen_rows_source(
 }
 
 #[inline]
+fn validate_q8_0_rows<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    input: &[super::Q8Block],
+) -> Result<usize> {
+    let expected_bytes = input
+        .len()
+        .checked_mul(34)
+        .ok_or_else(|| crate::invalid("q8_0 row byte length overflow"))?;
+    if rows.iter().any(|row| row.len() != expected_bytes) {
+        return Err(crate::invalid("mismatched q8_0 row byte length"));
+    }
+    Ok(input.len())
+}
+
+#[inline]
+fn try_dot_q8_0_rows_dotprod<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    input: &[super::Q8Block],
+) -> Option<Result<[f32; ROWS]>> {
+    if let Err(err) = validate_q8_0_rows(rows, input) {
+        return Some(Err(err));
+    }
+    if input.is_empty() {
+        return Some(Ok([0.0; ROWS]));
+    }
+    let dotprod = bonsai_neon_dot::Q8Dotprod::detect()?;
+    Some(
+        dotprod
+            .dot_scaled_rows_view::<ROWS, _>(rows, input)
+            .ok_or_else(|| crate::invalid("nonfinite tensor or activation value")),
+    )
+}
+
+#[inline]
+pub(super) fn dot_q8_0_row(bytes: &[u8], input: &[super::Q8Block]) -> Result<f32> {
+    if let Some(res) = try_dot_q8_0_rows_dotprod::<1>([bytes], input) {
+        return res.map(|[v]| v);
+    }
+    super::dot_legacy(super::Q8_0, bytes, input)
+}
+
+#[inline]
 #[expect(
     clippy::suboptimal_flops,
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
 pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> Result<[f32; 4]> {
+    if let Some(res) = try_dot_q8_0_rows_dotprod::<4>(rows, input) {
+        return res;
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return Ok([
             super::dot_legacy(super::Q8_0, rows[0], input)?,
@@ -4502,8 +4547,10 @@ pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> 
     let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut outputs = [0.0_f32; 4];
     let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
+    let mut act_finite = true;
     let chunks = rows.map(|row| row.as_chunks::<34>().0);
     for (index, activation) in input.iter().enumerate() {
+        act_finite &= activation.scale.is_finite();
         let b0 = &chunks[0][index];
         let b1 = &chunks[1][index];
         let b2 = &chunks[2][index];
@@ -4541,7 +4588,7 @@ pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> 
             }
         }
     }
-    if !scales_finite.all_true() {
+    if !scales_finite.all_true() || !act_finite {
         return Err(crate::invalid("nonfinite tensor or activation value"));
     }
     for out in &mut outputs {
@@ -4556,6 +4603,9 @@ pub(super) fn dot_q8_0_four_rows(rows: [&[u8]; 4], input: &[super::Q8Block]) -> 
     reason = "Preserve scalar reference multiply-then-add rounding."
 )]
 pub(super) fn dot_q8_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) -> Result<[f32; 8]> {
+    if let Some(res) = try_dot_q8_0_rows_dotprod::<8>(rows, input) {
+        return res;
+    }
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         let first = dot_q8_0_four_rows([rows[0], rows[1], rows[2], rows[3]], input)?;
         let second = dot_q8_0_four_rows([rows[4], rows[5], rows[6], rows[7]], input)?;
@@ -4566,8 +4616,10 @@ pub(super) fn dot_q8_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) ->
     let use_dotprod = bonsai_neon_dot::has_dotprod();
     let mut outputs = [0.0_f32; 8];
     let mut scales_finite = f32x4::splat(neon, 0.0).is_finite();
+    let mut act_finite = true;
     let chunks = rows.map(|row| row.as_chunks::<34>().0);
     for (index, activation) in input.iter().enumerate() {
+        act_finite &= activation.scale.is_finite();
         let (scales_lo, scales_hi) = f16_bits_to_f32_x8(
             neon,
             &[
@@ -4615,13 +4667,39 @@ pub(super) fn dot_q8_0_eight_rows(rows: [&[u8]; 8], input: &[super::Q8Block]) ->
             }
         }
     }
-    if !scales_finite.all_true() {
+    if !scales_finite.all_true() || !act_finite {
         return Err(crate::invalid("nonfinite tensor or activation value"));
     }
     for out in &mut outputs {
         *out = super::finite(*out)?;
     }
     Ok(outputs)
+}
+
+#[inline]
+pub(super) fn dot_q8_0_sixteen_rows(
+    rows: [&[u8]; 16],
+    input: &[super::Q8Block],
+) -> Result<[f32; 16]> {
+    if let Some(res) = try_dot_q8_0_rows_dotprod::<16>(rows, input) {
+        return res;
+    }
+    let lo = dot_q8_0_eight_rows(
+        [
+            rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
+        ],
+        input,
+    )?;
+    let hi = dot_q8_0_eight_rows(
+        [
+            rows[8], rows[9], rows[10], rows[11], rows[12], rows[13], rows[14], rows[15],
+        ],
+        input,
+    )?;
+    Ok([
+        lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3], hi[4],
+        hi[5], hi[6], hi[7],
+    ])
 }
 
 #[inline]
@@ -8187,5 +8265,141 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    fn build_q8_0_full_k_fixture(
+        rows: usize,
+        blocks: usize,
+        seed: usize,
+        extreme_payload: bool,
+    ) -> (Vec<u8>, usize, Vec<super::super::Q8Block>) {
+        let row_bytes = blocks * 34;
+        let f16_scales = [
+            0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3555, 0xb787, 0x3c00, 0xbc00,
+        ];
+        let act_scales = [0.0_f32, -0.0, 0.125, -0.375, 1.25, -2.5, 0.0625, -0.75];
+        let mut data = vec![0_u8; rows * row_bytes];
+        for r in 0..rows {
+            for b in 0..blocks {
+                let off = r * row_bytes + b * 34;
+                data[off..off + 2].copy_from_slice(
+                    &f16_scales[(r * 5 + b * 3 + seed) % f16_scales.len()].to_le_bytes(),
+                );
+                for i in 0..32 {
+                    data[off + 2 + i] = if extreme_payload {
+                        if (r + b + i + seed).is_multiple_of(2) {
+                            0x80
+                        } else {
+                            0x7f
+                        }
+                    } else {
+                        ((r * 41 + b * 23 + i * 13 + seed * 7) % 256).to_le_bytes()[0]
+                    };
+                }
+            }
+        }
+        let input = (0..blocks)
+            .map(|b| super::super::Q8Block {
+                scale: act_scales[(b * 5 + seed) % act_scales.len()],
+                sum: 0.0,
+                values: std::array::from_fn(|i| {
+                    if extreme_payload {
+                        if (b + i + seed).is_multiple_of(2) {
+                            i8::MIN
+                        } else {
+                            i8::MAX
+                        }
+                    } else {
+                        i8::from_ne_bytes([((b * 31 + i * 17 + seed * 11) % 256).to_le_bytes()[0]])
+                    }
+                }),
+            })
+            .collect();
+        (data, row_bytes, input)
+    }
+
+    #[test]
+    fn simd_neon_q8_0_full_k_1_4_8_16_rows_match_dot_legacy_zero_ulp() -> crate::Result<()> {
+        for &blocks in &[1_usize, 2, 3, 7, 64] {
+            for &(seed, extreme) in &[(0_usize, false), (3, true)] {
+                let (data, row_bytes, input) = build_q8_0_full_k_fixture(16, blocks, seed, extreme);
+                let row_refs: [&[u8]; 16] =
+                    std::array::from_fn(|r| &data[r * row_bytes..(r + 1) * row_bytes]);
+                let mut expected = [0_u32; 16];
+                for r in 0..16 {
+                    expected[r] =
+                        super::super::dot_legacy(super::super::Q8_0, row_refs[r], &input)?
+                            .to_bits();
+                    let actual_one = super::dot_q8_0_row(row_refs[r], &input)?;
+                    assert_eq!(actual_one.to_bits(), expected[r]);
+                }
+
+                for chunk in 0..4 {
+                    let base = chunk * 4;
+                    let four =
+                        dot_q8_0_four_rows(std::array::from_fn(|r| row_refs[base + r]), &input)?;
+                    for r in 0..4 {
+                        assert_eq!(four[r].to_bits(), expected[base + r]);
+                    }
+                }
+
+                for half in 0..2 {
+                    let base = half * 8;
+                    let eight =
+                        dot_q8_0_eight_rows(std::array::from_fn(|r| row_refs[base + r]), &input)?;
+                    for r in 0..8 {
+                        assert_eq!(eight[r].to_bits(), expected[base + r]);
+                    }
+                }
+
+                let sixteen = super::dot_q8_0_sixteen_rows(row_refs, &input)?;
+                for r in 0..16 {
+                    assert_eq!(sixteen[r].to_bits(), expected[r]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simd_neon_q8_0_full_k_rejects_nonfinite_scales_and_bad_slices() {
+        let (data, row_bytes, input) = build_q8_0_full_k_fixture(16, 7, 1, false);
+        for bad_row in [0_usize, 3, 7, 8, 15] {
+            for bad_f16 in [0x7c00_u16, 0x7e00, 0xfc00] {
+                let mut bad_data = data.clone();
+                let off = bad_row * row_bytes + 5 * 34;
+                bad_data[off..off + 2].copy_from_slice(&bad_f16.to_le_bytes());
+                let bad_refs: [&[u8]; 16] =
+                    std::array::from_fn(|r| &bad_data[r * row_bytes..(r + 1) * row_bytes]);
+                assert!(super::dot_q8_0_row(bad_refs[bad_row], &input).is_err());
+                assert!(super::dot_q8_0_sixteen_rows(bad_refs, &input).is_err());
+                let half = (bad_row / 8) * 8;
+                assert!(
+                    dot_q8_0_eight_rows(std::array::from_fn(|r| bad_refs[half + r]), &input)
+                        .is_err()
+                );
+                let quarter = (bad_row / 4) * 4;
+                assert!(
+                    dot_q8_0_four_rows(std::array::from_fn(|r| bad_refs[quarter + r]), &input)
+                        .is_err()
+                );
+            }
+        }
+
+        let row_refs: [&[u8]; 16] =
+            std::array::from_fn(|r| &data[r * row_bytes..(r + 1) * row_bytes]);
+        for bad_act in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (_, _, mut bad_input) = build_q8_0_full_k_fixture(16, 7, 1, false);
+            bad_input[4].scale = bad_act;
+            assert!(super::dot_q8_0_row(row_refs[0], &bad_input).is_err());
+            assert!(dot_q8_0_four_rows(std::array::from_fn(|r| row_refs[r]), &bad_input).is_err());
+            assert!(dot_q8_0_eight_rows(std::array::from_fn(|r| row_refs[r]), &bad_input).is_err());
+            assert!(super::dot_q8_0_sixteen_rows(row_refs, &bad_input).is_err());
+        }
+
+        let mut short_refs = row_refs;
+        short_refs[11] = &row_refs[11][..row_bytes - 1];
+        assert!(super::dot_q8_0_sixteen_rows(short_refs, &input).is_err());
+        assert!(super::dot_q8_0_row(short_refs[11], &input).is_err());
     }
 }

@@ -537,6 +537,49 @@ impl Q8Dotprod {
         })
     }
 
+    /// Consumes `1`, `4`, `8`, or `16` complete 34-byte `Q8_0` weight rows inside one
+    /// full-K invocation using [`Q8ActivationBlock`] slices.
+    ///
+    /// Preserves exact `0 ULP` parity with scalar/NEON left-to-right non-FMA
+    /// `(row_scale * act_scale) * int_dot` accumulation. Returns `None` for
+    /// unsupported geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows<const ROWS: usize>(
+        self,
+        rows: [&[u8]; ROWS],
+        activation: &[Q8ActivationBlock],
+    ) -> Option<[f32; ROWS]> {
+        self.dot_scaled_rows_view::<ROWS, Q8ActivationBlock>(rows, activation)
+    }
+
+    /// Consumes `1`, `4`, `8`, or `16` complete 34-byte `Q8_0` weight rows inside one
+    /// full-K invocation over any [`Q8ActivationView`] slice.
+    ///
+    /// Preserves exact `0 ULP` parity with scalar/NEON left-to-right non-FMA
+    /// `(row_scale * act_scale) * int_dot` accumulation. Returns `None` for
+    /// unsupported geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows_view<const ROWS: usize, A: Q8ActivationView>(
+        self,
+        rows: [&[u8]; ROWS],
+        activation: &[A],
+    ) -> Option<[f32; ROWS]> {
+        if !scaled::valid_q8_0_rows(rows, activation) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::q8_0_detected_dot_scaled_rows::<ROWS, A>(self, rows, activation)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            scaled::portable_q8_0_rows_validated::<ROWS, A>(rows, activation)
+        }
+    }
+
     /// Consumes `8` complete 34-byte `Q8_0` weight rows across `1..=8` tokens inside
     /// one full-K invocation using [`Q8ActivationBlock`] slices.
     ///
@@ -1289,6 +1332,43 @@ pub fn smmla_q8_0_8x4(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 4]) -> [[i32; 4]; 
         return tile;
     }
     rows.map(|row| cols.map(|col| dot_q8_0_block(row, col)))
+}
+
+/// Consumes `1`, `4`, `8`, or `16` complete 34-byte `Q8_0` weight rows against
+/// [`Q8ActivationBlock`] slices inside one full-K invocation.
+///
+/// Uses `SDOT` on ARM64 or portable fallback otherwise, preserving exact
+/// `0 ULP` non-FMA rounding. Returns `None` for unsupported geometry or
+/// nonfinite scales/outputs.
+#[inline]
+#[must_use]
+pub fn dot_q8_0_scaled_rows<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    activation: &[Q8ActivationBlock],
+) -> Option<[f32; ROWS]> {
+    dot_q8_0_scaled_rows_view::<ROWS, Q8ActivationBlock>(rows, activation)
+}
+
+/// Consumes `1`, `4`, `8`, or `16` complete 34-byte `Q8_0` weight rows against
+/// generic [`Q8ActivationView`] slices inside one full-K invocation.
+///
+/// Uses `SDOT` on ARM64 or portable fallback otherwise, preserving exact
+/// `0 ULP` non-FMA rounding. Returns `None` for unsupported geometry or
+/// nonfinite scales/outputs.
+#[inline]
+#[must_use]
+pub fn dot_q8_0_scaled_rows_view<const ROWS: usize, A: Q8ActivationView>(
+    rows: [&[u8]; ROWS],
+    activation: &[A],
+) -> Option<[f32; ROWS]> {
+    if !scaled::valid_q8_0_rows(rows, activation) {
+        return None;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(detected) = Q8Dotprod::detect() {
+        return aarch64::q8_0_detected_dot_scaled_rows::<ROWS, A>(detected, rows, activation);
+    }
+    scaled::portable_q8_0_rows_validated::<ROWS, A>(rows, activation)
 }
 
 /// Consumes `8` complete 34-byte `Q8_0` weight rows across `1..=8` [`Q8ActivationBlock`]

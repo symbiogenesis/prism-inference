@@ -183,6 +183,19 @@ pub(super) fn valid_ptq1_8x_tokens<A: Q8ActivationView>(rows: [&[u8]; 8], tokens
             .all(|tok| tok.len() == len && tok.iter().all(|block| block.scale().is_finite()))
 }
 
+pub(super) fn valid_q8_0_rows<const ROWS: usize, A: Q8ActivationView>(
+    rows: [&[u8]; ROWS],
+    activation: &[A],
+) -> bool {
+    let block_count = activation.len();
+    matches!(ROWS, 1 | 4 | 8 | 16)
+        && block_count != 0
+        && block_count
+            .checked_mul(34)
+            .is_some_and(|bytes| rows.iter().all(|row| row.len() == bytes))
+        && activation.iter().all(|block| block.scale().is_finite())
+}
+
 pub(super) fn valid_q8_0_8x_tokens<A: Q8ActivationView>(rows: [&[u8]; 8], tokens: &[&[A]]) -> bool {
     if tokens.is_empty() || tokens.len() > 8 {
         return false;
@@ -286,6 +299,40 @@ pub(super) fn portable_ptq1_8x_tokens_validated<const PINNED: bool, A: Q8Activat
         }
     }
     Some(())
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    clippy::suboptimal_flops,
+    reason = "32-element i8*i8 dot fits in f32 mantissa and non-FMA multiply-then-add matches scalar Q8_0 rounding."
+)]
+pub(super) fn portable_q8_0_rows_validated<const ROWS: usize, A: Q8ActivationView>(
+    rows: [&[u8]; ROWS],
+    activation: &[A],
+) -> Option<[f32; ROWS]> {
+    let mut output = [0.0_f32; ROWS];
+    for (row, dst) in rows.into_iter().zip(&mut output) {
+        let mut sum = 0.0_f32;
+        for (block, act) in row.as_chunks::<34>().0.iter().zip(activation) {
+            let row_scale = bonsai_ternary::half_to_float(u16::from_le_bytes([block[0], block[1]]));
+            if !row_scale.is_finite() {
+                return None;
+            }
+            let act_vals = act.values();
+            let int_dot: i32 = block[2..34]
+                .iter()
+                .zip(act_vals)
+                .map(|(&w, &a)| i32::from(i8::from_ne_bytes([w])) * i32::from(a))
+                .sum();
+            sum += (row_scale * act.scale()) * (int_dot as f32);
+        }
+        if !sum.is_finite() {
+            return None;
+        }
+        *dst = sum;
+    }
+    Some(output)
 }
 
 #[cfg(any(test, not(target_arch = "aarch64")))]
@@ -1456,5 +1503,223 @@ mod tests {
         for r in 0..8 {
             assert_eq!(out[r].map(f32::to_bits), sentinel[r].map(f32::to_bits));
         }
+    }
+
+    fn sample_q8_0_rows16_fixture(
+        blocks_per_row: usize,
+        seed: usize,
+    ) -> ([Vec<u8>; 16], Vec<super::Q8ActivationBlock>) {
+        let f16_scales = [
+            0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3555, 0xb787, 0x3c00, 0xbc00,
+        ];
+        let act_scales = [0.0_f32, -0.0, 0.125, -0.375, 1.5, -2.25, 0.0625, -0.5];
+        let rows: [Vec<u8>; 16] = std::array::from_fn(|row| {
+            let mut bytes: Vec<u8> = (0..blocks_per_row * 34)
+                .map(|i| {
+                    i.wrapping_mul(61 + row)
+                        .wrapping_add(seed * 13 + row * 7)
+                        .to_le_bytes()[0]
+                })
+                .collect();
+            for (b, block) in bytes.as_chunks_mut::<34>().0.iter_mut().enumerate() {
+                let s = f16_scales[(b * 3 + row + seed) % f16_scales.len()];
+                block[..2].copy_from_slice(&s.to_le_bytes());
+                if (b + row) % 5 == 0 {
+                    block[2..34].fill(0x80);
+                } else if (b + row) % 7 == 0 {
+                    block[2..34].fill(0x7f);
+                }
+            }
+            bytes
+        });
+        let acts: Vec<super::Q8ActivationBlock> = (0..blocks_per_row)
+            .map(|b| super::Q8ActivationBlock {
+                scale: act_scales[(b * 5 + seed) % act_scales.len()],
+                values: std::array::from_fn(|lane| {
+                    if b % 6 == 0 {
+                        if lane % 2 == 0 { -128 } else { 127 }
+                    } else {
+                        i8::from_ne_bytes([lane
+                            .wrapping_mul(43 + b)
+                            .wrapping_add(b * 17 + seed)
+                            .to_le_bytes()[0]])
+                    }
+                }),
+            })
+            .collect();
+        (rows, acts)
+    }
+
+    #[test]
+    fn x1_q8_0_scaled_rows_1_4_8_16_match_portable_zero_ulp() {
+        use super::portable_q8_0_rows_validated;
+
+        let Some(detected) = crate::Q8Dotprod::detect() else {
+            return;
+        };
+        #[cfg(target_arch = "aarch64")]
+        let caps = [
+            detected,
+            crate::Q8Dotprod {
+                i8mm: false,
+                ..detected
+            },
+            crate::Q8Dotprod {
+                dotprod: false,
+                ..detected
+            },
+        ];
+        #[cfg(not(target_arch = "aarch64"))]
+        let caps = [detected];
+
+        for (seed, block_count) in [1_usize, 2, 3, 4, 5, 7, 16, 64].into_iter().enumerate() {
+            let (rows, acts) = sample_q8_0_rows16_fixture(block_count, seed + 11);
+            let act_views: Vec<(&[i8; 32], f32)> =
+                acts.iter().map(|b| (&b.values, b.scale)).collect();
+
+            let r1 = [rows[0].as_slice()];
+            let r4: [&[u8]; 4] = std::array::from_fn(|r| rows[r].as_slice());
+            let r8: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+            let r16: [&[u8]; 16] = std::array::from_fn(|r| rows[r].as_slice());
+
+            let exp1 = portable_q8_0_rows_validated(r1, &acts).map(|v| v.map(f32::to_bits));
+            let exp4 = portable_q8_0_rows_validated(r4, &acts).map(|v| v.map(f32::to_bits));
+            let exp8 = portable_q8_0_rows_validated(r8, &acts).map(|v| v.map(f32::to_bits));
+            let exp16 = portable_q8_0_rows_validated(r16, &acts).map(|v| v.map(f32::to_bits));
+            assert!(exp16.is_some());
+
+            for cap in caps {
+                assert_eq!(
+                    cap.dot_scaled_rows(r1, &acts).map(|v| v.map(f32::to_bits)),
+                    exp1
+                );
+                assert_eq!(
+                    cap.dot_scaled_rows(r4, &acts).map(|v| v.map(f32::to_bits)),
+                    exp4
+                );
+                assert_eq!(
+                    cap.dot_scaled_rows(r8, &acts).map(|v| v.map(f32::to_bits)),
+                    exp8
+                );
+                assert_eq!(
+                    cap.dot_scaled_rows(r16, &acts).map(|v| v.map(f32::to_bits)),
+                    exp16
+                );
+                assert_eq!(
+                    cap.dot_scaled_rows_view(r16, &act_views)
+                        .map(|v| v.map(f32::to_bits)),
+                    exp16
+                );
+            }
+            assert_eq!(
+                crate::dot_q8_0_scaled_rows(r1, &acts).map(|v| v.map(f32::to_bits)),
+                exp1
+            );
+            assert_eq!(
+                crate::dot_q8_0_scaled_rows(r4, &acts).map(|v| v.map(f32::to_bits)),
+                exp4
+            );
+            assert_eq!(
+                crate::dot_q8_0_scaled_rows(r8, &acts).map(|v| v.map(f32::to_bits)),
+                exp8
+            );
+            assert_eq!(
+                crate::dot_q8_0_scaled_rows(r16, &acts).map(|v| v.map(f32::to_bits)),
+                exp16
+            );
+            assert_eq!(
+                crate::dot_q8_0_scaled_rows_view(r16, &act_views).map(|v| v.map(f32::to_bits)),
+                exp16
+            );
+        }
+    }
+
+    #[test]
+    fn x1_q8_0_scaled_rows_reject_bad_inputs_and_overflow() {
+        let Some(detected) = crate::Q8Dotprod::detect() else {
+            return;
+        };
+        let (rows, mut acts) = sample_q8_0_rows16_fixture(5, 77);
+        let r16: [&[u8]; 16] = std::array::from_fn(|r| rows[r].as_slice());
+
+        assert!(detected.dot_scaled_rows([r16[0]], &[]).is_none());
+        assert!(detected.dot_scaled_rows([r16[0], r16[1]], &acts).is_none());
+        assert!(
+            detected
+                .dot_scaled_rows([r16[0], r16[1], r16[2]], &acts)
+                .is_none()
+        );
+        assert!(
+            detected
+                .dot_scaled_rows([&rows[0][..5 * 34 - 1]], &acts)
+                .is_none()
+        );
+        let mut mismatched16 = r16;
+        mismatched16[15] = &rows[15][..4 * 34];
+        assert!(detected.dot_scaled_rows(mismatched16, &acts).is_none());
+
+        for bad_f16 in [0x7c00_u16, 0x7e00, 0xfc00] {
+            for (bad_row, bad_blk) in [(0, 0), (0, 4), (3, 1), (7, 4), (15, 4)] {
+                let mut bad_rows = rows.clone();
+                bad_rows[bad_row][bad_blk * 34..bad_blk * 34 + 2]
+                    .copy_from_slice(&bad_f16.to_le_bytes());
+                let bad16: [&[u8]; 16] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                assert!(detected.dot_scaled_rows(bad16, &acts).is_none());
+                if bad_row < 8 {
+                    let bad8: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                    assert!(detected.dot_scaled_rows(bad8, &acts).is_none());
+                }
+                if bad_row < 4 {
+                    let bad4: [&[u8]; 4] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                    assert!(detected.dot_scaled_rows(bad4, &acts).is_none());
+                }
+                if bad_row == 0 {
+                    assert!(
+                        detected
+                            .dot_scaled_rows([bad_rows[0].as_slice()], &acts)
+                            .is_none()
+                    );
+                }
+            }
+        }
+
+        let orig_scale = acts[4].scale;
+        acts[4].scale = f32::NAN;
+        assert!(detected.dot_scaled_rows(r16, &acts).is_none());
+        acts[4].scale = f32::INFINITY;
+        assert!(detected.dot_scaled_rows(r16, &acts).is_none());
+        acts[4].scale = orig_scale;
+
+        let mut ovf_row = vec![0x7f_u8; 5 * 34];
+        for blk in ovf_row.as_chunks_mut::<34>().0 {
+            blk[..2].copy_from_slice(&0x7bff_u16.to_le_bytes());
+        }
+        let ovf_acts = vec![
+            super::Q8ActivationBlock {
+                scale: 1.0e32,
+                values: [127; 32],
+            };
+            5
+        ];
+        assert!(
+            detected
+                .dot_scaled_rows([ovf_row.as_slice()], &ovf_acts)
+                .is_none()
+        );
+        assert!(
+            detected
+                .dot_scaled_rows([ovf_row.as_slice(); 4], &ovf_acts)
+                .is_none()
+        );
+        assert!(
+            detected
+                .dot_scaled_rows([ovf_row.as_slice(); 8], &ovf_acts)
+                .is_none()
+        );
+        assert!(
+            detected
+                .dot_scaled_rows([ovf_row.as_slice(); 16], &ovf_acts)
+                .is_none()
+        );
     }
 }

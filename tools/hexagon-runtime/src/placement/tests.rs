@@ -532,3 +532,152 @@ fn placement_f32_groups_require_explicit_opt_in_and_full_member_selection() -> R
     assert_eq!(inner.calls, 2);
     Ok(())
 }
+
+#[test]
+fn placement_admits_ptq1_f32_when_supported_and_falls_back_to_q8_only_without_f32() -> Result<()> {
+    struct DualPtq1Executor {
+        f32_enabled: bool,
+        f32_calls: usize,
+        q8_calls: usize,
+    }
+
+    impl Pq2ProjectionExecutor for DualPtq1Executor {
+        fn identity(&self) -> &'static str {
+            "dual-ptq1-control"
+        }
+
+        fn supports(&self, _: &Tensor) -> bool {
+            false
+        }
+
+        fn supports_f32(&self, tensor: &Tensor) -> bool {
+            self.f32_enabled && tensor.kind == 143 && tensor.dimensions[0].is_multiple_of(128)
+        }
+
+        fn supports_q8(&self, tensor: &Tensor) -> bool {
+            tensor.kind == 143
+        }
+
+        fn project(
+            &mut self,
+            _: &Tensor,
+            _: &[Q8KBlock],
+            _: bool,
+            output: &mut Vec<f32>,
+        ) -> Result<()> {
+            output.clear();
+            Err(invalid("unexpected Q8K call"))
+        }
+
+        fn project_f32(
+            &mut self,
+            tensor: &Tensor,
+            _: &[f32],
+            _: bool,
+            output: &mut Vec<f32>,
+        ) -> Result<()> {
+            self.f32_calls += 1;
+            output.resize(tensor.dimensions[1], 7.0);
+            Ok(())
+        }
+
+        fn project_q8(
+            &mut self,
+            tensor: &Tensor,
+            _: &[Q8Block],
+            _: bool,
+            output: &mut Vec<f32>,
+        ) -> Result<()> {
+            self.q8_calls += 1;
+            output.resize(tensor.dimensions[1], 3.0);
+            Ok(())
+        }
+    }
+
+    let mut ptq1_model = model();
+    let ptq1_up = tensor("blk.0.ffn_up.weight", 143, 256);
+    ptq1_model.tensors.insert(ptq1_up.name.clone(), ptq1_up);
+    let target = &ptq1_model.tensors["blk.0.ffn_up.weight"];
+
+    // 1. When supports_f32 is true for kind == 143, Route::F32 takes precedence over Route::Q8.
+    let mut f32_inner = DualPtq1Executor {
+        f32_enabled: true,
+        f32_calls: 0,
+        q8_calls: 0,
+    };
+    let mut placed_f32 =
+        PlacedProjectionExecutor::new(&mut f32_inner, &ptq1_model, &["blk.0.ffn_up.weight"])?;
+    assert!(placed_f32.supports_f32(target));
+    assert!(!placed_f32.supports_q8(target));
+    assert!(!placed_f32.supports(target));
+    let mut out = Vec::new();
+    placed_f32.project_f32(target, &vec![1.0_f32; 256], true, &mut out)?;
+    assert_eq!(out, [7.0]);
+    assert!(placed_f32.project_q8(target, &[], true, &mut out).is_err());
+    assert_eq!(f32_inner.f32_calls, 1);
+    assert_eq!(f32_inner.q8_calls, 0);
+
+    // 2. When supports_f32 is false, kind == 143 falls back cleanly to Route::Q8.
+    let mut q8_inner = DualPtq1Executor {
+        f32_enabled: false,
+        f32_calls: 0,
+        q8_calls: 0,
+    };
+    let mut placed_q8 =
+        PlacedProjectionExecutor::new(&mut q8_inner, &ptq1_model, &["blk.0.ffn_up.weight"])?;
+    assert!(!placed_q8.supports_f32(target));
+    assert!(placed_q8.supports_q8(target));
+    placed_q8.project_q8(target, &[], true, &mut out)?;
+    assert_eq!(out, [3.0]);
+    assert_eq!(q8_inner.q8_calls, 1);
+    Ok(())
+}
+
+#[test]
+fn placed_native_q2_executor_routes_ptq1_via_f32() -> Result<()> {
+    struct Ptq1Submitter {
+        calls: usize,
+    }
+    impl hexagon_native_rpc::NativeQ2Submitter for Ptq1Submitter {
+        fn submit(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            assert_eq!(columns, 256);
+            assert_eq!(rows, 32);
+            assert_eq!(weights.len(), 2304);
+            assert_eq!(activation.len(), 256);
+            self.calls += 1;
+            output.fill(5.5);
+            Ok(())
+        }
+    }
+
+    let mut ptq1_32 = tensor("blk.0.ptq1_up.weight", 143, 256);
+    ptq1_32.dimensions[1] = 32;
+    ptq1_32.data = Arc::<[u8]>::from(ptq1_32.data.repeat(32)).into();
+    let mut ptq1_model = model();
+    ptq1_model.tensors.insert(ptq1_32.name.clone(), ptq1_32);
+    let target_32 = &ptq1_model.tensors["blk.0.ptq1_up.weight"];
+    let limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
+        256,
+        32,
+        16,
+        std::time::Duration::from_secs(4),
+    )
+    .map_err(|_| invalid("limits"))?;
+    let mut native = crate::NativeQ2Executor::new(Ptq1Submitter { calls: 0 }, limits, 1024 * 1024);
+    let mut placed_native =
+        PlacedProjectionExecutor::new(&mut native, &ptq1_model, &["blk.0.ptq1_up.weight"])?;
+    assert!(placed_native.supports_f32(target_32));
+    assert!(!placed_native.supports_q8(target_32));
+    let mut out = Vec::new();
+    placed_native.project_f32(target_32, &vec![1.0_f32; 256], true, &mut out)?;
+    assert_eq!(out, [5.5; 32]);
+    assert_eq!(native.statistics().projections_completed, 1);
+    Ok(())
+}

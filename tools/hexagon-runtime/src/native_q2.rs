@@ -1,10 +1,11 @@
 //! Full-`K` 1-op native `HTP_TYPE_Q2_0` projection executor over `libggml-htp-v81.so`.
 //!
-//! Losslessly transcodes Swift's `PQ2_0` (`34` bytes per 128 weights) into
-//! `llama.cpp`'s native tiled `HTP_TYPE_Q2_0` (`576` bytes per 32x64 tile,
-//! repeating each 128-weight `FP16` scale across both 64-weight sub-tiles) and
-//! executes the full `K <= 5120`, `M <= 17408` projection in a single DSP
-//! operation (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`).
+//! Losslessly transcodes Swift's `PQ2_0` (`34` bytes per 128 weights) and
+//! `PTQ1_0` (`28` bytes per 128 weights) into `llama.cpp`'s native tiled
+//! `HTP_TYPE_Q2_0` (`576` bytes per 32x64 tile, repeating each 128-weight
+//! `FP16` scale across both 64-weight sub-tiles) and executes the full
+//! `K <= 5120`, `M <= 17408` projection in a single DSP operation
+//! (`HTP_MM_KERNEL_HVX_QUANT_ROW_N1`).
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
@@ -222,6 +223,7 @@ pub const DEFAULT_NATIVE_Q2_RESIDENT_METADATA_BYTES: usize = 512 * 1024;
 
 struct ResidentProjection {
     source: bonsai_prism_runtime::model::TensorBytes,
+    kind: u32,
     columns: usize,
     rows: usize,
     first_handle: usize,
@@ -231,8 +233,9 @@ struct ResidentProjection {
 struct ResidentCache {
     projections: Vec<ResidentProjection>,
     // Sorted indirection keeps projection indices stable while new sources are
-    // prepared. Geometry is part of the key: one immutable byte allocation may
-    // legitimately be viewed as differently shaped matrices.
+    // prepared. Encoding kind and geometry are part of the key: one immutable
+    // byte allocation may legitimately be viewed as differently shaped matrices
+    // or distinct packed representations without colliding.
     by_storage: Vec<usize>,
     handles: Vec<NativeQ2WeightHandle>,
     reservation: usize,
@@ -292,16 +295,20 @@ impl ResidentCache {
     }
 
     fn find(&self, tensor: &Tensor) -> Option<usize> {
+        if !matches!(tensor.kind, PQ2_KIND | PTQ1_KIND) {
+            return None;
+        }
         let &[columns, rows] = tensor.dimensions.as_slice() else {
             return None;
         };
-        let key = (tensor.data.as_ptr().addr(), columns, rows);
+        let key = (tensor.data.as_ptr().addr(), tensor.kind, columns, rows);
         let position = self
             .by_storage
             .binary_search_by_key(&key, |&index| {
                 let projection = &self.projections[index];
                 (
                     projection.source.as_ptr().addr(),
+                    projection.kind,
                     projection.columns,
                     projection.rows,
                 )
@@ -310,7 +317,7 @@ impl ResidentCache {
         let index = self.by_storage[position];
         let projection = &self.projections[index];
         (bonsai_prism_runtime::model::TensorBytes::ptr_eq(&projection.source, &tensor.data)
-            && tensor.kind == 142
+            && tensor.kind == projection.kind
             && tensor.dimensions.as_slice() == [projection.columns, projection.rows])
         .then_some(index)
     }
@@ -324,6 +331,7 @@ impl ResidentCache {
     fn commit(&mut self, tensor: &Tensor, first_handle: usize, evaluated: bool) -> usize {
         let key = (
             tensor.data.as_ptr().addr(),
+            tensor.kind,
             tensor.dimensions[0],
             tensor.dimensions[1],
         );
@@ -333,6 +341,7 @@ impl ResidentCache {
                 let projection = &self.projections[index];
                 (
                     projection.source.as_ptr().addr(),
+                    projection.kind,
                     projection.columns,
                     projection.rows,
                 )
@@ -341,6 +350,7 @@ impl ResidentCache {
         let index = self.projections.len();
         self.projections.push(ResidentProjection {
             source: tensor.data.clone(),
+            kind: tensor.kind,
             columns: tensor.dimensions[0],
             rows: tensor.dimensions[1],
             first_handle,
@@ -576,6 +586,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 let block_start = col_start / 128;
                 let packed_bytes = mapped_rows * 36 * chunk_blocks;
                 let geometry = ChunkGeometry {
+                    kind: tensor.kind,
                     total_blocks,
                     row_start,
                     active_rows,
@@ -630,9 +641,9 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         Ok(Some(cache.commit(tensor, first_handle, evaluated)))
     }
 
-    /// Pre-pack and stage a `PQ2_0` projection tensor into the session's
-    /// resident arena before token evaluation so Token 0 flushes the resident
-    /// weight arena only once on its first submission.
+    /// Pre-pack and stage a `PQ2_0` or `PTQ1_0` projection tensor into the
+    /// session's resident arena before token evaluation so Token 0 flushes the
+    /// resident weight arena only once on its first submission.
     /// Native sessions pack directly into fresh admitted resident extents, without
     /// a temporary packed-weight buffer or a subsequent host copy. Other submitters
     /// retain the bounded scratch-and-copy preparation contract.
@@ -671,9 +682,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let single_op =
             columns <= self.maximum_columns && rows <= self.maximum_rows && rows.is_multiple_of(32);
         if !single_op {
-            for block in tensor.data.as_chunks::<34>().0 {
-                scale(block)?;
-            }
+            validate_source_scales(tensor)?;
         }
         let result = self.prepare_resident(tensor, weights, false);
         if result.is_err() {
@@ -819,6 +828,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             pack_native_chunk(
                 &tensor.data,
                 ChunkGeometry {
+                    kind: tensor.kind,
                     total_blocks,
                     row_start: 0,
                     active_rows: rows,
@@ -866,9 +876,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             columns <= self.maximum_columns && rows <= self.maximum_rows && rows.is_multiple_of(32);
         let cached = self.residency.as_ref().and_then(|cache| cache.find(tensor));
         if cached.is_none() && !single_op {
-            for block in tensor.data.as_chunks::<34>().0 {
-                scale(block)?;
-            }
+            validate_source_scales(tensor)?;
         }
         finite_slice(activation)?;
         let max_chunk_cols = columns.min(self.maximum_columns);
@@ -927,6 +935,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 } else {
                     let chunk_blocks = active_cols / 128;
                     let geom = ChunkGeometry {
+                        kind: tensor.kind,
                         total_blocks: columns / 128,
                         row_start,
                         active_rows,
@@ -1346,9 +1355,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         // Retain the scalar tiled path's first-shape/scale/finite precedence.
         // No token is submitted before the complete tile's inputs are valid.
         if cached.is_none() {
-            for block in tensor.data.as_chunks::<34>().0 {
-                scale(block)?;
-            }
+            validate_source_scales(tensor)?;
         }
         for activation in activations {
             if activation.len() != columns {
@@ -1422,6 +1429,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                     pack_native_chunk(
                         &tensor.data,
                         ChunkGeometry {
+                            kind: tensor.kind,
                             total_blocks: columns / 128,
                             row_start,
                             active_rows,
@@ -1534,6 +1542,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 pack_native_chunk(
                     &tensor.data,
                     ChunkGeometry {
+                        kind: tensor.kind,
                         total_blocks: columns / 128,
                         row_start: 0,
                         active_rows: rows,
@@ -3102,8 +3111,61 @@ fn selected_tensor_key(tensor: &Tensor) -> (usize, u32, &[usize], &str) {
     )
 }
 
+const PQ2_KIND: u32 = 142;
+const PTQ1_KIND: u32 = 143;
+
+const fn source_block_bytes(kind: u32) -> Option<usize> {
+    match kind {
+        PQ2_KIND => Some(34),
+        PTQ1_KIND => Some(28),
+        _ => None,
+    }
+}
+
+const fn ptq1_symbol_table() -> [[u8; 5]; 256] {
+    let mut table = [[0_u8; 5]; 256];
+    let mut index = 0_usize;
+    let mut byte = 0_u16;
+    while byte < 256 {
+        let mut fraction = byte;
+        let mut digit = 0_usize;
+        while digit < 5 {
+            fraction *= 3;
+            let trit = fraction >> 8;
+            table[index][digit] = trit.to_le_bytes()[0];
+            fraction &= 255;
+            digit += 1;
+        }
+        byte += 1;
+        index += 1;
+    }
+    table
+}
+
+const PTQ1_SYMBOLS: [[u8; 5]; 256] = ptq1_symbol_table();
+
+fn validate_source_scales(tensor: &Tensor) -> Result<()> {
+    match tensor.kind {
+        PQ2_KIND => {
+            for block in tensor.data.as_chunks::<34>().0 {
+                scale(block)?;
+            }
+        }
+        PTQ1_KIND => {
+            for block in tensor.data.as_chunks::<28>().0 {
+                scale(&block[26..])?;
+            }
+        }
+        _ => return Err(invalid("unsupported Hexagon native Q2 tensor type or rank")),
+    }
+    Ok(())
+}
+
 fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
-    if tensor.kind != 142 || tensor.dimensions.len() != 2 {
+    let Some(block_bytes) = source_block_bytes(tensor.kind) else {
+        return Err(invalid("unsupported Hexagon native Q2 tensor type or rank"));
+    };
+    if tensor.dimensions.len() != 2 {
         return Err(invalid("unsupported Hexagon native Q2 tensor type or rank"));
     }
     let (columns, rows) = (tensor.dimensions[0], tensor.dimensions[1]);
@@ -3111,7 +3173,7 @@ fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
         || rows == 0
         || !columns.is_multiple_of(128)
         || (columns / 128)
-            .checked_mul(34)
+            .checked_mul(block_bytes)
             .and_then(|bytes| bytes.checked_mul(rows))
             != Some(tensor.data.len())
     {
@@ -3124,6 +3186,7 @@ fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
 
 #[derive(Clone, Copy)]
 struct ChunkGeometry {
+    kind: u32,
     total_blocks: usize,
     row_start: usize,
     active_rows: usize,
@@ -3138,11 +3201,96 @@ fn initialize_native_weights(weights: &mut [u8]) {
     }
 }
 
-fn pack_row_group(
+fn pack_ptq1_tile_into(original: &[u8], row_in_tile: usize, pair_buf: &mut [u8]) -> Result<()> {
+    let original: &[u8; 28] = original
+        .try_into()
+        .map_err(|_| invalid("invalid PTQ1 block length"))?;
+    if row_in_tile >= 32 {
+        return Err(invalid("invalid PTQ1 tile row index"));
+    }
+    let pair_buf: &mut [u8; 1152] = pair_buf
+        .try_into()
+        .map_err(|_| invalid("invalid HTP Q2 tile pair buffer length"))?;
+
+    let scale_bytes = [original[26], original[27]];
+    if (u16::from_le_bytes(scale_bytes) & 0x7c00) == 0x7c00 {
+        return Err(invalid("nonfinite Hexagon Q2 scale"));
+    }
+    let scale_pos0 = 512 + row_in_tile * 2;
+    let scale_pos1 = 576 + 512 + row_in_tile * 2;
+    pair_buf[scale_pos0..scale_pos0 + 2].copy_from_slice(&scale_bytes);
+    pair_buf[scale_pos1..scale_pos1 + 2].copy_from_slice(&scale_bytes);
+
+    let wide: [[u8; 5]; 16] = std::array::from_fn(|m| PTQ1_SYMBOLS[usize::from(original[m])]);
+    let q_pos = [
+        row_in_tile * 4,
+        128 + row_in_tile * 4,
+        256 + row_in_tile * 4,
+        384 + row_in_tile * 4,
+        576 + row_in_tile * 4,
+    ];
+    for n in 0..5 {
+        let base = q_pos[n];
+        for digit in 0..4 {
+            pair_buf[base + digit] = wide[digit][n]
+                | (wide[digit + 4][n] << 2)
+                | (wide[digit + 8][n] << 4)
+                | (wide[digit + 12][n] << 6);
+        }
+    }
+
+    let mid: [[u8; 5]; 8] = std::array::from_fn(|m| PTQ1_SYMBOLS[usize::from(original[16 + m])]);
+    let q_pos5 = 576 + 128 + row_in_tile * 4;
+    let q_pos6 = 576 + 256 + row_in_tile * 4;
+    for digit in 0..4 {
+        pair_buf[q_pos5 + digit] = mid[digit][0]
+            | (mid[digit + 4][0] << 2)
+            | (mid[digit][1] << 4)
+            | (mid[digit + 4][1] << 6);
+        pair_buf[q_pos6 + digit] = mid[digit][2]
+            | (mid[digit + 4][2] << 2)
+            | (mid[digit][3] << 4)
+            | (mid[digit + 4][3] << 6);
+    }
+
+    let tail0 = PTQ1_SYMBOLS[usize::from(original[24])];
+    let tail1 = PTQ1_SYMBOLS[usize::from(original[25])];
+    let q_pos7 = 576 + 384 + row_in_tile * 4;
+    pair_buf[q_pos7] = mid[0][4] | (mid[4][4] << 2) | (tail0[0] << 4) | (tail0[2] << 6);
+    pair_buf[q_pos7 + 1] = mid[1][4] | (mid[5][4] << 2) | (tail1[0] << 4) | (tail1[2] << 6);
+    pair_buf[q_pos7 + 2] = mid[2][4] | (mid[6][4] << 2) | (tail0[1] << 4) | (tail0[3] << 6);
+    pair_buf[q_pos7 + 3] = mid[3][4] | (mid[7][4] << 2) | (tail1[1] << 4) | (tail1[3] << 6);
+    Ok(())
+}
+
+fn pack_ptq1_row_group(
     tensor_data: &[u8],
     geometry: ChunkGeometry,
-    row_group: usize,
-    group_weights: &mut [u8],
+    group_row_start: usize,
+    group_rows: usize,
+    tile_pairs: &mut [[u8; 1152]],
+) -> Result<()> {
+    for row_in_tile in 0..group_rows {
+        let local_row = group_row_start + row_in_tile;
+        let row_block_base =
+            (geometry.row_start + local_row) * geometry.total_blocks + geometry.block_start;
+        let row_blocks = tensor_data
+            [row_block_base * 28..(row_block_base + geometry.chunk_blocks) * 28]
+            .as_chunks::<28>()
+            .0;
+        for (original, pair_buf) in row_blocks.iter().zip(tile_pairs.iter_mut()) {
+            pack_ptq1_tile_into(original, row_in_tile, pair_buf)?;
+        }
+    }
+    Ok(())
+}
+
+fn pack_pq2_row_group(
+    tensor_data: &[u8],
+    geometry: ChunkGeometry,
+    group_row_start: usize,
+    group_rows: usize,
+    tile_pairs: &mut [[u8; 1152]],
 ) -> Result<()> {
     #[inline]
     const fn permute_q2_dword(bytes: [u8; 8]) -> [u8; 8] {
@@ -3154,12 +3302,6 @@ fn pack_row_group(
         packed.to_le_bytes()
     }
 
-    let group_row_start = row_group * 32;
-    let group_rows = geometry.active_rows.saturating_sub(group_row_start).min(32);
-    if group_rows < 32 {
-        initialize_native_weights(group_weights);
-    }
-    let tile_pairs = group_weights.as_chunks_mut::<1152>().0;
     for row_in_tile in 0..group_rows {
         let local_row = group_row_start + row_in_tile;
         let row_block_base =
@@ -3233,6 +3375,37 @@ fn pack_row_group(
     Ok(())
 }
 
+fn pack_row_group(
+    tensor_data: &[u8],
+    geometry: ChunkGeometry,
+    row_group: usize,
+    group_weights: &mut [u8],
+) -> Result<()> {
+    let group_row_start = row_group * 32;
+    let group_rows = geometry.active_rows.saturating_sub(group_row_start).min(32);
+    if group_rows < 32 {
+        initialize_native_weights(group_weights);
+    }
+    let tile_pairs = group_weights.as_chunks_mut::<1152>().0;
+    match geometry.kind {
+        PTQ1_KIND => pack_ptq1_row_group(
+            tensor_data,
+            geometry,
+            group_row_start,
+            group_rows,
+            tile_pairs,
+        ),
+        PQ2_KIND => pack_pq2_row_group(
+            tensor_data,
+            geometry,
+            group_row_start,
+            group_rows,
+            tile_pairs,
+        ),
+        _ => Err(invalid("unsupported Hexagon native Q2 tensor type or rank")),
+    }
+}
+
 fn pack_native_chunk(
     tensor_data: &[u8],
     geometry: ChunkGeometry,
@@ -3273,6 +3446,8 @@ static NEXT_CACHE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 pub struct NativeQ2ArenaCacheEntry {
     /// Original model tensor name, matching `Tensor::name`.
     pub name: String,
+    /// Source tensor encoding (`142` for `PQ2_0`, `143` for `PTQ1_0`).
+    pub kind: u32,
     /// Original active input-column extent (`K`), always a positive multiple of `128`.
     pub columns: usize,
     /// Original active output-row extent (`M`).
@@ -3288,12 +3463,29 @@ pub struct NativeQ2ArenaCacheEntry {
 /// Format (`"SB2HQ2C1"`):
 /// - `0..8`: magic `"SB2HQ2C1"`
 /// - `8..12`: HTP architecture (`u32` LE: `73` or `81`)
-/// - `12..44`: bound model SHA-256 (`[u8; 32]`)
+/// - `12..44`: bound model + tensor-kind/geometry key SHA-256 (`[u8; 32]`)
 /// - `44..48`: tensor entry count (`u32` LE)
 /// - `48..80`: full SHA-256 digest over the contiguous payload region
-/// - `80..`: `tensor_count` entries of `(name_len u32 LE, name utf8, columns u64 LE, rows u64 LE, offset u64 LE, byte_len u64 LE)`
+/// - `80..`: `tensor_count` entries of `(name_len u32 LE, name utf8, kind u32 LE, columns u64 LE, rows u64 LE, offset u64 LE, byte_len u64 LE)`
 /// - contiguous packed `HTP_TYPE_Q2_0` tensor payloads
 pub struct NativeQ2ArenaCache;
+
+fn cache_binding_sha256(model_sha256: [u8; 32], tensors: &[Tensor]) -> Result<[u8; 32]> {
+    let mut hasher = bonsai_native_hash::Hasher::new()?;
+    hasher.update(b"SB2HQ2C1-binding-v2\0")?;
+    hasher.update(&model_sha256)?;
+    hasher.update(&u64::try_from(tensors.len())?.to_le_bytes())?;
+    for tensor in tensors {
+        hasher.update(&u64::try_from(tensor.name.len())?.to_le_bytes())?;
+        hasher.update(tensor.name.as_bytes())?;
+        hasher.update(&tensor.kind.to_le_bytes())?;
+        hasher.update(&u64::try_from(tensor.dimensions.len())?.to_le_bytes())?;
+        for &dimension in &tensor.dimensions {
+            hasher.update(&u64::try_from(dimension)?.to_le_bytes())?;
+        }
+    }
+    Ok(hasher.finish()?)
+}
 
 struct TempCacheFileGuard {
     path: PathBuf,
@@ -3417,6 +3609,7 @@ fn read_and_validate_cache_entries<S: NativeQ2Submitter>(
         reader.read_exact(&mut name_bytes)?;
         let name = String::from_utf8(name_bytes)
             .map_err(|_| invalid("non-UTF8 tensor name in native Q2 arena cache"))?;
+        let kind = read_u32_le(reader)?;
         let cols_u64 = read_u64_le(reader)?;
         let rows_u64 = read_u64_le(reader)?;
         let offset = read_u64_le(reader)?;
@@ -3429,6 +3622,7 @@ fn read_and_validate_cache_entries<S: NativeQ2Submitter>(
             .map_err(|_| invalid("native Q2 arena cache byte length overflow"))?;
         if name != tensor.name
             || !seen_names.insert(name.clone())
+            || kind != tensor.kind
             || columns != expected_cols
             || rows != expected_rows
             || offset != running_offset
@@ -3444,6 +3638,7 @@ fn read_and_validate_cache_entries<S: NativeQ2Submitter>(
             .ok_or_else(|| invalid("native Q2 arena cache total payload overflow"))?;
         entries.push(NativeQ2ArenaCacheEntry {
             name,
+            kind,
             columns,
             rows,
             offset,
@@ -3490,6 +3685,7 @@ impl NativeQ2ArenaCache {
             let byte_len_u64 = u64::try_from(packed_bytes)?;
             entries.push(NativeQ2ArenaCacheEntry {
                 name: tensor.name.clone(),
+                kind: tensor.kind,
                 columns,
                 rows,
                 offset: running_offset,
@@ -3500,6 +3696,7 @@ impl NativeQ2ArenaCache {
                 .ok_or_else(|| invalid("native Q2 arena cache total offset overflow"))?;
         }
 
+        let binding_sha256 = cache_binding_sha256(model_sha256, tensors)?;
         let temp_path = cache_temp_path(path);
         let mut guard = TempCacheFileGuard::new(temp_path.clone());
         let file = OpenOptions::new()
@@ -3509,12 +3706,13 @@ impl NativeQ2ArenaCache {
         let mut writer = BufWriter::new(file);
         writer.write_all(NATIVE_Q2_ARENA_CACHE_MAGIC)?;
         writer.write_all(&architecture.to_le_bytes())?;
-        writer.write_all(&model_sha256)?;
+        writer.write_all(&binding_sha256)?;
         writer.write_all(&u32::try_from(tensors.len())?.to_le_bytes())?;
         writer.write_all(&[0_u8; 32])?;
         for entry in &entries {
             writer.write_all(&u32::try_from(entry.name.len())?.to_le_bytes())?;
             writer.write_all(entry.name.as_bytes())?;
+            writer.write_all(&entry.kind.to_le_bytes())?;
             writer.write_all(&u64::try_from(entry.columns)?.to_le_bytes())?;
             writer.write_all(&u64::try_from(entry.rows)?.to_le_bytes())?;
             writer.write_all(&entry.offset.to_le_bytes())?;
@@ -3525,6 +3723,7 @@ impl NativeQ2ArenaCache {
         let mut scratch = Vec::new();
         for (tensor, entry) in tensors.iter().zip(&entries) {
             let geometry = ChunkGeometry {
+                kind: tensor.kind,
                 total_blocks: entry.columns / 128,
                 row_start: 0,
                 active_rows: entry.rows,
@@ -3606,8 +3805,9 @@ impl NativeQ2ArenaCache {
         }
         let mut reader = BufReader::new(file);
         let header = read_cache_header(&mut reader)?;
+        let expected_binding_sha256 = cache_binding_sha256(expected_model_sha256, tensors)?;
         if header.architecture != executor.htp_architecture()
-            || header.model_sha256 != expected_model_sha256
+            || header.model_sha256 != expected_binding_sha256
             || header.tensor_count != tensors.len()
         {
             return Err(invalid("native Q2 arena cache identity mismatch"));
@@ -5422,6 +5622,7 @@ mod tests {
                 block[1] = 0x35;
             }
             let geometry = ChunkGeometry {
+                kind: PQ2_KIND,
                 total_blocks,
                 row_start: 0,
                 active_rows,
@@ -6368,6 +6569,482 @@ mod tests {
             .is_err()
         );
         assert_eq!(exec_v73_b.submitter.inner.copies, 0);
+        Ok(())
+    }
+
+    fn repack_pq2_to_ptq1_tensor(pq2: &Tensor) -> Result<Tensor> {
+        let mut ptq1_data = Vec::with_capacity((pq2.data.len() / 34) * 28);
+        for block in pq2.data.as_chunks::<34>().0 {
+            let mut unit: [u8; 34] = *block;
+            let orig_scale = [unit[0], unit[1]];
+            let is_zero = matches!(u16::from_le_bytes(orig_scale), 0 | 0x8000);
+            if is_zero {
+                unit[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            }
+            let mut packed = bonsai_ternary::pack_ptq(&unit)
+                .map_err(|_| invalid("test PQ2 block contained non-ternary symbol"))?;
+            if is_zero {
+                packed[26..28].copy_from_slice(&orig_scale);
+            }
+            ptq1_data.extend_from_slice(&packed);
+        }
+        Ok(Tensor {
+            name: pq2.name.clone(),
+            dimensions: pq2.dimensions.clone(),
+            kind: PTQ1_KIND,
+            data: Arc::<[u8]>::from(ptq1_data).into(),
+        })
+    }
+
+    fn make_ternary_pq2_tensor(name: &str, columns: usize, rows: usize, scales: &[u16]) -> Tensor {
+        let blocks = columns / 128;
+        let mut data = vec![0_u8; rows * blocks * 34];
+        for (block_idx, block) in data.as_chunks_mut::<34>().0.iter_mut().enumerate() {
+            let scale_bits = scales[block_idx % scales.len()];
+            block[..2].copy_from_slice(&scale_bits.to_le_bytes());
+            for (byte_idx, byte) in block[2..].iter_mut().enumerate() {
+                let mut packed = 0_u8;
+                for lane in 0..4 {
+                    let trit = ((block_idx * 7 + byte_idx * 5 + lane * 3) % 3).to_le_bytes()[0];
+                    packed |= trit << (lane * 2);
+                }
+                *byte = packed;
+            }
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: vec![columns, rows],
+            kind: PQ2_KIND,
+            data: Arc::<[u8]>::from(data).into(),
+        }
+    }
+
+    #[test]
+    fn pack_ptq1_tile_into_matches_pq2_pack_row_group_byte_for_byte() -> Result<()> {
+        let total_blocks = 3;
+        let scales = [
+            0x3c00_u16, // +1.0
+            0xbc00,     // -1.0
+            0x0001,     // +min subnormal
+            0x8001,     // -min subnormal
+            0x03ff,     // +max subnormal
+            0x0000,     // +0.0
+            0x8000,     // -0.0
+            0xb555,     // negative normal
+        ];
+        for active_rows in [1, 17, 32] {
+            let pq2 =
+                make_ternary_pq2_tensor("tile-parity", total_blocks * 128, active_rows, &scales);
+            let ptq1 = repack_pq2_to_ptq1_tensor(&pq2)?;
+
+            let mut pq2_tiles = vec![0xaa_u8; total_blocks * 2 * 576];
+            pack_row_group(
+                &pq2.data,
+                ChunkGeometry {
+                    kind: PQ2_KIND,
+                    total_blocks,
+                    row_start: 0,
+                    active_rows,
+                    block_start: 0,
+                    chunk_blocks: total_blocks,
+                },
+                0,
+                &mut pq2_tiles,
+            )?;
+
+            let mut ptq1_tiles = vec![0xaa_u8; total_blocks * 2 * 576];
+            pack_row_group(
+                &ptq1.data,
+                ChunkGeometry {
+                    kind: PTQ1_KIND,
+                    total_blocks,
+                    row_start: 0,
+                    active_rows,
+                    block_start: 0,
+                    chunk_blocks: total_blocks,
+                },
+                0,
+                &mut ptq1_tiles,
+            )?;
+            assert_eq!(ptq1_tiles, pq2_tiles, "active_rows={active_rows}");
+        }
+
+        // Verify all 256 PTQ byte encodings match bonsai_ternary::decode_ptq_trits
+        // when transcoded by pack_ptq1_tile_into.
+        let mut pair_buf = vec![0x55_u8; 1152];
+        for seed in 0_u16..256 {
+            let mut block = [0_u8; 28];
+            for (slot, byte) in block[..26].iter_mut().enumerate() {
+                *byte = u8::try_from((usize::from(seed) + slot * 11) & 0xff)?;
+            }
+            block[26..28].copy_from_slice(&0xb800_u16.to_le_bytes()); // -0.5
+            initialize_native_weights(&mut pair_buf);
+            pack_ptq1_tile_into(&block, 19, &mut pair_buf)?;
+
+            let expected_trits = bonsai_ternary::decode_ptq_trits(&block);
+            assert_eq!(&pair_buf[512 + 19 * 2..512 + 19 * 2 + 2], &[0x00, 0xb8]);
+            assert_eq!(
+                &pair_buf[576 + 512 + 19 * 2..576 + 512 + 19 * 2 + 2],
+                &[0x00, 0xb8]
+            );
+            for (index, &trit) in expected_trits.iter().enumerate() {
+                let group = index / 16;
+                let lane = (index % 16) / 4;
+                let digit = index % 4;
+                let at = (group / 4) * 576 + (group % 4) * 128 + 19 * 4 + digit;
+                let actual_sym = (pair_buf[at] >> (lane * 2)) & 3;
+                assert_eq!(i16::from(actual_sym) - 1, trit, "seed={seed} index={index}");
+            }
+        }
+
+        // Reject non-finite FP16 scales (+Inf, -Inf, qNaN, sNaN) and bad slice bounds.
+        for bad_scale in [0x7c00_u16, 0xfc00, 0x7e00, 0x7c01] {
+            let mut bad_block = [0_u8; 28];
+            bad_block[26..28].copy_from_slice(&bad_scale.to_le_bytes());
+            assert!(pack_ptq1_tile_into(&bad_block, 0, &mut pair_buf).is_err());
+        }
+        assert!(pack_ptq1_tile_into(&[0_u8; 27], 0, &mut pair_buf).is_err());
+        assert!(pack_ptq1_tile_into(&[0_u8; 28], 32, &mut pair_buf).is_err());
+        assert!(pack_ptq1_tile_into(&[0_u8; 28], 0, &mut [0_u8; 1151]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_ptq1_resident_tiles_and_execution_match_pq2() -> Result<()> {
+        let scales = [0x3800_u16, 0xbc00, 0x0001, 0x3c00];
+        let pq2_gate = make_ternary_pq2_tensor("blk.0.ffn_gate.weight", 256, 49, &scales);
+        let pq2_up = make_ternary_pq2_tensor("blk.0.ffn_up.weight", 256, 49, &scales);
+        let pq2_down = make_ternary_pq2_tensor("blk.0.ffn_down.weight", 256, 49, &scales);
+        let ptq1_gate = repack_pq2_to_ptq1_tensor(&pq2_gate)?;
+        let ptq1_up = repack_pq2_to_ptq1_tensor(&pq2_up)?;
+        let ptq1_down = repack_pq2_to_ptq1_tensor(&pq2_down)?;
+
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 256, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(65_536)
+            .map_err(|_| invalid("residency"))?;
+
+        for direct in [false, true] {
+            let mut pq2_exec = NativeQ2Executor::new(
+                arena_submitter_at_capacity(direct, 32_768)?,
+                limits,
+                4 * 1024 * 1024,
+            )
+            .with_resident_weights(8192)?;
+            let mut ptq1_exec = NativeQ2Executor::new(
+                arena_submitter_at_capacity(direct, 32_768)?,
+                limits,
+                4 * 1024 * 1024,
+            )
+            .with_resident_weights(8192)?;
+
+            assert!(!Pq2ProjectionExecutor::supports(&ptq1_exec, &ptq1_gate));
+            assert!(!Pq2ProjectionExecutor::supports_q8(&ptq1_exec, &ptq1_gate));
+            assert!(Pq2ProjectionExecutor::supports_f32(&ptq1_exec, &ptq1_gate));
+
+            pq2_exec.select_and_prewarm_tensors(&[
+                pq2_gate.clone(),
+                pq2_up.clone(),
+                pq2_down.clone(),
+            ])?;
+            ptq1_exec.select_and_prewarm_tensors(&[
+                ptq1_gate.clone(),
+                ptq1_up.clone(),
+                ptq1_down.clone(),
+            ])?;
+            assert_eq!(ptq1_exec.submitter.memory, pq2_exec.submitter.memory);
+            assert_eq!(
+                ptq1_exec
+                    .residency_statistics()
+                    .weight_payload_bytes_prepared,
+                pq2_exec
+                    .residency_statistics()
+                    .weight_payload_bytes_prepared
+            );
+            assert!(!Pq2ProjectionExecutor::supports_f32(&ptq1_exec, &pq2_gate));
+        }
+
+        // Single-op resident + group + FFN chain execution on PTQ1_0.
+        let ptq1_sq = repack_pq2_to_ptq1_tensor(&make_ternary_pq2_tensor(
+            "blk.0.ffn_gate.weight",
+            256,
+            256,
+            &scales,
+        ))?;
+        let ptq1_sq_up = repack_pq2_to_ptq1_tensor(&make_ternary_pq2_tensor(
+            "blk.0.ffn_up.weight",
+            256,
+            256,
+            &scales,
+        ))?;
+        let ptq1_sq_down = repack_pq2_to_ptq1_tensor(&make_ternary_pq2_tensor(
+            "blk.0.ffn_down.weight",
+            256,
+            256,
+            &scales,
+        ))?;
+
+        let single_limits =
+            NativeQ2ProjectionLimits::new(5120, 17_408, 128, Duration::from_secs(10))
+                .map_err(|_| invalid("limits"))?
+                .with_resident_weights(131_072)
+                .map_err(|_| invalid("residency"))?;
+        let mut mock_sub = MockNativeSubmitter {
+            batch_ffn: true,
+            ffn_pair_calls: 0,
+            calls: 0,
+            resident_calls: 0,
+            remaining: 128,
+            residency_bytes: 131_072,
+        };
+        let mut exec = NativeQ2Executor::new(&mut mock_sub, single_limits, 16 * 1024 * 1024)
+            .with_resident_weights(16_384)?;
+        let act = vec![1.25_f32; 256];
+        let mut out = Vec::new();
+        Pq2ProjectionExecutor::project_f32(&mut exec, &ptq1_sq, &act, true, &mut out)?;
+        assert_eq!(out.len(), 256);
+        assert!(Pq2ProjectionExecutor::supports_f32_ffn_chain(
+            &exec,
+            [&ptq1_sq, &ptq1_sq_up, &ptq1_sq_down]
+        ));
+        Pq2ProjectionExecutor::project_f32_ffn_chain(
+            &mut exec,
+            [&ptq1_sq, &ptq1_sq_up, &ptq1_sq_down],
+            &act,
+            None,
+            Some(64),
+            true,
+            &mut out,
+        )?;
+        assert_eq!(out.len(), 256);
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_ptq1_streaming_and_scale_rejection() -> Result<()> {
+        let scales = [0x3800_u16, 0xbc00, 0x0001, 0x3c00];
+        let pq2_gate = make_ternary_pq2_tensor("blk.0.ffn_gate.weight", 256, 49, &scales);
+        let ptq1_gate = repack_pq2_to_ptq1_tensor(&pq2_gate)?;
+
+        // Streaming (nonresident) single-op + multi-tile fallback parity with PQ2_0.
+        let stream_limits = NativeQ2ProjectionLimits::new(128, 32, 64, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?;
+        let mut pq2_stream = NativeQ2Executor::new(
+            MockNativeSubmitter {
+                batch_ffn: false,
+                ffn_pair_calls: 0,
+                calls: 0,
+                resident_calls: 0,
+                remaining: 64,
+                residency_bytes: 0,
+            },
+            stream_limits,
+            1024 * 1024,
+        );
+        let mut ptq1_stream = NativeQ2Executor::new(
+            MockNativeSubmitter {
+                batch_ffn: false,
+                ffn_pair_calls: 0,
+                calls: 0,
+                resident_calls: 0,
+                remaining: 64,
+                residency_bytes: 0,
+            },
+            stream_limits,
+            1024 * 1024,
+        );
+        let act = vec![1.25_f32; 256];
+        let mut pq2_out = Vec::new();
+        let mut ptq1_out = Vec::new();
+        pq2_stream.project_f32(&pq2_gate, &act, true, &mut pq2_out)?;
+        ptq1_stream.project_f32(&ptq1_gate, &act, true, &mut ptq1_out)?;
+        assert_eq!(ptq1_out, pq2_out);
+
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 256, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(65_536)
+            .map_err(|_| invalid("residency"))?;
+
+        // Non-finite PTQ1 scale rejects without committing handles (both prewarm & project_f32).
+        let mut bad_ptq1 = ptq1_gate;
+        let mut bad_bytes = bad_ptq1.data.to_vec();
+        bad_bytes[26..28].copy_from_slice(&0x7e00_u16.to_le_bytes());
+        bad_ptq1.data = Arc::<[u8]>::from(bad_bytes).into();
+        let mut err_exec = NativeQ2Executor::new(arena_submitter(true)?, limits, 1024 * 1024)
+            .with_resident_weights(4096)?;
+        assert!(err_exec.prewarm_tensor(&bad_ptq1).is_err());
+        assert_eq!(err_exec.residency_statistics().tensors_prepared, 0);
+        let mut out = Vec::new();
+        assert!(
+            err_exec
+                .project_f32(&bad_ptq1, &act, true, &mut out)
+                .is_err()
+        );
+        assert!(err_exec.is_faulted());
+
+        // Single-op prewarm on non-finite PTQ1 scale faults immediately without committing handles.
+        let bad_single_ptq1 = {
+            let mut t = repack_pq2_to_ptq1_tensor(&make_ternary_pq2_tensor(
+                "bad-single",
+                128,
+                32,
+                &scales,
+            ))?;
+            let mut bytes = t.data.to_vec();
+            bytes[26..28].copy_from_slice(&0x7c00_u16.to_le_bytes());
+            t.data = Arc::<[u8]>::from(bytes).into();
+            t
+        };
+        let mut single_err_exec =
+            NativeQ2Executor::new(arena_submitter(true)?, limits, 1024 * 1024)
+                .with_resident_weights(4096)?;
+        assert!(single_err_exec.prewarm_tensor(&bad_single_ptq1).is_err());
+        assert!(single_err_exec.is_faulted());
+        assert_eq!(single_err_exec.residency_statistics().tensors_prepared, 0);
+        assert_eq!(single_err_exec.submitter.registry.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_prepare_resident_parallel_parity_pq2_and_ptq1() -> Result<()> {
+        let scales = [0x3800_u16, 0xbc00, 0x0001, 0x3c00, 0xb555];
+        let pq2 = make_ternary_pq2_tensor("blk.0.ffn_up.weight", 256, 81, &scales);
+        let ptq1 = repack_pq2_to_ptq1_tensor(&pq2)?;
+        let limits = NativeQ2ProjectionLimits::new(256, 128, 32, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(32_768)
+            .map_err(|_| invalid("residency"))?;
+
+        let workers_to_test: &[usize] = if cfg!(feature = "parallel-rows") {
+            &[1, 4]
+        } else {
+            &[1]
+        };
+
+        for tensor in [&pq2, &ptq1] {
+            let mut serial = NativeQ2Executor::new(
+                arena_submitter_at_capacity(true, 32_768)?,
+                limits,
+                4 * 1024 * 1024,
+            )
+            .with_resident_weights(4096)?;
+            assert!(serial.prewarm_tensor(tensor)?);
+
+            for &workers in workers_to_test {
+                let mut par = NativeQ2Executor::new(
+                    arena_submitter_at_capacity(true, 32_768)?,
+                    limits,
+                    4 * 1024 * 1024,
+                )
+                .with_resident_weights(4096)?
+                .with_row_parallelism(RowParallelism::new(workers)?)?;
+                assert!(par.prewarm_tensor(tensor)?);
+                assert_eq!(par.submitter.memory, serial.submitter.memory);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_arena_cache_ptq1_round_trip_and_kind_isolation() -> Result<()> {
+        let scales = [0x3800_u16, 0xbc00, 0x3c00];
+        let pq2_tensors = vec![
+            make_ternary_pq2_tensor("blk.0.ffn_gate.weight", 256, 32, &scales),
+            make_ternary_pq2_tensor("blk.0.ffn_up.weight", 256, 49, &scales),
+            make_ternary_pq2_tensor("blk.0.ffn_down.weight", 256, 32, &scales),
+        ];
+        let ptq1_tensors: Vec<Tensor> = pq2_tensors
+            .iter()
+            .map(repack_pq2_to_ptq1_tensor)
+            .collect::<Result<_>>()?;
+
+        let pq2_guard = temp_arena_cache_path("cache-pq2-kind");
+        let ptq1_guard = temp_arena_cache_path("cache-ptq1-kind");
+        let shared_model_sha = [0x5a_u8; 32];
+
+        let pq2_entries = NativeQ2ArenaCache::save_verified_cache(
+            &pq2_guard.path,
+            81,
+            shared_model_sha,
+            &pq2_tensors,
+            None,
+        )?;
+        let ptq1_entries = NativeQ2ArenaCache::save_verified_cache(
+            &ptq1_guard.path,
+            81,
+            shared_model_sha,
+            &ptq1_tensors,
+            None,
+        )?;
+        assert_ne!(pq2_entries, ptq1_entries);
+        assert!(ptq1_entries.iter().all(|entry| entry.kind == PTQ1_KIND));
+
+        let limits = NativeQ2ProjectionLimits::new(256, 64, 16, Duration::from_secs(4))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(16_384)
+            .map_err(|_| invalid("residency"))?;
+
+        let mut pq2_exec = NativeQ2Executor::new(
+            arena_submitter_at_capacity(true, 16_384)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+            &mut pq2_exec,
+            &pq2_guard.path,
+            shared_model_sha,
+            &pq2_tensors,
+        )?;
+
+        let mut ptq1_exec = NativeQ2Executor::new(
+            arena_submitter_at_capacity(true, 16_384)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+            &mut ptq1_exec,
+            &ptq1_guard.path,
+            shared_model_sha,
+            &ptq1_tensors,
+        )?;
+        assert_eq!(ptq1_exec.submitter.memory, pq2_exec.submitter.memory);
+
+        // Cross-kind loads with identical model_sha, names and shapes must reject before prepare_weights.
+        let mut wrong_kind_a = NativeQ2Executor::new(
+            arena_submitter_at_capacity(false, 16_384)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        assert!(
+            NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                &mut wrong_kind_a,
+                &pq2_guard.path,
+                shared_model_sha,
+                &ptq1_tensors,
+            )
+            .is_err()
+        );
+        assert_eq!(wrong_kind_a.submitter.copies, 0);
+
+        let mut wrong_kind_b = NativeQ2Executor::new(
+            arena_submitter_at_capacity(false, 16_384)?,
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(4096)?;
+        assert!(
+            NativeQ2ArenaCache::load_and_prewarm_from_verified_cache(
+                &mut wrong_kind_b,
+                &ptq1_guard.path,
+                shared_model_sha,
+                &pq2_tensors,
+            )
+            .is_err()
+        );
+        assert_eq!(wrong_kind_b.submitter.copies, 0);
         Ok(())
     }
 }

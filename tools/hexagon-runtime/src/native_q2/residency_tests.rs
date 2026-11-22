@@ -60,3 +60,28 @@ fn resident_cache_index_native_metadata_reservation_covers_every_vector() -> Res
     assert!(!cache.has_metadata_capacity(1));
     Ok(())
 }
+
+#[test]
+fn resident_cache_index_admits_ptq1_and_separates_from_pq2_alias() -> Result<()> {
+    let mut cache = ResidentCache::new(4096)?;
+    let shared: Arc<[u8]> = Arc::from(vec![0x55; 128 * 34]);
+    let ptq1 = Tensor {
+        name: "shared-ptq1".into(),
+        kind: 143,
+        dimensions: vec![128, 32],
+        data: Arc::clone(&shared).into(),
+    };
+    let pq2_alias = Tensor {
+        name: "shared-pq2".into(),
+        kind: 142,
+        dimensions: vec![128, 32],
+        data: shared.into(),
+    };
+    assert_eq!(cache.commit(&ptq1, 3, true), 0);
+    assert_eq!(cache.find(&ptq1), Some(0));
+    assert_eq!(cache.find(&pq2_alias), None);
+    assert_eq!(cache.commit(&pq2_alias, 9, false), 1);
+    assert_eq!(cache.find(&ptq1), Some(0));
+    assert_eq!(cache.find(&pq2_alias), Some(1));
+    Ok(())
+}

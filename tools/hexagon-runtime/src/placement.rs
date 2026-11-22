@@ -82,7 +82,7 @@ impl<'a> PlacedProjectionExecutor<'a> {
                 tensor.dimensions[0].is_multiple_of(128),
                 tensor.dimensions[0].is_multiple_of(256),
             ) {
-                (142, true, _) if executor.supports_f32(tensor) => Route::F32,
+                (142 | 143, true, _) if executor.supports_f32(tensor) => Route::F32,
                 (142, _, true) if executor.supports(tensor) => Route::Q8K,
                 (142, _, false) | (143, _, _) if executor.supports_q8(tensor) => Route::Q8,
                 _ => return Err(invalid("unsupported explicit projection placement tensor")),

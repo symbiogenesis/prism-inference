@@ -359,9 +359,7 @@ impl MovingSourceCursor {
         // Keep the search strictly prior to the newly committed tail token(s).
         let tail_guard = history.len().saturating_sub(2);
         let lo = base.saturating_sub(2).max(1);
-        let hi = base
-            .saturating_add(self.resync_window)
-            .min(tail_guard);
+        let hi = base.saturating_add(self.resync_window).min(tail_guard);
         if history.len() >= 2 && lo < hi {
             let prev = history[history.len() - 2];
             for idx in lo..hi {
@@ -587,10 +585,9 @@ impl AdaptiveSpeculationGate {
         let alpha = self.config.smoothing;
         let total_ns = duration_to_ns_f64(verify_duration.saturating_add(flush_duration));
         if total_ns > 0.0 {
-            self.ewma_verify_ns = Some(
-                self.ewma_verify_ns
-                    .map_or(total_ns, |prev| alpha.mul_add(total_ns, (1.0 - alpha) * prev)),
-            );
+            self.ewma_verify_ns = Some(self.ewma_verify_ns.map_or(total_ns, |prev| {
+                alpha.mul_add(total_ns, (1.0 - alpha) * prev)
+            }));
         }
 
         let emitted_f64 = u64_to_f64(u64::try_from(emitted).unwrap_or(u64::MAX));

@@ -330,7 +330,12 @@ impl<D: Decoder> Runtime<D> {
                 remaining.min(capacity.max(1))
             };
             let cursor_draft = if draft_limit > 0 {
-                cursor.propose_with_tree(&self.suffix_tree, suffix_config, draft_limit, &mut storage)?
+                cursor.propose_with_tree(
+                    &self.suffix_tree,
+                    suffix_config,
+                    draft_limit,
+                    &mut storage,
+                )?
             } else {
                 crate::speculative::CursorDraft::default()
             };
@@ -1650,7 +1655,10 @@ mod tests {
             assert_eq!(folded.tokens, ordinary.tokens);
             assert_eq!(folded.logits, ordinary.logits);
             assert_eq!(folded.decoder.kv_state, ordinary.decoder.kv_state);
-            assert_eq!(folded.decoder.recurrent_state, ordinary.decoder.recurrent_state);
+            assert_eq!(
+                folded.decoder.recurrent_state,
+                ordinary.decoder.recurrent_state
+            );
             assert!(!folded.decoder.has_pending_folded_verification());
             assert_eq!(stats.replay_steps, 0);
             assert_eq!(stats.rollback_restores, 0);

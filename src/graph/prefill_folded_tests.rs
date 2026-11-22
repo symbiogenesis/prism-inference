@@ -101,7 +101,10 @@ fn hybrid_model(cfg: &HybridConfig) -> Model {
     let attn_out_in = cfg.heads * cfg.head;
 
     let metadata = BTreeMap::from([
-        ("general.architecture".to_owned(), MetadataValue::from("qwen35")),
+        (
+            "general.architecture".to_owned(),
+            MetadataValue::from("qwen35"),
+        ),
         ("qwen35.block_count".to_owned(), MetadataValue::from(2_u32)),
         (
             "qwen35.context_length".to_owned(),
@@ -143,7 +146,10 @@ fn hybrid_model(cfg: &HybridConfig) -> Model {
             "qwen35.rope.dimension_sections".to_owned(),
             MetadataValue::from(cfg.rope_sections.to_vec()),
         ),
-        ("qwen35.rope.freq_base".to_owned(), MetadataValue::from(10_000.0_f32)),
+        (
+            "qwen35.rope.freq_base".to_owned(),
+            MetadataValue::from(10_000.0_f32),
+        ),
         (
             "qwen35.ssm.state_size".to_owned(),
             MetadataValue::from(u32::try_from(cfg.ssm_head).unwrap_or(2)),
@@ -164,7 +170,10 @@ fn hybrid_model(cfg: &HybridConfig) -> Model {
             "qwen35.ssm.conv_kernel".to_owned(),
             MetadataValue::from(u32::try_from(cfg.conv).unwrap_or(2)),
         ),
-        ("qwen35.full_attention_interval".to_owned(), MetadataValue::from(2_u32)),
+        (
+            "qwen35.full_attention_interval".to_owned(),
+            MetadataValue::from(2_u32),
+        ),
         (
             "qwen35.attention.recurrent_layers".to_owned(),
             MetadataValue::from(vec![true, false]),
@@ -186,10 +195,18 @@ fn hybrid_model(cfg: &HybridConfig) -> Model {
         &[cfg.embedding, cfg.vocab],
         pattern(cfg.embedding * cfg.vocab, 2, 0.5),
     );
-    insert("output_norm.weight", &[cfg.embedding], vec![1.0; cfg.embedding]);
+    insert(
+        "output_norm.weight",
+        &[cfg.embedding],
+        vec![1.0; cfg.embedding],
+    );
 
     // Layer 0: Recurrent (GDN + conv)
-    insert("blk.0.attn_norm.weight", &[cfg.embedding], vec![1.0; cfg.embedding]);
+    insert(
+        "blk.0.attn_norm.weight",
+        &[cfg.embedding],
+        vec![1.0; cfg.embedding],
+    );
     insert(
         "blk.0.post_attention_norm.weight",
         &[cfg.embedding],
@@ -210,8 +227,16 @@ fn hybrid_model(cfg: &HybridConfig) -> Model {
         &[cfg.conv, conv_w],
         pattern(cfg.conv * conv_w, 5, 0.25),
     );
-    insert("blk.0.ssm_dt.bias", &[cfg.ssm_values], vec![0.125; cfg.ssm_values]);
-    insert("blk.0.ssm_a", &[cfg.ssm_values], vec![-0.25; cfg.ssm_values]);
+    insert(
+        "blk.0.ssm_dt.bias",
+        &[cfg.ssm_values],
+        vec![0.125; cfg.ssm_values],
+    );
+    insert(
+        "blk.0.ssm_a",
+        &[cfg.ssm_values],
+        vec![-0.25; cfg.ssm_values],
+    );
     insert(
         "blk.0.ssm_beta.weight",
         &[cfg.embedding, cfg.ssm_values],
@@ -222,7 +247,11 @@ fn hybrid_model(cfg: &HybridConfig) -> Model {
         &[cfg.embedding, cfg.ssm_values],
         pattern(cfg.embedding * cfg.ssm_values, 7, 0.25),
     );
-    insert("blk.0.ssm_norm.weight", &[cfg.ssm_head], vec![1.0; cfg.ssm_head]);
+    insert(
+        "blk.0.ssm_norm.weight",
+        &[cfg.ssm_head],
+        vec![1.0; cfg.ssm_head],
+    );
     insert(
         "blk.0.ssm_out.weight",
         &[val_w, cfg.embedding],
@@ -245,7 +274,11 @@ fn hybrid_model(cfg: &HybridConfig) -> Model {
     );
 
     // Layer 1: Full attention
-    insert("blk.1.attn_norm.weight", &[cfg.embedding], vec![1.0; cfg.embedding]);
+    insert(
+        "blk.1.attn_norm.weight",
+        &[cfg.embedding],
+        vec![1.0; cfg.embedding],
+    );
     insert(
         "blk.1.post_attention_norm.weight",
         &[cfg.embedding],
@@ -333,10 +366,16 @@ fn configure_folded(
         );
         let r1_model = Model {
             metadata: BTreeMap::from([
-                ("general.architecture".to_owned(), MetadataValue::from("qwen35")),
+                (
+                    "general.architecture".to_owned(),
+                    MetadataValue::from("qwen35"),
+                ),
                 ("general.type".to_owned(), MetadataValue::from("adapter")),
                 ("adapter.type".to_owned(), MetadataValue::from("lora")),
-                ("adapter.lora_alpha".to_owned(), MetadataValue::from(1.0_f32)),
+                (
+                    "adapter.lora_alpha".to_owned(),
+                    MetadataValue::from(1.0_f32),
+                ),
             ]),
             tensors: rank_one_tensors,
             identity: "r1-folded-test".to_owned(),
@@ -371,10 +410,16 @@ fn configure_folded(
         }
         let mr_model = Model {
             metadata: BTreeMap::from([
-                ("general.architecture".to_owned(), MetadataValue::from("qwen35")),
+                (
+                    "general.architecture".to_owned(),
+                    MetadataValue::from("qwen35"),
+                ),
                 ("general.type".to_owned(), MetadataValue::from("adapter")),
                 ("adapter.type".to_owned(), MetadataValue::from("lora")),
-                ("adapter.lora_alpha".to_owned(), MetadataValue::from(2.0_f32)),
+                (
+                    "adapter.lora_alpha".to_owned(),
+                    MetadataValue::from(2.0_f32),
+                ),
             ]),
             tensors: mr_tensors,
             identity: "mr-folded-test".to_owned(),
@@ -492,7 +537,8 @@ fn assert_logits_bit_eq(left: &[f32], right: &[f32], ctx: &str) {
 }
 
 #[test]
-fn folded_verification_matches_sequential_zero_ulp_across_arithmetics_workers_and_kv() -> Result<()> {
+fn folded_verification_matches_sequential_zero_ulp_across_arithmetics_workers_and_kv() -> Result<()>
+{
     #[allow(
         unused_mut,
         reason = "Parallel-rows worker cases are appended only when the parallel-rows feature is enabled."
@@ -657,7 +703,8 @@ fn folded_verification_guards_observers_and_rolls_back_mid_block_cancellation() 
         }
         Ok(())
     };
-    let err = folded.evaluate_verification_block_folded(&[1, 2], &[3, 4], &mut rows, &cancel_mid_tile);
+    let err =
+        folded.evaluate_verification_block_folded(&[1, 2], &[3, 4], &mut rows, &cancel_mid_tile);
     assert!(err.is_err());
     assert_eq!(rows, Vec::<Vec<f32>>::new());
     assert!(!folded.has_pending_folded_verification());

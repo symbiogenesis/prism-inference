@@ -466,7 +466,8 @@ impl Qwen35 {
             tile.tokens
                 .min(crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS)
         };
-        let folded_state = FoldedVerificationState::new(verify_capacity, &self.layers, &self.geometry)?;
+        let folded_state =
+            FoldedVerificationState::new(verify_capacity, &self.layers, &self.geometry)?;
         let tile = self
             .tiled_prefill
             .as_mut()
@@ -860,7 +861,10 @@ impl Qwen35 {
         Ok(())
     }
 
-    pub(super) fn flush_folded_verification(&mut self, check: &dyn Fn() -> Result<()>) -> Result<()> {
+    pub(super) fn flush_folded_verification(
+        &mut self,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
         if !self.state_consistent {
             return Err(invalid(
                 "decoder state is inconsistent after failed evaluation and requires reset or restore",
@@ -897,10 +901,9 @@ impl Qwen35 {
                 .zip(&mut self.workspace.deltas)
             {
                 if matches!(layer.attention, Attention::Recurrent(_)) {
-                    let layer_tape = folded
-                        .layers
-                        .get_mut(rec_idx)
-                        .ok_or_else(|| invalid("folded verification recurrent layer tape missing"))?;
+                    let layer_tape = folded.layers.get_mut(rec_idx).ok_or_else(|| {
+                        invalid("folded verification recurrent layer tape missing")
+                    })?;
                     rec_idx += 1;
                     gdn::flush_recurrent_carry_layer(
                         layer_tape,

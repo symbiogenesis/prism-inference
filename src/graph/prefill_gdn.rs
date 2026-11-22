@@ -1,12 +1,12 @@
 //! Opt-in bounded triangular GDN chunks; no cumulative-decay division.
 
 use super::{TileReuse, TiledPrefill, project_tile, project_tile_pair};
-use crate::kernels::prefill::ProjectionTile;
 use crate::graph::{
     ActiveAdapters, Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms,
     copy_into, finite, l2_norm, resize_into, sigmoid, small_float,
 };
 use crate::kernels::pinned_gdn::ChunkInput as Input;
+use crate::kernels::prefill::ProjectionTile;
 use crate::kernels::{
     RmsNormWeights, add_scaled_slice_in_place, gdn_wy_update_eight_rows, gdn_wy_update_four_rows,
     scale_slice_into,
@@ -759,7 +759,8 @@ fn flush_carry_heads(
             head_outputs,
             head_out_len,
             |base_head, matrix_chunk, out_chunk| {
-                let mut inputs = [EMPTY_GDN_INPUT; crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS];
+                let mut inputs =
+                    [EMPTY_GDN_INPUT; crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS];
                 for (offset, (head_matrix, head_out)) in matrix_chunk
                     .chunks_exact_mut(head_state_len)
                     .zip(out_chunk.chunks_exact_mut(head_out_len))
@@ -782,7 +783,13 @@ fn flush_carry_heads(
                     }
                     let prev_head =
                         &previous[head_index * head_state_len..(head_index + 1) * head_state_len];
-                    exact_head_into(arithmetic, prev_head, &inputs[..kept], head_matrix, head_out)?;
+                    exact_head_into(
+                        arithmetic,
+                        prev_head,
+                        &inputs[..kept],
+                        head_matrix,
+                        head_out,
+                    )?;
                 }
                 Ok(())
             },

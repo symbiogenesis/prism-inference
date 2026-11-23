@@ -1179,6 +1179,122 @@ fn dot_f32_f32_row(neon: Neon, weights: &[f32], input: &[f32]) -> f32 {
     sum
 }
 
+#[inline]
+fn dot_f16_f32_row_4tokens(neon: Neon, weights_f16: &[u16], inputs: [&[f32]; 4]) -> [f32; 4] {
+    let mut acc0 = [f32x4::splat(neon, 0.0); 4];
+    let mut acc1 = [f32x4::splat(neon, 0.0); 4];
+    let (w_chunks8, w_rem8) = weights_f16.as_chunks::<8>();
+    let (x0_chunks8, x0_rem8) = inputs[0].as_chunks::<8>();
+    let (x1_chunks8, x1_rem8) = inputs[1].as_chunks::<8>();
+    let (x2_chunks8, x2_rem8) = inputs[2].as_chunks::<8>();
+    let (x3_chunks8, x3_rem8) = inputs[3].as_chunks::<8>();
+    for (idx, w8) in w_chunks8.iter().enumerate() {
+        let (w_lo, w_hi) = f16_bits_to_f32_x8(neon, w8);
+        let x8s = [
+            &x0_chunks8[idx],
+            &x1_chunks8[idx],
+            &x2_chunks8[idx],
+            &x3_chunks8[idx],
+        ];
+        for (x8, (a0, a1)) in x8s.into_iter().zip(acc0.iter_mut().zip(acc1.iter_mut())) {
+            let x_lo = f32x4::from_slice(neon, &x8[..4]);
+            let x_hi = f32x4::from_slice(neon, &x8[4..]);
+            *a0 = w_lo.mul_add_precise(x_lo, *a0);
+            *a1 = w_hi.mul_add_precise(x_hi, *a1);
+        }
+    }
+    let (w_chunks4, w_tail) = w_rem8.as_chunks::<4>();
+    let (x0_chunks4, x0_tail) = x0_rem8.as_chunks::<4>();
+    let (x1_chunks4, x1_tail) = x1_rem8.as_chunks::<4>();
+    let (x2_chunks4, x2_tail) = x2_rem8.as_chunks::<4>();
+    let (x3_chunks4, x3_tail) = x3_rem8.as_chunks::<4>();
+    if let (Some(w4), Some(x0), Some(x1), Some(x2), Some(x3)) = (
+        w_chunks4.first(),
+        x0_chunks4.first(),
+        x1_chunks4.first(),
+        x2_chunks4.first(),
+        x3_chunks4.first(),
+    ) {
+        let w = f16_bits_to_f32_x4(neon, *w4);
+        for (x4, a0) in [x0, x1, x2, x3].into_iter().zip(acc0.iter_mut()) {
+            let x = f32x4::from_slice(neon, x4);
+            *a0 = w.mul_add_precise(x, *a0);
+        }
+    }
+    let mut sums = [0.0_f32; 4];
+    for ((a0, a1), sum) in acc0.into_iter().zip(acc1).zip(sums.iter_mut()) {
+        let mut lanes = [0.0_f32; 4];
+        (a0 + a1).store_slice(&mut lanes);
+        *sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    }
+    let x_tails = [x0_tail, x1_tail, x2_tail, x3_tail];
+    for (i, &w_bits) in w_tail.iter().enumerate() {
+        let w = bonsai_ternary::half_to_float(w_bits);
+        for (sum, x_tail) in sums.iter_mut().zip(x_tails) {
+            *sum = w.mul_add(x_tail[i], *sum);
+        }
+    }
+    sums
+}
+
+#[inline]
+fn dot_f32_f32_row_4tokens(neon: Neon, weights: &[f32], inputs: [&[f32]; 4]) -> [f32; 4] {
+    let mut acc0 = [f32x4::splat(neon, 0.0); 4];
+    let mut acc1 = [f32x4::splat(neon, 0.0); 4];
+    let (w_chunks8, w_rem8) = weights.as_chunks::<8>();
+    let (x0_chunks8, x0_rem8) = inputs[0].as_chunks::<8>();
+    let (x1_chunks8, x1_rem8) = inputs[1].as_chunks::<8>();
+    let (x2_chunks8, x2_rem8) = inputs[2].as_chunks::<8>();
+    let (x3_chunks8, x3_rem8) = inputs[3].as_chunks::<8>();
+    for (idx, w8) in w_chunks8.iter().enumerate() {
+        let w_lo = f32x4::from_slice(neon, &w8[..4]);
+        let w_hi = f32x4::from_slice(neon, &w8[4..]);
+        let x8s = [
+            &x0_chunks8[idx],
+            &x1_chunks8[idx],
+            &x2_chunks8[idx],
+            &x3_chunks8[idx],
+        ];
+        for (x8, (a0, a1)) in x8s.into_iter().zip(acc0.iter_mut().zip(acc1.iter_mut())) {
+            let x_lo = f32x4::from_slice(neon, &x8[..4]);
+            let x_hi = f32x4::from_slice(neon, &x8[4..]);
+            *a0 = w_lo.mul_add_precise(x_lo, *a0);
+            *a1 = w_hi.mul_add_precise(x_hi, *a1);
+        }
+    }
+    let (w_chunks4, w_tail) = w_rem8.as_chunks::<4>();
+    let (x0_chunks4, x0_tail) = x0_rem8.as_chunks::<4>();
+    let (x1_chunks4, x1_tail) = x1_rem8.as_chunks::<4>();
+    let (x2_chunks4, x2_tail) = x2_rem8.as_chunks::<4>();
+    let (x3_chunks4, x3_tail) = x3_rem8.as_chunks::<4>();
+    if let (Some(w4), Some(x0), Some(x1), Some(x2), Some(x3)) = (
+        w_chunks4.first(),
+        x0_chunks4.first(),
+        x1_chunks4.first(),
+        x2_chunks4.first(),
+        x3_chunks4.first(),
+    ) {
+        let w = f32x4::from_slice(neon, w4);
+        for (x4, a0) in [x0, x1, x2, x3].into_iter().zip(acc0.iter_mut()) {
+            let x = f32x4::from_slice(neon, x4);
+            *a0 = w.mul_add_precise(x, *a0);
+        }
+    }
+    let mut sums = [0.0_f32; 4];
+    for ((a0, a1), sum) in acc0.into_iter().zip(acc1).zip(sums.iter_mut()) {
+        let mut lanes = [0.0_f32; 4];
+        (a0 + a1).store_slice(&mut lanes);
+        *sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    }
+    let x_tails = [x0_tail, x1_tail, x2_tail, x3_tail];
+    for (i, &w) in w_tail.iter().enumerate() {
+        for (sum, x_tail) in sums.iter_mut().zip(x_tails) {
+            *sum = w.mul_add(x_tail[i], *sum);
+        }
+    }
+    sums
+}
+
 pub(super) fn lora_multi_a_f16(
     a_weights: &[u16],
     in_features: usize,
@@ -1188,11 +1304,75 @@ pub(super) fn lora_multi_a_f16(
     let neon = fearless_simd::Level::baseline().as_neon()?;
     if in_features == 0
         || input.len() != in_features
-        || a_weights.len() != ranks.len().saturating_mul(in_features)
+        || ranks
+            .len()
+            .checked_mul(in_features)
+            .is_none_or(|expected| a_weights.len() != expected)
     {
         return Some(false);
     }
-    for (a_row, dst) in a_weights.chunks_exact(in_features).zip(ranks.iter_mut()) {
+    let (r_quads, r_tail) = ranks.as_chunks_mut::<4>();
+    let quad_len = r_quads.len() * 4 * in_features;
+    let (w_quads, w_tail) = a_weights.split_at(quad_len);
+    let (x_chunks8, x_rem8) = input.as_chunks::<8>();
+    let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
+    for (w_quad, dst4) in w_quads.chunks_exact(4 * in_features).zip(r_quads.iter_mut()) {
+        let (r0, rest) = w_quad.split_at(in_features);
+        let (r1, rest) = rest.split_at(in_features);
+        let (r2, r3) = rest.split_at(in_features);
+        let (r0_8, r0_rem8) = r0.as_chunks::<8>();
+        let (r1_8, r1_rem8) = r1.as_chunks::<8>();
+        let (r2_8, r2_rem8) = r2.as_chunks::<8>();
+        let (r3_8, r3_rem8) = r3.as_chunks::<8>();
+        let mut acc0 = [f32x4::splat(neon, 0.0); 4];
+        let mut acc1 = [f32x4::splat(neon, 0.0); 4];
+        for (idx, x8) in x_chunks8.iter().enumerate() {
+            let x_lo = f32x4::from_slice(neon, &x8[..4]);
+            let x_hi = f32x4::from_slice(neon, &x8[4..]);
+            for (w8, (a0, a1)) in [&r0_8[idx], &r1_8[idx], &r2_8[idx], &r3_8[idx]]
+                .into_iter()
+                .zip(acc0.iter_mut().zip(acc1.iter_mut()))
+            {
+                let (w_lo, w_hi) = f16_bits_to_f32_x8(neon, w8);
+                *a0 = w_lo.mul_add_precise(x_lo, *a0);
+                *a1 = w_hi.mul_add_precise(x_hi, *a1);
+            }
+        }
+        let (r0_4, r0_t) = r0_rem8.as_chunks::<4>();
+        let (r1_4, r1_t) = r1_rem8.as_chunks::<4>();
+        let (r2_4, r2_t) = r2_rem8.as_chunks::<4>();
+        let (r3_4, r3_t) = r3_rem8.as_chunks::<4>();
+        if let (Some(x4), Some(w0), Some(w1), Some(w2), Some(w3)) = (
+            x_chunks4.first(),
+            r0_4.first(),
+            r1_4.first(),
+            r2_4.first(),
+            r3_4.first(),
+        ) {
+            let x = f32x4::from_slice(neon, x4);
+            for (w4, a0) in [w0, w1, w2, w3].into_iter().zip(acc0.iter_mut()) {
+                let w = f16_bits_to_f32_x4(neon, *w4);
+                *a0 = w.mul_add_precise(x, *a0);
+            }
+        }
+        let mut sums = [0.0_f32; 4];
+        for ((a0, a1), sum) in acc0.into_iter().zip(acc1).zip(sums.iter_mut()) {
+            let mut lanes = [0.0_f32; 4];
+            (a0 + a1).store_slice(&mut lanes);
+            *sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        }
+        let r_tails = [r0_t, r1_t, r2_t, r3_t];
+        for (i, &x) in x_tail.iter().enumerate() {
+            for (sum, r_tail) in sums.iter_mut().zip(r_tails) {
+                *sum = bonsai_ternary::half_to_float(r_tail[i]).mul_add(x, *sum);
+            }
+        }
+        if !sums.iter().all(|v| v.is_finite()) {
+            return Some(false);
+        }
+        *dst4 = sums;
+    }
+    for (a_row, dst) in w_tail.chunks_exact(in_features).zip(r_tail.iter_mut()) {
         let dot = dot_f16_f32_row(neon, a_row, input);
         if !dot.is_finite() {
             return Some(false);
@@ -1211,11 +1391,76 @@ pub(super) fn lora_multi_a_f32(
     let neon = fearless_simd::Level::baseline().as_neon()?;
     if in_features == 0
         || input.len() != in_features
-        || a_weights.len() != ranks.len().saturating_mul(in_features)
+        || ranks
+            .len()
+            .checked_mul(in_features)
+            .is_none_or(|expected| a_weights.len() != expected)
     {
         return Some(false);
     }
-    for (a_row, dst) in a_weights.chunks_exact(in_features).zip(ranks.iter_mut()) {
+    let (r_quads, r_tail) = ranks.as_chunks_mut::<4>();
+    let quad_len = r_quads.len() * 4 * in_features;
+    let (w_quads, w_tail) = a_weights.split_at(quad_len);
+    let (x_chunks8, x_rem8) = input.as_chunks::<8>();
+    let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
+    for (w_quad, dst4) in w_quads.chunks_exact(4 * in_features).zip(r_quads.iter_mut()) {
+        let (r0, rest) = w_quad.split_at(in_features);
+        let (r1, rest) = rest.split_at(in_features);
+        let (r2, r3) = rest.split_at(in_features);
+        let (r0_8, r0_rem8) = r0.as_chunks::<8>();
+        let (r1_8, r1_rem8) = r1.as_chunks::<8>();
+        let (r2_8, r2_rem8) = r2.as_chunks::<8>();
+        let (r3_8, r3_rem8) = r3.as_chunks::<8>();
+        let mut acc0 = [f32x4::splat(neon, 0.0); 4];
+        let mut acc1 = [f32x4::splat(neon, 0.0); 4];
+        for (idx, x8) in x_chunks8.iter().enumerate() {
+            let x_lo = f32x4::from_slice(neon, &x8[..4]);
+            let x_hi = f32x4::from_slice(neon, &x8[4..]);
+            for (w8, (a0, a1)) in [&r0_8[idx], &r1_8[idx], &r2_8[idx], &r3_8[idx]]
+                .into_iter()
+                .zip(acc0.iter_mut().zip(acc1.iter_mut()))
+            {
+                let w_lo = f32x4::from_slice(neon, &w8[..4]);
+                let w_hi = f32x4::from_slice(neon, &w8[4..]);
+                *a0 = w_lo.mul_add_precise(x_lo, *a0);
+                *a1 = w_hi.mul_add_precise(x_hi, *a1);
+            }
+        }
+        let (r0_4, r0_t) = r0_rem8.as_chunks::<4>();
+        let (r1_4, r1_t) = r1_rem8.as_chunks::<4>();
+        let (r2_4, r2_t) = r2_rem8.as_chunks::<4>();
+        let (r3_4, r3_t) = r3_rem8.as_chunks::<4>();
+        if let (Some(x4), Some(w0), Some(w1), Some(w2), Some(w3)) = (
+            x_chunks4.first(),
+            r0_4.first(),
+            r1_4.first(),
+            r2_4.first(),
+            r3_4.first(),
+        ) {
+            let x = f32x4::from_slice(neon, x4);
+            for (w4, a0) in [w0, w1, w2, w3].into_iter().zip(acc0.iter_mut()) {
+                let w = f32x4::from_slice(neon, w4);
+                *a0 = w.mul_add_precise(x, *a0);
+            }
+        }
+        let mut sums = [0.0_f32; 4];
+        for ((a0, a1), sum) in acc0.into_iter().zip(acc1).zip(sums.iter_mut()) {
+            let mut lanes = [0.0_f32; 4];
+            (a0 + a1).store_slice(&mut lanes);
+            *sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        }
+        let r_tails = [r0_t, r1_t, r2_t, r3_t];
+        for (i, &x) in x_tail.iter().enumerate() {
+            for (sum, r_tail) in sums.iter_mut().zip(r_tails) {
+                *sum = r_tail[i].mul_add(x, *sum);
+            }
+        }
+        if !sums.iter().all(|v| v.is_finite()) {
+            return Some(false);
+        }
+        *dst4 = sums;
+    }
+    for (a_row, dst) in w_tail.chunks_exact(in_features).zip(r_tail.iter_mut()) {
         let dot = dot_f32_f32_row(neon, a_row, input);
         if !dot.is_finite() {
             return Some(false);
@@ -1241,13 +1486,25 @@ pub(super) fn lora_multi_a_tokens_f16(
     {
         return Some(false);
     }
+    let (tok_quads, tok_tail) = inputs.as_chunks::<4>();
+    let tail_base = tok_quads.len() * 4;
     for (r, a_row) in a_weights.chunks_exact(in_features).enumerate() {
-        for (t, &input) in inputs.iter().enumerate() {
+        for (q_idx, tok4) in tok_quads.iter().enumerate() {
+            let dots = dot_f16_f32_row_4tokens(neon, a_row, *tok4);
+            if !dots.iter().all(|v| v.is_finite()) {
+                return Some(false);
+            }
+            let base_t = q_idx * 4;
+            for (offset, &dot) in dots.iter().enumerate() {
+                ranks_out[(base_t + offset) * rank + r] = dot;
+            }
+        }
+        for (offset, &input) in tok_tail.iter().enumerate() {
             let dot = dot_f16_f32_row(neon, a_row, input);
             if !dot.is_finite() {
                 return Some(false);
             }
-            ranks_out[t * rank + r] = dot;
+            ranks_out[(tail_base + offset) * rank + r] = dot;
         }
     }
     Some(true)
@@ -1269,13 +1526,25 @@ pub(super) fn lora_multi_a_tokens_f32(
     {
         return Some(false);
     }
+    let (tok_quads, tok_tail) = inputs.as_chunks::<4>();
+    let tail_base = tok_quads.len() * 4;
     for (r, a_row) in a_weights.chunks_exact(in_features).enumerate() {
-        for (t, &input) in inputs.iter().enumerate() {
+        for (q_idx, tok4) in tok_quads.iter().enumerate() {
+            let dots = dot_f32_f32_row_4tokens(neon, a_row, *tok4);
+            if !dots.iter().all(|v| v.is_finite()) {
+                return Some(false);
+            }
+            let base_t = q_idx * 4;
+            for (offset, &dot) in dots.iter().enumerate() {
+                ranks_out[(base_t + offset) * rank + r] = dot;
+            }
+        }
+        for (offset, &input) in tok_tail.iter().enumerate() {
             let dot = dot_f32_f32_row(neon, a_row, input);
             if !dot.is_finite() {
                 return Some(false);
             }
-            ranks_out[t * rank + r] = dot;
+            ranks_out[(tail_base + offset) * rank + r] = dot;
         }
     }
     Some(true)
@@ -1356,20 +1625,52 @@ pub(super) fn lora_multi_b_scale_and_finish_tokens_f16(
         || n_tokens == 0
         || ranks.len() != n_tokens.saturating_mul(rank)
         || !correction.len().is_multiple_of(n_tokens)
-        || b_weights.len() != (correction.len() / n_tokens).saturating_mul(rank)
     {
         return Some(false);
     }
+    let local_rows = correction.len() / n_tokens;
+    if b_weights.len() != local_rows.saturating_mul(rank)
+        || start_row
+            .checked_add(local_rows)
+            .is_none_or(|end| base_outputs.iter().any(|base| base.len() < end))
+    {
+        return Some(false);
+    }
+    let (base_quads, base_tail) = base_outputs.as_chunks::<4>();
+    let quad_rank_len = base_quads.len() * 4 * rank;
+    let (ranks_quad_slice, ranks_tail_slice) = ranks.split_at(quad_rank_len);
     for (local_row, (b_row, corr_slots)) in b_weights
         .chunks_exact(rank)
         .zip(correction.chunks_exact_mut(n_tokens))
         .enumerate()
     {
         let global_row = start_row + local_row;
-        for (t, (&base_slice, corr_slot)) in
-            base_outputs.iter().zip(corr_slots.iter_mut()).enumerate()
+        let (corr_quads, corr_tail) = corr_slots.as_chunks_mut::<4>();
+        for ((base4, corr4), ranks4) in base_quads
+            .iter()
+            .zip(corr_quads.iter_mut())
+            .zip(ranks_quad_slice.chunks_exact(4 * rank))
         {
-            let tok_ranks = &ranks[t * rank..(t + 1) * rank];
+            let r0 = &ranks4[..rank];
+            let r1 = &ranks4[rank..2 * rank];
+            let r2 = &ranks4[2 * rank..3 * rank];
+            let r3 = &ranks4[3 * rank..];
+            let dots = dot_f16_f32_row_4tokens(neon, b_row, [r0, r1, r2, r3]);
+            for ((dot, &base_slice), corr_slot) in
+                dots.into_iter().zip(base4.iter()).zip(corr4.iter_mut())
+            {
+                let updated = dot.mul_add(scale, base_slice[global_row]);
+                if !updated.is_finite() {
+                    return Some(false);
+                }
+                *corr_slot = updated;
+            }
+        }
+        for ((&base_slice, corr_slot), tok_ranks) in base_tail
+            .iter()
+            .zip(corr_tail.iter_mut())
+            .zip(ranks_tail_slice.chunks_exact(rank))
+        {
             let dot = dot_f16_f32_row(neon, b_row, tok_ranks);
             let updated = dot.mul_add(scale, base_slice[global_row]);
             if !updated.is_finite() {
@@ -1396,20 +1697,52 @@ pub(super) fn lora_multi_b_scale_and_finish_tokens_f32(
         || n_tokens == 0
         || ranks.len() != n_tokens.saturating_mul(rank)
         || !correction.len().is_multiple_of(n_tokens)
-        || b_weights.len() != (correction.len() / n_tokens).saturating_mul(rank)
     {
         return Some(false);
     }
+    let local_rows = correction.len() / n_tokens;
+    if b_weights.len() != local_rows.saturating_mul(rank)
+        || start_row
+            .checked_add(local_rows)
+            .is_none_or(|end| base_outputs.iter().any(|base| base.len() < end))
+    {
+        return Some(false);
+    }
+    let (base_quads, base_tail) = base_outputs.as_chunks::<4>();
+    let quad_rank_len = base_quads.len() * 4 * rank;
+    let (ranks_quad_slice, ranks_tail_slice) = ranks.split_at(quad_rank_len);
     for (local_row, (b_row, corr_slots)) in b_weights
         .chunks_exact(rank)
         .zip(correction.chunks_exact_mut(n_tokens))
         .enumerate()
     {
         let global_row = start_row + local_row;
-        for (t, (&base_slice, corr_slot)) in
-            base_outputs.iter().zip(corr_slots.iter_mut()).enumerate()
+        let (corr_quads, corr_tail) = corr_slots.as_chunks_mut::<4>();
+        for ((base4, corr4), ranks4) in base_quads
+            .iter()
+            .zip(corr_quads.iter_mut())
+            .zip(ranks_quad_slice.chunks_exact(4 * rank))
         {
-            let tok_ranks = &ranks[t * rank..(t + 1) * rank];
+            let r0 = &ranks4[..rank];
+            let r1 = &ranks4[rank..2 * rank];
+            let r2 = &ranks4[2 * rank..3 * rank];
+            let r3 = &ranks4[3 * rank..];
+            let dots = dot_f32_f32_row_4tokens(neon, b_row, [r0, r1, r2, r3]);
+            for ((dot, &base_slice), corr_slot) in
+                dots.into_iter().zip(base4.iter()).zip(corr4.iter_mut())
+            {
+                let updated = dot.mul_add(scale, base_slice[global_row]);
+                if !updated.is_finite() {
+                    return Some(false);
+                }
+                *corr_slot = updated;
+            }
+        }
+        for ((&base_slice, corr_slot), tok_ranks) in base_tail
+            .iter()
+            .zip(corr_tail.iter_mut())
+            .zip(ranks_tail_slice.chunks_exact(rank))
+        {
             let dot = dot_f32_f32_row(neon, b_row, tok_ranks);
             let updated = dot.mul_add(scale, base_slice[global_row]);
             if !updated.is_finite() {
@@ -5071,19 +5404,41 @@ fn try_dot_q8_0_eight_rows_tile_fast<const TOKENS: usize>(
     }
     let dotprod = bonsai_neon_dot::Q8Dotprod::detect()?;
     let mut sums = [[0.0_f32; TOKENS]; 8];
-    for (chunk_idx, chunk) in preparations[..token_count].chunks(8).enumerate() {
+    let (chunks8, rem8) = preparations[..token_count].as_chunks::<8>();
+    if !chunks8.is_empty() {
+        let mut out_buf = [[[0.0_f32; 8]; 8]; 4];
+        for (batch_idx, batch) in chunks8.chunks(4).enumerate() {
+            let mut arg_chunks: [[&[super::Q8Block]; 8]; 4] = [[&[]; 8]; 4];
+            for (c, chunk) in batch.iter().enumerate() {
+                arg_chunks[c] = std::array::from_fn(|t| &chunk[t].q8[..block_count]);
+            }
+            let out_slice = &mut out_buf[..batch.len()];
+            let Some(()) =
+                dotprod.dot_scaled_8x8_chunks(rows, &arg_chunks[..batch.len()], out_slice)
+            else {
+                return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+            };
+            for (c, chunk_out) in out_slice.iter().enumerate() {
+                let base = (batch_idx * 4 + c) * 8;
+                for r in 0..8 {
+                    sums[r][base..base + 8].copy_from_slice(&chunk_out[r]);
+                }
+            }
+        }
+    }
+    if !rem8.is_empty() {
         let mut tok_refs: [&[super::Q8Block]; 8] = [&[]; 8];
-        for (t, scratch) in chunk.iter().enumerate() {
+        for (t, scratch) in rem8.iter().enumerate() {
             tok_refs[t] = &scratch.q8[..block_count];
         }
         let mut out = [[0.0_f32; 8]; 8];
-        let Some(()) = dotprod.dot_scaled_8x_tokens_view(rows, &tok_refs[..chunk.len()], &mut out)
+        let Some(()) = dotprod.dot_scaled_8x_tokens_view(rows, &tok_refs[..rem8.len()], &mut out)
         else {
             return Some(Err(crate::invalid("nonfinite tensor or activation value")));
         };
-        let base = chunk_idx * 8;
+        let base = chunks8.len() * 8;
         for r in 0..8 {
-            sums[r][base..base + chunk.len()].copy_from_slice(&out[r][..chunk.len()]);
+            sums[r][base..base + rem8.len()].copy_from_slice(&out[r][..rem8.len()]);
         }
     }
     Some(Ok(sums))
@@ -8401,5 +8756,263 @@ mod tests {
         short_refs[11] = &row_refs[11][..row_bytes - 1];
         assert!(super::dot_q8_0_sixteen_rows(short_refs, &input).is_err());
         assert!(super::dot_q8_0_row(short_refs[11], &input).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lora_multi_tests {
+    fn scalar_dot_f32(weights: &[f32], input: &[f32]) -> f32 {
+        let mut acc0 = [0.0_f32; 4];
+        let mut acc1 = [0.0_f32; 4];
+        let (w_chunks8, w_rem8) = weights.as_chunks::<8>();
+        let (x_chunks8, x_rem8) = input.as_chunks::<8>();
+        for (w8, x8) in w_chunks8.iter().zip(x_chunks8) {
+            for k in 0..4 {
+                acc0[k] = w8[k].mul_add(x8[k], acc0[k]);
+                acc1[k] = w8[4 + k].mul_add(x8[4 + k], acc1[k]);
+            }
+        }
+        let (w_chunks4, w_tail) = w_rem8.as_chunks::<4>();
+        let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
+        if let (Some(w4), Some(x4)) = (w_chunks4.first(), x_chunks4.first()) {
+            for k in 0..4 {
+                acc0[k] = w4[k].mul_add(x4[k], acc0[k]);
+            }
+        }
+        let combined = [
+            acc0[0] + acc1[0],
+            acc0[1] + acc1[1],
+            acc0[2] + acc1[2],
+            acc0[3] + acc1[3],
+        ];
+        let mut sum = (combined[0] + combined[1]) + (combined[2] + combined[3]);
+        for (&w, &x) in w_tail.iter().zip(x_tail) {
+            sum = w.mul_add(x, sum);
+        }
+        sum
+    }
+
+    fn scalar_dot_f16(weights: &[u16], input: &[f32]) -> f32 {
+        let mut acc0 = [0.0_f32; 4];
+        let mut acc1 = [0.0_f32; 4];
+        let (w_chunks8, w_rem8) = weights.as_chunks::<8>();
+        let (x_chunks8, x_rem8) = input.as_chunks::<8>();
+        for (w8, x8) in w_chunks8.iter().zip(x_chunks8) {
+            for k in 0..4 {
+                acc0[k] = bonsai_ternary::half_to_float(w8[k]).mul_add(x8[k], acc0[k]);
+                acc1[k] = bonsai_ternary::half_to_float(w8[4 + k]).mul_add(x8[4 + k], acc1[k]);
+            }
+        }
+        let (w_chunks4, w_tail) = w_rem8.as_chunks::<4>();
+        let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
+        if let (Some(w4), Some(x4)) = (w_chunks4.first(), x_chunks4.first()) {
+            for k in 0..4 {
+                acc0[k] = bonsai_ternary::half_to_float(w4[k]).mul_add(x4[k], acc0[k]);
+            }
+        }
+        let combined = [
+            acc0[0] + acc1[0],
+            acc0[1] + acc1[1],
+            acc0[2] + acc1[2],
+            acc0[3] + acc1[3],
+        ];
+        let mut sum = (combined[0] + combined[1]) + (combined[2] + combined[3]);
+        for (&w, &x) in w_tail.iter().zip(x_tail) {
+            sum = bonsai_ternary::half_to_float(w).mul_add(x, sum);
+        }
+        sum
+    }
+
+    fn sample_lora_pair(rows: usize, cols: usize, mult: usize, salt: usize) -> (Vec<u16>, Vec<f32>) {
+        let pool = [0.0_f32, -0.0, 0.25, -0.5, 1.5, -2.25, 0.125, -0.75];
+        let f16_vals: Vec<u16> = (0..rows * cols)
+            .map(|i| bonsai_ternary::float_to_half(pool[(i * mult + salt) % pool.len()]))
+            .collect();
+        let f32_vals = f16_vals
+            .iter()
+            .copied()
+            .map(bonsai_ternary::half_to_float)
+            .collect();
+        (f16_vals, f32_vals)
+    }
+
+    fn sample_lora_tokens(count: usize, width: usize, mult_t: usize, mult_c: usize) -> Vec<Vec<f32>> {
+        let pool = [0.0_f32, -0.0, 0.25, -0.5, 1.5, -2.25, 0.125, -0.75];
+        (0..count)
+            .map(|t| {
+                (0..width)
+                    .map(|col| pool[(t * mult_t + col * mult_c) % pool.len()])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lora_multi_4way_a_matches_scalar_bits_across_ranks_and_tokens() {
+        if fearless_simd::Level::baseline().as_neon().is_none() {
+            return;
+        }
+        for in_features in [1_usize, 3, 4, 7, 11, 16, 29] {
+            for rank in [1_usize, 3, 4, 7, 16, 32] {
+                let (a_f16, a_f32) = sample_lora_pair(rank, in_features, 7, rank);
+                for token_count in [1_usize, 3, 4, 7, 8, 16] {
+                    let inputs = sample_lora_tokens(token_count, in_features, 11, 3);
+                    let input_refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
+                    let mut expected_f16 = vec![0.0_f32; token_count * rank];
+                    let mut expected_f32 = vec![0.0_f32; token_count * rank];
+                    for (t, input) in input_refs.iter().enumerate() {
+                        let (mut single_f16, mut single_f32) =
+                            (vec![f32::NAN; rank], vec![f32::NAN; rank]);
+                        assert_eq!(
+                            super::lora_multi_a_f16(&a_f16, in_features, input, &mut single_f16),
+                            Some(true)
+                        );
+                        assert_eq!(
+                            super::lora_multi_a_f32(&a_f32, in_features, input, &mut single_f32),
+                            Some(true)
+                        );
+                        for r in 0..rank {
+                            let exp_f16 =
+                                scalar_dot_f16(&a_f16[r * in_features..(r + 1) * in_features], input);
+                            let exp_f32 =
+                                scalar_dot_f32(&a_f32[r * in_features..(r + 1) * in_features], input);
+                            assert_eq!(single_f16[r].to_bits(), exp_f16.to_bits());
+                            assert_eq!(single_f32[r].to_bits(), exp_f32.to_bits());
+                            expected_f16[t * rank + r] = exp_f16;
+                            expected_f32[t * rank + r] = exp_f32;
+                        }
+                    }
+
+                    let (mut batch_f16, mut batch_f32) =
+                        (vec![f32::NAN; token_count * rank], vec![f32::NAN; token_count * rank]);
+                    assert_eq!(
+                        super::lora_multi_a_tokens_f16(
+                            &a_f16, in_features, rank, &input_refs, &mut batch_f16,
+                        ),
+                        Some(true)
+                    );
+                    assert_eq!(
+                        super::lora_multi_a_tokens_f32(
+                            &a_f32, in_features, rank, &input_refs, &mut batch_f32,
+                        ),
+                        Some(true)
+                    );
+                    assert_eq!(
+                        batch_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        expected_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        batch_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        expected_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lora_multi_4way_b_matches_scalar_bits_across_ranks_and_tokens() {
+        if fearless_simd::Level::baseline().as_neon().is_none() {
+            return;
+        }
+        let out_features = 13_usize;
+        let start_row = 3_usize;
+        let sub_rows = out_features - start_row;
+        let scale = 0.375_f32;
+        for rank in [1_usize, 3, 4, 7, 16, 32] {
+            let (b_f16, b_f32) = sample_lora_pair(out_features, rank, 5, rank);
+            let sub_b_f16 = &b_f16[start_row * rank..];
+            let sub_b_f32 = &b_f32[start_row * rank..];
+            for token_count in [1_usize, 3, 4, 7, 8, 16] {
+                let rank_tokens = sample_lora_tokens(token_count, rank, 7, 5);
+                let flat_ranks: Vec<f32> = rank_tokens.iter().flatten().copied().collect();
+                let base_outputs = sample_lora_tokens(token_count, out_features, 5, 9);
+                let base_refs: Vec<&[f32]> = base_outputs.iter().map(Vec::as_slice).collect();
+                let (mut corr_f16, mut corr_f32) =
+                    (vec![f32::NAN; sub_rows * token_count], vec![f32::NAN; sub_rows * token_count]);
+                assert_eq!(
+                    super::lora_multi_b_scale_and_finish_tokens_f16(
+                        sub_b_f16, &flat_ranks, rank, scale, &base_refs, start_row, &mut corr_f16,
+                    ),
+                    Some(true)
+                );
+                assert_eq!(
+                    super::lora_multi_b_scale_and_finish_tokens_f32(
+                        sub_b_f32, &flat_ranks, rank, scale, &base_refs, start_row, &mut corr_f32,
+                    ),
+                    Some(true)
+                );
+                for local_row in 0..sub_rows {
+                    let b_row_f16 = &sub_b_f16[local_row * rank..(local_row + 1) * rank];
+                    let b_row_f32 = &sub_b_f32[local_row * rank..(local_row + 1) * rank];
+                    for t in 0..token_count {
+                        let tok_r = &flat_ranks[t * rank..(t + 1) * rank];
+                        let base_val = base_outputs[t][start_row + local_row];
+                        let exp16 = scalar_dot_f16(b_row_f16, tok_r).mul_add(scale, base_val);
+                        let exp32 = scalar_dot_f32(b_row_f32, tok_r).mul_add(scale, base_val);
+                        assert_eq!(corr_f16[local_row * token_count + t].to_bits(), exp16.to_bits());
+                        assert_eq!(corr_f32[local_row * token_count + t].to_bits(), exp32.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lora_multi_4way_rejects_nonfinite_and_invalid_extents() {
+        if fearless_simd::Level::baseline().as_neon().is_none() {
+            return;
+        }
+        let a_f32 = vec![1.0_f32; 5 * 9];
+        let a_f16 = vec![0x3c00_u16; 5 * 9];
+        let mut bad_input = vec![1.0_f32; 9];
+        bad_input[7] = f32::NAN;
+        let mut ranks = vec![0.0_f32; 5];
+        assert_eq!(
+            super::lora_multi_a_f32(&a_f32, 9, &bad_input, &mut ranks),
+            Some(false)
+        );
+        assert_eq!(
+            super::lora_multi_a_f16(&a_f16, 9, &bad_input, &mut ranks),
+            Some(false)
+        );
+
+        let good_input = vec![1.0_f32; 9];
+        let inputs: Vec<&[f32]> = vec![
+            &good_input,
+            &good_input,
+            &bad_input,
+            &good_input,
+            &good_input,
+        ];
+        let mut ranks_tok = vec![0.0_f32; 5 * 5];
+        assert_eq!(
+            super::lora_multi_a_tokens_f32(&a_f32, 9, 5, &inputs, &mut ranks_tok),
+            Some(false)
+        );
+        assert_eq!(
+            super::lora_multi_a_tokens_f16(&a_f16, 9, 5, &inputs, &mut ranks_tok),
+            Some(false)
+        );
+
+        let b_f32 = vec![1.0_f32; 3 * 7];
+        let b_f16 = vec![0x3c00_u16; 3 * 7];
+        let mut bad_ranks = vec![1.0_f32; 5 * 7];
+        bad_ranks[3 * 7 + 5] = f32::INFINITY;
+        let base_row = [0.5_f32; 3];
+        let bases = [&base_row[..]; 5];
+        let mut corr = vec![0.0_f32; 3 * 5];
+        assert_eq!(
+            super::lora_multi_b_scale_and_finish_tokens_f32(
+                &b_f32, &bad_ranks, 7, 1.0, &bases, 0, &mut corr,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            super::lora_multi_b_scale_and_finish_tokens_f16(
+                &b_f16, &bad_ranks, 7, 1.0, &bases, 0, &mut corr,
+            ),
+            Some(false)
+        );
     }
 }

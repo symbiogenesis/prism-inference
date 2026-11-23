@@ -499,6 +499,33 @@ impl Ptq1Dotprod {
             scaled::portable_ptq1_8x_tokens_validated::<PINNED, A>(rows, tokens, out)
         }
     }
+
+    /// Consumes `8` complete 28-byte `PTQ1_0` rows across `1..=4` eight-token
+    /// chunks (`8..=32` tokens) inside a single full-K invocation over any
+    /// [`Q8ActivationView`] slices, preserving exact `0 ULP` parity.
+    ///
+    /// Returns `None` for unsupported chunk/output geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks<const PINNED: bool, A: Q8ActivationView>(
+        self,
+        rows: [&[u8]; 8],
+        chunks: &[[&[A]; 8]],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        if !scaled::valid_ptq1_8x8_chunks(rows, chunks, outputs.len()) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::ptq1_detected_dot_scaled_8x8_chunks::<PINNED, A>(self, rows, chunks, outputs)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            scaled::portable_ptq1_8x8_chunks_validated::<PINNED, A>(rows, chunks, outputs)
+        }
+    }
 }
 
 /// Detected `Q8_0` SIMD capability (`dotprod` and/or `i8mm`) reusable across full-K calls.
@@ -622,6 +649,33 @@ impl Q8Dotprod {
         {
             let _ = self;
             scaled::portable_q8_0_8x_tokens_validated(rows, tokens, out)
+        }
+    }
+
+    /// Consumes `8` complete 34-byte `Q8_0` weight rows across `1..=4` eight-token
+    /// chunks (`8..=32` tokens) inside a single full-K invocation over any
+    /// [`Q8ActivationView`] slices, preserving exact `0 ULP` non-FMA parity.
+    ///
+    /// Returns `None` for unsupported chunk/output geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks<A: Q8ActivationView>(
+        self,
+        rows: [&[u8]; 8],
+        chunks: &[[&[A]; 8]],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        if !scaled::valid_q8_0_8x8_chunks(rows, chunks, outputs.len()) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::q8_0_detected_dot_scaled_8x8_chunks::<A>(self, rows, chunks, outputs)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            scaled::portable_q8_0_8x8_chunks_validated::<A>(rows, chunks, outputs)
         }
     }
 }

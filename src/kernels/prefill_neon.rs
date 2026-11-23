@@ -1812,31 +1812,64 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
         && let Some(dotprod) = bonsai_neon_dot::Ptq1Dotprod::detect()
     {
         let q8_len = block_count * 4;
-        for (chunk_idx, chunk) in preparations.chunks(8).enumerate() {
+        let (chunks8, rem8) = preparations.as_chunks::<8>();
+        if !chunks8.is_empty() {
+            let mut out_buf = [[[0.0_f32; 8]; 8]; 4];
+            for (batch_idx, batch) in chunks8.chunks(4).enumerate() {
+                let mut arg_chunks: [[&[crate::kernels::Q8Block]; 8]; 4] = [[&[]; 8]; 4];
+                for (c, chunk) in batch.iter().enumerate() {
+                    arg_chunks[c] = std::array::from_fn(|t| &chunk[t].q8[..q8_len]);
+                }
+                let out_slice = &mut out_buf[..batch.len()];
+                let result = if pinned {
+                    dotprod.dot_scaled_8x8_chunks::<true, _>(
+                        rows,
+                        &arg_chunks[..batch.len()],
+                        out_slice,
+                    )
+                } else {
+                    dotprod.dot_scaled_8x8_chunks::<false, _>(
+                        rows,
+                        &arg_chunks[..batch.len()],
+                        out_slice,
+                    )
+                };
+                let Some(()) = result else {
+                    return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+                };
+                for (c, chunk_out) in out_slice.iter().enumerate() {
+                    let base = (batch_idx * 4 + c) * 8;
+                    for row in 0..8 {
+                        sums[row][base..base + 8].copy_from_slice(&chunk_out[row]);
+                    }
+                }
+            }
+        }
+        if !rem8.is_empty() {
             let mut tok_refs: [&[crate::kernels::Q8Block]; 8] = [&[]; 8];
-            for (t, scratch) in chunk.iter().enumerate() {
+            for (t, scratch) in rem8.iter().enumerate() {
                 tok_refs[t] = &scratch.q8[..q8_len];
             }
             let mut out_chunk = [[0.0_f32; 8]; 8];
             let result = if pinned {
                 dotprod.dot_scaled_8x_tokens_view::<true, _>(
                     rows,
-                    &tok_refs[..chunk.len()],
+                    &tok_refs[..rem8.len()],
                     &mut out_chunk,
                 )
             } else {
                 dotprod.dot_scaled_8x_tokens_view::<false, _>(
                     rows,
-                    &tok_refs[..chunk.len()],
+                    &tok_refs[..rem8.len()],
                     &mut out_chunk,
                 )
             };
             let Some(()) = result else {
                 return Some(Err(crate::invalid("nonfinite tensor or activation value")));
             };
-            let base = chunk_idx * 8;
-            for r in 0..8 {
-                sums[r][base..base + chunk.len()].copy_from_slice(&out_chunk[r][..chunk.len()]);
+            let base = chunks8.len() * 8;
+            for row in 0..8 {
+                sums[row][base..base + rem8.len()].copy_from_slice(&out_chunk[row][..rem8.len()]);
             }
         }
         let block_count_u64 = u64::try_from(block_count).ok()?;
@@ -2590,7 +2623,7 @@ mod tests {
             preps.push(neon_scratch);
         }
 
-        for count in [1_usize, 2, 3, 4, 5, 7, 8, 9, 16] {
+        for count in [1_usize, 2, 3, 4, 5, 7, 8, 9, 16, 24, 32] {
             let mut decoded = 0_u64;
             let actual = super::dot_q8_eight_rows::<MAX_TILE_TOKENS>(
                 row_refs,
@@ -2619,7 +2652,7 @@ mod tests {
         let columns = 384_usize;
         let block_count = columns / 128;
         let row_bytes = block_count * 28;
-        let (tensor, inputs) = sample_ptq1_eight_row_tensor(columns, 16)?;
+        let (tensor, inputs) = sample_ptq1_eight_row_tensor(columns, 32)?;
         let row_refs: [&[u8]; 8] =
             std::array::from_fn(|r| &tensor.data[r * row_bytes..(r + 1) * row_bytes]);
         for pinned in [false, true] {

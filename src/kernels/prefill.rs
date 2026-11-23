@@ -1392,4 +1392,107 @@ mod tests {
         assert_eq!(recovered_bits, scalar_bits(&t0, &inputs_8_alt, false)?);
         Ok(())
     }
+
+    #[test]
+    fn tiled_ptq1_and_q8_0_16_and_32_token_tiles_match_scalar_bits_and_reject_nonfinite() -> Result<()> {
+        for (kind, columns, rows) in [(PTQ1, 256_usize, 19_usize), (Q8_0, 192_usize, 21_usize)] {
+            let mut data = Vec::new();
+            for row in 0..rows {
+                let values: Vec<f32> = (0..columns)
+                    .map(|col| {
+                        [1.25, -2.5, 0.0, -0.0, 0.5, -0.375, 3.0, -0.125][(col * 5 + row * 3) % 8]
+                    })
+                    .collect();
+                data.extend_from_slice(&super::super::quantize_row(kind, &values)?);
+            }
+            let mut tensor = Tensor {
+                name: format!("tile-16-32-{kind}"),
+                dimensions: vec![columns, rows],
+                kind,
+                data: Arc::<[u8]>::from(data).into(),
+            };
+            let max_inputs: Vec<Vec<f32>> = (0..32)
+                .map(|token| {
+                    (0..columns)
+                        .map(|col| {
+                            [1.5, -128.0, 0.0, -0.0, 63.5, -3.25, 7.125][(col + token * 7) % 7]
+                        })
+                        .collect()
+                })
+                .collect();
+
+            for pinned in [false, true] {
+                if kind == Q8_0 && pinned {
+                    continue;
+                }
+                let expected: Vec<Vec<u32>> = max_inputs
+                    .iter()
+                    .map(|input| {
+                        let mut scratch = if pinned {
+                            MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                        } else {
+                            MatvecScratch::with_backend(MatvecBackend::Scalar)
+                        };
+                        let mut out = Vec::new();
+                        matvec_into(&tensor, input, &mut out, &mut scratch)?;
+                        Ok(out.into_iter().map(f32::to_bits).collect())
+                    })
+                    .collect::<Result<_>>()?;
+
+                for count in [16_usize, 19, 24, 32] {
+                    let inputs = &max_inputs[..count];
+                    for backend in [
+                        MatvecBackend::Scalar,
+                        MatvecBackend::Auto,
+                        MatvecBackend::ExperimentalNeon,
+                    ] {
+                        let mut tile = ProjectionTile::with_backend(backend);
+                        let mut actual = vec![vec![f32::NAN]; count];
+                        tile.project(&tensor, inputs, &mut actual, pinned, &|| Ok(()))?;
+                        let actual_bits: Vec<Vec<u32>> = actual
+                            .iter()
+                            .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                            .collect();
+                        assert_eq!(
+                            actual_bits, expected[..count],
+                            "mismatch kind={kind} count={count} pinned={pinned}"
+                        );
+                    }
+                }
+            }
+
+            let block_bytes = if kind == PTQ1 { 28 } else { 34 };
+            let scale_off = if kind == PTQ1 { 26 } else { 0 };
+            let valid = tensor.data.clone();
+            let mut bad_weight = valid.to_vec();
+            let corrupt_off = 3 * (columns / if kind == PTQ1 { 128 } else { 32 }) * block_bytes
+                + block_bytes
+                + scale_off;
+            bad_weight[corrupt_off..corrupt_off + 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
+            tensor.data = Arc::<[u8]>::from(bad_weight).into();
+            for count in [16_usize, 32] {
+                let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
+                let mut out = vec![vec![1.0_f32]; count];
+                assert!(
+                    tile.project(&tensor, &max_inputs[..count], &mut out, kind == PTQ1, &|| Ok(()))
+                        .is_err()
+                );
+                assert!(out.iter().all(Vec::is_empty));
+            }
+
+            tensor.data = valid;
+            for count in [16_usize, 32] {
+                let mut bad_inputs = max_inputs[..count].to_vec();
+                bad_inputs[count - 3][columns - 1] = f32::NAN;
+                let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
+                let mut out = vec![vec![1.0_f32]; count];
+                assert!(
+                    tile.project(&tensor, &bad_inputs, &mut out, kind == PTQ1, &|| Ok(()))
+                        .is_err()
+                );
+                assert!(out.iter().all(Vec::is_empty));
+            }
+        }
+        Ok(())
+    }
 }

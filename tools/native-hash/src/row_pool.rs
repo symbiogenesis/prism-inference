@@ -591,13 +591,17 @@ mod tests {
         assert_eq!(pool.shared.sleeping_workers.load(Ordering::Acquire), 3);
 
         // Wake all 3 sleeping background workers plus caller across a 4-way barrier.
-        let barrier = std::sync::Barrier::new(4);
+        // Hold a second barrier after reading `sleeping_workers` so no worker can
+        // finish `task` and re-enter the spin->sleep path before all 4 threads check.
+        let wake_barrier = std::sync::Barrier::new(4);
+        let check_barrier = std::sync::Barrier::new(4);
         let awake_seen = AtomicUsize::new(0);
         pool.dispatch(4, |_| {
-            barrier.wait();
+            wake_barrier.wait();
             if pool.shared.sleeping_workers.load(Ordering::Acquire) == 0 {
                 awake_seen.fetch_add(1, Ordering::Relaxed);
             }
+            check_barrier.wait();
         });
         assert_eq!(awake_seen.load(Ordering::Relaxed), 4);
 

@@ -99,10 +99,17 @@ impl PreparedMatvec<'_> {
                 row_bytes,
                 outputs,
                 |bytes, output| {
-                    super::super::parallel_rows::fill_batched_chunk(
+                    super::super::parallel_rows::fill_sixteen_batched_chunk(
+                        output,
                         bytes,
                         row_bytes,
-                        output,
+                        &|rows| {
+                            if pinned {
+                                super::super::neon::dot_ptq1_sixteen_rows_pinned(rows, q8)
+                            } else {
+                                super::super::neon::dot_ptq1_sixteen_rows_source(rows, q8)
+                            }
+                        },
                         &|rows| {
                             if pinned {
                                 super::super::neon::dot_ptq1_eight_rows_pinned(rows, q8)

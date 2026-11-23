@@ -229,3 +229,68 @@ fn q8_siblings_refuse_mixed_formats_and_q8k_preparation_before_dispatch() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn q8_siblings_ptq1_row_counts_1_to_33_match_scalar_zero_ulp() -> Result<()> {
+    let columns = 256_usize;
+    let input: Vec<_> = (0..columns)
+        .map(|index| [127.0, -128.0, 0.5001, -0.0, 63.5001, 1.5, -0.5001][index % 7])
+        .collect();
+    for rows in 1..=33_usize {
+        let companion_rows = 34 - rows;
+        let tensors = [
+            weight(PTQ1, columns, rows)?,
+            weight(PTQ1, columns, companion_rows)?,
+        ];
+        for pinned in [false, true] {
+            let make_scratch = |backend| {
+                if pinned {
+                    MatvecScratch::with_pinned_backend(backend)
+                } else {
+                    MatvecScratch::with_backend(backend)
+                }
+            };
+            let mut expected: [Vec<f32>; 2] = std::array::from_fn(|_| Vec::new());
+            for (tensor, output) in tensors.iter().zip(&mut expected) {
+                matvec_into(
+                    tensor,
+                    &input,
+                    output,
+                    &mut make_scratch(MatvecBackend::Scalar),
+                )?;
+            }
+            for backend in [MatvecBackend::Auto, MatvecBackend::ExperimentalNeon] {
+                let mut scratch = make_scratch(backend);
+                let mut outputs: [Vec<f32>; 2] = std::array::from_fn(|_| vec![f32::NAN]);
+                let mut prepared = scratch.prepare(&tensors[0], &input)?;
+                prepared.matvec_q8_siblings_into(&tensors.each_ref(), &mut outputs.each_mut())?;
+                for (actual, expected) in outputs.iter().zip(&expected) {
+                    assert_eq!(bits(actual), bits(expected), "rows={rows} pinned={pinned}");
+                }
+            }
+        }
+    }
+
+    let valid = weight(PTQ1, columns, 17)?;
+    let mut bad = weight(PTQ1, columns, 17)?;
+    let mut bad_data = bad.data.to_vec();
+    let row15_scale_offset = 15 * (columns / 128) * 28 + 26;
+    bad_data[row15_scale_offset..row15_scale_offset + 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
+    bad.data = Arc::<[u8]>::from(bad_data).into();
+    for pinned in [false, true] {
+        let mut scratch = if pinned {
+            MatvecScratch::with_pinned_backend(MatvecBackend::ExperimentalNeon)
+        } else {
+            MatvecScratch::with_backend(MatvecBackend::ExperimentalNeon)
+        };
+        let mut outputs: [Vec<f32>; 2] = std::array::from_fn(|_| vec![f32::NAN]);
+        let mut prepared = scratch.prepare(&valid, &input)?;
+        assert!(
+            prepared
+                .matvec_q8_siblings_into(&[&valid, &bad], &mut outputs.each_mut())
+                .is_err()
+        );
+        assert!(outputs.iter().all(Vec::is_empty));
+    }
+    Ok(())
+}

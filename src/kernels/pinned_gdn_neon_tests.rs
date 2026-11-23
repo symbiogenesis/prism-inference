@@ -1108,3 +1108,58 @@ fn x1_gdn_prefill_second_phase_late_failure_keeps_all_destinations_untouched() -
     }
     Ok(())
 }
+
+#[test]
+fn pinned_gdn_dot_pair_four_and_eight_rows_match_scalar_zero_ulp() -> Result<()> {
+    for width in [1, 15, 16, 17, 32, 64, 128, 131] {
+        let mut raw_states = values(width * 8);
+        let mut first = values(width);
+        let mut second = values(width);
+        for (i, elem) in raw_states.iter_mut().enumerate() {
+            if i % 5 == 0 {
+                *elem = -*elem;
+            }
+        }
+        raw_states[0] = -0.0;
+        first[width - 1] = -first[width - 1];
+        second[0] = f32::from_bits(1);
+
+        let rows8: [&[f32]; 8] = std::array::from_fn(|r| &raw_states[r * width..(r + 1) * width]);
+        let rows4: [&[f32]; 4] = [rows8[0], rows8[1], rows8[2], rows8[3]];
+
+        let pairs4 = super::dot_pair_four_rows(rows4, &first, &second)
+            .ok_or_else(|| invalid("baseline NEON was unavailable"))?;
+        for (r, &row) in rows4.iter().enumerate() {
+            let exp0 = dot_scalar(row, &first)?;
+            let exp1 = dot_scalar(row, &second)?;
+            assert_eq!(
+                pairs4[r].0.to_bits(),
+                exp0.to_bits(),
+                "4-row width={width} r={r}"
+            );
+            assert_eq!(
+                pairs4[r].1.to_bits(),
+                exp1.to_bits(),
+                "4-row width={width} r={r}"
+            );
+        }
+
+        let pairs8 = super::dot_pair_eight_rows(rows8, &first, &second)
+            .ok_or_else(|| invalid("baseline NEON was unavailable"))?;
+        for (r, &row) in rows8.iter().enumerate() {
+            let exp0 = dot_scalar(row, &first)?;
+            let exp1 = dot_scalar(row, &second)?;
+            assert_eq!(
+                pairs8[r].0.to_bits(),
+                exp0.to_bits(),
+                "8-row width={width} r={r}"
+            );
+            assert_eq!(
+                pairs8[r].1.to_bits(),
+                exp1.to_bits(),
+                "8-row width={width} r={r}"
+            );
+        }
+    }
+    Ok(())
+}

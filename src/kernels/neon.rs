@@ -2679,45 +2679,37 @@ pub(super) fn gdn_wy_update_eight_rows(
     let width = matrix_rows[0].len();
     let count = inputs.len();
     let scale_vec = f32x4::splat(neon, last_cumulative);
-    let vec16_blocks = width / 16;
+    let vec8_blocks = width / 8;
     let [m0, m1, m2, m3, m4, m5, m6, m7] = matrix_rows;
     let mut rows = [m0, m1, m2, m3, m4, m5, m6, m7];
-    for b in 0..vec16_blocks {
-        let offset = b * 16;
-        let mut acc = [[f32x4::splat(neon, 0.0); 4]; 8];
+    for b in 0..vec8_blocks {
+        let offset = b * 8;
+        let mut acc = [[f32x4::splat(neon, 0.0); 2]; 8];
         for r in 0..8 {
-            let s = &states[r][offset..offset + 16];
+            let s = &states[r][offset..offset + 8];
             acc[r] = [
                 scale_vec * f32x4::from_slice(neon, &s[0..4]),
                 scale_vec * f32x4::from_slice(neon, &s[4..8]),
-                scale_vec * f32x4::from_slice(neon, &s[8..12]),
-                scale_vec * f32x4::from_slice(neon, &s[12..16]),
             ];
         }
         for (prior, input) in inputs[..count].iter().enumerate() {
-            let kb = &input.key[offset..offset + 16];
+            let kb = &input.key[offset..offset + 8];
             let k0 = f32x4::from_slice(neon, &kb[0..4]);
             let k1 = f32x4::from_slice(neon, &kb[4..8]);
-            let k2 = f32x4::from_slice(neon, &kb[8..12]);
-            let k3 = f32x4::from_slice(neon, &kb[12..16]);
             for r in 0..8 {
                 let sd = f32x4::splat(neon, scaled_deltas[r][prior]);
                 acc[r][0] += sd * k0;
                 acc[r][1] += sd * k1;
-                acc[r][2] += sd * k2;
-                acc[r][3] += sd * k3;
             }
         }
         for (out_row, row_acc) in rows.iter_mut().zip(acc.iter()) {
-            let out_block = &mut out_row[offset..offset + 16];
+            let out_block = &mut out_row[offset..offset + 8];
             row_acc[0].store_slice(&mut out_block[0..4]);
             row_acc[1].store_slice(&mut out_block[4..8]);
-            row_acc[2].store_slice(&mut out_block[8..12]);
-            row_acc[3].store_slice(&mut out_block[12..16]);
         }
     }
     let vec4_blocks = width / 4;
-    for b in (vec16_blocks * 4)..vec4_blocks {
+    for b in (vec8_blocks * 2)..vec4_blocks {
         let offset = b * 4;
         let mut a: [f32x4<Neon>; 8] = std::array::from_fn(|r| {
             scale_vec * f32x4::from_slice(neon, &states[r][offset..offset + 4])
@@ -9080,5 +9072,103 @@ mod lora_multi_tests {
             ),
             Some(false)
         );
+    }
+
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "Scalar reference preserves separate binary32 multiply and add roundings."
+    )]
+    fn scalar_gdn_wy_update_row(
+        state: &[f32],
+        last_cumulative: f32,
+        inputs: &[super::super::pinned_gdn::ChunkInput<'_>],
+        scaled_deltas: &[f32; 32],
+        out: &mut [f32],
+    ) {
+        for (idx, dst) in out.iter_mut().enumerate() {
+            let mut acc = last_cumulative * state[idx];
+            for (prior, input) in inputs.iter().enumerate() {
+                acc += scaled_deltas[prior] * input.key[idx];
+            }
+            *dst = acc;
+        }
+    }
+
+    #[test]
+    fn gdn_wy_update_eight_rows_matches_scalar_zero_ulp() {
+        if fearless_simd::Level::baseline().as_neon().is_none() {
+            return;
+        }
+        let mut seed = 0x517c_c1b7_u32;
+        let mut next_f32 = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let mag = f32::from_bits((seed & 0x007f_ffff) | 0x3d80_0000);
+            if (seed >> 31) != 0 { -mag } else { mag }
+        };
+        for width in [1_usize, 4, 7, 8, 12, 15, 16, 32, 64, 128, 131] {
+            let state_buf: Vec<f32> = (0..8 * width).map(|_| next_f32()).collect();
+            let states: [&[f32]; 8] =
+                std::array::from_fn(|r| &state_buf[r * width..(r + 1) * width]);
+            let last_cumulative = next_f32();
+            for count in [1_usize, 2, 4, 16, 32] {
+                let keys: Vec<Vec<f32>> = (0..count)
+                    .map(|_| (0..width).map(|_| next_f32()).collect())
+                    .collect();
+                let empty: [f32; 0] = [];
+                let inputs: Vec<super::super::pinned_gdn::ChunkInput<'_>> = keys
+                    .iter()
+                    .map(|key| super::super::pinned_gdn::ChunkInput {
+                        query: &empty,
+                        key,
+                        value: &empty,
+                        decay: 0.875,
+                        beta: 0.5,
+                    })
+                    .collect();
+                let mut scaled_deltas = [[0.0_f32; 32]; 8];
+                for row in &mut scaled_deltas {
+                    for slot in row.iter_mut().take(count) {
+                        *slot = next_f32();
+                    }
+                }
+                let mut neon_buf = vec![f32::NAN; 8 * width];
+                {
+                    let (h0, h1) = neon_buf.split_at_mut(4 * width);
+                    let (r01, r23) = h0.split_at_mut(2 * width);
+                    let (r45, r67) = h1.split_at_mut(2 * width);
+                    let (m0, m1) = r01.split_at_mut(width);
+                    let (m2, m3) = r23.split_at_mut(width);
+                    let (m4, m5) = r45.split_at_mut(width);
+                    let (m6, m7) = r67.split_at_mut(width);
+                    assert!(super::gdn_wy_update_eight_rows(
+                        states,
+                        last_cumulative,
+                        &inputs,
+                        &scaled_deltas,
+                        [m0, m1, m2, m3, m4, m5, m6, m7],
+                    ));
+                }
+                let mut expected = vec![0.0_f32; width];
+                for r in 0..8 {
+                    scalar_gdn_wy_update_row(
+                        states[r],
+                        last_cumulative,
+                        &inputs,
+                        &scaled_deltas[r],
+                        &mut expected,
+                    );
+                    let actual = &neon_buf[r * width..(r + 1) * width];
+                    assert_eq!(
+                        actual.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        "width={width} count={count} row={r}"
+                    );
+                }
+            }
+        }
     }
 }

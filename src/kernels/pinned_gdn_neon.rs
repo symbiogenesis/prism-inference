@@ -143,139 +143,104 @@ pub(super) fn dot_four(state: &[f32], inputs: [&[f32]; 4]) -> Option<[f32; 4]> {
     Some(results)
 }
 
-/// Computes `(dot(states[r], first), dot(states[r], second))` across four state rows in one pass,
-/// sharing each `first` and `second` vector load across all four rows' four-register FMA trees.
+/// Computes `(dot(states[r], first), dot(states[r], second))` across two state rows in one pass,
+/// sharing each `first` and `second` vector load across both rows' four-register FMA trees.
 #[inline]
 #[expect(
     clippy::suboptimal_flops,
     reason = "Pinned scalar remainder retains separate multiply/add rounding."
 )]
+fn dot_pair_two_rows(
+    neon: Neon,
+    states: [&[f32]; 2],
+    first: &[f32],
+    second: &[f32],
+) -> [(f32, f32); 2] {
+    let len = first.len().min(second.len());
+    let vectorized = len / 16 * 16;
+    let mut f = [[f32x4::splat(neon, 0.0); 4]; 2];
+    let mut s = [[f32x4::splat(neon, 0.0); 4]; 2];
+    let st0 = &states[0][..len];
+    let st1 = &states[1][..len];
+    for (((first_block, second_block), st0_block), st1_block) in first[..vectorized]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(second[..vectorized].as_chunks::<16>().0)
+        .zip(st0[..vectorized].as_chunks::<16>().0)
+        .zip(st1[..vectorized].as_chunks::<16>().0)
+    {
+        let k0 = f32x4::from_slice(neon, &first_block[0..4]);
+        let k1 = f32x4::from_slice(neon, &first_block[4..8]);
+        let k2 = f32x4::from_slice(neon, &first_block[8..12]);
+        let k3 = f32x4::from_slice(neon, &first_block[12..16]);
+        let q0 = f32x4::from_slice(neon, &second_block[0..4]);
+        let q1 = f32x4::from_slice(neon, &second_block[4..8]);
+        let q2 = f32x4::from_slice(neon, &second_block[8..12]);
+        let q3 = f32x4::from_slice(neon, &second_block[12..16]);
+        for (r, st_block) in [st0_block, st1_block].into_iter().enumerate() {
+            let v0 = f32x4::from_slice(neon, &st_block[0..4]);
+            let v1 = f32x4::from_slice(neon, &st_block[4..8]);
+            let v2 = f32x4::from_slice(neon, &st_block[8..12]);
+            let v3 = f32x4::from_slice(neon, &st_block[12..16]);
+            f[r][0] = v0.mul_add_precise(k0, f[r][0]);
+            f[r][1] = v1.mul_add_precise(k1, f[r][1]);
+            f[r][2] = v2.mul_add_precise(k2, f[r][2]);
+            f[r][3] = v3.mul_add_precise(k3, f[r][3]);
+            s[r][0] = v0.mul_add_precise(q0, s[r][0]);
+            s[r][1] = v1.mul_add_precise(q1, s[r][1]);
+            s[r][2] = v2.mul_add_precise(q2, s[r][2]);
+            s[r][3] = v3.mul_add_precise(q3, s[r][3]);
+        }
+    }
+    let mut results: [(f32, f32); 2] = std::array::from_fn(|r| {
+        (
+            ((f[r][0] + f[r][2]) + (f[r][1] + f[r][3])).reduce_sum(),
+            ((s[r][0] + s[r][2]) + (s[r][1] + s[r][3])).reduce_sum(),
+        )
+    });
+    for (((&k, &q), &a), &b) in first[vectorized..len]
+        .iter()
+        .zip(&second[vectorized..len])
+        .zip(&st0[vectorized..])
+        .zip(&st1[vectorized..])
+    {
+        results[0].0 += a * k;
+        results[0].1 += a * q;
+        results[1].0 += b * k;
+        results[1].1 += b * q;
+    }
+    results
+}
+
+/// Computes `(dot(states[r], first), dot(states[r], second))` across four state rows in two
+/// spill-free two-row passes, sharing `first` and `second` vector loads per pair.
+#[inline]
 pub(super) fn dot_pair_four_rows(
     states: [&[f32]; 4],
     first: &[f32],
     second: &[f32],
 ) -> Option<[(f32, f32); 4]> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let vectorized = first.len() / 16 * 16;
-    let mut f = [[f32x4::splat(neon, 0.0); 4]; 4];
-    let mut s = [[f32x4::splat(neon, 0.0); 4]; 4];
-    let st_chunks = states.map(|row| row[..vectorized].as_chunks::<16>().0);
-    for (b, (first_block, second_block)) in first[..vectorized]
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .zip(second[..vectorized].as_chunks::<16>().0)
-        .enumerate()
-    {
-        let k0 = f32x4::from_slice(neon, &first_block[0..4]);
-        let k1 = f32x4::from_slice(neon, &first_block[4..8]);
-        let k2 = f32x4::from_slice(neon, &first_block[8..12]);
-        let k3 = f32x4::from_slice(neon, &first_block[12..16]);
-        let q0 = f32x4::from_slice(neon, &second_block[0..4]);
-        let q1 = f32x4::from_slice(neon, &second_block[4..8]);
-        let q2 = f32x4::from_slice(neon, &second_block[8..12]);
-        let q3 = f32x4::from_slice(neon, &second_block[12..16]);
-        for r in 0..4 {
-            let st_block = &st_chunks[r][b];
-            let st0 = f32x4::from_slice(neon, &st_block[0..4]);
-            let st1 = f32x4::from_slice(neon, &st_block[4..8]);
-            let st2 = f32x4::from_slice(neon, &st_block[8..12]);
-            let st3 = f32x4::from_slice(neon, &st_block[12..16]);
-            f[r][0] = st0.mul_add_precise(k0, f[r][0]);
-            f[r][1] = st1.mul_add_precise(k1, f[r][1]);
-            f[r][2] = st2.mul_add_precise(k2, f[r][2]);
-            f[r][3] = st3.mul_add_precise(k3, f[r][3]);
-            s[r][0] = st0.mul_add_precise(q0, s[r][0]);
-            s[r][1] = st1.mul_add_precise(q1, s[r][1]);
-            s[r][2] = st2.mul_add_precise(q2, s[r][2]);
-            s[r][3] = st3.mul_add_precise(q3, s[r][3]);
-        }
-    }
-    let mut results: [(f32, f32); 4] = std::array::from_fn(|r| {
-        (
-            ((f[r][0] + f[r][2]) + (f[r][1] + f[r][3])).reduce_sum(),
-            ((s[r][0] + s[r][2]) + (s[r][1] + s[r][3])).reduce_sum(),
-        )
-    });
-    let rem_base = first[vectorized..].iter().zip(&second[vectorized..]);
-    for (idx, (&k, &q)) in rem_base.enumerate() {
-        let col = vectorized + idx;
-        for (r, res) in results.iter_mut().enumerate() {
-            let st = states[r][col];
-            res.0 += st * k;
-            res.1 += st * q;
-        }
-    }
-    Some(results)
+    let [p0, p1] = dot_pair_two_rows(neon, [states[0], states[1]], first, second);
+    let [p2, p3] = dot_pair_two_rows(neon, [states[2], states[3]], first, second);
+    Some([p0, p1, p2, p3])
 }
 
-/// Computes `(dot(states[r], first), dot(states[r], second))` across eight state rows in one pass,
-/// sharing each `first` and `second` vector load across all eight rows' four-register FMA trees.
+/// Computes `(dot(states[r], first), dot(states[r], second))` across eight state rows in four
+/// spill-free two-row passes, sharing `first` and `second` vector loads per pair.
 #[inline]
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "Pinned scalar remainder retains separate multiply/add rounding."
-)]
 pub(super) fn dot_pair_eight_rows(
     states: [&[f32]; 8],
     first: &[f32],
     second: &[f32],
 ) -> Option<[(f32, f32); 8]> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let vectorized = first.len() / 16 * 16;
-    let mut f = [[f32x4::splat(neon, 0.0); 4]; 8];
-    let mut s = [[f32x4::splat(neon, 0.0); 4]; 8];
-    let st_chunks = states.map(|row| row[..vectorized].as_chunks::<16>().0);
-    for (b, (first_block, second_block)) in first[..vectorized]
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .zip(second[..vectorized].as_chunks::<16>().0)
-        .enumerate()
-    {
-        let k0 = f32x4::from_slice(neon, &first_block[0..4]);
-        let k1 = f32x4::from_slice(neon, &first_block[4..8]);
-        let k2 = f32x4::from_slice(neon, &first_block[8..12]);
-        let k3 = f32x4::from_slice(neon, &first_block[12..16]);
-        let q0 = f32x4::from_slice(neon, &second_block[0..4]);
-        let q1 = f32x4::from_slice(neon, &second_block[4..8]);
-        let q2 = f32x4::from_slice(neon, &second_block[8..12]);
-        let q3 = f32x4::from_slice(neon, &second_block[12..16]);
-        for r in 0..8 {
-            let st_block = &st_chunks[r][b];
-            let st0 = f32x4::from_slice(neon, &st_block[0..4]);
-            let st1 = f32x4::from_slice(neon, &st_block[4..8]);
-            let st2 = f32x4::from_slice(neon, &st_block[8..12]);
-            let st3 = f32x4::from_slice(neon, &st_block[12..16]);
-            f[r][0] = st0.mul_add_precise(k0, f[r][0]);
-            f[r][1] = st1.mul_add_precise(k1, f[r][1]);
-            f[r][2] = st2.mul_add_precise(k2, f[r][2]);
-            f[r][3] = st3.mul_add_precise(k3, f[r][3]);
-            s[r][0] = st0.mul_add_precise(q0, s[r][0]);
-            s[r][1] = st1.mul_add_precise(q1, s[r][1]);
-            s[r][2] = st2.mul_add_precise(q2, s[r][2]);
-            s[r][3] = st3.mul_add_precise(q3, s[r][3]);
-        }
-    }
-    let mut results: [(f32, f32); 8] = std::array::from_fn(|r| {
-        (
-            ((f[r][0] + f[r][2]) + (f[r][1] + f[r][3])).reduce_sum(),
-            ((s[r][0] + s[r][2]) + (s[r][1] + s[r][3])).reduce_sum(),
-        )
-    });
-    for (idx, (&k, &q)) in first[vectorized..]
-        .iter()
-        .zip(&second[vectorized..])
-        .enumerate()
-    {
-        let col = vectorized + idx;
-        for (r, res) in results.iter_mut().enumerate() {
-            let st = states[r][col];
-            res.0 += st * k;
-            res.1 += st * q;
-        }
-    }
-    Some(results)
+    let [p0, p1] = dot_pair_two_rows(neon, [states[0], states[1]], first, second);
+    let [p2, p3] = dot_pair_two_rows(neon, [states[2], states[3]], first, second);
+    let [p4, p5] = dot_pair_two_rows(neon, [states[4], states[5]], first, second);
+    let [p6, p7] = dot_pair_two_rows(neon, [states[6], states[7]], first, second);
+    Some([p0, p1, p2, p3, p4, p5, p6, p7])
 }
 
 /// Scales `state` by `decay` and accumulates its four-register FMA dot product with `key` in one pass.

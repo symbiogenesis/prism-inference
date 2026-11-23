@@ -20,6 +20,7 @@ use bonsai_prism_runtime::{
         lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
         swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256},
     },
+    sampling::FiniteLogits,
 };
 use bonsai_ternary::half_to_float;
 
@@ -896,6 +897,12 @@ impl<'a> BufferCleanupGuard<'a> {
 
     fn alloc_storage(&mut self, bytes: u64) -> Result<BufferId, Error> {
         let id = self.device.create_storage_buffer(bytes)?;
+        self.buffers.push(id);
+        Ok(id)
+    }
+
+    fn alloc_readback_storage(&mut self, bytes: u64) -> Result<BufferId, Error> {
+        let id = self.device.create_readback_storage_buffer(bytes)?;
         self.buffers.push(id);
         Ok(id)
     }
@@ -2031,6 +2038,35 @@ impl VulkanBatchedGraphExecutor {
         check: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
         let t_len = tokens.len();
+        if let Some(dst) = logits_out {
+            self.run_tile_gpu_into(tokens, Some(dst), check)?;
+            if let Err(err) = ensure_finite_f32(dst, "GPU batched graph produced non-finite logits")
+            {
+                dst.clear();
+                self.state_consistent = false;
+                return Err(err);
+            }
+        } else {
+            self.run_tile_gpu_into(tokens, None, check)?;
+        }
+        self.commit_tile_position(t_len);
+        Ok(())
+    }
+
+    fn commit_tile_position(&mut self, t_len: usize) {
+        self.position += t_len;
+        for slot in &mut self.mrope_positions[..3] {
+            *slot += t_len;
+        }
+    }
+
+    fn run_tile_gpu_into(
+        &mut self,
+        tokens: &[u32],
+        logits_out: Option<&mut Vec<f32>>,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let t_len = tokens.len();
         if logits_out.is_some() && t_len != 1 {
             return Err(Error::InvalidInput(
                 "logit readout requires a single token".to_owned(),
@@ -2051,6 +2087,7 @@ impl VulkanBatchedGraphExecutor {
 
         let mut mutated_gpu = false;
         let run_result = (|| -> Result<(), Error> {
+            self.device.ensure_pipelined_idle()?;
             for (chunk_idx, range) in chunks.iter().enumerate() {
                 if chunk_idx > 0 {
                     check()?;
@@ -2099,38 +2136,37 @@ impl VulkanBatchedGraphExecutor {
                     let narrow_final = !need_logits && layer_idx + 1 == total_layers;
                     self.record_layer_tokens(layer_idx, t_len, narrow_final, min_align)?;
                 }
-                if chunk_idx + 1 == chunks.len() && need_logits {
+                let is_final_chunk = chunk_idx + 1 == chunks.len();
+                if is_final_chunk && need_logits {
                     self.record_final_logits()?;
                 }
                 if !self.batch_recorder.is_empty() {
                     mutated_gpu = true;
-                    let submits = self.device.submit_compute_batches_with_max_stages(
+                    let submits = self.device.submit_pipelined_batches_with_max_stages(
                         &self.batch_recorder,
                         self.config.tdr_policy.max_stages_per_submit,
+                        is_final_chunk,
                     )?;
                     self.submits_completed = self.submits_completed.saturating_add(submits);
                 }
             }
+            self.device.finish_pipelined_session()?;
 
             if let Some(dst) = logits_out {
                 dst.resize(self.geometry.vocabulary, 0.0_f32);
                 self.device.read_buffer_f32(self.scratch.logits, dst)?;
-                ensure_finite_f32(dst, "GPU batched graph produced non-finite logits")?;
             }
             Ok(())
         })();
 
         if run_result.is_err() {
+            self.device.abort_pipelined_session();
             if mutated_gpu {
                 self.state_consistent = false;
             }
             return run_result;
         }
 
-        self.position += t_len;
-        for slot in &mut self.mrope_positions[..3] {
-            *slot += t_len;
-        }
         Ok(())
     }
 
@@ -3924,6 +3960,35 @@ impl Decoder for VulkanBatchedGraphExecutor {
             .map_err(Error::into_runtime_error)
     }
 
+    fn evaluate_finite_into<'a>(
+        &mut self,
+        token: u32,
+        output: &'a mut Vec<f32>,
+    ) -> RuntimeResult<FiniteLogits<'a>> {
+        output.clear();
+        self.validate_execution_ready(&[token])
+            .map_err(Error::into_runtime_error)?;
+        if let Err(err) = self.run_tile_gpu_into(&[token], Some(output), &mut || Ok(())) {
+            output.clear();
+            return Err(err.into_runtime_error());
+        }
+        if output.len() != self.geometry.vocabulary || output.is_empty() || output.len() > 1_048_576
+        {
+            output.clear();
+            self.state_consistent = false;
+            return Err(Error::InvalidInput(
+                "GPU returned invalid logit vocabulary extent".to_owned(),
+            )
+            .into_runtime_error());
+        }
+        let prev_consistent = self.state_consistent;
+        self.state_consistent = false;
+        let finite = FiniteLogits::new(output.as_slice())?;
+        self.state_consistent = prev_consistent;
+        self.commit_tile_position(1);
+        Ok(finite)
+    }
+
     fn ingest(&mut self, token: u32) -> RuntimeResult<()> {
         self.ingest_token(token).map_err(Error::into_runtime_error)
     }
@@ -5378,7 +5443,7 @@ fn allocate_scratch(
         attn_probs: guard.alloc_storage(sizes[18])?,
         attn_score_bytes: plan.score_bytes,
         allocated_tile_tokens: plan.allocated_tile_tokens,
-        logits: guard.alloc_storage(sizes[19])?,
+        logits: guard.alloc_readback_storage(sizes[19])?,
         dummy_state: guard.alloc_storage(sizes[20])?,
     })
 }

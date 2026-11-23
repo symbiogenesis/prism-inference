@@ -1073,9 +1073,7 @@ fn open_hexagon_native_q2_executor(
     bonsai_hexagon_runtime::NativeQ2ResidencyStatistics,
     bonsai_hexagon_runtime::VtcmPlacementPlan,
 )> {
-    if !supports_hexagon_native_q2_representation(session.representation())
-        || session.cpu_speculation().is_some()
-    {
+    if !supports_hexagon_native_q2_representation(session.representation()) {
         return None;
     }
     let package_dir = discover_hexagon_package_directory()?;
@@ -1166,6 +1164,35 @@ fn open_hexagon_native_q2_executor(
     Some((executor, tensors, residency, plan))
 }
 
+/// Retain host layer weights whenever a CPU prefill or CPU speculation phase
+/// may execute fallback projection tiles after installing an accelerator executor.
+#[cfg_attr(
+    all(
+        not(test),
+        not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))
+    ),
+    expect(
+        dead_code,
+        reason = "Host-weight retention check is called on Windows ARM64 worker setup and unit tests."
+    )
+)]
+pub(super) const fn should_release_executor_host_weights(
+    has_cpu_prefill: bool,
+    has_cpu_speculation: bool,
+) -> bool {
+    !has_cpu_prefill && !has_cpu_speculation
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+fn release_unused_executor_host_weights(session: &mut SwiftSession) {
+    if should_release_executor_host_weights(
+        session.cpu_prefill().is_some(),
+        session.cpu_speculation().is_some(),
+    ) {
+        let _ = session.release_executor_resident_host_weights();
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
 fn install_default_hexagon_executor(
     session: &mut SwiftSession,
@@ -1199,9 +1226,7 @@ fn install_default_hexagon_executor(
         *slot = Some(executor);
     });
     session.set_projection_executor(Some(Box::new(WorkerThreadHexagonExecutor)));
-    if session.cpu_prefill().is_none() {
-        let _ = session.release_executor_resident_host_weights();
-    }
+    release_unused_executor_host_weights(session);
     Some(startup)
 }
 
@@ -1331,9 +1356,7 @@ fn install_composite_executor(
             *slot = Some(composite);
         });
         session.set_projection_executor(Some(Box::new(WorkerThreadCompositeExecutor { identity })));
-        if session.cpu_prefill().is_none() {
-            let _ = session.release_executor_resident_host_weights();
-        }
+        release_unused_executor_host_weights(session);
         Ok(startup)
     }
     #[cfg(not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")))]

@@ -731,3 +731,245 @@ fn folded_verification_guards_observers_and_rolls_back_mid_block_cancellation() 
     assert_full_state_bit_eq(&seq, &folded)?;
     Ok(())
 }
+
+fn pq2_mixed_hybrid_model(cfg: &HybridConfig) -> Model {
+    let mut model = hybrid_model(cfg);
+    for (idx, (name, tensor)) in model.tensors.iter_mut().enumerate() {
+        if let &[cols, rows] = tensor.dimensions.as_slice()
+            && name.starts_with("blk.")
+            && cols >= 128
+            && cols.is_multiple_of(128)
+        {
+            let mut block = [0x55_u8; 34];
+            let scale = 0x3400_u16.wrapping_add(u16::try_from((idx % 7) * 0x0100).unwrap_or(0));
+            block[..2].copy_from_slice(&scale.to_le_bytes());
+            for (j, byte) in block[2..].iter_mut().enumerate() {
+                *byte = u8::try_from((idx * 17 + j * 31) & 0xff).unwrap_or(0x55);
+            }
+            tensor.kind = crate::kernels::PQ2;
+            tensor.data = Arc::<[u8]>::from(block.repeat((cols / 128) * rows)).into();
+        }
+    }
+    model
+}
+
+struct MockDecodeOnlyExecutor {
+    decode_calls: Arc<std::sync::atomic::AtomicUsize>,
+    released: Vec<crate::model::TensorBytes>,
+}
+
+impl MockDecodeOnlyExecutor {
+    fn cpu_f32_matvec(
+        tensor: &Tensor,
+        activation: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        let mut scratch = if pinned {
+            crate::kernels::MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+        } else {
+            crate::kernels::MatvecScratch::with_backend(MatvecBackend::Scalar)
+        };
+        crate::kernels::matvec_into(tensor, activation, output, &mut scratch)
+    }
+}
+
+impl crate::kernels::Pq2ProjectionExecutor for MockDecodeOnlyExecutor {
+    fn identity(&self) -> &'static str {
+        "mock-decode-only-hexagon-executor"
+    }
+
+    fn supports(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    fn supports_tile_tokens(&self) -> bool {
+        false
+    }
+
+    fn project(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[crate::kernels::Q8KBlock],
+        _fused: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err(invalid("unexpected quantized mock call"))
+    }
+
+    fn supports_f32(&self, tensor: &Tensor) -> bool {
+        matches!(tensor.kind, crate::kernels::PQ2 | crate::kernels::PTQ1)
+            && tensor.dimensions.len() == 2
+            && tensor.name.starts_with("blk.")
+    }
+
+    fn project_f32(
+        &mut self,
+        tensor: &Tensor,
+        activation: &[f32],
+        pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.decode_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self::cpu_f32_matvec(tensor, activation, pinned, output)
+    }
+
+    fn project_f32_tokens(
+        &mut self,
+        _tensor: &Tensor,
+        _activations: &[Vec<f32>],
+        _pinned: bool,
+        _outputs: &mut [Vec<f32>],
+    ) -> Result<()> {
+        Err(invalid(
+            "decode-only executor must not receive tile token projections",
+        ))
+    }
+
+    fn release_host_weight_binding(
+        &mut self,
+        previous_tensor: &Tensor,
+        released_data: &crate::model::TensorBytes,
+    ) -> bool {
+        if self.supports_f32(previous_tensor)
+            && released_data.is_empty()
+            && !released_data.is_mapped()
+        {
+            self.released.push(released_data.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn has_released_host_weight(&self, tensor: &Tensor) -> bool {
+        tensor.data.is_empty()
+            && self.supports_f32(tensor)
+            && self
+                .released
+                .iter()
+                .any(|token| crate::model::TensorBytes::ptr_eq(token, &tensor.data))
+    }
+}
+
+fn build_decode_only_mixed_session(
+    model: Model,
+    context: usize,
+    decode_calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Qwen35> {
+    let mut mixed = Qwen35::with_state_budget_and_kv(
+        model,
+        context,
+        64 * 1024 * 1024,
+        MatvecBackend::Scalar,
+        KvCachePolicy::F16,
+    )?;
+    mixed.set_projection_executor(Some(Box::new(MockDecodeOnlyExecutor {
+        decode_calls,
+        released: Vec::new(),
+    })));
+    let prefill_scratch = mixed.tiled_prefill_scratch_bytes(8)?;
+    mixed = mixed.with_tiled_prefill(8, prefill_scratch)?;
+    let verify_scratch = mixed.tiled_verification_scratch_bytes()?;
+    mixed.with_tiled_verification(verify_scratch)
+}
+
+fn assert_missing_host_weight_rejects_tiled_verification(
+    cfg: &HybridConfig,
+    decode_calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<()> {
+    let mut released_model = pq2_mixed_hybrid_model(cfg);
+    if let Some(tensor) = released_model.tensors.get_mut("blk.0.ffn_up.weight") {
+        tensor.data = crate::model::TensorBytes::default();
+    }
+    assert!(build_decode_only_mixed_session(released_model, cfg.context, decode_calls).is_err());
+    Ok(())
+}
+
+#[test]
+fn folded_verification_with_decode_only_executor_matches_cpu_and_preserves_rollback() -> Result<()>
+{
+    let cfg = HybridConfig::pinned_swift_aligned();
+    let mut seq = configure_folded(
+        pq2_mixed_hybrid_model(&cfg),
+        &cfg,
+        Arithmetic::Source,
+        1,
+        KvCachePolicy::F16,
+        false,
+    )?;
+
+    let decode_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut mixed = build_decode_only_mixed_session(
+        pq2_mixed_hybrid_model(&cfg),
+        cfg.context,
+        Arc::clone(&decode_calls),
+    )?;
+
+    // Host-weight release must stay fail-closed whenever tiled verification is enabled.
+    assert!(mixed.release_executor_resident_host_weights().is_err());
+
+    // Single-token decode routes through the decode-only executor.
+    let s0 = seq.evaluate(0)?;
+    let mut m0 = Vec::new();
+    mixed.evaluate_into(0, &mut m0)?;
+    assert_logits_bit_eq(&s0, &m0, "mixed init decode");
+    let after_init_calls = decode_calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(after_init_calls > 0);
+
+    // Folded verification rounds and carry-flush bypass the non-tile executor and match CPU bit-for-bit.
+    let mut rows = Vec::new();
+    mixed.evaluate_verification_block_folded(&[], &[1, 2, 3], &mut rows, &|| Ok(()))?;
+    assert_eq!(
+        decode_calls.load(std::sync::atomic::Ordering::Relaxed),
+        after_init_calls
+    );
+    let s1 = seq.evaluate(1)?;
+    let s2 = seq.evaluate(2)?;
+    assert_logits_bit_eq(&s1, &rows[0], "mixed verify tok 1");
+    assert_logits_bit_eq(&s2, &rows[1], "mixed verify tok 2");
+    mixed.commit_folded_verification(2)?;
+
+    // Mid-block cancellation must roll back cleanly while keeping decode executor intact.
+    let checks = Cell::new(0_usize);
+    let cancel = || {
+        let next = checks.get() + 1;
+        checks.set(next);
+        if next >= 5 {
+            return Err(invalid("mixed mid-block cancel"));
+        }
+        Ok(())
+    };
+    assert!(
+        mixed
+            .evaluate_verification_block_folded(&[1, 2], &[3, 4], &mut rows, &cancel)
+            .is_err()
+    );
+    assert!(rows.is_empty());
+    assert_full_state_bit_eq(&seq, &mixed)?;
+
+    // Standard verification also falls back to CPU tiles cleanly when executor lacks tile support.
+    let std_s3 = seq.evaluate(3)?;
+    mixed.evaluate_verification_block(&[3], &mut rows, &|| Ok(()))?;
+    assert_eq!(
+        decode_calls.load(std::sync::atomic::Ordering::Relaxed),
+        after_init_calls
+    );
+    assert_logits_bit_eq(&std_s3, &rows[0], "mixed std verify tok 3");
+    assert_full_state_bit_eq(&seq, &mixed)?;
+
+    // Subsequent single-token decode resumes using the decode-only executor and matches checkpoints.
+    let s4 = seq.evaluate(4)?;
+    let mut m4 = Vec::new();
+    mixed.evaluate_into(4, &mut m4)?;
+    assert!(decode_calls.load(std::sync::atomic::Ordering::Relaxed) > after_init_calls);
+    assert_logits_bit_eq(&s4, &m4, "mixed resumed decode");
+    assert_full_state_bit_eq(&seq, &mixed)?;
+    assert_eq!(
+        seq.checkpoint()?.layers.len(),
+        mixed.checkpoint()?.layers.len()
+    );
+
+    assert_missing_host_weight_rejects_tiled_verification(&cfg, decode_calls)
+}

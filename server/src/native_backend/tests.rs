@@ -1344,6 +1344,86 @@ fn private_cpu_prefill_gdn_wy_f32_and_mixed_phase_hexagon_startup_bind_readiness
 }
 
 #[test]
+fn private_cpu_speculation_allows_mixed_phase_hexagon_and_composite_readiness() -> TestResult {
+    use bonsai_prism_runtime::{
+        graph::KvCachePolicy,
+        swift_session::{CpuPrefill, CpuSpeculation, STATE_MEMORY_BYTES},
+    };
+    use profile::ProjectionStartup;
+
+    assert!(worker::should_release_executor_host_weights(false, false));
+    assert!(!worker::should_release_executor_host_weights(true, false));
+    assert!(!worker::should_release_executor_host_weights(false, true));
+    assert!(!worker::should_release_executor_host_weights(true, true));
+
+    run(async {
+        let prefill = CpuPrefill::new(16, 64 * 1024 * 1024)?;
+        let speculation = CpuSpeculation::new(4, 16 * 1024 * 1024, STATE_MEMORY_BYTES)?;
+        let identity: Arc<str> = Arc::from(format!(
+            "{}:cpu-tiled-ffn-v1:16:cpu-tiled-verify-v1",
+            cpu_base_graph_identity(KvCachePolicy::F16),
+        ));
+        for (placement, startup, expected_effective) in [
+            (
+                Placement::Auto,
+                ProjectionStartup::NativeQ2 {
+                    resident_tensors: 168,
+                    resident_weight_bytes: 2_888_663_040,
+                    host_metadata_bytes: 524_128,
+                },
+                "hexagon-native-q2",
+            ),
+            (
+                Placement::Auto,
+                ProjectionStartup::NativeQ2Partial {
+                    architecture: 81,
+                    resident_tensors: 84,
+                    resident_weight_bytes: 1_444_331_520,
+                    host_metadata_bytes: 262_064,
+                },
+                "hexagon-native-q2-partial",
+            ),
+            (
+                Placement::Composite,
+                ProjectionStartup::Composite {
+                    identity: Arc::from("composite-projection-v1:abcdef"),
+                    npu_resident_tensors: 168,
+                    gpu_resident_tensors: 232,
+                    resident_weight_bytes: 5_600_000_000,
+                    host_metadata_bytes: 262_144,
+                },
+                "composite-hexagon-vulkan",
+            ),
+        ] {
+            let observed = Observation {
+                kv_cache: Some(KvCachePolicy::F16),
+                cpu_prefill: Some(prefill),
+                cpu_speculation: Some(speculation),
+                startup_graph_identity: Some(identity.clone()),
+                startup_projection: Some(startup),
+                ..Observation::default()
+            };
+            let mut worker = Worker::with_placement(FakeEngine(observed), 42, placement)
+                .map_err(|error| format!("{error:?}"))?;
+            let (result, reply) = perform(&mut worker, request("/v1/models", &[], true)).await?;
+            assert_eq!(result, Ok(()));
+            let end = reply
+                .array_windows()
+                .position(|part| part == b"\r\n\r\n")
+                .ok_or("missing readiness response head")?
+                + 4;
+            let body: Value = serde_json::from_slice(&reply[end..])?;
+            let model = &body["data"][0];
+            assert_eq!(model["cpu_prefill_tokens"], 16);
+            assert_eq!(model["cpu_speculative_tokens"], 4);
+            assert_eq!(model["startup_graph_identity"], identity.as_ref());
+            assert_eq!(model["startup_projection"]["effective"], expected_effective);
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn private_prompt_end_and_multi_branch_checkpoints_validate_and_bind_readiness() -> TestResult {
     use bonsai_prism_runtime::runtime::PromptReuse;
 

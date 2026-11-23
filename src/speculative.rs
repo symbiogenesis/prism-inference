@@ -1344,6 +1344,24 @@ pub const MAX_DRAFT_TREE_NODES: usize = 16;
 
 const NO_INDEX: u32 = u32::MAX;
 const MAX_TRACKED_CONT_PER_NODE: usize = 8;
+const MIN_ROOT_EDGE_INDEX_CAP: usize = 64;
+
+const fn root_index_capacity(target_entries: usize) -> usize {
+    let scaled = target_entries.saturating_mul(2);
+    let mut cap = MIN_ROOT_EDGE_INDEX_CAP;
+    while cap < scaled && cap < MAX_SUFFIX_TREE_TOKENS {
+        cap *= 2;
+    }
+    cap
+}
+
+fn root_token_hash(token: u32) -> usize {
+    let mut x = token.wrapping_mul(0x9e37_79b9);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x85eb_ca6b);
+    x ^= x >> 13;
+    usize::try_from(x).unwrap_or(0)
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ContEntry {
@@ -1408,6 +1426,8 @@ pub struct SuffixTree {
     nodes: Vec<SuffixNode>,
     edges: Vec<SuffixEdge>,
     cont_entries: Vec<ContEntry>,
+    root_edge_index: Vec<u32>,
+    root_edge_count: usize,
 }
 
 impl SuffixTree {
@@ -1419,6 +1439,8 @@ impl SuffixTree {
             nodes: Vec::new(),
             edges: Vec::new(),
             cont_entries: Vec::new(),
+            root_edge_index: Vec::new(),
+            root_edge_count: 0,
         }
     }
 
@@ -1437,6 +1459,7 @@ impl SuffixTree {
             tree.edges.try_reserve(max_tokens)?;
             tree.cont_entries
                 .try_reserve(max_tokens.saturating_mul(2))?;
+            tree.reserve_root_edge_index(max_tokens)?;
         }
         Ok(tree)
     }
@@ -1459,6 +1482,8 @@ impl SuffixTree {
         self.nodes.clear();
         self.edges.clear();
         self.cont_entries.clear();
+        self.root_edge_index.fill(NO_INDEX);
+        self.root_edge_count = 0;
     }
 
     /// Synchronize the suffix tree incrementally against a target committed token history.
@@ -1482,6 +1507,9 @@ impl SuffixTree {
         self.history.try_reserve(tokens.len())?;
         self.nodes.try_reserve(tokens.len().saturating_mul(2))?;
         self.edges.try_reserve(tokens.len())?;
+        if !tokens.is_empty() {
+            self.reserve_root_edge_index(tokens.len())?;
+        }
         for &token in tokens {
             self.push(token)?;
         }
@@ -1558,7 +1586,75 @@ impl SuffixTree {
         Ok(())
     }
 
+    fn reserve_root_edge_index(&mut self, target_entries: usize) -> Result<()> {
+        let target_cap = root_index_capacity(target_entries);
+        if self.root_edge_index.len() >= target_cap {
+            return Ok(());
+        }
+        let mut table = Vec::new();
+        table.try_reserve_exact(target_cap)?;
+        table.resize(target_cap, NO_INDEX);
+        if let Some(root) = self.nodes.first() {
+            let mut cur = root.first_edge;
+            while cur != NO_INDEX {
+                let edge_idx = usize::try_from(cur)?;
+                let edge = self.edges[edge_idx];
+                Self::insert_root_edge_slot(&mut table, edge.first_token, cur)?;
+                cur = edge.next;
+            }
+        }
+        self.root_edge_index = table;
+        Ok(())
+    }
+
+    fn ensure_root_index_for_insert(&mut self) -> Result<()> {
+        if self.root_edge_index.is_empty()
+            || (self.root_edge_count.saturating_add(1).saturating_mul(2)
+                > self.root_edge_index.len()
+                && self.root_edge_index.len() < MAX_SUFFIX_TREE_TOKENS)
+        {
+            let target_entries = self.root_edge_count.saturating_add(1).max(32);
+            self.reserve_root_edge_index(target_entries)?;
+        }
+        Ok(())
+    }
+
+    fn insert_root_edge_slot(table: &mut [u32], first_token: u32, edge_u32: u32) -> Result<()> {
+        let len = table.len();
+        if len == 0 {
+            return Err(invalid("empty suffix tree root hash index"));
+        }
+        let mask = len - 1;
+        let mut slot = root_token_hash(first_token) & mask;
+        for _ in 0..len {
+            if table[slot] == NO_INDEX {
+                table[slot] = edge_u32;
+                return Ok(());
+            }
+            slot = (slot + 1) & mask;
+        }
+        Err(invalid("suffix tree root hash index capacity exhausted"))
+    }
+
     fn find_edge(&self, node_idx: usize, first_token: u32) -> Option<(usize, u32)> {
+        if node_idx == 0 && !self.root_edge_index.is_empty() {
+            let len = self.root_edge_index.len();
+            let mask = len - 1;
+            let mut slot = root_token_hash(first_token) & mask;
+            for _ in 0..len {
+                let cur = self.root_edge_index[slot];
+                if cur == NO_INDEX {
+                    return None;
+                }
+                let edge_idx = usize::try_from(cur).ok()?;
+                let edge = self.edges[edge_idx];
+                if edge.first_token == first_token {
+                    return Some((edge_idx, edge.child));
+                }
+                slot = (slot + 1) & mask;
+            }
+            return None;
+        }
         let mut cur = self.nodes[node_idx].first_edge;
         while cur != NO_INDEX {
             let Ok(edge_idx) = usize::try_from(cur) else {
@@ -1581,8 +1677,17 @@ impl SuffixTree {
         depth: u8,
         cont_token: u32,
     ) -> Result<()> {
+        if parent_idx == 0 {
+            self.ensure_root_index_for_insert()?;
+        }
+        let first_token = self.history[usize::try_from(end_u32)? - 1 - parent_depth];
         let leaf_u32 = u32::try_from(self.nodes.len())?;
         let cont_idx = u32::try_from(self.cont_entries.len())?;
+        let edge_u32 = u32::try_from(self.edges.len())?;
+        if parent_idx == 0 {
+            Self::insert_root_edge_slot(&mut self.root_edge_index, first_token, edge_u32)?;
+            self.root_edge_count += 1;
+        }
         self.cont_entries.push(ContEntry {
             token: cont_token,
             count: 1,
@@ -1599,8 +1704,6 @@ impl SuffixTree {
             first_cont: cont_idx,
             first_edge: NO_INDEX,
         });
-        let first_token = self.history[usize::try_from(end_u32)? - 1 - parent_depth];
-        let edge_u32 = u32::try_from(self.edges.len())?;
         self.edges.push(SuffixEdge {
             first_token,
             child: leaf_u32,
@@ -2842,5 +2945,92 @@ mod tests {
         assert_eq!(stats.cursor_draft_tokens, 4);
         assert_eq!(stats.adaptive_gate_skips, 2);
         assert_eq!(stats.serial_burst_tokens, 2);
+    }
+
+    fn linear_find_root_edge(tree: &SuffixTree, first_token: u32) -> Option<(usize, u32)> {
+        let mut cur = tree.nodes.first()?.first_edge;
+        while cur != super::NO_INDEX {
+            let edge_idx = usize::try_from(cur).ok()?;
+            let edge = tree.edges[edge_idx];
+            if edge.first_token == first_token {
+                return Some((edge_idx, edge.child));
+            }
+            cur = edge.next;
+        }
+        None
+    }
+
+    #[test]
+    fn suffix_tree_root_hash_index_matches_linear_scan_large_vocab() -> Result<()> {
+        let mut tree = SuffixTree::with_capacity(40_000)?;
+        let mut history = Vec::with_capacity(40_000);
+        // Generate > 20_000 distinct tokens plus repeated motifs to trigger multiple
+        // power-of-two rehashes (64 -> 128 -> ... -> 65536) and internal splits.
+        let mut lcg = 0x9e37_79b9_u32;
+        for step in 0_u32..40_000 {
+            let tok = if step % 7 == 0 && step >= 28 {
+                let phase = (step / 7) % 12;
+                100 + phase
+            } else {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                1_000 + (lcg % 24_576)
+            };
+            history.push(tok);
+            tree.push(tok)?;
+        }
+        assert!(tree.root_edge_count > 16_384);
+        assert!(tree.root_edge_index.len().is_power_of_two());
+        assert!(tree.root_edge_index.len() <= super::MAX_SUFFIX_TREE_TOKENS);
+
+        // Every pushed root token and thousands of absent probes must agree with linked-list scan.
+        for probe in (0_u32..30_000).step_by(3) {
+            assert_eq!(
+                tree.find_edge(0, probe),
+                linear_find_root_edge(&tree, probe),
+                "root edge lookup mismatch for token {probe}"
+            );
+        }
+
+        // Incremental sync & rollback clear/rebuild preserve equivalence and identical drafts.
+        let mut rebuilt = SuffixTree::new();
+        rebuilt.sync(&history)?;
+        assert_eq!(tree.root_edge_count, rebuilt.root_edge_count);
+        for probe in 100_u32..120 {
+            assert_eq!(
+                rebuilt.find_edge(0, probe),
+                linear_find_root_edge(&rebuilt, probe)
+            );
+        }
+
+        let cfg = SuffixDraftConfig::new(2, 16, 4)?;
+        let mut out_indexed = [0_u32; MAX_SPECULATIVE_DRAFT_TOKENS];
+        let mut out_linear = [0_u32; MAX_SPECULATIVE_DRAFT_TOKENS];
+        for tok in [100_u32, 101, 102, 103, 104, 105, 100, 101] {
+            rebuilt.push(tok)?;
+        }
+        let mut saw_nonempty = false;
+        for tok in [102_u32, 103, 104, 105, 106, 107] {
+            rebuilt.push(tok)?;
+            let draft_a = rebuilt.propose_adaptive(cfg, 0.0, 4, &mut out_indexed)?;
+            let mut copy = rebuilt.clone();
+            copy.root_edge_index.clear();
+            let draft_b = copy.propose_adaptive(cfg, 0.0, 4, &mut out_linear)?;
+            assert_eq!(draft_a.len, draft_b.len);
+            assert_eq!(draft_a.matched_tokens, draft_b.matched_tokens);
+            assert_eq!(draft_a.confidence.to_bits(), draft_b.confidence.to_bits());
+            assert_eq!(out_indexed[..draft_a.len], out_linear[..draft_b.len]);
+            saw_nonempty |= draft_a.len > 0;
+        }
+        assert!(saw_nonempty);
+
+        rebuilt.clear();
+        assert_eq!(rebuilt.root_edge_count, 0);
+        assert_eq!(rebuilt.find_edge(0, 100), None);
+        rebuilt.sync(&history[..1_000])?;
+        assert_eq!(
+            rebuilt.find_edge(0, history[0]),
+            linear_find_root_edge(&rebuilt, history[0])
+        );
+        Ok(())
     }
 }

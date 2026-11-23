@@ -434,6 +434,39 @@ impl Qwen35 {
             .ok_or_else(|| invalid("verification logits reservation overflow"))
     }
 
+    fn has_released_host_weight(&self) -> bool {
+        let executor = self.projection_executor.as_deref();
+        let released = |tensor: &Tensor| {
+            tensor.data.is_empty()
+                || executor.is_some_and(|exec| exec.has_released_host_weight(tensor))
+        };
+        self.layers.iter().any(|layer| {
+            let attn_released = match &layer.attention {
+                Attention::Full(full) => {
+                    released(&full.query)
+                        || released(&full.key)
+                        || released(&full.value)
+                        || released(&full.output)
+                }
+                Attention::Recurrent(rec) => {
+                    released(&rec.qkv)
+                        || released(&rec.gate)
+                        || released(&rec.beta)
+                        || released(&rec.alpha)
+                        || released(&rec.output)
+                }
+            };
+            attn_released || released(&layer.up) || released(&layer.gate) || released(&layer.down)
+        })
+    }
+
+    fn lacks_tile_weights_for_cpu_fallback(&self) -> bool {
+        self.projection_executor
+            .as_ref()
+            .is_none_or(|exec| !exec.supports_tile_tokens())
+            && self.has_released_host_weight()
+    }
+
     /// Explicitly enable tiled target verification on an empty CPU graph.
     ///
     /// Eligible packed layer projections and the vocabulary head share weights
@@ -447,13 +480,9 @@ impl Qwen35 {
     /// Rejects nonempty/already selected graphs, triangular GDN, insufficient
     /// additional reservation and identity-allocation failure.
     pub fn with_tiled_verification(mut self, additional_bytes: usize) -> Result<Self> {
-        if self
-            .projection_executor
-            .as_ref()
-            .is_some_and(|exec| !exec.supports_tile_tokens())
-        {
+        if self.lacks_tile_weights_for_cpu_fallback() {
             return Err(invalid(
-                "tiled verification requires CPU-only or tile-capable projections",
+                "tiled verification with non-tile executor requires retained host weights",
             ));
         }
         let required = self.tiled_verification_scratch_bytes()?;
@@ -588,10 +617,7 @@ impl Qwen35 {
         }
         if tokens.is_empty()
             || tokens.len() > self.verification_capacity()
-            || self
-                .projection_executor
-                .as_ref()
-                .is_some_and(|exec| !exec.supports_tile_tokens())
+            || self.lacks_tile_weights_for_cpu_fallback()
             || tokens
                 .iter()
                 .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
@@ -613,7 +639,10 @@ impl Qwen35 {
         let mut executor = self.projection_executor.take();
         let result = (|| {
             check()?;
-            let prefill_executor = executor.as_mut().map(Self::coerce_executor);
+            let prefill_executor = executor
+                .as_mut()
+                .map(Self::coerce_executor)
+                .filter(|exec| exec.supports_tile_tokens());
             self.ingest_cpu_tile_with_folded(
                 tokens,
                 check,
@@ -652,10 +681,7 @@ impl Qwen35 {
         }
         if tokens.is_empty()
             || tokens.len() > self.verification_capacity()
-            || self
-                .projection_executor
-                .as_ref()
-                .is_some_and(|exec| !exec.supports_tile_tokens())
+            || self.lacks_tile_weights_for_cpu_fallback()
             || tokens
                 .iter()
                 .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocabulary))
@@ -781,7 +807,10 @@ impl Qwen35 {
         let mut executor = self.projection_executor.take();
         let result = (|| {
             check()?;
-            let prefill_executor = executor.as_mut().map(Self::coerce_executor);
+            let prefill_executor = executor
+                .as_mut()
+                .map(Self::coerce_executor)
+                .filter(|exec| exec.supports_tile_tokens());
             self.ingest_cpu_tile_with_folded(
                 tokens,
                 check,

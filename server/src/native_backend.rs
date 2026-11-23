@@ -9,6 +9,7 @@
 
 mod diagnostics;
 mod profile;
+mod vulkan_session;
 mod worker;
 
 use crate::{
@@ -36,6 +37,8 @@ use tokio::{
     net::TcpListener,
     time::{Instant, timeout_at},
 };
+#[cfg(windows)]
+pub(crate) use vulkan_session::VulkanSwiftSession;
 #[cfg(windows)]
 pub(super) use worker::register_hexagon_model_path;
 use worker::{Event, Input, Output, Worker};
@@ -153,6 +156,32 @@ pub(crate) async fn serve_with_options(
     placement: Placement,
     options: WorkerOptions,
 ) -> Result<(), NativeBackendError> {
+    if placement == Placement::Cpu {
+        session.set_projection_executor(None);
+    }
+    let seed = session.seed();
+    serve_engine_with_options(listener, session, seed, key, placement, options).await
+}
+
+#[cfg(windows)]
+pub(crate) async fn serve_vulkan_with_options(
+    listener: TcpListener,
+    session: VulkanSwiftSession,
+    key: String,
+    options: WorkerOptions,
+) -> Result<(), NativeBackendError> {
+    let seed = session.seed();
+    serve_engine_with_options(listener, session, seed, key, Placement::Vulkan, options).await
+}
+
+async fn serve_engine_with_options<E: worker::Engine>(
+    listener: TcpListener,
+    engine: E,
+    seed: u32,
+    key: String,
+    placement: Placement,
+    options: WorkerOptions,
+) -> Result<(), NativeBackendError> {
     let address = listener
         .local_addr()
         .map_err(|_| NativeBackendError::Configuration)?;
@@ -160,14 +189,10 @@ pub(crate) async fn serve_with_options(
     {
         return Err(NativeBackendError::Configuration);
     }
-    let policy = RequestPolicy::new(address.port(), &key)
-        .map_err(|_| NativeBackendError::Configuration)?
-        .with_vision(session.has_vision());
-    if placement == Placement::Cpu {
-        session.set_projection_executor(None);
-    }
-    let seed = session.seed();
-    let mut worker = Worker::with_options(session, seed, placement, &options)?;
+    let base_policy =
+        RequestPolicy::new(address.port(), &key).map_err(|_| NativeBackendError::Configuration)?;
+    let mut worker = Worker::with_options(engine, seed, placement, &options)?;
+    let policy = base_policy.with_vision(worker.profile.vision);
     loop {
         let (client, peer) = listener
             .accept()
@@ -192,14 +217,44 @@ pub(crate) async fn serve_broker_pipe_with_options(
     placement: Placement,
     options: WorkerOptions,
 ) -> Result<(), NativeBackendError> {
-    let policy = RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, key)
-        .map_err(|_| NativeBackendError::Configuration)?
-        .with_vision(session.has_vision());
     if placement == Placement::Cpu {
         session.set_projection_executor(None);
     }
     let seed = session.seed();
-    let worker = Worker::with_options(session, seed, placement, &options)?;
+    serve_broker_pipe_engine_with_options(endpoint, session, seed, key, placement, options).await
+}
+
+#[cfg(windows)]
+pub(crate) async fn serve_broker_pipe_vulkan_with_options(
+    endpoint: crate::broker_pipe::ServerEndpoint,
+    session: VulkanSwiftSession,
+    key: &str,
+    options: WorkerOptions,
+) -> Result<(), NativeBackendError> {
+    let seed = session.seed();
+    serve_broker_pipe_engine_with_options(
+        endpoint,
+        session,
+        seed,
+        key,
+        Placement::Vulkan,
+        options,
+    )
+    .await
+}
+
+async fn serve_broker_pipe_engine_with_options<E: worker::Engine>(
+    endpoint: crate::broker_pipe::ServerEndpoint,
+    engine: E,
+    seed: u32,
+    key: &str,
+    placement: Placement,
+    options: WorkerOptions,
+) -> Result<(), NativeBackendError> {
+    let base_policy = RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, key)
+        .map_err(|_| NativeBackendError::Configuration)?;
+    let worker = Worker::with_options(engine, seed, placement, &options)?;
+    let policy = base_policy.with_vision(worker.profile.vision);
     serve_broker_pipe_with_worker(endpoint, &policy, worker).await
 }
 

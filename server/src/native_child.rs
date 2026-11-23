@@ -309,13 +309,14 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         validate_read_path(&key)?;
         ChildTransport::Loopback { port, key }
     };
+    let resolved_placement = placement.unwrap_or_default();
     let resolved_kv_cache =
-        kv_cache.unwrap_or(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE);
+        resolve_kv_cache_for_placement(resolved_placement, kv_cache).ok_or_else(invalid)?;
     let resolved_policy = admission_policy.unwrap_or_default();
     let daisyrose_lora =
         resolve_daisyrose_config(daisyrose_path, daisyrose_bytes, daisyrose_sha256)?;
     let config = Config {
-        placement: placement.unwrap_or_default(),
+        placement: resolved_placement,
         model: model.ok_or_else(invalid)?,
         transport,
         verified_sections,
@@ -361,6 +362,9 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         }
     }
     if config.mmproj.is_some() && config.cpu_speculation.is_some() {
+        return Err(invalid());
+    }
+    if !placement_supports_config(&config) {
         return Err(invalid());
     }
     let requires_reuse_capacity = config.prompt_reuse == PromptReuse::PromptEndAndLatest
@@ -591,6 +595,32 @@ fn parse_speculation(
     }
 }
 
+const fn resolve_kv_cache_for_placement(
+    placement: Placement,
+    kv_cache: Option<KvCachePolicy>,
+) -> Option<KvCachePolicy> {
+    match (placement, kv_cache) {
+        (Placement::Vulkan, None | Some(KvCachePolicy::F16)) => Some(KvCachePolicy::F16),
+        (Placement::Vulkan, Some(_)) => None,
+        (_, Some(policy)) => Some(policy),
+        (_, None) => Some(bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE),
+    }
+}
+
+const fn placement_supports_config(config: &Config) -> bool {
+    !matches!(
+        (
+            config.placement,
+            config.mmproj.is_some(),
+            config.cpu_prefill.is_some(),
+            config.cpu_speculation.is_some(),
+        ),
+        (Placement::Vulkan, true, _, _)
+            | (Placement::Vulkan, _, true, _)
+            | (Placement::Vulkan, _, _, true)
+    )
+}
+
 fn parse_capacity_with_policy(
     context_tokens: Option<OsString>,
     memory_limit_bytes: Option<OsString>,
@@ -805,10 +835,47 @@ fn required_memory_bytes(config: &Config) -> io::Result<u64> {
         })
 }
 
+enum PreparedBackend {
+    Cpu {
+        session: Box<SwiftSession>,
+        placement: Placement,
+    },
+    Vulkan(Box<crate::native_backend::VulkanSwiftSession>),
+}
+
 async fn serve_prepared(
     prepared_transport: PreparedTransport,
     session: SwiftSession,
     placement: Placement,
+    options: WorkerOptions,
+) -> io::Result<()> {
+    serve_prepared_backend(
+        prepared_transport,
+        PreparedBackend::Cpu {
+            session: Box::new(session),
+            placement,
+        },
+        options,
+    )
+    .await
+}
+
+async fn serve_prepared_vulkan(
+    prepared_transport: PreparedTransport,
+    session: crate::native_backend::VulkanSwiftSession,
+    options: WorkerOptions,
+) -> io::Result<()> {
+    serve_prepared_backend(
+        prepared_transport,
+        PreparedBackend::Vulkan(Box::new(session)),
+        options,
+    )
+    .await
+}
+
+async fn serve_prepared_backend(
+    prepared_transport: PreparedTransport,
+    backend: PreparedBackend,
     options: WorkerOptions,
 ) -> io::Result<()> {
     let served = match prepared_transport {
@@ -816,29 +883,105 @@ async fn serve_prepared(
             let listener = bound_loopback_socket(port)
                 .and_then(|socket| socket.listen(1))
                 .map_err(|error| startup::at(Stage::Listener, &error))?;
-            let result = Box::pin(crate::native_backend::serve_with_options(
-                listener, session, key, placement, options,
-            ))
-            .await;
+            let result = match backend {
+                PreparedBackend::Cpu { session, placement } => Box::pin(
+                    crate::native_backend::serve_with_options(
+                        listener, *session, key, placement, options,
+                    ),
+                )
+                .await,
+                PreparedBackend::Vulkan(session) => Box::pin(
+                    crate::native_backend::serve_vulkan_with_options(
+                        listener, *session, key, options,
+                    ),
+                )
+                .await,
+            };
             drop(guard);
             result
         }
-        PreparedTransport::BrokerPipe { endpoint, key } => {
-            Box::pin(crate::native_backend::serve_broker_pipe_with_options(
-                endpoint,
-                session,
-                key.as_str(),
-                placement,
-                options,
-            ))
-            .await
-        }
+        PreparedTransport::BrokerPipe { endpoint, key } => match backend {
+            PreparedBackend::Cpu { session, placement } => Box::pin(
+                crate::native_backend::serve_broker_pipe_with_options(
+                    endpoint,
+                    *session,
+                    key.as_str(),
+                    placement,
+                    options,
+                ),
+            )
+            .await,
+            PreparedBackend::Vulkan(session) => Box::pin(
+                crate::native_backend::serve_broker_pipe_vulkan_with_options(
+                    endpoint,
+                    *session,
+                    key.as_str(),
+                    options,
+                ),
+            )
+            .await,
+        },
     };
     served.map_err(|_| {
         startup::at(
             Stage::Backend,
             &io::Error::other("native Swift backend admission closed"),
         )
+    })
+}
+
+fn load_prepared_backend(config: &Config) -> io::Result<PreparedBackend> {
+    let parallelism = RowParallelism::new(config.row_workers)
+        .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
+    let context_tokens = config.capacity.map_or(
+        bonsai_prism_runtime::model::swift::CONTEXT_TOKENS,
+        |(tokens, _)| tokens,
+    );
+    let daisyrose = config.daisyrose_lora.as_ref().map(|item| MultiRankAdapterSpec {
+        path: &item.path,
+        bytes: item.bytes,
+        sha256: &item.sha256,
+    });
+    if config.placement == Placement::Vulkan {
+        let _ = parallelism;
+        let session = crate::native_backend::VulkanSwiftSession::load_profile_with_adapters(
+            &config.model,
+            config.representation,
+            config.adapter.as_deref(),
+            daisyrose,
+            config.seed,
+            config.row_workers,
+            context_tokens,
+            config.prompt_reuse,
+            config.branch_checkpoints,
+        )
+        .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
+        return Ok(PreparedBackend::Vulkan(Box::new(session)));
+    }
+    let mut session = SwiftSession::load_profile_with_adapters(
+        &config.model,
+        config.representation,
+        config.adapter.as_deref(),
+        daisyrose,
+        MatvecBackend::Auto,
+        config.seed,
+        parallelism,
+        config.kv_cache,
+        context_tokens,
+        config.cpu_prefill,
+        config.cpu_speculation,
+        config.prompt_reuse,
+        config.branch_checkpoints,
+    )
+    .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
+    if let Some(ref mmproj) = config.mmproj {
+        session
+            .load_vision(mmproj, config.image_max_tokens)
+            .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
+    }
+    Ok(PreparedBackend::Cpu {
+        session: Box::new(session),
+        placement: config.placement,
     })
 }
 
@@ -886,51 +1029,22 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     {
         verify_broker_pipe_sections(endpoint, &config, expected_sections)?;
     }
-    let parallelism = RowParallelism::new(config.row_workers)
-        .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
-    let mut session = SwiftSession::load_profile_with_adapters(
-        &config.model,
-        config.representation,
-        config.adapter.as_deref(),
-        config
-            .daisyrose_lora
-            .as_ref()
-            .map(|item| MultiRankAdapterSpec {
-                path: &item.path,
-                bytes: item.bytes,
-                sha256: &item.sha256,
-            }),
-        MatvecBackend::Auto,
-        config.seed,
-        parallelism,
-        config.kv_cache,
-        config.capacity.map_or(
-            bonsai_prism_runtime::model::swift::CONTEXT_TOKENS,
-            |(tokens, _)| tokens,
-        ),
-        config.cpu_prefill,
-        config.cpu_speculation,
-        config.prompt_reuse,
-        config.branch_checkpoints,
-    )
-    .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
-    if let Some(ref mmproj) = config.mmproj {
-        session
-            .load_vision(mmproj, config.image_max_tokens)
-            .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
-    }
+    let backend = load_prepared_backend(&config)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| startup::at(Stage::Runtime, &error))?;
-    runtime.block_on(serve_prepared(
-        prepared_transport,
-        session,
-        config.placement,
-        WorkerOptions {
-            hexagon_arena_cache: config.hexagon_arena_cache,
-        },
-    ))
+    let options = WorkerOptions {
+        hexagon_arena_cache: config.hexagon_arena_cache,
+    };
+    match backend {
+        PreparedBackend::Vulkan(session) => {
+            runtime.block_on(serve_prepared_vulkan(prepared_transport, *session, options))
+        }
+        PreparedBackend::Cpu { session, placement } => {
+            runtime.block_on(serve_prepared(prepared_transport, *session, placement, options))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -974,7 +1088,12 @@ mod tests {
             let config = parse(selected.clone())?;
             assert_eq!(config.placement, expected);
             assert_eq!(config.capacity, None);
-            assert_eq!(config.kv_cache, KvCachePolicy::Rotated4);
+            let expected_kv_cache = if expected == Placement::Vulkan {
+                KvCachePolicy::F16
+            } else {
+                KvCachePolicy::Rotated4
+            };
+            assert_eq!(config.kv_cache, expected_kv_cache);
             selected.extend(["--placement".into(), name.into()]);
             assert!(parse(selected).is_err());
         }
@@ -2232,6 +2351,171 @@ mod tests {
         let mut relative = base;
         relative.extend(["--hexagon-arena-cache".into(), "relative-cache".into()]);
         assert!(parse(relative).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_vulkan_placement_defaults_and_accepts_f16_configurations() -> io::Result<()> {
+        use bonsai_prism_runtime::swift_session::{
+            CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES,
+        };
+
+        let (_directory, [model, key, adapter]) = files()?;
+        let base: Vec<OsString> = vec![
+            "--native-engine-child".into(),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8080".into(),
+            "--seed".into(),
+            "42".into(),
+            "--placement".into(),
+            "vulkan".into(),
+        ];
+
+        let default_cfg = parse(base.clone())?;
+        assert_eq!(default_cfg.placement, Placement::Vulkan);
+        assert_eq!(default_cfg.kv_cache, KvCachePolicy::F16);
+        assert!(default_cfg.mmproj.is_none());
+        assert!(default_cfg.cpu_prefill.is_none());
+        assert!(default_cfg.cpu_speculation.is_none());
+
+        let mut explicit_f16 = base.clone();
+        explicit_f16.extend(["--kv-cache".into(), "f16".into()]);
+        assert_eq!(parse(explicit_f16)?.kv_cache, KvCachePolicy::F16);
+
+        let f16_mem = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES;
+        let state_u64 = u64::try_from(STATE_MEMORY_BYTES).map_err(io::Error::other)?;
+        let prompt_end_mem = f16_mem + state_u64;
+        let mut capacity = base.clone();
+        capacity.extend([
+            "--context-tokens".into(),
+            "8192".into(),
+            "--memory-limit-bytes".into(),
+            f16_mem.to_string().into(),
+        ]);
+        let capacity_cfg = parse(capacity)?;
+        assert_eq!(capacity_cfg.kv_cache, KvCachePolicy::F16);
+        assert_eq!(capacity_cfg.capacity, Some((8192, f16_mem)));
+
+        let mut variant = base;
+        variant.extend([
+            "--use-repacked-ptq1".into(),
+            "--abliterate-lora".into(),
+            adapter,
+            "--prompt-reuse".into(),
+            "prompt-end-and-latest".into(),
+            "--context-tokens".into(),
+            "8192".into(),
+            "--memory-limit-bytes".into(),
+            prompt_end_mem.to_string().into(),
+        ]);
+        let variant_cfg = parse(variant)?;
+        assert_eq!(variant_cfg.placement, Placement::Vulkan);
+        assert_eq!(variant_cfg.representation, Representation::CurrentRepackedPtq1);
+        assert_eq!(variant_cfg.prompt_reuse, PromptReuse::PromptEndAndLatest);
+        Ok(())
+    }
+
+    fn vulkan_cpu_only_cases(
+        prefill_scratch: &str,
+        verify_scratch: &str,
+        checkpoint: &str,
+        memory: &str,
+    ) -> Vec<Vec<String>> {
+        let cap = ["--kv-cache", "f16", "--context-tokens", "8192", "--memory-limit-bytes", memory];
+        let prefill = ["--cpu-prefill-tokens", "16", "--cpu-prefill-scratch-bytes", prefill_scratch];
+        let mut suffix_case: Vec<&str> = Vec::from(cap);
+        suffix_case.extend(prefill);
+        suffix_case.extend([
+            "--spec-type", "suffix", "--cpu-verification-scratch-bytes", verify_scratch,
+            "--cpu-speculative-checkpoint-bytes", checkpoint,
+        ]);
+        let mut spec_tokens_case: Vec<&str> = Vec::from(cap);
+        spec_tokens_case.extend(prefill);
+        spec_tokens_case.extend([
+            "--cpu-speculative-tokens", "4", "--cpu-verification-scratch-bytes", verify_scratch,
+            "--cpu-speculative-checkpoint-bytes", checkpoint,
+        ]);
+        let mut gdn_case: Vec<&str> = Vec::from(cap);
+        gdn_case.extend(["--prompt-reuse", "latest"]);
+        gdn_case.extend(prefill);
+        gdn_case.extend(["--cpu-prefill-gdn", "wy-f32"]);
+        let mut prefill_only_case: Vec<&str> = Vec::from(cap);
+        prefill_only_case.extend(["--prompt-reuse", "latest"]);
+        prefill_only_case.extend(prefill);
+        [
+            vec!["--kv-cache", "rsq4"],
+            vec!["--kv-cache", "rsq4vf"],
+            vec!["--kv-cache", "rsq4k3v"],
+            suffix_case,
+            spec_tokens_case,
+            gdn_case,
+            prefill_only_case,
+        ]
+        .into_iter()
+        .map(|case| case.into_iter().map(str::to_owned).collect())
+        .collect()
+    }
+
+    #[test]
+    fn native_child_vulkan_placement_rejects_unsupported_flags() -> io::Result<()> {
+        let (directory, [model, key, _adapter]) = files()?;
+        let mmproj = directory.path().join("mmproj.gguf");
+        std::fs::write(&mmproj, [])?;
+        let prefill_scratch = (64_usize * 1024 * 1024).to_string();
+        let verify_scratch = (16_usize * 1024 * 1024).to_string();
+        let checkpoint = bonsai_prism_runtime::swift_session::STATE_MEMORY_BYTES.to_string();
+        let base = |placement: &str| -> Vec<OsString> {
+            vec![
+                "--native-engine-child".into(),
+                "--model".into(),
+                model.clone(),
+                "--key-file".into(),
+                key.clone(),
+                "--port".into(),
+                "8080".into(),
+                "--seed".into(),
+                "42".into(),
+                "--placement".into(),
+                placement.into(),
+            ]
+        };
+
+        for extra in vulkan_cpu_only_cases(
+            &prefill_scratch,
+            &verify_scratch,
+            &checkpoint,
+            "68719476736",
+        ) {
+            let mut cpu_args = base("cpu");
+            cpu_args.extend(extra.iter().map(OsString::from));
+            assert!(parse(cpu_args).is_ok());
+
+            let mut vk_args = base("vulkan");
+            vk_args.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(vk_args).is_err());
+        }
+
+        for incomplete in [
+            vec!["--spec-type", "suffix"],
+            vec!["--cpu-speculative-tokens", "4"],
+            vec!["--cpu-prefill-gdn", "wy-f32"],
+        ] {
+            let mut vk_args = base("vulkan");
+            vk_args.extend(incomplete.into_iter().map(OsString::from));
+            assert!(parse(vk_args).is_err());
+        }
+
+        let mut cpu_vision = base("cpu");
+        cpu_vision.extend(["--mmproj".into(), mmproj.as_os_str().to_owned()]);
+        assert!(parse(cpu_vision).is_ok());
+
+        let mut vk_vision = base("vulkan");
+        vk_vision.extend(["--mmproj".into(), mmproj.into_os_string()]);
+        assert!(parse(vk_vision).is_err());
         Ok(())
     }
 }

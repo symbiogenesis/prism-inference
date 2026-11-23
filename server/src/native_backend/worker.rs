@@ -1376,6 +1376,17 @@ fn valid_graph_profile(profile: &ModelProfile) -> bool {
     {
         return false;
     }
+    if profile.placement == Placement::Vulkan {
+        return profile.kv_cache == KvCachePolicy::F16
+            && profile.cpu_prefill.is_none()
+            && profile.cpu_speculation.is_none()
+            && !profile.vision
+            && profile.startup_graph_identity.as_deref().is_none_or(|identity| {
+                !identity.is_empty()
+                    && identity.len() <= 4096
+                    && identity.bytes().all(|byte| byte.is_ascii_graphic())
+            });
+    }
     let Some(identity) = profile.startup_graph_identity.as_deref() else {
         return profile.kv_cache == KvCachePolicy::F16 && profile.cpu_prefill.is_none();
     };

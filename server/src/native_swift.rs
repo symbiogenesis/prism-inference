@@ -39,6 +39,39 @@ impl NativeChat {
     }
 }
 
+pub(crate) struct CanonicalRequest<'a> {
+    pub(crate) messages: &'a serde_json::Value,
+    pub(crate) output_tokens: usize,
+    pub(crate) enable_thinking: bool,
+    pub(crate) adapter_scale: Option<f32>,
+    pub(crate) multi_rank_scale: Option<f32>,
+}
+
+pub(crate) fn parse_canonical_request(
+    value: &serde_json::Value,
+    has_rank_one: bool,
+    has_multi_rank: bool,
+) -> Result<CanonicalRequest<'_>, Rejection> {
+    let messages = value.get("messages").ok_or(Rejection::ChatSchema)?;
+    let enable_thinking = value["chat_template_kwargs"]["enable_thinking"]
+        .as_bool()
+        .ok_or(Rejection::ChatSchema)?;
+    let output_tokens = value
+        .get("max_completion_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(Rejection::CompletionLimit)?;
+    let (adapter_scale, multi_rank_scale) =
+        parse_adapter_scales(value, has_rank_one, has_multi_rank)?;
+    Ok(CanonicalRequest {
+        messages,
+        output_tokens,
+        enable_thinking,
+        adapter_scale,
+        multi_rank_scale,
+    })
+}
+
 /// Render, tokenize and admit an already authenticated strict broker request.
 ///
 /// The existing broker canonicalization fixes sampling and selects thinking.
@@ -52,26 +85,18 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
     let admitted = pending.admit_with_context(session.context_tokens(), |body| {
         let value: serde_json::Value =
             serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?;
-        let messages = value.get("messages").ok_or(Rejection::ChatSchema)?;
-        let enable_thinking = value["chat_template_kwargs"]["enable_thinking"]
-            .as_bool()
-            .ok_or(Rejection::ChatSchema)?;
-        let output = value
-            .get("max_completion_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or(Rejection::CompletionLimit)?;
-        let has_rank_one = session.adapter_identity().is_some();
-        let has_multi_rank = session.secondary_adapter_identity().is_some();
-        let (adapter_scale, multi_rank_scale) =
-            parse_adapter_scales(&value, has_rank_one, has_multi_rank)?;
+        let request = parse_canonical_request(
+            &value,
+            session.adapter_identity().is_some(),
+            session.secondary_adapter_identity().is_some(),
+        )?;
         let prompt = session
             .prepare_with_adapter_scales(
-                messages,
-                output,
-                enable_thinking,
-                adapter_scale,
-                multi_rank_scale,
+                request.messages,
+                request.output_tokens,
+                request.enable_thinking,
+                request.adapter_scale,
+                request.multi_rank_scale,
             )
             .map_err(|error| classify_preparation_error(error.as_ref()))?;
         let count = prompt.prompt_tokens();
@@ -113,7 +138,7 @@ fn parse_adapter_scale(value: &serde_json::Value) -> Result<Option<f32>, Rejecti
     Ok(Some(parse_scale_value(&entries[0]["scale"])?))
 }
 
-fn parse_adapter_scales(
+pub(crate) fn parse_adapter_scales(
     value: &serde_json::Value,
     has_rank_one: bool,
     has_multi_rank: bool,
@@ -159,7 +184,7 @@ fn parse_adapter_scales(
     }
 }
 
-fn classify_preparation_error(
+pub(crate) fn classify_preparation_error(
     error: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> Rejection {
     if error.is::<bonsai_prism_runtime::TokenLimitExceeded>() {

@@ -97,6 +97,8 @@ struct Observation {
     state: Arc<AtomicUsize>,
     resets: Arc<AtomicUsize>,
     terminated: Arc<AtomicBool>,
+    placement: Option<Placement>,
+    vision: bool,
     row_workers: Option<usize>,
     prompt_reuse: bonsai_prism_runtime::runtime::PromptReuse,
     prompt_reuse_checkpoints: Option<usize>,
@@ -143,6 +145,8 @@ impl worker::Engine for FakeEngine {
     }
     fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
         Ok(ModelProfile {
+            placement: self.0.placement.unwrap_or(Placement::Auto),
+            vision: self.0.vision,
             row_workers: self.0.row_workers.unwrap_or(1),
             prompt_reuse: self.0.prompt_reuse,
             prompt_reuse_checkpoints: self.0.prompt_reuse_checkpoints.unwrap_or(1),
@@ -3099,4 +3103,434 @@ fn hexagon_arena_cache_save_writes_verified_header_for_pq2_and_ptq1() -> TestRes
         assert_eq!(&raw[8..12], &arch.to_le_bytes());
     }
     Ok(())
+}
+
+#[test]
+fn adreno_vulkan_batched_startup_validates_and_renders_readiness() {
+    use bonsai_prism_runtime::graph::KvCachePolicy;
+
+    let identity: Arc<str> = Arc::from(format!("adreno-vulkan-batched-v1:{}", "a1".repeat(32)));
+    assert_eq!(identity.len(), "adreno-vulkan-batched-v1:".len() + 64);
+    assert!(identity.len() <= 256);
+
+    let startup = profile::ProjectionStartup::AdrenoVulkan {
+        identity: Arc::clone(&identity),
+        resident_tensors: 256,
+        resident_weight_bytes: 2_147_483_648,
+    };
+    assert!(startup.valid(Placement::Vulkan));
+    assert!(!startup.valid(Placement::Auto));
+    assert!(!startup.valid(Placement::Cpu));
+    assert!(!startup.valid(Placement::Composite));
+
+    let model_profile = ModelProfile {
+        placement: Placement::Vulkan,
+        projection_startup: startup,
+        kv_cache: KvCachePolicy::F16,
+        startup_graph_identity: Some(Arc::clone(&identity)),
+        ..ModelProfile::default()
+    };
+    let ready = model_profile.readiness(7);
+    let entry = &ready["data"][0];
+    assert_eq!(entry["placement"], json!("vulkan"));
+    assert_eq!(entry["projection_backend"], json!("adreno-vulkan"));
+    assert_eq!(entry["startup_projection"]["requested"], json!("vulkan"));
+    assert_eq!(entry["startup_projection"]["effective"], json!("adreno-vulkan"));
+    assert_eq!(entry["startup_projection"]["identity"], json!(identity.as_ref()));
+    assert_eq!(entry["startup_projection"]["resident_tensors"], json!(256));
+    assert_eq!(
+        entry["startup_projection"]["resident_weight_bytes"],
+        json!(2_147_483_648_u64)
+    );
+    assert_eq!(entry["startup_projection"]["host_metadata_bytes"], json!(0));
+
+    for invalid in [
+        profile::ProjectionStartup::AdrenoVulkan {
+            identity: Arc::clone(&identity),
+            resident_tensors: 0,
+            resident_weight_bytes: 1,
+        },
+        profile::ProjectionStartup::AdrenoVulkan {
+            identity: Arc::clone(&identity),
+            resident_tensors: 1,
+            resident_weight_bytes: 0,
+        },
+        profile::ProjectionStartup::AdrenoVulkan {
+            identity: Arc::from(""),
+            resident_tensors: 1,
+            resident_weight_bytes: 1,
+        },
+        profile::ProjectionStartup::AdrenoVulkan {
+            identity: Arc::from("adreno vulkan whitespace"),
+            resident_tensors: 1,
+            resident_weight_bytes: 1,
+        },
+        profile::ProjectionStartup::AdrenoVulkan {
+            identity: Arc::from("x".repeat(257)),
+            resident_tensors: 1,
+            resident_weight_bytes: 1,
+        },
+    ] {
+        assert!(!invalid.valid(Placement::Vulkan));
+    }
+}
+
+#[test]
+fn vulkan_placement_valid_graph_profile_enforces_f16_no_cpu_prefill_speculation_or_vision()
+-> TestResult {
+    use bonsai_prism_runtime::{
+        graph::KvCachePolicy,
+        swift_session::{CpuPrefill, CpuSpeculation},
+    };
+
+    let identity: Arc<str> = Arc::from(format!("adreno-vulkan-batched-v1:{}", "b2".repeat(32)));
+    let valid_startup = profile::ProjectionStartup::AdrenoVulkan {
+        identity: Arc::clone(&identity),
+        resident_tensors: 55,
+        resident_weight_bytes: 1_048_576,
+    };
+    let base = Observation {
+        placement: Some(Placement::Vulkan),
+        kv_cache: Some(KvCachePolicy::F16),
+        startup_projection: Some(valid_startup),
+        ..Observation::default()
+    };
+    assert!(Worker::with_placement(FakeEngine(base.clone()), 7, Placement::Vulkan).is_ok());
+
+    let with_identity = Observation {
+        startup_graph_identity: Some(identity),
+        ..base.clone()
+    };
+    assert!(Worker::with_placement(FakeEngine(with_identity), 7, Placement::Vulkan).is_ok());
+
+    let invalid_profiles = [
+        Observation {
+            kv_cache: Some(KvCachePolicy::Rotated4),
+            ..base.clone()
+        },
+        Observation {
+            kv_cache: Some(KvCachePolicy::Rotated4FittedValues),
+            ..base.clone()
+        },
+        Observation {
+            kv_cache: Some(KvCachePolicy::Rotated4Keys3Values),
+            ..base.clone()
+        },
+        Observation {
+            cpu_prefill: Some(CpuPrefill::new(16, 64)?),
+            ..base.clone()
+        },
+        Observation {
+            cpu_speculation: Some(CpuSpeculation::new(4, 8, 1_048_576)?),
+            ..base.clone()
+        },
+        Observation {
+            vision: true,
+            ..base.clone()
+        },
+        Observation {
+            startup_graph_identity: Some(Arc::from("")),
+            ..base.clone()
+        },
+        Observation {
+            startup_graph_identity: Some(Arc::from("bad identity")),
+            ..base.clone()
+        },
+        Observation {
+            startup_graph_identity: Some(Arc::from("z".repeat(4097))),
+            ..base.clone()
+        },
+        Observation {
+            startup_projection: Some(profile::ProjectionStartup::Cpu),
+            ..base.clone()
+        },
+        Observation {
+            startup_projection: Some(profile::ProjectionStartup::AdrenoVulkan {
+                identity: Arc::from("bad identity"),
+                resident_tensors: 1,
+                resident_weight_bytes: 1,
+            }),
+            ..base.clone()
+        },
+        Observation {
+            startup_projection: Some(profile::ProjectionStartup::AdrenoVulkan {
+                identity: Arc::from("adreno-vulkan-batched-v1:ok"),
+                resident_tensors: 0,
+                resident_weight_bytes: 1,
+            }),
+            ..base
+        },
+    ];
+    for obs in invalid_profiles {
+        assert!(matches!(
+            Worker::with_placement(FakeEngine(obs), 7, Placement::Vulkan),
+            Err(NativeBackendError::Configuration)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn vulkan_session_adapter_scale_actions() -> TestResult {
+    use bonsai_prism_runtime::runtime::PromptReuse;
+
+    assert_eq!(
+        vulkan_session::decide_adapter_scale_action(
+            Some(1.3),
+            None,
+            Some(1.3),
+            None,
+            PromptReuse::Latest,
+        )?,
+        vulkan_session::AdapterScaleAction::Reuse
+    );
+    assert_eq!(
+        vulkan_session::decide_adapter_scale_action(
+            Some(1.3),
+            None,
+            Some(0.5),
+            None,
+            PromptReuse::Latest,
+        )?,
+        vulkan_session::AdapterScaleAction::Reset {
+            update_scales: Some((Some(0.5), None)),
+        }
+    );
+    let r1_neg_zero = vulkan_session::decide_adapter_scale_action(
+        Some(0.0),
+        None,
+        Some(-0.0),
+        None,
+        PromptReuse::Latest,
+    )?;
+    match r1_neg_zero {
+        vulkan_session::AdapterScaleAction::Reset {
+            update_scales: Some((Some(scale), None)),
+        } => assert_eq!(scale.to_bits(), (-0.0_f32).to_bits()),
+        other => return Err(format!("unexpected rank-one scale action: {other:?}").into()),
+    }
+    assert_eq!(
+        vulkan_session::decide_adapter_scale_action(
+            None,
+            Some(0.0),
+            None,
+            Some(-0.0),
+            PromptReuse::Latest,
+        )?,
+        vulkan_session::AdapterScaleAction::Reuse
+    );
+    assert_eq!(
+        vulkan_session::decide_adapter_scale_action(
+            Some(1.3),
+            Some(0.0),
+            Some(1.3),
+            Some(0.0),
+            PromptReuse::Disabled,
+        )?,
+        vulkan_session::AdapterScaleAction::Reset {
+            update_scales: Some((Some(1.3), Some(0.0))),
+        }
+    );
+    for bad in [
+        vulkan_session::decide_adapter_scale_action(
+            Some(1.3),
+            None,
+            None,
+            None,
+            PromptReuse::Latest,
+        ),
+        vulkan_session::decide_adapter_scale_action(
+            Some(1.3),
+            None,
+            Some(f32::NAN),
+            None,
+            PromptReuse::Latest,
+        ),
+        vulkan_session::decide_adapter_scale_action(
+            None,
+            Some(0.0),
+            None,
+            Some(3.0),
+            PromptReuse::Latest,
+        ),
+        vulkan_session::decide_adapter_scale_action(
+            Some(1.3),
+            None,
+            Some(-0.1),
+            None,
+            PromptReuse::Latest,
+        ),
+    ] {
+        assert!(bad.is_err());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn vulkan_session_canonical_request_and_error_classification() -> TestResult {
+    let valid_value = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"enable_thinking": false},
+        "max_completion_tokens": 16,
+        "lora": [{"id": 0, "scale": 0.75}, {"id": 1, "scale": 0.25}],
+    });
+    let parsed = crate::native_swift::parse_canonical_request(&valid_value, true, true)
+        .map_err(|err| format!("parse_canonical_request failed: {err:?}"))?;
+    assert_eq!(parsed.output_tokens, 16);
+    assert!(!parsed.enable_thinking);
+    assert_eq!(parsed.adapter_scale, Some(0.75));
+    assert_eq!(parsed.multi_rank_scale, Some(0.25));
+    assert_eq!(
+        crate::native_swift::parse_canonical_request(&json!({"messages": []}), false, false)
+            .err(),
+        Some(Rejection::ChatSchema)
+    );
+    let generic_err = std::io::Error::other("broken");
+    assert_eq!(
+        crate::native_swift::classify_preparation_error(&generic_err),
+        Rejection::TokenCountUnavailable
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn synthetic_batched_model_with_mtp_layer() -> bonsai_prism_runtime::model::Model {
+    use bonsai_prism_runtime::model::{Model, Tensor, TensorBytes};
+    use std::collections::BTreeMap;
+
+    let mut tensors = BTreeMap::new();
+    let insert_tensor = |map: &mut BTreeMap<String, Tensor>, name: String, bytes: usize| {
+        let shared = Arc::<[u8]>::from(vec![0_u8; bytes]);
+        map.insert(
+            name.clone(),
+            Tensor {
+                name,
+                dimensions: vec![1, bytes],
+                kind: 0,
+                data: TensorBytes::Shared(shared),
+            },
+        );
+    };
+    for layer_idx in 0_usize..4 {
+        for suffix in [
+            "attn_norm.weight",
+            "post_attention_norm.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        ] {
+            insert_tensor(&mut tensors, format!("blk.{layer_idx}.{suffix}"), 64);
+        }
+        let extra: &[&str] = if (layer_idx + 1).is_multiple_of(4) {
+            &[
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "attn_q_norm.weight",
+                "attn_k_norm.weight",
+            ]
+        } else {
+            &[
+                "attn_qkv.weight",
+                "attn_gate.weight",
+                "ssm_beta.weight",
+                "ssm_alpha.weight",
+                "ssm_conv1d.weight",
+                "ssm_dt.bias",
+                "ssm_a",
+                "ssm_norm.weight",
+                "ssm_out.weight",
+            ]
+        };
+        for suffix in extra {
+            insert_tensor(&mut tensors, format!("blk.{layer_idx}.{suffix}"), 64);
+        }
+    }
+    insert_tensor(&mut tensors, "blk.4.attn_norm.weight".to_owned(), 4096);
+    insert_tensor(&mut tensors, "output_norm.weight".to_owned(), 64);
+    insert_tensor(&mut tensors, "token_embd.weight".to_owned(), 128);
+    insert_tensor(&mut tensors, "output.weight".to_owned(), 64);
+
+    Model {
+        metadata: BTreeMap::new(),
+        tensors,
+        identity: "synthetic-batched-vulkan".to_owned(),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn vulkan_session_active_resident_weights_ignores_inactive_mtp_layers() {
+    let mut model = synthetic_batched_model_with_mtp_layer();
+    assert_eq!(
+        vulkan_session::compute_active_resident_weights(&model, 4),
+        Some((55, 55 * 64))
+    );
+    model.tensors.remove("output.weight");
+    assert_eq!(
+        vulkan_session::compute_active_resident_weights(&model, 4),
+        Some((55, 54 * 64 + 128))
+    );
+    model.tensors.remove("output_norm.weight");
+    assert_eq!(
+        vulkan_session::compute_active_resident_weights(&model, 4),
+        None
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn vulkan_session_load_rejects_invalid_profiles_without_gpu() {
+    use bonsai_prism_runtime::{
+        model::swift::Representation,
+        runtime::PromptReuse,
+        swift_session::BranchCheckpoints,
+    };
+
+    let missing_path = std::env::temp_dir().join("nonexistent-batched-vulkan-model.gguf");
+    assert!(
+        VulkanSwiftSession::load_profile_with_adapters(
+            &missing_path,
+            Representation::Pq2,
+            None,
+            None,
+            7,
+            0,
+            4352,
+            PromptReuse::Latest,
+            BranchCheckpoints::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        VulkanSwiftSession::load_profile_with_adapters(
+            &missing_path,
+            Representation::Pq2,
+            None,
+            None,
+            7,
+            1,
+            128,
+            PromptReuse::Latest,
+            BranchCheckpoints::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        VulkanSwiftSession::load_profile_with_adapters(
+            &missing_path,
+            Representation::Pq2,
+            None,
+            None,
+            7,
+            1,
+            4352,
+            PromptReuse::Latest,
+            BranchCheckpoints::default(),
+        )
+        .is_err()
+    );
 }

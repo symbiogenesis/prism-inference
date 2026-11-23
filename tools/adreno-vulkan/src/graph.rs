@@ -259,8 +259,6 @@ pub struct VulkanLayerPipelines {
     attn_fused_f16prob_f16kv: PipelineId,
     rms_norm: PipelineId,
     add_rms_norm: PipelineId,
-    residual_add: PipelineId,
-    residual_add_batched: PipelineId,
     rope: PipelineId,
     rope_batched: PipelineId,
     mul_sigmoid: PipelineId,
@@ -287,6 +285,11 @@ pub struct VulkanLayerPipelines {
     quant_q8_0_pinned_batched: PipelineId,
     quant_q8_0_pinned_native: PipelineId,
     quant_q8_0_pinned_native_batched: PipelineId,
+    fused_hadamard1024_q8k_pinned: PipelineId,
+    fused_hadamard1024_q8k_unpinned: PipelineId,
+    fused_hadamard1024_q8_0_source: PipelineId,
+    fused_hadamard1024_q8_0_pinned: PipelineId,
+    fused_hadamard1024_q8_0_pinned_native: PipelineId,
     hadamard_batched: PipelineId,
     f32_matvec: PipelineId,
     f32_gemm_batched: PipelineId,
@@ -322,7 +325,7 @@ impl VulkanLayerPipelines {
     pub fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         let proj = ProjectionPipelines::compile(device, use_sdot)?;
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v4:")?;
+        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v5:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
         hash_bytes(&mut hasher, b"proj_bundle:")?;
         hash_bytes(&mut hasher, proj.digest_sha256.as_bytes())?;
@@ -360,13 +363,6 @@ impl VulkanLayerPipelines {
 
         let (rms_norm, _) = make_pipe(b"rms_norm_f32", spirv::rms_norm_f32(), 3, 2)?;
         let (add_rms_norm, _) = make_pipe(b"add_rms_norm_f32", spirv::add_rms_norm_f32(), 4, 2)?;
-        let (residual_add, _) = make_pipe(b"residual_add_f32", spirv::residual_add_f32(), 2, 1)?;
-        let (residual_add_batched, _) = make_pipe(
-            b"residual_add_batched_f32",
-            spirv::residual_add_batched_f32(),
-            2,
-            2,
-        )?;
         let (rope, _) = make_pipe(b"rope_f32", spirv::rope_f32(), 2, 4)?;
         let (rope_batched, _) = make_pipe(b"rope_batched_f32", spirv::rope_batched_f32(), 2, 5)?;
         let (mul_sigmoid, _) = make_pipe(b"mul_sigmoid_f32", spirv::mul_sigmoid_f32(), 2, 1)?;
@@ -469,6 +465,36 @@ impl VulkanLayerPipelines {
             2,
             2,
         )?;
+        let (fused_hadamard1024_q8k_pinned, _) = make_pipe(
+            b"fused_hadamard1024_q8k_pinned",
+            spirv::fused_basis_hadamard1024_q8k_4plane(true),
+            3,
+            7,
+        )?;
+        let (fused_hadamard1024_q8k_unpinned, _) = make_pipe(
+            b"fused_hadamard1024_q8k_unpinned",
+            spirv::fused_basis_hadamard1024_q8k_4plane(false),
+            3,
+            7,
+        )?;
+        let (fused_hadamard1024_q8_0_source, _) = make_pipe(
+            b"fused_hadamard1024_q8_0_source",
+            spirv::fused_basis_hadamard1024_q8_0(false, false),
+            3,
+            7,
+        )?;
+        let (fused_hadamard1024_q8_0_pinned, _) = make_pipe(
+            b"fused_hadamard1024_q8_0_pinned",
+            spirv::fused_basis_hadamard1024_q8_0(true, false),
+            3,
+            7,
+        )?;
+        let (fused_hadamard1024_q8_0_pinned_native, _) = make_pipe(
+            b"fused_hadamard1024_q8_0_pinned_native",
+            spirv::fused_basis_hadamard1024_q8_0(true, true),
+            3,
+            7,
+        )?;
         let (hadamard_batched, _) = make_pipe(
             b"ffn_hadamard_batched_f32",
             spirv::ffn_hadamard_batched_f32(),
@@ -529,8 +555,6 @@ impl VulkanLayerPipelines {
             attn_fused_f16prob_f16kv,
             rms_norm,
             add_rms_norm,
-            residual_add,
-            residual_add_batched,
             rope,
             rope_batched,
             mul_sigmoid,
@@ -557,6 +581,11 @@ impl VulkanLayerPipelines {
             quant_q8_0_pinned_batched,
             quant_q8_0_pinned_native,
             quant_q8_0_pinned_native_batched,
+            fused_hadamard1024_q8k_pinned,
+            fused_hadamard1024_q8k_unpinned,
+            fused_hadamard1024_q8_0_source,
+            fused_hadamard1024_q8_0_pinned,
+            fused_hadamard1024_q8_0_pinned_native,
             hadamard_batched,
             f32_matvec,
             f32_gemm_batched,
@@ -2302,16 +2331,30 @@ impl VulkanBatchedGraphExecutor {
         let attn_norm_w = self.layers[layer_idx].attn_norm_w;
         let post_norm_w = self.layers[layer_idx].post_norm_w;
 
-        self.batch_recorder.push_barrier(
-            self.pipelines.rms_norm,
-            &[
-                BufferSpan::whole(self.scratch.hidden),
-                BufferSpan::whole(attn_norm_w),
-                BufferSpan::whole(self.scratch.norm),
-            ],
-            &[embed_u32, eps_bits],
-            checked_grid(&self.device, [1, tokens_u32, 1])?,
-        );
+        if layer_idx == 0 {
+            self.batch_recorder.push_barrier(
+                self.pipelines.rms_norm,
+                &[
+                    BufferSpan::whole(self.scratch.hidden),
+                    BufferSpan::whole(attn_norm_w),
+                    BufferSpan::whole(self.scratch.norm),
+                ],
+                &[embed_u32, eps_bits],
+                checked_grid(&self.device, [1, tokens_u32, 1])?,
+            );
+        } else {
+            self.batch_recorder.push_barrier(
+                self.pipelines.add_rms_norm,
+                &[
+                    BufferSpan::whole(self.scratch.hidden),
+                    BufferSpan::whole(self.scratch.delta),
+                    BufferSpan::whole(attn_norm_w),
+                    BufferSpan::whole(self.scratch.norm),
+                ],
+                &[embed_u32, eps_bits],
+                checked_grid(&self.device, [1, tokens_u32, 1])?,
+            );
+        }
 
         let is_recurrent = matches!(
             self.layers[layer_idx].attention,
@@ -2454,56 +2497,10 @@ impl VulkanBatchedGraphExecutor {
             self.scratch.dummy_state
         };
 
-        let (gdn_out_buf, gdn_normed_buf) = if tokens == 1 {
-            let conv_out_buf = self.scratch.proj_e;
-            self.batch_recorder.push_barrier(
-                self.pipelines.conv1d_silu,
-                &[
-                    BufferSpan::whole(proj_qkv_buf),
-                    BufferSpan::whole(active_conv_state),
-                    BufferSpan::whole(convolution_w),
-                    BufferSpan::whole(conv_out_buf),
-                ],
-                &[channels_u32, kernel_u32],
-                checked_grid(&self.device, [channels_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-            );
-            self.batch_recorder.push_concurrent(
-                self.pipelines.gdn_gates,
-                &[
-                    BufferSpan::whole(proj_alpha_buf),
-                    BufferSpan::whole(proj_beta_buf),
-                    BufferSpan::whole(time_bias),
-                    BufferSpan::whole(ssm_a),
-                ],
-                &[v_heads_u32],
-                checked_grid(&self.device, [v_heads_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-            );
-            self.batch_recorder.push_barrier(
-                self.pipelines.l2_norm,
-                &[BufferSpan::whole(conv_out_buf)],
-                &[qk_heads_u32, ssm_head_u32, self.geometry.epsilon.to_bits()],
-                checked_grid(&self.device, [1, qk_heads_u32, 1])?,
-            );
-
-            let (q_span, k_span, v_span) =
-                self.resolve_gdn_qkv_spans(conv_out_buf, key_width, val_width, min_align)?;
-            let out_buf = proj_qkv_buf;
-            self.batch_recorder.push_barrier(
-                self.pipelines.gdn_step,
-                &[
-                    BufferSpan::whole(matrix_state),
-                    q_span,
-                    k_span,
-                    v_span,
-                    BufferSpan::whole(proj_alpha_buf),
-                    BufferSpan::whole(proj_beta_buf),
-                    BufferSpan::whole(out_buf),
-                ],
-                &[v_heads_u32, k_heads_u32, ssm_head_u32, gdn_scale_bits],
-                checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?,
-            );
-            (out_buf, conv_out_buf)
-        } else if self.geometry.convolution <= 8 && self.geometry.ssm_head <= 256 {
+        let (gdn_out_buf, gdn_normed_buf) = if self.geometry.convolution <= 8
+            && ((tokens == 1 && self.geometry.ssm_head <= 128)
+                || (tokens > 1 && self.geometry.ssm_head <= 256))
+        {
             let batched_out_buf = self.scratch.proj_e;
             let conv_grid = checked_grid(&self.device, [channels_u32.div_ceil(WORKGROUP_X), 1, 1])?;
             let gates_grid = checked_grid(
@@ -2565,6 +2562,55 @@ impl VulkanBatchedGraphExecutor {
                 gdn_grid,
             );
             (batched_out_buf, self.scratch.perm_tmp)
+        } else if tokens == 1 {
+            let conv_out_buf = self.scratch.proj_e;
+            self.batch_recorder.push_barrier(
+                self.pipelines.conv1d_silu,
+                &[
+                    BufferSpan::whole(proj_qkv_buf),
+                    BufferSpan::whole(active_conv_state),
+                    BufferSpan::whole(convolution_w),
+                    BufferSpan::whole(conv_out_buf),
+                ],
+                &[channels_u32, kernel_u32],
+                checked_grid(&self.device, [channels_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+            self.batch_recorder.push_concurrent(
+                self.pipelines.gdn_gates,
+                &[
+                    BufferSpan::whole(proj_alpha_buf),
+                    BufferSpan::whole(proj_beta_buf),
+                    BufferSpan::whole(time_bias),
+                    BufferSpan::whole(ssm_a),
+                ],
+                &[v_heads_u32],
+                checked_grid(&self.device, [v_heads_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+            self.batch_recorder.push_barrier(
+                self.pipelines.l2_norm,
+                &[BufferSpan::whole(conv_out_buf)],
+                &[qk_heads_u32, ssm_head_u32, self.geometry.epsilon.to_bits()],
+                checked_grid(&self.device, [1, qk_heads_u32, 1])?,
+            );
+
+            let (q_span, k_span, v_span) =
+                self.resolve_gdn_qkv_spans(conv_out_buf, key_width, val_width, min_align)?;
+            let out_buf = proj_qkv_buf;
+            self.batch_recorder.push_barrier(
+                self.pipelines.gdn_step,
+                &[
+                    BufferSpan::whole(matrix_state),
+                    q_span,
+                    k_span,
+                    v_span,
+                    BufferSpan::whole(proj_alpha_buf),
+                    BufferSpan::whole(proj_beta_buf),
+                    BufferSpan::whole(out_buf),
+                ],
+                &[v_heads_u32, k_heads_u32, ssm_head_u32, gdn_scale_bits],
+                checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?,
+            );
+            (out_buf, conv_out_buf)
         } else {
             // `perm_tmp` holds single-token [q, k, v] during the serial recurrence while `proj_e` accumulates `[T, val_width]`.
             let conv_tmp_buf = self.scratch.perm_tmp;
@@ -2811,12 +2857,14 @@ impl VulkanBatchedGraphExecutor {
                 &[head_dim_u32, eps_bits],
                 checked_grid(&self.device, [1, tokens_u32 * kv_heads_u32, 1])?,
             );
-            self.batch_recorder.push_concurrent(
-                self.pipelines.round_f16,
-                &[BufferSpan::whole(val_buf)],
-                &[total_kv_u32],
-                checked_grid(&self.device, [total_kv_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-            );
+            if self.config.kv_precision == VulkanKvPrecision::Fp32 {
+                self.batch_recorder.push_concurrent(
+                    self.pipelines.round_f16,
+                    &[BufferSpan::whole(val_buf)],
+                    &[total_kv_u32],
+                    checked_grid(&self.device, [total_kv_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                );
+            }
             self.record_rope_tokens(
                 key_buf,
                 kv_heads_u32,
@@ -2893,12 +2941,14 @@ impl VulkanBatchedGraphExecutor {
             &[head_dim_u32, eps_bits],
             checked_grid(&self.device, [1, tokens_u32 * kv_heads_u32, 1])?,
         );
-        self.batch_recorder.push_concurrent(
-            self.pipelines.round_f16,
-            &[BufferSpan::whole(val_buf)],
-            &[total_kv_u32],
-            checked_grid(&self.device, [total_kv_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-        );
+        if self.config.kv_precision == VulkanKvPrecision::Fp32 {
+            self.batch_recorder.push_concurrent(
+                self.pipelines.round_f16,
+                &[BufferSpan::whole(val_buf)],
+                &[total_kv_u32],
+                checked_grid(&self.device, [total_kv_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+        }
 
         self.record_rope_tokens(
             query_buf,
@@ -3367,51 +3417,36 @@ impl VulkanBatchedGraphExecutor {
         );
 
         self.record_projection_group_tokens(mid_buf, &[(ffn_down, self.scratch.delta)], tokens)?;
-
-        let embed_u32 = u32::try_from(self.geometry.embedding)
-            .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
-        let tokens_u32 = u32::try_from(tokens)
-            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
-        if tokens == 1 {
-            self.batch_recorder.push_barrier(
-                self.pipelines.residual_add,
-                &[
-                    BufferSpan::whole(self.scratch.hidden),
-                    BufferSpan::whole(self.scratch.delta),
-                ],
-                &[embed_u32],
-                checked_grid(&self.device, [embed_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-            );
-        } else {
-            self.batch_recorder.push_barrier(
-                self.pipelines.residual_add_batched,
-                &[
-                    BufferSpan::whole(self.scratch.hidden),
-                    BufferSpan::whole(self.scratch.delta),
-                ],
-                &[embed_u32, tokens_u32],
-                checked_grid(
-                    &self.device,
-                    [embed_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
-                )?,
-            );
-        }
         Ok(())
     }
 
     fn record_final_logits(&mut self) -> Result<(), Error> {
         let embed_u32 = u32::try_from(self.geometry.embedding)
             .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
-        self.batch_recorder.push_barrier(
-            self.pipelines.rms_norm,
-            &[
-                BufferSpan::whole(self.scratch.hidden),
-                BufferSpan::whole(self.output_norm_w),
-                BufferSpan::whole(self.scratch.norm),
-            ],
-            &[embed_u32, self.geometry.epsilon.to_bits()],
-            checked_grid(&self.device, [1, 1, 1])?,
-        );
+        if self.layers.is_empty() {
+            self.batch_recorder.push_barrier(
+                self.pipelines.rms_norm,
+                &[
+                    BufferSpan::whole(self.scratch.hidden),
+                    BufferSpan::whole(self.output_norm_w),
+                    BufferSpan::whole(self.scratch.norm),
+                ],
+                &[embed_u32, self.geometry.epsilon.to_bits()],
+                checked_grid(&self.device, [1, 1, 1])?,
+            );
+        } else {
+            self.batch_recorder.push_barrier(
+                self.pipelines.add_rms_norm,
+                &[
+                    BufferSpan::whole(self.scratch.hidden),
+                    BufferSpan::whole(self.scratch.delta),
+                    BufferSpan::whole(self.output_norm_w),
+                    BufferSpan::whole(self.scratch.norm),
+                ],
+                &[embed_u32, self.geometry.epsilon.to_bits()],
+                checked_grid(&self.device, [1, 1, 1])?,
+            );
+        }
         self.record_projection_group_tokens(
             self.scratch.norm,
             &[(self.output_weight, self.scratch.logits)],
@@ -3547,6 +3582,66 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
+    fn can_fuse_hadamard_1024(
+        &self,
+        basis: (bool, bool),
+        cols: usize,
+        group: &[(GpuMatrixWeight, BufferId)],
+    ) -> bool {
+        let (rotated, grouped_ssm) = basis;
+        if !rotated
+            || self.transforms.block != 1024
+            || !cols.is_multiple_of(1024)
+            || group.iter().any(|(w, _)| w.encoding == WeightEncoding::F32)
+        {
+            return false;
+        }
+        if grouped_ssm {
+            let kh = self.geometry.ssm_keys;
+            let rep = self.geometry.ssm_values.checked_div(kh).unwrap_or(0);
+            let hd = self.geometry.ssm_head;
+            return kh > 0 && rep > 0 && hd > 0 && kh * rep * hd == cols;
+        }
+        true
+    }
+
+    fn fused_hadamard1024_push(
+        &self,
+        cols: usize,
+        grouped_ssm: bool,
+    ) -> Result<(BufferId, [u32; 7]), Error> {
+        let cols_u32 = u32::try_from(cols)
+            .map_err(|_| Error::ResourceLimit("transform width exceeds u32".to_owned()))?;
+        let (sign_buf, has_signs) = if let Some(&sb) = self.transforms.sign_buffers.get(&cols) {
+            (sb, 1_u32)
+        } else {
+            (self.scratch.dummy_state, 0_u32)
+        };
+        let (use_permute, kh, rep, hd) = if grouped_ssm {
+            let kh = u32::try_from(self.geometry.ssm_keys)
+                .map_err(|_| Error::ResourceLimit("ssm_keys exceeds u32".to_owned()))?;
+            let rep = u32::try_from(self.geometry.ssm_values / self.geometry.ssm_keys)
+                .map_err(|_| Error::ResourceLimit("repetitions exceeds u32".to_owned()))?;
+            let hd = u32::try_from(self.geometry.ssm_head)
+                .map_err(|_| Error::ResourceLimit("ssm_head exceeds u32".to_owned()))?;
+            (1_u32, kh, rep, hd)
+        } else {
+            (0_u32, 1_u32, 1_u32, 1_u32)
+        };
+        Ok((
+            sign_buf,
+            [
+                cols_u32,
+                hadamard_norm_bits(1024),
+                has_signs,
+                use_permute,
+                kh,
+                rep,
+                hd,
+            ],
+        ))
+    }
+
     fn record_basis_projection_subgroup_tokens(
         &mut self,
         src_buf: BufferId,
@@ -3555,7 +3650,12 @@ impl VulkanBatchedGraphExecutor {
         tokens: usize,
     ) -> Result<(), Error> {
         let cols = group[0].0.cols;
-        let act_buf = self.apply_forward_basis_transform_tokens(src_buf, cols, basis, tokens)?;
+        let fused_h1024 = self.can_fuse_hadamard_1024(basis, cols, group);
+        let act_buf = if fused_h1024 {
+            src_buf
+        } else {
+            self.apply_forward_basis_transform_tokens(src_buf, cols, basis, tokens)?
+        };
 
         let needs_q8k = group
             .iter()
@@ -3566,6 +3666,19 @@ impl VulkanBatchedGraphExecutor {
         let needs_ptq1_q8_0 = group
             .iter()
             .any(|(w, _)| w.encoding == WeightEncoding::Ptq1Q8_0);
+
+        if fused_h1024 {
+            return self.dispatch_fused_hadamard1024_projection_group(
+                src_buf,
+                cols,
+                basis.1,
+                group,
+                tokens,
+                needs_q8k,
+                needs_q8_0_source_or_pinned && needs_ptq1_q8_0 && self.resolved_pinned_arithmetic,
+            );
+        }
+
         if needs_q8_0_source_or_pinned && needs_ptq1_q8_0 && self.resolved_pinned_arithmetic {
             let q8_0_pq2: Vec<(GpuMatrixWeight, BufferId)> = group
                 .iter()
@@ -3582,8 +3695,112 @@ impl VulkanBatchedGraphExecutor {
                 .dispatch_prepared_projection_group_tokens(act_buf, cols, &q8_0_ptq1, tokens);
         }
 
-        let _ = (needs_q8k, needs_q8_0_source_or_pinned, needs_ptq1_q8_0);
         self.dispatch_prepared_projection_group_tokens(act_buf, cols, group, tokens)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Encodes fused 1024-element basis-transform+quantization dispatch without mutating `src_buf` for LoRA."
+    )]
+    fn dispatch_fused_hadamard1024_projection_group(
+        &mut self,
+        src_buf: BufferId,
+        cols: usize,
+        grouped_ssm: bool,
+        group: &[(GpuMatrixWeight, BufferId)],
+        tokens: usize,
+        needs_q8k: bool,
+        split_pinned_ptq1: bool,
+    ) -> Result<(), Error> {
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
+        let blocks1024 = u32::try_from(cols / 1024)
+            .map_err(|_| Error::ResourceLimit("Hadamard1024 grid exceeds u32".to_owned()))?;
+        let grid = checked_grid(&self.device, [blocks1024, tokens_u32, 1])?;
+        let (sign_buf, push) = self.fused_hadamard1024_push(cols, grouped_ssm)?;
+
+        if needs_q8k {
+            let q8k_pipe = if self.resolved_pinned_arithmetic {
+                self.pipelines.fused_hadamard1024_q8k_pinned
+            } else {
+                self.pipelines.fused_hadamard1024_q8k_unpinned
+            };
+            self.batch_recorder.push_barrier(
+                q8k_pipe,
+                &[
+                    BufferSpan::whole(src_buf),
+                    BufferSpan::whole(sign_buf),
+                    BufferSpan::whole(self.scratch.act_q8k),
+                ],
+                &push,
+                grid,
+            );
+        }
+        let q8k_emitted = needs_q8k;
+
+        if split_pinned_ptq1 {
+            let q8_0_pq2: Vec<(GpuMatrixWeight, BufferId)> = group
+                .iter()
+                .copied()
+                .filter(|(w, _)| w.encoding != WeightEncoding::Ptq1Q8_0)
+                .collect();
+            let q8_0_ptq1: Vec<(GpuMatrixWeight, BufferId)> = group
+                .iter()
+                .copied()
+                .filter(|(w, _)| w.encoding == WeightEncoding::Ptq1Q8_0)
+                .collect();
+            self.batch_recorder.push(
+                self.pipelines.fused_hadamard1024_q8_0_pinned,
+                &[
+                    BufferSpan::whole(src_buf),
+                    BufferSpan::whole(sign_buf),
+                    BufferSpan::whole(self.scratch.act_q8_0),
+                ],
+                &push,
+                grid,
+                !q8k_emitted,
+            );
+            self.dispatch_projection_weights(src_buf, cols, &q8_0_pq2, tokens)?;
+            self.batch_recorder.push_barrier(
+                self.pipelines.fused_hadamard1024_q8_0_pinned_native,
+                &[
+                    BufferSpan::whole(src_buf),
+                    BufferSpan::whole(sign_buf),
+                    BufferSpan::whole(self.scratch.act_q8_0),
+                ],
+                &push,
+                grid,
+            );
+            return self.dispatch_projection_weights(src_buf, cols, &q8_0_ptq1, tokens);
+        }
+
+        let q8_kind = group.iter().find_map(|(w, _)| match w.encoding {
+            WeightEncoding::Pq2Q8_0 => Some(WeightEncoding::Pq2Q8_0),
+            WeightEncoding::Ptq1Q8_0 => Some(WeightEncoding::Ptq1Q8_0),
+            WeightEncoding::Q8_0 => Some(WeightEncoding::Q8_0),
+            WeightEncoding::Pq2Q8k | WeightEncoding::F32 => None,
+        });
+        if let Some(kind) = q8_kind {
+            let pipe = match (self.resolved_pinned_arithmetic, kind) {
+                (false, _) => self.pipelines.fused_hadamard1024_q8_0_source,
+                (true, WeightEncoding::Ptq1Q8_0) => {
+                    self.pipelines.fused_hadamard1024_q8_0_pinned_native
+                }
+                (true, _) => self.pipelines.fused_hadamard1024_q8_0_pinned,
+            };
+            self.batch_recorder.push(
+                pipe,
+                &[
+                    BufferSpan::whole(src_buf),
+                    BufferSpan::whole(sign_buf),
+                    BufferSpan::whole(self.scratch.act_q8_0),
+                ],
+                &push,
+                grid,
+                !q8k_emitted,
+            );
+        }
+        self.dispatch_projection_weights(src_buf, cols, group, tokens)
     }
 
     fn apply_forward_basis_transform_tokens(
@@ -3685,10 +3902,6 @@ impl VulkanBatchedGraphExecutor {
         Ok(cur)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Quantizes shared activation once (Q8K and/or Q8_0) and dispatches 1-token GEMV or 4-token coalesced GEMM projections cleanly."
-    )]
     fn dispatch_prepared_projection_group_tokens(
         &mut self,
         act_buf: BufferId,
@@ -3704,11 +3917,6 @@ impl VulkanBatchedGraphExecutor {
         let tokens_u32 = u32::try_from(tokens)
             .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
         let multi_token = tokens > 1;
-        let tok_tiles_y = if multi_token {
-            tokens_u32.div_ceil(4)
-        } else {
-            1
-        };
 
         let needs_q8k = group
             .iter()
@@ -3779,6 +3987,34 @@ impl VulkanBatchedGraphExecutor {
                 );
             }
         }
+
+        self.dispatch_projection_weights(act_buf, cols, group, tokens)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Dispatches all weight-encoded matrix projections (`Pq2Q8k`, `Pq2Q8_0`, `Ptq1Q8_0`, `Q8_0`, `F32`) from already-quantized or float activation scratch."
+    )]
+    fn dispatch_projection_weights(
+        &mut self,
+        f32_act_buf: BufferId,
+        cols: usize,
+        group: &[(GpuMatrixWeight, BufferId)],
+        tokens: usize,
+    ) -> Result<(), Error> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let cols_u32 = u32::try_from(cols)
+            .map_err(|_| Error::ResourceLimit("projection cols exceed u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
+        let multi_token = tokens > 1;
+        let tok_tiles_y = if multi_token {
+            tokens_u32.div_ceil(4)
+        } else {
+            1
+        };
 
         for (idx, (weight, out_buf)) in group.iter().enumerate() {
             let rows_u32 = u32::try_from(weight.rows)
@@ -3855,7 +4091,7 @@ impl VulkanBatchedGraphExecutor {
                             self.pipelines.f32_gemm_batched,
                             &[
                                 weight.span,
-                                BufferSpan::whole(act_buf),
+                                BufferSpan::whole(f32_act_buf),
                                 BufferSpan::whole(*out_buf),
                             ],
                             &[cols_u32, rows_u32, tokens_u32],
@@ -3867,7 +4103,7 @@ impl VulkanBatchedGraphExecutor {
                             self.pipelines.f32_matvec,
                             &[
                                 weight.span,
-                                BufferSpan::whole(act_buf),
+                                BufferSpan::whole(f32_act_buf),
                                 BufferSpan::whole(*out_buf),
                             ],
                             &[cols_u32, rows_u32],

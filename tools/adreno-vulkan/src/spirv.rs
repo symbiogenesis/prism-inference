@@ -410,7 +410,11 @@ impl ShaderBuilder {
         id
     }
 
-    fn finish(mut self) -> Vec<u32> {
+    fn finish(self) -> Vec<u32> {
+        self.finish_with_local_size([WORKGROUP_X, 1, 1])
+    }
+
+    fn finish_with_local_size(mut self, local_size: [u32; 3]) -> Vec<u32> {
         let mut ep = vec![EXEC_MODEL_GL_COMPUTE, self.main_fn_id];
         ep.extend(encode_string("main"));
         ep.extend(self.entry_interface.iter().copied());
@@ -418,7 +422,13 @@ impl ShaderBuilder {
         push_inst(
             &mut self.execution_modes,
             OP_EXECUTION_MODE,
-            &[self.main_fn_id, EXEC_MODE_LOCAL_SIZE, WORKGROUP_X, 1, 1],
+            &[
+                self.main_fn_id,
+                EXEC_MODE_LOCAL_SIZE,
+                local_size[0],
+                local_size[1],
+                local_size[2],
+            ],
         );
         push_inst(&mut self.fn_body, OP_RETURN, &[]);
         push_inst(&mut self.fn_body, OP_FUNCTION_END, &[]);
@@ -3740,6 +3750,408 @@ pub fn quantize_f32_to_q8k_4plane_batched(pinned: bool) -> Vec<u32> {
     quantize_f32_to_q8k_4plane(pinned)
 }
 
+const HADAMARD_1024_WG_X: u32 = 256;
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Maintains clean single-pass SPIR-V emission for fused optional SSM permutation, sign scaling, and 1024-point FWHT in shared memory."
+)]
+fn emit_fused_basis_hadamard1024_smem_fwht(
+    b: &mut ShaderBuilder,
+    in_buf: u32,
+    sign_buf: u32,
+    smem: u32,
+    lid: u32,
+    blk1024: u32,
+    tok: u32,
+    push_var: u32,
+) -> (u32, u32) {
+    let cols = b.load_push(push_var, 0);
+    let norm_bits = b.load_push(push_var, 1);
+    let has_signs = b.load_push(push_var, 2);
+    let use_permute = b.load_push(push_var, 3);
+    let num_k_heads = b.load_push(push_var, 4);
+    let repetitions = b.load_push(push_var, 5);
+    let head_dim = b.load_push(push_var, 6);
+    let norm = b.bitcast(b.f32_t, norm_bits);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c256 = b.const_u32(HADAMARD_1024_WG_X);
+    let c1024 = b.const_u32(1024);
+
+    let tok_base = b.umul(tok, cols);
+    let blk1024_base = b.umul(blk1024, c1024);
+    let signs_active = b.u_ne(has_signs, c0);
+    let perm_flag = b.u_ne(use_permute, c0);
+    let rep_nz = b.u_ne(repetitions, c0);
+    let hd_nz = b.u_ne(head_dim, c0);
+    let kh_nz = b.u_ne(num_k_heads, c0);
+    let dims_nz = b.logical_and(rep_nz, hd_nz);
+    let dims_all = b.logical_and(dims_nz, kh_nz);
+    let permute_active = b.logical_and(perm_flag, dims_all);
+
+    let src_pos_var = b.local_u32_var();
+    let val_var = b.local_f32_var();
+    for k in 0_u32..4 {
+        let k_off = b.const_u32(k * HADAMARD_1024_WG_X);
+        let local_pos = b.uadd(lid, k_off);
+        let dst_pos = b.uadd(blk1024_base, local_pos);
+        b.store_var(src_pos_var, dst_pos);
+        b.emit_if(permute_active, |b| {
+            let dst_head = b.udiv(dst_pos, head_dim);
+            let dst_head_off = b.umul(dst_head, head_dim);
+            let d = b.usub(dst_pos, dst_head_off);
+            let key = b.udiv(dst_head, repetitions);
+            let key_rep = b.umul(key, repetitions);
+            let repeat = b.usub(dst_head, key_rep);
+            let rep_k = b.umul(repeat, num_k_heads);
+            let src_head = b.uadd(rep_k, key);
+            let src_head_off = b.umul(src_head, head_dim);
+            let src_pos = b.uadd(src_head_off, d);
+            b.store_var(src_pos_var, src_pos);
+        });
+        let resolved_src = b.load_var_u32(src_pos_var);
+        let global_in_idx = b.uadd(tok_base, resolved_src);
+        let raw_val = b.load_sb_f32(in_buf, global_in_idx);
+        b.store_var(val_var, raw_val);
+        b.emit_if(signs_active, |b| {
+            let sign_v = b.load_sb_f32(sign_buf, dst_pos);
+            let cur_v = b.load_var_f32(val_var);
+            let scaled_v = b.fmul_nc(cur_v, sign_v);
+            b.store_var(val_var, scaled_v);
+        });
+        let final_v = b.load_var_f32(val_var);
+        let v_u32 = b.bitcast(b.u32_t, final_v);
+        b.store_wg_u32(smem, local_pos, v_u32);
+    }
+    b.workgroup_barrier();
+
+    let half_var = b.local_u32_var();
+    b.store_var(half_var, c1);
+    b.emit_while(
+        |b| {
+            let h = b.load_var_u32(half_var);
+            b.u_lt(h, c1024)
+        },
+        |b| {
+            let half = b.load_var_u32(half_var);
+            let mask = b.binop(OP_I_SUB, b.u32_t, half, c1);
+            let p1 = b.uadd(lid, c256);
+            for p_idx in [lid, p1] {
+                let lo = b.uand(p_idx, mask);
+                let bp = b.binop(OP_I_SUB, b.u32_t, p_idx, lo);
+                let hi = b.ushl(bp, c1);
+                let left = b.uor(hi, lo);
+                let right = b.uor(left, half);
+                let l_bits = b.load_wg_u32(smem, left);
+                let r_bits = b.load_wg_u32(smem, right);
+                let l_val = b.bitcast(b.f32_t, l_bits);
+                let r_val = b.bitcast(b.f32_t, r_bits);
+                let sum_f = b.fadd_nc(l_val, r_val);
+                let diff_f = b.fsub_nc(l_val, r_val);
+                let sum_u = b.bitcast(b.u32_t, sum_f);
+                let diff_u = b.bitcast(b.u32_t, diff_f);
+                b.store_wg_u32(smem, left, sum_u);
+                b.store_wg_u32(smem, right, diff_u);
+            }
+            b.workgroup_barrier();
+            let next_half = b.ushl(half, c1);
+            b.store_var(half_var, next_half);
+        },
+    );
+
+    (cols, norm)
+}
+
+fn fused_q8k_subgroup_abs_max_shared(
+    b: &mut ShaderBuilder,
+    smem: u32,
+    lid: u32,
+    sub_lid: u32,
+    q8k_subwg: u32,
+    local_best: u32,
+    local_idx: u32,
+) -> u32 {
+    let c6 = b.const_u32(6);
+    let c256 = b.const_u32(HADAMARD_1024_WG_X);
+    let best_bits = b.bitcast(b.u32_t, local_best);
+    let idx_slot_base = b.uadd(c256, lid);
+    b.store_wg_u32(smem, lid, best_bits);
+    b.store_wg_u32(smem, idx_slot_base, local_idx);
+    b.workgroup_barrier();
+
+    for stride in [32_u32, 16, 8, 4, 2, 1] {
+        let sc = b.const_u32(stride);
+        let active = b.u_lt(sub_lid, sc);
+        b.emit_if(active, |b| {
+            let oth_val_slot = b.uadd(lid, sc);
+            let oth_idx_slot = b.uadd(idx_slot_base, sc);
+            let cur_bits = b.load_wg_u32(smem, lid);
+            let oth_bits = b.load_wg_u32(smem, oth_val_slot);
+            let cur_idx = b.load_wg_u32(smem, idx_slot_base);
+            let oth_idx = b.load_wg_u32(smem, oth_idx_slot);
+            let cur_f = b.bitcast(b.f32_t, cur_bits);
+            let oth_f = b.bitcast(b.f32_t, oth_bits);
+            let abs_c = b.f_abs(cur_f);
+            let abs_o = b.f_abs(oth_f);
+            let abs_gt = b.f_gt(abs_o, abs_c);
+            let abs_eq = b.f_eq(abs_o, abs_c);
+            let idx_lt = b.u_lt(oth_idx, cur_idx);
+            let eq_earlier = b.logical_and(abs_eq, idx_lt);
+            let take_oth = b.logical_or(abs_gt, eq_earlier);
+            let chosen_val = b.select(b.u32_t, take_oth, oth_bits, cur_bits);
+            let chosen_idx = b.select(b.u32_t, take_oth, oth_idx, cur_idx);
+            b.store_wg_u32(smem, lid, chosen_val);
+            b.store_wg_u32(smem, idx_slot_base, chosen_idx);
+        });
+        b.workgroup_barrier();
+    }
+
+    let group_head = b.ushl(q8k_subwg, c6);
+    let max_u32 = b.load_wg_u32(smem, group_head);
+    b.workgroup_barrier();
+    b.bitcast(b.f32_t, max_u32)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Quantizes four subgroup-partitioned 256-element FWHT blocks to 4-plane `Q8_K` after barrier."
+)]
+fn emit_fused_q8k_quant_phase(
+    b: &mut ShaderBuilder,
+    smem: u32,
+    out_buf: u32,
+    lid: u32,
+    blk1024: u32,
+    tok: u32,
+    cols: u32,
+    norm: u32,
+    pinned: bool,
+) {
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let c4 = b.const_u32(4);
+    let c5 = b.const_u32(5);
+    let c6 = b.const_u32(6);
+    let c7 = b.const_u32(7);
+    let c8 = b.const_u32(8);
+    let c12 = b.const_u32(12);
+    let c31 = b.const_u32(31);
+    let c34 = b.const_u32(34);
+    let c63 = b.const_u32(63);
+
+    let q8k_subwg = b.ushr(lid, c6);
+    let sub_lid = b.uand(lid, c63);
+    let sub_blk = b.ushr(sub_lid, c5);
+    let word_in_sub = b.uand(sub_lid, c31);
+    let word_j = b.ushr(word_in_sub, c2);
+    let digit = b.uand(word_in_sub, c3);
+    let sub_off = b.ushl(sub_blk, c7);
+    let word_off = b.ushl(word_j, c4);
+    let base_sw = b.uadd(sub_off, word_off);
+    let elem_local = b.uadd(base_sw, digit);
+
+    let subwg_off = b.ushl(q8k_subwg, c8);
+    let smem_e0 = b.uadd(subwg_off, elem_local);
+    let smem_e1 = b.uadd(smem_e0, c4);
+    let smem_e2 = b.uadd(smem_e0, c8);
+    let smem_e3 = b.uadd(smem_e0, c12);
+    let raw0_u = b.load_wg_u32(smem, smem_e0);
+    let raw1_u = b.load_wg_u32(smem, smem_e1);
+    let raw2_u = b.load_wg_u32(smem, smem_e2);
+    let raw3_u = b.load_wg_u32(smem, smem_e3);
+    let raw0 = b.bitcast(b.f32_t, raw0_u);
+    let raw1 = b.bitcast(b.f32_t, raw1_u);
+    let raw2 = b.bitcast(b.f32_t, raw2_u);
+    let raw3 = b.bitcast(b.f32_t, raw3_u);
+    let v0 = b.fmul_nc(raw0, norm);
+    let v1 = b.fmul_nc(raw1, norm);
+    let v2 = b.fmul_nc(raw2, norm);
+    let v3 = b.fmul_nc(raw3, norm);
+    b.workgroup_barrier();
+
+    let mut best_val = v0;
+    let mut best_idx = elem_local;
+    for (candidate, cand_off) in [(v1, c4), (v2, c8), (v3, c12)] {
+        let abs_b = b.f_abs(best_val);
+        let abs_c = b.f_abs(candidate);
+        let gt = b.f_gt(abs_c, abs_b);
+        best_val = b.select(b.f32_t, gt, candidate, best_val);
+        let cand_idx = b.uadd(elem_local, cand_off);
+        best_idx = b.select(b.u32_t, gt, cand_idx, best_idx);
+    }
+
+    let maximum =
+        fused_q8k_subgroup_abs_max_shared(b, smem, lid, sub_lid, q8k_subwg, best_val, best_idx);
+    let (is_zero, iscale, scale) = q8k_scale_from_max(b, maximum);
+
+    let q0 = quantize_one_q8k_lane(b, v0, iscale, is_zero, pinned);
+    let q1 = quantize_one_q8k_lane(b, v1, iscale, is_zero, pinned);
+    let q2 = quantize_one_q8k_lane(b, v2, iscale, is_zero, pinned);
+    let q3 = quantize_one_q8k_lane(b, v3, iscale, is_zero, pinned);
+    let packed = pack_four_i8_to_u32(b, [q0, q1, q2, q3]);
+
+    let blocks128_per_tok = b.ushr(cols, c7);
+    let tok_blk128_off = b.umul(tok, blocks128_per_tok);
+    let blk1024_x4 = b.ushl(blk1024, c2);
+    let blk256 = b.uadd(blk1024_x4, q8k_subwg);
+    let blk256_x2 = b.ushl(blk256, c1);
+    let blk128_in_tok = b.uadd(blk256_x2, sub_blk);
+    let blk128_idx = b.uadd(tok_blk128_off, blk128_in_tok);
+    let out_blk_base = b.umul(blk128_idx, c34);
+    let plane_off = b.uadd(c2, word_in_sub);
+    let plane_dst = b.uadd(out_blk_base, plane_off);
+    b.store_sb_u32(out_buf, plane_dst, packed);
+
+    reduce_and_store_q8k_header(
+        b,
+        smem,
+        lid,
+        word_in_sub,
+        [q0, q1, q2, q3],
+        out_buf,
+        out_blk_base,
+        scale,
+    );
+}
+
+/// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8K_4plane` SPIR-V 1.6 words.
+///
+/// Uses `local_size_x = 256` with a single `4 KiB` `[u32; 1024]` workgroup buffer; leaves read-only
+/// `in_f32` unmodified so active `LoRA` adapters consume exact unrotated activations.
+/// Bindings: `0` read-only `in_f32` (`f32`), `1` read-only `sign_f32` (`f32`),
+/// `2` writable `q8k_4plane` (`u32`).
+/// Push constants (`7 × u32`): `[cols, norm_bits, has_signs, use_permute, num_k_heads, repetitions, head_dim]`.
+/// Dispatch: `(cols / 1024, tokens, 1)`.
+#[must_use]
+pub fn fused_basis_hadamard1024_q8k_4plane(pinned: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 7);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let sign_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::U32, AccessMode::ReadWrite);
+    let smem = b.workgroup_u32_array(1024);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let blk1024 = b.load_input_component(wid_vec, 0);
+    let tok = b.load_input_component(wid_vec, 1);
+
+    let (cols, norm) = emit_fused_basis_hadamard1024_smem_fwht(
+        &mut b, in_buf, sign_buf, smem, lid, blk1024, tok, push_var,
+    );
+    emit_fused_q8k_quant_phase(&mut b, smem, out_buf, lid, blk1024, tok, cols, norm, pinned);
+
+    b.finish_with_local_size([HADAMARD_1024_WG_X, 1, 1])
+}
+
+/// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8_0` SPIR-V 1.6 words.
+///
+/// Uses `local_size_x = 256` (`8` threads per `Q8_0` 32-element block, `32` blocks per `1024` block).
+/// Bindings: `0` read-only `in_f32` (`f32`), `1` read-only `sign_f32` (`f32`),
+/// `2` writable `out_q8` (`u32`).
+/// Push constants (`7 × u32`): `[cols, norm_bits, has_signs, use_permute, num_k_heads, repetitions, head_dim]`.
+/// Dispatch: `(cols / 1024, tokens, 1)`.
+#[must_use]
+pub fn fused_basis_hadamard1024_q8_0(pinned: bool, native_scale: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 7);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let sign_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::U32, AccessMode::ReadWrite);
+    let smem = b.workgroup_u32_array(1024);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let blk1024 = b.load_input_component(wid_vec, 0);
+    let tok = b.load_input_component(wid_vec, 1);
+
+    let (cols, norm) = emit_fused_basis_hadamard1024_smem_fwht(
+        &mut b, in_buf, sign_buf, smem, lid, blk1024, tok, push_var,
+    );
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let c5 = b.const_u32(5);
+    let c7 = b.const_u32(7);
+    let c9 = b.const_u32(9);
+
+    let elem_base = b.ushl(lid, c2);
+    let mut vals = [0_u32; 4];
+    let mut abs_vals = [0_u32; 4];
+    for i in 0_u32..4 {
+        let idx_c = b.const_u32(i);
+        let s_idx = b.uadd(elem_base, idx_c);
+        let s_bits = b.load_wg_u32(smem, s_idx);
+        let raw = b.bitcast(b.f32_t, s_bits);
+        let val = b.fmul_nc(raw, norm);
+        let av = b.f_abs(val);
+        let i_us = usize::try_from(i).unwrap_or(0);
+        vals[i_us] = val;
+        abs_vals[i_us] = av;
+    }
+    b.workgroup_barrier();
+
+    let max01 = b.f_max(abs_vals[0], abs_vals[1]);
+    let max23 = b.f_max(abs_vals[2], abs_vals[3]);
+    let local_max = b.f_max(max01, max23);
+    let local_max_u = b.bitcast(b.u32_t, local_max);
+    b.store_wg_u32(smem, lid, local_max_u);
+    b.workgroup_barrier();
+
+    let q8_blk_local = b.ushr(lid, c3);
+    let lane_w = b.uand(lid, c7);
+    for stride in [4_u32, 2, 1] {
+        let sc = b.const_u32(stride);
+        let active = b.u_lt(lane_w, sc);
+        b.emit_if(active, |b| {
+            let oth_slot = b.uadd(lid, sc);
+            let cur_u = b.load_wg_u32(smem, lid);
+            let oth_u = b.load_wg_u32(smem, oth_slot);
+            let cur_f = b.bitcast(b.f32_t, cur_u);
+            let oth_f = b.bitcast(b.f32_t, oth_u);
+            let mx = b.f_max(cur_f, oth_f);
+            let mx_u = b.bitcast(b.u32_t, mx);
+            b.store_wg_u32(smem, lid, mx_u);
+        });
+        b.workgroup_barrier();
+    }
+
+    let grp_head = b.ushl(q8_blk_local, c3);
+    let max_u = b.load_wg_u32(smem, grp_head);
+    let maximum = b.bitcast(b.f32_t, max_u);
+    let (scale_bits, inv_scale, zero_blk) = emit_q8_0_scale_and_inv(&mut b, maximum, native_scale);
+
+    let mut qs = [0_u32; 4];
+    for i in 0..4 {
+        qs[i] = emit_quantize_q8_0_lane(&mut b, vals[i], inv_scale, zero_blk, pinned);
+    }
+    let packed = pack_four_i8_to_u32(&mut b, qs);
+
+    let blks32_per_tok = b.ushr(cols, c5);
+    let tok_blk32_off = b.umul(tok, blks32_per_tok);
+    let blk1024_blks = b.ushl(blk1024, c5);
+    let blk32_in_tok = b.uadd(blk1024_blks, q8_blk_local);
+    let total_blk = b.uadd(tok_blk32_off, blk32_in_tok);
+    let out_blk_base = b.umul(total_blk, c9);
+    let dst_word_off = b.uadd(c1, lane_w);
+    let dst_word = b.uadd(out_blk_base, dst_word_off);
+    b.store_sb_u32(out_buf, dst_word, packed);
+
+    let is_head = b.u_eq(lane_w, c0);
+    b.emit_if(is_head, |b| {
+        b.store_sb_u32(out_buf, out_blk_base, scale_bits);
+    });
+
+    b.finish_with_local_size([HADAMARD_1024_WG_X, 1, 1])
+}
+
 fn vector_exp_spirv(b: &mut ShaderBuilder, value: u32) -> u32 {
     let f_zero = b.const_f32(0.0);
     let magic = b.const_f32(12_582_912.0);
@@ -6213,6 +6625,69 @@ pub fn kv_unpack_f16_to_f32() -> Vec<u32> {
     b.finish()
 }
 
+fn emit_q8_0_scale_and_inv(
+    b: &mut ShaderBuilder,
+    maximum: u32,
+    native_scale: bool,
+) -> (u32, u32, u32) {
+    let f_zero = b.const_f32(0.0);
+    let f_one = b.const_f32(1.0);
+    let f_127 = b.const_f32(127.0);
+    let d = if native_scale {
+        let c_inv127 = b.const_f32(f32::from_bits(0x3c01_0204));
+        b.fmul_nc(maximum, c_inv127)
+    } else {
+        b.fdiv(maximum, f_127)
+    };
+    let scale = b.round_f16(d);
+    let scale_u32 = b.bitcast(b.u32_t, scale);
+
+    let zero_blk = b.f_eq(d, f_zero);
+    let safe_denom = b.select(
+        b.f32_t,
+        zero_blk,
+        f_one,
+        if native_scale { maximum } else { d },
+    );
+    let numer = if native_scale { f_127 } else { f_one };
+    let inv_cand = b.fdiv(numer, safe_denom);
+    let inv_scale = b.select(b.f32_t, zero_blk, f_zero, inv_cand);
+    (scale_u32, inv_scale, zero_blk)
+}
+
+fn emit_quantize_q8_0_lane(
+    b: &mut ShaderBuilder,
+    v: u32,
+    inv_scale: u32,
+    zero_blk: u32,
+    pinned: bool,
+) -> u32 {
+    if pinned {
+        quantize_one_q8k_lane(b, v, inv_scale, zero_blk, false)
+    } else {
+        let f_zero = b.const_f32(0.0);
+        let f_half = b.const_f32(0.5);
+        let f_one = b.const_f32(1.0);
+        let i_zero = b.const_i32(0);
+        let i_min = b.const_i32(-127);
+        let i_max = b.const_i32(127);
+        let prod = b.fmul_nc(v, inv_scale);
+        let ax = b.f_abs(prod);
+        let fl = b.f_floor(ax);
+        let frac = b.fsub_nc(ax, fl);
+        let up = b.f_ge(frac, f_half);
+        let add_bit = b.select(b.f32_t, up, f_one, f_zero);
+        let mag_f = b.fadd_nc(fl, add_bit);
+        let mag_i = b.f32_to_i32(mag_f);
+        let neg_i = b.isub(i_zero, mag_i);
+        let is_neg = b.f_lt(prod, f_zero);
+        let signed_q = b.select(b.i32_t, is_neg, neg_i, mag_i);
+        let q_lo = b.s_max(signed_q, i_min);
+        let q_clamped = b.s_min(q_lo, i_max);
+        b.select(b.i32_t, zero_blk, i_zero, q_clamped)
+    }
+}
+
 fn emit_quantize_q8_0_block(
     b: &mut ShaderBuilder,
     in_buf: u32,
@@ -6226,12 +6701,6 @@ fn emit_quantize_q8_0_block(
     let c9 = b.const_u32(9);
     let c32 = b.const_u32(32);
     let f_zero = b.const_f32(0.0);
-    let f_half = b.const_f32(0.5);
-    let f_one = b.const_f32(1.0);
-    let f_127 = b.const_f32(127.0);
-    let i_zero = b.const_i32(0);
-    let i_min = b.const_i32(-127);
-    let i_max = b.const_i32(127);
 
     let in_base = b.umul(blk, c32);
     let out_base = b.umul(blk, c9);
@@ -6247,26 +6716,8 @@ fn emit_quantize_q8_0_block(
         b.store_var(max_var, mx);
     });
     let maximum = b.load_var_f32(max_var);
-    let d = if native_scale {
-        let c_inv127 = b.const_f32(f32::from_bits(0x3c01_0204));
-        b.fmul_nc(maximum, c_inv127)
-    } else {
-        b.fdiv(maximum, f_127)
-    };
-    let scale = b.round_f16(d);
-    let scale_u32 = b.bitcast(b.u32_t, scale);
+    let (scale_u32, inv_scale, zero_blk) = emit_q8_0_scale_and_inv(b, maximum, native_scale);
     b.store_sb_u32(out_buf, out_base, scale_u32);
-
-    let zero_blk = b.f_eq(d, f_zero);
-    let safe_denom = b.select(
-        b.f32_t,
-        zero_blk,
-        f_one,
-        if native_scale { maximum } else { d },
-    );
-    let numer = if native_scale { f_127 } else { f_one };
-    let inv_cand = b.fdiv(numer, safe_denom);
-    let inv_scale = b.select(b.f32_t, zero_blk, f_zero, inv_cand);
 
     for w_j in 0_u32..8 {
         let mut qs = [0_u32; 4];
@@ -6274,25 +6725,8 @@ fn emit_quantize_q8_0_block(
             let elem_off = b.const_u32(w_j * 4 + lane);
             let elem_idx = b.uadd(in_base, elem_off);
             let v = b.load_sb_f32(in_buf, elem_idx);
-            let q = if pinned {
-                quantize_one_q8k_lane(b, v, inv_scale, zero_blk, false)
-            } else {
-                let prod = b.fmul_nc(v, inv_scale);
-                let ax = b.f_abs(prod);
-                let fl = b.f_floor(ax);
-                let frac = b.fsub_nc(ax, fl);
-                let up = b.f_ge(frac, f_half);
-                let add_bit = b.select(b.f32_t, up, f_one, f_zero);
-                let mag_f = b.fadd_nc(fl, add_bit);
-                let mag_i = b.f32_to_i32(mag_f);
-                let neg_i = b.isub(i_zero, mag_i);
-                let is_neg = b.f_lt(prod, f_zero);
-                let signed_q = b.select(b.i32_t, is_neg, neg_i, mag_i);
-                let q_lo = b.s_max(signed_q, i_min);
-                let q_clamped = b.s_min(q_lo, i_max);
-                b.select(b.i32_t, zero_blk, i_zero, q_clamped)
-            };
-            qs[usize::try_from(lane).unwrap_or(0)] = q;
+            qs[usize::try_from(lane).unwrap_or(0)] =
+                emit_quantize_q8_0_lane(b, v, inv_scale, zero_blk, pinned);
         }
         let packed = pack_four_i8_to_u32(b, qs);
         let dst_off = b.const_u32(1 + w_j);
@@ -7480,6 +7914,11 @@ mod tests {
             quantize_f32_to_q8_0_batched(false, false),
             quantize_f32_to_q8_0_batched(true, false),
             quantize_f32_to_q8_0_batched(true, true),
+            fused_basis_hadamard1024_q8k_4plane(false),
+            fused_basis_hadamard1024_q8k_4plane(true),
+            fused_basis_hadamard1024_q8_0(false, false),
+            fused_basis_hadamard1024_q8_0(true, false),
+            fused_basis_hadamard1024_q8_0(true, true),
             ffn_swiglu_f32(false),
             ffn_swiglu_f32(true),
             ffn_hadamard_f32(),

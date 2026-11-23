@@ -768,12 +768,12 @@ pub(super) const fn supports_hexagon_native_q2_representation(
     representation: bonsai_prism_runtime::model::swift::Representation,
 ) -> bool {
     match representation {
-        bonsai_prism_runtime::model::swift::Representation::Pq2 => true,
-        // `NativeQ2Executor`, `NativeQ2ArenaCache`, and `plan_native_q2_layers_for_budget`
-        // already support `PTQ1_KIND` (143) via `supports_f32`, but non-server runtime crates
-        // (`src/graph.rs`, `src/kernels/projection.rs`, `src/graph/prefill.rs`,
-        // `src/graph/projection.rs`) currently restrict `supports_f32` dispatch to `PQ2` (142).
-        bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1 => false,
+        bonsai_prism_runtime::model::swift::Representation::Pq2
+        // `NativeQ2Executor`, `NativeQ2ArenaCache`, `plan_native_q2_layers_for_budget`,
+        // and `supports_f32` runtime dispatch (`src/graph.rs`, `src/kernels/projection.rs`,
+        // `src/graph/prefill.rs`, `src/graph/projection.rs`) all admit both `PQ2` (142) and
+        // `PTQ1_0` (143).
+        | bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1 => true,
     }
 }
 
@@ -1170,6 +1170,9 @@ fn install_default_hexagon_executor(
         *slot = Some(executor);
     });
     session.set_projection_executor(Some(Box::new(WorkerThreadHexagonExecutor)));
+    if session.cpu_prefill().is_none() {
+        let _ = session.release_executor_resident_host_weights();
+    }
     Some(startup)
 }
 
@@ -1299,6 +1302,9 @@ fn install_composite_executor(
             *slot = Some(composite);
         });
         session.set_projection_executor(Some(Box::new(WorkerThreadCompositeExecutor { identity })));
+        if session.cpu_prefill().is_none() {
+            let _ = session.release_executor_resident_host_weights();
+        }
         Ok(startup)
     }
     #[cfg(not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")))]

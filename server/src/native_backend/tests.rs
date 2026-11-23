@@ -2755,7 +2755,7 @@ fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
     assert!(worker::supports_hexagon_native_q2_representation(
         Representation::Pq2
     ));
-    assert!(!worker::supports_hexagon_native_q2_representation(
+    assert!(worker::supports_hexagon_native_q2_representation(
         Representation::CurrentRepackedPtq1
     ));
 

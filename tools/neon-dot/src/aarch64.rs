@@ -771,6 +771,10 @@ fn dot_pq2_eight_consumption_dotprod(
 }
 
 /// All extents and activation scales were checked by the safe parent boundary.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keeps octet scale validation and register-resident accumulation together."
+)]
 #[target_feature(enable = "neon,dotprod")]
 fn pq2_scaled_rows<const ROWS: usize, const FUSED: bool>(
     rows: [&[u8]; ROWS],
@@ -2104,24 +2108,46 @@ fn dot_pq2_4x4_stream_i8mm(
 }
 
 #[inline]
-#[target_feature(enable = "neon,i8mm")]
-fn accumulate_pq2_half_4x8_i8mm(
+#[target_feature(enable = "neon")]
+fn unpack_pq2_paired_plane(
     raw_rows: [uint8x16_t; 4],
+    plane: usize,
+    mask: uint8x16_t,
+) -> (int8x16_t, int8x16_t, int8x16_t, int8x16_t) {
+    let w0 = unpack_pq2_plane_s8(raw_rows[0], plane, mask);
+    let w1 = unpack_pq2_plane_s8(raw_rows[1], plane, mask);
+    let w2 = unpack_pq2_plane_s8(raw_rows[2], plane, mask);
+    let w3 = unpack_pq2_plane_s8(raw_rows[3], plane, mask);
+    let (w01_lo, w01_hi) = pair_s8_lo_hi(w0, w1);
+    let (w23_lo, w23_hi) = pair_s8_lo_hi(w2, w3);
+    (w01_lo, w01_hi, w23_lo, w23_hi)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn unpack_pq2_paired_half(
+    raw_rows: [uint8x16_t; 4],
+    mask: uint8x16_t,
+) -> [(int8x16_t, int8x16_t, int8x16_t, int8x16_t); 4] {
+    [
+        unpack_pq2_paired_plane(raw_rows, 0, mask),
+        unpack_pq2_paired_plane(raw_rows, 1, mask),
+        unpack_pq2_paired_plane(raw_rows, 2, mask),
+        unpack_pq2_paired_plane(raw_rows, 3, mask),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "neon,i8mm")]
+fn accumulate_pq2_paired_half_4x8_i8mm(
+    w_planes: &[(int8x16_t, int8x16_t, int8x16_t, int8x16_t); 4],
     planes: [&[i8; 128]; 8],
     half: usize,
-    mask: uint8x16_t,
     acc_lo: &mut [int32x4_t; 4],
     acc_hi: &mut [int32x4_t; 4],
 ) {
     let plane_base = half * 4;
-    for plane in 0..4 {
-        let w0 = unpack_pq2_plane_s8(raw_rows[0], plane, mask);
-        let w1 = unpack_pq2_plane_s8(raw_rows[1], plane, mask);
-        let w2 = unpack_pq2_plane_s8(raw_rows[2], plane, mask);
-        let w3 = unpack_pq2_plane_s8(raw_rows[3], plane, mask);
-        let (w01_lo, w01_hi) = pair_s8_lo_hi(w0, w1);
-        let (w23_lo, w23_hi) = pair_s8_lo_hi(w2, w3);
-
+    for (plane, &(w01_lo, w01_hi, w23_lo, w23_hi)) in w_planes.iter().enumerate() {
         let chunk = plane_base + plane;
         let (a01_lo, a01_hi) =
             pair_s8_lo_hi(plane_s8x16(planes[0], chunk), plane_s8x16(planes[1], chunk));
@@ -2141,6 +2167,20 @@ fn accumulate_pq2_half_4x8_i8mm(
         acc_hi[2] = smmla_s32(smmla_s32(acc_hi[2], w23_lo, b01_lo), w23_hi, b01_hi);
         acc_hi[3] = smmla_s32(smmla_s32(acc_hi[3], w23_lo, b23_lo), w23_hi, b23_hi);
     }
+}
+
+#[inline]
+#[target_feature(enable = "neon,i8mm")]
+fn accumulate_pq2_half_4x8_i8mm(
+    raw_rows: [uint8x16_t; 4],
+    planes: [&[i8; 128]; 8],
+    half: usize,
+    mask: uint8x16_t,
+    acc_lo: &mut [int32x4_t; 4],
+    acc_hi: &mut [int32x4_t; 4],
+) {
+    let w_planes = unpack_pq2_paired_half(raw_rows, mask);
+    accumulate_pq2_paired_half_4x8_i8mm(&w_planes, planes, half, acc_lo, acc_hi);
 }
 
 #[inline]
@@ -2659,6 +2699,7 @@ fn dot_scaled_8x8_chunks_i8mm<const FUSED: bool>(
     let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
 
     for block_idx in 0..block_count {
+        prefetch_row_blocks(&row_chunks, block_idx, block_count);
         let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
         let row_scales = widen_row_scales_f16(&blocks)?;
 
@@ -2668,8 +2709,8 @@ fn dot_scaled_8x8_chunks_i8mm<const FUSED: bool>(
             let (r1_h0, r1_h1) = load_pq2_block_halves(blocks[rbase + 1]);
             let (r2_h0, r2_h1) = load_pq2_block_halves(blocks[rbase + 2]);
             let (r3_h0, r3_h1) = load_pq2_block_halves(blocks[rbase + 3]);
-            let raw_h0 = [r0_h0, r1_h0, r2_h0, r3_h0];
-            let raw_h1 = [r0_h1, r1_h1, r2_h1, r3_h1];
+            let w_h0 = unpack_pq2_paired_half([r0_h0, r1_h0, r2_h0, r3_h0], mask);
+            let w_h1 = unpack_pq2_paired_half([r0_h1, r1_h1, r2_h1, r3_h1], mask);
             for (chunk, out_chunk) in chunks.iter().zip(outputs.iter_mut()) {
                 let a = [
                     &chunk[0][block_idx],
@@ -2695,8 +2736,8 @@ fn dot_scaled_8x8_chunks_i8mm<const FUSED: bool>(
                 let sums_hi = load_s32x4(&[a[4].sum, a[5].sum, a[6].sum, a[7].sum]);
                 let mut acc_lo = [vdupq_n_s32(0); 4];
                 let mut acc_hi = [vdupq_n_s32(0); 4];
-                accumulate_pq2_half_4x8_i8mm(raw_h0, planes, 0, mask, &mut acc_lo, &mut acc_hi);
-                accumulate_pq2_half_4x8_i8mm(raw_h1, planes, 1, mask, &mut acc_lo, &mut acc_hi);
+                accumulate_pq2_paired_half_4x8_i8mm(&w_h0, planes, 0, &mut acc_lo, &mut acc_hi);
+                accumulate_pq2_paired_half_4x8_i8mm(&w_h1, planes, 1, &mut acc_lo, &mut acc_hi);
 
                 let scales_lo_arr = [a[0].scale, a[1].scale, a[2].scale, a[3].scale];
                 let scales_hi_arr = [a[4].scale, a[5].scale, a[6].scale, a[7].scale];
@@ -2746,6 +2787,7 @@ fn dot_scaled_8x8_chunks_dotprod<const FUSED: bool>(
     let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
 
     for block_idx in 0..block_count {
+        prefetch_row_blocks(&row_chunks, block_idx, block_count);
         let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
         let row_scales = widen_row_scales_f16(&blocks)?;
 
@@ -4350,38 +4392,32 @@ fn ptq1_scaled_rows_dotprod<const ROWS: usize, const PINNED: bool, A: super::Q8A
             }
             let blocks: [&[u8; 28]; ROWS] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
             let row_scales = ptq1_validate_row_scales(&blocks)?;
-            if ROWS <= 8 {
-                let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
-                let a_scales: [f32; 4] = std::array::from_fn(|g| act_groups[g].scale());
-                let a_pairs: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|g| {
-                    let ah = act_groups[g].values().as_chunks::<16>().0;
-                    (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
-                });
-                for (r, (&block, &rs)) in blocks.iter().zip(row_scales.iter()).enumerate() {
+            let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
+            let a_scales: [f32; 4] = std::array::from_fn(|g| act_groups[g].scale());
+            let a_pairs: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|g| {
+                let ah = act_groups[g].values().as_chunks::<16>().0;
+                (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
+            });
+            for ((block_half, scale_half), lane_half) in blocks
+                .chunks(8)
+                .zip(row_scales.chunks(8))
+                .zip(lanes.chunks_mut(8))
+            {
+                for ((&block, &rs), lane_slot) in block_half
+                    .iter()
+                    .zip(scale_half.iter())
+                    .zip(lane_half.iter_mut())
+                {
                     let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(block);
                     let s0 = sdot32_vec(t0, t1, a_pairs[0].0, a_pairs[0].1);
                     let mut lane =
-                        vfmaq_f32(lanes[r], vcvtq_f32_s32(s0), vdupq_n_f32(rs * a_scales[0]));
+                        vfmaq_f32(*lane_slot, vcvtq_f32_s32(s0), vdupq_n_f32(rs * a_scales[0]));
                     let s1 = sdot32_vec(t2, t3, a_pairs[1].0, a_pairs[1].1);
                     lane = vfmaq_f32(lane, vcvtq_f32_s32(s1), vdupq_n_f32(rs * a_scales[1]));
                     let s2 = sdot32_vec(t4, t5, a_pairs[2].0, a_pairs[2].1);
                     lane = vfmaq_f32(lane, vcvtq_f32_s32(s2), vdupq_n_f32(rs * a_scales[2]));
                     let s3 = sdot32_vec(t6, t7, a_pairs[3].0, a_pairs[3].1);
-                    lanes[r] = vfmaq_f32(lane, vcvtq_f32_s32(s3), vdupq_n_f32(rs * a_scales[3]));
-                }
-            } else {
-                for group in 0..4 {
-                    let act = &activation[block_idx * 4 + group];
-                    let ah = act.values().as_chunks::<16>().0;
-                    let a0 = load_s8x16(&ah[0]);
-                    let a1 = load_s8x16(&ah[1]);
-                    let a_scale = act.scale();
-                    for (r, (&block, &rs)) in blocks.iter().zip(row_scales.iter()).enumerate() {
-                        let (w0, w1) = unpack_ptq1_group(block, group);
-                        let sdot = sdot32_vec(w0, w1, a0, a1);
-                        lanes[r] =
-                            vfmaq_f32(lanes[r], vcvtq_f32_s32(sdot), vdupq_n_f32(rs * a_scale));
-                    }
+                    *lane_slot = vfmaq_f32(lane, vcvtq_f32_s32(s3), vdupq_n_f32(rs * a_scales[3]));
                 }
             }
         }
@@ -4824,61 +4860,145 @@ pub(super) fn ptq1_detected_dot_scaled_8x_tokens<const PINNED: bool, A: super::Q
     }
 }
 
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn ptq1_pinned_quad_k_tile<A: super::Q8ActivationView>(
+    half_trits: &[[[int8x16_t; 8]; 4]],
+    half_scales: &[[f32; 4]],
+    tok_quad: [&[A]; 4],
+    k_base: usize,
+    mut acc: [[core::arch::aarch64::float32x4_t; 4]; 4],
+) -> [[core::arch::aarch64::float32x4_t; 4]; 4] {
+    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32};
+
+    for (k_off, (block_trits, rs)) in half_trits.iter().zip(half_scales).enumerate() {
+        let act_base = (k_base + k_off) * 4;
+        for group in 0..4 {
+            let act_idx = act_base + group;
+            let a_scales = [
+                tok_quad[0][act_idx].scale(),
+                tok_quad[1][act_idx].scale(),
+                tok_quad[2][act_idx].scale(),
+                tok_quad[3][act_idx].scale(),
+            ];
+            let a_pairs: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|t| {
+                let ah = tok_quad[t][act_idx].values().as_chunks::<16>().0;
+                (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
+            });
+            for (r, (&row_rs, row_trits)) in rs.iter().zip(block_trits.iter()).enumerate() {
+                let w0 = row_trits[group * 2];
+                let w1 = row_trits[group * 2 + 1];
+                for t in 0..4 {
+                    let sdot = sdot32_vec(w0, w1, a_pairs[t].0, a_pairs[t].1);
+                    acc[r][t] = vfmaq_f32(
+                        acc[r][t],
+                        vcvtq_f32_s32(sdot),
+                        vdupq_n_f32(row_rs * a_scales[t]),
+                    );
+                }
+            }
+        }
+    }
+    acc
+}
+
 #[target_feature(enable = "neon,dotprod")]
 fn ptq1_scaled_8x8_chunks_pinned_dotprod<const CHUNKS: usize, A: super::Q8ActivationView>(
     rows: [&[u8]; 8],
     chunks: &[[&[A]; 8]],
     outputs: &mut [[[f32; 8]; 8]],
 ) -> Option<()> {
-    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32};
+    use core::arch::aarch64::{vdupq_n_f32, vdupq_n_s8};
 
+    const K_TILE: usize = 8;
     let row_chunks = rows.map(|row| row.as_chunks::<28>().0);
     let block_count = row_chunks[0].len();
     let mut lanes = [[[[0.0_f32; 4]; 8]; 8]; CHUNKS];
+    let mut out_buf = [[[0.0_f32; 8]; 8]; CHUNKS];
 
-    for block_idx in 0..block_count {
-        prefetch_row_blocks(&row_chunks, block_idx, block_count);
-        let blocks: [&[u8; 28]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
-        let row_scales = ptq1_validate_row_scales(&blocks)?;
-        let act_base = block_idx * 4;
-        for (r, (&block, &rs)) in blocks.iter().zip(row_scales.iter()).enumerate() {
-            let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(block);
-            let pairs = [(t0, t1), (t2, t3), (t4, t5), (t6, t7)];
+    for k_base in (0..block_count).step_by(K_TILE) {
+        let tile_len = (block_count - k_base).min(K_TILE);
+        let is_first = k_base == 0;
+        let is_last = k_base + tile_len == block_count;
+
+        let mut scales_lo = [[0.0_f32; 4]; K_TILE];
+        let mut scales_hi = [[0.0_f32; 4]; K_TILE];
+        for k_off in 0..tile_len {
+            let block_idx = k_base + k_off;
+            prefetch_row_blocks(&row_chunks, block_idx, block_count);
+            let blocks: [&[u8; 28]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
+            let row_scales = ptq1_validate_row_scales(&blocks)?;
+            scales_lo[k_off] = [row_scales[0], row_scales[1], row_scales[2], row_scales[3]];
+            scales_hi[k_off] = [row_scales[4], row_scales[5], row_scales[6], row_scales[7]];
+        }
+
+        for row_half in 0..2 {
+            let rbase = row_half * 4;
+            let half_scales = if row_half == 0 {
+                &scales_lo[..tile_len]
+            } else {
+                &scales_hi[..tile_len]
+            };
+            let mut half_trits = [[[vdupq_n_s8(0); 8]; 4]; K_TILE];
+            for (k_off, dst_block) in half_trits.iter_mut().take(tile_len).enumerate() {
+                let block_idx = k_base + k_off;
+                for (r, dst_row) in dst_block.iter_mut().enumerate() {
+                    *dst_row = unpack_ptq1_vectors(&row_chunks[rbase + r][block_idx]);
+                }
+            }
+
             for (chunk_idx, chunk) in chunks.iter().take(CHUNKS).enumerate() {
-                let mut acc: [core::arch::aarch64::float32x4_t; 8] =
-                    std::array::from_fn(|t| load_f32x4_neon(&lanes[chunk_idx][r][t]));
-                for (group, &(w0, w1)) in pairs.iter().enumerate() {
-                    let act_idx = act_base + group;
-                    for (t, acc_slot) in acc.iter_mut().enumerate() {
-                        let act = &chunk[t][act_idx];
-                        let ah = act.values().as_chunks::<16>().0;
-                        let sdot = sdot32_vec(w0, w1, load_s8x16(&ah[0]), load_s8x16(&ah[1]));
-                        *acc_slot = vfmaq_f32(
-                            *acc_slot,
-                            vcvtq_f32_s32(sdot),
-                            vdupq_n_f32(rs * act.scale()),
-                        );
+                for tok_half in 0..2 {
+                    let tbase = tok_half * 4;
+                    let tok_quad = [
+                        chunk[tbase],
+                        chunk[tbase + 1],
+                        chunk[tbase + 2],
+                        chunk[tbase + 3],
+                    ];
+                    let acc_init = if is_first {
+                        [[vdupq_n_f32(0.0); 4]; 4]
+                    } else {
+                        std::array::from_fn(|r| {
+                            std::array::from_fn(|t| {
+                                load_f32x4_neon(&lanes[chunk_idx][rbase + r][tbase + t])
+                            })
+                        })
+                    };
+                    let acc = ptq1_pinned_quad_k_tile(
+                        &half_trits[..tile_len],
+                        half_scales,
+                        tok_quad,
+                        k_base,
+                        acc_init,
+                    );
+                    if is_last {
+                        for r in 0..4 {
+                            for t in 0..4 {
+                                let mut l = [0.0_f32; 4];
+                                store_f32x4_neon(acc[r][t], &mut l);
+                                let val = (l[0] + l[1]) + (l[2] + l[3]);
+                                if !val.is_finite() {
+                                    return None;
+                                }
+                                out_buf[chunk_idx][rbase + r][tbase + t] = val;
+                            }
+                        }
+                    } else {
+                        for r in 0..4 {
+                            for t in 0..4 {
+                                store_f32x4_neon(
+                                    acc[r][t],
+                                    &mut lanes[chunk_idx][rbase + r][tbase + t],
+                                );
+                            }
+                        }
                     }
                 }
-                for (t, acc_vec) in acc.into_iter().enumerate() {
-                    store_f32x4_neon(acc_vec, &mut lanes[chunk_idx][r][t]);
-                }
             }
         }
     }
 
-    let mut out_buf = [[[0.0_f32; 8]; 8]; CHUNKS];
-    for (chunk_lanes, chunk_out) in lanes.iter().zip(out_buf.iter_mut()) {
-        for (row_lanes, row_out) in chunk_lanes.iter().zip(chunk_out.iter_mut()) {
-            for (l, dst) in row_lanes.iter().zip(row_out.iter_mut()) {
-                let val = (l[0] + l[1]) + (l[2] + l[3]);
-                if !val.is_finite() {
-                    return None;
-                }
-                *dst = val;
-            }
-        }
-    }
     for (dst, src) in outputs.iter_mut().zip(out_buf.iter()) {
         *dst = *src;
     }

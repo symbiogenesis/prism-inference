@@ -1505,6 +1505,16 @@ impl SwiftSession {
         self.runtime.set_projection_executor(executor);
     }
 
+    /// Release file-mapped host backing bytes on layer weights already claimed
+    /// and resident on the installed projection executor.
+    ///
+    /// # Errors
+    /// Refuses when no projection executor is installed or when CPU tiled prefill
+    /// is configured, since tiled prefill still reads host weights.
+    pub fn release_executor_resident_host_weights(&mut self) -> Result<usize> {
+        self.runtime.release_executor_resident_host_weights()
+    }
+
     /// Installed projection executor identity, absent for ordinary CPU execution.
     ///
     /// This describes installation, not device execution or qualification.
@@ -3277,6 +3287,9 @@ mod tests {
 
         let method: fn(&SwiftSession) -> &'static str = SwiftSession::model_identity;
         let _ = method;
+        let release_method: fn(&mut SwiftSession) -> Result<usize> =
+            SwiftSession::release_executor_resident_host_weights;
+        let _ = release_method;
         assert_eq!(Representation::Pq2.model_sha256(), MODEL_SHA256);
         assert_eq!(
             Representation::CurrentRepackedPtq1.model_sha256(),

@@ -1901,7 +1901,7 @@ impl Transforms {
             return false;
         };
         let columns = weight.dimensions.first().copied().unwrap_or(0);
-        (weight.kind == crate::kernels::PQ2
+        (matches!(weight.kind, crate::kernels::PQ2 | crate::kernels::PTQ1)
             && columns.is_multiple_of(128)
             && executor.supports_f32(weight))
             || (weight.kind == crate::kernels::PQ2
@@ -1973,11 +1973,13 @@ impl Transforms {
                                     .matvec
                                     .shares_contract(weights[index], weight)
                                     .unwrap_or(false)
-                                || (weight.kind == crate::kernels::PQ2
-                                    && weight
-                                        .dimensions
-                                        .first()
-                                        .is_some_and(|&cols| cols.is_multiple_of(128))
+                                || (matches!(
+                                    weight.kind,
+                                    crate::kernels::PQ2 | crate::kernels::PTQ1
+                                ) && weight
+                                    .dimensions
+                                    .first()
+                                    .is_some_and(|&cols| cols.is_multiple_of(128))
                                     && exec.supports_f32(weight))
                         })
                 });
@@ -1997,17 +1999,41 @@ impl Transforms {
                             && prepared.is_compatible(w).unwrap_or(false)
                     })
                     .count();
-                if group_len >= 2
-                    && skip_cpu_quantization
+                let f32_batch_len = if skip_cpu_quantization && let Some(exec) = executor.as_deref()
+                {
+                    let mixed_len = weights[index..]
+                        .iter()
+                        .enumerate()
+                        .take_while(|&(offset, w)| {
+                            !completed[index + offset]
+                                && self.basis(w) == basis
+                                && prepared.is_f32_executor_compatible(w).unwrap_or(false)
+                                && exec.supports_f32(w)
+                        })
+                        .count();
+                    if mixed_len >= 2 && exec.supports_f32_group(&weights[index..index + mixed_len])
+                    {
+                        mixed_len
+                    } else if group_len >= 2
+                        && group_len != mixed_len
+                        && exec.supports_f32_group(&weights[index..index + group_len])
+                    {
+                        group_len
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                if f32_batch_len >= 2
                     && let Some(executor) = executor.as_deref_mut()
-                    && executor.supports_f32_group(&weights[index..index + group_len])
                 {
                     prepared.matvec_group_with_executor(
-                        &weights[index..index + group_len],
-                        &mut outputs[index..index + group_len],
+                        &weights[index..index + f32_batch_len],
+                        &mut outputs[index..index + f32_batch_len],
                         executor,
                     )?;
-                    completed[index..index + group_len].fill(true);
+                    completed[index..index + f32_batch_len].fill(true);
                     continue;
                 }
                 // Compatible CPU packed/BF16 siblings already share their exact
@@ -6962,6 +6988,12 @@ mod tests {
                 block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
                 block.repeat(width / 128)
             }
+            143 => {
+                let mut pq2_block = [0x66_u8; 34];
+                pq2_block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+                let block = bonsai_ternary::pack_ptq(&pq2_block).unwrap_or([0; 28]);
+                block.repeat(width / 128)
+            }
             8 => {
                 let mut block = [1; 34];
                 block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
@@ -7324,6 +7356,110 @@ mod tests {
         assert_eq!(grouped_scratch.matvec.preparation_count(), 2);
         assert_eq!(grouped_scratch.matvec.statistics().matrix_successes, 2);
         assert_eq!(grouped_outputs, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_projection_admits_ptq1_and_mixed_pq2_ptq1_on_f32_executor() -> Result<()> {
+        let width = 256;
+        let geometry = projection_geometry(width);
+        let q_pq2 = projection_weight("blk.0.attn_q.weight", 142, width);
+        let k_ptq1 = projection_weight("blk.0.attn_k.weight", 143, width);
+        let v_ptq1 = projection_weight("blk.0.attn_v.weight", 143, width);
+        let transforms = Transforms {
+            block: 4,
+            weights: BTreeSet::from([q_pq2.name.clone(), k_ptq1.name.clone(), v_ptq1.name.clone()]),
+            signs: BTreeMap::from([(width, vec![1.0; width])]),
+            ..Transforms::default()
+        };
+        let input: Vec<f32> = (0..width)
+            .map(|index| [1.0, -0.5, 0.25, -0.125][index % 4])
+            .collect();
+        let mut expected = [Vec::new(), Vec::new(), Vec::new()];
+        let mut cpu_scratch = ProjectionScratch::default();
+        transforms.project_group_into(
+            [&q_pq2, &k_ptq1, &v_ptq1],
+            &input,
+            &geometry,
+            expected.each_mut(),
+            &mut cpu_scratch,
+        )?;
+
+        // Uniform PTQ1 group batches via supports_f32_group without CPU Q8_0 quantization.
+        let mut ptq1_group = F32OnlyExecutor {
+            offloaded_names: BTreeSet::from([k_ptq1.name.clone(), v_ptq1.name.clone()]),
+            allow_group: true,
+            f32_calls: 0,
+            f32_group_calls: 0,
+        };
+        let mut ptq1_outputs = [Vec::new(), Vec::new()];
+        let mut ptq1_scratch = ProjectionScratch::default();
+        let mut ptq1_opt: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor> =
+            Some(&mut ptq1_group);
+        transforms.project_group_into_with_executor(
+            [&k_ptq1, &v_ptq1],
+            &input,
+            &geometry,
+            ptq1_outputs.each_mut(),
+            &mut ptq1_scratch,
+            &mut ptq1_opt,
+        )?;
+        assert_eq!(ptq1_group.f32_calls, 0);
+        assert_eq!(ptq1_group.f32_group_calls, 1);
+        assert_eq!(ptq1_scratch.matvec.statistics().matrix_successes, 0);
+        assert_eq!(ptq1_outputs, [expected[1].clone(), expected[2].clone()]);
+
+        // Mixed [PQ2, PTQ1, PTQ1] batches all three siblings in one F32 group.
+        let mut mixed_group = F32OnlyExecutor {
+            offloaded_names: BTreeSet::from([
+                q_pq2.name.clone(),
+                k_ptq1.name.clone(),
+                v_ptq1.name.clone(),
+            ]),
+            allow_group: true,
+            f32_calls: 0,
+            f32_group_calls: 0,
+        };
+        let mut mixed_outputs = [Vec::new(), Vec::new(), Vec::new()];
+        let mut mixed_scratch = ProjectionScratch::default();
+        let mut mixed_opt: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor> =
+            Some(&mut mixed_group);
+        transforms.project_group_into_with_executor(
+            [&q_pq2, &k_ptq1, &v_ptq1],
+            &input,
+            &geometry,
+            mixed_outputs.each_mut(),
+            &mut mixed_scratch,
+            &mut mixed_opt,
+        )?;
+        assert_eq!(mixed_group.f32_calls, 0);
+        assert_eq!(mixed_group.f32_group_calls, 1);
+        assert_eq!(mixed_scratch.matvec.statistics().matrix_successes, 0);
+        assert_eq!(mixed_outputs, expected);
+
+        // Partial PTQ1 offload falls back to CPU for unclaimed siblings.
+        let mut partial_ptq1 = F32OnlyExecutor {
+            offloaded_names: BTreeSet::from([k_ptq1.name.clone()]),
+            allow_group: true,
+            f32_calls: 0,
+            f32_group_calls: 0,
+        };
+        let mut partial_outputs = [Vec::new(), Vec::new()];
+        let mut partial_scratch = ProjectionScratch::default();
+        let mut partial_opt: Option<&mut dyn crate::kernels::Pq2ProjectionExecutor> =
+            Some(&mut partial_ptq1);
+        transforms.project_group_into_with_executor(
+            [&k_ptq1, &v_ptq1],
+            &input,
+            &geometry,
+            partial_outputs.each_mut(),
+            &mut partial_scratch,
+            &mut partial_opt,
+        )?;
+        assert_eq!(partial_ptq1.f32_calls, 1);
+        assert_eq!(partial_ptq1.f32_group_calls, 0);
+        assert_eq!(partial_scratch.matvec.statistics().matrix_successes, 1);
+        assert_eq!(partial_outputs, [expected[1].clone(), expected[2].clone()]);
         Ok(())
     }
 
@@ -9338,7 +9474,8 @@ mod tests {
         }
 
         fn supports_f32(&self, tensor: &Tensor) -> bool {
-            tensor.kind == crate::kernels::PQ2 && tensor.name.contains(".ffn_")
+            matches!(tensor.kind, crate::kernels::PQ2 | crate::kernels::PTQ1)
+                && tensor.name.contains(".ffn_")
         }
 
         fn project(
@@ -9617,6 +9754,85 @@ mod tests {
         crate::Decoder::reset(&mut decoder)?;
         assert_eq!(decoder.row_workers(), 4);
         assert_eq!(decoder.workspace.adapter.row_workers(), 4);
+        drop(decoder);
+        Ok(())
+    }
+
+    #[test]
+    fn release_executor_resident_host_weights_releases_mapped_ptq1_and_pq2_weights() -> Result<()> {
+        let (mut model, guard, _) = build_mapped_pq2_release_fixture()?;
+        let _guard = guard;
+        let ptq1_block = bonsai_ternary::pack_ptq(&{
+            let mut blk = [0x55_u8; 34];
+            blk[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            blk
+        })?;
+        let ptq1_128x128 = ptq1_block.repeat(128);
+        let path = std::env::temp_dir().join(format!(
+            "SwiftBonsai-GraphReleasePtq1-{}.bin",
+            std::process::id()
+        ));
+        let mut blob = Vec::with_capacity(ptq1_128x128.len() * 3);
+        for _ in 0..3 {
+            blob.extend_from_slice(&ptq1_128x128);
+        }
+        std::fs::write(&path, &blob)?;
+        let file = std::fs::File::open(&path)?;
+        let mapped = bonsai_native_hash::mmap::MappedReadOnlyFile::try_map(
+            &file,
+            u64::try_from(blob.len())?,
+        )?;
+        drop(file);
+        let _ptq1_guard = MappedWeightBinGuard { path };
+        let mut expected_ffn_bytes = 0_usize;
+        for (idx, name) in [
+            "blk.0.attn_k.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = idx * ptq1_128x128.len();
+            let data = if let Some(file_map) = &mapped {
+                crate::model::TensorBytes::from(file_map.slice(offset, ptq1_128x128.len())?)
+            } else {
+                crate::model::TensorBytes::from(Arc::<[u8]>::from(
+                    &blob[offset..offset + ptq1_128x128.len()],
+                ))
+            };
+            model.tensors.insert(
+                name.to_owned(),
+                Tensor {
+                    name: name.to_owned(),
+                    dimensions: vec![128, 128],
+                    kind: crate::kernels::PTQ1,
+                    data,
+                },
+            );
+        }
+        if let Some(gate) = model.tensors.get("blk.0.ffn_gate.weight")
+            && gate.data.is_mapped()
+        {
+            expected_ffn_bytes += gate.data.len();
+        }
+        if mapped.is_some() {
+            expected_ffn_bytes += 2 * ptq1_128x128.len();
+        }
+        let mut decoder = super::Qwen35::new(model, 32)?;
+        decoder.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor)));
+        let released = decoder.release_executor_resident_host_weights()?;
+        assert_eq!(released, expected_ffn_bytes);
+        assert!(!decoder.layers[0].gate.data.is_mapped());
+        assert!(!decoder.layers[0].up.data.is_mapped());
+        assert!(!decoder.layers[0].down.data.is_mapped());
+        if let super::Attention::Full(full) = &decoder.layers[0].attention {
+            assert_eq!(full.key.data.is_mapped(), cfg!(windows));
+            assert!(!full.key.data.is_empty());
+        } else {
+            return Err(crate::invalid("expected full attention layer"));
+        }
+        assert_eq!(decoder.release_executor_resident_host_weights()?, 0);
         drop(decoder);
         Ok(())
     }

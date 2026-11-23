@@ -2781,8 +2781,8 @@ fn project_tile_pair<'a>(
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
     if let Some(exec) = executor.as_deref_mut()
-        && tensors[0].kind == 142
-        && tensors[1].kind == 142
+        && matches!(tensors[0].kind, 142 | 143)
+        && matches!(tensors[1].kind, 142 | 143)
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && exec.supports_f32_group(&tensors)
     {
@@ -2924,9 +2924,9 @@ fn try_project_tile_ffn_chain(
         return Ok(false);
     };
     if adapters.affects_any(&tensors)
-        || gate.kind != 142
-        || up.kind != 142
-        || down.kind != 142
+        || !matches!(gate.kind, 142 | 143)
+        || !matches!(up.kind, 142 | 143)
+        || !matches!(down.kind, 142 | 143)
         || transforms.basis(gate) != transforms.basis(up)
     {
         return Ok(false);
@@ -2998,8 +2998,8 @@ fn project_tile_ffn_swiglu<'a>(
     if !adapters.affects_any(&[gate, up])
         && !transforms.is_compacted_down(down)
         && let Some(exec) = executor.as_deref_mut()
-        && gate.kind == 142
-        && up.kind == 142
+        && matches!(gate.kind, 142 | 143)
+        && matches!(up.kind, 142 | 143)
         && transforms.basis(gate) == transforms.basis(up)
         && exec.supports_f32_ffn_swiglu(gate, up)
     {
@@ -3214,9 +3214,9 @@ fn project_tile_triple<'a>(
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
     if let Some(exec) = executor.as_deref_mut()
-        && tensors[0].kind == 142
-        && tensors[1].kind == 142
-        && tensors[2].kind == 142
+        && matches!(tensors[0].kind, 142 | 143)
+        && matches!(tensors[1].kind, 142 | 143)
+        && matches!(tensors[2].kind, 142 | 143)
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && transforms.basis(tensors[0]) == transforms.basis(tensors[2])
         && exec.supports_f32_group(&tensors)
@@ -3392,7 +3392,8 @@ fn project_tile<'a>(
             .dimensions
             .get(1..)
             .map_or(0, |dims| dims.iter().product::<usize>());
-        if tensor.kind == 142 && cols.is_multiple_of(128) && exec.supports_f32(tensor) {
+        if matches!(tensor.kind, 142 | 143) && cols.is_multiple_of(128) && exec.supports_f32(tensor)
+        {
             check()?;
             exec.project_f32_tokens(
                 tensor,
@@ -3794,6 +3795,453 @@ mod chunkwise_kv_tests {
                 .with_chunkwise_gdn_prefill()?;
             assert!(wy_for_verify.tiled_verification_scratch_bytes().is_err());
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ptq1_executor_tests {
+    use std::sync::Arc;
+
+    use super::{
+        ActiveAdapters, AdapterScratch, Arithmetic, Geometry, MatvecBackend, ProjectionTile,
+        Tensor, TileReuse, Transforms, project_tile, project_tile_ffn_swiglu, project_tile_pair,
+        project_tile_triple, try_project_tile_ffn_chain,
+    };
+    use crate::Result;
+    use crate::kernels::{MatvecScratch, Pq2ProjectionExecutor, Q8Block, Q8KBlock, matvec_into};
+
+    struct TiledPtq1Exec {
+        allow_f32: bool,
+        allow_q8: bool,
+        f32_tokens_calls: usize,
+        pair_calls: usize,
+        triple_calls: usize,
+        swiglu_tokens_calls: usize,
+        chain_tokens_calls: usize,
+        q8_calls: usize,
+    }
+
+    impl Pq2ProjectionExecutor for TiledPtq1Exec {
+        fn identity(&self) -> &'static str {
+            "tiled-ptq1-test"
+        }
+
+        fn supports(&self, _tensor: &Tensor) -> bool {
+            true
+        }
+
+        fn supports_q8(&self, _tensor: &Tensor) -> bool {
+            self.allow_q8
+        }
+
+        fn supports_f32(&self, _tensor: &Tensor) -> bool {
+            self.allow_f32
+        }
+
+        fn supports_f32_group(&self, _tensors: &[&Tensor]) -> bool {
+            self.allow_f32
+        }
+
+        fn supports_f32_ffn_swiglu(&self, _gate: &Tensor, _up: &Tensor) -> bool {
+            self.allow_f32
+        }
+
+        fn supports_f32_ffn_chain(&self, _tensors: [&Tensor; 3]) -> bool {
+            self.allow_f32
+        }
+
+        fn project(
+            &mut self,
+            _tensor: &Tensor,
+            _activation: &[Q8KBlock],
+            _fused: bool,
+            _output: &mut Vec<f32>,
+        ) -> Result<()> {
+            Err(crate::invalid("PTQ1 must never dispatch to Q8_K"))
+        }
+
+        fn project_q8(
+            &mut self,
+            tensor: &Tensor,
+            _activation: &[Q8Block],
+            _pinned: bool,
+            output: &mut Vec<f32>,
+        ) -> Result<()> {
+            self.q8_calls += 1;
+            output.clear();
+            output.resize(tensor.dimensions[1], 6.5);
+            Ok(())
+        }
+
+        fn project_f32_tokens(
+            &mut self,
+            tensor: &Tensor,
+            activations: &[Vec<f32>],
+            _pinned: bool,
+            outputs: &mut [Vec<f32>],
+        ) -> Result<()> {
+            self.f32_tokens_calls += 1;
+            assert_eq!(activations.len(), outputs.len());
+            for out in outputs.iter_mut() {
+                out.clear();
+                out.resize(tensor.dimensions[1], 1.5);
+            }
+            Ok(())
+        }
+
+        fn project_f32_pair_tokens(
+            &mut self,
+            tensors: [&Tensor; 2],
+            activations: &[Vec<f32>],
+            _pinned: bool,
+            outputs_a: &mut [Vec<f32>],
+            outputs_b: &mut [Vec<f32>],
+        ) -> Result<()> {
+            self.pair_calls += 1;
+            assert_eq!(activations.len(), outputs_a.len());
+            for (a, b) in outputs_a.iter_mut().zip(outputs_b.iter_mut()) {
+                a.clear();
+                a.resize(tensors[0].dimensions[1], 2.5);
+                b.clear();
+                b.resize(tensors[1].dimensions[1], 3.5);
+            }
+            Ok(())
+        }
+
+        fn project_f32_triple_tokens(
+            &mut self,
+            tensors: [&Tensor; 3],
+            activations: &[Vec<f32>],
+            _pinned: bool,
+            outputs_a: &mut [Vec<f32>],
+            outputs_b: &mut [Vec<f32>],
+            outputs_c: &mut [Vec<f32>],
+        ) -> Result<()> {
+            self.triple_calls += 1;
+            assert_eq!(activations.len(), outputs_a.len());
+            for ((a, b), c) in outputs_a
+                .iter_mut()
+                .zip(outputs_b.iter_mut())
+                .zip(outputs_c.iter_mut())
+            {
+                a.clear();
+                a.resize(tensors[0].dimensions[1], 4.5);
+                b.clear();
+                b.resize(tensors[1].dimensions[1], 5.5);
+                c.clear();
+                c.resize(tensors[2].dimensions[1], 6.5);
+            }
+            Ok(())
+        }
+
+        fn project_f32_ffn_swiglu_tokens(
+            &mut self,
+            gate: &Tensor,
+            _up: &Tensor,
+            activations: &[Vec<f32>],
+            _pinned: bool,
+            outputs: &mut [Vec<f32>],
+        ) -> Result<()> {
+            self.swiglu_tokens_calls += 1;
+            assert_eq!(activations.len(), outputs.len());
+            for out in outputs.iter_mut() {
+                out.clear();
+                out.resize(gate.dimensions[1], 7.5);
+            }
+            Ok(())
+        }
+
+        fn project_f32_ffn_chain_tokens(
+            &mut self,
+            tensors: [&Tensor; 3],
+            activations: &[Vec<f32>],
+            _residuals: Option<&[Vec<f32>]>,
+            _hadamard_block_size: Option<u32>,
+            _pinned: bool,
+            outputs: &mut [Vec<f32>],
+        ) -> Result<()> {
+            self.chain_tokens_calls += 1;
+            assert_eq!(activations.len(), outputs.len());
+            for out in outputs.iter_mut() {
+                out.clear();
+                out.resize(tensors[2].dimensions[1], 8.5);
+            }
+            Ok(())
+        }
+    }
+
+    fn ptq1_tensor(name: &str, cols: usize, rows: usize) -> Result<Tensor> {
+        let mut pq2_block = [0x66_u8; 34];
+        pq2_block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+        let block = bonsai_ternary::pack_ptq(&pq2_block)?;
+        Ok(Tensor {
+            name: name.into(),
+            dimensions: vec![cols, rows],
+            kind: 143,
+            data: Arc::<[u8]>::from(block.repeat((cols / 128) * rows)).into(),
+        })
+    }
+
+    fn pq2_tensor(name: &str, cols: usize, rows: usize) -> Tensor {
+        let mut block = [0x55_u8; 34];
+        block[..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+        Tensor {
+            name: name.into(),
+            dimensions: vec![cols, rows],
+            kind: 142,
+            data: Arc::<[u8]>::from(block.repeat((cols / 128) * rows)).into(),
+        }
+    }
+
+    fn test_geometry() -> Geometry {
+        Geometry {
+            embedding: 256,
+            feed_forward: 128,
+            heads: 2,
+            kv_heads: 1,
+            head: 128,
+            rope: 64,
+            rope_sections: [32, 0, 0, 0],
+            rope_base: 10_000.0,
+            epsilon: 1e-6,
+            ssm_head: 128,
+            ssm_keys: 1,
+            ssm_values: 1,
+            convolution: 2,
+        }
+    }
+
+    fn new_exec(allow_f32: bool, allow_q8: bool) -> TiledPtq1Exec {
+        TiledPtq1Exec {
+            allow_f32,
+            allow_q8,
+            f32_tokens_calls: 0,
+            pair_calls: 0,
+            triple_calls: 0,
+            swiglu_tokens_calls: 0,
+            chain_tokens_calls: 0,
+            q8_calls: 0,
+        }
+    }
+
+    #[test]
+    fn ptq1_tiled_prefill_dispatches_supports_f32_tile_and_group_paths() -> Result<()> {
+        let transforms = Transforms::default();
+        let geometry = test_geometry();
+        let q_pq2 = pq2_tensor("q_pq2", 256, 128);
+        let q_ptq1 = ptq1_tensor("q_ptq1", 256, 128)?;
+        let k_ptq1 = ptq1_tensor("k_ptq1", 256, 128)?;
+        let v_ptq1 = ptq1_tensor("v_ptq1", 256, 128)?;
+        let inputs = vec![vec![0.5_f32; 256], vec![-0.25_f32; 256]];
+        let mut out_a = vec![Vec::new(); 2];
+        let mut out_b = vec![Vec::new(); 2];
+        let mut out_c = vec![Vec::new(); 2];
+        let mut transformed = vec![Vec::new(); 2];
+        let mut adapter_scratch = AdapterScratch::default();
+        let mut proj_scratch = MatvecScratch::default();
+        let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
+        let mut exec = new_exec(true, false);
+
+        let _ = project_tile(
+            &transforms,
+            &geometry,
+            Arithmetic::Source,
+            ActiveAdapters::default(),
+            &mut adapter_scratch,
+            &mut proj_scratch,
+            TileReuse::default(),
+            &q_ptq1,
+            &inputs,
+            &mut out_a,
+            &mut transformed,
+            &mut projector,
+            Some(&mut exec),
+            &|| Ok(()),
+        )?;
+        assert_eq!(out_a[0][0], 1.5);
+
+        let _ = project_tile_pair(
+            &transforms,
+            &geometry,
+            Arithmetic::Source,
+            ActiveAdapters::default(),
+            &mut adapter_scratch,
+            &mut proj_scratch,
+            TileReuse::default(),
+            [&q_pq2, &k_ptq1],
+            &inputs,
+            &mut out_a,
+            &mut out_b,
+            &mut transformed,
+            &mut projector,
+            Some(&mut exec),
+            &|| Ok(()),
+        )?;
+        assert_eq!((out_a[0][0], out_b[1][0]), (2.5, 3.5));
+
+        let _ = project_tile_triple(
+            &transforms,
+            &geometry,
+            Arithmetic::Source,
+            ActiveAdapters::default(),
+            &mut adapter_scratch,
+            &mut proj_scratch,
+            TileReuse::default(),
+            [&q_pq2, &k_ptq1, &v_ptq1],
+            &inputs,
+            &mut out_a,
+            &mut out_b,
+            &mut out_c,
+            &mut transformed,
+            &mut projector,
+            Some(&mut exec),
+            &|| Ok(()),
+        )?;
+        assert_eq!((out_a[0][0], out_b[0][0], out_c[1][0]), (4.5, 5.5, 6.5));
+        assert_eq!(
+            (exec.f32_tokens_calls, exec.pair_calls, exec.triple_calls),
+            (1, 1, 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ptq1_tiled_prefill_dispatches_supports_f32_ffn_paths() -> Result<()> {
+        let transforms = Transforms::default();
+        let geometry = test_geometry();
+        let gate_ptq1 = ptq1_tensor("gate_ptq1", 256, 128)?;
+        let up_ptq1 = ptq1_tensor("up_ptq1", 256, 128)?;
+        let down_ptq1 = ptq1_tensor("down_ptq1", 128, 256)?;
+        let inputs = vec![vec![0.5_f32; 256], vec![-0.25_f32; 256]];
+        let mut out_a = vec![Vec::new(); 2];
+        let mut out_b = vec![Vec::new(); 2];
+        let mut out_c = vec![Vec::new(); 2];
+        let mut transformed = vec![Vec::new(); 2];
+        let mut adapter_scratch = AdapterScratch::default();
+        let mut proj_scratch = MatvecScratch::default();
+        let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
+        let mut exec = new_exec(true, false);
+
+        let _ = project_tile_ffn_swiglu(
+            &transforms,
+            &geometry,
+            Arithmetic::Source,
+            ActiveAdapters::default(),
+            &mut adapter_scratch,
+            &mut proj_scratch,
+            TileReuse::default(),
+            &gate_ptq1,
+            &up_ptq1,
+            &down_ptq1,
+            &inputs,
+            &mut out_a,
+            &mut out_b,
+            &mut transformed,
+            &mut projector,
+            Some(&mut exec),
+            &|| Ok(()),
+        )?;
+        assert_eq!(out_b[1][0], 7.5);
+
+        let chained = try_project_tile_ffn_chain(
+            &transforms,
+            &geometry,
+            Arithmetic::Source,
+            ActiveAdapters::default(),
+            TileReuse::default(),
+            [&gate_ptq1, &up_ptq1, &down_ptq1],
+            &inputs,
+            None,
+            &mut out_c,
+            &mut transformed,
+            &projector,
+            Some(&mut exec),
+            &|| Ok(()),
+        )?;
+        assert!(chained);
+        assert_eq!(out_c[1][0], 8.5);
+        assert_eq!((exec.swiglu_tokens_calls, exec.chain_tokens_calls), (1, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn ptq1_tiled_prefill_falls_back_to_q8_and_cpu_when_supports_f32_is_false() -> Result<()> {
+        let transforms = Transforms::default();
+        let geometry = test_geometry();
+        let ptq1 = ptq1_tensor("q_ptq1", 256, 4)?;
+        let inputs = vec![vec![0.5_f32; 256], vec![-0.25_f32; 256]];
+        let mut expected = vec![Vec::new(); 2];
+        let mut cpu_scratch = MatvecScratch::default();
+        for (inp, exp) in inputs.iter().zip(&mut expected) {
+            matvec_into(&ptq1, inp, exp, &mut cpu_scratch)?;
+        }
+
+        let mut outputs = vec![Vec::new(); 2];
+        let mut transformed = vec![Vec::new(); 2];
+        let mut adapter_scratch = AdapterScratch::default();
+        let mut proj_scratch = MatvecScratch::default();
+        let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
+
+        let mut q8_exec = TiledPtq1Exec {
+            allow_f32: false,
+            allow_q8: true,
+            f32_tokens_calls: 0,
+            pair_calls: 0,
+            triple_calls: 0,
+            swiglu_tokens_calls: 0,
+            chain_tokens_calls: 0,
+            q8_calls: 0,
+        };
+        let _ = project_tile(
+            &transforms,
+            &geometry,
+            Arithmetic::Source,
+            ActiveAdapters::default(),
+            &mut adapter_scratch,
+            &mut proj_scratch,
+            TileReuse::default(),
+            &ptq1,
+            &inputs,
+            &mut outputs,
+            &mut transformed,
+            &mut projector,
+            Some(&mut q8_exec),
+            &|| Ok(()),
+        )?;
+        assert_eq!(q8_exec.f32_tokens_calls, 0);
+        assert_eq!(q8_exec.q8_calls, 2);
+        assert_eq!(outputs, vec![vec![6.5_f32; 4], vec![6.5_f32; 4]]);
+
+        let mut cpu_exec = TiledPtq1Exec {
+            allow_f32: false,
+            allow_q8: false,
+            f32_tokens_calls: 0,
+            pair_calls: 0,
+            triple_calls: 0,
+            swiglu_tokens_calls: 0,
+            chain_tokens_calls: 0,
+            q8_calls: 0,
+        };
+        let _ = project_tile(
+            &transforms,
+            &geometry,
+            Arithmetic::Source,
+            ActiveAdapters::default(),
+            &mut adapter_scratch,
+            &mut proj_scratch,
+            TileReuse::default(),
+            &ptq1,
+            &inputs,
+            &mut outputs,
+            &mut transformed,
+            &mut projector,
+            Some(&mut cpu_exec),
+            &|| Ok(()),
+        )?;
+        assert_eq!(cpu_exec.f32_tokens_calls, 0);
+        assert_eq!(cpu_exec.q8_calls, 0);
+        assert_eq!(outputs, expected);
         Ok(())
     }
 }

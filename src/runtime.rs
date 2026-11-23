@@ -436,6 +436,16 @@ impl Runtime<crate::graph::Qwen35> {
         self.decoder.set_projection_executor(executor);
     }
 
+    /// Release file-mapped host backing bytes on layer weights already claimed
+    /// and resident on the installed projection executor.
+    ///
+    /// # Errors
+    /// Refuses when no projection executor is installed or when CPU tiled prefill
+    /// is configured, since tiled prefill still reads host weights.
+    pub fn release_executor_resident_host_weights(&mut self) -> Result<usize> {
+        self.decoder.release_executor_resident_host_weights()
+    }
+
     /// Clear complete conversation state before changing a loaded adapter scale.
     ///
     /// This narrow operation exposes no mutable decoder access. All committed
@@ -4393,6 +4403,291 @@ mod multimodal_tests {
         )?;
         assert_eq!(terminal_out, [3]);
         assert_eq!(runtime.media_spans(), [span_end]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ptq1_host_release_tests {
+    use std::collections::BTreeMap;
+
+    use bonsai_gguf::MetadataValue;
+
+    use super::*;
+    use crate::graph::Qwen35;
+    use crate::kernels::{PQ2, PTQ1, Pq2ProjectionExecutor, Q8KBlock};
+    use crate::model::{Model, Tensor, TensorBytes};
+
+    struct ClaimFfnMixedExecutor;
+
+    impl Pq2ProjectionExecutor for ClaimFfnMixedExecutor {
+        fn identity(&self) -> &'static str {
+            "runtime-claim-ffn-mixed"
+        }
+
+        fn supports(&self, _tensor: &Tensor) -> bool {
+            false
+        }
+
+        fn supports_f32(&self, tensor: &Tensor) -> bool {
+            matches!(tensor.kind, PQ2 | PTQ1) && tensor.name.contains(".ffn_")
+        }
+
+        fn project(
+            &mut self,
+            _tensor: &Tensor,
+            _activation: &[Q8KBlock],
+            _fused: bool,
+            _output: &mut Vec<f32>,
+        ) -> Result<()> {
+            Err(invalid("not invoked in runtime host-weight release test"))
+        }
+    }
+
+    struct TempFileGuard {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn mapped_mixed_metadata() -> BTreeMap<String, MetadataValue> {
+        let mut metadata = BTreeMap::new();
+        for (key, value) in [
+            ("general.architecture", MetadataValue::from("qwen35")),
+            ("qwen35.block_count", MetadataValue::from(1_u32)),
+            ("qwen35.context_length", MetadataValue::from(32_u32)),
+            ("qwen35.embedding_length", MetadataValue::from(128_u32)),
+            ("qwen35.feed_forward_length", MetadataValue::from(128_u32)),
+            ("qwen35.attention.head_count", MetadataValue::from(1_u32)),
+            ("qwen35.attention.head_count_kv", MetadataValue::from(1_u32)),
+            ("qwen35.attention.key_length", MetadataValue::from(128_u32)),
+            (
+                "qwen35.attention.value_length",
+                MetadataValue::from(128_u32),
+            ),
+            ("qwen35.rope.dimension_count", MetadataValue::from(64_u32)),
+            ("qwen35.rope.freq_base", MetadataValue::from(10_000.0_f32)),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon",
+                MetadataValue::from(1e-6_f32),
+            ),
+            ("qwen35.full_attention_interval", MetadataValue::from(1_u32)),
+            ("qwen35.ssm.state_size", MetadataValue::from(1_u32)),
+            ("qwen35.ssm.group_count", MetadataValue::from(1_u32)),
+            ("qwen35.ssm.time_step_rank", MetadataValue::from(1_u32)),
+            ("qwen35.ssm.inner_size", MetadataValue::from(1_u32)),
+            ("qwen35.ssm.conv_kernel", MetadataValue::from(2_u32)),
+        ] {
+            metadata.insert(key.to_owned(), value);
+        }
+        metadata.insert(
+            "qwen35.rope.dimension_sections".to_owned(),
+            MetadataValue::from(vec![32_u32, 0, 0, 0]),
+        );
+        metadata.insert(
+            "qwen35.attention.recurrent_layers".to_owned(),
+            MetadataValue::from(vec![false]),
+        );
+        metadata
+    }
+
+    fn f32_vec(name: &str, dims: &[usize], val: f32) -> Tensor {
+        let len: usize = dims.iter().product();
+        Tensor {
+            name: name.to_owned(),
+            dimensions: dims.to_vec(),
+            kind: 0,
+            data: Arc::<[u8]>::from(
+                vec![val; len]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        }
+    }
+
+    fn base_f32_tensors() -> BTreeMap<String, Tensor> {
+        BTreeMap::from([
+            (
+                "token_embd.weight".to_owned(),
+                f32_vec("token_embd.weight", &[128, 2], 0.25),
+            ),
+            (
+                "output.weight".to_owned(),
+                f32_vec("output.weight", &[128, 2], -0.25),
+            ),
+            (
+                "output_norm.weight".to_owned(),
+                f32_vec("output_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.attn_norm.weight".to_owned(),
+                f32_vec("blk.0.attn_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.post_attention_norm.weight".to_owned(),
+                f32_vec("blk.0.post_attention_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.attn_q_norm.weight".to_owned(),
+                f32_vec("blk.0.attn_q_norm.weight", &[128], 1.0),
+            ),
+            (
+                "blk.0.attn_k_norm.weight".to_owned(),
+                f32_vec("blk.0.attn_k_norm.weight", &[128], 1.0),
+            ),
+        ])
+    }
+
+    fn build_mapped_mixed_qwen35() -> Result<(Qwen35, Option<TempFileGuard>, usize)> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut pq2_block = [0x55_u8; 34];
+        pq2_block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        let ptq1_block = bonsai_ternary::pack_ptq(&pq2_block)?;
+        let pq2_128x256 = pq2_block.repeat(256);
+        let pq2_128x128 = pq2_block.repeat(128);
+        let ptq1_128x128 = ptq1_block.repeat(128);
+        let specs = [
+            (
+                "blk.0.attn_q.weight",
+                256_usize,
+                PQ2,
+                pq2_128x256.as_slice(),
+            ),
+            ("blk.0.attn_k.weight", 128, PTQ1, ptq1_128x128.as_slice()),
+            ("blk.0.attn_v.weight", 128, PQ2, pq2_128x128.as_slice()),
+            (
+                "blk.0.attn_output.weight",
+                128,
+                PTQ1,
+                ptq1_128x128.as_slice(),
+            ),
+            ("blk.0.ffn_gate.weight", 128, PQ2, pq2_128x128.as_slice()),
+            ("blk.0.ffn_up.weight", 128, PTQ1, ptq1_128x128.as_slice()),
+            ("blk.0.ffn_down.weight", 128, PTQ1, ptq1_128x128.as_slice()),
+        ];
+        let blob: Vec<u8> = specs
+            .iter()
+            .flat_map(|(_, _, _, bytes)| bytes.iter().copied())
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "SwiftBonsai-RuntimeReleaseMapped-{}-{id}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, &blob)?;
+        let file = std::fs::File::open(&path)?;
+        let mapped = bonsai_native_hash::mmap::MappedReadOnlyFile::try_map(
+            &file,
+            u64::try_from(blob.len())?,
+        )?;
+        drop(file);
+        let guard = Some(TempFileGuard { path });
+        let mut tensors = base_f32_tensors();
+        let mut offset = 0_usize;
+        for (name, rows, kind, bytes) in specs {
+            let data = if let Some(file_map) = &mapped {
+                TensorBytes::from(file_map.slice(offset, bytes.len())?)
+            } else {
+                TensorBytes::from(Arc::<[u8]>::from(bytes))
+            };
+            offset += bytes.len();
+            tensors.insert(
+                name.to_owned(),
+                Tensor {
+                    name: name.to_owned(),
+                    dimensions: vec![128, rows],
+                    kind,
+                    data,
+                },
+            );
+        }
+        let expected_ffn_bytes = if mapped.is_some() {
+            pq2_128x128.len() + 2 * ptq1_128x128.len()
+        } else {
+            0
+        };
+        let decoder = Qwen35::new(
+            Model {
+                metadata: mapped_mixed_metadata(),
+                tensors,
+                identity: "runtime-mapped-release-fixture".to_owned(),
+            },
+            32,
+        )?;
+        Ok((decoder, guard, expected_ffn_bytes))
+    }
+
+    #[test]
+    fn runtime_release_executor_resident_host_weights_forwards_and_enforces_guards() -> Result<()> {
+        let (decoder, guard, expected_ffn_bytes) = build_mapped_mixed_qwen35()?;
+        let _guard = guard;
+        let limits = Limits {
+            context_tokens: 32,
+            checkpoints: 1,
+            checkpoint_bytes: decoder.checkpoint_bytes().max(4096),
+        };
+        let mut runtime = Runtime::new(decoder, limits)?;
+
+        // 1. Refuses cleanly when no projection executor is installed.
+        assert!(runtime.release_executor_resident_host_weights().is_err());
+
+        // 2. Refuses cleanly when CPU tiled prefill is active.
+        let (tiled_dec, tiled_guard, _) = build_mapped_mixed_qwen35()?;
+        let _tiled_guard = tiled_guard;
+        let scratch = tiled_dec.tiled_prefill_scratch_bytes(8)?;
+        let tiled_dec = tiled_dec.with_tiled_prefill(8, scratch)?;
+        let mut tiled_runtime = Runtime::new(
+            tiled_dec,
+            Limits {
+                context_tokens: 32,
+                checkpoints: 1,
+                checkpoint_bytes: 16_384,
+            },
+        )?;
+        tiled_runtime.set_projection_executor(Some(Box::new(ClaimFfnMixedExecutor)));
+        assert!(
+            tiled_runtime
+                .release_executor_resident_host_weights()
+                .is_err()
+        );
+        drop(tiled_runtime);
+
+        // 3. Releases both mapped PQ2_0 and mapped PTQ1_0 FFN tensors claimed by supports_f32.
+        runtime.set_projection_executor(Some(Box::new(ClaimFfnMixedExecutor)));
+        let released = runtime.release_executor_resident_host_weights()?;
+        assert_eq!(released, expected_ffn_bytes);
+        assert!(
+            runtime
+                .decoder()
+                .projection_tensor("blk.0.ffn_gate.weight")
+                .is_some_and(|t| !t.data.is_mapped() && t.data.is_empty())
+        );
+        assert!(
+            runtime
+                .decoder()
+                .projection_tensor("blk.0.ffn_up.weight")
+                .is_some_and(|t| !t.data.is_mapped() && t.data.is_empty())
+        );
+        assert!(
+            runtime
+                .decoder()
+                .projection_tensor("blk.0.ffn_down.weight")
+                .is_some_and(|t| !t.data.is_mapped() && t.data.is_empty())
+        );
+        assert!(
+            runtime
+                .decoder()
+                .projection_tensor("blk.0.attn_k.weight")
+                .is_some_and(|t| t.data.is_mapped() == cfg!(windows) && !t.data.is_empty())
+        );
+        assert_eq!(runtime.release_executor_resident_host_weights()?, 0);
+        drop(runtime);
         Ok(())
     }
 }

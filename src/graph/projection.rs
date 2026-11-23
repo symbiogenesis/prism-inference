@@ -120,10 +120,11 @@ struct Work {
 
 fn projection_operations(executor: &dyn Pq2ProjectionExecutor, tensor: &Tensor) -> Result<u64> {
     let columns = tensor.dimensions[0];
-    let selected =
-        (tensor.kind == 142 && columns.is_multiple_of(128) && executor.supports_f32(tensor))
-            || (tensor.kind == 142 && columns.is_multiple_of(256) && executor.supports(tensor))
-            || (matches!(tensor.kind, 142 | 143) && executor.supports_q8(tensor));
+    let selected = (matches!(tensor.kind, 142 | 143)
+        && columns.is_multiple_of(128)
+        && executor.supports_f32(tensor))
+        || (tensor.kind == 142 && columns.is_multiple_of(256) && executor.supports(tensor))
+        || (matches!(tensor.kind, 142 | 143) && executor.supports_q8(tensor));
     if !selected {
         return Ok(0);
     }
@@ -676,6 +677,98 @@ mod tests {
         let down_proj = dec_down.with_projection_executor(&mut exec)?;
         assert_eq!(down_proj.work.map(|w| w.hidden), Some(8));
         assert_ne!(attn_digest, down_proj.plan_digest);
+        Ok(())
+    }
+
+    struct Ptq1PlanTestExecutor {
+        supports_f32: bool,
+        supports_ffn_fusion: bool,
+    }
+
+    impl Pq2ProjectionExecutor for Ptq1PlanTestExecutor {
+        fn identity(&self) -> &'static str {
+            "ptq1-plan-test"
+        }
+
+        fn operation_capacity(&self) -> Option<u64> {
+            Some(100)
+        }
+
+        fn operation_count(&self, _tensor: &Tensor) -> Option<u64> {
+            Some(2)
+        }
+
+        fn supports(&self, _tensor: &Tensor) -> bool {
+            false
+        }
+
+        fn supports_f32(&self, _tensor: &Tensor) -> bool {
+            self.supports_f32
+        }
+
+        fn supports_f32_ffn_swiglu(&self, _gate: &Tensor, _up: &Tensor) -> bool {
+            self.supports_ffn_fusion
+        }
+
+        fn supports_f32_ffn_chain(&self, _tensors: [&Tensor; 3]) -> bool {
+            self.supports_ffn_fusion
+        }
+
+        fn project(
+            &mut self,
+            _tensor: &Tensor,
+            _activation: &[bonsai_ternary::Q8KBlock],
+            _fused: bool,
+            _output: &mut Vec<f32>,
+        ) -> Result<()> {
+            Err(invalid("unexpected Q8_K project"))
+        }
+    }
+
+    #[test]
+    fn projected_qwen35_accounts_work_and_digest_for_ptq1_supports_f32() -> Result<()> {
+        let provenance = Arc::new(());
+        let mut decoder = tiny_decoder(Arc::clone(&provenance))?;
+        decoder.output.kind = 143;
+        if let Attention::Full(attn) = &mut decoder.layers[0].attention {
+            attn.query.kind = 143;
+            attn.key.kind = 143;
+            attn.value.kind = 143;
+            attn.output.kind = 143;
+        }
+        decoder.layers[0].up.kind = 143;
+        decoder.layers[0].gate.kind = 143;
+        decoder.layers[0].down.kind = 143;
+
+        let mut exec_on = Ptq1PlanTestExecutor {
+            supports_f32: true,
+            supports_ffn_fusion: true,
+        };
+        let proj_on = decoder.with_projection_executor(&mut exec_on)?;
+        // 7 PTQ1 layer projections * 2 ops + 2 FFN chain extra hidden ops = 16; output = 2.
+        assert_eq!(proj_on.work.map(|w| (w.hidden, w.output)), Some((16, 2)));
+        assert!(proj_on.admit_work(2, 1).is_ok());
+        let digest_on = proj_on.plan_digest;
+        drop(proj_on);
+
+        let mut decoder_off = tiny_decoder(provenance)?;
+        decoder_off.output.kind = 143;
+        if let Attention::Full(attn) = &mut decoder_off.layers[0].attention {
+            attn.query.kind = 143;
+            attn.key.kind = 143;
+            attn.value.kind = 143;
+            attn.output.kind = 143;
+        }
+        decoder_off.layers[0].up.kind = 143;
+        decoder_off.layers[0].gate.kind = 143;
+        decoder_off.layers[0].down.kind = 143;
+        let mut exec_off = Ptq1PlanTestExecutor {
+            supports_f32: false,
+            supports_ffn_fusion: false,
+        };
+        let proj_off = decoder_off.with_projection_executor(&mut exec_off)?;
+        assert_eq!(proj_off.work.map(|w| (w.hidden, w.output)), Some((0, 0)));
+        assert_ne!(digest_on, proj_off.plan_digest);
         Ok(())
     }
 }

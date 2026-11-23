@@ -2,7 +2,7 @@
 
 use bonsai_ternary::Q8KBlock;
 
-use super::{PQ2, PTQ1, PreparedMatvec, Q8Block, dimensions, is_finite_slice};
+use super::{ActivationContract, PQ2, PTQ1, PreparedMatvec, Q8Block, dimensions, is_finite_slice};
 use crate::{Result, invalid, model::Tensor};
 
 /// Scoped executor for original PQ2 rows and already prepared `Q8_K` activations.
@@ -568,7 +568,22 @@ macro_rules! forward_pq2_projection_executor {
 forward_pq2_projection_executor!(E => &mut E);
 forward_pq2_projection_executor!(E => Box<E>);
 
+const fn is_f32_executor_kind(kind: u32) -> bool {
+    matches!(kind, PQ2 | PTQ1)
+}
+
 impl PreparedMatvec<'_> {
+    pub(crate) fn is_f32_executor_compatible(&self, tensor: &Tensor) -> Result<bool> {
+        let (columns, _, _) = dimensions(tensor)?;
+        Ok(columns == self.input.len()
+            && columns.is_multiple_of(128)
+            && is_f32_executor_kind(tensor.kind)
+            && matches!(
+                self.contract,
+                ActivationContract::Q8K | ActivationContract::Q8 | ActivationContract::PinnedPtq1Q8
+            ))
+    }
+
     fn validate_f32_ffn_chain(
         &self,
         tensors: [&Tensor; 3],
@@ -578,11 +593,9 @@ impl PreparedMatvec<'_> {
         let (gate_cols, gate_rows, _) = dimensions(gate)?;
         let (up_cols, up_rows, _) = dimensions(up)?;
         let (down_cols, down_rows, _) = dimensions(down)?;
-        if !self.is_compatible(gate)?
-            || !self.is_compatible(up)?
-            || gate.kind != PQ2
-            || up.kind != PQ2
-            || down.kind != PQ2
+        if !self.is_f32_executor_compatible(gate)?
+            || !self.is_f32_executor_compatible(up)?
+            || !is_f32_executor_kind(down.kind)
             || gate_cols != up_cols
             || gate_rows != up_rows
             || down_cols != gate_rows
@@ -706,10 +719,8 @@ impl PreparedMatvec<'_> {
         let result = (|| {
             let (gate_cols, gate_rows, _) = dimensions(gate)?;
             let (up_cols, up_rows, _) = dimensions(up)?;
-            if !self.is_compatible(gate)?
-                || !self.is_compatible(up)?
-                || gate.kind != PQ2
-                || up.kind != PQ2
+            if !self.is_f32_executor_compatible(gate)?
+                || !self.is_f32_executor_compatible(up)?
                 || gate_cols != up_cols
                 || gate_rows != up_rows
                 || !gate_cols.is_multiple_of(128)
@@ -756,10 +767,7 @@ impl PreparedMatvec<'_> {
         let result = (|| {
             for &tensor in tensors {
                 let (columns, _, _) = dimensions(tensor)?;
-                if !self.is_compatible(tensor)?
-                    || tensor.kind != PQ2
-                    || !columns.is_multiple_of(128)
-                {
+                if !self.is_f32_executor_compatible(tensor)? || !columns.is_multiple_of(128) {
                     return Err(invalid(
                         "incompatible prepared projection executor activation",
                     ));
@@ -818,7 +826,10 @@ impl PreparedMatvec<'_> {
                     "incompatible prepared projection executor activation",
                 ));
             }
-            if tensor.kind == PQ2 && columns.is_multiple_of(128) && executor.supports_f32(tensor) {
+            if is_f32_executor_kind(tensor.kind)
+                && columns.is_multiple_of(128)
+                && executor.supports_f32(tensor)
+            {
                 executor.project_f32(
                     tensor,
                     self.input,

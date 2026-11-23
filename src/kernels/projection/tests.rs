@@ -707,3 +707,218 @@ fn forwarding_impls_preserve_all_executor_methods_and_matvec_compatibility() -> 
     assert_eq!(output, vec![11.0_f32; 128]);
     Ok(())
 }
+
+fn ptq1_weight(name: &str, cols: usize, rows: usize) -> Result<Tensor> {
+    let mut pq2_block = [0x66_u8; 34];
+    pq2_block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    let ptq1_block = bonsai_ternary::pack_ptq(&pq2_block)?;
+    Ok(Tensor {
+        name: name.into(),
+        dimensions: vec![cols, rows],
+        kind: 143,
+        data: Arc::<[u8]>::from(ptq1_block.repeat((cols / 128) * rows)).into(),
+    })
+}
+
+fn pq2_weight_2d(name: &str, cols: usize, rows: usize) -> Tensor {
+    let mut block = [0x55_u8; 34];
+    block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    Tensor {
+        name: name.into(),
+        dimensions: vec![cols, rows],
+        kind: 142,
+        data: Arc::<[u8]>::from(block.repeat((cols / 128) * rows)).into(),
+    }
+}
+
+#[test]
+fn ptq1_supports_f32_and_mixed_pq2_ptq1_dispatch_across_executor_paths() -> Result<()> {
+    for cols in [128_usize, 256] {
+        let gate_ptq1 = ptq1_weight("gate_ptq1", cols, 128)?;
+        let up_ptq1 = ptq1_weight("up_ptq1", cols, 128)?;
+        let down_ptq1 = ptq1_weight("down_ptq1", 128, cols)?;
+        let gate_pq2 = pq2_weight_2d("gate_pq2", cols, 128);
+        let input = vec![1.0_f32; cols];
+        let lora_a = vec![0.5_f32; 128];
+
+        let mut scratch = MatvecScratch::default();
+        let mut prepared = scratch.prepare_f32_executor(&gate_ptq1, &input)?;
+        let mut exec = FullForwardingExecutor::default();
+        let mut output = Vec::new();
+        let mut other = Vec::new();
+
+        prepared.matvec_with_executor(&gate_ptq1, &mut output, &mut exec)?;
+        assert_eq!(output, vec![3.0_f32; 128]);
+
+        prepared.matvec_group_with_executor(
+            &[&gate_ptq1, &up_ptq1],
+            &mut [&mut output, &mut other],
+            &mut exec,
+        )?;
+        assert_eq!(output, vec![4.0_f32; 128]);
+        assert_eq!(other, vec![4.0_f32; 128]);
+
+        prepared.matvec_ffn_swiglu_with_executor(&gate_ptq1, &up_ptq1, &mut output, &mut exec)?;
+        assert_eq!(output, vec![9.0_f32; 128]);
+
+        prepared.matvec_ffn_chain_with_executor(
+            [&gate_ptq1, &up_ptq1, &down_ptq1],
+            None,
+            None,
+            &mut output,
+            &mut exec,
+        )?;
+        assert_eq!(output, vec![10.0_f32; cols]);
+
+        let dot = prepared.matvec_ffn_chain_lora_with_executor(
+            [&gate_ptq1, &up_ptq1, &down_ptq1],
+            None,
+            None,
+            &lora_a,
+            &mut output,
+            &mut exec,
+        )?;
+        assert_eq!(
+            (dot, output.as_slice()),
+            (11.5, vec![11.0_f32; cols].as_slice())
+        );
+
+        // Mixed PQ2 + PTQ1 across group, SwiGLU, FFN chain, and FFN chain LoRA.
+        let mut mixed_prepared = scratch.prepare_f32_executor(&gate_pq2, &input)?;
+        mixed_prepared.matvec_group_with_executor(
+            &[&gate_pq2, &up_ptq1],
+            &mut [&mut output, &mut other],
+            &mut exec,
+        )?;
+        assert_eq!(output, vec![4.0_f32; 128]);
+        assert_eq!(other, vec![4.0_f32; 128]);
+
+        mixed_prepared.matvec_ffn_swiglu_with_executor(
+            &gate_pq2,
+            &up_ptq1,
+            &mut output,
+            &mut exec,
+        )?;
+        assert_eq!(output, vec![9.0_f32; 128]);
+
+        mixed_prepared.matvec_ffn_chain_with_executor(
+            [&gate_pq2, &up_ptq1, &down_ptq1],
+            None,
+            None,
+            &mut output,
+            &mut exec,
+        )?;
+        assert_eq!(output, vec![10.0_f32; cols]);
+
+        let mixed_dot = mixed_prepared.matvec_ffn_chain_lora_with_executor(
+            [&gate_pq2, &up_ptq1, &down_ptq1],
+            None,
+            None,
+            &lora_a,
+            &mut output,
+            &mut exec,
+        )?;
+        assert_eq!(mixed_dot, 11.5);
+        assert_eq!(output, vec![11.0_f32; cols]);
+    }
+    Ok(())
+}
+
+struct Ptq1FallbackExecutor {
+    allow_q8: bool,
+    q8k_calls: usize,
+    q8_calls: usize,
+    f32_calls: usize,
+}
+
+impl Pq2ProjectionExecutor for Ptq1FallbackExecutor {
+    fn identity(&self) -> &'static str {
+        "ptq1-fallback-test"
+    }
+
+    fn supports(&self, _tensor: &Tensor) -> bool {
+        true
+    }
+
+    fn supports_q8(&self, _tensor: &Tensor) -> bool {
+        self.allow_q8
+    }
+
+    fn supports_f32(&self, _tensor: &Tensor) -> bool {
+        false
+    }
+
+    fn project(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[Q8KBlock],
+        _fused: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.q8k_calls += 1;
+        Err(invalid("PTQ1 must never dispatch to Q8_K project"))
+    }
+
+    fn project_q8(
+        &mut self,
+        tensor: &Tensor,
+        _activation: &[super::Q8Block],
+        _pinned: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.q8_calls += 1;
+        output.clear();
+        output.resize(tensor.dimensions[1], 7.25);
+        Ok(())
+    }
+
+    fn project_f32(
+        &mut self,
+        _tensor: &Tensor,
+        _activation: &[f32],
+        _pinned: bool,
+        _output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.f32_calls += 1;
+        Err(invalid("unexpected F32 call when supports_f32 is false"))
+    }
+}
+
+#[test]
+fn ptq1_falls_back_to_supports_q8_and_cpu_when_supports_f32_is_false() -> Result<()> {
+    let ptq1 = ptq1_weight("ptq1", 256, 4)?;
+    let input: Vec<f32> = (0..256)
+        .map(|i| if i % 2 == 0 { 0.5 } else { -0.25 })
+        .collect();
+    let mut cpu_scratch = MatvecScratch::default();
+    let mut expected = Vec::new();
+    super::super::matvec_into(&ptq1, &input, &mut expected, &mut cpu_scratch)?;
+
+    let mut q8_exec = Ptq1FallbackExecutor {
+        allow_q8: true,
+        q8k_calls: 0,
+        q8_calls: 0,
+        f32_calls: 0,
+    };
+    let mut scratch = MatvecScratch::default();
+    let mut prepared = scratch.prepare(&ptq1, &input)?;
+    let mut output = Vec::new();
+    prepared.matvec_with_executor(&ptq1, &mut output, &mut q8_exec)?;
+    assert_eq!(q8_exec.f32_calls, 0);
+    assert_eq!(q8_exec.q8k_calls, 0);
+    assert_eq!(q8_exec.q8_calls, 1);
+    assert_eq!(output, vec![7.25_f32; 4]);
+
+    let mut cpu_exec = Ptq1FallbackExecutor {
+        allow_q8: false,
+        q8k_calls: 0,
+        q8_calls: 0,
+        f32_calls: 0,
+    };
+    prepared.matvec_with_executor(&ptq1, &mut output, &mut cpu_exec)?;
+    assert_eq!(cpu_exec.f32_calls, 0);
+    assert_eq!(cpu_exec.q8k_calls, 0);
+    assert_eq!(cpu_exec.q8_calls, 0);
+    assert_eq!(output, expected);
+    Ok(())
+}

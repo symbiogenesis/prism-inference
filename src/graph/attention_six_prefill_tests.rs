@@ -3,7 +3,9 @@
 use bonsai_ternary::half_to_float;
 
 use super::super::{Geometry, KvCache};
-use super::{attend_prefix, attend_tile_chunk, pinned_attention};
+use super::{
+    attend_group, attend_prefix, attend_tile_chunk, attend_tile_kv_group, pinned_attention,
+};
 use crate::kernels::RowParallelism;
 
 struct Fixture {
@@ -511,6 +513,271 @@ fn six_head_prefill_24_head_gqa_preserves_earliest_error_across_workers() -> cra
         }
         if let Some(token) = early_token {
             fixture.queries[token][6 * width] = 0.25;
+        }
+    }
+    Ok(())
+}
+
+fn check_attend_group_two_keys_lengths<const HEADS: usize>() -> crate::Result<()> {
+    for past_tokens in [1, 15, 16, 255, 256, 257, 513, 1025] {
+        let fixture = fixture_with_geometry(12, 2, past_tokens + 4, past_tokens - 1, 1)?;
+        let width = fixture.geometry.head;
+        let head = 6;
+        let offset = head / 6 * width;
+        let mut actual = vec![19.0_f32; HEADS * width];
+        let mut scores = vec![19.0_f32; HEADS * (past_tokens + 1)];
+        let mut packed_probs = vec![[0_u16; HEADS]; past_tokens + 1];
+        attend_group::<HEADS>(
+            &fixture.geometry,
+            head,
+            &fixture.queries[0],
+            &fixture.projected[0],
+            &fixture.keys,
+            &fixture.values,
+            &fixture.current_keys[0],
+            &fixture.current_values[0],
+            &mut actual,
+            &mut scores,
+            &mut packed_probs,
+            0.125,
+        )?;
+        for local_head in 0..HEADS {
+            let h = head + local_head;
+            let query = &fixture.queries[0][h * width..(h + 1) * width];
+            let mut probs = Vec::with_capacity(past_tokens + 1);
+            for key in fixture.keys.tokens().take(past_tokens) {
+                probs.push(
+                    pinned_attention::dot(
+                        key[offset..offset + width]
+                            .iter()
+                            .copied()
+                            .map(half_to_float),
+                        query,
+                    )? * 0.125,
+                );
+            }
+            probs.push(
+                pinned_attention::dot(
+                    fixture.current_keys[0][offset..offset + width]
+                        .iter()
+                        .copied(),
+                    query,
+                )? * 0.125,
+            );
+            pinned_attention::softmax_round_f16(&mut probs)?;
+            for channel in 0..width {
+                let reduction = pinned_attention::dot(
+                    fixture
+                        .values
+                        .tokens()
+                        .take(past_tokens)
+                        .map(|row| half_to_float(row[offset + channel]))
+                        .chain(std::iter::once(fixture.current_values[0][offset + channel])),
+                    &probs,
+                )?;
+                let gate = fixture.projected[0][(h * 2 + 1) * width + channel];
+                let expected = reduction * (1.0 / (1.0 + (-gate).exp()));
+                assert_eq!(
+                    actual[local_head * width + channel].to_bits(),
+                    expected.to_bits(),
+                    "attend_group<{HEADS}> mismatch at past_tokens={past_tokens}, local_head={local_head}, channel={channel}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn six_head_decode_attend_group_two_keys_matches_oracle_across_lengths() -> crate::Result<()> {
+    check_attend_group_two_keys_lengths::<6>()?;
+    check_attend_group_two_keys_lengths::<3>()?;
+    check_attend_group_two_keys_lengths::<2>()?;
+    Ok(())
+}
+
+#[test]
+fn six_head_prefill_single_pack_and_tile_chunk_match_oracle_across_lengths() -> crate::Result<()> {
+    for (base, count) in [
+        (0, 1),
+        (14, 1),
+        (15, 2),
+        (254, 2),
+        (255, 2),
+        (256, 3),
+        (512, 2),
+        (1024, 2),
+    ] {
+        let fixture = fixture_with_geometry(12, 2, base + count + 4, base, count)?;
+        let width = fixture.geometry.head;
+        let expected: Vec<_> = (0..count)
+            .map(|token| reference(&fixture, base + token, token))
+            .collect::<crate::Result<_>>()?;
+
+        let mut prefix_out = vec![19.0_f32; 6 * width];
+        let mut prefix_scores = vec![19.0_f32; 6 * (base + 1)];
+        prefix(&fixture, base, &mut prefix_out, &mut prefix_scores)?;
+        assert_eq!(
+            prefix_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected[0][..6 * width]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "attend_prefix mismatch at base={base}"
+        );
+
+        let score_stride = 6 * (base + count);
+        let mut actual = vec![vec![19.0_f32; fixture.geometry.heads * width]; count];
+        let mut scores = vec![19.0_f32; count * score_stride];
+        attend_tile_chunk(
+            &fixture.geometry,
+            base,
+            &fixture.queries,
+            &fixture.projected,
+            &fixture.keys,
+            &fixture.values,
+            &fixture.current_keys,
+            &fixture.current_values,
+            &mut actual,
+            &mut scores,
+            score_stride,
+            0.125,
+        )?;
+        assert_eq!(
+            actual
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "attend_tile_chunk mismatch at base={base}, count={count}"
+        );
+
+        for kv_head in 0..fixture.geometry.kv_heads {
+            let head_start = kv_head * 6;
+            let mut kv_out = vec![19.0_f32; count * 6 * width];
+            let mut kv_scores = vec![19.0_f32; count * score_stride];
+            attend_tile_kv_group(
+                &fixture.geometry,
+                head_start,
+                base,
+                &fixture.queries,
+                &fixture.projected,
+                &fixture.keys,
+                &fixture.values,
+                &fixture.current_keys,
+                &fixture.current_values,
+                &mut kv_out,
+                &mut kv_scores,
+                score_stride,
+                0.125,
+            )?;
+            for (tok, expected_row) in expected.iter().enumerate() {
+                let got = &kv_out[tok * 6 * width..(tok + 1) * 6 * width];
+                let want = &expected_row[head_start * width..(head_start + 6) * width];
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "attend_tile_kv_group mismatch at base={base}, count={count}, kv_head={kv_head}, tok={tok}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn six_head_prefill_24_head_gqa_2d_counts_match_oracle_across_workers() -> crate::Result<()> {
+    #[cfg(feature = "parallel-rows")]
+    let worker_counts = [1, 2, 4, 12, 18];
+    #[cfg(not(feature = "parallel-rows"))]
+    let worker_counts = [1];
+    let base = 255;
+    for count in [1, 2, 3, 4, 5, 8] {
+        let fixture = fixture_with_geometry(24, 4, base + count + 4, base, count)?;
+        let width = fixture.geometry.head;
+        let expected: Vec<_> = (0..count)
+            .map(|token| reference(&fixture, base + token, token))
+            .collect::<crate::Result<_>>()?;
+        let score_stride = 6 * (base + count);
+        for workers in worker_counts {
+            let parallelism = RowParallelism::new(workers)?;
+            let kv_heads = fixture.geometry.kv_heads;
+            let n_chunks = if count < workers && count > 1 {
+                count
+            } else {
+                1
+            };
+            let max_chunk_tokens = count.div_ceil(n_chunks);
+            let kv_out_len = 6 * width;
+            let out_unit = max_chunk_tokens * kv_out_len;
+            let score_unit = max_chunk_tokens * score_stride;
+            let total_tasks = n_chunks * kv_heads;
+            let mut flat_out = vec![19.0_f32; total_tasks * out_unit];
+            let mut scores = vec![19.0_f32; total_tasks * score_unit];
+            parallelism.update_paired_chunks(
+                &mut flat_out,
+                out_unit,
+                &mut scores,
+                score_unit,
+                |base_task, out_chunk, scores_chunk| {
+                    for (local, (task_out, task_scores)) in out_chunk
+                        .chunks_exact_mut(out_unit)
+                        .zip(scores_chunk.chunks_exact_mut(score_unit))
+                        .enumerate()
+                    {
+                        let task_idx = base_task + local;
+                        let chunk_idx = task_idx / kv_heads;
+                        let kv_head = task_idx % kv_heads;
+                        let q_len = count / n_chunks;
+                        let rem = count % n_chunks;
+                        let tok_start = chunk_idx * q_len + chunk_idx.min(rem);
+                        let chunk_tokens = q_len + usize::from(chunk_idx < rem);
+                        let tok_end = tok_start + chunk_tokens;
+                        attend_tile_kv_group(
+                            &fixture.geometry,
+                            kv_head * 6,
+                            base + tok_start,
+                            &fixture.queries[tok_start..tok_end],
+                            &fixture.projected[tok_start..tok_end],
+                            &fixture.keys,
+                            &fixture.values,
+                            &fixture.current_keys[tok_start..tok_end],
+                            &fixture.current_values[tok_start..tok_end],
+                            &mut task_out[..chunk_tokens * kv_out_len],
+                            &mut task_scores[..chunk_tokens * score_stride],
+                            score_stride,
+                            0.125,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+            for chunk_idx in 0..n_chunks {
+                let q_len = count / n_chunks;
+                let rem = count % n_chunks;
+                let tok_start = chunk_idx * q_len + chunk_idx.min(rem);
+                let chunk_tokens = q_len + usize::from(chunk_idx < rem);
+                for kv_head in 0..kv_heads {
+                    let task_idx = chunk_idx * kv_heads + kv_head;
+                    for local_tok in 0..chunk_tokens {
+                        let got = &flat_out[task_idx * out_unit + local_tok * kv_out_len
+                            ..task_idx * out_unit + (local_tok + 1) * kv_out_len];
+                        let want = &expected[tok_start + local_tok]
+                            [kv_head * kv_out_len..(kv_head + 1) * kv_out_len];
+                        assert_eq!(
+                            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "2D prefill mismatch count={count}, workers={workers}, tok={}, kv_head={kv_head}",
+                            tok_start + local_tok
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())

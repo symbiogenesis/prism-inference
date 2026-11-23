@@ -50,13 +50,55 @@ pub(super) fn attend(
     )
 }
 
+fn resize_packed_rows(buf: &mut Vec<[u16; 6]>, len: usize) -> Result<&mut [[u16; 6]]> {
+    if len == 0 || len > crate::model::swift::CONTEXT_TOKENS {
+        return Err(invalid("invalid pinned packed probability length"));
+    }
+    if len > buf.len() {
+        let additional = len - buf.len();
+        buf.try_reserve_exact(additional)?;
+        buf.resize(len, [0_u16; 6]);
+    }
+    Ok(&mut buf[..len])
+}
+
+fn score_past_prefix<const HEADS: usize>(
+    keys: &KvCache,
+    past_tokens: usize,
+    offset: usize,
+    width: usize,
+    query_rows: [&[f32]; HEADS],
+    scores: &mut [&mut [f32]; HEADS],
+    scale: f32,
+) -> Result<()> {
+    let mut key_iter = keys.tokens().take(past_tokens).enumerate();
+    while let Some((pos0, key0)) = key_iter.next() {
+        if let Some((pos1, key1)) = key_iter.next() {
+            let dots = six::dot_two_keys(
+                [&key0[offset..offset + width], &key1[offset..offset + width]],
+                query_rows,
+            )?;
+            for (score, (dot0, dot1)) in scores.iter_mut().zip(dots[0].into_iter().zip(dots[1])) {
+                score[pos0] = dot0 * scale;
+                score[pos1] = dot1 * scale;
+            }
+        } else {
+            let dots = six::dot_group(&key0[offset..offset + width], query_rows)?;
+            for (score, dot) in scores.iter_mut().zip(dots) {
+                score[pos0] = dot * scale;
+            }
+        }
+    }
+    Ok(())
+}
+
 // Tiled prefill has appended the whole tile before attention. Restrict both
 // caches to the causal prefix; the current row retains its original F32 dot.
 #[expect(
     clippy::too_many_arguments,
     reason = "Explicit causal extent keeps already-appended future KV rows unreachable."
 )]
-fn attend_prefix(
+fn attend_prefix_with_scratch(
     geometry: &Geometry,
     head: usize,
     queries: &[f32],
@@ -69,6 +111,7 @@ fn attend_prefix(
     output: &mut [f32],
     scores: &mut [f32],
     scale: f32,
+    packed_scratch: &mut Vec<[u16; 6]>,
 ) -> Result<()> {
     let width = geometry.head;
     if width == 0
@@ -92,12 +135,15 @@ fn attend_prefix(
         std::array::from_fn(|index| &queries[(head + index) * width..(head + index + 1) * width]);
     let score_len = past_tokens + 1;
     let mut scores = rows(scores, score_len)?;
-    for (position, key) in keys.tokens().take(past_tokens).enumerate() {
-        let dots = six::dot(&key[offset..offset + width], query_rows)?;
-        for (score, dot) in scores.iter_mut().zip(dots) {
-            score[position] = dot * scale;
-        }
-    }
+    score_past_prefix(
+        keys,
+        past_tokens,
+        offset,
+        width,
+        query_rows,
+        &mut scores,
+        scale,
+    )?;
     for (score, query) in scores.iter_mut().zip(query_rows) {
         score[score_len - 1] =
             pinned_attention::dot_f32(&current_key[offset..offset + width], query)? * scale;
@@ -112,6 +158,44 @@ fn attend_prefix(
         output,
         scores.each_ref().map(|score| &score[..]),
         past_tokens,
+        packed_scratch,
+    )
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit causal extent keeps already-appended future KV rows unreachable."
+)]
+fn attend_prefix(
+    geometry: &Geometry,
+    head: usize,
+    queries: &[f32],
+    projected: &[f32],
+    keys: &KvCache,
+    values: &KvCache,
+    past_tokens: usize,
+    current_key: &[f32],
+    current_value: &[f32],
+    output: &mut [f32],
+    scores: &mut [f32],
+    scale: f32,
+) -> Result<()> {
+    let mut packed_scratch = Vec::new();
+    attend_prefix_with_scratch(
+        geometry,
+        head,
+        queries,
+        projected,
+        keys,
+        values,
+        past_tokens,
+        current_key,
+        current_value,
+        output,
+        scores,
+        scale,
+        &mut packed_scratch,
     )
 }
 
@@ -119,7 +203,7 @@ const CAUSAL_PACK_CHUNK: usize = 256;
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Borrow causal score rows and the original cache/projection without extra scratch."
+    reason = "Borrow causal score rows, original cache/projection, and reusable packed scratch."
 )]
 fn apply_values(
     geometry: &Geometry,
@@ -130,6 +214,7 @@ fn apply_values(
     output: &mut [f32],
     scores: [&[f32]; 6],
     past_tokens: usize,
+    packed_scratch: &mut Vec<[u16; 6]>,
 ) -> Result<()> {
     let width = geometry.head;
     let offset = head / 6 * width;
@@ -143,7 +228,7 @@ fn apply_values(
         std::array::from_fn(|index| attention_gate(projected, head + index, width));
     let mut out_rows = rows(output, width)?.map(|row| row.chunks_mut(six::VALUE_TILE));
     let score_len = past_tokens + 1;
-    let mut run_tiles = |packed: Option<&[[u16; 6]]>| -> Result<()> {
+    let mut run_tiles = |weights: &[[u16; 6]]| -> Result<()> {
         for start in (0..width).step_by(six::VALUE_TILE) {
             let end = (start + six::VALUE_TILE).min(width);
             let [o0, o1, o2, o3, o4, o5] = out_rows.each_mut().map(|row| {
@@ -152,34 +237,25 @@ fn apply_values(
             });
             let tile_outputs = [o0?, o1?, o2?, o3?, o4?, o5?];
             let tile_gates = gates.map(|gate| &gate[start..end]);
-            if let Some(weights) = packed {
-                six::value_tile_group_packed_gated::<6>(
-                    values.tokens().take(past_tokens),
-                    &current_value[offset + start..offset + end],
-                    weights,
-                    offset + start,
-                    tile_outputs,
-                    tile_gates,
-                )?;
-            } else {
-                six::value_tile_six_from_scores_gated(
-                    values.tokens().take(past_tokens),
-                    &current_value[offset + start..offset + end],
-                    scores,
-                    offset + start,
-                    tile_outputs,
-                    tile_gates,
-                )?;
-            }
+            six::value_tile_group_packed_gated::<6>(
+                values.tokens().take(past_tokens),
+                &current_value[offset + start..offset + end],
+                weights,
+                offset + start,
+                tile_outputs,
+                tile_gates,
+            )?;
         }
         Ok(())
     };
     if score_len <= CAUSAL_PACK_CHUNK {
         let mut packed = [[0_u16; 6]; CAUSAL_PACK_CHUNK];
         pinned_attention::pack_f16_rows(scores, &mut packed[..score_len])?;
-        return run_tiles(Some(&packed[..score_len]));
+        return run_tiles(&packed[..score_len]);
     }
-    run_tiles(None)
+    let packed = resize_packed_rows(packed_scratch, score_len)?;
+    pinned_attention::pack_f16_rows(scores, packed)?;
+    run_tiles(packed)
 }
 
 /// Evaluates `HEADS` (`HEADS` in `{2, 3, 6}`) contiguous query heads sharing a single
@@ -235,12 +311,15 @@ pub(super) fn attend_group<const HEADS: usize>(
     if packed_probs.len() != score_len {
         return Err(invalid("invalid group attention packed probability length"));
     }
-    for (position, key) in keys.tokens().take(past_tokens).enumerate() {
-        let dots = six::dot_group(&key[offset..offset + width], query_rows)?;
-        for (score, dot) in scores.iter_mut().zip(dots) {
-            score[position] = dot * scale;
-        }
-    }
+    score_past_prefix(
+        keys,
+        past_tokens,
+        offset,
+        width,
+        query_rows,
+        &mut scores,
+        scale,
+    )?;
     for (score, query) in scores.iter_mut().zip(query_rows) {
         score[score_len - 1] =
             pinned_attention::dot_f32(&current_key[offset..offset + width], query)? * scale;
@@ -294,7 +373,7 @@ fn apply_values_group<const HEADS: usize>(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Pair existing causal score, cache, projection and output borrows without retained scratch."
+    reason = "Pair existing causal score, cache, projection, output borrows, and reusable packed scratch."
 )]
 fn apply_values_pair(
     geometry: &Geometry,
@@ -305,6 +384,7 @@ fn apply_values_pair(
     outputs: [&mut [f32]; 2],
     scores: [[&[f32]; 6]; 2],
     past_tokens: usize,
+    packed_scratch: &mut [Vec<[u16; 6]>; 2],
 ) -> Result<()> {
     let width = geometry.head;
     let offset = head / 6 * width;
@@ -322,7 +402,7 @@ fn apply_values_pair(
     let mut second_rows = rows(second, width)?.map(|row| row.chunks_mut(six::PAIR_VALUE_TILE));
     let first_len = past_tokens + 1;
     let second_len = past_tokens + 2;
-    let mut run_tiles = |packed: Option<[&[[u16; 6]]; 2]>| -> Result<()> {
+    let mut run_tiles = |weights: [&[[u16; 6]]; 2]| -> Result<()> {
         for start in (0..width).step_by(six::PAIR_VALUE_TILE) {
             let end = (start + six::PAIR_VALUE_TILE).min(width);
             let [f0, f1, f2, f3, f4, f5] = first_rows.each_mut().map(|row| {
@@ -339,25 +419,14 @@ fn apply_values_pair(
             ];
             let tile_current = current.map(|row| &row[offset + start..offset + end]);
             let tile_gates = gates.map(|row| row.map(|gate| &gate[start..end]));
-            if let Some(weights) = packed {
-                six::value_pair_tile_packed_gated(
-                    values.tokens().take(past_tokens + 1),
-                    tile_current,
-                    weights,
-                    offset + start,
-                    tile_outputs,
-                    tile_gates,
-                )?;
-            } else {
-                six::value_pair_tile_from_scores_gated(
-                    values.tokens().take(past_tokens + 1),
-                    tile_current,
-                    scores,
-                    offset + start,
-                    tile_outputs,
-                    tile_gates,
-                )?;
-            }
+            six::value_pair_tile_packed_gated(
+                values.tokens().take(past_tokens + 1),
+                tile_current,
+                weights,
+                offset + start,
+                tile_outputs,
+                tile_gates,
+            )?;
         }
         Ok(())
     };
@@ -366,20 +435,94 @@ fn apply_values_pair(
         let mut packed1 = [[0_u16; 6]; CAUSAL_PACK_CHUNK];
         pinned_attention::pack_f16_rows(scores[0], &mut packed0[..first_len])?;
         pinned_attention::pack_f16_rows(scores[1], &mut packed1[..second_len])?;
-        return run_tiles(Some([&packed0[..first_len], &packed1[..second_len]]));
+        return run_tiles([&packed0[..first_len], &packed1[..second_len]]);
     }
-    run_tiles(None)
+    let [buf0, buf1] = packed_scratch;
+    let packed0 = resize_packed_rows(buf0, first_len)?;
+    pinned_attention::pack_f16_rows(scores[0], packed0)?;
+    let packed1 = resize_packed_rows(buf1, second_len)?;
+    pinned_attention::pack_f16_rows(scores[1], packed1)?;
+    run_tiles([&*packed0, &*packed1])
 }
 
-// Each caller worker owns complete token rows and its six-head score storage.
-// Keep the cache owner immutable and reuse one six-head group at a time rather
-// than falling back to two independent tail heads in Swift's 6:1 GQA geometry.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "Paired causal scoring and publication retain borrowed token rows, exact extents and caller-owned score storage."
+    reason = "Paired causal six-head group scoring and publication borrow cache and caller score storage."
 )]
-pub(super) fn attend_tile_chunk(
+fn attend_group_pair(
+    geometry: &Geometry,
+    head: usize,
+    position: usize,
+    queries: [&[f32]; 2],
+    projected: [&[f32]; 2],
+    keys: &KvCache,
+    values: &KvCache,
+    current_keys: [&[f32]; 2],
+    current_values: [&[f32]; 2],
+    outputs: [&mut [f32]; 2],
+    first_scores: &mut [f32],
+    second_scores: &mut [f32],
+    scale: f32,
+    packed_scratch: &mut [Vec<[u16; 6]>; 2],
+) -> Result<()> {
+    let width = geometry.head;
+    let offset = head / 6 * width;
+    let query_rows: [[&[f32]; 6]; 2] = std::array::from_fn(|token| {
+        std::array::from_fn(|index| {
+            &queries[token][(head + index) * width..(head + index + 1) * width]
+        })
+    });
+    let mut score_rows = [
+        rows(&mut first_scores[..6 * (position + 1)], position + 1)?,
+        rows(&mut second_scores[..6 * (position + 2)], position + 2)?,
+    ];
+    for (cached, key) in keys.tokens().take(position + 1).enumerate() {
+        if cached == position {
+            // Only the second token sees the first token's F16 key;
+            // each token's own key retains the original F32 path.
+            let dots = six::dot(&key[offset..offset + width], query_rows[1])?;
+            for (score, dot) in score_rows[1].iter_mut().zip(dots) {
+                score[cached] = dot * scale;
+            }
+        } else {
+            let dots = six::dot_pair(&key[offset..offset + width], query_rows)?;
+            for (scores, dots) in score_rows.iter_mut().zip(dots) {
+                for (score, dot) in scores.iter_mut().zip(dots) {
+                    score[cached] = dot * scale;
+                }
+            }
+        }
+    }
+    for (token, scores) in score_rows.iter_mut().enumerate() {
+        for (score, query) in scores.iter_mut().zip(query_rows[token]) {
+            score[position + token] =
+                pinned_attention::dot_f32(&current_keys[token][offset..offset + width], query)?
+                    * scale;
+            pinned_attention::softmax(score)?;
+        }
+    }
+    let [first_rows, second_rows] = score_rows;
+    apply_values_pair(
+        geometry,
+        head,
+        projected,
+        values,
+        current_values,
+        outputs,
+        [
+            first_rows.each_ref().map(|score| &score[..]),
+            second_rows.each_ref().map(|score| &score[..]),
+        ],
+        position,
+        packed_scratch,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Validate full six-head prefill tile invariants before chunk or KV-group dispatch."
+)]
+fn validate_tile_inputs(
     geometry: &Geometry,
     first_position: usize,
     queries: &[Vec<f32>],
@@ -388,12 +531,10 @@ pub(super) fn attend_tile_chunk(
     values: &KvCache,
     current_keys: &[Vec<f32>],
     current_values: &[Vec<f32>],
-    outputs: &mut [Vec<f32>],
-    scores: &mut [f32],
+    count: usize,
+    scores_len: usize,
     score_stride: usize,
-    scale: f32,
 ) -> Result<()> {
-    let count = outputs.len();
     let score_extent = first_position
         .checked_add(count)
         .and_then(|positions| positions.checked_mul(6));
@@ -406,15 +547,11 @@ pub(super) fn attend_tile_chunk(
         || projected.len() != count
         || current_keys.len() != count
         || current_values.len() != count
-        || count.checked_mul(score_stride) != Some(scores.len())
+        || count.checked_mul(score_stride) != Some(scores_len)
         || score_extent.is_none_or(|extent| score_stride < extent)
-        || outputs
-            .iter()
-            .any(|output| output.len() != geometry.heads * geometry.head)
     {
         return Err(invalid("invalid six-head attention tile geometry"));
     }
-    // Validate all borrowed rows before paired indexing or output publication.
     let width = geometry.head;
     let last_position = first_position
         .checked_add(count - 1)
@@ -435,6 +572,52 @@ pub(super) fn attend_tile_chunk(
     {
         return Err(invalid("invalid six-head attention paired causal geometry"));
     }
+    Ok(())
+}
+
+// Each caller worker owns complete token rows and its six-head score storage.
+// Keep the cache owner immutable and reuse one six-head group at a time rather
+// than falling back to two independent tail heads in Swift's 6:1 GQA geometry.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Paired causal scoring and publication retain borrowed token rows, exact extents and caller-owned score storage."
+)]
+pub(super) fn attend_tile_chunk(
+    geometry: &Geometry,
+    first_position: usize,
+    queries: &[Vec<f32>],
+    projected: &[Vec<f32>],
+    keys: &KvCache,
+    values: &KvCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    outputs: &mut [Vec<f32>],
+    scores: &mut [f32],
+    score_stride: usize,
+    scale: f32,
+) -> Result<()> {
+    let count = outputs.len();
+    let width = geometry.head;
+    if outputs
+        .iter()
+        .any(|output| output.len() != geometry.heads * width)
+    {
+        return Err(invalid("invalid six-head attention tile geometry"));
+    }
+    validate_tile_inputs(
+        geometry,
+        first_position,
+        queries,
+        projected,
+        keys,
+        values,
+        current_keys,
+        current_values,
+        count,
+        scores.len(),
+        score_stride,
+    )?;
+    let mut packed_scratch = [Vec::new(), Vec::new()];
     for (pair_index, pair_output) in outputs.chunks_mut(2).enumerate() {
         let first = pair_index * 2;
         let position = first_position + first;
@@ -443,7 +626,7 @@ pub(super) fn attend_tile_chunk(
         let [first_output, second_output] = pair_output else {
             let output = &mut pair_output[0];
             for head in (0..geometry.heads).step_by(6) {
-                attend_prefix(
+                attend_prefix_with_scratch(
                     geometry,
                     head,
                     &queries[first],
@@ -456,66 +639,126 @@ pub(super) fn attend_tile_chunk(
                     &mut output[head * width..(head + 6) * width],
                     &mut pair_scores[..6 * (position + 1)],
                     scale,
+                    &mut packed_scratch[0],
                 )?;
             }
             continue;
         };
         let (first_scores, second_scores) = pair_scores.split_at_mut(score_stride);
         for head in (0..geometry.heads).step_by(6) {
-            let offset = head / 6 * width;
-            let query_rows: [[&[f32]; 6]; 2] = std::array::from_fn(|token| {
-                std::array::from_fn(|index| {
-                    &queries[first + token][(head + index) * width..(head + index + 1) * width]
-                })
-            });
-            let mut score_rows = [
-                rows(&mut first_scores[..6 * (position + 1)], position + 1)?,
-                rows(&mut second_scores[..6 * (position + 2)], position + 2)?,
-            ];
-            for (cached, key) in keys.tokens().take(position + 1).enumerate() {
-                if cached == position {
-                    // Only the second token sees the first token's F16 key;
-                    // each token's own key retains the original F32 path.
-                    let dots = six::dot(&key[offset..offset + width], query_rows[1])?;
-                    for (score, dot) in score_rows[1].iter_mut().zip(dots) {
-                        score[cached] = dot * scale;
-                    }
-                } else {
-                    let dots = six::dot_pair(&key[offset..offset + width], query_rows)?;
-                    for (scores, dots) in score_rows.iter_mut().zip(dots) {
-                        for (score, dot) in scores.iter_mut().zip(dots) {
-                            score[cached] = dot * scale;
-                        }
-                    }
-                }
-            }
-            for (token, scores) in score_rows.iter_mut().enumerate() {
-                for (score, query) in scores.iter_mut().zip(query_rows[token]) {
-                    score[position + token] = pinned_attention::dot_f32(
-                        &current_keys[first + token][offset..offset + width],
-                        query,
-                    )? * scale;
-                    pinned_attention::softmax(score)?;
-                }
-            }
-            let [first_rows, second_rows] = score_rows;
-            apply_values_pair(
+            attend_group_pair(
                 geometry,
                 head,
+                position,
+                [&queries[first], &queries[first + 1]],
                 [&projected[first], &projected[first + 1]],
+                keys,
                 values,
+                [&current_keys[first], &current_keys[first + 1]],
                 [&current_values[first], &current_values[first + 1]],
                 [
                     &mut first_output[head * width..(head + 6) * width],
                     &mut second_output[head * width..(head + 6) * width],
                 ],
-                [
-                    first_rows.each_ref().map(|score| &score[..]),
-                    second_rows.each_ref().map(|score| &score[..]),
-                ],
-                position,
+                first_scores,
+                second_scores,
+                scale,
+                &mut packed_scratch,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Evaluates one six-head KV group (`head..head + 6`) across a contiguous causal
+/// token chunk into a packed `[chunk_tokens][6][width]` output slice.
+///
+/// # Errors
+/// Rejects malformed geometry, out-of-range group heads, oversized chunks, and
+/// nonfinite causal reductions before returning.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Disjoint 2D (token_chunk, kv_head) prefill tasks borrow immutable prompt slices and write disjoint output/score slices."
+)]
+pub(super) fn attend_tile_kv_group(
+    geometry: &Geometry,
+    head: usize,
+    first_position: usize,
+    queries: &[Vec<f32>],
+    projected: &[Vec<f32>],
+    keys: &KvCache,
+    values: &KvCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    outputs: &mut [f32],
+    scores: &mut [f32],
+    score_stride: usize,
+    scale: f32,
+) -> Result<()> {
+    let count = queries.len();
+    let width = geometry.head;
+    if !head.is_multiple_of(6)
+        || head + 6 > geometry.heads
+        || outputs.len() != count.saturating_mul(6 * width)
+    {
+        return Err(invalid("invalid six-head attention tile geometry"));
+    }
+    validate_tile_inputs(
+        geometry,
+        first_position,
+        queries,
+        projected,
+        keys,
+        values,
+        current_keys,
+        current_values,
+        count,
+        scores.len(),
+        score_stride,
+    )?;
+    let group_stride = 6 * width;
+    let mut packed_scratch = [Vec::new(), Vec::new()];
+    for (pair_index, pair_output) in outputs.chunks_mut(2 * group_stride).enumerate() {
+        let first = pair_index * 2;
+        let pair_tokens = pair_output.len() / group_stride;
+        let position = first_position + first;
+        let pair_scores = &mut scores[first * score_stride..(first + pair_tokens) * score_stride];
+        if pair_tokens == 1 {
+            attend_prefix_with_scratch(
+                geometry,
+                head,
+                &queries[first],
+                &projected[first],
+                keys,
+                values,
+                position,
+                &current_keys[first],
+                &current_values[first],
+                pair_output,
+                &mut pair_scores[..6 * (position + 1)],
+                scale,
+                &mut packed_scratch[0],
+            )?;
+            continue;
+        }
+        let outputs_pair = pair_output.split_at_mut(group_stride).into();
+        let (first_scores, second_scores) = pair_scores.split_at_mut(score_stride);
+        attend_group_pair(
+            geometry,
+            head,
+            position,
+            [&queries[first], &queries[first + 1]],
+            [&projected[first], &projected[first + 1]],
+            keys,
+            values,
+            [&current_keys[first], &current_keys[first + 1]],
+            [&current_values[first], &current_values[first + 1]],
+            outputs_pair,
+            first_scores,
+            second_scores,
+            scale,
+            &mut packed_scratch,
+        )?;
     }
     Ok(())
 }

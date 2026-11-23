@@ -92,6 +92,8 @@ pub(super) struct TiledPrefill {
     beta: Vec<Vec<f32>>,
     alpha: Vec<Vec<f32>>,
     attended: Vec<Vec<f32>>,
+    attention_task_outputs: Vec<f32>,
+    attention_task_scores: Vec<f32>,
     attention: Vec<Vec<f32>>,
     frequencies: Vec<Vec<(f32, f32)>>,
     gdn_conv_outputs: Vec<f32>,
@@ -219,6 +221,8 @@ impl TiledPrefill {
             beta: create()?,
             alpha: create()?,
             attended: create()?,
+            attention_task_outputs: Vec::new(),
+            attention_task_scores: Vec::new(),
             attention: create()?,
             frequencies,
             gdn_conv_outputs: Vec::new(),
@@ -1772,6 +1776,622 @@ fn full_attention_kv_only_tile(
     Ok(())
 }
 
+const fn select_2d_attention_chunks(count: usize, kv_heads: usize, workers: usize) -> usize {
+    if count <= 1 || kv_heads <= 1 || workers <= 1 {
+        return 1;
+    }
+    let mut best_chunks = 1;
+    let mut best_active = 0;
+    let mut best_units = usize::MAX;
+    let mut n_chunks = 1;
+    while n_chunks <= count {
+        let units = n_chunks * kv_heads;
+        let task_units = units.div_ceil(workers);
+        let active = units.div_ceil(task_units);
+        if active > best_active || (active == best_active && units < best_units) {
+            best_active = active;
+            best_units = units;
+            best_chunks = n_chunks;
+        }
+        n_chunks += 1;
+    }
+    best_chunks
+}
+
+const fn token_chunk_range(count: usize, n_chunks: usize, chunk_idx: usize) -> (usize, usize) {
+    let base_len = count / n_chunks;
+    let rem = count % n_chunks;
+    let start = chunk_idx * base_len + if chunk_idx < rem { chunk_idx } else { rem };
+    let len = base_len + if chunk_idx < rem { 1 } else { 0 };
+    (start, len)
+}
+
+enum AttendedSlice<'a> {
+    TokenRows(&'a mut [Vec<f32>]),
+    FlatKvGroup {
+        rows: &'a mut [f32],
+        base_head: usize,
+        row_stride: usize,
+        head_width: usize,
+    },
+}
+
+type PairFourHeadSlices<'a> = ([&'a mut [f32]; 4], [&'a mut [f32]; 4]);
+
+impl AttendedSlice<'_> {
+    fn head_slice_mut(&mut self, tok_offset: usize, head: usize, width: usize) -> &mut [f32] {
+        match self {
+            Self::TokenRows(rows) => &mut rows[tok_offset][head * width..(head + 1) * width],
+            Self::FlatKvGroup {
+                rows,
+                base_head,
+                row_stride,
+                head_width,
+            } => {
+                let start = tok_offset * *row_stride + (head - *base_head) * *head_width;
+                &mut rows[start..start + width]
+            }
+        }
+    }
+
+    fn pair_four_heads_mut(
+        &mut self,
+        t0: usize,
+        t1: usize,
+        head: usize,
+        width: usize,
+    ) -> Result<PairFourHeadSlices<'_>> {
+        let (tok0, tok1) = match self {
+            Self::TokenRows(rows) => {
+                let (head_rows, tail_rows) = rows.split_at_mut(t1);
+                let start = head * width;
+                let end = (head + 4) * width;
+                (
+                    &mut head_rows[t0][start..end],
+                    &mut tail_rows[0][start..end],
+                )
+            }
+            Self::FlatKvGroup {
+                rows,
+                base_head,
+                row_stride,
+                head_width,
+            } => {
+                let stride = *row_stride;
+                let start = (head - *base_head) * *head_width;
+                let end = start + 4 * width;
+                let (_, tail) = rows.split_at_mut(t0 * stride);
+                let (row0, row1_and_more) = tail.split_at_mut(stride);
+                (&mut row0[start..end], &mut row1_and_more[start..end])
+            }
+        };
+        let (r0_left, r0_right) = tok0.split_at_mut(2 * width);
+        let (r0_0, r0_1) = r0_left.split_at_mut(width);
+        let (r0_2, r0_3) = r0_right.split_at_mut(width);
+        let (r1_left, r1_right) = tok1.split_at_mut(2 * width);
+        let (r1_0, r1_1) = r1_left.split_at_mut(width);
+        let (r1_2, r1_3) = r1_right.split_at_mut(width);
+        if r0_0.len() != width || r1_0.len() != width {
+            return Err(invalid("invalid generic attention output slice length"));
+        }
+        Ok(([r0_0, r0_1, r0_2, r0_3], [r1_0, r1_1, r1_2, r1_3]))
+    }
+
+    fn four_heads_mut(&mut self, t: usize, head: usize, width: usize) -> Result<[&mut [f32]; 4]> {
+        let row = match self {
+            Self::TokenRows(rows) => &mut rows[t][head * width..(head + 4) * width],
+            Self::FlatKvGroup {
+                rows,
+                base_head,
+                row_stride,
+                head_width,
+            } => {
+                let start = t * *row_stride + (head - *base_head) * *head_width;
+                &mut rows[start..start + 4 * width]
+            }
+        };
+        let (r01, r23) = row.split_at_mut(2 * width);
+        let (r0, r1) = r01.split_at_mut(width);
+        let (r2, r3) = r23.split_at_mut(width);
+        if r0.len() != width {
+            return Err(invalid("invalid generic attention output slice length"));
+        }
+        Ok([r0, r1, r2, r3])
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Evaluates one KV-head range across a causal token chunk for both 1D token chunks and 2D (token_chunk, kv_head) tasks."
+)]
+fn attend_generic_head_range(
+    g: &Geometry,
+    arithmetic: Arithmetic,
+    base: usize,
+    base_tok: usize,
+    chunk_tokens: usize,
+    head_start: usize,
+    head_end: usize,
+    heads_per_kv: usize,
+    max_score_len: usize,
+    token_score_stride: usize,
+    scale: f32,
+    key_cache: &KvCache,
+    value_cache: &KvCache,
+    query_ref: &[Vec<f32>],
+    projected_ref: &[Vec<f32>],
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    mut attended_out: AttendedSlice<'_>,
+    scores_chunk: &mut [f32],
+) -> Result<()> {
+    let mut head = head_start;
+    while head < head_end {
+        let kv_head = head / heads_per_kv;
+        let offset = kv_head * g.head;
+        if head + 4 <= head_end && kv_head == (head + 3) / heads_per_kv {
+            let shared_prefix_len = base + base_tok;
+            let total_past = shared_prefix_len + chunk_tokens.saturating_sub(1);
+            let score_one_key = |scores_chunk: &mut [f32],
+                                 pos: usize,
+                                 past_key: &[u16],
+                                 start_t: usize,
+                                 end_t: usize|
+             -> Result<()> {
+                let mut t = start_t;
+                while t + 2 <= end_t {
+                    let tok0 = base_tok + t;
+                    let tok1 = tok0 + 1;
+                    let queries0 = std::array::from_fn(|i| {
+                        let h = head + i;
+                        &query_ref[tok0][h * g.head..(h + 1) * g.head]
+                    });
+                    let queries1 = std::array::from_fn(|i| {
+                        let h = head + i;
+                        &query_ref[tok1][h * g.head..(h + 1) * g.head]
+                    });
+                    let (dots0, dots1) = arithmetic
+                        .attention_dot_two_token_four_queries(queries0, queries1, past_key)?;
+                    {
+                        let tok0_scores =
+                            &mut scores_chunk[t * token_score_stride..(t + 1) * token_score_stride];
+                        tok0_scores[pos] = dots0[0] * scale;
+                        tok0_scores[max_score_len + pos] = dots0[1] * scale;
+                        tok0_scores[2 * max_score_len + pos] = dots0[2] * scale;
+                        tok0_scores[3 * max_score_len + pos] = dots0[3] * scale;
+                    }
+                    {
+                        let tok1_scores = &mut scores_chunk
+                            [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
+                        tok1_scores[pos] = dots1[0] * scale;
+                        tok1_scores[max_score_len + pos] = dots1[1] * scale;
+                        tok1_scores[2 * max_score_len + pos] = dots1[2] * scale;
+                        tok1_scores[3 * max_score_len + pos] = dots1[3] * scale;
+                    }
+                    t += 2;
+                }
+                for rem_t in t..end_t {
+                    let tok = base_tok + rem_t;
+                    let queries = std::array::from_fn(|i| {
+                        let h = head + i;
+                        &query_ref[tok][h * g.head..(h + 1) * g.head]
+                    });
+                    let dots = arithmetic.attention_dot_four(queries, past_key)?;
+                    let tok_scores = &mut scores_chunk
+                        [rem_t * token_score_stride..(rem_t + 1) * token_score_stride];
+                    tok_scores[pos] = dots[0] * scale;
+                    tok_scores[max_score_len + pos] = dots[1] * scale;
+                    tok_scores[2 * max_score_len + pos] = dots[2] * scale;
+                    tok_scores[3 * max_score_len + pos] = dots[3] * scale;
+                }
+                Ok(())
+            };
+            let score_two_keys = |scores_chunk: &mut [f32],
+                                  pos0: usize,
+                                  keys2: [&[u16]; 2],
+                                  start_t: usize,
+                                  end_t: usize|
+             -> Result<()> {
+                let mut t = start_t;
+                while t + 2 <= end_t {
+                    let tok0 = base_tok + t;
+                    let tok1 = tok0 + 1;
+                    let queries0 = std::array::from_fn(|i| {
+                        let h = head + i;
+                        &query_ref[tok0][h * g.head..(h + 1) * g.head]
+                    });
+                    let queries1 = std::array::from_fn(|i| {
+                        let h = head + i;
+                        &query_ref[tok1][h * g.head..(h + 1) * g.head]
+                    });
+                    let (dots0_2, dots1_2) = arithmetic
+                        .attention_dot_two_keys_two_token_four_queries(queries0, queries1, keys2)?;
+                    {
+                        let tok0_scores =
+                            &mut scores_chunk[t * token_score_stride..(t + 1) * token_score_stride];
+                        for (k_off, dots) in dots0_2.into_iter().enumerate() {
+                            let pos = pos0 + k_off;
+                            tok0_scores[pos] = dots[0] * scale;
+                            tok0_scores[max_score_len + pos] = dots[1] * scale;
+                            tok0_scores[2 * max_score_len + pos] = dots[2] * scale;
+                            tok0_scores[3 * max_score_len + pos] = dots[3] * scale;
+                        }
+                    }
+                    {
+                        let tok1_scores = &mut scores_chunk
+                            [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
+                        for (k_off, dots) in dots1_2.into_iter().enumerate() {
+                            let pos = pos0 + k_off;
+                            tok1_scores[pos] = dots[0] * scale;
+                            tok1_scores[max_score_len + pos] = dots[1] * scale;
+                            tok1_scores[2 * max_score_len + pos] = dots[2] * scale;
+                            tok1_scores[3 * max_score_len + pos] = dots[3] * scale;
+                        }
+                    }
+                    t += 2;
+                }
+                if t < end_t {
+                    let tok = base_tok + t;
+                    let queries = std::array::from_fn(|i| {
+                        let h = head + i;
+                        &query_ref[tok][h * g.head..(h + 1) * g.head]
+                    });
+                    let dots2 = arithmetic.attention_dot_two_keys_four_queries(queries, keys2)?;
+                    let tok_scores =
+                        &mut scores_chunk[t * token_score_stride..(t + 1) * token_score_stride];
+                    for (k_off, dots) in dots2.into_iter().enumerate() {
+                        let pos = pos0 + k_off;
+                        tok_scores[pos] = dots[0] * scale;
+                        tok_scores[max_score_len + pos] = dots[1] * scale;
+                        tok_scores[2 * max_score_len + pos] = dots[2] * scale;
+                        tok_scores[3 * max_score_len + pos] = dots[3] * scale;
+                    }
+                }
+                Ok(())
+            };
+            let mut past_iter = key_cache.tokens().take(total_past).enumerate();
+            while let Some((pos0, p0)) = past_iter.next() {
+                if pos0 + 4 <= total_past
+                    && let Some((_, p1)) = past_iter.next()
+                    && let Some((_, p2)) = past_iter.next()
+                    && let Some((_, p3)) = past_iter.next()
+                {
+                    let keys4 = [
+                        &p0[offset..offset + g.head],
+                        &p1[offset..offset + g.head],
+                        &p2[offset..offset + g.head],
+                        &p3[offset..offset + g.head],
+                    ];
+                    let common_t = (pos0 + 4)
+                        .saturating_sub(shared_prefix_len)
+                        .min(chunk_tokens);
+                    if common_t > 0 {
+                        let t0 = (pos0 + 1).saturating_sub(shared_prefix_len).min(common_t);
+                        let t1 = (pos0 + 2).saturating_sub(shared_prefix_len).min(common_t);
+                        if t0 < t1 {
+                            score_one_key(scores_chunk, pos0, keys4[0], t0, t1)?;
+                        }
+                        if t1 < common_t {
+                            score_two_keys(scores_chunk, pos0, [keys4[0], keys4[1]], t1, common_t)?;
+                        }
+                        let t2 = (pos0 + 3).saturating_sub(shared_prefix_len).min(common_t);
+                        if t2 < common_t {
+                            score_one_key(scores_chunk, pos0 + 2, keys4[2], t2, common_t)?;
+                        }
+                    }
+                    let mut t = common_t;
+                    while t + 2 <= chunk_tokens {
+                        let tok0 = base_tok + t;
+                        let tok1 = tok0 + 1;
+                        let queries0 = std::array::from_fn(|i| {
+                            let h = head + i;
+                            &query_ref[tok0][h * g.head..(h + 1) * g.head]
+                        });
+                        let queries1 = std::array::from_fn(|i| {
+                            let h = head + i;
+                            &query_ref[tok1][h * g.head..(h + 1) * g.head]
+                        });
+                        let (dots0_4, dots1_4) = arithmetic
+                            .attention_dot_four_keys_two_token_four_queries(
+                                queries0, queries1, keys4,
+                            )?;
+                        let (scores_pair, _) = scores_chunk
+                            [t * token_score_stride..(t + 2) * token_score_stride]
+                            .split_at_mut(token_score_stride);
+                        let tok0_scores = scores_pair;
+                        for (k_off, dots) in dots0_4.into_iter().enumerate() {
+                            let pos = pos0 + k_off;
+                            tok0_scores[pos] = dots[0] * scale;
+                            tok0_scores[max_score_len + pos] = dots[1] * scale;
+                            tok0_scores[2 * max_score_len + pos] = dots[2] * scale;
+                            tok0_scores[3 * max_score_len + pos] = dots[3] * scale;
+                        }
+                        let tok1_scores = &mut scores_chunk
+                            [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
+                        for (k_off, dots) in dots1_4.into_iter().enumerate() {
+                            let pos = pos0 + k_off;
+                            tok1_scores[pos] = dots[0] * scale;
+                            tok1_scores[max_score_len + pos] = dots[1] * scale;
+                            tok1_scores[2 * max_score_len + pos] = dots[2] * scale;
+                            tok1_scores[3 * max_score_len + pos] = dots[3] * scale;
+                        }
+                        t += 2;
+                    }
+                    if t < chunk_tokens {
+                        let tok = base_tok + t;
+                        let queries = std::array::from_fn(|i| {
+                            let h = head + i;
+                            &query_ref[tok][h * g.head..(h + 1) * g.head]
+                        });
+                        let dots4 =
+                            arithmetic.attention_dot_four_keys_four_queries(queries, keys4)?;
+                        let tok_scores =
+                            &mut scores_chunk[t * token_score_stride..(t + 1) * token_score_stride];
+                        for (k_off, dots) in dots4.into_iter().enumerate() {
+                            let pos = pos0 + k_off;
+                            tok_scores[pos] = dots[0] * scale;
+                            tok_scores[max_score_len + pos] = dots[1] * scale;
+                            tok_scores[2 * max_score_len + pos] = dots[2] * scale;
+                            tok_scores[3 * max_score_len + pos] = dots[3] * scale;
+                        }
+                    }
+                    continue;
+                }
+                if pos0 + 2 <= total_past
+                    && let Some((_, p1)) = past_iter.next()
+                {
+                    let keys2 = [&p0[offset..offset + g.head], &p1[offset..offset + g.head]];
+                    let common_t = (pos0 + 2)
+                        .saturating_sub(shared_prefix_len)
+                        .min(chunk_tokens);
+                    let t0 = (pos0 + 1).saturating_sub(shared_prefix_len).min(common_t);
+                    if t0 < common_t {
+                        score_one_key(scores_chunk, pos0, keys2[0], t0, common_t)?;
+                    }
+                    score_two_keys(scores_chunk, pos0, keys2, common_t, chunk_tokens)?;
+                    continue;
+                }
+                let past_key = &p0[offset..offset + g.head];
+                let first_t = (pos0 + 1).saturating_sub(shared_prefix_len);
+                score_one_key(scores_chunk, pos0, past_key, first_t, chunk_tokens)?;
+            }
+            let pairs = chunk_tokens / 2;
+            for pair_idx in 0..pairs {
+                let t0 = pair_idx * 2;
+                let t1 = t0 + 1;
+                let tok0 = base_tok + t0;
+                let tok1 = base_tok + t1;
+                let score_len0 = base + tok0 + 1;
+                let score_len1 = base + tok1 + 1;
+                let queries0 = std::array::from_fn(|i| {
+                    let h = head + i;
+                    &query_ref[tok0][h * g.head..(h + 1) * g.head]
+                });
+                let queries1 = std::array::from_fn(|i| {
+                    let h = head + i;
+                    &query_ref[tok1][h * g.head..(h + 1) * g.head]
+                });
+                let current_dots0 = arithmetic.attention_current_dot_four(
+                    queries0,
+                    &current_keys[tok0][offset..offset + g.head],
+                )?;
+                let current_dots1 = arithmetic.attention_current_dot_four(
+                    queries1,
+                    &current_keys[tok1][offset..offset + g.head],
+                )?;
+                let pair_scores =
+                    &mut scores_chunk[t0 * token_score_stride..(t1 + 1) * token_score_stride];
+                let (tok0_scores, tok1_scores) = pair_scores.split_at_mut(token_score_stride);
+                let (s0_left, s0_right) = tok0_scores.split_at_mut(2 * max_score_len);
+                let (s0_0, s0_1) = s0_left.split_at_mut(max_score_len);
+                let (s0_2, s0_3) = s0_right.split_at_mut(max_score_len);
+                let s0_0 = &mut s0_0[..score_len0];
+                let s0_1 = &mut s0_1[..score_len0];
+                let s0_2 = &mut s0_2[..score_len0];
+                let s0_3 = &mut s0_3[..score_len0];
+                s0_0[score_len0 - 1] = current_dots0[0] * scale;
+                s0_1[score_len0 - 1] = current_dots0[1] * scale;
+                s0_2[score_len0 - 1] = current_dots0[2] * scale;
+                s0_3[score_len0 - 1] = current_dots0[3] * scale;
+                for scores in [&mut *s0_0, &mut *s0_1, &mut *s0_2, &mut *s0_3] {
+                    arithmetic.attention_softmax_round_f16(scores)?;
+                }
+                let (s1_left, s1_right) = tok1_scores.split_at_mut(2 * max_score_len);
+                let (s1_0, s1_1) = s1_left.split_at_mut(max_score_len);
+                let (s1_2, s1_3) = s1_right.split_at_mut(max_score_len);
+                let s1_0 = &mut s1_0[..score_len1];
+                let s1_1 = &mut s1_1[..score_len1];
+                let s1_2 = &mut s1_2[..score_len1];
+                let s1_3 = &mut s1_3[..score_len1];
+                s1_0[score_len1 - 1] = current_dots1[0] * scale;
+                s1_1[score_len1 - 1] = current_dots1[1] * scale;
+                s1_2[score_len1 - 1] = current_dots1[2] * scale;
+                s1_3[score_len1 - 1] = current_dots1[3] * scale;
+                for scores in [&mut *s1_0, &mut *s1_1, &mut *s1_2, &mut *s1_3] {
+                    arithmetic.attention_softmax_round_f16(scores)?;
+                }
+                let probs0: [&[f32]; 4] = [s0_0, s0_1, s0_2, s0_3];
+                let probs1: [&[f32]; 4] = [s1_0, s1_1, s1_2, s1_3];
+                let ([r0_0, r0_1, r0_2, r0_3], [r1_0, r1_1, r1_2, r1_3]) =
+                    attended_out.pair_four_heads_mut(t0, t1, head, g.head)?;
+                let g0_0 = attention_gate(&projected_ref[tok0], head, g.head);
+                let g0_1 = attention_gate(&projected_ref[tok0], head + 1, g.head);
+                let g0_2 = attention_gate(&projected_ref[tok0], head + 2, g.head);
+                let g0_3 = attention_gate(&projected_ref[tok0], head + 3, g.head);
+                let g1_0 = attention_gate(&projected_ref[tok1], head, g.head);
+                let g1_1 = attention_gate(&projected_ref[tok1], head + 1, g.head);
+                let g1_2 = attention_gate(&projected_ref[tok1], head + 2, g.head);
+                let g1_3 = attention_gate(&projected_ref[tok1], head + 3, g.head);
+                for (
+                    tile_idx,
+                    ((((out0_0, out0_1), out0_2), out0_3), (((out1_0, out1_1), out1_2), out1_3)),
+                ) in
+                    r0_0.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS)
+                        .zip(r0_1.chunks_mut(
+                            crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                        ))
+                        .zip(r0_2.chunks_mut(
+                            crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                        ))
+                        .zip(r0_3.chunks_mut(
+                            crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                        ))
+                        .zip(
+                            r1_0.chunks_mut(
+                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                            )
+                            .zip(r1_1.chunks_mut(
+                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                            ))
+                            .zip(r1_2.chunks_mut(
+                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                            ))
+                            .zip(r1_3.chunks_mut(
+                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
+                            )),
+                        )
+                        .enumerate()
+                {
+                    let dimension =
+                        tile_idx * crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS;
+                    let len = out0_0.len();
+                    arithmetic.attention_value_tile_four_two_tokens(
+                        value_cache,
+                        [
+                            &current_values[tok0][offset + dimension..offset + dimension + len],
+                            &current_values[tok1][offset + dimension..offset + dimension + len],
+                        ],
+                        offset + dimension,
+                        probs0,
+                        probs1,
+                        [out0_0, out0_1, out0_2, out0_3],
+                        [out1_0, out1_1, out1_2, out1_3],
+                        [
+                            [
+                                &g0_0[dimension..dimension + len],
+                                &g0_1[dimension..dimension + len],
+                                &g0_2[dimension..dimension + len],
+                                &g0_3[dimension..dimension + len],
+                            ],
+                            [
+                                &g1_0[dimension..dimension + len],
+                                &g1_1[dimension..dimension + len],
+                                &g1_2[dimension..dimension + len],
+                                &g1_3[dimension..dimension + len],
+                            ],
+                        ],
+                    )?;
+                }
+            }
+            if !chunk_tokens.is_multiple_of(2) {
+                let t = pairs * 2;
+                let tok = base_tok + t;
+                let score_len = base + tok + 1;
+                let queries = std::array::from_fn(|i| {
+                    let h = head + i;
+                    &query_ref[tok][h * g.head..(h + 1) * g.head]
+                });
+                let current_dots = arithmetic.attention_current_dot_four(
+                    queries,
+                    &current_keys[tok][offset..offset + g.head],
+                )?;
+                let tok_scores =
+                    &mut scores_chunk[t * token_score_stride..(t + 1) * token_score_stride];
+                let (s01, s23) = tok_scores.split_at_mut(2 * max_score_len);
+                let (s0, s1) = s01.split_at_mut(max_score_len);
+                let (s2, s3) = s23.split_at_mut(max_score_len);
+                let s0 = &mut s0[..score_len];
+                let s1 = &mut s1[..score_len];
+                let s2 = &mut s2[..score_len];
+                let s3 = &mut s3[..score_len];
+                s0[score_len - 1] = current_dots[0] * scale;
+                s1[score_len - 1] = current_dots[1] * scale;
+                s2[score_len - 1] = current_dots[2] * scale;
+                s3[score_len - 1] = current_dots[3] * scale;
+                for scores in [&mut *s0, &mut *s1, &mut *s2, &mut *s3] {
+                    arithmetic.attention_softmax_round_f16(scores)?;
+                }
+                let probs: [&[f32]; 4] = [s0, s1, s2, s3];
+                let [r0, r1, r2, r3] = attended_out.four_heads_mut(t, head, g.head)?;
+                let g0 = attention_gate(&projected_ref[tok], head, g.head);
+                let g1 = attention_gate(&projected_ref[tok], head + 1, g.head);
+                let g2 = attention_gate(&projected_ref[tok], head + 2, g.head);
+                let g3 = attention_gate(&projected_ref[tok], head + 3, g.head);
+                for (tile_idx, (((out0, out1), out2), out3)) in r0
+                    .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR)
+                    .zip(r1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
+                    .zip(r2.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
+                    .zip(r3.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
+                    .enumerate()
+                {
+                    let dimension = tile_idx * crate::kernels::pinned_attention::VALUE_TILE_FOUR;
+                    let len = out0.len();
+                    arithmetic.attention_value_tile_four(
+                        value_cache,
+                        &current_values[tok][offset + dimension..offset + dimension + len],
+                        offset + dimension,
+                        probs,
+                        [out0, out1, out2, out3],
+                        [
+                            &g0[dimension..dimension + len],
+                            &g1[dimension..dimension + len],
+                            &g2[dimension..dimension + len],
+                            &g3[dimension..dimension + len],
+                        ],
+                    )?;
+                }
+            }
+            head += 4;
+            continue;
+        }
+        for (pos, past) in key_cache
+            .tokens()
+            .take(base + base_tok + chunk_tokens.saturating_sub(1))
+            .enumerate()
+        {
+            let past_key = &past[offset..offset + g.head];
+            let first_t = (pos + 1).saturating_sub(base + base_tok);
+            for t in first_t..chunk_tokens {
+                let tok = base_tok + t;
+                let q = &query_ref[tok][head * g.head..(head + 1) * g.head];
+                scores_chunk[t * token_score_stride + pos] =
+                    arithmetic.attention_dot(q, past_key)? * scale;
+            }
+        }
+        for t in 0..chunk_tokens {
+            let tok = base_tok + t;
+            let score_len = base + tok + 1;
+            let q = &query_ref[tok][head * g.head..(head + 1) * g.head];
+            let scores =
+                &mut scores_chunk[t * token_score_stride..t * token_score_stride + score_len];
+            scores[score_len - 1] = arithmetic
+                .attention_current_dot(q, &current_keys[tok][offset..offset + g.head])?
+                * scale;
+            arithmetic.attention_softmax_round_f16(scores)?;
+            let result = attended_out.head_slice_mut(t, head, g.head);
+            let g_head = attention_gate(&projected_ref[tok], head, g.head);
+            for (tile_idx, out) in result
+                .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
+                .enumerate()
+            {
+                let dimension = tile_idx * crate::kernels::pinned_attention::VALUE_TILE;
+                let len = out.len();
+                arithmetic.attention_value_tile(
+                    value_cache,
+                    &current_values[tok][offset + dimension..offset + dimension + len],
+                    offset + dimension,
+                    scores,
+                    out,
+                )?;
+                crate::kernels::mul_sigmoid_in_place(out, &g_head[dimension..dimension + len]);
+            }
+        }
+        head += 1;
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2006,12 +2626,119 @@ fn full_attention_tile(
         matches!(arithmetic, Arithmetic::PinnedSwift) && g.heads / g.kv_heads == 6;
     let score_heads = if six_head_groups { 6 } else { 4 };
     let token_score_stride = score_heads * max_score_len;
+    let heads_per_kv = g.heads / g.kv_heads;
+    let workers = tile.projector.row_parallelism().workers();
     resize_attention_scores(
         count * score_heads,
         max_score_len,
         keys.maximum / keys.width,
         &mut attention_scratch.scores,
     )?;
+    if count < workers && g.kv_heads > 1 {
+        let n_chunks = select_2d_attention_chunks(count, g.kv_heads, workers);
+        let max_chunk_tokens = count.div_ceil(n_chunks);
+        let kv_out_len = heads_per_kv * g.head;
+        let chunk_out_unit = checked_product(&[max_chunk_tokens, kv_out_len])?;
+        let chunk_score_unit = checked_product(&[max_chunk_tokens, token_score_stride])?;
+        let total_tasks = n_chunks * g.kv_heads;
+        let total_score_rows = checked_product(&[total_tasks, max_chunk_tokens, score_heads])?;
+        let total_out_elems = checked_product(&[total_tasks, chunk_out_unit])?;
+        resize_attention_scores(
+            total_score_rows,
+            max_score_len,
+            keys.maximum / keys.width,
+            &mut tile.attention_task_scores,
+        )?;
+        resize_into(total_out_elems, &mut tile.attention_task_outputs)?;
+        let query_ref: &[Vec<f32>] = &tile.up[..count];
+        let projected_ref: &[Vec<f32>] = &tile.mixed[..count];
+        let current_keys: &[Vec<f32>] = &tile.recurrent_gate[..count];
+        let current_values: &[Vec<f32>] = &tile.beta[..count];
+        let key_cache: &KvCache = keys;
+        let value_cache: &KvCache = values;
+        tile.projector.row_parallelism().update_paired_chunks(
+            &mut tile.attention_task_outputs[..total_out_elems],
+            chunk_out_unit,
+            &mut tile.attention_task_scores[..total_tasks * chunk_score_unit],
+            chunk_score_unit,
+            |base_task, out_chunk, scores_chunk| {
+                for (local, (task_out, task_scores)) in out_chunk
+                    .chunks_exact_mut(chunk_out_unit)
+                    .zip(scores_chunk.chunks_exact_mut(chunk_score_unit))
+                    .enumerate()
+                {
+                    let task_idx = base_task + local;
+                    let chunk_idx = task_idx / g.kv_heads;
+                    let kv_head = task_idx % g.kv_heads;
+                    let (tok_start, chunk_tokens) = token_chunk_range(count, n_chunks, chunk_idx);
+                    let tok_end = tok_start + chunk_tokens;
+                    let active_out = &mut task_out[..chunk_tokens * kv_out_len];
+                    let active_scores = &mut task_scores[..chunk_tokens * token_score_stride];
+                    let head_start = kv_head * heads_per_kv;
+                    if six_head_groups {
+                        super::attention_six::attend_tile_kv_group(
+                            g,
+                            head_start,
+                            base + tok_start,
+                            &query_ref[tok_start..tok_end],
+                            &projected_ref[tok_start..tok_end],
+                            key_cache,
+                            value_cache,
+                            &current_keys[tok_start..tok_end],
+                            &current_values[tok_start..tok_end],
+                            active_out,
+                            active_scores,
+                            token_score_stride,
+                            scale,
+                        )?;
+                    } else {
+                        attend_generic_head_range(
+                            g,
+                            arithmetic,
+                            base,
+                            tok_start,
+                            chunk_tokens,
+                            head_start,
+                            head_start + heads_per_kv,
+                            heads_per_kv,
+                            max_score_len,
+                            token_score_stride,
+                            scale,
+                            key_cache,
+                            value_cache,
+                            query_ref,
+                            projected_ref,
+                            current_keys,
+                            current_values,
+                            AttendedSlice::FlatKvGroup {
+                                rows: active_out,
+                                base_head: head_start,
+                                row_stride: kv_out_len,
+                                head_width: g.head,
+                            },
+                            active_scores,
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        for chunk_idx in 0..n_chunks {
+            let (tok_start, chunk_tokens) = token_chunk_range(count, n_chunks, chunk_idx);
+            for kv_head in 0..g.kv_heads {
+                let task_idx = chunk_idx * g.kv_heads + kv_head;
+                let task_out = &tile.attention_task_outputs[task_idx * chunk_out_unit
+                    ..task_idx * chunk_out_unit + chunk_tokens * kv_out_len];
+                let out_offset = kv_head * kv_out_len;
+                for local_tok in 0..chunk_tokens {
+                    let src = &task_out[local_tok * kv_out_len..(local_tok + 1) * kv_out_len];
+                    tile.attended[tok_start + local_tok][out_offset..out_offset + kv_out_len]
+                        .copy_from_slice(src);
+                }
+            }
+        }
+        return Ok(());
+    }
     let query_ref: &[Vec<f32>] = &tile.up[..count];
     // The projected query/gate rows stay immutable through score/value work.
     let projected_ref: &[Vec<f32>] = &tile.mixed[..count];
@@ -2019,7 +2746,6 @@ fn full_attention_tile(
     let current_values: &[Vec<f32>] = &tile.beta[..count];
     let key_cache: &KvCache = keys;
     let value_cache: &KvCache = values;
-    let heads_per_kv = g.heads / g.kv_heads;
     tile.projector.row_parallelism().update_paired_chunks(
         &mut tile.attended[..count],
         1,
@@ -2044,504 +2770,27 @@ fn full_attention_tile(
                     scale,
                 );
             }
-            let mut head = 0;
-            while head < g.heads {
-                let kv_head = head / heads_per_kv;
-                let offset = kv_head * g.head;
-                if head + 4 <= g.heads && kv_head == (head + 3) / heads_per_kv {
-                    let shared_prefix_len = base + base_tok;
-                    let total_past = shared_prefix_len + chunk_tokens.saturating_sub(1);
-                    let score_one_key = |scores_chunk: &mut [f32],
-                                         pos: usize,
-                                         past_key: &[u16],
-                                         start_t: usize,
-                                         end_t: usize|
-                     -> Result<()> {
-                        let mut t = start_t;
-                        while t + 2 <= end_t {
-                            let tok0 = base_tok + t;
-                            let tok1 = tok0 + 1;
-                            let queries0 = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok0][h * g.head..(h + 1) * g.head]
-                            });
-                            let queries1 = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok1][h * g.head..(h + 1) * g.head]
-                            });
-                            let (dots0, dots1) = arithmetic.attention_dot_two_token_four_queries(
-                                queries0, queries1, past_key,
-                            )?;
-                            {
-                                let tok0_scores = &mut scores_chunk
-                                    [t * token_score_stride..(t + 1) * token_score_stride];
-                                tok0_scores[pos] = dots0[0] * scale;
-                                tok0_scores[max_score_len + pos] = dots0[1] * scale;
-                                tok0_scores[2 * max_score_len + pos] = dots0[2] * scale;
-                                tok0_scores[3 * max_score_len + pos] = dots0[3] * scale;
-                            }
-                            {
-                                let tok1_scores = &mut scores_chunk
-                                    [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
-                                tok1_scores[pos] = dots1[0] * scale;
-                                tok1_scores[max_score_len + pos] = dots1[1] * scale;
-                                tok1_scores[2 * max_score_len + pos] = dots1[2] * scale;
-                                tok1_scores[3 * max_score_len + pos] = dots1[3] * scale;
-                            }
-                            t += 2;
-                        }
-                        for rem_t in t..end_t {
-                            let tok = base_tok + rem_t;
-                            let queries = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok][h * g.head..(h + 1) * g.head]
-                            });
-                            let dots = arithmetic.attention_dot_four(queries, past_key)?;
-                            let tok_scores = &mut scores_chunk
-                                [rem_t * token_score_stride..(rem_t + 1) * token_score_stride];
-                            tok_scores[pos] = dots[0] * scale;
-                            tok_scores[max_score_len + pos] = dots[1] * scale;
-                            tok_scores[2 * max_score_len + pos] = dots[2] * scale;
-                            tok_scores[3 * max_score_len + pos] = dots[3] * scale;
-                        }
-                        Ok(())
-                    };
-                    let score_two_keys = |scores_chunk: &mut [f32],
-                                          pos0: usize,
-                                          keys2: [&[u16]; 2],
-                                          start_t: usize,
-                                          end_t: usize|
-                     -> Result<()> {
-                        let mut t = start_t;
-                        while t + 2 <= end_t {
-                            let tok0 = base_tok + t;
-                            let tok1 = tok0 + 1;
-                            let queries0 = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok0][h * g.head..(h + 1) * g.head]
-                            });
-                            let queries1 = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok1][h * g.head..(h + 1) * g.head]
-                            });
-                            let (dots0_2, dots1_2) = arithmetic
-                                .attention_dot_two_keys_two_token_four_queries(
-                                    queries0, queries1, keys2,
-                                )?;
-                            {
-                                let tok0_scores = &mut scores_chunk
-                                    [t * token_score_stride..(t + 1) * token_score_stride];
-                                for (k_off, dots) in dots0_2.into_iter().enumerate() {
-                                    let pos = pos0 + k_off;
-                                    tok0_scores[pos] = dots[0] * scale;
-                                    tok0_scores[max_score_len + pos] = dots[1] * scale;
-                                    tok0_scores[2 * max_score_len + pos] = dots[2] * scale;
-                                    tok0_scores[3 * max_score_len + pos] = dots[3] * scale;
-                                }
-                            }
-                            {
-                                let tok1_scores = &mut scores_chunk
-                                    [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
-                                for (k_off, dots) in dots1_2.into_iter().enumerate() {
-                                    let pos = pos0 + k_off;
-                                    tok1_scores[pos] = dots[0] * scale;
-                                    tok1_scores[max_score_len + pos] = dots[1] * scale;
-                                    tok1_scores[2 * max_score_len + pos] = dots[2] * scale;
-                                    tok1_scores[3 * max_score_len + pos] = dots[3] * scale;
-                                }
-                            }
-                            t += 2;
-                        }
-                        if t < end_t {
-                            let tok = base_tok + t;
-                            let queries = std::array::from_fn(|i| {
-                                let h = head + i;
-                                &query_ref[tok][h * g.head..(h + 1) * g.head]
-                            });
-                            let dots2 =
-                                arithmetic.attention_dot_two_keys_four_queries(queries, keys2)?;
-                            let tok_scores = &mut scores_chunk
-                                [t * token_score_stride..(t + 1) * token_score_stride];
-                            for (k_off, dots) in dots2.into_iter().enumerate() {
-                                let pos = pos0 + k_off;
-                                tok_scores[pos] = dots[0] * scale;
-                                tok_scores[max_score_len + pos] = dots[1] * scale;
-                                tok_scores[2 * max_score_len + pos] = dots[2] * scale;
-                                tok_scores[3 * max_score_len + pos] = dots[3] * scale;
-                            }
-                        }
-                        Ok(())
-                    };
-                    let mut past_iter = key_cache.tokens().take(total_past).enumerate();
-                    while let Some((pos0, p0)) = past_iter.next() {
-                        if pos0 + 4 <= total_past
-                            && let Some((_, p1)) = past_iter.next()
-                            && let Some((_, p2)) = past_iter.next()
-                            && let Some((_, p3)) = past_iter.next()
-                        {
-                            let keys4 = [
-                                &p0[offset..offset + g.head],
-                                &p1[offset..offset + g.head],
-                                &p2[offset..offset + g.head],
-                                &p3[offset..offset + g.head],
-                            ];
-                            let common_t = (pos0 + 4)
-                                .saturating_sub(shared_prefix_len)
-                                .min(chunk_tokens);
-                            if common_t > 0 {
-                                let t0 = (pos0 + 1).saturating_sub(shared_prefix_len).min(common_t);
-                                let t1 = (pos0 + 2).saturating_sub(shared_prefix_len).min(common_t);
-                                if t0 < t1 {
-                                    score_one_key(scores_chunk, pos0, keys4[0], t0, t1)?;
-                                }
-                                if t1 < common_t {
-                                    score_two_keys(
-                                        scores_chunk,
-                                        pos0,
-                                        [keys4[0], keys4[1]],
-                                        t1,
-                                        common_t,
-                                    )?;
-                                }
-                                let t2 = (pos0 + 3).saturating_sub(shared_prefix_len).min(common_t);
-                                if t2 < common_t {
-                                    score_one_key(scores_chunk, pos0 + 2, keys4[2], t2, common_t)?;
-                                }
-                            }
-                            let mut t = common_t;
-                            while t + 2 <= chunk_tokens {
-                                let tok0 = base_tok + t;
-                                let tok1 = tok0 + 1;
-                                let queries0 = std::array::from_fn(|i| {
-                                    let h = head + i;
-                                    &query_ref[tok0][h * g.head..(h + 1) * g.head]
-                                });
-                                let queries1 = std::array::from_fn(|i| {
-                                    let h = head + i;
-                                    &query_ref[tok1][h * g.head..(h + 1) * g.head]
-                                });
-                                let (dots0_4, dots1_4) = arithmetic
-                                    .attention_dot_four_keys_two_token_four_queries(
-                                        queries0, queries1, keys4,
-                                    )?;
-                                let (scores_pair, _) = scores_chunk
-                                    [t * token_score_stride..(t + 2) * token_score_stride]
-                                    .split_at_mut(token_score_stride);
-                                let tok0_scores = scores_pair;
-                                for (k_off, dots) in dots0_4.into_iter().enumerate() {
-                                    let pos = pos0 + k_off;
-                                    tok0_scores[pos] = dots[0] * scale;
-                                    tok0_scores[max_score_len + pos] = dots[1] * scale;
-                                    tok0_scores[2 * max_score_len + pos] = dots[2] * scale;
-                                    tok0_scores[3 * max_score_len + pos] = dots[3] * scale;
-                                }
-                                let tok1_scores = &mut scores_chunk
-                                    [(t + 1) * token_score_stride..(t + 2) * token_score_stride];
-                                for (k_off, dots) in dots1_4.into_iter().enumerate() {
-                                    let pos = pos0 + k_off;
-                                    tok1_scores[pos] = dots[0] * scale;
-                                    tok1_scores[max_score_len + pos] = dots[1] * scale;
-                                    tok1_scores[2 * max_score_len + pos] = dots[2] * scale;
-                                    tok1_scores[3 * max_score_len + pos] = dots[3] * scale;
-                                }
-                                t += 2;
-                            }
-                            if t < chunk_tokens {
-                                let tok = base_tok + t;
-                                let queries = std::array::from_fn(|i| {
-                                    let h = head + i;
-                                    &query_ref[tok][h * g.head..(h + 1) * g.head]
-                                });
-                                let dots4 = arithmetic
-                                    .attention_dot_four_keys_four_queries(queries, keys4)?;
-                                let tok_scores = &mut scores_chunk
-                                    [t * token_score_stride..(t + 1) * token_score_stride];
-                                for (k_off, dots) in dots4.into_iter().enumerate() {
-                                    let pos = pos0 + k_off;
-                                    tok_scores[pos] = dots[0] * scale;
-                                    tok_scores[max_score_len + pos] = dots[1] * scale;
-                                    tok_scores[2 * max_score_len + pos] = dots[2] * scale;
-                                    tok_scores[3 * max_score_len + pos] = dots[3] * scale;
-                                }
-                            }
-                            continue;
-                        }
-                        if pos0 + 2 <= total_past
-                            && let Some((_, p1)) = past_iter.next()
-                        {
-                            let keys2 =
-                                [&p0[offset..offset + g.head], &p1[offset..offset + g.head]];
-                            let common_t = (pos0 + 2)
-                                .saturating_sub(shared_prefix_len)
-                                .min(chunk_tokens);
-                            let t0 = (pos0 + 1).saturating_sub(shared_prefix_len).min(common_t);
-                            if t0 < common_t {
-                                score_one_key(scores_chunk, pos0, keys2[0], t0, common_t)?;
-                            }
-                            score_two_keys(scores_chunk, pos0, keys2, common_t, chunk_tokens)?;
-                            continue;
-                        }
-                        let past_key = &p0[offset..offset + g.head];
-                        let first_t = (pos0 + 1).saturating_sub(shared_prefix_len);
-                        score_one_key(scores_chunk, pos0, past_key, first_t, chunk_tokens)?;
-                    }
-                    let (attended_pairs, attended_odd) = attended_chunk.as_chunks_mut::<2>();
-                    for (pair_idx, [attended_tok0, attended_tok1]) in
-                        attended_pairs.iter_mut().enumerate()
-                    {
-                        let t0 = pair_idx * 2;
-                        let t1 = t0 + 1;
-                        let tok0 = base_tok + t0;
-                        let tok1 = base_tok + t1;
-                        let score_len0 = base + tok0 + 1;
-                        let score_len1 = base + tok1 + 1;
-                        let queries0 = std::array::from_fn(|i| {
-                            let h = head + i;
-                            &query_ref[tok0][h * g.head..(h + 1) * g.head]
-                        });
-                        let queries1 = std::array::from_fn(|i| {
-                            let h = head + i;
-                            &query_ref[tok1][h * g.head..(h + 1) * g.head]
-                        });
-                        let current_dots0 = arithmetic.attention_current_dot_four(
-                            queries0,
-                            &current_keys[tok0][offset..offset + g.head],
-                        )?;
-                        let current_dots1 = arithmetic.attention_current_dot_four(
-                            queries1,
-                            &current_keys[tok1][offset..offset + g.head],
-                        )?;
-                        let pair_scores = &mut scores_chunk
-                            [t0 * token_score_stride..(t1 + 1) * token_score_stride];
-                        let (tok0_scores, tok1_scores) =
-                            pair_scores.split_at_mut(token_score_stride);
-                        let (s0_left, s0_right) = tok0_scores.split_at_mut(2 * max_score_len);
-                        let (s0_0, s0_1) = s0_left.split_at_mut(max_score_len);
-                        let (s0_2, s0_3) = s0_right.split_at_mut(max_score_len);
-                        let s0_0 = &mut s0_0[..score_len0];
-                        let s0_1 = &mut s0_1[..score_len0];
-                        let s0_2 = &mut s0_2[..score_len0];
-                        let s0_3 = &mut s0_3[..score_len0];
-                        s0_0[score_len0 - 1] = current_dots0[0] * scale;
-                        s0_1[score_len0 - 1] = current_dots0[1] * scale;
-                        s0_2[score_len0 - 1] = current_dots0[2] * scale;
-                        s0_3[score_len0 - 1] = current_dots0[3] * scale;
-                        for scores in [&mut *s0_0, &mut *s0_1, &mut *s0_2, &mut *s0_3] {
-                            arithmetic.attention_softmax_round_f16(scores)?;
-                        }
-                        let (s1_left, s1_right) = tok1_scores.split_at_mut(2 * max_score_len);
-                        let (s1_0, s1_1) = s1_left.split_at_mut(max_score_len);
-                        let (s1_2, s1_3) = s1_right.split_at_mut(max_score_len);
-                        let s1_0 = &mut s1_0[..score_len1];
-                        let s1_1 = &mut s1_1[..score_len1];
-                        let s1_2 = &mut s1_2[..score_len1];
-                        let s1_3 = &mut s1_3[..score_len1];
-                        s1_0[score_len1 - 1] = current_dots1[0] * scale;
-                        s1_1[score_len1 - 1] = current_dots1[1] * scale;
-                        s1_2[score_len1 - 1] = current_dots1[2] * scale;
-                        s1_3[score_len1 - 1] = current_dots1[3] * scale;
-                        for scores in [&mut *s1_0, &mut *s1_1, &mut *s1_2, &mut *s1_3] {
-                            arithmetic.attention_softmax_round_f16(scores)?;
-                        }
-                        let probs0: [&[f32]; 4] = [s0_0, s0_1, s0_2, s0_3];
-                        let probs1: [&[f32]; 4] = [s1_0, s1_1, s1_2, s1_3];
-                        let (r0_left, r0_right) = attended_tok0[head * g.head..(head + 4) * g.head]
-                            .split_at_mut(2 * g.head);
-                        let (r0_0, r0_1) = r0_left.split_at_mut(g.head);
-                        let (r0_2, r0_3) = r0_right.split_at_mut(g.head);
-                        let (r1_left, r1_right) = attended_tok1[head * g.head..(head + 4) * g.head]
-                            .split_at_mut(2 * g.head);
-                        let (r1_0, r1_1) = r1_left.split_at_mut(g.head);
-                        let (r1_2, r1_3) = r1_right.split_at_mut(g.head);
-                        let g0_0 = attention_gate(&projected_ref[tok0], head, g.head);
-                        let g0_1 = attention_gate(&projected_ref[tok0], head + 1, g.head);
-                        let g0_2 = attention_gate(&projected_ref[tok0], head + 2, g.head);
-                        let g0_3 = attention_gate(&projected_ref[tok0], head + 3, g.head);
-                        let g1_0 = attention_gate(&projected_ref[tok1], head, g.head);
-                        let g1_1 = attention_gate(&projected_ref[tok1], head + 1, g.head);
-                        let g1_2 = attention_gate(&projected_ref[tok1], head + 2, g.head);
-                        let g1_3 = attention_gate(&projected_ref[tok1], head + 3, g.head);
-                        for (
-                            tile_idx,
-                            (
-                                (((out0_0, out0_1), out0_2), out0_3),
-                                (((out1_0, out1_1), out1_2), out1_3),
-                            ),
-                        ) in r0_0
-                            .chunks_mut(
-                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
-                            )
-                            .zip(r0_1.chunks_mut(
-                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
-                            ))
-                            .zip(r0_2.chunks_mut(
-                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
-                            ))
-                            .zip(r0_3.chunks_mut(
-                                crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
-                            ))
-                            .zip(
-                                r1_0.chunks_mut(
-                                    crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
-                                )
-                                .zip(r1_1.chunks_mut(
-                                    crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
-                                ))
-                                .zip(r1_2.chunks_mut(
-                                    crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
-                                ))
-                                .zip(r1_3.chunks_mut(
-                                    crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS,
-                                )),
-                            )
-                            .enumerate()
-                        {
-                            let dimension = tile_idx
-                                * crate::kernels::pinned_attention::VALUE_TILE_FOUR_TWO_TOKENS;
-                            let len = out0_0.len();
-                            arithmetic.attention_value_tile_four_two_tokens(
-                                value_cache,
-                                [
-                                    &current_values[tok0]
-                                        [offset + dimension..offset + dimension + len],
-                                    &current_values[tok1]
-                                        [offset + dimension..offset + dimension + len],
-                                ],
-                                offset + dimension,
-                                probs0,
-                                probs1,
-                                [out0_0, out0_1, out0_2, out0_3],
-                                [out1_0, out1_1, out1_2, out1_3],
-                                [
-                                    [
-                                        &g0_0[dimension..dimension + len],
-                                        &g0_1[dimension..dimension + len],
-                                        &g0_2[dimension..dimension + len],
-                                        &g0_3[dimension..dimension + len],
-                                    ],
-                                    [
-                                        &g1_0[dimension..dimension + len],
-                                        &g1_1[dimension..dimension + len],
-                                        &g1_2[dimension..dimension + len],
-                                        &g1_3[dimension..dimension + len],
-                                    ],
-                                ],
-                            )?;
-                        }
-                    }
-                    if let Some(attended_tok) = attended_odd.first_mut() {
-                        let t = attended_pairs.len() * 2;
-                        let tok = base_tok + t;
-                        let score_len = base + tok + 1;
-                        let queries = std::array::from_fn(|i| {
-                            let h = head + i;
-                            &query_ref[tok][h * g.head..(h + 1) * g.head]
-                        });
-                        let current_dots = arithmetic.attention_current_dot_four(
-                            queries,
-                            &current_keys[tok][offset..offset + g.head],
-                        )?;
-                        let tok_scores =
-                            &mut scores_chunk[t * token_score_stride..(t + 1) * token_score_stride];
-                        let (s01, s23) = tok_scores.split_at_mut(2 * max_score_len);
-                        let (s0, s1) = s01.split_at_mut(max_score_len);
-                        let (s2, s3) = s23.split_at_mut(max_score_len);
-                        let s0 = &mut s0[..score_len];
-                        let s1 = &mut s1[..score_len];
-                        let s2 = &mut s2[..score_len];
-                        let s3 = &mut s3[..score_len];
-                        s0[score_len - 1] = current_dots[0] * scale;
-                        s1[score_len - 1] = current_dots[1] * scale;
-                        s2[score_len - 1] = current_dots[2] * scale;
-                        s3[score_len - 1] = current_dots[3] * scale;
-                        for scores in [&mut *s0, &mut *s1, &mut *s2, &mut *s3] {
-                            arithmetic.attention_softmax_round_f16(scores)?;
-                        }
-                        let probs: [&[f32]; 4] = [s0, s1, s2, s3];
-                        let (r01, r23) = attended_tok[head * g.head..(head + 4) * g.head]
-                            .split_at_mut(2 * g.head);
-                        let (r0, r1) = r01.split_at_mut(g.head);
-                        let (r2, r3) = r23.split_at_mut(g.head);
-                        let g0 = attention_gate(&projected_ref[tok], head, g.head);
-                        let g1 = attention_gate(&projected_ref[tok], head + 1, g.head);
-                        let g2 = attention_gate(&projected_ref[tok], head + 2, g.head);
-                        let g3 = attention_gate(&projected_ref[tok], head + 3, g.head);
-                        for (tile_idx, (((out0, out1), out2), out3)) in r0
-                            .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR)
-                            .zip(r1.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
-                            .zip(r2.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
-                            .zip(r3.chunks_mut(crate::kernels::pinned_attention::VALUE_TILE_FOUR))
-                            .enumerate()
-                        {
-                            let dimension =
-                                tile_idx * crate::kernels::pinned_attention::VALUE_TILE_FOUR;
-                            let len = out0.len();
-                            arithmetic.attention_value_tile_four(
-                                value_cache,
-                                &current_values[tok][offset + dimension..offset + dimension + len],
-                                offset + dimension,
-                                probs,
-                                [out0, out1, out2, out3],
-                                [
-                                    &g0[dimension..dimension + len],
-                                    &g1[dimension..dimension + len],
-                                    &g2[dimension..dimension + len],
-                                    &g3[dimension..dimension + len],
-                                ],
-                            )?;
-                        }
-                    }
-                    head += 4;
-                    continue;
-                }
-                for (pos, past) in key_cache
-                    .tokens()
-                    .take(base + base_tok + chunk_tokens.saturating_sub(1))
-                    .enumerate()
-                {
-                    let past_key = &past[offset..offset + g.head];
-                    let first_t = (pos + 1).saturating_sub(base + base_tok);
-                    for t in first_t..chunk_tokens {
-                        let tok = base_tok + t;
-                        let q = &query_ref[tok][head * g.head..(head + 1) * g.head];
-                        scores_chunk[t * token_score_stride + pos] =
-                            arithmetic.attention_dot(q, past_key)? * scale;
-                    }
-                }
-                for (t, attended_tok) in attended_chunk.iter_mut().enumerate() {
-                    let tok = base_tok + t;
-                    let score_len = base + tok + 1;
-                    let q = &query_ref[tok][head * g.head..(head + 1) * g.head];
-                    let scores = &mut scores_chunk
-                        [t * token_score_stride..t * token_score_stride + score_len];
-                    scores[score_len - 1] = arithmetic
-                        .attention_current_dot(q, &current_keys[tok][offset..offset + g.head])?
-                        * scale;
-                    arithmetic.attention_softmax_round_f16(scores)?;
-                    let result = &mut attended_tok[head * g.head..(head + 1) * g.head];
-                    let g_head = attention_gate(&projected_ref[tok], head, g.head);
-                    for (tile_idx, out) in result
-                        .chunks_mut(crate::kernels::pinned_attention::VALUE_TILE)
-                        .enumerate()
-                    {
-                        let dimension = tile_idx * crate::kernels::pinned_attention::VALUE_TILE;
-                        let len = out.len();
-                        arithmetic.attention_value_tile(
-                            value_cache,
-                            &current_values[tok][offset + dimension..offset + dimension + len],
-                            offset + dimension,
-                            scores,
-                            out,
-                        )?;
-                        crate::kernels::mul_sigmoid_in_place(
-                            out,
-                            &g_head[dimension..dimension + len],
-                        );
-                    }
-                }
-                head += 1;
-            }
-            Ok(())
+            attend_generic_head_range(
+                g,
+                arithmetic,
+                base,
+                base_tok,
+                chunk_tokens,
+                0,
+                g.heads,
+                heads_per_kv,
+                max_score_len,
+                token_score_stride,
+                scale,
+                key_cache,
+                value_cache,
+                query_ref,
+                projected_ref,
+                current_keys,
+                current_values,
+                AttendedSlice::TokenRows(attended_chunk),
+                scores_chunk,
+            )
         },
     )
 }
@@ -4778,6 +5027,153 @@ mod state_only_gdn_tests {
                     );
                 }
                 _ => return Err(invalid("expected recurrent layer state")),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod attention_2d_tests {
+    use std::sync::Arc;
+
+    use super::super::{
+        ActiveAdapters, AdapterScratch, FullAttention, Geometry, KvCache, KvCachePolicy, Transforms,
+    };
+    use super::{Arithmetic, RowParallelism, TiledPrefill, full_attention_tile};
+    use crate::Result;
+    use crate::kernels::MatvecBackend;
+    use crate::model::Tensor;
+
+    fn sample(index: usize) -> f32 {
+        [0.0, -0.0, 0.33337, -0.251, 0.501, -1.001, 2.001][index % 7]
+    }
+
+    fn test_geometry() -> Geometry {
+        Geometry {
+            embedding: 256,
+            feed_forward: 256,
+            heads: 24,
+            kv_heads: 4,
+            head: 256,
+            rope: 64,
+            rope_sections: [11, 11, 10, 0],
+            rope_base: 10_000_000.0,
+            epsilon: 1e-6,
+            ssm_head: 128,
+            ssm_keys: 16,
+            ssm_values: 48,
+            convolution: 4,
+        }
+    }
+
+    fn run_attention_tile_once(
+        count: usize,
+        workers: usize,
+        arithmetic: Arithmetic,
+    ) -> Result<Vec<Vec<f32>>> {
+        let geometry = test_geometry();
+        let unused = Tensor {
+            name: String::from("unused-2d-attn-test"),
+            dimensions: vec![256, 256],
+            kind: 0,
+            data: Arc::<[u8]>::from([]).into(),
+        };
+        let weights = FullAttention {
+            query: unused.clone(),
+            key: unused.clone(),
+            value: unused.clone(),
+            output: unused,
+            query_norm: vec![1.0; geometry.head],
+            key_norm: vec![1.0; geometry.head],
+        };
+        let base = 63;
+        let mut keys =
+            KvCache::with_policy(geometry.kv_width(), 128, KvCachePolicy::F16, true, true)?;
+        let mut values =
+            KvCache::with_policy(geometry.kv_width(), 128, KvCachePolicy::F16, false, true)?;
+        for position in 0..base {
+            let key: Vec<f32> = (0..geometry.kv_width())
+                .map(|i| sample(i + position))
+                .collect();
+            let value: Vec<f32> = (0..geometry.kv_width())
+                .map(|i| sample(i + 3 * position + 1))
+                .collect();
+            keys.prepare_append(&key)?;
+            values.prepare_append(&value)?;
+            keys.append(&key);
+            values.append(&value);
+        }
+        let parallelism = RowParallelism::new(workers)?;
+        let mut tile = TiledPrefill::new(
+            count,
+            geometry.query_gate_width(),
+            0,
+            MatvecBackend::Scalar,
+            parallelism.clone(),
+        )?;
+        for token in 0..count {
+            tile.mixed[token] = (0..geometry.query_gate_width())
+                .map(|i| sample(i + 2 * token + 2))
+                .collect();
+            tile.recurrent_gate[token] = (0..geometry.kv_width())
+                .map(|i| sample(i + 3 * token + 3))
+                .collect();
+            tile.beta[token] = (0..geometry.kv_width())
+                .map(|i| sample(i + 4 * token + 4))
+                .collect();
+        }
+        let mut projection = super::super::ProjectionScratch::default();
+        projection.matvec.set_row_parallelism(parallelism);
+        let mut adapter_scratch = AdapterScratch::default();
+        let mut attention_scratch = super::super::AttentionScratch::default();
+        let mut frequencies_ready = false;
+        full_attention_tile(
+            &weights,
+            &geometry,
+            arithmetic,
+            &Transforms::default(),
+            base,
+            base,
+            count,
+            &mut frequencies_ready,
+            &mut keys,
+            &mut values,
+            &mut projection,
+            ActiveAdapters::default(),
+            &mut adapter_scratch,
+            &mut attention_scratch,
+            &mut tile,
+            &|| Ok(()),
+        )?;
+        Ok(tile.attended[..count].to_vec())
+    }
+
+    #[test]
+    fn full_attention_tile_2d_short_blocks_match_single_worker_zero_ulp() -> Result<()> {
+        #[cfg(feature = "parallel-rows")]
+        let worker_counts = [1, 2, 4, 12, 18];
+        #[cfg(not(feature = "parallel-rows"))]
+        let worker_counts = [1];
+        for count in [1, 2, 3, 4, 5, 8] {
+            for arithmetic in [Arithmetic::PinnedSwift, Arithmetic::Source] {
+                let expected = run_attention_tile_once(count, 1, arithmetic)?;
+                for workers in worker_counts {
+                    let actual = run_attention_tile_once(count, workers, arithmetic)?;
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .flatten()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .flatten()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        "2D full_attention_tile mismatch count={count}, workers={workers}"
+                    );
+                }
             }
         }
         Ok(())

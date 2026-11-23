@@ -6,11 +6,16 @@ use crate::{Result, invalid};
 pub(crate) const VALUE_TILE: usize = 64;
 
 // Twice the query rows at half the channel width retain the 24 KiB bound.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retain score-chunked fallback for direct paired value kernel parity tests."
+    )
+)]
 #[path = "pinned_attention_pair_values.rs"]
 mod pair_values;
-pub(crate) use pair_values::{
-    PAIR_VALUE_TILE, value_pair_tile_from_scores_gated, value_pair_tile_packed_gated,
-};
+pub(crate) use pair_values::{PAIR_VALUE_TILE, value_pair_tile_packed_gated};
 
 /// Reads and converts each cached F16 key element once across six query heads.
 ///
@@ -38,13 +43,31 @@ pub(crate) fn dot_group<const HEADS: usize>(
 
 /// Shares one cached key conversion across both tokens of a six-head pair.
 ///
-/// Twelve native-lane accumulators occupy 768 bytes, below the existing value
-/// stage's 24 KiB high water. Register pressure and total benefit need separate
-/// ARM64 code-generation and whole-request qualification.
+/// Uses a zero-spill two-pass half-stride NEON reduction (`dot_pair_six_neon`) on
+/// ARM64 Windows MSVC NEON to stay within 28 vector registers with 0-ULP parity.
 ///
 /// # Errors
 /// Rejects malformed rows and nonfinite reductions with the original lane tree.
 pub(crate) fn dot_pair(key: &[u16], queries: [[&[f32]; 6]; 2]) -> Result<[[f32; 6]; 2]> {
+    let len = key.len();
+    if len == 0
+        || len > super::MAX_ATTENTION_HEAD_DIM
+        || queries.iter().flatten().any(|query| query.len() != len)
+    {
+        return Err(invalid(
+            "invalid pinned six-head paired attention dot width",
+        ));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return dot_pair_six_neon(neon, key, queries);
+    }
     let [first, second] = queries;
     let values = dot_many::<12>(
         key,
@@ -59,6 +82,38 @@ pub(crate) fn dot_pair(key: &[u16], queries: [[&[f32]; 6]; 2]) -> Result<[[f32; 
     Ok(std::array::from_fn(|token| {
         std::array::from_fn(|head| values[token * 6 + head])
     }))
+}
+
+/// Evaluates two cached F16 keys against `HEADS` (`HEADS` in `{2, 3, 6}`) query heads
+/// sharing a six-head KV group, halving query loads while preserving the exact lane tree.
+///
+/// # Errors
+/// Rejects unsupported group sizes, empty, mismatched or oversized rows and
+/// nonfinite reductions.
+pub(crate) fn dot_two_keys<const HEADS: usize>(
+    keys: [&[u16]; 2],
+    queries: [&[f32]; HEADS],
+) -> Result<[[f32; HEADS]; 2]> {
+    let len = keys[0].len();
+    if !matches!(HEADS, 2 | 3 | 6)
+        || len == 0
+        || len > super::MAX_ATTENTION_HEAD_DIM
+        || keys[1].len() != len
+        || queries.iter().any(|query| query.len() != len)
+    {
+        return Err(invalid("invalid pinned two-key group attention dot width"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return dot_two_keys_six_neon(neon, keys, queries);
+    }
+    Ok([dot_many(keys[0], queries)?, dot_many(keys[1], queries)?])
 }
 
 fn dot_many<const HEADS: usize>(key: &[u16], queries: [&[f32]; HEADS]) -> Result<[f32; HEADS]> {
@@ -301,6 +356,13 @@ fn value_tile_group_packed_scalar<'a, const HEADS: usize>(
 /// # Errors
 /// Rejects invalid extents, cache-row counts, nonfinite inputs and nonfinite
 /// reductions before publishing any output.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retain chunked-score kernel for direct kernel parity tests."
+    )
+)]
 pub(crate) fn value_tile_six_from_scores_gated<'a>(
     past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
@@ -350,6 +412,13 @@ pub(crate) fn value_tile_six_from_scores_gated<'a>(
     value_tile_six_from_scores_scalar(past, current, scores, &(offset..end), &mut outputs, gates)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retain chunked-score scalar fallback for direct parity tests."
+    )
+)]
 #[expect(
     clippy::large_stack_arrays,
     reason = "The fixed six-head temporal accumulator is bounded to 24 KiB."
@@ -403,6 +472,13 @@ fn value_tile_six_from_scores_scalar<'a>(
     target_env = "msvc",
     target_feature = "neon"
 ))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retain chunked-score NEON decode helper for direct parity tests."
+    )
+)]
 #[inline]
 fn decode_six_single_neon(neon: fearless_simd::Neon, weights: [u16; 6]) -> [f32; 6] {
     use fearless_simd::SimdBase as _;
@@ -428,6 +504,13 @@ fn decode_six_single_neon(neon: fearless_simd::Neon, weights: [u16; 6]) -> [f32;
     target_env = "msvc",
     target_feature = "neon"
 ))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retain chunked-score NEON pair decode helper for direct parity tests."
+    )
+)]
 #[inline]
 fn decode_six_pair_neon(
     neon: fearless_simd::Neon,
@@ -461,6 +544,13 @@ fn decode_six_pair_neon(
     target_env = "msvc",
     target_feature = "neon"
 ))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retain chunked-score NEON fallback for direct parity tests."
+    )
+)]
 #[expect(
     clippy::large_stack_arrays,
     clippy::too_many_lines,
@@ -688,7 +778,7 @@ mod neon;
     target_env = "msvc",
     target_feature = "neon"
 ))]
-use neon::{dot_neon, value_tile_neon};
+use neon::{dot_neon, dot_pair_six_neon, dot_two_keys_six_neon, value_tile_neon};
 
 #[cfg(test)]
 #[path = "pinned_attention_six_tests.rs"]

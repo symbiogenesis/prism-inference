@@ -4,7 +4,9 @@ use std::cell::Cell;
 
 use bonsai_ternary::half_to_float;
 
-use super::{dot, dot_group, dot_pair, value_tile_gated, value_tile_group_packed_gated};
+use super::{
+    dot, dot_group, dot_pair, dot_two_keys, value_tile_gated, value_tile_group_packed_gated,
+};
 
 fn outputs(values: &mut [Vec<f32>; 6]) -> [&mut [f32]; 6] {
     let [first, second, third, fourth, fifth, sixth] = values;
@@ -407,5 +409,192 @@ fn group_scores_and_packed_values_match_six_head_oracle() -> crate::Result<()> {
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn six_head_dot_pair_and_two_keys_match_scalar_zero_ulp_exact_lengths() -> crate::Result<()> {
+    let key_pattern = [
+        0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3555, 0xb555, 0x7bff, 0xfbff,
+    ];
+    let query_pattern = [
+        0.0_f32,
+        -0.0,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        0.125,
+        -0.25,
+        0.5,
+        -1.0,
+    ];
+    for width in [1, 15, 16, 255, 256, 257, 513, 1024] {
+        for shift in [0, 3] {
+            let key0: Vec<u16> = (0..width)
+                .map(|i| key_pattern[(i + shift) % key_pattern.len()])
+                .collect();
+            let key1: Vec<u16> = (0..width)
+                .map(|i| key_pattern[(i * 3 + shift + 1) % key_pattern.len()])
+                .collect();
+            let queries: [[Vec<f32>; 6]; 2] = std::array::from_fn(|tok| {
+                std::array::from_fn(|head| {
+                    (0..width)
+                        .map(|i| {
+                            query_pattern[(i * 5 + tok * 3 + head + shift) % query_pattern.len()]
+                        })
+                        .collect()
+                })
+            });
+            let q0 = queries[0].each_ref().map(Vec::as_slice);
+            let q1 = queries[1].each_ref().map(Vec::as_slice);
+
+            let paired = dot_pair(&key0, [q0, q1])?;
+            assert_eq!(
+                dot(&key0, q0)?.map(f32::to_bits),
+                paired[0].map(f32::to_bits)
+            );
+            assert_eq!(
+                dot(&key0, q1)?.map(f32::to_bits),
+                paired[1].map(f32::to_bits)
+            );
+            for (tok, heads) in queries.iter().enumerate() {
+                for (head, query) in heads.iter().enumerate() {
+                    let expected =
+                        super::super::dot(key0.iter().copied().map(half_to_float), query)?;
+                    assert_eq!(
+                        paired[tok][head].to_bits(),
+                        expected.to_bits(),
+                        "dot_pair width={width} shift={shift} tok={tok} head={head}"
+                    );
+                }
+            }
+
+            let two_keys6 = dot_two_keys([key0.as_slice(), key1.as_slice()], q0)?;
+            assert_eq!(
+                dot_group(&key0, q0)?.map(f32::to_bits),
+                two_keys6[0].map(f32::to_bits)
+            );
+            assert_eq!(
+                dot_group(&key1, q0)?.map(f32::to_bits),
+                two_keys6[1].map(f32::to_bits)
+            );
+            for (k_idx, key_slice) in [&key0, &key1].into_iter().enumerate() {
+                for (head, query) in queries[0].iter().enumerate() {
+                    let expected =
+                        super::super::dot(key_slice.iter().copied().map(half_to_float), query)?;
+                    assert_eq!(
+                        two_keys6[k_idx][head].to_bits(),
+                        expected.to_bits(),
+                        "dot_two_keys<6> width={width} shift={shift} key={k_idx} head={head}"
+                    );
+                }
+            }
+
+            let q_three: [&[f32]; 3] = [q0[0], q0[1], q0[2]];
+            let two_keys3 = dot_two_keys([key0.as_slice(), key1.as_slice()], q_three)?;
+            assert_eq!(
+                dot_group(&key0, q_three)?.map(f32::to_bits),
+                two_keys3[0].map(f32::to_bits)
+            );
+            assert_eq!(
+                dot_group(&key1, q_three)?.map(f32::to_bits),
+                two_keys3[1].map(f32::to_bits)
+            );
+
+            let q_two: [&[f32]; 2] = [q0[4], q0[5]];
+            let two_keys2 = dot_two_keys([key0.as_slice(), key1.as_slice()], q_two)?;
+            assert_eq!(
+                dot_group(&key0, q_two)?.map(f32::to_bits),
+                two_keys2[0].map(f32::to_bits)
+            );
+            assert_eq!(
+                dot_group(&key1, q_two)?.map(f32::to_bits),
+                two_keys2[1].map(f32::to_bits)
+            );
+        }
+    }
+
+    assert!(dot_pair(&[0x3c00; 1025], [[&[1.0; 1025]; 6]; 2]).is_err());
+    assert!(dot_two_keys::<6>([&[0x3c00; 1025], &[0x3c00; 1025]], [&[1.0; 1025]; 6]).is_err());
+    assert!(dot_two_keys::<4>([&[0x3c00; 4], &[0x3c00; 4]], [&[1.0; 4]; 4]).is_err());
+    assert!(dot_two_keys::<6>([&[], &[]], [&[]; 6]).is_err());
+    assert!(dot_two_keys::<6>([&[0x3c00; 4], &[0x3c00; 3]], [&[1.0; 4]; 6]).is_err());
+    let mut bad_q = [&[1.0_f32; 4][..]; 6];
+    bad_q[5] = &[1.0_f32, 1.0, 1.0, f32::NAN];
+    assert!(dot_two_keys::<6>([&[0x3c00; 4], &[0x3c00; 4]], bad_q).is_err());
+    Ok(())
+}
+
+#[test]
+fn six_head_packed_values_preserve_zero_ulp_across_pack_chunk_boundaries() -> crate::Result<()> {
+    let val_pattern = [0x0000_u16, 0x8000, 0x3555, 0xb555, 0x3c00, 0xbc00];
+    let score_pattern = [0.0_f32, -0.0, 0.25, -0.5, 0.125, -0.125];
+    let width = 8;
+    for count in [1, 15, 16, 255, 256, 257, 513, 1025] {
+        let rows: Vec<Vec<u16>> = (0..count - 1)
+            .map(|t| {
+                (0..width)
+                    .map(|c| val_pattern[(t + c) % val_pattern.len()])
+                    .collect()
+            })
+            .collect();
+        let current: Vec<f32> = (0..width)
+            .map(|c| half_to_float(val_pattern[(count + c) % val_pattern.len()]))
+            .collect();
+        let scores: [Vec<f32>; 6] = std::array::from_fn(|h| {
+            (0..count)
+                .map(|t| score_pattern[(t * 3 + h) % score_pattern.len()])
+                .collect()
+        });
+        let score_refs = scores.each_ref().map(Vec::as_slice);
+        let mut packed = vec![[0_u16; 6]; count];
+        super::super::pack_f16_rows(score_refs, &mut packed)?;
+        let gates: [Vec<f32>; 6] =
+            std::array::from_fn(|h| vec![if h % 2 == 0 { 0.5 } else { -0.5 }; width]);
+        let mut packed_out: [Vec<f32>; 6] = std::array::from_fn(|_| vec![19.0; width]);
+        value_tile_group_packed_gated::<6>(
+            rows.iter().map(Vec::as_slice),
+            &current,
+            &packed,
+            0,
+            outputs(&mut packed_out),
+            gates.each_ref().map(Vec::as_slice),
+        )?;
+        let mut score_out: [Vec<f32>; 6] = std::array::from_fn(|_| vec![19.0; width]);
+        super::value_tile_six_from_scores_gated(
+            rows.iter().map(Vec::as_slice),
+            &current,
+            score_refs,
+            0,
+            outputs(&mut score_out),
+            gates.each_ref().map(Vec::as_slice),
+        )?;
+        for h in 0..6 {
+            assert_eq!(
+                packed_out[h]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                score_out[h].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "packed vs score value mismatch at count={count}, head={h}"
+            );
+            for (c, &actual) in packed_out[h].iter().enumerate() {
+                let mut f16_weights = Vec::with_capacity(count);
+                for row in &packed {
+                    f16_weights.push(half_to_float(row[h]));
+                }
+                let expected = super::super::dot(
+                    rows.iter()
+                        .map(|r| half_to_float(r[c]))
+                        .chain(std::iter::once(current[c])),
+                    &f16_weights,
+                )? * (1.0 / (1.0 + (-gates[h][c]).exp()));
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "oracle mismatch at count={count}, head={h}, channel={c}"
+                );
+            }
+        }
+    }
     Ok(())
 }

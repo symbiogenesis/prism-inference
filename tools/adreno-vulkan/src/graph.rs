@@ -217,6 +217,12 @@ pub struct VulkanBatchedConfig {
     /// Optional explicit override for Prism `PinnedSwift` vs `Source` integer rounding/FMA contract.
     /// When `None`, auto-detects from verified Swift model SHA-256 identities.
     pub pinned_arithmetic: Option<bool>,
+    /// Maximum prompt tokens evaluated together per batched GPU prefill tile (`1..=256`, default `16`).
+    ///
+    /// Setting `1` forces single-token evaluation inside [`Decoder::ingest_block`]. Larger values
+    /// amortize weight reads across tokens while remaining bounded by `scratch_budget_bytes` and
+    /// device `maxStorageBufferRange` limits.
+    pub prefill_tile_tokens: usize,
 }
 
 impl Default for VulkanBatchedConfig {
@@ -230,6 +236,7 @@ impl Default for VulkanBatchedConfig {
             max_layer_count: None,
             scratch_budget_bytes: 256 * 1024 * 1024,
             pinned_arithmetic: None,
+            prefill_tile_tokens: 16,
         }
     }
 }
@@ -252,24 +259,41 @@ pub struct VulkanLayerPipelines {
     rms_norm: PipelineId,
     add_rms_norm: PipelineId,
     residual_add: PipelineId,
+    residual_add_batched: PipelineId,
     rope: PipelineId,
+    rope_batched: PipelineId,
     mul_sigmoid: PipelineId,
     conv1d_silu: PipelineId,
+    conv1d_silu_offset: PipelineId,
     l2_norm: PipelineId,
     gdn_step: PipelineId,
+    gdn_step_batched_token: PipelineId,
     gdn_gates: PipelineId,
+    gdn_gates_batched: PipelineId,
     deinterleave_q_gate: PipelineId,
+    deinterleave_q_gate_batched: PipelineId,
     round_f16: PipelineId,
     kv_append_f32: PipelineId,
+    kv_append_batched_f32: PipelineId,
     kv_append_f16: PipelineId,
+    kv_append_batched_f16: PipelineId,
     quant_q8_0_source: PipelineId,
+    quant_q8_0_source_batched: PipelineId,
     quant_q8_0_pinned: PipelineId,
+    quant_q8_0_pinned_batched: PipelineId,
     quant_q8_0_pinned_native: PipelineId,
+    quant_q8_0_pinned_native_batched: PipelineId,
+    hadamard_batched: PipelineId,
     f32_matvec: PipelineId,
+    f32_gemm_batched: PipelineId,
     lora_b_accum: PipelineId,
+    lora_b_accum_batched: PipelineId,
     mul_f32_elemwise: PipelineId,
+    mul_f32_elemwise_batched: PipelineId,
     permute_ssm_heads: PipelineId,
+    permute_ssm_heads_batched: PipelineId,
     copy_slice: PipelineId,
+    copy_slice_offset: PipelineId,
     use_sdot: bool,
     attn_qk_digest: String,
     attn_qk_f16kv_digest: String,
@@ -289,13 +313,15 @@ impl VulkanLayerPipelines {
     /// creation or digest calculation fails.
     #[expect(
         clippy::too_many_lines,
-        reason = "Compiles and digests all whole-layer, projection, LoRA, and F32/packed-FP16 attention SPIR-V pipelines sequentially."
+        reason = "Compiles and digests all whole-layer, projection, LoRA, batched prefill, and F32/packed-FP16 attention SPIR-V pipelines sequentially."
     )]
     pub fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         let proj = ProjectionPipelines::compile(device, use_sdot)?;
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v2:")?;
+        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v3:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
+        hash_bytes(&mut hasher, b"proj_bundle:")?;
+        hash_bytes(&mut hasher, proj.digest_sha256.as_bytes())?;
 
         let mut make_pipe = |tag: &[u8],
                              words: Vec<u32>,
@@ -331,26 +357,71 @@ impl VulkanLayerPipelines {
         let (rms_norm, _) = make_pipe(b"rms_norm_f32", spirv::rms_norm_f32(), 3, 2)?;
         let (add_rms_norm, _) = make_pipe(b"add_rms_norm_f32", spirv::add_rms_norm_f32(), 4, 2)?;
         let (residual_add, _) = make_pipe(b"residual_add_f32", spirv::residual_add_f32(), 2, 1)?;
+        let (residual_add_batched, _) = make_pipe(
+            b"residual_add_batched_f32",
+            spirv::residual_add_batched_f32(),
+            2,
+            2,
+        )?;
         let (rope, _) = make_pipe(b"rope_f32", spirv::rope_f32(), 2, 4)?;
+        let (rope_batched, _) = make_pipe(b"rope_batched_f32", spirv::rope_batched_f32(), 2, 5)?;
         let (mul_sigmoid, _) = make_pipe(b"mul_sigmoid_f32", spirv::mul_sigmoid_f32(), 2, 1)?;
         let (conv1d_silu, _) = make_pipe(b"conv1d_silu_f32", spirv::conv1d_silu_f32(), 4, 2)?;
+        let (conv1d_silu_offset, _) = make_pipe(
+            b"conv1d_silu_offset_f32",
+            spirv::conv1d_silu_offset_f32(),
+            4,
+            3,
+        )?;
         let (l2_norm, _) = make_pipe(b"l2_norm_f32", spirv::l2_norm_f32(), 1, 3)?;
         let (gdn_step, _) = make_pipe(b"gdn_step_f32", spirv::gdn_step_f32(), 7, 4)?;
+        let (gdn_step_batched_token, _) = make_pipe(
+            b"gdn_step_batched_token_f32",
+            spirv::gdn_step_batched_token_f32(),
+            5,
+            5,
+        )?;
         let (gdn_gates, _) = make_pipe(b"gdn_gates_f32", spirv::gdn_gates_f32(), 4, 1)?;
+        let (gdn_gates_batched, _) =
+            make_pipe(b"gdn_gates_batched_f32", spirv::gdn_gates_batched_f32(), 4, 2)?;
         let (deinterleave_q_gate, _) = make_pipe(
             b"deinterleave_q_gate_f32",
             spirv::deinterleave_q_gate_f32(),
             3,
             2,
         )?;
+        let (deinterleave_q_gate_batched, _) = make_pipe(
+            b"deinterleave_q_gate_batched_f32",
+            spirv::deinterleave_q_gate_batched_f32(),
+            3,
+            3,
+        )?;
         let (round_f16, _) = make_pipe(b"round_f16_f32", spirv::round_f16_f32(), 1, 1)?;
         let (kv_append_f32, _) = make_pipe(b"kv_append_f32", spirv::kv_append_f32(), 2, 2)?;
+        let (kv_append_batched_f32, _) = make_pipe(
+            b"kv_append_batched_f32",
+            spirv::kv_append_batched_f32(),
+            2,
+            3,
+        )?;
         let (kv_append_f16, _) = make_pipe(b"kv_append_f16", spirv::kv_append_f16(), 2, 2)?;
+        let (kv_append_batched_f16, _) = make_pipe(
+            b"kv_append_batched_f16",
+            spirv::kv_append_batched_f16(),
+            2,
+            3,
+        )?;
         let (quant_q8_0_source, _) = make_pipe(
             b"quant_q8_0_source",
             spirv::quantize_f32_to_q8_0(false, false),
             2,
             1,
+        )?;
+        let (quant_q8_0_source_batched, _) = make_pipe(
+            b"quant_q8_0_source_batched",
+            spirv::quantize_f32_to_q8_0_batched(false, false),
+            2,
+            2,
         )?;
         let (quant_q8_0_pinned, _) = make_pipe(
             b"quant_q8_0_pinned",
@@ -358,23 +429,63 @@ impl VulkanLayerPipelines {
             2,
             1,
         )?;
+        let (quant_q8_0_pinned_batched, _) = make_pipe(
+            b"quant_q8_0_pinned_batched",
+            spirv::quantize_f32_to_q8_0_batched(true, false),
+            2,
+            2,
+        )?;
         let (quant_q8_0_pinned_native, _) = make_pipe(
             b"quant_q8_0_pinned_native",
             spirv::quantize_f32_to_q8_0(true, true),
             2,
             1,
         )?;
+        let (quant_q8_0_pinned_native_batched, _) = make_pipe(
+            b"quant_q8_0_pinned_native_batched",
+            spirv::quantize_f32_to_q8_0_batched(true, true),
+            2,
+            2,
+        )?;
+        let (hadamard_batched, _) = make_pipe(
+            b"ffn_hadamard_batched_f32",
+            spirv::ffn_hadamard_batched_f32(),
+            2,
+            4,
+        )?;
         let (f32_matvec, _) = make_pipe(b"f32_matvec", spirv::f32_matvec(), 3, 2)?;
+        let (f32_gemm_batched, _) =
+            make_pipe(b"f32_gemm_batched", spirv::f32_gemm_batched(), 3, 3)?;
         let (lora_b_accum, _) = make_pipe(b"lora_b_accum_f32", spirv::lora_b_accum_f32(), 3, 3)?;
+        let (lora_b_accum_batched, _) = make_pipe(
+            b"lora_b_accum_batched_f32",
+            spirv::lora_b_accum_batched_f32(),
+            3,
+            4,
+        )?;
         let (mul_f32_elemwise, _) =
             make_pipe(b"mul_f32_elemwise", spirv::mul_f32_elemwise(), 3, 1)?;
+        let (mul_f32_elemwise_batched, _) = make_pipe(
+            b"mul_f32_elemwise_batched",
+            spirv::mul_f32_elemwise_batched(),
+            3,
+            2,
+        )?;
         let (permute_ssm_heads, _) = make_pipe(
             b"permute_ssm_heads_f32",
             spirv::permute_ssm_heads_f32(),
             2,
             3,
         )?;
+        let (permute_ssm_heads_batched, _) = make_pipe(
+            b"permute_ssm_heads_batched_f32",
+            spirv::permute_ssm_heads_batched_f32(),
+            2,
+            4,
+        )?;
         let (copy_slice, _) = make_pipe(b"copy_slice_f32", spirv::copy_slice_f32(), 2, 2)?;
+        let (copy_slice_offset, _) =
+            make_pipe(b"copy_slice_offset_f32", spirv::copy_slice_offset_f32(), 2, 3)?;
 
         let digest_bytes = hasher
             .finish()
@@ -393,24 +504,41 @@ impl VulkanLayerPipelines {
             rms_norm,
             add_rms_norm,
             residual_add,
+            residual_add_batched,
             rope,
+            rope_batched,
             mul_sigmoid,
             conv1d_silu,
+            conv1d_silu_offset,
             l2_norm,
             gdn_step,
+            gdn_step_batched_token,
             gdn_gates,
+            gdn_gates_batched,
             deinterleave_q_gate,
+            deinterleave_q_gate_batched,
             round_f16,
             kv_append_f32,
+            kv_append_batched_f32,
             kv_append_f16,
+            kv_append_batched_f16,
             quant_q8_0_source,
+            quant_q8_0_source_batched,
             quant_q8_0_pinned,
+            quant_q8_0_pinned_batched,
             quant_q8_0_pinned_native,
+            quant_q8_0_pinned_native_batched,
+            hadamard_batched,
             f32_matvec,
+            f32_gemm_batched,
             lora_b_accum,
+            lora_b_accum_batched,
             mul_f32_elemwise,
+            mul_f32_elemwise_batched,
             permute_ssm_heads,
+            permute_ssm_heads_batched,
             copy_slice,
+            copy_slice_offset,
             use_sdot,
             attn_qk_digest,
             attn_qk_f16kv_digest,
@@ -713,6 +841,8 @@ struct GpuGraphScratch {
     lora_ranks: BufferId,
     attn_scores: BufferId,
     attn_probs: BufferId,
+    attn_score_bytes: u64,
+    allocated_tile_tokens: usize,
     logits: BufferId,
     dummy_state: BufferId,
 }
@@ -790,7 +920,9 @@ pub struct VulkanBatchedGraphExecutor {
     scratch: GpuGraphScratch,
     batch_recorder: CommandBatchRecorder,
     host_embed_scratch: Vec<f32>,
+    host_embed_tile_scratch: Vec<f32>,
     host_rope_freqs: Vec<f32>,
+    host_lora_ranks: Vec<f32>,
     rank_one_embed: Option<GpuRankOneEmbed>,
     rank_one_scale: Option<f32>,
     multi_rank_scale: Option<f32>,
@@ -866,6 +998,13 @@ impl VulkanBatchedGraphExecutor {
         adapters: VulkanBatchedAdapters<'_>,
     ) -> Result<Self, Error> {
         config.tdr_policy.validate()?;
+        if config.prefill_tile_tokens == 0 || config.prefill_tile_tokens > MAX_PREFILL_BLOCK_TOKENS
+        {
+            return Err(Error::InvalidInput(format!(
+                "prefill_tile_tokens must be in 1..={MAX_PREFILL_BLOCK_TOKENS}, got {}",
+                config.prefill_tile_tokens
+            )));
+        }
         let preferred_path = if device.capabilities().supports_integer_dot_4x8() {
             ProjectionKernelPath::IntegerDotPacked4x8
         } else {
@@ -899,6 +1038,10 @@ impl VulkanBatchedGraphExecutor {
             .capabilities()
             .compute_limits
             .max_storage_buffer_range;
+        let max_wg = device
+            .capabilities()
+            .compute_limits
+            .max_compute_work_group_count;
 
         let mut guard = BufferCleanupGuard::new(&mut device);
         let transforms = parse_and_upload_transforms(model, &geometry, &mut guard)?;
@@ -1030,8 +1173,10 @@ impl VulkanBatchedGraphExecutor {
         let scratch = allocate_scratch(
             &geometry,
             uploaded_adapters.max_rank,
+            config.prefill_tile_tokens,
             config.scratch_budget_bytes,
             max_storage_range,
+            max_wg,
             &mut guard,
         )?;
 
@@ -1054,7 +1199,10 @@ impl VulkanBatchedGraphExecutor {
         )?;
 
         let _ = min_align;
-        let host_rope_freqs = vec![0.0_f32; geometry.rope];
+        let alloc_tile = scratch.allocated_tile_tokens;
+        let host_rope_freqs = vec![0.0_f32; alloc_tile * geometry.rope];
+        let host_embed_tile_scratch = Vec::with_capacity(alloc_tile * geometry.embedding);
+        let host_lora_ranks = Vec::with_capacity(alloc_tile);
         Ok(Self {
             device,
             pipelines,
@@ -1073,7 +1221,9 @@ impl VulkanBatchedGraphExecutor {
             scratch,
             batch_recorder: CommandBatchRecorder::with_capacity(256),
             host_embed_scratch: Vec::with_capacity(geometry.embedding),
+            host_embed_tile_scratch,
             host_rope_freqs,
+            host_lora_ranks,
             rank_one_embed: uploaded_adapters.rank_one_embed,
             rank_one_scale: uploaded_adapters.rank_one_scale,
             multi_rank_scale: uploaded_adapters.multi_rank_scale,
@@ -1119,6 +1269,21 @@ impl VulkanBatchedGraphExecutor {
     /// [`Error::Unsupported`], or [`Error::Vulkan`].
     pub fn ingest_token(&mut self, token: u32) -> Result<(), Error> {
         self.step_token_impl(token, None)
+    }
+
+    /// Advances model recurrent/KV state on GPU across `tokens` in batched GPU tiles without
+    /// reading logits.
+    ///
+    /// Tiles up to [`VulkanBatchedConfig::prefill_tile_tokens`] (bounded by scratch budget and
+    /// device limits) evaluate together in a single GPU sweep over layer weights, using 4-token
+    /// coalesced GEMM kernels for quantized/F32 projections and `#40` multi-query causal attention.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if `tokens` is empty, contains an out-of-vocabulary token,
+    /// or exceeds `context_limit`, or [`Error::ResourceLimit`]/[`Error::DeviceFault`]/[`Error::Vulkan`]
+    /// on GPU failure.
+    pub fn ingest_tokens_batched(&mut self, tokens: &[u32]) -> Result<(), Error> {
+        self.ingest_tokens_batched_with_check(tokens, &mut || Ok(()))
     }
 
     /// Resets all GPU recurrent GDN/conv state and position counters cleanly back to position `0`.
@@ -1673,15 +1838,16 @@ impl VulkanBatchedGraphExecutor {
         self.device.is_faulted()
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Orchestrates token embedding upload, optional embedding LoRA, RoPE frequencies, chunked GPU execution, and finite logits readback."
-    )]
     fn step_token_impl(
         &mut self,
         token: u32,
         logits_out: Option<&mut Vec<f32>>,
     ) -> Result<(), Error> {
+        self.validate_execution_ready(&[token])?;
+        self.step_tile_impl(&[token], logits_out, &mut || Ok(()))
+    }
+
+    fn validate_execution_ready(&self, tokens: &[u32]) -> Result<(), Error> {
         if self.device.is_faulted() {
             return Err(Error::DeviceFault(
                 "Vulkan batched executor faulted and requires terminal teardown".to_owned(),
@@ -1693,45 +1859,111 @@ impl VulkanBatchedGraphExecutor {
                     .to_owned(),
             ));
         }
-        let token_idx = usize::try_from(token)
-            .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
-        if token_idx >= self.geometry.vocabulary {
+        if tokens.is_empty() {
+            return Err(Error::InvalidInput(
+                "at least one token is required".to_owned(),
+            ));
+        }
+        for &token in tokens {
+            let token_idx = usize::try_from(token)
+                .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
+            if token_idx >= self.geometry.vocabulary {
+                return Err(Error::InvalidInput(format!(
+                    "token {token} out of vocabulary bounds {}",
+                    self.geometry.vocabulary
+                )));
+            }
+        }
+        if self
+            .position
+            .checked_add(tokens.len())
+            .is_none_or(|end| end > self.resolved_context_limit)
+        {
             return Err(Error::InvalidInput(format!(
-                "token {token} out of vocabulary bounds {}",
-                self.geometry.vocabulary
+                "context limit {} exhausted for {} tokens at position {}",
+                self.resolved_context_limit,
+                tokens.len(),
+                self.position
             )));
         }
-        if self.position >= self.resolved_context_limit {
-            return Err(Error::InvalidInput(format!(
-                "context limit {} exhausted at position {}",
-                self.resolved_context_limit, self.position
-            )));
-        }
+        Ok(())
+    }
 
-        row_into(&self.embedding, token_idx, &mut self.host_embed_scratch)
-            .map_err(|err| Error::InvalidInput(err.to_string()))?;
-        ensure_finite_f32(
-            &self.host_embed_scratch,
-            "token embedding contains non-finite value",
-        )?;
-        self.device
-            .write_buffer_f32(self.scratch.hidden, &self.host_embed_scratch)?;
+    fn ingest_tokens_batched_with_check(
+        &mut self,
+        tokens: &[u32],
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.validate_execution_ready(tokens)?;
+        let tile_cap = self.scratch.allocated_tile_tokens.max(1);
+        for tile in tokens.chunks(tile_cap) {
+            check()?;
+            self.step_tile_impl(tile, None, check)?;
+            check()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_tile_host_inputs(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<Option<(BufferSpan, f32)>, Error> {
+        let t_len = tokens.len();
+        if t_len == 1 {
+            let token_idx = usize::try_from(tokens[0])
+                .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
+            row_into(&self.embedding, token_idx, &mut self.host_embed_scratch)
+                .map_err(|err| Error::InvalidInput(err.to_string()))?;
+            ensure_finite_f32(
+                &self.host_embed_scratch,
+                "token embedding contains non-finite value",
+            )?;
+            self.device
+                .write_buffer_f32(self.scratch.hidden, &self.host_embed_scratch)?;
+        } else {
+            self.host_embed_tile_scratch.clear();
+            for &token in tokens {
+                let token_idx = usize::try_from(token)
+                    .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
+                row_into(&self.embedding, token_idx, &mut self.host_embed_scratch)
+                    .map_err(|err| Error::InvalidInput(err.to_string()))?;
+                ensure_finite_f32(
+                    &self.host_embed_scratch,
+                    "token embedding contains non-finite value",
+                )?;
+                self.host_embed_tile_scratch
+                    .extend_from_slice(&self.host_embed_scratch);
+            }
+            self.device
+                .write_buffer_f32(self.scratch.hidden, &self.host_embed_tile_scratch)?;
+        }
 
         let active_embed_lora = if let (Some(embed_lora), Some(scale)) =
             (&self.rank_one_embed, self.rank_one_scale)
             && scale != 0.0
         {
-            let a_val = embed_lora.a_values.get(token_idx).copied().ok_or_else(|| {
-                Error::InvalidInput("embedding LoRA token out of bounds".to_owned())
-            })?;
             let effective_scale = scale * embed_lora.alpha;
-            if !a_val.is_finite() || !effective_scale.is_finite() {
+            if !effective_scale.is_finite() {
                 return Err(Error::InvalidInput(
                     "embedding LoRA scalar or scale is non-finite".to_owned(),
                 ));
             }
+            self.host_lora_ranks.clear();
+            for &token in tokens {
+                let token_idx = usize::try_from(token)
+                    .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
+                let a_val = embed_lora.a_values.get(token_idx).copied().ok_or_else(|| {
+                    Error::InvalidInput("embedding LoRA token out of bounds".to_owned())
+                })?;
+                if !a_val.is_finite() {
+                    return Err(Error::InvalidInput(
+                        "embedding LoRA scalar or scale is non-finite".to_owned(),
+                    ));
+                }
+                self.host_lora_ranks.push(a_val);
+            }
             self.device
-                .write_buffer_f32(self.scratch.lora_ranks, &[a_val])?;
+                .write_buffer_f32(self.scratch.lora_ranks, &self.host_lora_ranks)?;
             Some((embed_lora.b_span, effective_scale))
         } else {
             None
@@ -1742,14 +1974,42 @@ impl VulkanBatchedGraphExecutor {
             .iter()
             .any(|layer| matches!(layer.attention, GpuLayerAttention::Full { .. }));
         if has_full_layers {
-            fill_rope_frequencies(
-                &self.geometry,
-                self.mrope_positions,
-                &mut self.host_rope_freqs,
-            )?;
+            let rope = self.geometry.rope;
+            let rope_end = t_len * rope;
+            for (t, dst_slice) in self.host_rope_freqs[..rope_end]
+                .chunks_exact_mut(rope)
+                .enumerate()
+            {
+                let tok_mrope = [
+                    self.mrope_positions[0] + t,
+                    self.mrope_positions[1] + t,
+                    self.mrope_positions[2] + t,
+                    self.mrope_positions[3],
+                ];
+                fill_rope_frequencies(&self.geometry, tok_mrope, dst_slice)?;
+            }
             self.device
-                .write_buffer_f32(self.scratch.rope_freqs, &self.host_rope_freqs)?;
+                .write_buffer_f32(self.scratch.rope_freqs, &self.host_rope_freqs[..rope_end])?;
         }
+
+        Ok(active_embed_lora)
+    }
+
+    fn step_tile_impl(
+        &mut self,
+        tokens: &[u32],
+        logits_out: Option<&mut Vec<f32>>,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let t_len = tokens.len();
+        if logits_out.is_some() && t_len != 1 {
+            return Err(Error::InvalidInput(
+                "logit readout requires a single token".to_owned(),
+            ));
+        }
+        let t_u32 = u32::try_from(t_len)
+            .map_err(|_| Error::ResourceLimit("tile token count exceeds u32".to_owned()))?;
+        let active_embed_lora = self.prepare_tile_host_inputs(tokens)?;
 
         let chunks = self
             .config
@@ -1760,37 +2020,61 @@ impl VulkanBatchedGraphExecutor {
         let min_align = usize::try_from(self.device.min_storage_buffer_offset_alignment().max(1))
             .unwrap_or(256);
 
+        let mut mutated_gpu = false;
         let run_result = (|| -> Result<(), Error> {
             for (chunk_idx, range) in chunks.iter().enumerate() {
+                if chunk_idx > 0 {
+                    check()?;
+                }
                 self.batch_recorder.clear();
                 if chunk_idx == 0 {
                     if self.transforms.inverse_embedding {
-                        self.record_inverse_embedding_transform()?;
+                        self.record_inverse_embedding_transform_tokens(t_len)?;
                     }
                     if let Some((b_span, eff_scale)) = active_embed_lora {
                         let embed_u32 = u32::try_from(self.geometry.embedding).map_err(|_| {
                             Error::ResourceLimit("embedding exceeds u32".to_owned())
                         })?;
-                        self.batch_recorder.push_barrier(
-                            self.pipelines.lora_b_accum,
-                            &[
-                                b_span,
-                                BufferSpan::whole(self.scratch.lora_ranks),
-                                BufferSpan::whole(self.scratch.hidden),
-                            ],
-                            &[embed_u32, 1, eff_scale.to_bits()],
-                            checked_grid(&self.device, [embed_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-                        );
+                        if t_len == 1 {
+                            self.batch_recorder.push_barrier(
+                                self.pipelines.lora_b_accum,
+                                &[
+                                    b_span,
+                                    BufferSpan::whole(self.scratch.lora_ranks),
+                                    BufferSpan::whole(self.scratch.hidden),
+                                ],
+                                &[embed_u32, 1, eff_scale.to_bits()],
+                                checked_grid(
+                                    &self.device,
+                                    [embed_u32.div_ceil(WORKGROUP_X), 1, 1],
+                                )?,
+                            );
+                        } else {
+                            self.batch_recorder.push_barrier(
+                                self.pipelines.lora_b_accum_batched,
+                                &[
+                                    b_span,
+                                    BufferSpan::whole(self.scratch.lora_ranks),
+                                    BufferSpan::whole(self.scratch.hidden),
+                                ],
+                                &[embed_u32, 1, t_u32, eff_scale.to_bits()],
+                                checked_grid(
+                                    &self.device,
+                                    [embed_u32.div_ceil(WORKGROUP_X), t_u32.div_ceil(4), 1],
+                                )?,
+                            );
+                        }
                     }
                 }
                 for layer_idx in range.clone() {
                     let narrow_final = !need_logits && layer_idx + 1 == total_layers;
-                    self.record_layer(layer_idx, narrow_final, min_align)?;
+                    self.record_layer_tokens(layer_idx, t_len, narrow_final, min_align)?;
                 }
                 if chunk_idx + 1 == chunks.len() && need_logits {
                     self.record_final_logits()?;
                 }
                 if !self.batch_recorder.is_empty() {
+                    mutated_gpu = true;
                     let submits = self.device.submit_compute_batches_with_max_stages(
                         &self.batch_recorder,
                         self.config.tdr_policy.max_stages_per_submit,
@@ -1808,100 +2092,147 @@ impl VulkanBatchedGraphExecutor {
         })();
 
         if run_result.is_err() {
-            if !chunks.is_empty() {
+            if mutated_gpu {
                 self.state_consistent = false;
             }
             return run_result;
         }
 
-        self.position += 1;
+        self.position += t_len;
         for slot in &mut self.mrope_positions[..3] {
-            *slot += 1;
+            *slot += t_len;
         }
         Ok(())
     }
 
-    fn record_inverse_embedding_transform(&mut self) -> Result<(), Error> {
+    fn record_inverse_embedding_transform_tokens(&mut self, tokens: usize) -> Result<(), Error> {
         let len = self.geometry.embedding;
+        let len_u32 = u32::try_from(len)
+            .map_err(|_| Error::ResourceLimit("embedding length exceeds u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("token count exceeds u32".to_owned()))?;
+        let total_len_u32 = u32::try_from(tokens * len)
+            .map_err(|_| Error::ResourceLimit("batched embedding length exceeds u32".to_owned()))?;
+
         if self.transforms.block >= 2 && len.is_multiple_of(self.transforms.block) {
             let block_u32 = u32::try_from(self.transforms.block)
                 .map_err(|_| Error::InvalidInput("Hadamard block exceeds u32".to_owned()))?;
             let blk_cnt = u32::try_from(len / self.transforms.block)
                 .map_err(|_| Error::ResourceLimit("Hadamard grid exceeds u32".to_owned()))?;
             let norm_bits = hadamard_norm_bits(block_u32);
-            let grid = checked_grid(&self.device, [blk_cnt, 1, 1])?;
-            self.batch_recorder.push_barrier(
-                self.pipelines.proj.hadamard,
-                &[
-                    BufferSpan::whole(self.scratch.hidden),
-                    BufferSpan::whole(self.scratch.transformed),
-                ],
-                &[block_u32, norm_bits],
-                grid,
-            );
-            if let Some(&sign_buf) = self.transforms.sign_buffers.get(&len) {
-                let len_u32 = u32::try_from(len)
-                    .map_err(|_| Error::ResourceLimit("embedding length exceeds u32".to_owned()))?;
-                let elem_grid = checked_grid(&self.device, [len_u32.div_ceil(WORKGROUP_X), 1, 1])?;
+            if tokens == 1 {
                 self.batch_recorder.push_barrier(
-                    self.pipelines.mul_f32_elemwise,
+                    self.pipelines.proj.hadamard,
                     &[
-                        BufferSpan::whole(self.scratch.transformed),
-                        BufferSpan::whole(sign_buf),
                         BufferSpan::whole(self.scratch.hidden),
+                        BufferSpan::whole(self.scratch.transformed),
                     ],
-                    &[len_u32],
-                    elem_grid,
+                    &[block_u32, norm_bits],
+                    checked_grid(&self.device, [blk_cnt, 1, 1])?,
                 );
             } else {
-                let len_u32 = u32::try_from(len)
-                    .map_err(|_| Error::ResourceLimit("embedding length exceeds u32".to_owned()))?;
-                let copy_grid = checked_grid(&self.device, [len_u32.div_ceil(WORKGROUP_X), 1, 1])?;
+                self.batch_recorder.push_barrier(
+                    self.pipelines.hadamard_batched,
+                    &[
+                        BufferSpan::whole(self.scratch.hidden),
+                        BufferSpan::whole(self.scratch.transformed),
+                    ],
+                    &[block_u32, norm_bits, blk_cnt, tokens_u32],
+                    checked_grid(&self.device, [blk_cnt, tokens_u32, 1])?,
+                );
+            }
+            if let Some(&sign_buf) = self.transforms.sign_buffers.get(&len) {
+                self.record_mul_sign_tokens(
+                    self.scratch.transformed,
+                    sign_buf,
+                    self.scratch.hidden,
+                    len_u32,
+                    tokens_u32,
+                )?;
+            } else {
+                let copy_grid =
+                    checked_grid(&self.device, [total_len_u32.div_ceil(WORKGROUP_X), 1, 1])?;
                 self.batch_recorder.push_barrier(
                     self.pipelines.copy_slice,
                     &[
                         BufferSpan::whole(self.scratch.transformed),
                         BufferSpan::whole(self.scratch.hidden),
                     ],
-                    &[0, len_u32],
+                    &[0, total_len_u32],
                     copy_grid,
                 );
             }
         } else if let Some(&sign_buf) = self.transforms.sign_buffers.get(&len) {
-            let len_u32 = u32::try_from(len)
-                .map_err(|_| Error::ResourceLimit("embedding length exceeds u32".to_owned()))?;
-            let elem_grid = checked_grid(&self.device, [len_u32.div_ceil(WORKGROUP_X), 1, 1])?;
-            self.batch_recorder.push_barrier(
-                self.pipelines.mul_f32_elemwise,
-                &[
-                    BufferSpan::whole(self.scratch.hidden),
-                    BufferSpan::whole(sign_buf),
-                    BufferSpan::whole(self.scratch.transformed),
-                ],
-                &[len_u32],
-                elem_grid,
-            );
+            self.record_mul_sign_tokens(
+                self.scratch.hidden,
+                sign_buf,
+                self.scratch.transformed,
+                len_u32,
+                tokens_u32,
+            )?;
+            let copy_grid =
+                checked_grid(&self.device, [total_len_u32.div_ceil(WORKGROUP_X), 1, 1])?;
             self.batch_recorder.push_barrier(
                 self.pipelines.copy_slice,
                 &[
                     BufferSpan::whole(self.scratch.transformed),
                     BufferSpan::whole(self.scratch.hidden),
                 ],
-                &[0, len_u32],
+                &[0, total_len_u32],
+                copy_grid,
+            );
+        }
+        Ok(())
+    }
+
+    fn record_mul_sign_tokens(
+        &mut self,
+        in_buf: BufferId,
+        sign_buf: BufferId,
+        out_buf: BufferId,
+        len_u32: u32,
+        tokens_u32: u32,
+    ) -> Result<(), Error> {
+        if tokens_u32 == 1 {
+            let elem_grid = checked_grid(&self.device, [len_u32.div_ceil(WORKGROUP_X), 1, 1])?;
+            self.batch_recorder.push_barrier(
+                self.pipelines.mul_f32_elemwise,
+                &[
+                    BufferSpan::whole(in_buf),
+                    BufferSpan::whole(sign_buf),
+                    BufferSpan::whole(out_buf),
+                ],
+                &[len_u32],
+                elem_grid,
+            );
+        } else {
+            let elem_grid =
+                checked_grid(&self.device, [len_u32.div_ceil(WORKGROUP_X), tokens_u32, 1])?;
+            self.batch_recorder.push_barrier(
+                self.pipelines.mul_f32_elemwise_batched,
+                &[
+                    BufferSpan::whole(in_buf),
+                    BufferSpan::whole(sign_buf),
+                    BufferSpan::whole(out_buf),
+                ],
+                &[len_u32, tokens_u32],
                 elem_grid,
             );
         }
         Ok(())
     }
 
-    fn record_layer(
+    fn record_layer_tokens(
         &mut self,
         layer_idx: usize,
+        tokens: usize,
         narrow_final: bool,
         min_align: usize,
     ) -> Result<(), Error> {
         let embed_u32 = u32::try_from(self.geometry.embedding)
             .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
         let eps_bits = self.geometry.epsilon.to_bits();
         let attn_norm_w = self.layers[layer_idx].attn_norm_w;
         let post_norm_w = self.layers[layer_idx].post_norm_w;
@@ -1914,7 +2245,7 @@ impl VulkanBatchedGraphExecutor {
                 BufferSpan::whole(self.scratch.norm),
             ],
             &[embed_u32, eps_bits],
-            checked_grid(&self.device, [1, 1, 1])?,
+            checked_grid(&self.device, [1, tokens_u32, 1])?,
         );
 
         let is_recurrent = matches!(
@@ -1922,9 +2253,9 @@ impl VulkanBatchedGraphExecutor {
             GpuLayerAttention::Recurrent { .. }
         );
         if is_recurrent {
-            self.record_recurrent_attention(layer_idx, narrow_final, min_align)?;
+            self.record_recurrent_attention_tokens(layer_idx, tokens, narrow_final, min_align)?;
         } else {
-            self.record_full_attention(layer_idx, narrow_final)?;
+            self.record_full_attention_tokens(layer_idx, tokens, narrow_final, min_align)?;
         }
 
         if narrow_final {
@@ -1940,19 +2271,20 @@ impl VulkanBatchedGraphExecutor {
                 BufferSpan::whole(self.scratch.norm),
             ],
             &[embed_u32, eps_bits],
-            checked_grid(&self.device, [1, 1, 1])?,
+            checked_grid(&self.device, [1, tokens_u32, 1])?,
         );
 
-        self.record_ffn(layer_idx)
+        self.record_ffn_tokens(layer_idx, tokens)
     }
 
     #[expect(
         clippy::too_many_lines,
-        reason = "Encodes GPU-resident GDN recurrent layer stages preserving exact Qwen35 conv1d+SiLU, ClampedL2, decay/beta, delta-rule, and gated norm sequence."
+        reason = "Encodes GPU-resident GDN recurrent layer stages preserving exact Qwen35 conv1d+SiLU, ClampedL2, decay/beta, delta-rule, and gated norm sequence for single and batched prefill tokens."
     )]
-    fn record_recurrent_attention(
+    fn record_recurrent_attention_tokens(
         &mut self,
         layer_idx: usize,
+        tokens: usize,
         narrow_final: bool,
         min_align: usize,
     ) -> Result<(), Error> {
@@ -2007,19 +2339,19 @@ impl VulkanBatchedGraphExecutor {
         let proj_gate_buf = self.scratch.proj_b;
         let proj_beta_buf = self.scratch.proj_c;
         let proj_alpha_buf = self.scratch.proj_d;
-        let conv_out_buf = self.scratch.proj_e;
 
         if narrow_final {
-            self.record_projection_group(
+            self.record_projection_group_tokens(
                 self.scratch.norm,
                 &[
                     (qkv, proj_qkv_buf),
                     (beta, proj_beta_buf),
                     (alpha, proj_alpha_buf),
                 ],
+                tokens,
             )?;
         } else {
-            self.record_projection_group(
+            self.record_projection_group_tokens(
                 self.scratch.norm,
                 &[
                     (qkv, proj_qkv_buf),
@@ -2027,6 +2359,7 @@ impl VulkanBatchedGraphExecutor {
                     (beta, proj_beta_buf),
                     (alpha, proj_alpha_buf),
                 ],
+                tokens,
             )?;
         }
 
@@ -2045,6 +2378,10 @@ impl VulkanBatchedGraphExecutor {
             .map_err(|_| Error::ResourceLimit("ssm_head exceeds u32".to_owned()))?;
         let qk_heads_u32 = u32::try_from((2 * key_width) / self.geometry.ssm_head)
             .map_err(|_| Error::ResourceLimit("qk_heads exceeds u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
+        let dim_f32 = u16::try_from(self.geometry.ssm_head).map_or(1.0_f32, f32::from);
+        let gdn_scale_bits = (1.0_f32 / dim_f32.sqrt()).to_bits();
 
         let active_conv_state = if conv_state_elems > 0 {
             conv_state
@@ -2052,40 +2389,169 @@ impl VulkanBatchedGraphExecutor {
             self.scratch.dummy_state
         };
 
-        // conv1d+SiLU writes `conv_out` and updates `conv_state`; `gdn_gates` writes `alpha`/`beta`
-        // concurrently because it touches disjoint projection outputs!
+        let (gdn_out_buf, gdn_normed_buf) = if tokens == 1 {
+            let conv_out_buf = self.scratch.proj_e;
+            self.batch_recorder.push_barrier(
+                self.pipelines.conv1d_silu,
+                &[
+                    BufferSpan::whole(proj_qkv_buf),
+                    BufferSpan::whole(active_conv_state),
+                    BufferSpan::whole(convolution_w),
+                    BufferSpan::whole(conv_out_buf),
+                ],
+                &[channels_u32, kernel_u32],
+                checked_grid(&self.device, [channels_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+            self.batch_recorder.push_concurrent(
+                self.pipelines.gdn_gates,
+                &[
+                    BufferSpan::whole(proj_alpha_buf),
+                    BufferSpan::whole(proj_beta_buf),
+                    BufferSpan::whole(time_bias),
+                    BufferSpan::whole(ssm_a),
+                ],
+                &[v_heads_u32],
+                checked_grid(&self.device, [v_heads_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+            self.batch_recorder.push_barrier(
+                self.pipelines.l2_norm,
+                &[BufferSpan::whole(conv_out_buf)],
+                &[qk_heads_u32, ssm_head_u32, self.geometry.epsilon.to_bits()],
+                checked_grid(&self.device, [1, qk_heads_u32, 1])?,
+            );
+
+            let (q_span, k_span, v_span) =
+                self.resolve_gdn_qkv_spans(conv_out_buf, key_width, val_width, min_align)?;
+            let out_buf = proj_qkv_buf;
+            self.batch_recorder.push_barrier(
+                self.pipelines.gdn_step,
+                &[
+                    BufferSpan::whole(matrix_state),
+                    q_span,
+                    k_span,
+                    v_span,
+                    BufferSpan::whole(proj_alpha_buf),
+                    BufferSpan::whole(proj_beta_buf),
+                    BufferSpan::whole(out_buf),
+                ],
+                &[v_heads_u32, k_heads_u32, ssm_head_u32, gdn_scale_bits],
+                checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?,
+            );
+            (out_buf, conv_out_buf)
+        } else {
+            // `perm_tmp` holds single-token [q, k, v] during the serial recurrence while `proj_e` accumulates `[T, val_width]`.
+            let conv_tmp_buf = self.scratch.perm_tmp;
+            let batched_out_buf = self.scratch.proj_e;
+            let conv_grid = checked_grid(&self.device, [channels_u32.div_ceil(WORKGROUP_X), 1, 1])?;
+            let l2_grid = checked_grid(&self.device, [1, qk_heads_u32, 1])?;
+            let gdn_grid = checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?;
+
+            for t in 0..tokens {
+                let qkv_off = u32::try_from(t * channels)
+                    .map_err(|_| Error::ResourceLimit("GDN qkv offset exceeds u32".to_owned()))?;
+                let tok_u32 = u32::try_from(t)
+                    .map_err(|_| Error::ResourceLimit("GDN token index exceeds u32".to_owned()))?;
+                self.batch_recorder.push_barrier(
+                    self.pipelines.conv1d_silu_offset,
+                    &[
+                        BufferSpan::whole(proj_qkv_buf),
+                        BufferSpan::whole(active_conv_state),
+                        BufferSpan::whole(convolution_w),
+                        BufferSpan::whole(conv_tmp_buf),
+                    ],
+                    &[channels_u32, kernel_u32, qkv_off],
+                    conv_grid,
+                );
+                if t == 0 {
+                    self.batch_recorder.push_concurrent(
+                        self.pipelines.gdn_gates_batched,
+                        &[
+                            BufferSpan::whole(proj_alpha_buf),
+                            BufferSpan::whole(proj_beta_buf),
+                            BufferSpan::whole(time_bias),
+                            BufferSpan::whole(ssm_a),
+                        ],
+                        &[v_heads_u32, tokens_u32],
+                        checked_grid(
+                            &self.device,
+                            [v_heads_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
+                        )?,
+                    );
+                }
+                self.batch_recorder.push_barrier(
+                    self.pipelines.l2_norm,
+                    &[BufferSpan::whole(conv_tmp_buf)],
+                    &[qk_heads_u32, ssm_head_u32, self.geometry.epsilon.to_bits()],
+                    l2_grid,
+                );
+                self.batch_recorder.push_barrier(
+                    self.pipelines.gdn_step_batched_token,
+                    &[
+                        BufferSpan::whole(matrix_state),
+                        BufferSpan::whole(conv_tmp_buf),
+                        BufferSpan::whole(proj_alpha_buf),
+                        BufferSpan::whole(proj_beta_buf),
+                        BufferSpan::whole(batched_out_buf),
+                    ],
+                    &[
+                        v_heads_u32,
+                        k_heads_u32,
+                        ssm_head_u32,
+                        gdn_scale_bits,
+                        tok_u32,
+                    ],
+                    gdn_grid,
+                );
+            }
+            (batched_out_buf, self.scratch.perm_tmp)
+        };
+
+        if narrow_final {
+            return Ok(());
+        }
+
+        let norm_rows = u32::try_from(tokens * self.geometry.ssm_values)
+            .map_err(|_| Error::ResourceLimit("GDN norm rows exceed u32".to_owned()))?;
         self.batch_recorder.push_barrier(
-            self.pipelines.conv1d_silu,
+            self.pipelines.rms_norm,
             &[
-                BufferSpan::whole(proj_qkv_buf),
-                BufferSpan::whole(active_conv_state),
-                BufferSpan::whole(convolution_w),
-                BufferSpan::whole(conv_out_buf),
+                BufferSpan::whole(gdn_out_buf),
+                BufferSpan::whole(norm_w),
+                BufferSpan::whole(gdn_normed_buf),
             ],
-            &[channels_u32, kernel_u32],
-            checked_grid(&self.device, [channels_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-        );
-        self.batch_recorder.push_concurrent(
-            self.pipelines.gdn_gates,
-            &[
-                BufferSpan::whole(proj_alpha_buf),
-                BufferSpan::whole(proj_beta_buf),
-                BufferSpan::whole(time_bias),
-                BufferSpan::whole(ssm_a),
-            ],
-            &[v_heads_u32],
-            checked_grid(&self.device, [v_heads_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            &[ssm_head_u32, self.geometry.epsilon.to_bits()],
+            checked_grid(&self.device, [1, norm_rows, 1])?,
         );
 
-        // `ClampedL2` across [q (k_heads), k (k_heads)] in the prefix of `conv_out`.
+        let total_val_u32 = u32::try_from(tokens * val_width)
+            .map_err(|_| Error::ResourceLimit("batched value_width exceeds u32".to_owned()))?;
+        let gated_buf = gdn_out_buf;
+        let swiglu_pipe = if self.resolved_pinned_arithmetic {
+            self.pipelines.proj.swiglu_pinned
+        } else {
+            self.pipelines.proj.swiglu_unpinned
+        };
         self.batch_recorder.push_barrier(
-            self.pipelines.l2_norm,
-            &[BufferSpan::whole(conv_out_buf)],
-            &[qk_heads_u32, ssm_head_u32, self.geometry.epsilon.to_bits()],
-            checked_grid(&self.device, [1, qk_heads_u32, 1])?,
+            swiglu_pipe,
+            &[
+                BufferSpan::whole(proj_gate_buf),
+                BufferSpan::whole(gdn_normed_buf),
+                BufferSpan::whole(gated_buf),
+            ],
+            &[total_val_u32],
+            checked_grid(&self.device, [total_val_u32.div_ceil(WORKGROUP_X), 1, 1])?,
         );
 
-        // Extract `k` and `v` as aligned storage buffer spans (`subspan` if aligned, else GPU copy).
+        self.record_projection_group_tokens(gated_buf, &[(output_w, self.scratch.delta)], tokens)
+    }
+
+    fn resolve_gdn_qkv_spans(
+        &mut self,
+        conv_out_buf: BufferId,
+        key_width: usize,
+        val_width: usize,
+        min_align: usize,
+    ) -> Result<(BufferSpan, BufferSpan, BufferSpan), Error> {
         let q_bytes = f32_slice_bytes(key_width)?;
         let v_bytes = f32_slice_bytes(val_width)?;
         let conv_whole = BufferSpan::whole(conv_out_buf);
@@ -2135,70 +2601,20 @@ impl VulkanBatchedGraphExecutor {
                     BufferSpan::whole(self.scratch.gdn_v),
                 )
             };
-
-        let dim_f32 = u16::try_from(self.geometry.ssm_head).map_or(1.0_f32, f32::from);
-        let gdn_scale_bits = (1.0_f32 / dim_f32.sqrt()).to_bits();
-        let gdn_out_buf = proj_qkv_buf;
-        self.batch_recorder.push_barrier(
-            self.pipelines.gdn_step,
-            &[
-                BufferSpan::whole(matrix_state),
-                q_span,
-                k_span,
-                v_span,
-                BufferSpan::whole(proj_alpha_buf),
-                BufferSpan::whole(proj_beta_buf),
-                BufferSpan::whole(gdn_out_buf),
-            ],
-            &[v_heads_u32, k_heads_u32, ssm_head_u32, gdn_scale_bits],
-            checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?,
-        );
-
-        if narrow_final {
-            return Ok(());
-        }
-
-        // Per-head RMSNorm on `gdn_out` -> `conv_out_buf` (reused as normalized GDN output).
-        let gdn_normed_buf = conv_out_buf;
-        self.batch_recorder.push_barrier(
-            self.pipelines.rms_norm,
-            &[
-                BufferSpan::whole(gdn_out_buf),
-                BufferSpan::whole(norm_w),
-                BufferSpan::whole(gdn_normed_buf),
-            ],
-            &[ssm_head_u32, self.geometry.epsilon.to_bits()],
-            checked_grid(&self.device, [1, v_heads_u32, 1])?,
-        );
-
-        // Recurrent output gating uses `silu(gate) * gdn_normed` via `ffn_swiglu_f32`.
-        let val_u32 = u32::try_from(val_width)
-            .map_err(|_| Error::ResourceLimit("value_width exceeds u32".to_owned()))?;
-        let gated_buf = gdn_out_buf;
-        let swiglu_pipe = if self.resolved_pinned_arithmetic {
-            self.pipelines.proj.swiglu_pinned
-        } else {
-            self.pipelines.proj.swiglu_unpinned
-        };
-        self.batch_recorder.push_barrier(
-            swiglu_pipe,
-            &[
-                BufferSpan::whole(proj_gate_buf),
-                BufferSpan::whole(gdn_normed_buf),
-                BufferSpan::whole(gated_buf),
-            ],
-            &[val_u32],
-            checked_grid(&self.device, [val_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-        );
-
-        self.record_projection_group(gated_buf, &[(output_w, self.scratch.delta)])
+        Ok((q_span, k_span, v_span))
     }
 
     #[expect(
         clippy::too_many_lines,
-        reason = "Encodes GPU-resident full-attention layer preserving exact Q/Gate deinterleave, Q/K RMSNorm+RoPE(f16), V(f16), KV append/unpack, #40 attention, sigmoid gate, and output projection."
+        reason = "Encodes GPU-resident full-attention layer preserving exact Q/Gate deinterleave, Q/K RMSNorm+RoPE(f16), V(f16), KV append, #40 causal attention (with budget sub-tiling), sigmoid gate, and output projection."
     )]
-    fn record_full_attention(&mut self, layer_idx: usize, narrow_final: bool) -> Result<(), Error> {
+    fn record_full_attention_tokens(
+        &mut self,
+        layer_idx: usize,
+        tokens: usize,
+        narrow_final: bool,
+        min_align: usize,
+    ) -> Result<(), Error> {
         let (query_w, key_w, value_w, output_w, query_norm_w, key_norm_w, k_cache, v_cache) =
             match &self.layers[layer_idx].attention {
                 GpuLayerAttention::Full {
@@ -2244,17 +2660,19 @@ impl VulkanBatchedGraphExecutor {
         let kv_width = self.geometry.kv_width();
         let kv_width_u32 = u32::try_from(kv_width)
             .map_err(|_| Error::ResourceLimit("kv_width exceeds u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
+        let total_kv_u32 = u32::try_from(tokens * kv_width)
+            .map_err(|_| Error::ResourceLimit("batched kv_width exceeds u32".to_owned()))?;
         let pos_u32 = u32::try_from(self.position)
             .map_err(|_| Error::ResourceLimit("position exceeds u32".to_owned()))?;
         let eps_bits = self.geometry.epsilon.to_bits();
-        let total_seq = self.position + 1;
-        let total_seq_u32 = u32::try_from(total_seq)
-            .map_err(|_| Error::ResourceLimit("total_seq exceeds u32".to_owned()))?;
 
         if narrow_final {
-            self.record_projection_group(
+            self.record_projection_group_tokens(
                 self.scratch.norm,
                 &[(key_w, key_buf), (value_w, val_buf)],
+                tokens,
             )?;
             self.batch_recorder.push_barrier(
                 self.pipelines.rms_norm,
@@ -2264,49 +2682,70 @@ impl VulkanBatchedGraphExecutor {
                     BufferSpan::whole(key_buf),
                 ],
                 &[head_dim_u32, eps_bits],
-                checked_grid(&self.device, [1, kv_heads_u32, 1])?,
+                checked_grid(&self.device, [1, tokens_u32 * kv_heads_u32, 1])?,
             );
             self.batch_recorder.push_concurrent(
                 self.pipelines.round_f16,
                 &[BufferSpan::whole(val_buf)],
-                &[kv_width_u32],
-                checked_grid(&self.device, [kv_width_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                &[total_kv_u32],
+                checked_grid(&self.device, [total_kv_u32.div_ceil(WORKGROUP_X), 1, 1])?,
             );
-            self.batch_recorder.push_barrier(
-                self.pipelines.rope,
-                &[
-                    BufferSpan::whole(key_buf),
-                    BufferSpan::whole(self.scratch.rope_freqs),
-                ],
-                &[kv_heads_u32, head_dim_u32, rope_u32, 1],
-                checked_grid(
-                    &self.device,
-                    [head_dim_u32.div_ceil(WORKGROUP_X), kv_heads_u32, 1],
-                )?,
-            );
-            self.record_kv_append(key_buf, val_buf, k_cache, v_cache, kv_width_u32, pos_u32)?;
+            self.record_rope_tokens(
+                key_buf,
+                kv_heads_u32,
+                head_dim_u32,
+                rope_u32,
+                tokens_u32,
+                true,
+            )?;
+            self.record_kv_append_tokens(
+                key_buf,
+                val_buf,
+                k_cache,
+                v_cache,
+                kv_width_u32,
+                pos_u32,
+                tokens_u32,
+            )?;
             return Ok(());
         }
 
-        self.record_projection_group(
+        self.record_projection_group_tokens(
             self.scratch.norm,
             &[(query_w, q_gate_buf), (key_w, key_buf), (value_w, val_buf)],
+            tokens,
         )?;
 
-        let q_width_u32 = u32::try_from(self.geometry.q_width())
+        let q_width = self.geometry.q_width();
+        let q_width_u32 = u32::try_from(q_width)
             .map_err(|_| Error::ResourceLimit("q_width exceeds u32".to_owned()))?;
-        self.batch_recorder.push_barrier(
-            self.pipelines.deinterleave_q_gate,
-            &[
-                BufferSpan::whole(q_gate_buf),
-                BufferSpan::whole(query_buf),
-                BufferSpan::whole(gate_buf),
-            ],
-            &[num_heads_u32, head_dim_u32],
-            checked_grid(&self.device, [q_width_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-        );
+        if tokens == 1 {
+            self.batch_recorder.push_barrier(
+                self.pipelines.deinterleave_q_gate,
+                &[
+                    BufferSpan::whole(q_gate_buf),
+                    BufferSpan::whole(query_buf),
+                    BufferSpan::whole(gate_buf),
+                ],
+                &[num_heads_u32, head_dim_u32],
+                checked_grid(&self.device, [q_width_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+        } else {
+            self.batch_recorder.push_barrier(
+                self.pipelines.deinterleave_q_gate_batched,
+                &[
+                    BufferSpan::whole(q_gate_buf),
+                    BufferSpan::whole(query_buf),
+                    BufferSpan::whole(gate_buf),
+                ],
+                &[num_heads_u32, head_dim_u32, tokens_u32],
+                checked_grid(
+                    &self.device,
+                    [q_width_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
+                )?,
+            );
+        }
 
-        // Normalize Q, normalize K, and binary16-round V concurrently across disjoint buffers!
         self.batch_recorder.push_barrier(
             self.pipelines.rms_norm,
             &[
@@ -2315,7 +2754,7 @@ impl VulkanBatchedGraphExecutor {
                 BufferSpan::whole(query_buf),
             ],
             &[head_dim_u32, eps_bits],
-            checked_grid(&self.device, [1, num_heads_u32, 1])?,
+            checked_grid(&self.device, [1, tokens_u32 * num_heads_u32, 1])?,
         );
         self.batch_recorder.push_concurrent(
             self.pipelines.rms_norm,
@@ -2325,43 +2764,267 @@ impl VulkanBatchedGraphExecutor {
                 BufferSpan::whole(key_buf),
             ],
             &[head_dim_u32, eps_bits],
-            checked_grid(&self.device, [1, kv_heads_u32, 1])?,
+            checked_grid(&self.device, [1, tokens_u32 * kv_heads_u32, 1])?,
         );
         self.batch_recorder.push_concurrent(
             self.pipelines.round_f16,
             &[BufferSpan::whole(val_buf)],
-            &[kv_width_u32],
-            checked_grid(&self.device, [kv_width_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            &[total_kv_u32],
+            checked_grid(&self.device, [total_kv_u32.div_ceil(WORKGROUP_X), 1, 1])?,
         );
 
-        // Apply RoPE with F16 rounding concurrently to normalized Q and K!
+        self.record_rope_tokens(
+            query_buf,
+            num_heads_u32,
+            head_dim_u32,
+            rope_u32,
+            tokens_u32,
+            true,
+        )?;
+        self.record_rope_tokens(
+            key_buf,
+            kv_heads_u32,
+            head_dim_u32,
+            rope_u32,
+            tokens_u32,
+            false,
+        )?;
+
+        self.record_kv_append_tokens(
+            key_buf,
+            val_buf,
+            k_cache,
+            v_cache,
+            kv_width_u32,
+            pos_u32,
+            tokens_u32,
+        )?;
+
+        let attended_buf = q_gate_buf;
+        self.record_full_attention_causal(
+            query_buf,
+            k_cache,
+            v_cache,
+            attended_buf,
+            tokens,
+            q_width,
+            min_align,
+        )?;
+
+        let total_q_u32 = u32::try_from(tokens * q_width)
+            .map_err(|_| Error::ResourceLimit("batched q_width exceeds u32".to_owned()))?;
         self.batch_recorder.push_barrier(
-            self.pipelines.rope,
+            self.pipelines.mul_sigmoid,
+            &[BufferSpan::whole(attended_buf), BufferSpan::whole(gate_buf)],
+            &[total_q_u32],
+            checked_grid(&self.device, [total_q_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+        );
+
+        self.record_projection_group_tokens(attended_buf, &[(output_w, self.scratch.delta)], tokens)
+    }
+
+    fn record_rope_tokens(
+        &mut self,
+        vec_buf: BufferId,
+        heads_u32: u32,
+        head_dim_u32: u32,
+        rope_u32: u32,
+        tokens_u32: u32,
+        barrier: bool,
+    ) -> Result<(), Error> {
+        let bufs = [
+            BufferSpan::whole(vec_buf),
+            BufferSpan::whole(self.scratch.rope_freqs),
+        ];
+        if tokens_u32 == 1 {
+            let grid = checked_grid(
+                &self.device,
+                [head_dim_u32.div_ceil(WORKGROUP_X), heads_u32, 1],
+            )?;
+            self.batch_recorder.push(
+                self.pipelines.rope,
+                &bufs,
+                &[heads_u32, head_dim_u32, rope_u32, 1],
+                grid,
+                barrier,
+            );
+        } else {
+            let grid = checked_grid(
+                &self.device,
+                [head_dim_u32.div_ceil(WORKGROUP_X), heads_u32, tokens_u32],
+            )?;
+            self.batch_recorder.push(
+                self.pipelines.rope_batched,
+                &bufs,
+                &[heads_u32, head_dim_u32, rope_u32, 1, tokens_u32],
+                grid,
+                barrier,
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Dispatches #40 causal attention across full or sub-tiled query chunks within scratch and TDR MAC limits."
+    )]
+    fn record_full_attention_causal(
+        &mut self,
+        query_buf: BufferId,
+        k_cache: BufferId,
+        v_cache: BufferId,
+        attended_buf: BufferId,
+        tokens: usize,
+        q_width: usize,
+        min_align: usize,
+    ) -> Result<(), Error> {
+        let mut q_start = 0_usize;
+        while q_start < tokens {
+            let (chosen_sub_q, desc, plan) =
+                self.select_attention_sub_chunk(q_start, tokens - q_start)?;
+            self.dispatch_attention_sub_chunk(
+                query_buf,
+                k_cache,
+                v_cache,
+                attended_buf,
+                q_start,
+                chosen_sub_q,
+                tokens,
+                q_width,
+                min_align,
+                &desc,
+                plan.path,
+            )?;
+            q_start += chosen_sub_q;
+        }
+        Ok(())
+    }
+
+    fn select_attention_sub_chunk(
+        &self,
+        q_start: usize,
+        max_sub_q: usize,
+    ) -> Result<(usize, AttentionDescriptor, crate::AttentionTilePlan), Error> {
+        let num_heads_u32 = u32::try_from(self.geometry.heads)
+            .map_err(|_| Error::ResourceLimit("heads exceeds u32".to_owned()))?;
+        let kv_heads_u32 = u32::try_from(self.geometry.kv_heads)
+            .map_err(|_| Error::ResourceLimit("kv_heads exceeds u32".to_owned()))?;
+        let head_dim_u32 = u32::try_from(self.geometry.head)
+            .map_err(|_| Error::ResourceLimit("head exceeds u32".to_owned()))?;
+        let head_f32 = u16::try_from(self.geometry.head).map_or(1.0_f32, f32::from);
+        let scale = 1.0_f32 / head_f32.sqrt();
+        let effective_score_budget = self
+            .config
+            .scratch_budget_bytes
+            .min(self.scratch.attn_score_bytes.saturating_mul(2));
+
+        let mut sub_q = max_sub_q;
+        loop {
+            let sub_q_u32 = u32::try_from(sub_q)
+                .map_err(|_| Error::ResourceLimit("sub_q exceeds u32".to_owned()))?;
+            let sub_past = self.position + q_start;
+            let sub_past_u32 = u32::try_from(sub_past)
+                .map_err(|_| Error::ResourceLimit("past_len exceeds u32".to_owned()))?;
+            let sub_total_u32 = u32::try_from(sub_past + sub_q)
+                .map_err(|_| Error::ResourceLimit("total_seq exceeds u32".to_owned()))?;
+            let desc = AttentionDescriptor {
+                query_len: sub_q_u32,
+                total_seq: sub_total_u32,
+                past_len: sub_past_u32,
+                num_heads: num_heads_u32,
+                num_kv_heads: kv_heads_u32,
+                head_dim: head_dim_u32,
+                scale,
+                causal: true,
+            };
+            match select_attention_plan(
+                &desc,
+                self.device.capabilities(),
+                self.config.attention_strategy,
+                effective_score_budget,
+            ) {
+                Ok(plan) => return Ok((sub_q, desc, plan)),
+                Err(_) if sub_q > 1 => {
+                    sub_q /= 2;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Resolves direct, aligned-subspan, or GPU-copied Q/output spans for one causal attention sub-chunk."
+    )]
+    fn prepare_attention_chunk_spans(
+        &mut self,
+        query_buf: BufferId,
+        attended_buf: BufferId,
+        q_start: usize,
+        chosen_sub_q: usize,
+        tokens: usize,
+        q_width: usize,
+        min_align: usize,
+    ) -> Result<AttentionChunkSpans, Error> {
+        if q_start == 0 && chosen_sub_q == tokens {
+            return Ok(AttentionChunkSpans {
+                q_in: BufferSpan::whole(query_buf),
+                o_out: BufferSpan::whole(attended_buf),
+                copy_back: None,
+            });
+        }
+        let byte_off = f32_slice_bytes(q_start * q_width)?;
+        let slice_bytes = f32_slice_bytes(chosen_sub_q * q_width)?;
+        let aligned = usize::try_from(byte_off).is_ok_and(|off| off.is_multiple_of(min_align));
+        if aligned {
+            return Ok(AttentionChunkSpans {
+                q_in: BufferSpan::subspan(BufferSpan::whole(query_buf), byte_off, slice_bytes)?,
+                o_out: BufferSpan::subspan(BufferSpan::whole(attended_buf), byte_off, slice_bytes)?,
+                copy_back: None,
+            });
+        }
+        let elem_off = u32::try_from(q_start * q_width).map_err(|_| {
+            Error::ResourceLimit("attention slice offset exceeds u32".to_owned())
+        })?;
+        let slice_len = u32::try_from(chosen_sub_q * q_width).map_err(|_| {
+            Error::ResourceLimit("attention slice length exceeds u32".to_owned())
+        })?;
+        self.batch_recorder.push_barrier(
+            self.pipelines.copy_slice_offset,
             &[
                 BufferSpan::whole(query_buf),
-                BufferSpan::whole(self.scratch.rope_freqs),
+                BufferSpan::whole(self.scratch.transformed),
             ],
-            &[num_heads_u32, head_dim_u32, rope_u32, 1],
-            checked_grid(
-                &self.device,
-                [head_dim_u32.div_ceil(WORKGROUP_X), num_heads_u32, 1],
-            )?,
+            &[elem_off, 0, slice_len],
+            checked_grid(&self.device, [slice_len.div_ceil(WORKGROUP_X), 1, 1])?,
         );
-        self.batch_recorder.push_concurrent(
-            self.pipelines.rope,
-            &[
-                BufferSpan::whole(key_buf),
-                BufferSpan::whole(self.scratch.rope_freqs),
-            ],
-            &[kv_heads_u32, head_dim_u32, rope_u32, 1],
-            checked_grid(
-                &self.device,
-                [head_dim_u32.div_ceil(WORKGROUP_X), kv_heads_u32, 1],
-            )?,
-        );
+        Ok(AttentionChunkSpans {
+            q_in: BufferSpan::whole(self.scratch.transformed),
+            o_out: BufferSpan::whole(self.scratch.sign_tmp),
+            copy_back: Some((elem_off, slice_len)),
+        })
+    }
 
-        self.record_kv_append(key_buf, val_buf, k_cache, v_cache, kv_width_u32, pos_u32)?;
-
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Dispatches #40 fused or 3-stage causal attention and optional slice copy-back for one query sub-chunk."
+    )]
+    fn dispatch_attention_sub_chunk(
+        &mut self,
+        query_buf: BufferId,
+        k_cache: BufferId,
+        v_cache: BufferId,
+        attended_buf: BufferId,
+        q_start: usize,
+        chosen_sub_q: usize,
+        tokens: usize,
+        q_width: usize,
+        min_align: usize,
+        desc: &AttentionDescriptor,
+        path: AdrenoAttentionPath,
+    ) -> Result<(), Error> {
+        let num_heads_u32 = desc.num_heads;
+        let head_dim_u32 = desc.head_dim;
         let k_attn_span = BufferSpan::whole(k_cache);
         let v_attn_span = BufferSpan::whole(v_cache);
         let (fused_pipe, qk_pipe, pv_pipe) = match self.config.kv_precision {
@@ -2377,52 +3040,40 @@ impl VulkanBatchedGraphExecutor {
             ),
         };
 
-        let head_f32 = u16::try_from(self.geometry.head).map_or(1.0_f32, f32::from);
-        let desc = AttentionDescriptor {
-            query_len: 1,
-            total_seq: total_seq_u32,
-            past_len: pos_u32,
-            num_heads: num_heads_u32,
-            num_kv_heads: kv_heads_u32,
-            head_dim: head_dim_u32,
-            scale: 1.0_f32 / head_f32.sqrt(),
-            causal: true,
-        };
-        let plan = select_attention_plan(
-            &desc,
-            self.device.capabilities(),
-            self.config.attention_strategy,
-            self.config.scratch_budget_bytes,
+        let spans = self.prepare_attention_chunk_spans(
+            query_buf,
+            attended_buf,
+            q_start,
+            chosen_sub_q,
+            tokens,
+            q_width,
+            min_align,
         )?;
-        let attn_push = attention_push_constants(&desc);
-        let attended_buf = q_gate_buf;
-
-        match plan.path {
+        let q_in = spans.q_in;
+        let o_out = spans.o_out;
+        let copy_back = spans.copy_back;
+        let attn_push = attention_push_constants(desc);
+        match path {
             AdrenoAttentionPath::Fused => {
                 self.batch_recorder.push_barrier(
                     fused_pipe,
-                    &[
-                        BufferSpan::whole(query_buf),
-                        k_attn_span,
-                        v_attn_span,
-                        BufferSpan::whole(attended_buf),
-                    ],
+                    &[q_in, k_attn_span, v_attn_span, o_out],
                     &attn_push,
-                    checked_grid(&self.device, [1, num_heads_u32, 1])?,
+                    checked_grid(&self.device, [1, num_heads_u32, desc.query_len])?,
                 );
             }
             AdrenoAttentionPath::Decomposed3Stage => {
                 self.batch_recorder.push_barrier(
                     qk_pipe,
-                    &[
-                        BufferSpan::whole(query_buf),
-                        k_attn_span,
-                        BufferSpan::whole(self.scratch.attn_scores),
-                    ],
+                    &[q_in, k_attn_span, BufferSpan::whole(self.scratch.attn_scores)],
                     &attn_push,
                     checked_grid(
                         &self.device,
-                        [total_seq_u32.div_ceil(WORKGROUP_X), num_heads_u32, 1],
+                        [
+                            desc.total_seq.div_ceil(WORKGROUP_X),
+                            num_heads_u32,
+                            desc.query_len,
+                        ],
                     )?,
                 );
                 self.batch_recorder.push_barrier(
@@ -2432,36 +3083,47 @@ impl VulkanBatchedGraphExecutor {
                         BufferSpan::whole(self.scratch.attn_probs),
                     ],
                     &attn_push,
-                    checked_grid(&self.device, [1, num_heads_u32, 1])?,
+                    checked_grid(&self.device, [1, num_heads_u32, desc.query_len])?,
                 );
                 self.batch_recorder.push_barrier(
                     pv_pipe,
                     &[
                         BufferSpan::whole(self.scratch.attn_probs),
                         v_attn_span,
-                        BufferSpan::whole(attended_buf),
+                        o_out,
                     ],
                     &attn_push,
                     checked_grid(
                         &self.device,
-                        [head_dim_u32.div_ceil(WORKGROUP_X), num_heads_u32, 1],
+                        [
+                            head_dim_u32.div_ceil(WORKGROUP_X),
+                            num_heads_u32,
+                            desc.query_len,
+                        ],
                     )?,
                 );
             }
         }
 
-        // Apply `attended *= sigmoid(gate)` in place, then project `attn_output`.
-        self.batch_recorder.push_barrier(
-            self.pipelines.mul_sigmoid,
-            &[BufferSpan::whole(attended_buf), BufferSpan::whole(gate_buf)],
-            &[q_width_u32],
-            checked_grid(&self.device, [q_width_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-        );
-
-        self.record_projection_group(attended_buf, &[(output_w, self.scratch.delta)])
+        if let Some((elem_off, slice_len)) = copy_back {
+            self.batch_recorder.push_barrier(
+                self.pipelines.copy_slice_offset,
+                &[
+                    BufferSpan::whole(self.scratch.sign_tmp),
+                    BufferSpan::whole(attended_buf),
+                ],
+                &[0, elem_off, slice_len],
+                checked_grid(&self.device, [slice_len.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+        }
+        Ok(())
     }
 
-    fn record_kv_append(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Appends single-token or batched K/V rows to device FP16/F32 caches concurrently."
+    )]
+    fn record_kv_append_tokens(
         &mut self,
         key_buf: BufferId,
         val_buf: BufferId,
@@ -2469,9 +3131,10 @@ impl VulkanBatchedGraphExecutor {
         v_cache: BufferId,
         kv_width_u32: u32,
         pos_u32: u32,
+        tokens_u32: u32,
     ) -> Result<(), Error> {
-        match self.config.kv_precision {
-            VulkanKvPrecision::Fp16 => {
+        match (self.config.kv_precision, tokens_u32 == 1) {
+            (VulkanKvPrecision::Fp16, true) => {
                 let half_w = kv_width_u32 / 2;
                 let grid = checked_grid(&self.device, [half_w.div_ceil(WORKGROUP_X), 1, 1])?;
                 self.batch_recorder.push_barrier(
@@ -2487,8 +3150,26 @@ impl VulkanBatchedGraphExecutor {
                     grid,
                 );
             }
-            VulkanKvPrecision::Fp32 => {
-                let grid = checked_grid(&self.device, [kv_width_u32.div_ceil(WORKGROUP_X), 1, 1])?;
+            (VulkanKvPrecision::Fp16, false) => {
+                let half_w = kv_width_u32 / 2;
+                let grid =
+                    checked_grid(&self.device, [half_w.div_ceil(WORKGROUP_X), tokens_u32, 1])?;
+                self.batch_recorder.push_barrier(
+                    self.pipelines.kv_append_batched_f16,
+                    &[BufferSpan::whole(key_buf), BufferSpan::whole(k_cache)],
+                    &[kv_width_u32, pos_u32, tokens_u32],
+                    grid,
+                );
+                self.batch_recorder.push_concurrent(
+                    self.pipelines.kv_append_batched_f16,
+                    &[BufferSpan::whole(val_buf), BufferSpan::whole(v_cache)],
+                    &[kv_width_u32, pos_u32, tokens_u32],
+                    grid,
+                );
+            }
+            (VulkanKvPrecision::Fp32, true) => {
+                let grid =
+                    checked_grid(&self.device, [kv_width_u32.div_ceil(WORKGROUP_X), 1, 1])?;
                 self.batch_recorder.push_barrier(
                     self.pipelines.kv_append_f32,
                     &[BufferSpan::whole(key_buf), BufferSpan::whole(k_cache)],
@@ -2502,11 +3183,29 @@ impl VulkanBatchedGraphExecutor {
                     grid,
                 );
             }
+            (VulkanKvPrecision::Fp32, false) => {
+                let grid = checked_grid(
+                    &self.device,
+                    [kv_width_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
+                )?;
+                self.batch_recorder.push_barrier(
+                    self.pipelines.kv_append_batched_f32,
+                    &[BufferSpan::whole(key_buf), BufferSpan::whole(k_cache)],
+                    &[kv_width_u32, pos_u32, tokens_u32],
+                    grid,
+                );
+                self.batch_recorder.push_concurrent(
+                    self.pipelines.kv_append_batched_f32,
+                    &[BufferSpan::whole(val_buf), BufferSpan::whole(v_cache)],
+                    &[kv_width_u32, pos_u32, tokens_u32],
+                    grid,
+                );
+            }
         }
         Ok(())
     }
 
-    fn record_ffn(&mut self, layer_idx: usize) -> Result<(), Error> {
+    fn record_ffn_tokens(&mut self, layer_idx: usize, tokens: usize) -> Result<(), Error> {
         let ffn_gate = self.layers[layer_idx].ffn_gate;
         let ffn_up = self.layers[layer_idx].ffn_up;
         let ffn_down = self.layers[layer_idx].ffn_down;
@@ -2515,13 +3214,14 @@ impl VulkanBatchedGraphExecutor {
         let up_out_buf = self.scratch.proj_b;
         let mid_buf = self.scratch.proj_c;
 
-        self.record_projection_group(
+        self.record_projection_group_tokens(
             self.scratch.norm,
             &[(ffn_gate, gate_out_buf), (ffn_up, up_out_buf)],
+            tokens,
         )?;
 
-        let inter_u32 = u32::try_from(self.geometry.feed_forward)
-            .map_err(|_| Error::ResourceLimit("feed_forward exceeds u32".to_owned()))?;
+        let total_inter_u32 = u32::try_from(tokens * self.geometry.feed_forward)
+            .map_err(|_| Error::ResourceLimit("batched feed_forward exceeds u32".to_owned()))?;
         let swiglu_pipe = if self.resolved_pinned_arithmetic {
             self.pipelines.proj.swiglu_pinned
         } else {
@@ -2534,23 +3234,40 @@ impl VulkanBatchedGraphExecutor {
                 BufferSpan::whole(up_out_buf),
                 BufferSpan::whole(mid_buf),
             ],
-            &[inter_u32],
-            checked_grid(&self.device, [inter_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            &[total_inter_u32],
+            checked_grid(&self.device, [total_inter_u32.div_ceil(WORKGROUP_X), 1, 1])?,
         );
 
-        self.record_projection_group(mid_buf, &[(ffn_down, self.scratch.delta)])?;
+        self.record_projection_group_tokens(mid_buf, &[(ffn_down, self.scratch.delta)], tokens)?;
 
         let embed_u32 = u32::try_from(self.geometry.embedding)
             .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
-        self.batch_recorder.push_barrier(
-            self.pipelines.residual_add,
-            &[
-                BufferSpan::whole(self.scratch.hidden),
-                BufferSpan::whole(self.scratch.delta),
-            ],
-            &[embed_u32],
-            checked_grid(&self.device, [embed_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-        );
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
+        if tokens == 1 {
+            self.batch_recorder.push_barrier(
+                self.pipelines.residual_add,
+                &[
+                    BufferSpan::whole(self.scratch.hidden),
+                    BufferSpan::whole(self.scratch.delta),
+                ],
+                &[embed_u32],
+                checked_grid(&self.device, [embed_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+        } else {
+            self.batch_recorder.push_barrier(
+                self.pipelines.residual_add_batched,
+                &[
+                    BufferSpan::whole(self.scratch.hidden),
+                    BufferSpan::whole(self.scratch.delta),
+                ],
+                &[embed_u32, tokens_u32],
+                checked_grid(
+                    &self.device,
+                    [embed_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
+                )?,
+            );
+        }
         Ok(())
     }
 
@@ -2567,16 +3284,18 @@ impl VulkanBatchedGraphExecutor {
             &[embed_u32, self.geometry.epsilon.to_bits()],
             checked_grid(&self.device, [1, 1, 1])?,
         );
-        self.record_projection_group(
+        self.record_projection_group_tokens(
             self.scratch.norm,
             &[(self.output_weight, self.scratch.logits)],
+            1,
         )
     }
 
-    fn record_projection_group(
+    fn record_projection_group_tokens(
         &mut self,
         src_buf: BufferId,
         targets: &[(GpuMatrixWeight, BufferId)],
+        tokens: usize,
     ) -> Result<(), Error> {
         if targets.is_empty() {
             return Ok(());
@@ -2602,15 +3321,16 @@ impl VulkanBatchedGraphExecutor {
                 .copied()
                 .filter(|(w, _)| w.basis() == basis)
                 .collect();
-            self.record_basis_projection_subgroup(src_buf, basis, &group)?;
+            self.record_basis_projection_subgroup_tokens(src_buf, basis, &group, tokens)?;
         }
-        self.record_projection_group_adapters(src_buf, targets)
+        self.record_projection_group_adapters_tokens(src_buf, targets, tokens)
     }
 
-    fn record_projection_group_adapters(
+    fn record_projection_group_adapters_tokens(
         &mut self,
         src_buf: BufferId,
         targets: &[(GpuMatrixWeight, BufferId)],
+        tokens: usize,
     ) -> Result<(), Error> {
         let r1_scale = self.rank_one_scale.filter(|&s| s != 0.0);
         let mr_scale = self.multi_rank_scale.filter(|&s| s != 0.0);
@@ -2619,21 +3339,22 @@ impl VulkanBatchedGraphExecutor {
         }
         for &(weight, out_buf) in targets {
             if let (Some(scale), Some(lora)) = (r1_scale, weight.rank_one) {
-                self.record_linear_lora(src_buf, out_buf, lora, scale)?;
+                self.record_linear_lora_tokens(src_buf, out_buf, lora, scale, tokens)?;
             }
             if let (Some(scale), Some(lora)) = (mr_scale, weight.multi_rank) {
-                self.record_linear_lora(src_buf, out_buf, lora, scale)?;
+                self.record_linear_lora_tokens(src_buf, out_buf, lora, scale, tokens)?;
             }
         }
         Ok(())
     }
 
-    fn record_linear_lora(
+    fn record_linear_lora_tokens(
         &mut self,
         src_buf: BufferId,
         out_buf: BufferId,
         lora: GpuLoraFactor,
         user_scale: f32,
+        tokens: usize,
     ) -> Result<(), Error> {
         let effective_scale = user_scale * lora.scaling;
         if !effective_scale.is_finite() {
@@ -2647,39 +3368,66 @@ impl VulkanBatchedGraphExecutor {
             .map_err(|_| Error::ResourceLimit("LoRA out_features exceeds u32".to_owned()))?;
         let rank_u32 = u32::try_from(lora.rank)
             .map_err(|_| Error::ResourceLimit("LoRA rank exceeds u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
 
         // `src_buf` holds unrotated original activations across the whole projection group.
-        self.batch_recorder.push_barrier(
-            self.pipelines.f32_matvec,
-            &[
-                lora.a_span,
-                BufferSpan::whole(src_buf),
-                BufferSpan::whole(self.scratch.lora_ranks),
-            ],
-            &[in_u32, rank_u32],
-            checked_grid(&self.device, [rank_u32, 1, 1])?,
-        );
-        self.batch_recorder.push_barrier(
-            self.pipelines.lora_b_accum,
-            &[
-                lora.b_span,
-                BufferSpan::whole(self.scratch.lora_ranks),
-                BufferSpan::whole(out_buf),
-            ],
-            &[out_u32, rank_u32, effective_scale.to_bits()],
-            checked_grid(&self.device, [out_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-        );
+        if tokens == 1 {
+            self.batch_recorder.push_barrier(
+                self.pipelines.f32_matvec,
+                &[
+                    lora.a_span,
+                    BufferSpan::whole(src_buf),
+                    BufferSpan::whole(self.scratch.lora_ranks),
+                ],
+                &[in_u32, rank_u32],
+                checked_grid(&self.device, [rank_u32, 1, 1])?,
+            );
+            self.batch_recorder.push_barrier(
+                self.pipelines.lora_b_accum,
+                &[
+                    lora.b_span,
+                    BufferSpan::whole(self.scratch.lora_ranks),
+                    BufferSpan::whole(out_buf),
+                ],
+                &[out_u32, rank_u32, effective_scale.to_bits()],
+                checked_grid(&self.device, [out_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+            );
+        } else {
+            let tok_tiles = tokens_u32.div_ceil(4);
+            self.batch_recorder.push_barrier(
+                self.pipelines.f32_gemm_batched,
+                &[
+                    lora.a_span,
+                    BufferSpan::whole(src_buf),
+                    BufferSpan::whole(self.scratch.lora_ranks),
+                ],
+                &[in_u32, rank_u32, tokens_u32],
+                checked_grid(&self.device, [rank_u32, tok_tiles, 1])?,
+            );
+            self.batch_recorder.push_barrier(
+                self.pipelines.lora_b_accum_batched,
+                &[
+                    lora.b_span,
+                    BufferSpan::whole(self.scratch.lora_ranks),
+                    BufferSpan::whole(out_buf),
+                ],
+                &[out_u32, rank_u32, tokens_u32, effective_scale.to_bits()],
+                checked_grid(&self.device, [out_u32.div_ceil(WORKGROUP_X), tok_tiles, 1])?,
+            );
+        }
         Ok(())
     }
 
-    fn record_basis_projection_subgroup(
+    fn record_basis_projection_subgroup_tokens(
         &mut self,
         src_buf: BufferId,
         basis: (bool, bool),
         group: &[(GpuMatrixWeight, BufferId)],
+        tokens: usize,
     ) -> Result<(), Error> {
         let cols = group[0].0.cols;
-        let act_buf = self.apply_forward_basis_transform(src_buf, cols, basis)?;
+        let act_buf = self.apply_forward_basis_transform_tokens(src_buf, cols, basis, tokens)?;
 
         let needs_q8k = group
             .iter()
@@ -2691,7 +3439,6 @@ impl VulkanBatchedGraphExecutor {
             .iter()
             .any(|(w, _)| w.encoding == WeightEncoding::Ptq1Q8_0);
         if needs_q8_0_source_or_pinned && needs_ptq1_q8_0 && self.resolved_pinned_arithmetic {
-            // Execute Q8_0 variants sequentially if a mixed sibling group needs both standard and native scales.
             let q8_0_pq2: Vec<(GpuMatrixWeight, BufferId)> = group
                 .iter()
                 .copied()
@@ -2702,19 +3449,25 @@ impl VulkanBatchedGraphExecutor {
                 .copied()
                 .filter(|(w, _)| w.encoding == WeightEncoding::Ptq1Q8_0)
                 .collect();
-            self.dispatch_prepared_projection_group(act_buf, cols, &q8_0_pq2)?;
-            return self.dispatch_prepared_projection_group(act_buf, cols, &q8_0_ptq1);
+            self.dispatch_prepared_projection_group_tokens(act_buf, cols, &q8_0_pq2, tokens)?;
+            return self.dispatch_prepared_projection_group_tokens(
+                act_buf,
+                cols,
+                &q8_0_ptq1,
+                tokens,
+            );
         }
 
         let _ = (needs_q8k, needs_q8_0_source_or_pinned, needs_ptq1_q8_0);
-        self.dispatch_prepared_projection_group(act_buf, cols, group)
+        self.dispatch_prepared_projection_group_tokens(act_buf, cols, group, tokens)
     }
 
-    fn apply_forward_basis_transform(
+    fn apply_forward_basis_transform_tokens(
         &mut self,
         src_buf: BufferId,
         cols: usize,
         basis: (bool, bool),
+        tokens: usize,
     ) -> Result<BufferId, Error> {
         let (rotated, grouped_ssm) = basis;
         if !rotated {
@@ -2722,6 +3475,8 @@ impl VulkanBatchedGraphExecutor {
         }
         let cols_u32 = u32::try_from(cols)
             .map_err(|_| Error::ResourceLimit("transform width exceeds u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
         let mut cur = src_buf;
 
         if grouped_ssm {
@@ -2731,29 +3486,35 @@ impl VulkanBatchedGraphExecutor {
                 .map_err(|_| Error::ResourceLimit("ssm_keys exceeds u32".to_owned()))?;
             let hd = u32::try_from(self.geometry.ssm_head)
                 .map_err(|_| Error::ResourceLimit("ssm_head exceeds u32".to_owned()))?;
-            self.batch_recorder.push_barrier(
-                self.pipelines.permute_ssm_heads,
-                &[
-                    BufferSpan::whole(cur),
-                    BufferSpan::whole(self.scratch.perm_tmp),
-                ],
-                &[kh, rep, hd],
-                checked_grid(&self.device, [cols_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-            );
+            if tokens == 1 {
+                self.batch_recorder.push_barrier(
+                    self.pipelines.permute_ssm_heads,
+                    &[
+                        BufferSpan::whole(cur),
+                        BufferSpan::whole(self.scratch.perm_tmp),
+                    ],
+                    &[kh, rep, hd],
+                    checked_grid(&self.device, [cols_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                );
+            } else {
+                self.batch_recorder.push_barrier(
+                    self.pipelines.permute_ssm_heads_batched,
+                    &[
+                        BufferSpan::whole(cur),
+                        BufferSpan::whole(self.scratch.perm_tmp),
+                    ],
+                    &[kh, rep, hd, tokens_u32],
+                    checked_grid(
+                        &self.device,
+                        [cols_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
+                    )?,
+                );
+            }
             cur = self.scratch.perm_tmp;
         }
 
         if let Some(&sign_buf) = self.transforms.sign_buffers.get(&cols) {
-            self.batch_recorder.push_barrier(
-                self.pipelines.mul_f32_elemwise,
-                &[
-                    BufferSpan::whole(cur),
-                    BufferSpan::whole(sign_buf),
-                    BufferSpan::whole(self.scratch.sign_tmp),
-                ],
-                &[cols_u32],
-                checked_grid(&self.device, [cols_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-            );
+            self.record_mul_sign_tokens(cur, sign_buf, self.scratch.sign_tmp, cols_u32, tokens_u32)?;
             cur = self.scratch.sign_tmp;
         }
 
@@ -2762,15 +3523,27 @@ impl VulkanBatchedGraphExecutor {
                 .map_err(|_| Error::InvalidInput("Hadamard block exceeds u32".to_owned()))?;
             let blk_cnt = u32::try_from(cols / self.transforms.block)
                 .map_err(|_| Error::ResourceLimit("Hadamard grid exceeds u32".to_owned()))?;
-            self.batch_recorder.push_barrier(
-                self.pipelines.proj.hadamard,
-                &[
-                    BufferSpan::whole(cur),
-                    BufferSpan::whole(self.scratch.transformed),
-                ],
-                &[block_u32, hadamard_norm_bits(block_u32)],
-                checked_grid(&self.device, [blk_cnt, 1, 1])?,
-            );
+            if tokens == 1 {
+                self.batch_recorder.push_barrier(
+                    self.pipelines.proj.hadamard,
+                    &[
+                        BufferSpan::whole(cur),
+                        BufferSpan::whole(self.scratch.transformed),
+                    ],
+                    &[block_u32, hadamard_norm_bits(block_u32)],
+                    checked_grid(&self.device, [blk_cnt, 1, 1])?,
+                );
+            } else {
+                self.batch_recorder.push_barrier(
+                    self.pipelines.hadamard_batched,
+                    &[
+                        BufferSpan::whole(cur),
+                        BufferSpan::whole(self.scratch.transformed),
+                    ],
+                    &[block_u32, hadamard_norm_bits(block_u32), blk_cnt, tokens_u32],
+                    checked_grid(&self.device, [blk_cnt, tokens_u32, 1])?,
+                );
+            }
             cur = self.scratch.transformed;
         }
 
@@ -2779,19 +3552,29 @@ impl VulkanBatchedGraphExecutor {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "Quantizes shared activation once (Q8K and/or Q8_0) and dispatches sibling projections cleanly."
+        reason = "Quantizes shared activation once (Q8K and/or Q8_0) and dispatches 1-token GEMV or 4-token coalesced GEMM projections cleanly."
     )]
-    fn dispatch_prepared_projection_group(
+    fn dispatch_prepared_projection_group_tokens(
         &mut self,
         act_buf: BufferId,
         cols: usize,
         group: &[(GpuMatrixWeight, BufferId)],
+        tokens: usize,
     ) -> Result<(), Error> {
         if group.is_empty() {
             return Ok(());
         }
         let cols_u32 = u32::try_from(cols)
             .map_err(|_| Error::ResourceLimit("projection cols exceed u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
+        let multi_token = tokens > 1;
+        let tok_tiles_y = if multi_token {
+            tokens_u32.div_ceil(4)
+        } else {
+            1
+        };
+
         let needs_q8k = group
             .iter()
             .any(|(w, _)| w.encoding == WeightEncoding::Pq2Q8k);
@@ -2813,8 +3596,8 @@ impl VulkanBatchedGraphExecutor {
                     BufferSpan::whole(act_buf),
                     BufferSpan::whole(self.scratch.act_q8k),
                 ],
-                &[cols_u32, 1],
-                checked_grid(&self.device, [cols_u32 / 256, 1, 1])?,
+                &[cols_u32, tokens_u32],
+                checked_grid(&self.device, [cols_u32 / 256, tokens_u32, 1])?,
             );
             true
         } else {
@@ -2822,23 +3605,45 @@ impl VulkanBatchedGraphExecutor {
         };
 
         if let Some(q8_kind) = q8_0_kind {
-            let q8_pipe = match (self.resolved_pinned_arithmetic, q8_kind) {
-                (false, _) => self.pipelines.quant_q8_0_source,
-                (true, WeightEncoding::Ptq1Q8_0) => self.pipelines.quant_q8_0_pinned_native,
-                (true, _) => self.pipelines.quant_q8_0_pinned,
-            };
             let q8_blocks = cols_u32 / 32;
-            self.batch_recorder.push(
-                q8_pipe,
-                &[
-                    BufferSpan::whole(act_buf),
-                    BufferSpan::whole(self.scratch.act_q8_0),
-                ],
-                &[q8_blocks],
-                checked_grid(&self.device, [q8_blocks.div_ceil(WORKGROUP_X), 1, 1])?,
-                !quant_emitted,
-            );
+            let q8_bufs = [
+                BufferSpan::whole(act_buf),
+                BufferSpan::whole(self.scratch.act_q8_0),
+            ];
+            if multi_token {
+                let q8_pipe = match (self.resolved_pinned_arithmetic, q8_kind) {
+                    (false, _) => self.pipelines.quant_q8_0_source_batched,
+                    (true, WeightEncoding::Ptq1Q8_0) => {
+                        self.pipelines.quant_q8_0_pinned_native_batched
+                    }
+                    (true, _) => self.pipelines.quant_q8_0_pinned_batched,
+                };
+                self.batch_recorder.push(
+                    q8_pipe,
+                    &q8_bufs,
+                    &[q8_blocks, tokens_u32],
+                    checked_grid(
+                        &self.device,
+                        [q8_blocks.div_ceil(WORKGROUP_X), tokens_u32, 1],
+                    )?,
+                    !quant_emitted,
+                );
+            } else {
+                let q8_pipe = match (self.resolved_pinned_arithmetic, q8_kind) {
+                    (false, _) => self.pipelines.quant_q8_0_source,
+                    (true, WeightEncoding::Ptq1Q8_0) => self.pipelines.quant_q8_0_pinned_native,
+                    (true, _) => self.pipelines.quant_q8_0_pinned,
+                };
+                self.batch_recorder.push(
+                    q8_pipe,
+                    &q8_bufs,
+                    &[q8_blocks],
+                    checked_grid(&self.device, [q8_blocks.div_ceil(WORKGROUP_X), 1, 1])?,
+                    !quant_emitted,
+                );
+            }
         }
+
         for (idx, (weight, out_buf)) in group.iter().enumerate() {
             let rows_u32 = u32::try_from(weight.rows)
                 .map_err(|_| Error::ResourceLimit("projection rows exceed u32".to_owned()))?;
@@ -2853,7 +3658,7 @@ impl VulkanBatchedGraphExecutor {
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
                     let pipe = self.pipelines.proj.select_pq2_q8k(
                         self.resolved_pinned_arithmetic,
-                        false,
+                        multi_token,
                         false,
                     );
                     self.batch_recorder.push(
@@ -2863,8 +3668,11 @@ impl VulkanBatchedGraphExecutor {
                             BufferSpan::whole(self.scratch.act_q8k),
                             BufferSpan::whole(*out_buf),
                         ],
-                        &[rows_u32, blocks_u32, 1, act_words],
-                        checked_grid(&self.device, [rows_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                        &[rows_u32, blocks_u32, tokens_u32, act_words],
+                        checked_grid(
+                            &self.device,
+                            [rows_u32.div_ceil(WORKGROUP_X), tok_tiles_y, 1],
+                        )?,
                         barrier_before,
                     );
                 }
@@ -2876,11 +3684,13 @@ impl VulkanBatchedGraphExecutor {
                     let act_words = u32::try_from((cols / 32) * Q8_0_WORDS_PER_BLOCK)
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
                     let pipe = match weight.encoding {
-                        WeightEncoding::Pq2Q8_0 => self.pipelines.proj.pq2_q8_0,
-                        WeightEncoding::Ptq1Q8_0 if self.resolved_pinned_arithmetic => {
-                            self.pipelines.proj.ptq1_q8_0_pinned
+                        WeightEncoding::Pq2Q8_0 => {
+                            self.pipelines.proj.select_pq2_q8_0(multi_token)
                         }
-                        WeightEncoding::Ptq1Q8_0 => self.pipelines.proj.ptq1_q8_0,
+                        WeightEncoding::Ptq1Q8_0 => self
+                            .pipelines
+                            .proj
+                            .select_ptq1_q8_0(self.resolved_pinned_arithmetic, multi_token),
                         WeightEncoding::Pq2Q8k | WeightEncoding::F32 => {
                             return Err(Error::InvalidInput("unexpected encoding".to_owned()));
                         }
@@ -2892,23 +3702,40 @@ impl VulkanBatchedGraphExecutor {
                             BufferSpan::whole(self.scratch.act_q8_0),
                             BufferSpan::whole(*out_buf),
                         ],
-                        &[rows_u32, blocks_u32, 1, act_words],
-                        checked_grid(&self.device, [rows_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                        &[rows_u32, blocks_u32, tokens_u32, act_words],
+                        checked_grid(
+                            &self.device,
+                            [rows_u32.div_ceil(WORKGROUP_X), tok_tiles_y, 1],
+                        )?,
                         barrier_before,
                     );
                 }
                 WeightEncoding::F32 => {
-                    self.batch_recorder.push(
-                        self.pipelines.f32_matvec,
-                        &[
-                            weight.span,
-                            BufferSpan::whole(act_buf),
-                            BufferSpan::whole(*out_buf),
-                        ],
-                        &[cols_u32, rows_u32],
-                        checked_grid(&self.device, [rows_u32, 1, 1])?,
-                        barrier_before,
-                    );
+                    if multi_token {
+                        self.batch_recorder.push(
+                            self.pipelines.f32_gemm_batched,
+                            &[
+                                weight.span,
+                                BufferSpan::whole(act_buf),
+                                BufferSpan::whole(*out_buf),
+                            ],
+                            &[cols_u32, rows_u32, tokens_u32],
+                            checked_grid(&self.device, [rows_u32, tok_tiles_y, 1])?,
+                            barrier_before,
+                        );
+                    } else {
+                        self.batch_recorder.push(
+                            self.pipelines.f32_matvec,
+                            &[
+                                weight.span,
+                                BufferSpan::whole(act_buf),
+                                BufferSpan::whole(*out_buf),
+                            ],
+                            &[cols_u32, rows_u32],
+                            checked_grid(&self.device, [rows_u32, 1, 1])?,
+                            barrier_before,
+                        );
+                    }
                 }
             }
         }
@@ -3014,25 +3841,20 @@ impl Decoder for VulkanBatchedGraphExecutor {
             )
             .into_runtime_error());
         }
-        if self.device.is_faulted() {
-            return Err(Error::DeviceFault(
-                "Vulkan batched executor faulted and cannot ingest block".to_owned(),
-            )
-            .into_runtime_error());
-        }
-        if !self.state_consistent {
-            return Err(Error::InvalidInput(
-                "executor state is inconsistent after failed evaluation and requires reset or restore"
-                    .to_owned(),
-            )
-            .into_runtime_error());
-        }
-        for &token in tokens {
-            check()?;
-            self.ingest(token)?;
-            check()?;
-        }
-        Ok(())
+        let mut pending_check_err: Option<bonsai_prism_runtime::Error> = None;
+        let mut wrapped_check = || -> Result<(), Error> {
+            if let Err(err) = check() {
+                pending_check_err = Some(err);
+                return Err(Error::Cancelled);
+            }
+            Ok(())
+        };
+        let res = self.ingest_tokens_batched_with_check(tokens, &mut wrapped_check);
+        res.map_err(|err| {
+            pending_check_err
+                .take()
+                .unwrap_or_else(|| err.into_runtime_error())
+        })
     }
 
     fn checkpoint(&self) -> RuntimeResult<Self::Checkpoint> {
@@ -4205,13 +5027,141 @@ fn upload_full_attention(
     })
 }
 
-fn allocate_scratch(
+struct AttentionChunkSpans {
+    q_in: BufferSpan,
+    o_out: BufferSpan,
+    copy_back: Option<(u32, u32)>,
+}
+
+struct TileScratchPlan {
+    allocated_tile_tokens: usize,
+    score_bytes: u64,
+    sizes: [u64; 21],
+}
+
+fn compute_max_wg_tile_tokens(
     geometry: &GraphGeometry,
-    max_adapter_rank: usize,
+    max_wg: [u32; 3],
+    requested: usize,
+) -> usize {
+    let wg_x = usize::try_from(max_wg[0]).unwrap_or(65_535);
+    let wg_y = usize::try_from(max_wg[1]).unwrap_or(65_535);
+    let wg_z = usize::try_from(max_wg[2]).unwrap_or(65_535);
+    let wg_block = usize::try_from(WORKGROUP_X).unwrap_or(64);
+    let max_heads = [geometry.heads, geometry.kv_heads, geometry.ssm_values, 1]
+        .into_iter()
+        .max()
+        .unwrap_or(1);
+    let max_1d_per_tok = [
+        geometry.embedding,
+        geometry.feed_forward,
+        geometry.value_width(),
+        geometry.kv_width(),
+        geometry.q_width(),
+        1,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(1);
+
+    let cap_y = wg_y / max_heads;
+    let cap_1d = wg_x.saturating_mul(wg_block) / max_1d_per_tok;
+    requested.min(cap_y).min(wg_z).min(cap_1d).max(1)
+}
+
+struct TileScratchInputs {
+    embedding: usize,
+    max_f32_work: usize,
+    act_q8k_words_per_tok: usize,
+    act_q8_0_words_per_tok: usize,
+    rank_per_tok: usize,
+    rope: usize,
+    score_per_tok: usize,
+    key_scratch_bytes: u64,
+    val_scratch_bytes: u64,
+    logits_bytes: u64,
+}
+
+fn build_tile_scratch_plan(
+    inputs: &TileScratchInputs,
+    tile_tokens: usize,
+    score_tokens: usize,
+) -> Result<TileScratchPlan, Error> {
+    let hidden_bytes = f32_slice_bytes(tile_tokens * inputs.embedding)?.max(MIN_SCRATCH_BYTES);
+    let work_bytes = f32_slice_bytes(tile_tokens * inputs.max_f32_work)?.max(MIN_SCRATCH_BYTES);
+    let act_q8k_bytes =
+        u32_slice_bytes(tile_tokens * inputs.act_q8k_words_per_tok)?.max(MIN_SCRATCH_BYTES);
+    let act_q8_0_bytes =
+        u32_slice_bytes(tile_tokens * inputs.act_q8_0_words_per_tok)?.max(MIN_SCRATCH_BYTES);
+    let lora_ranks_bytes =
+        f32_slice_bytes(tile_tokens * inputs.rank_per_tok)?.max(MIN_SCRATCH_BYTES);
+    let rope_bytes = f32_slice_bytes(tile_tokens * inputs.rope)?.max(MIN_SCRATCH_BYTES);
+    let score_elems = score_tokens
+        .checked_mul(inputs.score_per_tok)
+        .ok_or_else(|| Error::ResourceLimit("attention score buffer overflow".to_owned()))?;
+    let score_bytes = f32_slice_bytes(score_elems)?.max(MIN_SCRATCH_BYTES);
+
+    let sizes = [
+        hidden_bytes,
+        hidden_bytes,
+        hidden_bytes,
+        work_bytes,
+        work_bytes,
+        work_bytes,
+        act_q8k_bytes,
+        act_q8_0_bytes,
+        work_bytes,
+        work_bytes,
+        work_bytes,
+        work_bytes,
+        work_bytes,
+        inputs.key_scratch_bytes,
+        inputs.val_scratch_bytes,
+        rope_bytes,
+        lora_ranks_bytes,
+        score_bytes,
+        score_bytes,
+        inputs.logits_bytes,
+        MIN_NORM_OR_BIAS_BYTES,
+    ];
+    Ok(TileScratchPlan {
+        allocated_tile_tokens: tile_tokens,
+        score_bytes,
+        sizes,
+    })
+}
+
+fn check_tile_scratch_limits(
+    plan: &TileScratchPlan,
     scratch_budget_bytes: u64,
     max_storage_range: u32,
-    guard: &mut BufferCleanupGuard<'_>,
-) -> Result<GpuGraphScratch, Error> {
+) -> Result<(), Error> {
+    let range_u64 = u64::from(max_storage_range);
+    let total_scratch: u64 = plan.sizes.iter().try_fold(0_u64, |acc, &sz| {
+        if sz > range_u64 {
+            return Err(Error::ResourceLimit(format!(
+                "scratch buffer size {sz} exceeds maxStorageBufferRange {max_storage_range}"
+            )));
+        }
+        acc.checked_add(sz)
+            .ok_or_else(|| Error::ResourceLimit("total scratch size overflow".to_owned()))
+    })?;
+    if scratch_budget_bytes > 0 && total_scratch > scratch_budget_bytes {
+        return Err(Error::ResourceLimit(format!(
+            "total GPU graph scratch {total_scratch} exceeds budget {scratch_budget_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+fn plan_tile_scratch(
+    geometry: &GraphGeometry,
+    max_adapter_rank: usize,
+    prefill_tile_tokens: usize,
+    scratch_budget_bytes: u64,
+    max_storage_range: u32,
+    max_wg: [u32; 3],
+) -> Result<TileScratchPlan, Error> {
     let max_proj_in = [
         geometry.embedding,
         geometry.feed_forward,
@@ -4236,61 +5186,66 @@ fn allocate_scratch(
     .unwrap_or(geometry.embedding);
 
     let max_f32_work = max_proj_in.max(max_proj_out);
-    let hidden_bytes = f32_slice_bytes(geometry.embedding)?.max(MIN_SCRATCH_BYTES);
-    let work_bytes = f32_slice_bytes(max_f32_work)?.max(MIN_SCRATCH_BYTES);
-    let act_q8k_words = max_proj_in.div_ceil(128) * Q8K_4PLANE_WORDS_PER_HALF;
-    let act_q8k_bytes = u32_slice_bytes(act_q8k_words)?.max(MIN_SCRATCH_BYTES);
-    let act_q8_0_words = max_proj_in.div_ceil(32) * Q8_0_WORDS_PER_BLOCK;
-    let act_q8_0_bytes = u32_slice_bytes(act_q8_0_words)?.max(MIN_SCRATCH_BYTES);
-
-    let lora_ranks_bytes = f32_slice_bytes(max_adapter_rank.max(1))?.max(MIN_SCRATCH_BYTES);
-    let score_elems = geometry
+    let score_per_tok = geometry
         .context_limit
         .checked_mul(geometry.heads)
         .ok_or_else(|| Error::ResourceLimit("attention score buffer overflow".to_owned()))?;
-    let score_bytes = f32_slice_bytes(score_elems)?.max(MIN_SCRATCH_BYTES);
-    let logits_bytes = f32_slice_bytes(geometry.vocabulary)?.max(MIN_SCRATCH_BYTES);
-    let rope_bytes = f32_slice_bytes(geometry.rope)?.max(MIN_SCRATCH_BYTES);
-    let key_scratch_bytes = f32_slice_bytes(geometry.key_width())?.max(MIN_SCRATCH_BYTES);
-    let val_scratch_bytes = f32_slice_bytes(geometry.value_width())?.max(MIN_SCRATCH_BYTES);
+    let inputs = TileScratchInputs {
+        embedding: geometry.embedding,
+        max_f32_work,
+        act_q8k_words_per_tok: max_proj_in.div_ceil(128) * Q8K_4PLANE_WORDS_PER_HALF,
+        act_q8_0_words_per_tok: max_proj_in.div_ceil(32) * Q8_0_WORDS_PER_BLOCK,
+        rank_per_tok: max_adapter_rank.max(1),
+        rope: geometry.rope,
+        score_per_tok,
+        key_scratch_bytes: f32_slice_bytes(geometry.key_width())?.max(MIN_SCRATCH_BYTES),
+        val_scratch_bytes: f32_slice_bytes(geometry.value_width())?.max(MIN_SCRATCH_BYTES),
+        logits_bytes: f32_slice_bytes(geometry.vocabulary)?.max(MIN_SCRATCH_BYTES),
+    };
 
-    let sizes = [
-        hidden_bytes,
-        hidden_bytes,
-        hidden_bytes,
-        work_bytes,
-        work_bytes,
-        work_bytes,
-        act_q8k_bytes,
-        act_q8_0_bytes,
-        work_bytes,
-        work_bytes,
-        work_bytes,
-        work_bytes,
-        work_bytes,
-        key_scratch_bytes,
-        val_scratch_bytes,
-        rope_bytes,
-        lora_ranks_bytes,
-        score_bytes,
-        score_bytes,
-        logits_bytes,
-        MIN_NORM_OR_BIAS_BYTES,
-    ];
-    let total_scratch: u64 = sizes.iter().try_fold(0_u64, |acc, &sz| {
-        if sz > u64::from(max_storage_range) {
-            return Err(Error::ResourceLimit(format!(
-                "scratch buffer size {sz} exceeds maxStorageBufferRange {max_storage_range}"
-            )));
+    let mut tile_cap = compute_max_wg_tile_tokens(geometry, max_wg, prefill_tile_tokens);
+    loop {
+        let candidate = build_tile_scratch_plan(&inputs, tile_cap, 1)?;
+        match check_tile_scratch_limits(&candidate, scratch_budget_bytes, max_storage_range) {
+            Ok(()) => break,
+            Err(_) if tile_cap > 1 => {
+                tile_cap -= 1;
+            }
+            Err(err) => return Err(err),
         }
-        acc.checked_add(sz)
-            .ok_or_else(|| Error::ResourceLimit("total scratch size overflow".to_owned()))
-    })?;
-    if scratch_budget_bytes > 0 && total_scratch > scratch_budget_bytes {
-        return Err(Error::ResourceLimit(format!(
-            "total GPU graph scratch {total_scratch} exceeds budget {scratch_budget_bytes}"
-        )));
     }
+
+    let mut score_tokens = tile_cap;
+    let chosen = loop {
+        if let Ok(candidate) = build_tile_scratch_plan(&inputs, tile_cap, score_tokens)
+            && check_tile_scratch_limits(&candidate, scratch_budget_bytes, max_storage_range)
+                .is_ok()
+        {
+            break candidate;
+        }
+        score_tokens -= 1;
+    };
+    Ok(chosen)
+}
+
+fn allocate_scratch(
+    geometry: &GraphGeometry,
+    max_adapter_rank: usize,
+    prefill_tile_tokens: usize,
+    scratch_budget_bytes: u64,
+    max_storage_range: u32,
+    max_wg: [u32; 3],
+    guard: &mut BufferCleanupGuard<'_>,
+) -> Result<GpuGraphScratch, Error> {
+    let plan = plan_tile_scratch(
+        geometry,
+        max_adapter_rank,
+        prefill_tile_tokens,
+        scratch_budget_bytes,
+        max_storage_range,
+        max_wg,
+    )?;
+    let sizes = plan.sizes;
 
     Ok(GpuGraphScratch {
         hidden: guard.alloc_storage(sizes[0])?,
@@ -4312,6 +5267,8 @@ fn allocate_scratch(
         lora_ranks: guard.alloc_storage(sizes[16])?,
         attn_scores: guard.alloc_storage(sizes[17])?,
         attn_probs: guard.alloc_storage(sizes[18])?,
+        attn_score_bytes: plan.score_bytes,
+        allocated_tile_tokens: plan.allocated_tile_tokens,
         logits: guard.alloc_storage(sizes[19])?,
         dummy_state: guard.alloc_storage(sizes[20])?,
     })
@@ -4387,6 +5344,7 @@ fn compute_base_provenance(
     hash_usize(&mut hasher, layer_count)?;
     hash_u32(&mut hasher, u32::from(resolved_pinned_arithmetic))?;
     hash_u64(&mut hasher, config.scratch_budget_bytes)?;
+    hash_usize(&mut hasher, config.prefill_tile_tokens)?;
     hash_str(&mut hasher, b"adapters:", adapter_content_sha256)?;
 
     // Also include sample attention cache key to tie planner geometry/limits cleanly.
@@ -4618,6 +5576,54 @@ mod tests {
         assert_ne!(id_r1_1, id_r1_0);
         assert_ne!(id_r1_1, id_r1_mr);
         assert_eq!(id_r1_1, compute_executor_identity(base, Some(1.0), None)?);
+        Ok(())
+    }
+
+    #[test]
+    fn tile_scratch_plan_respects_budget_and_falls_back_cleanly() -> Result<(), Error> {
+        let geometry = GraphGeometry {
+            embedding: 512,
+            feed_forward: 1024,
+            vocabulary: 4096,
+            heads: 16,
+            kv_heads: 4,
+            head: 64,
+            rope: 64,
+            rope_sections: [8, 8, 8, 0],
+            rope_base: 10_000.0,
+            epsilon: 1e-6,
+            ssm_head: 64,
+            ssm_keys: 4,
+            ssm_values: 8,
+            convolution: 4,
+            context_limit: 2048,
+        };
+        let wg = [65_535, 65_535, 65_535];
+        let full = plan_tile_scratch(&geometry, 8, 16, 64 * 1024 * 1024, u32::MAX, wg)?;
+        assert_eq!(full.allocated_tile_tokens, 16);
+        assert_eq!(full.score_bytes, 16 * 2048 * 16 * 4);
+
+        // Constrain budget so full 16-token non-score buffers fit (~1 MiB) while score scratch
+        // must step down below 16 tokens without failing initialization.
+        let one_tok_scores = 2048_u64 * 16 * 4;
+        let non_score_16: u64 = full
+            .sizes
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| idx != 17 && idx != 18)
+            .map(|(_, &sz)| sz)
+            .sum();
+        let tight_budget = non_score_16 + 4 * one_tok_scores;
+        let sub_score = plan_tile_scratch(&geometry, 8, 16, tight_budget, u32::MAX, wg)?;
+        assert_eq!(sub_score.allocated_tile_tokens, 16);
+        assert_eq!(sub_score.score_bytes, 2 * one_tok_scores);
+
+        // Extremely tight budget shrinks tile_cap toward 1 cleanly.
+        let plan_1tok = plan_tile_scratch(&geometry, 8, 1, 0, u32::MAX, wg)?;
+        let min_needed: u64 = plan_1tok.sizes.iter().sum();
+        let shrunk = plan_tile_scratch(&geometry, 8, 16, min_needed, u32::MAX, wg)?;
+        assert_eq!(shrunk.allocated_tile_tokens, 1);
+        assert!(plan_tile_scratch(&geometry, 8, 16, min_needed - 1, u32::MAX, wg).is_err());
         Ok(())
     }
 }

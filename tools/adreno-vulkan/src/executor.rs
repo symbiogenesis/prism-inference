@@ -8,6 +8,7 @@
 
 use std::{borrow::Borrow, cmp::Ordering, collections::BTreeMap};
 
+use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
     kernels::{Pq2ProjectionExecutor, Q8Block},
     model::{Tensor, TensorBytes, WeakTensorBytes},
@@ -19,7 +20,7 @@ use crate::{
     AttentionStageOutputs, AttentionStrategy, Error, ProjectionKernelPath,
     VulkanDeviceCapabilities, attention_cache_key,
     device::{AdrenoVulkanDevice, BufferId, BufferSpan, ComputeSpanStage, PipelineId, WeightArena},
-    select_attention_plan, spirv,
+    hash_bytes, hash_u32, select_attention_plan, spirv,
 };
 
 pub(crate) const KIND_PQ2: u32 = 142;
@@ -243,8 +244,11 @@ pub(crate) struct ProjectionPipelines {
     pub(crate) pq2_q8k_4tok_fused_res: PipelineId,
     pub(crate) pq2_q8k_4tok_unfused_res: PipelineId,
     pub(crate) pq2_q8_0: PipelineId,
+    pub(crate) pq2_q8_0_4tok: PipelineId,
     pub(crate) ptq1_q8_0: PipelineId,
     pub(crate) ptq1_q8_0_pinned: PipelineId,
+    pub(crate) ptq1_q8_0_4tok: PipelineId,
+    pub(crate) ptq1_q8_0_4tok_pinned: PipelineId,
     pub(crate) ptq1_q8k: PipelineId,
     pub(crate) quant_q8k_pinned: PipelineId,
     pub(crate) quant_q8k_unpinned: PipelineId,
@@ -252,85 +256,152 @@ pub(crate) struct ProjectionPipelines {
     pub(crate) swiglu_unpinned: PipelineId,
     pub(crate) hadamard: PipelineId,
     pub(crate) dot_scalar: PipelineId,
+    pub(crate) digest_sha256: String,
 }
 
 impl ProjectionPipelines {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Compiles and digests all projection, 4-token coalesced GEMM, quantization, and helper SPIR-V pipelines sequentially."
+    )]
     pub(crate) fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
+        let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
+        hash_bytes(&mut hasher, b"projection-pipelines-v2:")?;
+        hash_u32(&mut hasher, u32::from(use_sdot))?;
+        let mut make_pipe = |tag: &[u8],
+                             words: Vec<u32>,
+                             num_buffers: usize,
+                             push_u32s: usize|
+         -> Result<PipelineId, Error> {
+            let digest = spirv::shader_digest(&words)?;
+            hash_bytes(&mut hasher, tag)?;
+            hash_bytes(&mut hasher, digest.as_bytes())?;
+            device.create_compute_pipeline(&words, num_buffers, push_u32s)
+        };
+
+        let pq2_q8k_fused = make_pipe(
+            b"pq2_q8k_fused",
+            spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
+            3,
+            4,
+        )?;
+        let pq2_q8k_unfused = make_pipe(
+            b"pq2_q8k_unfused",
+            spirv::pq2_q8k_gemv_coalesced(use_sdot, false, false),
+            3,
+            4,
+        )?;
+        let pq2_q8k_fused_res = make_pipe(
+            b"pq2_q8k_fused_res",
+            spirv::pq2_q8k_gemv_coalesced(use_sdot, true, true),
+            4,
+            4,
+        )?;
+        let pq2_q8k_unfused_res = make_pipe(
+            b"pq2_q8k_unfused_res",
+            spirv::pq2_q8k_gemv_coalesced(use_sdot, false, true),
+            4,
+            4,
+        )?;
+        let pq2_q8k_4tok_fused = make_pipe(
+            b"pq2_q8k_4tok_fused",
+            spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, false),
+            3,
+            4,
+        )?;
+        let pq2_q8k_4tok_unfused = make_pipe(
+            b"pq2_q8k_4tok_unfused",
+            spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, false),
+            3,
+            4,
+        )?;
+        let pq2_q8k_4tok_fused_res = make_pipe(
+            b"pq2_q8k_4tok_fused_res",
+            spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, true),
+            4,
+            4,
+        )?;
+        let pq2_q8k_4tok_unfused_res = make_pipe(
+            b"pq2_q8k_4tok_unfused_res",
+            spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, true),
+            4,
+            4,
+        )?;
+        let pq2_q8_0 = make_pipe(b"pq2_q8_0", spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?;
+        let pq2_q8_0_4tok = make_pipe(
+            b"pq2_q8_0_4tok",
+            spirv::pq2_q8_0_gemm_4tok_coalesced(use_sdot),
+            3,
+            4,
+        )?;
+        let ptq1_q8_0 = make_pipe(
+            b"ptq1_q8_0",
+            spirv::ptq1_q8_0_gemv_coalesced(use_sdot, false),
+            3,
+            4,
+        )?;
+        let ptq1_q8_0_pinned = make_pipe(
+            b"ptq1_q8_0_pinned",
+            spirv::ptq1_q8_0_gemv_coalesced(use_sdot, true),
+            3,
+            4,
+        )?;
+        let ptq1_q8_0_4tok = make_pipe(
+            b"ptq1_q8_0_4tok",
+            spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, false),
+            3,
+            4,
+        )?;
+        let ptq1_q8_0_4tok_pinned = make_pipe(
+            b"ptq1_q8_0_4tok_pinned",
+            spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, true),
+            3,
+            4,
+        )?;
+        let ptq1_q8k = make_pipe(b"ptq1_q8k", spirv::ptq1_q8k_gemv_coalesced(use_sdot), 3, 4)?;
+        let quant_q8k_pinned = make_pipe(
+            b"quant_q8k_pinned",
+            spirv::quantize_f32_to_q8k_4plane(true),
+            2,
+            2,
+        )?;
+        let quant_q8k_unpinned = make_pipe(
+            b"quant_q8k_unpinned",
+            spirv::quantize_f32_to_q8k_4plane(false),
+            2,
+            2,
+        )?;
+        let swiglu_pinned = make_pipe(b"swiglu_pinned", spirv::ffn_swiglu_f32(true), 3, 1)?;
+        let swiglu_unpinned = make_pipe(b"swiglu_unpinned", spirv::ffn_swiglu_f32(false), 3, 1)?;
+        let hadamard = make_pipe(b"hadamard", spirv::ffn_hadamard_f32(), 2, 2)?;
+        let dot_scalar = make_pipe(b"dot_scalar", spirv::dot_f32_scalar(), 3, 1)?;
+        let digest_bytes = hasher
+            .finish()
+            .map_err(|err| Error::InvalidInput(err.to_string()))?;
+
         Ok(Self {
-            pq2_q8k_fused: device.create_compute_pipeline(
-                &spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
-                3,
-                4,
-            )?,
-            pq2_q8k_unfused: device.create_compute_pipeline(
-                &spirv::pq2_q8k_gemv_coalesced(use_sdot, false, false),
-                3,
-                4,
-            )?,
-            pq2_q8k_fused_res: device.create_compute_pipeline(
-                &spirv::pq2_q8k_gemv_coalesced(use_sdot, true, true),
-                4,
-                4,
-            )?,
-            pq2_q8k_unfused_res: device.create_compute_pipeline(
-                &spirv::pq2_q8k_gemv_coalesced(use_sdot, false, true),
-                4,
-                4,
-            )?,
-            pq2_q8k_4tok_fused: device.create_compute_pipeline(
-                &spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, false),
-                3,
-                4,
-            )?,
-            pq2_q8k_4tok_unfused: device.create_compute_pipeline(
-                &spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, false),
-                3,
-                4,
-            )?,
-            pq2_q8k_4tok_fused_res: device.create_compute_pipeline(
-                &spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, true),
-                4,
-                4,
-            )?,
-            pq2_q8k_4tok_unfused_res: device.create_compute_pipeline(
-                &spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, true),
-                4,
-                4,
-            )?,
-            pq2_q8_0: device.create_compute_pipeline(
-                &spirv::pq2_q8_0_gemv_coalesced(use_sdot),
-                3,
-                4,
-            )?,
-            ptq1_q8_0: device.create_compute_pipeline(
-                &spirv::ptq1_q8_0_gemv_coalesced(use_sdot, false),
-                3,
-                4,
-            )?,
-            ptq1_q8_0_pinned: device.create_compute_pipeline(
-                &spirv::ptq1_q8_0_gemv_coalesced(use_sdot, true),
-                3,
-                4,
-            )?,
-            ptq1_q8k: device.create_compute_pipeline(
-                &spirv::ptq1_q8k_gemv_coalesced(use_sdot),
-                3,
-                4,
-            )?,
-            quant_q8k_pinned: device.create_compute_pipeline(
-                &spirv::quantize_f32_to_q8k_4plane(true),
-                2,
-                2,
-            )?,
-            quant_q8k_unpinned: device.create_compute_pipeline(
-                &spirv::quantize_f32_to_q8k_4plane(false),
-                2,
-                2,
-            )?,
-            swiglu_pinned: device.create_compute_pipeline(&spirv::ffn_swiglu_f32(true), 3, 1)?,
-            swiglu_unpinned: device.create_compute_pipeline(&spirv::ffn_swiglu_f32(false), 3, 1)?,
-            hadamard: device.create_compute_pipeline(&spirv::ffn_hadamard_f32(), 2, 2)?,
-            dot_scalar: device.create_compute_pipeline(&spirv::dot_f32_scalar(), 3, 1)?,
+            pq2_q8k_fused,
+            pq2_q8k_unfused,
+            pq2_q8k_fused_res,
+            pq2_q8k_unfused_res,
+            pq2_q8k_4tok_fused,
+            pq2_q8k_4tok_unfused,
+            pq2_q8k_4tok_fused_res,
+            pq2_q8k_4tok_unfused_res,
+            pq2_q8_0,
+            pq2_q8_0_4tok,
+            ptq1_q8_0,
+            ptq1_q8_0_pinned,
+            ptq1_q8_0_4tok,
+            ptq1_q8_0_4tok_pinned,
+            ptq1_q8k,
+            quant_q8k_pinned,
+            quant_q8k_unpinned,
+            swiglu_pinned,
+            swiglu_unpinned,
+            hadamard,
+            dot_scalar,
+            digest_sha256: hex::encode(digest_bytes),
         })
     }
 
@@ -349,6 +420,23 @@ impl ProjectionPipelines {
             (true, false, false) => self.pq2_q8k_4tok_unfused,
             (true, true, true) => self.pq2_q8k_4tok_fused_res,
             (true, false, true) => self.pq2_q8k_4tok_unfused_res,
+        }
+    }
+
+    pub(crate) const fn select_pq2_q8_0(&self, multi_token: bool) -> PipelineId {
+        if multi_token {
+            self.pq2_q8_0_4tok
+        } else {
+            self.pq2_q8_0
+        }
+    }
+
+    pub(crate) const fn select_ptq1_q8_0(&self, pinned: bool, multi_token: bool) -> PipelineId {
+        match (multi_token, pinned) {
+            (false, false) => self.ptq1_q8_0,
+            (false, true) => self.ptq1_q8_0_pinned,
+            (true, false) => self.ptq1_q8_0_4tok,
+            (true, true) => self.ptq1_q8_0_4tok_pinned,
         }
     }
 }
@@ -2393,6 +2481,9 @@ fn is_4tok_pipeline(pipes: &ProjectionPipelines, pipe: PipelineId) -> bool {
         || pipe == pipes.pq2_q8k_4tok_unfused
         || pipe == pipes.pq2_q8k_4tok_fused_res
         || pipe == pipes.pq2_q8k_4tok_unfused_res
+        || pipe == pipes.pq2_q8_0_4tok
+        || pipe == pipes.ptq1_q8_0_4tok
+        || pipe == pipes.ptq1_q8_0_4tok_pinned
 }
 
 fn ensure_scratch(

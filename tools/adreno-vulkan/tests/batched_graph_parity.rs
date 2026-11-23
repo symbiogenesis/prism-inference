@@ -2,7 +2,13 @@
 //! [`VulkanBatchedGraphExecutor`].
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use bonsai_adreno_vulkan::{
     AttentionStrategy, CommandBatchRecorder, TdrChunkPolicy, VulkanBatchedAdapters,
@@ -244,13 +250,20 @@ fn build_ptq1_tensor(
     })
 }
 
+fn synthetic_hybrid_qwen35_model(identity: &str) -> ModelResult {
+    synthetic_hybrid_qwen35_model_with_layout(identity, 256, 256, 32)
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "Constructs an explicit synthetic hybrid recurrent-GDN + full-attention Qwen35 test model."
+    reason = "Constructs an explicit synthetic hybrid recurrent-GDN + full-attention Qwen35 test model with configurable dims and context."
 )]
-fn synthetic_hybrid_qwen35_model(identity: &str) -> ModelResult {
-    let embd = 256_usize;
-    let ffn = 256_usize;
+fn synthetic_hybrid_qwen35_model_with_layout(
+    identity: &str,
+    embd: usize,
+    ffn: usize,
+    context_length: u32,
+) -> ModelResult {
     let vocab = 16_usize;
     let heads = 4_usize;
     let kv_heads = 2_usize;
@@ -270,7 +283,7 @@ fn synthetic_hybrid_qwen35_model(identity: &str) -> ModelResult {
     );
     metadata.insert(
         "qwen35.context_length".to_owned(),
-        MetadataValue::from(32_u32),
+        MetadataValue::from(context_length),
     );
     metadata.insert("qwen35.block_count".to_owned(), MetadataValue::from(3_u32));
     metadata.insert(
@@ -550,29 +563,95 @@ fn assert_close(actual: &[f32], expected: &[f32], max_tol: f32, label: &str) {
     );
 }
 
+fn assert_close_rel(
+    actual: &[f32],
+    expected: &[f32],
+    abs_tol: f32,
+    rel_tol: f32,
+    label: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+    for (idx, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        let diff = (a - e).abs();
+        let allowed = rel_tol.mul_add(a.abs().max(e.abs()), abs_tol);
+        assert!(
+            diff <= allowed,
+            "{label}: idx {idx} abs diff {diff} exceeds allowed {allowed} (actual={a}, expected={e})"
+        );
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Validates all single-token, batched, 4-token GEMM, and attention SPIR-V modules."
+)]
 #[test]
 fn spirv_layer_and_helper_modules_pass_structural_validation() {
     let portable_modules = [
         ("rms_norm_f32", spirv::rms_norm_f32()),
+        ("rms_norm_batched_f32", spirv::rms_norm_batched_f32()),
         ("add_rms_norm_f32", spirv::add_rms_norm_f32()),
+        ("add_rms_norm_batched_f32", spirv::add_rms_norm_batched_f32()),
         ("residual_add_f32", spirv::residual_add_f32()),
+        ("residual_add_batched_f32", spirv::residual_add_batched_f32()),
         ("rope_f32", spirv::rope_f32()),
+        ("rope_batched_f32", spirv::rope_batched_f32()),
         ("mul_sigmoid_f32", spirv::mul_sigmoid_f32()),
         ("conv1d_silu_f32", spirv::conv1d_silu_f32()),
+        ("conv1d_silu_offset_f32", spirv::conv1d_silu_offset_f32()),
         ("l2_norm_f32", spirv::l2_norm_f32()),
         ("gdn_step_f32", spirv::gdn_step_f32()),
+        (
+            "gdn_step_batched_token_f32",
+            spirv::gdn_step_batched_token_f32(),
+        ),
         ("gdn_gates_f32", spirv::gdn_gates_f32()),
+        ("gdn_gates_batched_f32", spirv::gdn_gates_batched_f32()),
         ("deinterleave_q_gate_f32", spirv::deinterleave_q_gate_f32()),
+        (
+            "deinterleave_q_gate_batched_f32",
+            spirv::deinterleave_q_gate_batched_f32(),
+        ),
         ("round_f16_f32", spirv::round_f16_f32()),
         ("kv_append_f32", spirv::kv_append_f32()),
+        ("kv_append_batched_f32", spirv::kv_append_batched_f32()),
         ("kv_append_f16", spirv::kv_append_f16()),
+        ("kv_append_batched_f16", spirv::kv_append_batched_f16()),
         ("kv_unpack_f16_to_f32", spirv::kv_unpack_f16_to_f32()),
+        ("quant_q8k_4plane_src", spirv::quantize_f32_to_q8k_4plane(false)),
+        (
+            "quant_q8k_4plane_batched_pinned",
+            spirv::quantize_f32_to_q8k_4plane_batched(true),
+        ),
         ("quant_q8_0_src", spirv::quantize_f32_to_q8_0(false, false)),
-        ("quant_q8_0_pinned", spirv::quantize_f32_to_q8_0(true, true)),
+        (
+            "quant_q8_0_pinned",
+            spirv::quantize_f32_to_q8_0(true, true),
+        ),
+        (
+            "quant_q8_0_batched_src",
+            spirv::quantize_f32_to_q8_0_batched(false, false),
+        ),
+        (
+            "quant_q8_0_batched_pinned",
+            spirv::quantize_f32_to_q8_0_batched(true, false),
+        ),
+        (
+            "quant_q8_0_batched_native",
+            spirv::quantize_f32_to_q8_0_batched(true, true),
+        ),
+        ("ffn_hadamard_batched_f32", spirv::ffn_hadamard_batched_f32()),
         ("f32_matvec", spirv::f32_matvec()),
+        ("f32_gemm_batched", spirv::f32_gemm_batched()),
         ("mul_f32_elemwise", spirv::mul_f32_elemwise()),
+        ("mul_f32_elemwise_batched", spirv::mul_f32_elemwise_batched()),
         ("permute_ssm_heads_f32", spirv::permute_ssm_heads_f32()),
+        (
+            "permute_ssm_heads_batched_f32",
+            spirv::permute_ssm_heads_batched_f32(),
+        ),
         ("copy_slice_f32", spirv::copy_slice_f32()),
+        ("copy_slice_offset_f32", spirv::copy_slice_offset_f32()),
         ("attn_fused_f16prob", spirv::attn_fused_f16prob()),
         (
             "attn_fused_f16prob_f16kv",
@@ -584,6 +663,11 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         ("attn_pv_accum", spirv::attn_pv_accum()),
         ("attn_pv_accum_f16kv", spirv::attn_pv_accum_f16kv()),
         ("lora_b_accum_f32", spirv::lora_b_accum_f32()),
+        ("lora_b_accum_batched_f32", spirv::lora_b_accum_batched_f32()),
+        ("pq2_q8k_4tok_false", spirv::pq2_q8k_gemm_4tok_coalesced(false, false, false)),
+        ("pq2_q8_0_4tok_false", spirv::pq2_q8_0_gemm_4tok_coalesced(false)),
+        ("ptq1_q8_0_4tok_false_src", spirv::ptq1_q8_0_gemm_4tok_coalesced(false, false)),
+        ("ptq1_q8_0_4tok_false_pin", spirv::ptq1_q8_0_gemm_4tok_coalesced(false, true)),
     ];
     for (name, words) in portable_modules {
         assert_eq!(
@@ -592,13 +676,31 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "portable SPIR-V validation failed for {name}"
         );
     }
-    assert_eq!(
-        spirv::validate_spirv_module(
-            &spirv::pq2_q8k_gemv_coalesced(true, true, false),
-            Some(true)
+    for (name, words) in [
+        (
+            "pq2_q8k_gemv_sdot",
+            spirv::pq2_q8k_gemv_coalesced(true, true, false),
         ),
-        Ok(())
-    );
+        (
+            "pq2_q8k_4tok_sdot",
+            spirv::pq2_q8k_gemm_4tok_coalesced(true, false, false),
+        ),
+        ("pq2_q8_0_4tok_sdot", spirv::pq2_q8_0_gemm_4tok_coalesced(true)),
+        (
+            "ptq1_q8_0_4tok_sdot_src",
+            spirv::ptq1_q8_0_gemm_4tok_coalesced(true, false),
+        ),
+        (
+            "ptq1_q8_0_4tok_sdot_pin",
+            spirv::ptq1_q8_0_gemm_4tok_coalesced(true, true),
+        ),
+    ] {
+        assert_eq!(
+            spirv::validate_spirv_module(&words, Some(true)),
+            Ok(()),
+            "OpSDot SPIR-V validation failed for {name}"
+        );
+    }
 }
 
 #[test]
@@ -648,8 +750,16 @@ fn synthetic_hybrid_model_builds_and_config_defaults_are_well_formed() -> TestRe
     let cfg = VulkanBatchedConfig::default();
     assert_eq!(cfg.kv_precision, VulkanKvPrecision::Fp16);
     assert_eq!(cfg.tdr_policy.layers_per_submit, 8);
+    assert_eq!(cfg.prefill_tile_tokens, 16);
     assert_eq!(cfg.kv_precision.name(), "fp16");
     assert_eq!(VulkanKvPrecision::Fp32.name(), "fp32");
+
+    // Odd-128 width synthetic hybrid model builds cleanly for PQ2_0 x Q8_0 / PTQ1_0 x Q8_0 parity.
+    let odd_model = synthetic_hybrid_qwen35_model_with_layout("offline-odd128-hybrid", 384, 384, 32)?;
+    let mut cpu_odd = Qwen35::new(odd_model, 16)?;
+    let odd_l0 = cpu_odd.evaluate(0)?;
+    assert_eq!(odd_l0.len(), 16);
+    assert!(odd_l0.iter().all(|v| v.is_finite()));
     Ok(())
 }
 
@@ -1001,5 +1111,267 @@ fn live_decoder_trait_and_runtime_parity() -> TestResult {
     Decoder::evaluate_into(&mut limited, 0, &mut err_logits)?;
     assert!(Decoder::evaluate_into(&mut limited, 1, &mut err_logits).is_err());
     assert_eq!(err_logits, Vec::<f32>::new());
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Tests batched ingest parity across Fp16/Fp32 KV caches, tile sizes 1..=19, submit amortization, and checkpoint identity."
+)]
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_batched_prefill_matches_sequential_ingest_and_checkpoint() -> TestResult {
+    let invalid_zero = synthetic_hybrid_qwen35_model("invalid-tile-0")?;
+    assert!(
+        VulkanBatchedGraphExecutor::open(
+            &invalid_zero,
+            VulkanBatchedConfig {
+                prefill_tile_tokens: 0,
+                ..VulkanBatchedConfig::default()
+            },
+        )
+        .is_err()
+    );
+    let invalid_over = synthetic_hybrid_qwen35_model("invalid-tile-257")?;
+    assert!(
+        VulkanBatchedGraphExecutor::open(
+            &invalid_over,
+            VulkanBatchedConfig {
+                prefill_tile_tokens: bonsai_prism_runtime::MAX_PREFILL_BLOCK_TOKENS + 1,
+                ..VulkanBatchedConfig::default()
+            },
+        )
+        .is_err()
+    );
+
+    let full_seq: [u32; 19] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 3, 7, 11];
+    for kv_precision in [VulkanKvPrecision::Fp16, VulkanKvPrecision::Fp32] {
+        let mut seq_1tok_exec = VulkanBatchedGraphExecutor::open(
+            &synthetic_hybrid_qwen35_model("batched-vs-seq-base")?,
+            VulkanBatchedConfig {
+                kv_precision,
+                prefill_tile_tokens: 1,
+                ..VulkanBatchedConfig::default()
+            },
+        )?;
+        let mut cpu = Qwen35::with_adapters_and_kv(
+            synthetic_hybrid_qwen35_model("batched-vs-seq-base")?,
+            32,
+            64 * 1024 * 1024,
+            MatvecBackend::Auto,
+            None,
+            None,
+            KvCachePolicy::F16,
+        )?;
+        let mut seq_refs = Vec::new();
+        for &len in &[1_usize, 3, 4, 7, 8, 16, 19] {
+            seq_1tok_exec.reset()?;
+            cpu.reset()?;
+            let tokens = &full_seq[..len];
+            let seq_submits_before = seq_1tok_exec.submits_completed();
+            for &tok in tokens {
+                seq_1tok_exec.ingest_token(tok)?;
+                cpu.ingest(tok)?;
+            }
+            let seq_submits = seq_1tok_exec.submits_completed() - seq_submits_before;
+            let seq_logits = seq_1tok_exec.evaluate_token(2)?;
+            let cpu_logits = cpu.evaluate(2)?;
+            assert_close_rel(&seq_logits, &cpu_logits, 5e-3, 5e-3, "seq vs cpu reference");
+            seq_refs.push((len, seq_submits, seq_logits, cpu_logits));
+        }
+
+        for &tile_cfg in &[8_usize, 16] {
+            let tile_config = VulkanBatchedConfig {
+                kv_precision,
+                prefill_tile_tokens: tile_cfg,
+                ..VulkanBatchedConfig::default()
+            };
+            let mut same_cfg_seq = VulkanBatchedGraphExecutor::open(
+                &synthetic_hybrid_qwen35_model("batched-vs-seq-base")?,
+                tile_config.clone(),
+            )?;
+            let mut bat_exec = VulkanBatchedGraphExecutor::open(
+                &synthetic_hybrid_qwen35_model("batched-vs-seq-base")?,
+                tile_config,
+            )?;
+
+            for (len, seq_submits, seq_logits, cpu_logits) in &seq_refs {
+                let len = *len;
+                let tokens = &full_seq[..len];
+                same_cfg_seq.reset()?;
+                bat_exec.reset()?;
+
+                for &tok in tokens {
+                    same_cfg_seq.ingest_token(tok)?;
+                }
+                let seq_cp = same_cfg_seq.checkpoint()?;
+
+                let submits_before = bat_exec.submits_completed();
+                Decoder::ingest_block(&mut bat_exec, tokens, &|| Ok(()))?;
+                let bat_submits = bat_exec.submits_completed() - submits_before;
+                assert_eq!(bat_exec.position(), len);
+                if len >= 4 {
+                    assert!(
+                        bat_submits < *seq_submits,
+                        "expected submit amortization for len={len}, tile={tile_cfg}: bat={bat_submits} seq={seq_submits}"
+                    );
+                }
+
+                let bat_cp = bat_exec.checkpoint()?;
+                assert_eq!(bat_cp.position(), seq_cp.position());
+                assert_eq!(bat_cp.layer_count(), seq_cp.layer_count());
+                assert_eq!(
+                    bat_cp.identity_sha256()?,
+                    seq_cp.identity_sha256()?,
+                    "checkpoint SHA-256 mismatch for len={len} tile={tile_cfg} {kv_precision:?}"
+                );
+                let bat_logits = bat_exec.evaluate_token(2)?;
+                assert_close(
+                    &bat_logits,
+                    seq_logits,
+                    1e-5,
+                    &format!("batched vs sequential len={len} tile={tile_cfg} {kv_precision:?}"),
+                );
+                assert_close_rel(
+                    &bat_logits,
+                    cpu_logits,
+                    5e-3,
+                    5e-3,
+                    &format!("batched vs cpu len={len} tile={tile_cfg} {kv_precision:?}"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Tests odd-128 Q8_0 4-token GEMM, stacked RankOne+MultiRank LoRA, zero-scale bypass, sub-tiled attention fallback, and cancellation rollback."
+)]
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_batched_prefill_odd128_q8_0_lora_subtile_and_cancellation() -> TestResult {
+    // 1. Odd-128 column hybrid model + stacked RankOne + MultiRank LoRA across T=1, 3, 7, 16.
+    let base_seq_model = synthetic_hybrid_qwen35_model_with_layout("odd128-lora", 384, 384, 32)?;
+    let base_bat_model = synthetic_hybrid_qwen35_model_with_layout("odd128-lora", 384, 384, 32)?;
+    let r1_model = synthetic_rank_one_adapter(&base_seq_model, "r1-odd128", 1.5, true, 0)?;
+    let mr_model = synthetic_multi_rank_adapter(&base_seq_model, "mr-odd128", 2.0, 4, 1)?;
+    let make_adapters = || VulkanBatchedAdapters {
+        rank_one: Some(VulkanRankOneAdapterSpec {
+            adapter: &r1_model,
+            scale: 0.75,
+        }),
+        multi_rank: Some(VulkanMultiRankAdapterSpec {
+            adapter: &mr_model,
+            policy: MultiRankPolicy::AnyLinear,
+            scale: 1.25,
+        }),
+    };
+
+    let mut seq_exec = VulkanBatchedGraphExecutor::open_with_adapters(
+        &base_seq_model,
+        VulkanBatchedConfig {
+            prefill_tile_tokens: 1,
+            ..VulkanBatchedConfig::default()
+        },
+        make_adapters(),
+    )?;
+    let mut bat_exec = VulkanBatchedGraphExecutor::open_with_adapters(
+        &base_bat_model,
+        VulkanBatchedConfig {
+            prefill_tile_tokens: 16,
+            ..VulkanBatchedConfig::default()
+        },
+        make_adapters(),
+    )?;
+
+    let tokens: [u32; 7] = [0, 2, 4, 6, 8, 10, 12];
+    for &t in &tokens {
+        seq_exec.ingest_token(t)?;
+    }
+    bat_exec.ingest_tokens_batched(&tokens)?;
+    assert_eq!(bat_exec.position(), seq_exec.position());
+    let seq_logits = seq_exec.evaluate_token(5)?;
+    let bat_logits = bat_exec.evaluate_token(5)?;
+    assert_close(&bat_logits, &seq_logits, 2e-4, "odd128 lora batched vs seq");
+
+    // Zero-scale LoRA bypass in batched mode must match unadapted sequential base.
+    seq_exec.reset_with_adapter_scales(Some(0.0), Some(0.0))?;
+    bat_exec.reset_with_adapter_scales(Some(0.0), Some(0.0))?;
+    for &t in &tokens[..4] {
+        seq_exec.ingest_token(t)?;
+    }
+    bat_exec.ingest_tokens_batched(&tokens[..4])?;
+    let seq_zero = seq_exec.evaluate_token(1)?;
+    let bat_zero = bat_exec.evaluate_token(1)?;
+    assert_close(&bat_zero, &seq_zero, 1e-4, "odd128 zero-scale batched");
+
+    // 2. Tight scratch budget forcing attention sub-tiling (score_tokens < tile_tokens)
+    //    with Decomposed3Stage attention on context_length=1024 (1-tok score = 16 KiB).
+    let sub_model = synthetic_hybrid_qwen35_model_with_layout("subtile-attn", 384, 384, 1024)?;
+    let mut subtile_exec = VulkanBatchedGraphExecutor::open(
+        &sub_model,
+        VulkanBatchedConfig {
+            prefill_tile_tokens: 8,
+            attention_strategy: AttentionStrategy::ForceDecomposed,
+            scratch_budget_bytes: 450 * 1024,
+            ..VulkanBatchedConfig::default()
+        },
+    )?;
+    let mut sub_seq = VulkanBatchedGraphExecutor::open(
+        &synthetic_hybrid_qwen35_model_with_layout("subtile-attn", 384, 384, 1024)?,
+        VulkanBatchedConfig {
+            prefill_tile_tokens: 1,
+            attention_strategy: AttentionStrategy::ForceDecomposed,
+            ..VulkanBatchedConfig::default()
+        },
+    )?;
+    let sub_tokens: [u32; 5] = [1, 3, 5, 7, 9];
+    for &t in &sub_tokens {
+        sub_seq.ingest_token(t)?;
+    }
+    subtile_exec.ingest_tokens_batched(&sub_tokens)?;
+    assert_close(
+        &subtile_exec.evaluate_token(2)?,
+        &sub_seq.evaluate_token(2)?,
+        1e-4,
+        "sub-tiled decomposed attention parity",
+    );
+
+    // 3. Cancellation & fault rollback: pre-tile cancellation leaves state intact; mid-tile
+    //    cancellation with `layers_per_submit = 1` latches inconsistent state until `restore`.
+    let mut cancel_exec = VulkanBatchedGraphExecutor::open(
+        &synthetic_hybrid_qwen35_model("cancel-test")?,
+        VulkanBatchedConfig {
+            tdr_policy: TdrChunkPolicy::new(1, 2048)?,
+            prefill_tile_tokens: 4,
+            ..VulkanBatchedConfig::default()
+        },
+    )?;
+    cancel_exec.ingest_tokens_batched(&[0, 1])?;
+    let good_cp = cancel_exec.checkpoint()?;
+
+    let err_before = Decoder::ingest_block(&mut cancel_exec, &[2, 3, 4], &|| {
+        Err("pre-tile cancel".into())
+    });
+    assert!(err_before.is_err());
+    assert_eq!(cancel_exec.position(), 2);
+    let _ = cancel_exec.evaluate_token(2)?;
+
+    cancel_exec.restore(&good_cp)?;
+    let checks = AtomicUsize::new(0);
+    let err_mid = Decoder::ingest_block(&mut cancel_exec, &[2, 3, 4], &|| {
+        let count = checks.fetch_add(1, Ordering::Relaxed);
+        if count >= 1 {
+            return Err("mid-tile cancel".into());
+        }
+        Ok(())
+    });
+    assert!(err_mid.is_err());
+    assert!(cancel_exec.evaluate_token(2).is_err());
+    cancel_exec.restore(&good_cp)?;
+    assert_eq!(cancel_exec.position(), 2);
+    assert_eq!(cancel_exec.evaluate_token(2)?.len(), 16);
     Ok(())
 }

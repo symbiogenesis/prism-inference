@@ -32,7 +32,7 @@ use crate::{
         MAX_DESCRIPTOR_SETS_PER_SUBMIT, PipelineId, WeightArena,
     },
     executor::{
-        KIND_PQ2, KIND_PTQ1, KIND_Q8_0, MIN_SCRATCH_BYTES, ProjectionPipelines,
+        BatchTokenPath, KIND_PQ2, KIND_PTQ1, KIND_Q8_0, MIN_SCRATCH_BYTES, ProjectionPipelines,
         Q8_0_WORDS_PER_BLOCK, Q8K_4PLANE_WORDS_PER_HALF, attention_push_constants, checked_grid,
         ensure_finite_f32, f32_slice_bytes, hadamard_norm_bits, repack_coalesced_into,
         u32_slice_bytes, validate_matrix, validate_weight_scales,
@@ -4010,11 +4010,9 @@ impl VulkanBatchedGraphExecutor {
         let tokens_u32 = u32::try_from(tokens)
             .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
         let multi_token = tokens > 1;
-        let tok_tiles_y = if multi_token {
-            tokens_u32.div_ceil(4)
-        } else {
-            1
-        };
+        let batch_path = BatchTokenPath::for_tokens(&self.device, tokens);
+        let tok_tiles_16y = batch_path.grid_y(tokens_u32);
+        let tile_y_4 = batch_path.grid_y_four_tok_cap(tokens_u32);
 
         for (idx, (weight, out_buf)) in group.iter().enumerate() {
             let rows_u32 = u32::try_from(weight.rows)
@@ -4030,7 +4028,7 @@ impl VulkanBatchedGraphExecutor {
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
                     let pipe = self.pipelines.proj.select_pq2_q8k(
                         self.resolved_pinned_arithmetic,
-                        multi_token,
+                        batch_path,
                         false,
                     );
                     self.batch_recorder.push(
@@ -4043,7 +4041,7 @@ impl VulkanBatchedGraphExecutor {
                         &[rows_u32, blocks_u32, tokens_u32, act_words],
                         checked_grid(
                             &self.device,
-                            [rows_u32.div_ceil(WORKGROUP_X), tok_tiles_y, 1],
+                            [rows_u32.div_ceil(WORKGROUP_X), tok_tiles_16y, 1],
                         )?,
                         barrier_before,
                     );
@@ -4059,17 +4057,25 @@ impl VulkanBatchedGraphExecutor {
                     })?;
                     let act_words = u32::try_from((cols / 32) * Q8_0_WORDS_PER_BLOCK)
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
-                    let pipe = match weight.encoding {
-                        WeightEncoding::Pq2Q8_0 => self.pipelines.proj.select_pq2_q8_0(multi_token),
-                        WeightEncoding::Ptq1Q8_0 => self
-                            .pipelines
-                            .proj
-                            .select_ptq1_q8_0(self.resolved_pinned_arithmetic, multi_token),
-                        WeightEncoding::Q8_0 => self.pipelines.proj.select_q8_0_q8_0(multi_token),
+                    let (pipe, tok_tiles_y) = match weight.encoding {
+                        WeightEncoding::Pq2Q8_0 => {
+                            (self.pipelines.proj.select_pq2_q8_0(batch_path), tile_y_4)
+                        }
+                        WeightEncoding::Ptq1Q8_0 => (
+                            self.pipelines
+                                .proj
+                                .select_ptq1_q8_0(self.resolved_pinned_arithmetic, batch_path),
+                            tok_tiles_16y,
+                        ),
+                        WeightEncoding::Q8_0 => (
+                            self.pipelines.proj.select_q8_0_q8_0(batch_path),
+                            tok_tiles_16y,
+                        ),
                         WeightEncoding::Pq2Q8k | WeightEncoding::F32 => {
                             return Err(Error::InvalidInput("unexpected encoding".to_owned()));
                         }
                     };
+                    let tile_rows = rows_u32.div_ceil(WORKGROUP_X);
                     self.batch_recorder.push(
                         pipe,
                         &[
@@ -4078,10 +4084,7 @@ impl VulkanBatchedGraphExecutor {
                             BufferSpan::whole(*out_buf),
                         ],
                         &[rows_u32, blocks_u32, tokens_u32, act_words],
-                        checked_grid(
-                            &self.device,
-                            [rows_u32.div_ceil(WORKGROUP_X), tok_tiles_y, 1],
-                        )?,
+                        checked_grid(&self.device, [tile_rows, tok_tiles_y, 1])?,
                         barrier_before,
                     );
                 }
@@ -4095,7 +4098,7 @@ impl VulkanBatchedGraphExecutor {
                                 BufferSpan::whole(*out_buf),
                             ],
                             &[cols_u32, rows_u32, tokens_u32],
-                            checked_grid(&self.device, [rows_u32, tok_tiles_y, 1])?,
+                            checked_grid(&self.device, [rows_u32, tile_y_4, 1])?,
                             barrier_before,
                         );
                     } else {

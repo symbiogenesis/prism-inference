@@ -164,6 +164,7 @@ struct ShaderBuilder {
     ptr_input_u32_t: u32,
     ptr_fn_f32_t: Option<u32>,
     ptr_fn_u32_t: Option<u32>,
+    ptr_fn_i32_t: Option<u32>,
     ptr_push_u32_t: Option<u32>,
     ptr_sb_u32_t: Option<u32>,
     ptr_sb_f32_t: Option<u32>,
@@ -232,6 +233,7 @@ impl ShaderBuilder {
             ptr_input_u32_t: 0,
             ptr_fn_f32_t: None,
             ptr_fn_u32_t: None,
+            ptr_fn_i32_t: None,
             ptr_push_u32_t: None,
             ptr_sb_u32_t: None,
             ptr_sb_f32_t: None,
@@ -844,6 +846,34 @@ impl ShaderBuilder {
     fn load_var_u32(&mut self, var: u32) -> u32 {
         let val = self.alloc_id();
         push_inst(&mut self.fn_body, OP_LOAD, &[self.u32_t, val, var]);
+        val
+    }
+
+    fn local_i32_var(&mut self) -> u32 {
+        let ptr_t = if let Some(id) = self.ptr_fn_i32_t {
+            id
+        } else {
+            let id = self.alloc_id();
+            push_inst(
+                &mut self.types_consts_globals,
+                OP_TYPE_POINTER,
+                &[id, STORAGE_FUNCTION, self.i32_t],
+            );
+            self.ptr_fn_i32_t = Some(id);
+            id
+        };
+        let var = self.alloc_id();
+        push_inst(
+            &mut self.fn_header,
+            OP_VARIABLE,
+            &[ptr_t, var, STORAGE_FUNCTION],
+        );
+        var
+    }
+
+    fn load_var_i32(&mut self, var: u32) -> u32 {
+        let val = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_LOAD, &[self.i32_t, val, var]);
         val
     }
 
@@ -1827,21 +1857,53 @@ pub fn pq2_q8_0_gemv(use_sdot: bool) -> Vec<u32> {
     b.finish()
 }
 
-struct PtqDecodedBlock {
-    w_scale: u32,
-    lanes: [u32; 32],
-}
-
-fn decode_ptq1_block_lanes(b: &mut ShaderBuilder, weights_buf: u32, wbase: u32) -> PtqDecodedBlock {
-    decode_ptq1_block_lanes_strided(b, weights_buf, wbase, 1)
-}
-
-fn decode_ptq1_block_lanes_strided(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Advances a pair of packed ternary state words by one base-3 digit (`4` packed trits) in place."
+)]
+fn step_ptq1_pair_trits(
     b: &mut ShaderBuilder,
-    weights_buf: u32,
+    lo: u32,
+    hi: u32,
+    c3: u32,
+    c8: u32,
+    c16: u32,
+    c24: u32,
+    m00ff: u32,
+    mask_trit: u32,
+) -> (u32, u32, u32) {
+    let wg_lo = b.umul(lo, c3);
+    let wg_hi = b.umul(hi, c3);
+    let lo_s8 = b.ushr(wg_lo, c8);
+    let d0 = b.uand(lo_s8, mask_trit);
+    let lo_s24 = b.ushr(wg_lo, c24);
+    let d2 = b.uand(lo_s24, mask_trit);
+    let hi_s8 = b.ushr(wg_hi, c8);
+    let d1 = b.uand(hi_s8, mask_trit);
+    let hi_s24 = b.ushr(wg_hi, c24);
+    let d3 = b.uand(hi_s24, mask_trit);
+    let next_lo = b.uand(wg_lo, m00ff);
+    let next_hi = b.uand(wg_hi, m00ff);
+
+    let t1 = b.ushl(d1, c8);
+    let t2 = b.ushl(d2, c16);
+    let t3 = b.ushl(d3, c24);
+    let t01 = b.uor(d0, t1);
+    let t23 = b.uor(t2, t3);
+    (next_lo, next_hi, b.uor(t01, t23))
+}
+
+fn stream_ptq1_block_strided<L, C>(
+    b: &mut ShaderBuilder,
+    mut load_weight: L,
     wbase: u32,
     word_stride: u32,
-) -> PtqDecodedBlock {
+    mut consume_word: C,
+) -> u32
+where
+    L: FnMut(&mut ShaderBuilder, u32) -> u32,
+    C: FnMut(&mut ShaderBuilder, usize, u32, u32),
+{
     let m00ff = b.const_u32(0x00FF_00FF);
     let mask_low_byte = b.const_u32(0xFF);
     let mask_hi_byte = b.const_u32(0xFF00);
@@ -1851,106 +1913,197 @@ fn decode_ptq1_block_lanes_strided(
     let c24 = b.const_u32(24);
     let mask_trit = b.const_u32(3);
 
-    let mut lanes = [0_u32; 32];
-
-    for g in 0_u32..4 {
-        let g_c = b.const_u32(g * word_stride);
-        let wg_idx = b.uadd(wbase, g_c);
-        let wg = b.load_sb_u32(weights_buf, wg_idx);
-        let mut lo = b.uand(wg, m00ff);
-        let wg_s8 = b.ushr(wg, c8);
-        let mut hi = b.uand(wg_s8, m00ff);
-
-        for n in 0_u32..5 {
-            lo = b.umul(lo, c3);
-            hi = b.umul(hi, c3);
-            let lo_s8 = b.ushr(lo, c8);
-            let d0 = b.uand(lo_s8, mask_trit);
-            let lo_s24 = b.ushr(lo, c24);
-            let d2 = b.uand(lo_s24, mask_trit);
-            let hi_s8 = b.ushr(hi, c8);
-            let d1 = b.uand(hi_s8, mask_trit);
-            let hi_s24 = b.ushr(hi, c24);
-            let d3 = b.uand(hi_s24, mask_trit);
-            lo = b.uand(lo, m00ff);
-            hi = b.uand(hi, m00ff);
-
-            let t1 = b.ushl(d1, c8);
-            let t2 = b.ushl(d2, c16);
-            let t3 = b.ushl(d3, c24);
-            let t01 = b.uor(d0, t1);
-            let t23 = b.uor(t2, t3);
-            lanes[usize::try_from(4 * n + g).unwrap_or(0)] = b.uor(t01, t23);
-        }
-    }
-
-    for g2 in 0_u32..2 {
-        let g2_c = b.const_u32((4 + g2) * word_stride);
-        let wg_idx = b.uadd(wbase, g2_c);
-        let wg = b.load_sb_u32(weights_buf, wg_idx);
-        let mut lo = b.uand(wg, m00ff);
-        let wg_s8 = b.ushr(wg, c8);
-        let mut hi = b.uand(wg_s8, m00ff);
-
-        for n in 0_u32..5 {
-            lo = b.umul(lo, c3);
-            hi = b.umul(hi, c3);
-            let lo_s8 = b.ushr(lo, c8);
-            let d0 = b.uand(lo_s8, mask_trit);
-            let lo_s24 = b.ushr(lo, c24);
-            let d2 = b.uand(lo_s24, mask_trit);
-            let hi_s8 = b.ushr(hi, c8);
-            let d1 = b.uand(hi_s8, mask_trit);
-            let hi_s24 = b.ushr(hi, c24);
-            let d3 = b.uand(hi_s24, mask_trit);
-            lo = b.uand(lo, m00ff);
-            hi = b.uand(hi, m00ff);
-
-            let t1 = b.ushl(d1, c8);
-            let t2 = b.ushl(d2, c16);
-            let t3 = b.ushl(d3, c24);
-            let t01 = b.uor(d0, t1);
-            let t23 = b.uor(t2, t3);
-            lanes[usize::try_from(20 + 2 * n + g2).unwrap_or(0)] = b.uor(t01, t23);
-        }
-    }
-
+    // Load `w6` first for `w_scale` so group `0..=3` can consume streamed trits immediately.
     let c6 = b.const_u32(6 * word_stride);
     let w6_idx = b.uadd(wbase, c6);
-    let w6 = b.load_sb_u32(weights_buf, w6_idx);
-    let w_scale_u16 = b.ushr(w6, c16);
+    let w6_head = load_weight(b, w6_idx);
+    let w_scale_u16 = b.ushr(w6_head, c16);
     let w_scale = b.unpack_half_low(w_scale_u16);
 
-    let b24 = b.uand(w6, mask_low_byte);
-    let b25_masked = b.uand(w6, mask_hi_byte);
+    let mut lo = [0_u32; 4];
+    let mut hi = [0_u32; 4];
+    for g in 0_usize..4 {
+        let g_u32 = u32::try_from(g).unwrap_or(0);
+        let g_c = b.const_u32(g_u32 * word_stride);
+        let word_idx = b.uadd(wbase, g_c);
+        let wg = load_weight(b, word_idx);
+        lo[g] = b.uand(wg, m00ff);
+        let wg_s8 = b.ushr(wg, c8);
+        hi[g] = b.uand(wg_s8, m00ff);
+    }
+    for n in 0_usize..5 {
+        for g in 0_usize..4 {
+            let (next_lo, next_hi, packed) =
+                step_ptq1_pair_trits(b, lo[g], hi[g], c3, c8, c16, c24, m00ff, mask_trit);
+            lo[g] = next_lo;
+            hi[g] = next_hi;
+            consume_word(b, n * 4 + g, packed, w_scale);
+        }
+    }
+
+    let mut lo2 = [0_u32; 2];
+    let mut hi2 = [0_u32; 2];
+    for g2 in 0_usize..2 {
+        let g2_u32 = u32::try_from(4 + g2).unwrap_or(4);
+        let g2_c = b.const_u32(g2_u32 * word_stride);
+        let word_idx = b.uadd(wbase, g2_c);
+        let wg = load_weight(b, word_idx);
+        lo2[g2] = b.uand(wg, m00ff);
+        let wg_s8 = b.ushr(wg, c8);
+        hi2[g2] = b.uand(wg_s8, m00ff);
+    }
+    for n in 0_usize..5 {
+        for g2 in 0_usize..2 {
+            let (next_lo, next_hi, packed) =
+                step_ptq1_pair_trits(b, lo2[g2], hi2[g2], c3, c8, c16, c24, m00ff, mask_trit);
+            lo2[g2] = next_lo;
+            hi2[g2] = next_hi;
+            consume_word(b, 20 + n * 2 + g2, packed, w_scale);
+        }
+    }
+
+    let w6_tail = load_weight(b, w6_idx);
+    let b24 = b.uand(w6_tail, mask_low_byte);
+    let b25_masked = b.uand(w6_tail, mask_hi_byte);
     let b25_shifted = b.ushl(b25_masked, c8);
     let mut pair = b.uor(b24, b25_shifted);
 
-    let mut d_steps = [(0_u32, 0_u32); 4];
-    for slot in &mut d_steps {
-        pair = b.umul(pair, c3);
-        let pair_s8 = b.ushr(pair, c8);
-        let ev = b.uand(pair_s8, mask_trit);
-        let pair_s24 = b.ushr(pair, c24);
-        let od = b.uand(pair_s24, mask_trit);
-        pair = b.uand(pair, m00ff);
-        *slot = (ev, od);
+    for half_w in 0_usize..2 {
+        let mut d_pair = [(0_u32, 0_u32); 2];
+        for slot in &mut d_pair {
+            pair = b.umul(pair, c3);
+            let pair_s8 = b.ushr(pair, c8);
+            let ev = b.uand(pair_s8, mask_trit);
+            let pair_s24 = b.ushr(pair, c24);
+            let od = b.uand(pair_s24, mask_trit);
+            pair = b.uand(pair, m00ff);
+            *slot = (ev, od);
+        }
+        let d01 = b.ushl(d_pair[0].1, c8);
+        let w_01 = b.uor(d_pair[0].0, d01);
+        let d2 = b.ushl(d_pair[1].0, c16);
+        let d3 = b.ushl(d_pair[1].1, c24);
+        let w_23 = b.uor(d2, d3);
+        let word_trits = b.uor(w_01, w_23);
+        consume_word(b, 30 + half_w, word_trits, w_scale);
     }
-    let d0_1 = b.ushl(d_steps[0].1, c8);
-    let w30_01 = b.uor(d_steps[0].0, d0_1);
-    let d1_0 = b.ushl(d_steps[1].0, c16);
-    let d1_1 = b.ushl(d_steps[1].1, c24);
-    let w30_23 = b.uor(d1_0, d1_1);
-    lanes[30] = b.uor(w30_01, w30_23);
 
-    let d2_1 = b.ushl(d_steps[2].1, c8);
-    let w31_01 = b.uor(d_steps[2].0, d2_1);
-    let d3_0 = b.ushl(d_steps[3].0, c16);
-    let d3_1 = b.ushl(d_steps[3].1, c24);
-    let w31_23 = b.uor(d3_0, d3_1);
-    lanes[31] = b.uor(w31_01, w31_23);
+    w_scale
+}
 
-    PtqDecodedBlock { w_scale, lanes }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Unifies streaming PTQ1_0 x Q8_0 dot product across K tokens (1-tok GEMV, 4-tok GEMM, and 16-tok shared-memory GEMM)."
+)]
+fn emit_ptq1_q8_0_stream_block<const K: usize, LW, LA>(
+    b: &mut ShaderBuilder,
+    load_weight: LW,
+    load_act: LA,
+    wbase: u32,
+    word_stride: u32,
+    blk_act_bases: [u32; K],
+    use_sdot: bool,
+    pinned_4lane: bool,
+    lane_vars: &[[u32; 4]; K],
+) where
+    LW: FnMut(&mut ShaderBuilder, u32) -> u32,
+    LA: FnMut(&mut ShaderBuilder, u32) -> u32,
+{
+    let f_zero = b.const_f32(0.0);
+    let i_zero = b.const_i32(0);
+    let mut load_act = load_act;
+    let mut act_scales = [f_zero; K];
+    let mut block_sums = [f_zero; K];
+    let mut lane_sums = [[i_zero; 4]; K];
+    let mut isums = [i_zero; K];
+
+    let w_scale = stream_ptq1_block_strided(
+        b,
+        load_weight,
+        wbase,
+        word_stride,
+        |b, word_idx, packed_trits, w_scale| {
+            let grp = u32::try_from(word_idx / 8).unwrap_or(0);
+            let in_grp = u32::try_from(word_idx % 8).unwrap_or(0);
+            let grp_off_c = b.const_u32(grp * 9);
+            if in_grp == 0 {
+                for (k, &base) in blk_act_bases.iter().enumerate() {
+                    let sb_idx = b.uadd(base, grp_off_c);
+                    let u = load_act(b, sb_idx);
+                    act_scales[k] = b.bitcast(b.f32_t, u);
+                }
+                if pinned_4lane {
+                    lane_sums = [[i_zero; 4]; K];
+                } else {
+                    isums = [i_zero; K];
+                }
+            }
+
+            let act_w_off = b.const_u32(grp * 9 + 1 + in_grp);
+            let lane_idx = word_idx % 4;
+            if K == 1 {
+                let act_w_idx = b.uadd(blk_act_bases[0], act_w_off);
+                let aw = load_act(b, act_w_idx);
+                let dot = dot_trit_lanes_with_act(b, packed_trits, aw, use_sdot);
+                if pinned_4lane {
+                    lane_sums[0][lane_idx] = b.iadd(lane_sums[0][lane_idx], dot);
+                } else {
+                    isums[0] = b.iadd(isums[0], dot);
+                }
+            } else if use_sdot {
+                let packed_w = swar_bias_minus_one(b, packed_trits);
+                for (k, &base) in blk_act_bases.iter().enumerate() {
+                    let act_w_idx = b.uadd(base, act_w_off);
+                    let aw = load_act(b, act_w_idx);
+                    let dot = b.sdot_packed(packed_w, aw);
+                    if pinned_4lane {
+                        lane_sums[k][lane_idx] = b.iadd(lane_sums[k][lane_idx], dot);
+                    } else {
+                        isums[k] = b.iadd(isums[k], dot);
+                    }
+                }
+            } else {
+                let w_i32 = unpack_packed_trits_to_i32_weights(b, packed_trits);
+                for (k, &base) in blk_act_bases.iter().enumerate() {
+                    let act_w_idx = b.uadd(base, act_w_off);
+                    let aw = load_act(b, act_w_idx);
+                    let dot = portable_dot4_i32_weights(b, w_i32, aw);
+                    if pinned_4lane {
+                        lane_sums[k][lane_idx] = b.iadd(lane_sums[k][lane_idx], dot);
+                    } else {
+                        isums[k] = b.iadd(isums[k], dot);
+                    }
+                }
+            }
+
+            if in_grp == 7 {
+                for k in 0..K {
+                    if pinned_4lane {
+                        let d = b.fmul_nc(w_scale, act_scales[k]);
+                        for (&lane_var, &sum_val) in lane_vars[k].iter().zip(&lane_sums[k]) {
+                            let lane_f32 = b.i32_to_f32(sum_val);
+                            let prev = b.load_var_f32(lane_var);
+                            let next = b.fma(lane_f32, d, prev);
+                            b.store_var(lane_var, next);
+                        }
+                    } else {
+                        let grp_sum_f32 = b.i32_to_f32(isums[k]);
+                        let scaled = b.fmul_nc(act_scales[k], grp_sum_f32);
+                        block_sums[k] = b.fadd_nc(block_sums[k], scaled);
+                    }
+                }
+            }
+        },
+    );
+
+    if !pinned_4lane {
+        for (row_vars, &block_sum) in lane_vars.iter().zip(&block_sums) {
+            let prev = b.load_var_f32(row_vars[0]);
+            let contrib = b.fmul_nc(w_scale, block_sum);
+            let next = b.fadd_nc(prev, contrib);
+            b.store_var(row_vars[0], next);
+        }
+    }
 }
 
 fn dot_trit_lanes_with_act(b: &mut ShaderBuilder, lanes: u32, act_w: u32, use_sdot: bool) -> u32 {
@@ -2011,58 +2164,20 @@ pub fn ptq1_q8_0_gemv(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
         b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
             let blk_total = b.uadd(row_blocks, blk);
             let wbase = b.umul(blk_total, c7);
-            let decoded = decode_ptq1_block_lanes(b, weights_buf, wbase);
-
             let blk_act_off = b.umul(blk, c36);
             let blk_act_base = b.uadd(tok_act_base, blk_act_off);
 
-            let mut block_sum = f_zero;
-
-            for grp in 0_usize..4 {
-                let grp_index = u32::try_from(grp).unwrap_or(0);
-                let grp_off_c = b.const_u32(grp_index * 9);
-                let grp_base = b.uadd(blk_act_base, grp_off_c);
-                let act_scale_u32 = b.load_sb_u32(act_buf, grp_base);
-                let act_scale = b.bitcast(b.f32_t, act_scale_u32);
-
-                let mut lane_sums = [b.const_i32(0); 4];
-                for half in 0_usize..2 {
-                    for (l, lane_slot) in lane_sums.iter_mut().enumerate() {
-                        let act_within_grp = u32::try_from(half * 4 + l).unwrap_or(0);
-                        let act_off_c = b.const_u32(1 + act_within_grp);
-                        let act_w_idx = b.uadd(grp_base, act_off_c);
-                        let act_w = b.load_sb_u32(act_buf, act_w_idx);
-                        let word_idx = grp * 8 + half * 4 + l;
-                        let dot =
-                            dot_trit_lanes_with_act(b, decoded.lanes[word_idx], act_w, use_sdot);
-                        *lane_slot = b.iadd(*lane_slot, dot);
-                    }
-                }
-
-                if pinned_4lane {
-                    let d = b.fmul_nc(decoded.w_scale, act_scale);
-                    for (&lane_var, &sum_val) in lane_vars.iter().zip(&lane_sums) {
-                        let lane_f32 = b.i32_to_f32(sum_val);
-                        let prev = b.load_var_f32(lane_var);
-                        let next = b.fma(lane_f32, d, prev);
-                        b.store_var(lane_var, next);
-                    }
-                } else {
-                    let s01 = b.iadd(lane_sums[0], lane_sums[1]);
-                    let s23 = b.iadd(lane_sums[2], lane_sums[3]);
-                    let grp_int = b.iadd(s01, s23);
-                    let grp_sum_f32 = b.i32_to_f32(grp_int);
-                    let scaled = b.fmul_nc(act_scale, grp_sum_f32);
-                    block_sum = b.fadd_nc(block_sum, scaled);
-                }
-            }
-
-            if !pinned_4lane {
-                let prev = b.load_var_f32(lane_vars[0]);
-                let contrib = b.fmul_nc(decoded.w_scale, block_sum);
-                let next = b.fadd_nc(prev, contrib);
-                b.store_var(lane_vars[0], next);
-            }
+            emit_ptq1_q8_0_stream_block(
+                b,
+                |b, idx| b.load_sb_u32(weights_buf, idx),
+                |b, idx| b.load_sb_u32(act_buf, idx),
+                wbase,
+                1,
+                [blk_act_base],
+                use_sdot,
+                pinned_4lane,
+                &[lane_vars],
+            );
         });
 
         let final_val = if pinned_4lane {
@@ -2126,7 +2241,6 @@ pub fn ptq1_q8k_gemv(use_sdot: bool) -> Vec<u32> {
         b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
             let blk_total = b.uadd(row_blocks, blk);
             let wbase = b.umul(blk_total, c7);
-            let decoded = decode_ptq1_block_lanes(b, weights_buf, wbase);
 
             let q8k_idx = b.ushr(blk, c1);
             let q8k_off = b.umul(q8k_idx, c65);
@@ -2140,16 +2254,22 @@ pub fn ptq1_q8k_gemv(use_sdot: bool) -> Vec<u32> {
             let act_vals_base = b.uadd(q8k_vals_start, half_off);
 
             let mut sum_int = b.const_i32(0);
-            for (word_idx, &lanes) in decoded.lanes.iter().enumerate() {
-                let off_c = b.const_u32(u32::try_from(word_idx).unwrap_or(0));
-                let act_idx = b.uadd(act_vals_base, off_c);
-                let act_w = b.load_sb_u32(act_buf, act_idx);
-                let dot = dot_trit_lanes_with_act(b, lanes, act_w, use_sdot);
-                sum_int = b.iadd(sum_int, dot);
-            }
+            let w_scale = stream_ptq1_block_strided(
+                b,
+                |b, idx| b.load_sb_u32(weights_buf, idx),
+                wbase,
+                1,
+                |b, word_idx, lanes, _| {
+                    let off_c = b.const_u32(u32::try_from(word_idx).unwrap_or(0));
+                    let act_idx = b.uadd(act_vals_base, off_c);
+                    let act_w = b.load_sb_u32(act_buf, act_idx);
+                    let dot = dot_trit_lanes_with_act(b, lanes, act_w, use_sdot);
+                    sum_int = b.iadd(sum_int, dot);
+                },
+            );
 
             let sum_f32 = b.i32_to_f32(sum_int);
-            let d = b.fmul_nc(decoded.w_scale, act_scale);
+            let d = b.fmul_nc(w_scale, act_scale);
             let prev = b.load_var_f32(acc_var);
             let prod = b.fmul_nc(d, sum_f32);
             let next = b.fadd_nc(prev, prod);
@@ -2203,11 +2323,23 @@ fn portable_dot4_u8_packed4_s8(b: &mut ShaderBuilder, u4: u32, act_s4: u32) -> u
 }
 
 fn coalesced_pq2_scale(b: &mut ShaderBuilder, weights_buf: u32, tile_base: u32, lane: u32) -> u32 {
+    coalesced_pq2_scale_from_loader(b, |b, idx| b.load_sb_u32(weights_buf, idx), tile_base, lane)
+}
+
+fn coalesced_pq2_scale_from_loader<L>(
+    b: &mut ShaderBuilder,
+    mut load_word: L,
+    base: u32,
+    lane: u32,
+) -> u32
+where
+    L: FnMut(&mut ShaderBuilder, u32) -> u32,
+{
     let c0 = b.const_u32(0);
     let c1 = b.const_u32(1);
     let pair_off = b.ushr(lane, c1);
-    let idx = b.uadd(tile_base, pair_off);
-    let raw_pair = b.load_sb_u32(weights_buf, idx);
+    let idx = b.uadd(base, pair_off);
+    let raw_pair = load_word(b, idx);
     let (s_ev, s_od) = b.unpack_half_pair(raw_pair);
     let odd_bit = b.uand(lane, c1);
     let is_odd = b.u_ne(odd_bit, c0);
@@ -2236,11 +2368,30 @@ fn dot_pq2_4digits_with_act(
     act_words_base: u32,
     use_sdot: bool,
 ) -> u32 {
+    dot_pq2_4digits_from_loader(
+        b,
+        q,
+        |b, idx| b.load_sb_u32(act_buf, idx),
+        act_words_base,
+        use_sdot,
+    )
+}
+
+fn dot_pq2_4digits_from_loader<L>(
+    b: &mut ShaderBuilder,
+    q: [u32; 4],
+    mut load_word: L,
+    act_words_base: u32,
+    use_sdot: bool,
+) -> u32
+where
+    L: FnMut(&mut ShaderBuilder, u32) -> u32,
+{
     let mut sum = b.const_i32(0);
     for (digit, &q_word) in q.iter().enumerate() {
         let d_off = b.const_u32(u32::try_from(digit).unwrap_or(0));
         let act_idx = b.uadd(act_words_base, d_off);
-        let plane = b.load_sb_u32(act_buf, act_idx);
+        let plane = load_word(b, act_idx);
         let dot = if use_sdot {
             b.sdot_packed(q_word, plane)
         } else {
@@ -3021,58 +3172,25 @@ pub fn q8_0_q8_0_gemm_4tok_coalesced(use_sdot: bool) -> Vec<u32> {
     b.finish()
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Maintains clean SPIR-V emission decomposition for 32-element PTQ1xQ8_0 groups."
-)]
-fn ptq1_q8_0_group_step(
-    b: &mut ShaderBuilder,
-    decoded: &PtqDecodedBlock,
-    act_buf: u32,
-    grp_base: u32,
-    grp: usize,
-    use_sdot: bool,
-    pinned_4lane: bool,
-    lane_vars: [u32; 4],
-    block_sum: &mut u32,
-) {
-    let act_scale_u32 = b.load_sb_u32(act_buf, grp_base);
-    let act_scale = b.bitcast(b.f32_t, act_scale_u32);
-    let mut lane_sums = [b.const_i32(0); 4];
-    for half in 0_usize..2 {
-        for (l, lane_slot) in lane_sums.iter_mut().enumerate() {
-            let act_within_grp = u32::try_from(half * 4 + l).unwrap_or(0);
-            let act_off_c = b.const_u32(1 + act_within_grp);
-            let act_w_idx = b.uadd(grp_base, act_off_c);
-            let act_w = b.load_sb_u32(act_buf, act_w_idx);
-            let word_idx = grp * 8 + half * 4 + l;
-            let dot = dot_trit_lanes_with_act(b, decoded.lanes[word_idx], act_w, use_sdot);
-            *lane_slot = b.iadd(*lane_slot, dot);
-        }
-    }
+fn finalize_ptq1_lane_vars(b: &mut ShaderBuilder, lane_vars: &[u32; 4], pinned_4lane: bool) -> u32 {
     if pinned_4lane {
-        let d = b.fmul_nc(decoded.w_scale, act_scale);
-        for (&lane_var, &sum_val) in lane_vars.iter().zip(&lane_sums) {
-            let lane_f32 = b.i32_to_f32(sum_val);
-            let prev = b.load_var_f32(lane_var);
-            let next = b.fma(lane_f32, d, prev);
-            b.store_var(lane_var, next);
-        }
+        let l0 = b.load_var_f32(lane_vars[0]);
+        let l1 = b.load_var_f32(lane_vars[1]);
+        let l2 = b.load_var_f32(lane_vars[2]);
+        let l3 = b.load_var_f32(lane_vars[3]);
+        let s01 = b.fadd_nc(l0, l1);
+        let s23 = b.fadd_nc(l2, l3);
+        b.fadd_nc(s01, s23)
     } else {
-        let s01 = b.iadd(lane_sums[0], lane_sums[1]);
-        let s23 = b.iadd(lane_sums[2], lane_sums[3]);
-        let grp_int = b.iadd(s01, s23);
-        let grp_sum_f32 = b.i32_to_f32(grp_int);
-        let scaled = b.fmul_nc(act_scale, grp_sum_f32);
-        *block_sum = b.fadd_nc(*block_sum, scaled);
+        b.load_var_f32(lane_vars[0])
     }
 }
 
-/// Emits coalesced 64-row `PTQ1_0` Ã— `Q8_0` GEMV SPIR-V 1.6 words (`0%` weight overhead).
+/// Emits coalesced 64-row `PTQ1_0` × `Q8_0` GEMV SPIR-V 1.6 words (`0%` weight overhead).
 ///
 /// Bindings: `0` read-only coalesced `PTQ1_0` (`448` `u32`/block-tile), `1` read-only `Q8Block`
 /// (`9` `u32`/32-elem block), `2` writable `output` (`f32`).
-/// Push constants (`4 Ã— u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn ptq1_q8_0_gemv_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
@@ -3096,13 +3214,19 @@ pub fn ptq1_q8_0_gemv_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> 
 
     b.emit_if(in_bounds, |b| {
         let f_zero = b.const_f32(0.0);
-        let lane_vars = [
-            b.local_f32_var(),
-            b.local_f32_var(),
-            b.local_f32_var(),
-            b.local_f32_var(),
-        ];
-        for var in lane_vars {
+        let lane_vars = if pinned_4lane {
+            [
+                b.local_f32_var(),
+                b.local_f32_var(),
+                b.local_f32_var(),
+                b.local_f32_var(),
+            ]
+        } else {
+            let v = b.local_f32_var();
+            [v, v, v, v]
+        };
+        let init_count = if pinned_4lane { 4 } else { 1 };
+        for &var in &lane_vars[..init_count] {
             b.store_var(var, f_zero);
         }
 
@@ -3123,48 +3247,23 @@ pub fn ptq1_q8_0_gemv_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> 
             let blk_off = b.umul(blk, c448);
             let tile_base = b.uadd(rg_base, blk_off);
             let wbase = b.uadd(tile_base, lane);
-            let decoded = decode_ptq1_block_lanes_strided(b, weights_buf, wbase, 64);
-
             let blk_act_off = b.umul(blk, c36);
             let blk_act_base = b.uadd(tok_act_base, blk_act_off);
-            let mut block_sum = f_zero;
 
-            for grp in 0_usize..4 {
-                let grp_index = u32::try_from(grp).unwrap_or(0);
-                let grp_off_c = b.const_u32(grp_index * 9);
-                let grp_base = b.uadd(blk_act_base, grp_off_c);
-                ptq1_q8_0_group_step(
-                    b,
-                    &decoded,
-                    act_buf,
-                    grp_base,
-                    grp,
-                    use_sdot,
-                    pinned_4lane,
-                    lane_vars,
-                    &mut block_sum,
-                );
-            }
-
-            if !pinned_4lane {
-                let prev = b.load_var_f32(lane_vars[0]);
-                let contrib = b.fmul_nc(decoded.w_scale, block_sum);
-                let next = b.fadd_nc(prev, contrib);
-                b.store_var(lane_vars[0], next);
-            }
+            emit_ptq1_q8_0_stream_block(
+                b,
+                |b, idx| b.load_sb_u32(weights_buf, idx),
+                |b, idx| b.load_sb_u32(act_buf, idx),
+                wbase,
+                64,
+                [blk_act_base],
+                use_sdot,
+                pinned_4lane,
+                &[lane_vars],
+            );
         });
 
-        let final_val = if pinned_4lane {
-            let l0 = b.load_var_f32(lane_vars[0]);
-            let l1 = b.load_var_f32(lane_vars[1]);
-            let l2 = b.load_var_f32(lane_vars[2]);
-            let l3 = b.load_var_f32(lane_vars[3]);
-            let s01 = b.fadd_nc(l0, l1);
-            let s23 = b.fadd_nc(l2, l3);
-            b.fadd_nc(s01, s23)
-        } else {
-            b.load_var_f32(lane_vars[0])
-        };
+        let final_val = finalize_ptq1_lane_vars(b, &lane_vars, pinned_4lane);
         let tok_out = b.umul(token, rows);
         let out_idx = b.uadd(tok_out, row);
         b.store_sb_f32(out_buf, out_idx, final_val);
@@ -3173,81 +3272,12 @@ pub fn ptq1_q8_0_gemv_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> 
     b.finish()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Maintains clean SPIR-V emission decomposition for 4-token 32-element PTQ1xQ8_0 groups."
-)]
-fn ptq1_q8_0_4tok_group_step(
-    b: &mut ShaderBuilder,
-    decoded: &PtqDecodedBlock,
-    act_buf: u32,
-    grp_bases: [u32; 4],
-    grp: usize,
-    use_sdot: bool,
-    pinned_4lane: bool,
-    lane_vars: &[[u32; 4]; 4],
-    block_sums: &mut [u32; 4],
-) {
-    let act_scales = grp_bases.map(|gb| {
-        let u = b.load_sb_u32(act_buf, gb);
-        b.bitcast(b.f32_t, u)
-    });
-    let mut lane_sums = [[b.const_i32(0); 4]; 4];
-    for half in 0_usize..2 {
-        for l in 0_usize..4 {
-            let act_within_grp = u32::try_from(half * 4 + l).unwrap_or(0);
-            let act_off_c = b.const_u32(1 + act_within_grp);
-            let word_idx = grp * 8 + half * 4 + l;
-            if use_sdot {
-                let packed_w = swar_bias_minus_one(b, decoded.lanes[word_idx]);
-                for (k, &gb) in grp_bases.iter().enumerate() {
-                    let act_w_idx = b.uadd(gb, act_off_c);
-                    let act_w = b.load_sb_u32(act_buf, act_w_idx);
-                    let dot = b.sdot_packed(packed_w, act_w);
-                    lane_sums[k][l] = b.iadd(lane_sums[k][l], dot);
-                }
-            } else {
-                let w_i32 = unpack_packed_trits_to_i32_weights(b, decoded.lanes[word_idx]);
-                for (k, &gb) in grp_bases.iter().enumerate() {
-                    let act_w_idx = b.uadd(gb, act_off_c);
-                    let act_w = b.load_sb_u32(act_buf, act_w_idx);
-                    let dot = portable_dot4_i32_weights(b, w_i32, act_w);
-                    lane_sums[k][l] = b.iadd(lane_sums[k][l], dot);
-                }
-            }
-        }
-    }
-
-    for k in 0_usize..4 {
-        if pinned_4lane {
-            let d = b.fmul_nc(decoded.w_scale, act_scales[k]);
-            for (&lane_var, &sum_val) in lane_vars[k].iter().zip(&lane_sums[k]) {
-                let lane_f32 = b.i32_to_f32(sum_val);
-                let prev = b.load_var_f32(lane_var);
-                let next = b.fma(lane_f32, d, prev);
-                b.store_var(lane_var, next);
-            }
-        } else {
-            let s01 = b.iadd(lane_sums[k][0], lane_sums[k][1]);
-            let s23 = b.iadd(lane_sums[k][2], lane_sums[k][3]);
-            let grp_int = b.iadd(s01, s23);
-            let grp_sum_f32 = b.i32_to_f32(grp_int);
-            let scaled = b.fmul_nc(act_scales[k], grp_sum_f32);
-            block_sums[k] = b.fadd_nc(block_sums[k], scaled);
-        }
-    }
-}
-
-/// Emits coalesced 64-row `×` 4-token `PTQ1_0` `×` `Q8_0` GEMM SPIR-V 1.6 words (`pinned_4lane` or standard).
+/// Emits coalesced 64-row × 4-token `PTQ1_0` × `Q8_0` GEMM SPIR-V 1.6 words (`pinned_4lane` or standard).
 ///
 /// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(4), 1)`. Decodes each `PTQ1_0` block once
-/// per K-block and reuses decoded trits across up to 4 consecutive tokens.
+/// per K-block in streaming fashion and reuses each 4-trit group across up to 4 consecutive tokens.
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Builds complete SPIR-V 1.6 compute module for 4-token coalesced PTQ1 x Q8_0 GEMM with lane-accumulator setup and tail store."
-)]
 pub fn ptq1_q8_0_gemm_4tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
@@ -3312,53 +3342,26 @@ pub fn ptq1_q8_0_gemm_4tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<
             let blk_off = b.umul(blk, c448);
             let tile_base = b.uadd(rg_base, blk_off);
             let wbase = b.uadd(tile_base, lane);
-            let decoded = decode_ptq1_block_lanes_strided(b, weights_buf, wbase, 64);
-
             let blk_act_off = b.umul(blk, c36);
             let blk_act_bases = tok_act_bases.map(|base| b.uadd(base, blk_act_off));
-            let mut block_sums = [f_zero; 4];
 
-            for grp in 0_usize..4 {
-                let grp_index = u32::try_from(grp).unwrap_or(0);
-                let grp_off_c = b.const_u32(grp_index * 9);
-                let grp_bases = blk_act_bases.map(|base| b.uadd(base, grp_off_c));
-                ptq1_q8_0_4tok_group_step(
-                    b,
-                    &decoded,
-                    act_buf,
-                    grp_bases,
-                    grp,
-                    use_sdot,
-                    pinned_4lane,
-                    &lane_vars,
-                    &mut block_sums,
-                );
-            }
-
-            if !pinned_4lane {
-                for (row_vars, &block_sum) in lane_vars.iter().zip(&block_sums) {
-                    let prev = b.load_var_f32(row_vars[0]);
-                    let contrib = b.fmul_nc(decoded.w_scale, block_sum);
-                    let next = b.fadd_nc(prev, contrib);
-                    b.store_var(row_vars[0], next);
-                }
-            }
+            emit_ptq1_q8_0_stream_block(
+                b,
+                |b, idx| b.load_sb_u32(weights_buf, idx),
+                |b, idx| b.load_sb_u32(act_buf, idx),
+                wbase,
+                64,
+                blk_act_bases,
+                use_sdot,
+                pinned_4lane,
+                &lane_vars,
+            );
         });
 
         for (&tk, row_vars) in tok_clamped.iter().zip(&lane_vars) {
             let valid = b.u_lt(tk, tokens);
             b.emit_if(valid, |b| {
-                let final_val = if pinned_4lane {
-                    let l0 = b.load_var_f32(row_vars[0]);
-                    let l1 = b.load_var_f32(row_vars[1]);
-                    let l2 = b.load_var_f32(row_vars[2]);
-                    let l3 = b.load_var_f32(row_vars[3]);
-                    let s01 = b.fadd_nc(l0, l1);
-                    let s23 = b.fadd_nc(l2, l3);
-                    b.fadd_nc(s01, s23)
-                } else {
-                    b.load_var_f32(row_vars[0])
-                };
+                let final_val = finalize_ptq1_lane_vars(b, row_vars, pinned_4lane);
                 let tok_out = b.umul(tk, rows);
                 let out_idx = b.uadd(tok_out, row);
                 b.store_sb_f32(out_buf, out_idx, final_val);
@@ -3369,11 +3372,11 @@ pub fn ptq1_q8_0_gemm_4tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<
     b.finish()
 }
 
-/// Emits coalesced 64-row `PTQ1_0` Ã— `Q8_K` GEMV SPIR-V 1.6 words (`0%` weight overhead).
+/// Emits coalesced 64-row `PTQ1_0` × `Q8_K` GEMV SPIR-V 1.6 words (`0%` weight overhead).
 ///
 /// Bindings: `0` read-only coalesced `PTQ1_0` (`448` `u32`/block-tile), `1` read-only `Q8KBlock`
 /// (`65` `u32`/block), `2` writable `output` (`f32`).
-/// Push constants (`4 Ã— u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn ptq1_q8k_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
@@ -3397,7 +3400,9 @@ pub fn ptq1_q8k_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
 
     b.emit_if(in_bounds, |b| {
         let acc_var = b.local_f32_var();
+        let sum_var = b.local_i32_var();
         let f_zero = b.const_f32(0.0);
+        let i_zero = b.const_i32(0);
         b.store_var(acc_var, f_zero);
 
         let c0 = b.const_u32(0);
@@ -3418,7 +3423,6 @@ pub fn ptq1_q8k_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
             let blk_off = b.umul(blk, c448);
             let tile_base = b.uadd(rg_base, blk_off);
             let wbase = b.uadd(tile_base, lane);
-            let decoded = decode_ptq1_block_lanes_strided(b, weights_buf, wbase, 64);
 
             let q8k_idx = b.ushr(blk, c1);
             let q8k_off = b.umul(q8k_idx, c65);
@@ -3431,17 +3435,26 @@ pub fn ptq1_q8k_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
             let q8k_vals_start = b.uadd(q8k_base, c1);
             let act_vals_base = b.uadd(q8k_vals_start, half_off);
 
-            let mut sum_int = b.const_i32(0);
-            for (word_idx, &lanes) in decoded.lanes.iter().enumerate() {
-                let off_c = b.const_u32(u32::try_from(word_idx).unwrap_or(0));
-                let act_idx = b.uadd(act_vals_base, off_c);
-                let act_w = b.load_sb_u32(act_buf, act_idx);
-                let dot = dot_trit_lanes_with_act(b, lanes, act_w, use_sdot);
-                sum_int = b.iadd(sum_int, dot);
-            }
+            b.store_var(sum_var, i_zero);
+            let w_scale = stream_ptq1_block_strided(
+                b,
+                |b, idx| b.load_sb_u32(weights_buf, idx),
+                wbase,
+                64,
+                |b, word_idx, lanes, _w_scale| {
+                    let off_c = b.const_u32(u32::try_from(word_idx).unwrap_or(0));
+                    let act_idx = b.uadd(act_vals_base, off_c);
+                    let act_w = b.load_sb_u32(act_buf, act_idx);
+                    let dot = dot_trit_lanes_with_act(b, lanes, act_w, use_sdot);
+                    let prev = b.load_var_i32(sum_var);
+                    let next = b.iadd(prev, dot);
+                    b.store_var(sum_var, next);
+                },
+            );
 
+            let sum_int = b.load_var_i32(sum_var);
             let sum_f32 = b.i32_to_f32(sum_int);
-            let d = b.fmul_nc(decoded.w_scale, act_scale);
+            let d = b.fmul_nc(w_scale, act_scale);
             let prev = b.load_var_f32(acc_var);
             let prod = b.fmul_nc(d, sum_f32);
             let next = b.fadd_nc(prev, prod);
@@ -3455,6 +3468,605 @@ pub fn ptq1_q8k_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
     });
 
     b.finish()
+}
+
+struct Workgroup16TokIds {
+    lane: u32,
+    wy: u32,
+    tid: u32,
+    row: u32,
+    rows: u32,
+    blocks_per_row: u32,
+    tokens: u32,
+    act_words_per_token: u32,
+    rg_base: u32,
+    row_ok: u32,
+    wg_ok: u32,
+    tk0: u32,
+    tk1: u32,
+}
+
+fn setup_16tok_workgroup(
+    b: &mut ShaderBuilder,
+    push_var: u32,
+    tile_words: u32,
+) -> Workgroup16TokIds {
+    let wid = b.workgroup_id();
+    let lid = b.local_invocation_id();
+    let rg = b.load_input_component(wid, 0);
+    let tok_tile = b.load_input_component(wid, 1);
+    let lane = b.load_input_component(lid, 0);
+    let wy = b.load_input_component(lid, 1);
+
+    let rows = b.load_push(push_var, 0);
+    let blocks_per_row = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let act_words_per_token = b.load_push(push_var, 3);
+
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c16 = b.const_u32(16);
+    let c64 = b.const_u32(64);
+
+    let tid_hi = b.umul(wy, c64);
+    let tid = b.uadd(tid_hi, lane);
+    let rg_start = b.umul(rg, c64);
+    let row = b.uadd(rg_start, lane);
+    let tok_base = b.umul(tok_tile, c16);
+
+    let wy2 = b.umul(wy, c2);
+    let tk0 = b.uadd(tok_base, wy2);
+    let tk1 = b.uadd(tk0, c1);
+
+    let tile_c = b.const_u32(tile_words);
+    let rg_tiles = b.umul(rg, blocks_per_row);
+    let rg_base = b.umul(rg_tiles, tile_c);
+
+    let rg_ok = b.u_lt(rg_start, rows);
+    let tok_ok = b.u_lt(tok_base, tokens);
+    let wg_ok = b.logical_and(rg_ok, tok_ok);
+    let row_ok = b.u_lt(row, rows);
+
+    Workgroup16TokIds {
+        lane,
+        wy,
+        tid,
+        row,
+        rows,
+        blocks_per_row,
+        tokens,
+        act_words_per_token,
+        rg_base,
+        row_ok,
+        wg_ok,
+        tk0,
+        tk1,
+    }
+}
+
+fn clamp_two_token_act_bases(
+    b: &mut ShaderBuilder,
+    tk0: u32,
+    tk1: u32,
+    tokens: u32,
+    act_words_per_token: u32,
+) -> (u32, u32) {
+    let c1 = b.const_u32(1);
+    let last_tok = b.binop(OP_I_SUB, b.u32_t, tokens, c1);
+    let ok0 = b.u_lt(tk0, tokens);
+    let c0_tok = b.select(b.u32_t, ok0, tk0, last_tok);
+    let ok1 = b.u_lt(tk1, tokens);
+    let c1_tok = b.select(b.u32_t, ok1, tk1, last_tok);
+    (
+        b.umul(c0_tok, act_words_per_token),
+        b.umul(c1_tok, act_words_per_token),
+    )
+}
+
+fn load_smem_w_544(b: &mut ShaderBuilder, weights_buf: u32, smem_w: u32, tile_base: u32, tid: u32) {
+    let w_glob = b.uadd(tile_base, tid);
+    let w_val = b.load_sb_u32(weights_buf, w_glob);
+    b.store_wg_u32(smem_w, tid, w_val);
+    let c32 = b.const_u32(32);
+    let c512 = b.const_u32(512);
+    let tail_ok = b.u_lt(tid, c32);
+    b.emit_if(tail_ok, |b| {
+        let s_idx = b.uadd(c512, tid);
+        let g_idx = b.uadd(tile_base, s_idx);
+        let tail_val = b.load_sb_u32(weights_buf, g_idx);
+        b.store_wg_u32(smem_w, s_idx, tail_val);
+    });
+}
+
+fn load_smem_w_448(b: &mut ShaderBuilder, weights_buf: u32, smem_w: u32, tile_base: u32, tid: u32) {
+    let c448 = b.const_u32(448);
+    let w_ok = b.u_lt(tid, c448);
+    b.emit_if(w_ok, |b| {
+        let g_idx = b.uadd(tile_base, tid);
+        let w_val = b.load_sb_u32(weights_buf, g_idx);
+        b.store_wg_u32(smem_w, tid, w_val);
+    });
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Stages a pair of token activation blocks into shared memory for a 64-lane wave."
+)]
+fn load_smem_act_pair(
+    b: &mut ShaderBuilder,
+    act_buf: u32,
+    smem_act: u32,
+    blk_act_base0: u32,
+    blk_act_base1: u32,
+    s_act0_base: u32,
+    s_act1_base: u32,
+    lane: u32,
+    act_blk_words: u32,
+) {
+    let limit = b.const_u32(act_blk_words);
+    let lane_ok = b.u_lt(lane, limit);
+    b.emit_if(lane_ok, |b| {
+        let g0 = b.uadd(blk_act_base0, lane);
+        let v0 = b.load_sb_u32(act_buf, g0);
+        let s0 = b.uadd(s_act0_base, lane);
+        b.store_wg_u32(smem_act, s0, v0);
+
+        let g1 = b.uadd(blk_act_base1, lane);
+        let v1 = b.load_sb_u32(act_buf, g1);
+        let s1 = b.uadd(s_act1_base, lane);
+        b.store_wg_u32(smem_act, s1, v1);
+    });
+}
+
+fn store_16tok_pair_outputs<F>(
+    b: &mut ShaderBuilder,
+    out_buf: u32,
+    res_buf: Option<u32>,
+    ids: &Workgroup16TokIds,
+    mut read_final: F,
+) where
+    F: FnMut(&mut ShaderBuilder, usize) -> u32,
+{
+    for (pair_idx, &tk) in [ids.tk0, ids.tk1].iter().enumerate() {
+        let tok_ok = b.u_lt(tk, ids.tokens);
+        let out_ok = b.logical_and(ids.row_ok, tok_ok);
+        b.emit_if(out_ok, |b| {
+            let tok_out = b.umul(tk, ids.rows);
+            let out_idx = b.uadd(tok_out, ids.row);
+            let final_val = read_final(b, pair_idx);
+            store_maybe_residual_f32(b, out_buf, res_buf, out_idx, final_val);
+        });
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Inner shared-memory K-block accumulation helper for 16-token PQ2 x Q8K GEMM."
+)]
+fn emit_pq2_q8k_16tok_block(
+    b: &mut ShaderBuilder,
+    smem_w: u32,
+    smem_act: u32,
+    lane: u32,
+    s_act0_base: u32,
+    s_act1_base: u32,
+    isum0_var: u32,
+    isum1_var: u32,
+    acc0_var: u32,
+    acc1_var: u32,
+    use_sdot: bool,
+    fused: bool,
+) {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c4 = b.const_u32(4);
+    let c8 = b.const_u32(8);
+    let c32 = b.const_u32(32);
+    let c64 = b.const_u32(64);
+    let i_zero = b.const_i32(0);
+
+    b.store_var(isum0_var, i_zero);
+    b.store_var(isum1_var, i_zero);
+
+    b.emit_for_range(c0, c8, c1, |b, word_j| {
+        let j64 = b.umul(word_j, c64);
+        let w_off = b.uadd(c32, j64);
+        let w_idx = b.uadd(w_off, lane);
+        let pq_word = b.load_wg_u32(smem_w, w_idx);
+        let q = coalesced_pq2_unpack_4digits(b, pq_word);
+
+        let j4 = b.umul(word_j, c4);
+        let plane_off = b.uadd(c2, j4);
+
+        let pbase0 = b.uadd(s_act0_base, plane_off);
+        let part0 = dot_pq2_4digits_from_loader(
+            b,
+            q,
+            |b, idx| b.load_wg_u32(smem_act, idx),
+            pbase0,
+            use_sdot,
+        );
+        let prev0 = b.load_var_i32(isum0_var);
+        let next0 = b.iadd(prev0, part0);
+        b.store_var(isum0_var, next0);
+
+        let pbase1 = b.uadd(s_act1_base, plane_off);
+        let part1 = dot_pq2_4digits_from_loader(
+            b,
+            q,
+            |b, idx| b.load_wg_u32(smem_act, idx),
+            pbase1,
+            use_sdot,
+        );
+        let prev1 = b.load_var_i32(isum1_var);
+        let next1 = b.iadd(prev1, part1);
+        b.store_var(isum1_var, next1);
+    });
+
+    let w_scale = coalesced_pq2_scale_from_loader(b, |b, idx| b.load_wg_u32(smem_w, idx), c0, lane);
+
+    for (s_base, isum_var, acc_var) in [
+        (s_act0_base, isum0_var, acc0_var),
+        (s_act1_base, isum1_var, acc1_var),
+    ] {
+        let act_scale_u32 = b.load_wg_u32(smem_act, s_base);
+        let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+        let hsum_idx = b.uadd(s_base, c1);
+        let hsum_u32 = b.load_wg_u32(smem_act, hsum_idx);
+        let half_sum = b.bitcast(b.i32_t, hsum_u32);
+        let int_sum = b.load_var_i32(isum_var);
+        let corrected = b.isub(int_sum, half_sum);
+        let float_dot = b.i32_to_f32(corrected);
+        let d = b.fmul_nc(w_scale, act_scale);
+        let prev = b.load_var_f32(acc_var);
+        let next = if fused {
+            b.fma(d, float_dot, prev)
+        } else {
+            let prod = b.fmul_nc(d, float_dot);
+            b.fadd_nc(prev, prod)
+        };
+        b.store_var(acc_var, next);
+    }
+}
+
+/// Emits 16-token shared-weight `PQ2_0` × 4-plane `Q8_K` prefill GEMM SPIR-V 1.6 (`(64, 8, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(16), 1)`.
+/// Uses `smem_w[544] + smem_act[544]` (`4,352 B` workgroup shared memory), keeping only 2 `acc`
+/// and 2 `isum` registers live across a clean runtime `word_j` loop (`0..8`) per `(wy)` wave64.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn pq2_q8k_gemm_16tok_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let res_buf = has_residual.then(|| b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly));
+
+    let smem_w = b.workgroup_u32_array(544);
+    let smem_act = b.workgroup_u32_array(544);
+    let ids = setup_16tok_workgroup(&mut b, push_var, 544);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let acc0_var = b.local_f32_var();
+        let acc1_var = b.local_f32_var();
+        let isum0_var = b.local_i32_var();
+        let isum1_var = b.local_i32_var();
+        let f_zero = b.const_f32(0.0);
+        b.store_var(acc0_var, f_zero);
+        b.store_var(acc1_var, f_zero);
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c34 = b.const_u32(34);
+        let c68 = b.const_u32(68);
+        let c544 = b.const_u32(544);
+
+        let (tok_act_base0, tok_act_base1) =
+            clamp_two_token_act_bases(b, ids.tk0, ids.tk1, ids.tokens, ids.act_words_per_token);
+        let s_act0_base = b.umul(ids.wy, c68);
+        let s_act1_base = b.uadd(s_act0_base, c34);
+
+        b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
+            let blk_off = b.umul(blk, c544);
+            let tile_base = b.uadd(ids.rg_base, blk_off);
+            let act_off = b.umul(blk, c34);
+            let blk_act_base0 = b.uadd(tok_act_base0, act_off);
+            let blk_act_base1 = b.uadd(tok_act_base1, act_off);
+
+            load_smem_w_544(b, weights_buf, smem_w, tile_base, ids.tid);
+            load_smem_act_pair(
+                b,
+                act_buf,
+                smem_act,
+                blk_act_base0,
+                blk_act_base1,
+                s_act0_base,
+                s_act1_base,
+                ids.lane,
+                34,
+            );
+            b.workgroup_barrier();
+
+            emit_pq2_q8k_16tok_block(
+                b,
+                smem_w,
+                smem_act,
+                ids.lane,
+                s_act0_base,
+                s_act1_base,
+                isum0_var,
+                isum1_var,
+                acc0_var,
+                acc1_var,
+                use_sdot,
+                fused,
+            );
+            b.workgroup_barrier();
+        });
+
+        store_16tok_pair_outputs(b, out_buf, res_buf, &ids, |b, pair_idx| {
+            let var = if pair_idx == 0 { acc0_var } else { acc1_var };
+            b.load_var_f32(var)
+        });
+    });
+
+    b.finish_with_local_size([64, 8, 1])
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Inner shared-memory K-block accumulation helper for 16-token Q8_0 x Q8_0 GEMM."
+)]
+fn emit_q8_0_q8_0_16tok_block(
+    b: &mut ShaderBuilder,
+    smem_w: u32,
+    smem_act: u32,
+    lane: u32,
+    s_act0_base: u32,
+    s_act1_base: u32,
+    isum0_var: u32,
+    isum1_var: u32,
+    acc0_var: u32,
+    acc1_var: u32,
+    use_sdot: bool,
+) {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c8 = b.const_u32(8);
+    let c32 = b.const_u32(32);
+    let c64 = b.const_u32(64);
+    let i_zero = b.const_i32(0);
+
+    b.store_var(isum0_var, i_zero);
+    b.store_var(isum1_var, i_zero);
+
+    b.emit_for_range(c0, c8, c1, |b, word_j| {
+        let j64 = b.umul(word_j, c64);
+        let w_off = b.uadd(c32, j64);
+        let w_idx = b.uadd(w_off, lane);
+        let w_word = b.load_wg_u32(smem_w, w_idx);
+        let act_off = b.uadd(c1, word_j);
+
+        let a0_idx = b.uadd(s_act0_base, act_off);
+        let aw0 = b.load_wg_u32(smem_act, a0_idx);
+        let a1_idx = b.uadd(s_act1_base, act_off);
+        let aw1 = b.load_wg_u32(smem_act, a1_idx);
+
+        let (dot0, dot1) = if use_sdot {
+            (b.sdot_packed(w_word, aw0), b.sdot_packed(w_word, aw1))
+        } else {
+            let weights_i32 = unpack_packed4_s8_to_i32(b, w_word);
+            (
+                portable_dot4_i32_weights(b, weights_i32, aw0),
+                portable_dot4_i32_weights(b, weights_i32, aw1),
+            )
+        };
+        let prev0 = b.load_var_i32(isum0_var);
+        let next0 = b.iadd(prev0, dot0);
+        b.store_var(isum0_var, next0);
+        let prev1 = b.load_var_i32(isum1_var);
+        let next1 = b.iadd(prev1, dot1);
+        b.store_var(isum1_var, next1);
+    });
+
+    let w_scale = coalesced_pq2_scale_from_loader(b, |b, idx| b.load_wg_u32(smem_w, idx), c0, lane);
+
+    for (s_base, isum_var, acc_var) in [
+        (s_act0_base, isum0_var, acc0_var),
+        (s_act1_base, isum1_var, acc1_var),
+    ] {
+        let act_scale_u32 = b.load_wg_u32(smem_act, s_base);
+        let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+        let d = b.fmul_nc(w_scale, act_scale);
+        let int_sum = b.load_var_i32(isum_var);
+        let sum_f32 = b.i32_to_f32(int_sum);
+        let contrib = b.fmul_nc(d, sum_f32);
+        let prev = b.load_var_f32(acc_var);
+        let next = b.fadd_nc(prev, contrib);
+        b.store_var(acc_var, next);
+    }
+}
+
+/// Emits 16-token shared-weight `Q8_0` × `Q8_0` prefill GEMM SPIR-V 1.6 words (`(64, 8, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(16), 1)`.
+/// Uses `smem_w[544] + smem_act[144]` (`2,752 B` workgroup shared memory) across a runtime
+/// `word_j` loop (`0..8`). Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn q8_0_q8_0_gemm_16tok_coalesced(use_sdot: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let smem_w = b.workgroup_u32_array(544);
+    let smem_act = b.workgroup_u32_array(144);
+    let ids = setup_16tok_workgroup(&mut b, push_var, 544);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let acc0_var = b.local_f32_var();
+        let acc1_var = b.local_f32_var();
+        let isum0_var = b.local_i32_var();
+        let isum1_var = b.local_i32_var();
+        let f_zero = b.const_f32(0.0);
+        b.store_var(acc0_var, f_zero);
+        b.store_var(acc1_var, f_zero);
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c9 = b.const_u32(9);
+        let c18 = b.const_u32(18);
+        let c544 = b.const_u32(544);
+
+        let (tok_act_base0, tok_act_base1) =
+            clamp_two_token_act_bases(b, ids.tk0, ids.tk1, ids.tokens, ids.act_words_per_token);
+        let s_act0_base = b.umul(ids.wy, c18);
+        let s_act1_base = b.uadd(s_act0_base, c9);
+
+        b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
+            let blk_off = b.umul(blk, c544);
+            let tile_base = b.uadd(ids.rg_base, blk_off);
+            let act_off = b.umul(blk, c9);
+            let blk_act_base0 = b.uadd(tok_act_base0, act_off);
+            let blk_act_base1 = b.uadd(tok_act_base1, act_off);
+
+            load_smem_w_544(b, weights_buf, smem_w, tile_base, ids.tid);
+            load_smem_act_pair(
+                b,
+                act_buf,
+                smem_act,
+                blk_act_base0,
+                blk_act_base1,
+                s_act0_base,
+                s_act1_base,
+                ids.lane,
+                9,
+            );
+            b.workgroup_barrier();
+
+            emit_q8_0_q8_0_16tok_block(
+                b,
+                smem_w,
+                smem_act,
+                ids.lane,
+                s_act0_base,
+                s_act1_base,
+                isum0_var,
+                isum1_var,
+                acc0_var,
+                acc1_var,
+                use_sdot,
+            );
+            b.workgroup_barrier();
+        });
+
+        store_16tok_pair_outputs(b, out_buf, None, &ids, |b, pair_idx| {
+            let var = if pair_idx == 0 { acc0_var } else { acc1_var };
+            b.load_var_f32(var)
+        });
+    });
+
+    b.finish_with_local_size([64, 8, 1])
+}
+
+/// Emits 16-token shared-weight `PTQ1_0` × `Q8_0` prefill GEMM SPIR-V 1.6 words (`(64, 8, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(16), 1)`.
+/// Uses `smem_w[448] + smem_act[576]` (`4,096 B` workgroup shared memory) and streams
+/// each `PTQ1_0` block across 2 consecutive tokens per wave64.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn ptq1_q8_0_gemm_16tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let smem_w = b.workgroup_u32_array(448);
+    let smem_act = b.workgroup_u32_array(576);
+    let ids = setup_16tok_workgroup(&mut b, push_var, 448);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let f_zero = b.const_f32(0.0);
+        let lane_vars = if pinned_4lane {
+            std::array::from_fn(|_| {
+                [
+                    b.local_f32_var(),
+                    b.local_f32_var(),
+                    b.local_f32_var(),
+                    b.local_f32_var(),
+                ]
+            })
+        } else {
+            std::array::from_fn(|_| {
+                let v = b.local_f32_var();
+                [v, v, v, v]
+            })
+        };
+        for row_vars in &lane_vars {
+            let count = if pinned_4lane { 4 } else { 1 };
+            for &var in &row_vars[..count] {
+                b.store_var(var, f_zero);
+            }
+        }
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c36 = b.const_u32(36);
+        let c72 = b.const_u32(72);
+        let c448 = b.const_u32(448);
+
+        let (tok_act_base0, tok_act_base1) =
+            clamp_two_token_act_bases(b, ids.tk0, ids.tk1, ids.tokens, ids.act_words_per_token);
+        let s_act0_base = b.umul(ids.wy, c72);
+        let s_act1_base = b.uadd(s_act0_base, c36);
+
+        b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
+            let blk_off = b.umul(blk, c448);
+            let tile_base = b.uadd(ids.rg_base, blk_off);
+            let blk_act_off = b.umul(blk, c36);
+            let blk_act_base0 = b.uadd(tok_act_base0, blk_act_off);
+            let blk_act_base1 = b.uadd(tok_act_base1, blk_act_off);
+
+            load_smem_w_448(b, weights_buf, smem_w, tile_base, ids.tid);
+            load_smem_act_pair(
+                b,
+                act_buf,
+                smem_act,
+                blk_act_base0,
+                blk_act_base1,
+                s_act0_base,
+                s_act1_base,
+                ids.lane,
+                36,
+            );
+            b.workgroup_barrier();
+
+            emit_ptq1_q8_0_stream_block(
+                b,
+                |b, idx| b.load_wg_u32(smem_w, idx),
+                |b, idx| b.load_wg_u32(smem_act, idx),
+                ids.lane,
+                64,
+                [s_act0_base, s_act1_base],
+                use_sdot,
+                pinned_4lane,
+                &lane_vars,
+            );
+            b.workgroup_barrier();
+        });
+
+        store_16tok_pair_outputs(b, out_buf, None, &ids, |b, pair_idx| {
+            finalize_ptq1_lane_vars(b, &lane_vars[pair_idx], pinned_4lane)
+        });
+    });
+
+    b.finish_with_local_size([64, 8, 1])
 }
 
 fn q8k_signed_abs_max_shared(
@@ -7533,12 +8145,18 @@ pub fn validate_spirv_module(words: &[u32], expected_sdot: Option<bool>) -> Resu
                     .first()
                     .ok_or_else(|| Error::InvalidInput("OpExecutionMode missing fn".to_owned()))?;
                 check_id(fn_id, "OpExecutionMode")?;
-                if ops.get(1) == Some(&EXEC_MODE_LOCAL_SIZE)
-                    && (ops.len() < 5 || ops[2] == 0 || ops[3] == 0 || ops[4] == 0)
-                {
-                    return Err(Error::InvalidInput(
-                        "invalid LocalSize execution mode extents".to_owned(),
-                    ));
+                if ops.get(1) == Some(&EXEC_MODE_LOCAL_SIZE) {
+                    if ops.len() < 5 || ops[2] == 0 || ops[3] == 0 || ops[4] == 0 {
+                        return Err(Error::InvalidInput(
+                            "invalid LocalSize execution mode extents".to_owned(),
+                        ));
+                    }
+                    let invocations = ops[2].saturating_mul(ops[3]).saturating_mul(ops[4]);
+                    if invocations > 1024 {
+                        return Err(Error::InvalidInput(format!(
+                            "LocalSize workgroup invocations {invocations} exceed 1024"
+                        )));
+                    }
                 }
             }
             OP_DECORATE | OP_MEMBER_DECORATE => {
@@ -7813,6 +8431,28 @@ pub fn validate_spirv_module(words: &[u32], expected_sdot: Option<bool>) -> Resu
     Ok(())
 }
 
+/// Extracts the declared `LocalSize` `[x, y, z]` workgroup extents from a validated SPIR-V 1.6 module.
+///
+/// # Errors
+/// Returns `Error::InvalidInput` if the module fails structural validation or omits `LocalSize`.
+pub fn extract_local_size(words: &[u32]) -> Result<[u32; 3], Error> {
+    validate_spirv_module(words, None)?;
+    let mut offset = 5_usize;
+    while offset < words.len() {
+        let header = words[offset];
+        let wc = usize::try_from(header >> 16).unwrap_or(0);
+        let op = header & 0xffff;
+        let ops = &words[offset + 1..offset + wc];
+        if op == u32::from(OP_EXECUTION_MODE) && ops.get(1) == Some(&EXEC_MODE_LOCAL_SIZE) {
+            return Ok([ops[2], ops[3], ops[4]]);
+        }
+        offset += wc;
+    }
+    Err(Error::InvalidInput(
+        "SPIR-V module missing LocalSize execution mode".to_owned(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7848,6 +8488,16 @@ mod tests {
                 pq2_q8k_gemm_4tok_coalesced(false, false, false),
                 Some(false),
             ),
+            (pq2_q8k_gemm_16tok_coalesced(true, true, false), Some(true)),
+            (pq2_q8k_gemm_16tok_coalesced(true, false, true), Some(true)),
+            (
+                pq2_q8k_gemm_16tok_coalesced(false, true, false),
+                Some(false),
+            ),
+            (
+                pq2_q8k_gemm_16tok_coalesced(false, false, true),
+                Some(false),
+            ),
             (pq2_q8_0_gemv(true), Some(true)),
             (pq2_q8_0_gemv(false), Some(false)),
             (pq2_q8_0_gemv_coalesced(true), Some(true)),
@@ -7864,6 +8514,10 @@ mod tests {
             (ptq1_q8_0_gemm_4tok_coalesced(true, false), Some(true)),
             (ptq1_q8_0_gemm_4tok_coalesced(false, true), Some(false)),
             (ptq1_q8_0_gemm_4tok_coalesced(false, false), Some(false)),
+            (ptq1_q8_0_gemm_16tok_coalesced(true, true), Some(true)),
+            (ptq1_q8_0_gemm_16tok_coalesced(true, false), Some(true)),
+            (ptq1_q8_0_gemm_16tok_coalesced(false, true), Some(false)),
+            (ptq1_q8_0_gemm_16tok_coalesced(false, false), Some(false)),
             (ptq1_q8k_gemv(true), Some(true)),
             (ptq1_q8k_gemv(false), Some(false)),
             (ptq1_q8k_gemv_coalesced(true), Some(true)),
@@ -7872,6 +8526,8 @@ mod tests {
             (q8_0_q8_0_gemv_coalesced(false), Some(false)),
             (q8_0_q8_0_gemm_4tok_coalesced(true), Some(true)),
             (q8_0_q8_0_gemm_4tok_coalesced(false), Some(false)),
+            (q8_0_q8_0_gemm_16tok_coalesced(true), Some(true)),
+            (q8_0_q8_0_gemm_16tok_coalesced(false), Some(false)),
         ] {
             assert_valid_spirv_structure(&module, expected_sdot);
             assert_eq!(shader_digest(&module)?.len(), 64);
@@ -7898,6 +8554,32 @@ mod tests {
         let mut bad_bound = s3;
         bad_bound[3] = 2;
         assert!(validate_spirv_module(&bad_bound, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn emitted_local_sizes_match_workgroup_contracts() -> Result<(), Error> {
+        assert_eq!(extract_local_size(&pq2_q8k_gemv(true, true))?, [64, 1, 1]);
+        assert_eq!(
+            extract_local_size(&fused_basis_hadamard1024_q8k_4plane(true))?,
+            [256, 1, 1]
+        );
+        assert_eq!(
+            extract_local_size(&fused_basis_hadamard1024_q8_0(true, true))?,
+            [256, 1, 1]
+        );
+        assert_eq!(
+            extract_local_size(&pq2_q8k_gemm_16tok_coalesced(true, true, false))?,
+            [64, 8, 1]
+        );
+        assert_eq!(
+            extract_local_size(&q8_0_q8_0_gemm_16tok_coalesced(false))?,
+            [64, 8, 1]
+        );
+        assert_eq!(
+            extract_local_size(&ptq1_q8_0_gemm_16tok_coalesced(true, false))?,
+            [64, 8, 1]
+        );
         Ok(())
     }
 

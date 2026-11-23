@@ -13,13 +13,15 @@ use std::{
 use bonsai_adreno_vulkan::{
     AttentionStrategy, CommandBatchRecorder, ProjectionKernelPath, TdrChunkPolicy,
     VulkanBatchedAdapters, VulkanBatchedConfig, VulkanBatchedGraphExecutor, VulkanKvPrecision,
-    VulkanMultiRankAdapterSpec, VulkanPq2Executor, VulkanRankOneAdapterSpec, spirv,
+    VulkanMultiRankAdapterSpec, VulkanPq2Executor, VulkanRankOneAdapterSpec,
+    device::{AdrenoVulkanDevice, BufferId, BufferSpan, ComputeStage},
+    spirv,
 };
 use bonsai_gguf::MetadataValue;
 use bonsai_prism_runtime::{
     Decoder,
     graph::{KvCachePolicy, Qwen35},
-    kernels::{MatvecBackend, Pq2ProjectionExecutor, Q8Block},
+    kernels::{MatvecBackend, Pq2ProjectionExecutor, Q8Block, Q8KBlock},
     model::{
         Model, Tensor,
         lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
@@ -711,8 +713,36 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             spirv::lora_b_accum_batched_f32(),
         ),
         (
+            "fused_basis_hadamard1024_q8k_unpinned",
+            spirv::fused_basis_hadamard1024_q8k_4plane(false),
+        ),
+        (
+            "fused_basis_hadamard1024_q8k_pinned",
+            spirv::fused_basis_hadamard1024_q8k_4plane(true),
+        ),
+        (
+            "fused_basis_hadamard1024_q8_0_src",
+            spirv::fused_basis_hadamard1024_q8_0(false, false),
+        ),
+        (
+            "fused_basis_hadamard1024_q8_0_pinned",
+            spirv::fused_basis_hadamard1024_q8_0(true, false),
+        ),
+        (
+            "fused_basis_hadamard1024_q8_0_native",
+            spirv::fused_basis_hadamard1024_q8_0(true, true),
+        ),
+        (
             "pq2_q8k_4tok_false",
             spirv::pq2_q8k_gemm_4tok_coalesced(false, false, false),
+        ),
+        (
+            "pq2_q8k_16tok_false",
+            spirv::pq2_q8k_gemm_16tok_coalesced(false, false, false),
+        ),
+        (
+            "pq2_q8k_16tok_false_fused_res",
+            spirv::pq2_q8k_gemm_16tok_coalesced(false, true, true),
         ),
         (
             "pq2_q8_0_4tok_false",
@@ -726,10 +756,22 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "ptq1_q8_0_4tok_false_pin",
             spirv::ptq1_q8_0_gemm_4tok_coalesced(false, true),
         ),
+        (
+            "ptq1_q8_0_16tok_false_src",
+            spirv::ptq1_q8_0_gemm_16tok_coalesced(false, false),
+        ),
+        (
+            "ptq1_q8_0_16tok_false_pin",
+            spirv::ptq1_q8_0_gemm_16tok_coalesced(false, true),
+        ),
         ("q8_0_q8_0_false", spirv::q8_0_q8_0_gemv_coalesced(false)),
         (
             "q8_0_q8_0_4tok_false",
             spirv::q8_0_q8_0_gemm_4tok_coalesced(false),
+        ),
+        (
+            "q8_0_q8_0_16tok_false",
+            spirv::q8_0_q8_0_gemm_16tok_coalesced(false),
         ),
     ];
     for (name, words) in portable_modules {
@@ -749,6 +791,14 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             spirv::pq2_q8k_gemm_4tok_coalesced(true, false, false),
         ),
         (
+            "pq2_q8k_16tok_sdot",
+            spirv::pq2_q8k_gemm_16tok_coalesced(true, false, false),
+        ),
+        (
+            "pq2_q8k_16tok_sdot_fused_res",
+            spirv::pq2_q8k_gemm_16tok_coalesced(true, true, true),
+        ),
+        (
             "pq2_q8_0_4tok_sdot",
             spirv::pq2_q8_0_gemm_4tok_coalesced(true),
         ),
@@ -760,10 +810,22 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "ptq1_q8_0_4tok_sdot_pin",
             spirv::ptq1_q8_0_gemm_4tok_coalesced(true, true),
         ),
+        (
+            "ptq1_q8_0_16tok_sdot_src",
+            spirv::ptq1_q8_0_gemm_16tok_coalesced(true, false),
+        ),
+        (
+            "ptq1_q8_0_16tok_sdot_pin",
+            spirv::ptq1_q8_0_gemm_16tok_coalesced(true, true),
+        ),
         ("q8_0_q8_0_sdot", spirv::q8_0_q8_0_gemv_coalesced(true)),
         (
             "q8_0_q8_0_4tok_sdot",
             spirv::q8_0_q8_0_gemm_4tok_coalesced(true),
+        ),
+        (
+            "q8_0_q8_0_16tok_sdot",
+            spirv::q8_0_q8_0_gemm_16tok_coalesced(true),
         ),
     ] {
         assert_eq!(
@@ -772,6 +834,22 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "OpSDot SPIR-V validation failed for {name}"
         );
     }
+    assert_eq!(
+        spirv::extract_local_size(&spirv::fused_basis_hadamard1024_q8k_4plane(true)),
+        Ok([256, 1, 1])
+    );
+    assert_eq!(
+        spirv::extract_local_size(&spirv::pq2_q8k_gemm_16tok_coalesced(true, false, false)),
+        Ok([64, 8, 1])
+    );
+    assert_eq!(
+        spirv::extract_local_size(&spirv::q8_0_q8_0_gemm_16tok_coalesced(false)),
+        Ok([64, 8, 1])
+    );
+    assert_eq!(
+        spirv::extract_local_size(&spirv::ptq1_q8_0_gemm_16tok_coalesced(true, true)),
+        Ok([64, 8, 1])
+    );
 }
 
 #[test]
@@ -1793,6 +1871,840 @@ fn live_batched_gdn_scan_and_conv1d_edge_geometries_match_sequential() -> TestRe
             5e-3,
             &format!("bat vs cpu ssm_head={ssm_head} conv_k={conv_k}"),
         );
+    }
+    Ok(())
+}
+
+fn assert_bits_eq(actual: &[f32], expected: &[f32], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+    for (idx, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            e.to_bits(),
+            "{label}: idx {idx} bit mismatch ({a} vs {e})"
+        );
+    }
+}
+
+fn repack_test_32b_coalesced(raw: &[u8], cols: usize, rows: usize, block_cols: usize) -> Vec<u32> {
+    let blocks_per_row = cols / block_cols;
+    let row_bytes = blocks_per_row * 34;
+    let row_groups = rows.div_ceil(64);
+    let mut dst = vec![0_u32; row_groups * blocks_per_row * 544];
+    for rg in 0..row_groups {
+        let r_base = rg * 64;
+        for blk in 0..blocks_per_row {
+            let tile_off = (rg * blocks_per_row + blk) * 544;
+            let blk_off = blk * 34;
+            for pair in 0..32 {
+                let r_ev = r_base + pair * 2;
+                let r_od = r_ev + 1;
+                let s_ev = if r_ev < rows {
+                    let b = &raw[r_ev * row_bytes + blk_off..];
+                    u16::from_le_bytes([b[0], b[1]])
+                } else {
+                    0
+                };
+                let s_od = if r_od < rows {
+                    let b = &raw[r_od * row_bytes + blk_off..];
+                    u16::from_le_bytes([b[0], b[1]])
+                } else {
+                    0
+                };
+                dst[tile_off + pair] = u32::from(s_ev) | (u32::from(s_od) << 16);
+            }
+            for lane in 0..64 {
+                let r = r_base + lane;
+                if r >= rows {
+                    continue;
+                }
+                let block = &raw[r * row_bytes + blk_off..][..34];
+                for word_j in 0..8 {
+                    let c = 2 + word_j * 4;
+                    dst[tile_off + 32 + word_j * 64 + lane] =
+                        u32::from_le_bytes([block[c], block[c + 1], block[c + 2], block[c + 3]]);
+                }
+            }
+        }
+    }
+    dst
+}
+
+fn repack_test_ptq1_coalesced(raw: &[u8], cols: usize, rows: usize) -> Vec<u32> {
+    let blocks_per_row = cols / 128;
+    let row_bytes = blocks_per_row * 28;
+    let row_groups = rows.div_ceil(64);
+    let mut dst = vec![0_u32; row_groups * blocks_per_row * 448];
+    for rg in 0..row_groups {
+        let r_base = rg * 64;
+        for blk in 0..blocks_per_row {
+            let tile_off = (rg * blocks_per_row + blk) * 448;
+            let blk_off = blk * 28;
+            for lane in 0..64 {
+                let r = r_base + lane;
+                if r >= rows {
+                    continue;
+                }
+                let block = &raw[r * row_bytes + blk_off..][..28];
+                for (w_idx, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+                    dst[tile_off + w_idx * 64 + lane] = u32::from_le_bytes(*chunk);
+                }
+            }
+        }
+    }
+    dst
+}
+
+fn build_q8k_4plane_words(cols: usize, tokens: usize) -> (Vec<Q8KBlock>, Vec<u32>) {
+    let q8k_per_tok = cols / 256;
+    let mut blocks = Vec::with_capacity(tokens * q8k_per_tok);
+    let mut words = Vec::with_capacity(tokens * q8k_per_tok * 68);
+    for t in 0..tokens {
+        for b in 0..q8k_per_tok {
+            let mut values = [0_i8; 256];
+            let mut sums = [0_i16; 16];
+            for (i, slot) in values.iter_mut().enumerate() {
+                let v = if i == 0 && (t + b).is_multiple_of(2) {
+                    i8::MIN
+                } else if i == 255 {
+                    i8::MAX
+                } else {
+                    let raw = i32::try_from((i * 11 + t * 17 + b * 5) % 197).unwrap_or(0) - 98;
+                    i8::try_from(raw).unwrap_or(0)
+                };
+                *slot = v;
+                sums[i / 16] += i16::from(v);
+            }
+            let sign = if (t + b).is_multiple_of(2) { 1.0 } else { -1.0 };
+            let scale =
+                sign * (0.015_625_f32 * f32::from(u8::try_from((t + b) % 7 + 1).unwrap_or(1)));
+            let blk = Q8KBlock {
+                scale,
+                values,
+                sums,
+            };
+            for half in 0..2 {
+                let hvals = &blk.values[half * 128..(half + 1) * 128];
+                let hsum: i32 = blk.sums[half * 8..(half + 1) * 8]
+                    .iter()
+                    .map(|&s| i32::from(s))
+                    .sum();
+                words.push(blk.scale.to_bits());
+                words.push((64 * hsum).cast_unsigned());
+                for chunk4 in hvals.as_chunks::<4>().0 {
+                    words.push(u32::from_le_bytes([
+                        chunk4[0].cast_unsigned(),
+                        chunk4[1].cast_unsigned(),
+                        chunk4[2].cast_unsigned(),
+                        chunk4[3].cast_unsigned(),
+                    ]));
+                }
+            }
+            blocks.push(blk);
+        }
+    }
+    (blocks, words)
+}
+
+fn build_q8_0_words(cols: usize, tokens: usize) -> Vec<u32> {
+    let blocks_per_tok = cols / 32;
+    let mut words = Vec::with_capacity(tokens * blocks_per_tok * 9);
+    for t in 0..tokens {
+        for b in 0..blocks_per_tok {
+            let sign = if (t + b).is_multiple_of(2) { 1.0 } else { -1.0 };
+            let scale =
+                sign * (0.031_25_f32 * f32::from(u8::try_from((t + b) % 5 + 1).unwrap_or(1)));
+            words.push(scale.to_bits());
+            for j in 0..8 {
+                let b0 =
+                    i8::try_from(i32::try_from((t * 7 + b * 3 + j * 4) % 181).unwrap_or(0) - 90)
+                        .unwrap_or(0);
+                let b1 =
+                    i8::try_from(i32::try_from((t * 5 + b * 9 + j * 3) % 181).unwrap_or(0) - 90)
+                        .unwrap_or(0);
+                let b2 =
+                    i8::try_from(i32::try_from((t * 3 + b * 7 + j * 5) % 181).unwrap_or(0) - 90)
+                        .unwrap_or(0);
+                let b3 =
+                    i8::try_from(i32::try_from((t * 11 + b * 2 + j * 6) % 181).unwrap_or(0) - 90)
+                        .unwrap_or(0);
+                words.push(u32::from_le_bytes([
+                    b0.cast_unsigned(),
+                    b1.cast_unsigned(),
+                    b2.cast_unsigned(),
+                    b3.cast_unsigned(),
+                ]));
+            }
+        }
+    }
+    words
+}
+
+fn clone_model(model: &Model) -> Model {
+    Model {
+        metadata: model.metadata.clone(),
+        tensors: model.tensors.clone(),
+        identity: model.identity.clone(),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Encodes and executes both unfused and fused Hadamard1024+quant paths in a single batch."
+)]
+fn verify_fused_hadamard_case(
+    dev: &mut AdrenoVulkanDevice,
+    base_rec: &CommandBatchRecorder,
+    fused_pipe: bonsai_adreno_vulkan::device::PipelineId,
+    unfused_pipe: bonsai_adreno_vulkan::device::PipelineId,
+    src_buf: BufferId,
+    sign_buf: BufferId,
+    rot_tmp: BufferId,
+    fused_out: BufferId,
+    unfused_out: BufferId,
+    unfused_push: [u32; 2],
+    unfused_grid: [u32; 3],
+    fused_push: &[u32; 7],
+    tokens: u32,
+    byte_len: usize,
+    label: &str,
+) -> TestResult {
+    let mut rec = base_rec.clone();
+    rec.push_barrier(
+        unfused_pipe,
+        &[BufferSpan::whole(rot_tmp), BufferSpan::whole(unfused_out)],
+        &unfused_push,
+        unfused_grid,
+    );
+    rec.push_barrier(
+        fused_pipe,
+        &[
+            BufferSpan::whole(src_buf),
+            BufferSpan::whole(sign_buf),
+            BufferSpan::whole(fused_out),
+        ],
+        fused_push,
+        [2, tokens, 1],
+    );
+    dev.submit_compute_batch(&rec)?;
+
+    let mut f_bytes = vec![0_u8; byte_len];
+    let mut u_bytes = vec![0_u8; byte_len];
+    dev.read_buffer_bytes(fused_out, &mut f_bytes)?;
+    dev.read_buffer_bytes(unfused_out, &mut u_bytes)?;
+    assert_eq!(f_bytes, u_bytes, "{label}");
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Encodes unfused PermuteSSM + MulSign + Hadamard1024 chain for token batch parity."
+)]
+fn build_basis_unfused_batch(
+    p_perm: bonsai_adreno_vulkan::device::PipelineId,
+    p_mul: bonsai_adreno_vulkan::device::PipelineId,
+    p_had: bonsai_adreno_vulkan::device::PipelineId,
+    src_buf: BufferId,
+    sign_buf: BufferId,
+    perm_tmp: BufferId,
+    sign_tmp: BufferId,
+    rot_tmp: BufferId,
+    cols_u32: u32,
+    norm_bits: u32,
+    use_sign: u32,
+    use_perm: u32,
+    kh: u32,
+    rep: u32,
+    hd: u32,
+    tokens: u32,
+) -> CommandBatchRecorder {
+    let mut base_rec = CommandBatchRecorder::new();
+    let mut cur = src_buf;
+    if use_perm == 1 {
+        base_rec.push_barrier(
+            p_perm,
+            &[BufferSpan::whole(cur), BufferSpan::whole(perm_tmp)],
+            &[kh, rep, hd, tokens],
+            [cols_u32.div_ceil(64), tokens, 1],
+        );
+        cur = perm_tmp;
+    }
+    if use_sign == 1 {
+        base_rec.push_barrier(
+            p_mul,
+            &[
+                BufferSpan::whole(cur),
+                BufferSpan::whole(sign_buf),
+                BufferSpan::whole(sign_tmp),
+            ],
+            &[cols_u32, tokens],
+            [cols_u32.div_ceil(64), tokens, 1],
+        );
+        cur = sign_tmp;
+    }
+    base_rec.push_barrier(
+        p_had,
+        &[BufferSpan::whole(cur), BufferSpan::whole(rot_tmp)],
+        &[1024, norm_bits, 2, tokens],
+        [2, tokens, 1],
+    );
+    base_rec
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Verifies Q8K and Q8_0 fused Hadamard1024+quant across signs, permutation, and token counts."
+)]
+fn live_fused_hadamard1024_quant_matches_unfused_zero_ulp() -> TestResult {
+    let mut dev = AdrenoVulkanDevice::open()?;
+    let cols = 2048_usize;
+    let cols_u32 = 2048_u32;
+    let max_tokens = 17_usize;
+    let (kh, rep, hd) = (2_u32, 2_u32, 512_u32);
+    let norm_bits = (1.0_f32 / 32.0_f32).to_bits();
+
+    let src_vals: Vec<f32> = (0..max_tokens * cols)
+        .map(|i| {
+            let phase = i32::try_from(i % 257).unwrap_or(0) - 128;
+            f32::from(i16::try_from(phase).unwrap_or(0)) * 0.013_75_f32
+        })
+        .collect();
+    let sign_vals: Vec<f32> = (0..cols)
+        .map(|i| {
+            if (i * 7 + 3) % 5 < 2 {
+                -1.0_f32
+            } else {
+                1.0_f32
+            }
+        })
+        .collect();
+
+    let f32_bytes = u64::try_from(max_tokens * cols * 4)?;
+    let src_buf = dev.create_storage_buffer(f32_bytes)?;
+    let sign_buf = dev.create_storage_buffer(u64::try_from(cols * 4)?)?;
+    let perm_tmp = dev.create_storage_buffer(f32_bytes)?;
+    let sign_tmp = dev.create_storage_buffer(f32_bytes)?;
+    let rot_tmp = dev.create_storage_buffer(f32_bytes)?;
+    let fused_q8k =
+        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 128) * 34 * 4)?)?;
+    let unfused_q8k =
+        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 128) * 34 * 4)?)?;
+    let fused_q8_0 = dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 32) * 9 * 4)?)?;
+    let unfused_q8_0 =
+        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 32) * 9 * 4)?)?;
+
+    dev.write_buffer_f32(src_buf, &src_vals)?;
+    dev.write_buffer_f32(sign_buf, &sign_vals)?;
+    let mut initial_src_bytes = vec![0_u8; src_vals.len() * 4];
+    dev.read_buffer_bytes(src_buf, &mut initial_src_bytes)?;
+
+    let p_perm = dev.create_compute_pipeline(&spirv::permute_ssm_heads_batched_f32(), 2, 4)?;
+    let p_mul = dev.create_compute_pipeline(&spirv::mul_f32_elemwise_batched(), 3, 2)?;
+    let p_had = dev.create_compute_pipeline(&spirv::ffn_hadamard_batched_f32(), 2, 4)?;
+    let q8k_variant_pipes = [false, true].map(|pinned| {
+        (
+            pinned,
+            dev.create_compute_pipeline(&spirv::quantize_f32_to_q8k_4plane(pinned), 2, 2),
+            dev.create_compute_pipeline(&spirv::fused_basis_hadamard1024_q8k_4plane(pinned), 3, 7),
+        )
+    });
+    let q8_0_variant_pipes = [(false, false), (true, false), (true, true)].map(|(pin, nat)| {
+        (
+            pin,
+            nat,
+            dev.create_compute_pipeline(&spirv::quantize_f32_to_q8_0_batched(pin, nat), 2, 2),
+            dev.create_compute_pipeline(&spirv::fused_basis_hadamard1024_q8_0(pin, nat), 3, 7),
+        )
+    });
+
+    for (tokens, use_sign, use_perm) in [(1_u32, 0_u32, 0_u32), (8, 1, 0), (17, 1, 1)] {
+        let base_rec = build_basis_unfused_batch(
+            p_perm, p_mul, p_had, src_buf, sign_buf, perm_tmp, sign_tmp, rot_tmp, cols_u32,
+            norm_bits, use_sign, use_perm, kh, rep, hd, tokens,
+        );
+        let fused_push = [cols_u32, norm_bits, use_sign, use_perm, kh, rep, hd];
+
+        for (pinned, pipe_uq8k, pipe_fq8k) in &q8k_variant_pipes {
+            let uq8k = (*pipe_uq8k).clone()?;
+            let fq8k = (*pipe_fq8k).clone()?;
+            let byte_len = usize::try_from(tokens)? * (cols / 128) * 34 * 4;
+            verify_fused_hadamard_case(
+                &mut dev,
+                &base_rec,
+                fq8k,
+                uq8k,
+                src_buf,
+                sign_buf,
+                rot_tmp,
+                fused_q8k,
+                unfused_q8k,
+                [cols_u32, tokens],
+                [cols_u32 / 256, tokens, 1],
+                &fused_push,
+                tokens,
+                byte_len,
+                &format!(
+                    "fused Hadamard1024 Q8K T={tokens} s={use_sign} p={use_perm} pin={pinned}"
+                ),
+            )?;
+        }
+
+        for (pinned, native, pipe_uq8, pipe_fq8) in &q8_0_variant_pipes {
+            let uq8 = (*pipe_uq8).clone()?;
+            let fq8 = (*pipe_fq8).clone()?;
+            let q8_blocks = cols_u32 / 32;
+            let byte_len = usize::try_from(tokens)? * (cols / 32) * 9 * 4;
+            verify_fused_hadamard_case(
+                &mut dev,
+                &base_rec,
+                fq8,
+                uq8,
+                src_buf,
+                sign_buf,
+                rot_tmp,
+                fused_q8_0,
+                unfused_q8_0,
+                [q8_blocks, tokens],
+                [q8_blocks.div_ceil(64), tokens, 1],
+                &fused_push,
+                tokens,
+                byte_len,
+                &format!(
+                    "fused Hadamard1024 Q8_0 T={tokens} s={use_sign} p={use_perm} pin={pinned} nat={native}"
+                ),
+            )?;
+        }
+    }
+
+    let mut after_src_bytes = vec![0_u8; src_vals.len() * 4];
+    dev.read_buffer_bytes(src_buf, &mut after_src_bytes)?;
+    assert_eq!(
+        after_src_bytes, initial_src_bytes,
+        "fused Hadamard1024 shader must not mutate src_buf (protects LoRA adapters)"
+    );
+    Ok(())
+}
+
+fn verify_pq2_executor_tokens_zero_ulp(
+    pq2_tensor: &Tensor,
+    q8k_blocks: &[Q8KBlock],
+    cols: usize,
+    rows: usize,
+    max_t: usize,
+) -> TestResult {
+    for path in [
+        ProjectionKernelPath::IntegerDotPacked4x8,
+        ProjectionKernelPath::PortableIntegerFallback,
+    ] {
+        let mut pq2_exec = match VulkanPq2Executor::open_with_path(path, 64 * 1024 * 1024) {
+            Ok(e) => e,
+            Err(bonsai_adreno_vulkan::Error::Unsupported)
+                if path == ProjectionKernelPath::IntegerDotPacked4x8 =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        assert_eq!(pq2_exec.prewarm_tensors(&[pq2_tensor])?, 1);
+        for fused in [false, true] {
+            let mut single_ref = Vec::with_capacity(max_t * rows);
+            let q8k_per_tok = cols / 256;
+            for t in 0..max_t {
+                let mut single = Vec::new();
+                pq2_exec.project(
+                    pq2_tensor,
+                    &q8k_blocks[t * q8k_per_tok..(t + 1) * q8k_per_tok],
+                    fused,
+                    &mut single,
+                )?;
+                single_ref.extend_from_slice(&single);
+            }
+            for &t in &[1_usize, 3, 8, 15, 16, 17] {
+                let mut out = Vec::new();
+                pq2_exec.project_pq2_q8k_tokens(
+                    pq2_tensor,
+                    &q8k_blocks[..t * q8k_per_tok],
+                    t,
+                    fused,
+                    &mut out,
+                )?;
+                assert_bits_eq(
+                    &out,
+                    &single_ref[..t * rows],
+                    &format!("{path:?} pq2_q8k_tokens T={t} fused={fused}"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tests coalesced 16-tok shared-memory PQ2 and Q8_0 variants against 1-tok GEMV at 0 ULP."
+)]
+fn verify_coalesced_16tok_and_ptq1_for_mode(
+    dev: &mut AdrenoVulkanDevice,
+    use_sdot: bool,
+    cols: usize,
+    rows: usize,
+    rows_u32: u32,
+    b_pq2: BufferId,
+    b_q8_0: BufferId,
+    b_ptq1: BufferId,
+    b_act_k: BufferId,
+    b_act_8: BufferId,
+    b_res: BufferId,
+    b_out_ref: BufferId,
+    b_out_4: BufferId,
+    b_out_16: BufferId,
+) -> TestResult {
+    let row_tiles = rows_u32.div_ceil(64);
+    let blk_128 = u32::try_from(cols / 128)?;
+    let blk_32 = u32::try_from(cols / 32)?;
+    let act_w_k = blk_128 * 34;
+    let act_w_8 = blk_32 * 9;
+
+    for fused in [false, true] {
+        let p_ref = dev.create_compute_pipeline(
+            &spirv::pq2_q8k_gemv_coalesced(use_sdot, fused, true),
+            4,
+            4,
+        )?;
+        let p_16 = dev.create_compute_pipeline(
+            &spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, fused, true),
+            4,
+            4,
+        )?;
+        for &t in &[1_u32, 3, 8, 15, 16, 17] {
+            let count = usize::try_from(t)? * rows;
+            let mut ref_out = vec![0.0_f32; count];
+            let mut g16_out = vec![0.0_f32; count];
+            dev.submit_compute_stages(&[
+                ComputeStage {
+                    pipeline: p_ref,
+                    buffers: &[b_pq2, b_act_k, b_out_ref, b_res],
+                    push_u32s: &[rows_u32, blk_128, t, act_w_k],
+                    workgroups: [row_tiles, t, 1],
+                },
+                ComputeStage {
+                    pipeline: p_16,
+                    buffers: &[b_pq2, b_act_k, b_out_16, b_res],
+                    push_u32s: &[rows_u32, blk_128, t, act_w_k],
+                    workgroups: [row_tiles, t.div_ceil(16), 1],
+                },
+            ])?;
+            dev.read_buffer_f32(b_out_ref, &mut ref_out)?;
+            dev.read_buffer_f32(b_out_16, &mut g16_out)?;
+            assert_bits_eq(
+                &g16_out,
+                &ref_out,
+                &format!("pq2_q8k 16tok res sdot={use_sdot} fused={fused} T={t}"),
+            );
+        }
+    }
+
+    let p_q8_ref = dev.create_compute_pipeline(&spirv::q8_0_q8_0_gemv_coalesced(use_sdot), 3, 4)?;
+    let p_q8_16 =
+        dev.create_compute_pipeline(&spirv::q8_0_q8_0_gemm_16tok_coalesced(use_sdot), 3, 4)?;
+    for &t in &[1_u32, 3, 8, 15, 16, 17] {
+        let count = usize::try_from(t)? * rows;
+        let mut ref_out = vec![0.0_f32; count];
+        let mut g16_out = vec![0.0_f32; count];
+        dev.submit_compute_stages(&[
+            ComputeStage {
+                pipeline: p_q8_ref,
+                buffers: &[b_q8_0, b_act_8, b_out_ref],
+                push_u32s: &[rows_u32, blk_32, t, act_w_8],
+                workgroups: [row_tiles, t, 1],
+            },
+            ComputeStage {
+                pipeline: p_q8_16,
+                buffers: &[b_q8_0, b_act_8, b_out_16],
+                push_u32s: &[rows_u32, blk_32, t, act_w_8],
+                workgroups: [row_tiles, t.div_ceil(16), 1],
+            },
+        ])?;
+        dev.read_buffer_f32(b_out_ref, &mut ref_out)?;
+        dev.read_buffer_f32(b_out_16, &mut g16_out)?;
+        assert_bits_eq(
+            &g16_out,
+            &ref_out,
+            &format!("q8_0_q8_0 16tok sdot={use_sdot} T={t}"),
+        );
+    }
+
+    verify_ptq1_streaming_4_and_16tok(
+        dev, use_sdot, rows, rows_u32, blk_128, act_w_8, row_tiles, b_ptq1, b_act_8, b_out_ref,
+        b_out_4, b_out_16,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tests streaming 4-tok and 16-tok PTQ1 x Q8_0 kernels against 1-tok GEMV reference at 0 ULP."
+)]
+fn verify_ptq1_streaming_4_and_16tok(
+    dev: &mut AdrenoVulkanDevice,
+    use_sdot: bool,
+    rows: usize,
+    rows_u32: u32,
+    blk_128: u32,
+    act_w_8: u32,
+    row_tiles: u32,
+    b_ptq1: BufferId,
+    b_act_8: BufferId,
+    b_out_ref: BufferId,
+    b_out_4: BufferId,
+    b_out_16: BufferId,
+) -> TestResult {
+    for pinned in [false, true] {
+        let p_ptq_ref =
+            dev.create_compute_pipeline(&spirv::ptq1_q8_0_gemv_coalesced(use_sdot, pinned), 3, 4)?;
+        let p_ptq_4 = dev.create_compute_pipeline(
+            &spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, pinned),
+            3,
+            4,
+        )?;
+        let p_ptq_16 = dev.create_compute_pipeline(
+            &spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, pinned),
+            3,
+            4,
+        )?;
+        for &t in &[1_u32, 3, 8, 15, 16, 17] {
+            let count = usize::try_from(t)? * rows;
+            let mut ref_out = vec![0.0_f32; count];
+            let mut g4_out = vec![0.0_f32; count];
+            let mut g16_out = vec![0.0_f32; count];
+            dev.submit_compute_stages(&[
+                ComputeStage {
+                    pipeline: p_ptq_ref,
+                    buffers: &[b_ptq1, b_act_8, b_out_ref],
+                    push_u32s: &[rows_u32, blk_128, t, act_w_8],
+                    workgroups: [row_tiles, t, 1],
+                },
+                ComputeStage {
+                    pipeline: p_ptq_4,
+                    buffers: &[b_ptq1, b_act_8, b_out_4],
+                    push_u32s: &[rows_u32, blk_128, t, act_w_8],
+                    workgroups: [row_tiles, t.div_ceil(4), 1],
+                },
+                ComputeStage {
+                    pipeline: p_ptq_16,
+                    buffers: &[b_ptq1, b_act_8, b_out_16],
+                    push_u32s: &[rows_u32, blk_128, t, act_w_8],
+                    workgroups: [row_tiles, t.div_ceil(16), 1],
+                },
+            ])?;
+            dev.read_buffer_f32(b_out_ref, &mut ref_out)?;
+            dev.read_buffer_f32(b_out_4, &mut g4_out)?;
+            dev.read_buffer_f32(b_out_16, &mut g16_out)?;
+            assert_bits_eq(
+                &g4_out,
+                &ref_out,
+                &format!("ptq1 4tok streaming sdot={use_sdot} pinned={pinned} T={t}"),
+            );
+            assert_bits_eq(
+                &g16_out,
+                &ref_out,
+                &format!("ptq1 16tok streaming sdot={use_sdot} pinned={pinned} T={t}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_16tok_shared_gemm_and_streaming_ptq1_zero_ulp_parity() -> TestResult {
+    let cols = 512_usize;
+    let rows = 131_usize;
+    let rows_u32 = 131_u32;
+    let max_t = 17_usize;
+    let pq2_tensor = build_pq2_tensor("gemm16.pq2", cols, rows, 3);
+    let q8_0_tensor = build_q8_0_tensor("gemm16.q8_0", cols, rows, 5);
+    let ptq1_tensor = build_ptq1_tensor("gemm16.ptq1", cols, rows, 7)?;
+    let (q8k_blocks, q8k_words) = build_q8k_4plane_words(cols, max_t);
+    let q8_0_words = build_q8_0_words(cols, max_t);
+    let res_vals = fill_pattern(max_t * rows, 0.05, 19);
+
+    verify_pq2_executor_tokens_zero_ulp(&pq2_tensor, &q8k_blocks, cols, rows, max_t)?;
+
+    let mut dev = AdrenoVulkanDevice::open()?;
+    let sdot_supported = dev.capabilities().supports_integer_dot_4x8();
+    let pq2_coal = repack_test_32b_coalesced(&pq2_tensor.data, cols, rows, 128);
+    let q8_0_coal = repack_test_32b_coalesced(&q8_0_tensor.data, cols, rows, 32);
+    let ptq1_coal = repack_test_ptq1_coalesced(&ptq1_tensor.data, cols, rows);
+
+    let b_pq2 = dev.create_storage_buffer(u64::try_from(pq2_coal.len() * 4)?)?;
+    let b_q8_0 = dev.create_storage_buffer(u64::try_from(q8_0_coal.len() * 4)?)?;
+    let b_ptq1 = dev.create_storage_buffer(u64::try_from(ptq1_coal.len() * 4)?)?;
+    let b_act_k = dev.create_storage_buffer(u64::try_from(q8k_words.len() * 4)?)?;
+    let b_act_8 = dev.create_storage_buffer(u64::try_from(q8_0_words.len() * 4)?)?;
+    let b_res = dev.create_storage_buffer(u64::try_from(res_vals.len() * 4)?)?;
+    let b_out_ref = dev.create_storage_buffer(u64::try_from(max_t * rows * 4)?)?;
+    let b_out_4 = dev.create_storage_buffer(u64::try_from(max_t * rows * 4)?)?;
+    let b_out_16 = dev.create_storage_buffer(u64::try_from(max_t * rows * 4)?)?;
+
+    dev.write_buffer_u32(b_pq2, &pq2_coal)?;
+    dev.write_buffer_u32(b_q8_0, &q8_0_coal)?;
+    dev.write_buffer_u32(b_ptq1, &ptq1_coal)?;
+    dev.write_buffer_u32(b_act_k, &q8k_words)?;
+    dev.write_buffer_u32(b_act_8, &q8_0_words)?;
+    dev.write_buffer_f32(b_res, &res_vals)?;
+
+    let sdot_modes = if sdot_supported {
+        vec![false, true]
+    } else {
+        vec![false]
+    };
+    for use_sdot in sdot_modes {
+        verify_coalesced_16tok_and_ptq1_for_mode(
+            &mut dev, use_sdot, cols, rows, rows_u32, b_pq2, b_q8_0, b_ptq1, b_act_k, b_act_8,
+            b_res, b_out_ref, b_out_4, b_out_16,
+        )?;
+    }
+    Ok(())
+}
+
+fn synthetic_hadamard1024_hybrid_model(identity: &str) -> ModelResult {
+    let embd = 1024_usize;
+    let ffn = 1024_usize;
+    let mut model = synthetic_hybrid_qwen35_model_with_layout(identity, embd, ffn, 64)?;
+    let signs: Vec<i32> = (0..embd)
+        .map(|i| if (i * 5 + 1) % 3 == 0 { -1 } else { 1 })
+        .collect();
+    let mut rotated_weights: Vec<String> = Vec::new();
+    for layer in 0..3 {
+        let p = format!("blk.{layer}.");
+        for suffix in ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"] {
+            rotated_weights.push(format!("{p}{suffix}"));
+        }
+        if layer < 2 {
+            rotated_weights.push(format!("{p}attn_qkv.weight"));
+            rotated_weights.push(format!("{p}attn_gate.weight"));
+        } else {
+            for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight"] {
+                rotated_weights.push(format!("{p}{suffix}"));
+            }
+        }
+    }
+    model.metadata.insert(
+        "prism.hadamard.version".to_owned(),
+        MetadataValue::from(1_u32),
+    );
+    model.metadata.insert(
+        "prism.hadamard.block_size".to_owned(),
+        MetadataValue::from(1024_u32),
+    );
+    model.metadata.insert(
+        "prism.hadamard.transform".to_owned(),
+        MetadataValue::from("normalized-sylvester-walsh-hadamard"),
+    );
+    model.metadata.insert(
+        "prism.hadamard.axis".to_owned(),
+        MetadataValue::from("input-last-dimension"),
+    );
+    model.metadata.insert(
+        "prism.hadamard.weight_names".to_owned(),
+        MetadataValue::from(rotated_weights),
+    );
+    model.metadata.insert(
+        "prism.hadamard.sign_mode".to_owned(),
+        MetadataValue::from("explicit"),
+    );
+    model.metadata.insert(
+        "prism.hadamard.sign_widths".to_owned(),
+        MetadataValue::from(vec![1024_u32]),
+    );
+    model.metadata.insert(
+        "prism.hadamard.sign_values".to_owned(),
+        MetadataValue::from(signs),
+    );
+    Ok(model)
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_prefill_16tok_fused_h1024_and_decode_gdn_hybrid_parity() -> TestResult {
+    let prompt_all: [u32; 17] = [0, 3, 6, 9, 12, 2, 5, 8, 11, 14, 1, 4, 7, 10, 13, 15, 2];
+    let base_model = synthetic_hadamard1024_hybrid_model("h1024-hybrid-16tok")?;
+    let q8_model = clone_with_q8_0_weights(&base_model, 29);
+
+    for model in [&base_model, &q8_model] {
+        let mut cpu = Qwen35::with_adapters_and_kv(
+            clone_model(model),
+            64,
+            64 * 1024 * 1024,
+            MatvecBackend::Auto,
+            None,
+            None,
+            KvCachePolicy::F16,
+        )?;
+        let mut seq_exec = VulkanBatchedGraphExecutor::open(
+            model,
+            VulkanBatchedConfig {
+                prefill_tile_tokens: 16,
+                ..VulkanBatchedConfig::default()
+            },
+        )?;
+        let mut bat_exec = VulkanBatchedGraphExecutor::open(
+            model,
+            VulkanBatchedConfig {
+                prefill_tile_tokens: 16,
+                ..VulkanBatchedConfig::default()
+            },
+        )?;
+
+        for &len in &[8_usize, 15, 16, 17] {
+            let prompt = &prompt_all[..len];
+            cpu.reset()?;
+            seq_exec.reset()?;
+            bat_exec.reset()?;
+
+            for &tok in prompt {
+                cpu.ingest(tok)?;
+                seq_exec.ingest_token(tok)?;
+            }
+            bat_exec.ingest_tokens_batched(prompt)?;
+            assert_eq!(
+                bat_exec.checkpoint()?.identity_sha256()?,
+                seq_exec.checkpoint()?.identity_sha256()?,
+                "prefill T={len} checkpoint mismatch"
+            );
+
+            // Exercise register-resident single-token GDN decode + evaluate_finite_into after prefill.
+            for &dec_tok in &[4_u32, 9] {
+                cpu.ingest(dec_tok)?;
+                seq_exec.ingest_token(dec_tok)?;
+                bat_exec.ingest_token(dec_tok)?;
+            }
+            assert_eq!(
+                bat_exec.checkpoint()?.identity_sha256()?,
+                seq_exec.checkpoint()?.identity_sha256()?,
+                "post-decode T={len} checkpoint mismatch"
+            );
+
+            let cpu_logits = cpu.evaluate(11)?;
+            let seq_logits = seq_exec.evaluate_token(11)?;
+            let mut bat_out = Vec::new();
+            let finite = Decoder::evaluate_finite_into(&mut bat_exec, 11, &mut bat_out)?;
+            assert_close(
+                finite.as_slice(),
+                &seq_logits,
+                1e-4,
+                &format!("bat vs seq h1024 hybrid T={len}"),
+            );
+            assert_close_rel(
+                finite.as_slice(),
+                &cpu_logits,
+                5e-3,
+                5e-3,
+                &format!("bat vs cpu h1024 hybrid T={len}"),
+            );
+        }
     }
     Ok(())
 }

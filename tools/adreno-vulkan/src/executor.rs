@@ -246,14 +246,21 @@ pub(crate) struct ProjectionPipelines {
     pub(crate) pq2_q8k_4tok_unfused: PipelineId,
     pub(crate) pq2_q8k_4tok_fused_res: PipelineId,
     pub(crate) pq2_q8k_4tok_unfused_res: PipelineId,
+    pub(crate) pq2_q8k_16tok_fused: PipelineId,
+    pub(crate) pq2_q8k_16tok_unfused: PipelineId,
+    pub(crate) pq2_q8k_16tok_fused_res: PipelineId,
+    pub(crate) pq2_q8k_16tok_unfused_res: PipelineId,
     pub(crate) pq2_q8_0: PipelineId,
     pub(crate) pq2_q8_0_4tok: PipelineId,
     pub(crate) ptq1_q8_0: PipelineId,
     pub(crate) ptq1_q8_0_pinned: PipelineId,
     pub(crate) ptq1_q8_0_4tok: PipelineId,
     pub(crate) ptq1_q8_0_4tok_pinned: PipelineId,
+    pub(crate) ptq1_q8_0_16tok: PipelineId,
+    pub(crate) ptq1_q8_0_16tok_pinned: PipelineId,
     pub(crate) q8_0_q8_0: PipelineId,
     pub(crate) q8_0_q8_0_4tok: PipelineId,
+    pub(crate) q8_0_q8_0_16tok: PipelineId,
     pub(crate) ptq1_q8k: PipelineId,
     pub(crate) quant_q8k_pinned: PipelineId,
     pub(crate) quant_q8k_unpinned: PipelineId,
@@ -264,14 +271,56 @@ pub(crate) struct ProjectionPipelines {
     pub(crate) digest_sha256: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BatchTokenPath {
+    Single,
+    Four,
+    Sixteen,
+}
+
+impl BatchTokenPath {
+    pub(crate) const fn for_tokens(device: &AdrenoVulkanDevice, tokens: usize) -> Self {
+        if tokens >= 8 && supports_16tok_gemm(device) {
+            Self::Sixteen
+        } else if tokens > 1 {
+            Self::Four
+        } else {
+            Self::Single
+        }
+    }
+
+    pub(crate) const fn grid_y(self, tokens_u32: u32) -> u32 {
+        match self {
+            Self::Single => tokens_u32,
+            Self::Four => tokens_u32.div_ceil(4),
+            Self::Sixteen => tokens_u32.div_ceil(16),
+        }
+    }
+
+    pub(crate) const fn grid_y_four_tok_cap(self, tokens_u32: u32) -> u32 {
+        match self {
+            Self::Single => tokens_u32,
+            Self::Four | Self::Sixteen => tokens_u32.div_ceil(4),
+        }
+    }
+}
+
+pub(crate) const fn supports_16tok_gemm(device: &AdrenoVulkanDevice) -> bool {
+    let limits = &device.capabilities().compute_limits;
+    limits.max_compute_work_group_invocations >= 512
+        && limits.max_compute_work_group_size[0] >= 64
+        && limits.max_compute_work_group_size[1] >= 8
+        && limits.max_compute_shared_memory_size >= 4_480
+}
+
 impl ProjectionPipelines {
     #[expect(
         clippy::too_many_lines,
-        reason = "Compiles and digests all projection, 4-token coalesced GEMM, quantization, and helper SPIR-V pipelines sequentially."
+        reason = "Compiles and digests all 1-tok, 4-tok, 16-tok shared-memory GEMM, quantization, and helper SPIR-V pipelines sequentially."
     )]
     pub(crate) fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"projection-pipelines-v3:")?;
+        hash_bytes(&mut hasher, b"projection-pipelines-v4:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
         let mut make_pipe = |tag: &[u8],
                              words: Vec<u32>,
@@ -332,6 +381,30 @@ impl ProjectionPipelines {
             4,
             4,
         )?;
+        let pq2_q8k_16tok_fused = make_pipe(
+            b"pq2_q8k_16tok_fused",
+            spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, true, false),
+            3,
+            4,
+        )?;
+        let pq2_q8k_16tok_unfused = make_pipe(
+            b"pq2_q8k_16tok_unfused",
+            spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, false, false),
+            3,
+            4,
+        )?;
+        let pq2_q8k_16tok_fused_res = make_pipe(
+            b"pq2_q8k_16tok_fused_res",
+            spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, true, true),
+            4,
+            4,
+        )?;
+        let pq2_q8k_16tok_unfused_res = make_pipe(
+            b"pq2_q8k_16tok_unfused_res",
+            spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, false, true),
+            4,
+            4,
+        )?;
         let pq2_q8_0 = make_pipe(b"pq2_q8_0", spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?;
         let pq2_q8_0_4tok = make_pipe(
             b"pq2_q8_0_4tok",
@@ -363,6 +436,18 @@ impl ProjectionPipelines {
             3,
             4,
         )?;
+        let ptq1_q8_0_16tok = make_pipe(
+            b"ptq1_q8_0_16tok",
+            spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, false),
+            3,
+            4,
+        )?;
+        let ptq1_q8_0_16tok_pinned = make_pipe(
+            b"ptq1_q8_0_16tok_pinned",
+            spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, true),
+            3,
+            4,
+        )?;
         let q8_0_q8_0 = make_pipe(
             b"q8_0_q8_0",
             spirv::q8_0_q8_0_gemv_coalesced(use_sdot),
@@ -372,6 +457,12 @@ impl ProjectionPipelines {
         let q8_0_q8_0_4tok = make_pipe(
             b"q8_0_q8_0_4tok",
             spirv::q8_0_q8_0_gemm_4tok_coalesced(use_sdot),
+            3,
+            4,
+        )?;
+        let q8_0_q8_0_16tok = make_pipe(
+            b"q8_0_q8_0_16tok",
+            spirv::q8_0_q8_0_gemm_16tok_coalesced(use_sdot),
             3,
             4,
         )?;
@@ -405,14 +496,21 @@ impl ProjectionPipelines {
             pq2_q8k_4tok_unfused,
             pq2_q8k_4tok_fused_res,
             pq2_q8k_4tok_unfused_res,
+            pq2_q8k_16tok_fused,
+            pq2_q8k_16tok_unfused,
+            pq2_q8k_16tok_fused_res,
+            pq2_q8k_16tok_unfused_res,
             pq2_q8_0,
             pq2_q8_0_4tok,
             ptq1_q8_0,
             ptq1_q8_0_pinned,
             ptq1_q8_0_4tok,
             ptq1_q8_0_4tok_pinned,
+            ptq1_q8_0_16tok,
+            ptq1_q8_0_16tok_pinned,
             q8_0_q8_0,
             q8_0_q8_0_4tok,
+            q8_0_q8_0_16tok,
             ptq1_q8k,
             quant_q8k_pinned,
             quant_q8k_unpinned,
@@ -427,43 +525,48 @@ impl ProjectionPipelines {
     pub(crate) const fn select_pq2_q8k(
         &self,
         fused: bool,
-        multi_token: bool,
+        path: BatchTokenPath,
         has_residual: bool,
     ) -> PipelineId {
-        match (multi_token, fused, has_residual) {
-            (false, true, false) => self.pq2_q8k_fused,
-            (false, false, false) => self.pq2_q8k_unfused,
-            (false, true, true) => self.pq2_q8k_fused_res,
-            (false, false, true) => self.pq2_q8k_unfused_res,
-            (true, true, false) => self.pq2_q8k_4tok_fused,
-            (true, false, false) => self.pq2_q8k_4tok_unfused,
-            (true, true, true) => self.pq2_q8k_4tok_fused_res,
-            (true, false, true) => self.pq2_q8k_4tok_unfused_res,
+        match (path, fused, has_residual) {
+            (BatchTokenPath::Single, true, false) => self.pq2_q8k_fused,
+            (BatchTokenPath::Single, false, false) => self.pq2_q8k_unfused,
+            (BatchTokenPath::Single, true, true) => self.pq2_q8k_fused_res,
+            (BatchTokenPath::Single, false, true) => self.pq2_q8k_unfused_res,
+            (BatchTokenPath::Four, true, false) => self.pq2_q8k_4tok_fused,
+            (BatchTokenPath::Four, false, false) => self.pq2_q8k_4tok_unfused,
+            (BatchTokenPath::Four, true, true) => self.pq2_q8k_4tok_fused_res,
+            (BatchTokenPath::Four, false, true) => self.pq2_q8k_4tok_unfused_res,
+            (BatchTokenPath::Sixteen, true, false) => self.pq2_q8k_16tok_fused,
+            (BatchTokenPath::Sixteen, false, false) => self.pq2_q8k_16tok_unfused,
+            (BatchTokenPath::Sixteen, true, true) => self.pq2_q8k_16tok_fused_res,
+            (BatchTokenPath::Sixteen, false, true) => self.pq2_q8k_16tok_unfused_res,
         }
     }
 
-    pub(crate) const fn select_pq2_q8_0(&self, multi_token: bool) -> PipelineId {
-        if multi_token {
-            self.pq2_q8_0_4tok
-        } else {
-            self.pq2_q8_0
+    pub(crate) const fn select_pq2_q8_0(&self, path: BatchTokenPath) -> PipelineId {
+        match path {
+            BatchTokenPath::Single => self.pq2_q8_0,
+            BatchTokenPath::Four | BatchTokenPath::Sixteen => self.pq2_q8_0_4tok,
         }
     }
 
-    pub(crate) const fn select_ptq1_q8_0(&self, pinned: bool, multi_token: bool) -> PipelineId {
-        match (multi_token, pinned) {
-            (false, false) => self.ptq1_q8_0,
-            (false, true) => self.ptq1_q8_0_pinned,
-            (true, false) => self.ptq1_q8_0_4tok,
-            (true, true) => self.ptq1_q8_0_4tok_pinned,
+    pub(crate) const fn select_ptq1_q8_0(&self, pinned: bool, path: BatchTokenPath) -> PipelineId {
+        match (path, pinned) {
+            (BatchTokenPath::Single, false) => self.ptq1_q8_0,
+            (BatchTokenPath::Single, true) => self.ptq1_q8_0_pinned,
+            (BatchTokenPath::Four, false) => self.ptq1_q8_0_4tok,
+            (BatchTokenPath::Four, true) => self.ptq1_q8_0_4tok_pinned,
+            (BatchTokenPath::Sixteen, false) => self.ptq1_q8_0_16tok,
+            (BatchTokenPath::Sixteen, true) => self.ptq1_q8_0_16tok_pinned,
         }
     }
 
-    pub(crate) const fn select_q8_0_q8_0(&self, multi_token: bool) -> PipelineId {
-        if multi_token {
-            self.q8_0_q8_0_4tok
-        } else {
-            self.q8_0_q8_0
+    pub(crate) const fn select_q8_0_q8_0(&self, path: BatchTokenPath) -> PipelineId {
+        match path {
+            BatchTokenPath::Single => self.q8_0_q8_0,
+            BatchTokenPath::Four => self.q8_0_q8_0_4tok,
+            BatchTokenPath::Sixteen => self.q8_0_q8_0_16tok,
         }
     }
 }
@@ -704,7 +807,8 @@ impl VulkanPq2Executor {
         pack_q8k_blocks_4plane_into(activations, &mut self.act_pack_scratch)?;
         let act_words_per_token = u32::try_from(blocks_per_row * Q8K_4PLANE_WORDS_PER_HALF)
             .map_err(|_| Error::ResourceLimit("activation word count overflow".to_owned()))?;
-        let pipe = self.pipes.select_pq2_q8k(fused, tokens > 1, false);
+        let path = BatchTokenPath::for_tokens(&self.device, tokens);
+        let pipe = self.pipes.select_pq2_q8k(fused, path, false);
         let words = std::mem::take(&mut self.act_pack_scratch);
         let res = self.dispatch_single_word_gemv(
             tensor,
@@ -744,7 +848,9 @@ impl VulkanPq2Executor {
             .ok_or_else(|| Error::ResourceLimit("projection output count overflow".to_owned()))?;
         let act_bytes = u32_slice_bytes(act_words.len())?;
         let out_bytes = f32_slice_bytes(total_outputs)?;
-        let grid_y = if is_4tok_pipeline(&self.pipes, pipeline) {
+        let grid_y = if is_16tok_pipeline(&self.pipes, pipeline) {
+            tokens_u32.div_ceil(16)
+        } else if is_4tok_pipeline(&self.pipes, pipeline) {
             tokens_u32.div_ceil(4)
         } else {
             tokens_u32
@@ -1058,8 +1164,9 @@ impl VulkanPq2Executor {
             let mut gemm_pushes = [[0_u32; 4]; 3];
             let mut gemm_grids = [[1_u32; 3]; 3];
             let mut gemm_pipes = [quant_pipe; 3];
-            let gemm_pipe = self.pipes.select_pq2_q8k(pinned, tokens > 1, false);
-            let grid_y = if tokens > 1 { t_u32.div_ceil(4) } else { 1 };
+            let path = BatchTokenPath::for_tokens(&self.device, tokens);
+            let gemm_pipe = self.pipes.select_pq2_q8k(pinned, path, false);
+            let grid_y = path.grid_y(t_u32);
 
             for (idx, &tensor) in tensors.iter().enumerate() {
                 let rows = tensor.dimensions[1];
@@ -1182,8 +1289,9 @@ impl VulkanPq2Executor {
             } else {
                 self.pipes.swiglu_unpinned
             };
-            let gemm_pipe = self.pipes.select_pq2_q8k(pinned, tokens > 1, false);
-            let grid_y = if tokens > 1 { t_u32.div_ceil(4) } else { 1 };
+            let path = BatchTokenPath::for_tokens(&self.device, tokens);
+            let gemm_pipe = self.pipes.select_pq2_q8k(pinned, path, false);
+            let grid_y = path.grid_y(t_u32);
             let quant_spans = [BufferSpan::whole(f32_in_buf), BufferSpan::whole(q8k_buf)];
             let gate_spans = [
                 w_gate.span(),
@@ -1436,11 +1544,10 @@ impl VulkanPq2Executor {
         } else {
             self.pipes.swiglu_unpinned
         };
-        let up_pipe = self.pipes.select_pq2_q8k(pinned, tokens > 1, false);
-        let down_pipe = self
-            .pipes
-            .select_pq2_q8k(pinned, tokens > 1, res_buf.is_some());
-        let grid_y = if tokens > 1 { t_u32.div_ceil(4) } else { 1 };
+        let path = BatchTokenPath::for_tokens(&self.device, tokens);
+        let up_pipe = self.pipes.select_pq2_q8k(pinned, path, false);
+        let down_pipe = self.pipes.select_pq2_q8k(pinned, path, res_buf.is_some());
+        let grid_y = path.grid_y(t_u32);
 
         let quant_in_spans = [f32_in_span, q8k_in_span];
         let quant_in_push = [in_cols_u32, t_u32];
@@ -1673,7 +1780,9 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
         let act_words_per_token = u32::try_from(self.act_pack_scratch.len()).map_err(|_| {
             Error::ResourceLimit("activation word count overflow".to_owned()).into_runtime_error()
         })?;
-        let pipeline = self.pipes.select_pq2_q8k(fused, false, false);
+        let pipeline = self
+            .pipes
+            .select_pq2_q8k(fused, BatchTokenPath::Single, false);
         let words = std::mem::take(&mut self.act_pack_scratch);
         let res = self.dispatch_single_word_gemv(
             tensor,
@@ -2530,6 +2639,16 @@ fn is_4tok_pipeline(pipes: &ProjectionPipelines, pipe: PipelineId) -> bool {
         || pipe == pipes.ptq1_q8_0_4tok
         || pipe == pipes.ptq1_q8_0_4tok_pinned
         || pipe == pipes.q8_0_q8_0_4tok
+}
+
+fn is_16tok_pipeline(pipes: &ProjectionPipelines, pipe: PipelineId) -> bool {
+    pipe == pipes.pq2_q8k_16tok_fused
+        || pipe == pipes.pq2_q8k_16tok_unfused
+        || pipe == pipes.pq2_q8k_16tok_fused_res
+        || pipe == pipes.pq2_q8k_16tok_unfused_res
+        || pipe == pipes.ptq1_q8_0_16tok
+        || pipe == pipes.ptq1_q8_0_16tok_pinned
+        || pipe == pipes.q8_0_q8_0_16tok
 }
 
 fn ensure_scratch(

@@ -10,6 +10,7 @@ use std::ffi::CStr;
 use std::ops::Range;
 use std::ptr::{NonNull, null_mut};
 use std::slice;
+use std::sync::{Mutex, PoisonError};
 
 use ash::vk;
 use bonsai_native_hash::Hasher;
@@ -18,6 +19,8 @@ use crate::{
     AdrenoFamily, CoopMatShape, Error, MemoryHeapBudget, VulkanComputeLimits,
     VulkanDeviceCapabilities, hash_bytes, hash_u32, hash_u64, hash_usize,
 };
+
+static QGLC_PIPELINE_COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
 const FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 const QUALCOMM_VENDOR_ID: u32 = 0x5143;
@@ -1647,6 +1650,11 @@ impl AdrenoVulkanDevice {
                 "push constants ({push_bytes} B) exceed limit ({max_push} B)"
             )));
         }
+
+        // Adreno QGLC shader compiler uses shared in-process state during concurrent compiles.
+        let _compile_guard = QGLC_PIPELINE_COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
 
         let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv_words);
         // SAFETY: `spirv_words` slice is valid for `shader_info` duration.

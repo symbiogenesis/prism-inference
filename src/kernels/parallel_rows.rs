@@ -104,15 +104,18 @@ mod tests {
         let data = [0_u8, 1, 2, 3, 4, 5, 6, 7];
         let mut output = Vec::with_capacity(data.len());
         let mut errors = Vec::new();
+        let caller = std::thread::current().id();
         let error = policy.fill(&data, 1, &mut output, &mut errors, |row| {
             assert_eq!(
                 row.as_ptr(),
                 data.as_ptr().wrapping_add(usize::from(row[0]))
             );
+            let current = std::thread::current();
             assert!(
-                std::thread::current()
-                    .name()
-                    .is_some_and(|name| name.starts_with("prism-row-"))
+                current.id() == caller
+                    || current
+                        .name()
+                        .is_some_and(|name| name.starts_with("prism-row-"))
             );
             if row[0] == 3 || row[0] == 7 {
                 Err(invalid(format!("rejected row {}", row[0])))

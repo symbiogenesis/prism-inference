@@ -453,15 +453,21 @@ mod tests {
                     row.as_ptr(),
                     data.as_ptr().wrapping_add(usize::from(row[0]))
                 );
+                let current = std::thread::current();
                 assert!(
-                    std::thread::current()
-                        .name()
-                        .is_some_and(|name| name.starts_with("prism-row-"))
+                    current.id() == caller
+                        || current
+                            .name()
+                            .is_some_and(|name| name.starts_with("prism-row-"))
                 );
-                let wait = std::time::Instant::now();
-                while !checked.load(Ordering::Acquire) {
-                    assert!(wait.elapsed() < std::time::Duration::from_secs(2));
-                    std::thread::yield_now();
+                if current.id() == caller {
+                    assert!(checked.load(Ordering::Acquire));
+                } else {
+                    let wait = std::time::Instant::now();
+                    while !checked.load(Ordering::Acquire) {
+                        assert!(wait.elapsed() < std::time::Duration::from_secs(2));
+                        std::thread::yield_now();
+                    }
                 }
                 *blocks += 1;
                 let value = f32::from(row[0]);
@@ -503,6 +509,7 @@ mod tests {
         );
         assert_eq!(blocks, 8);
 
+        let caller = std::thread::current().id();
         let started = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
         let checks = Cell::new(0);
@@ -522,10 +529,12 @@ mod tests {
             },
             |_, blocks| {
                 started.store(true, Ordering::Release);
-                let wait = std::time::Instant::now();
-                while !cancelled.load(Ordering::Acquire) {
-                    assert!(wait.elapsed() < std::time::Duration::from_secs(2));
-                    std::thread::yield_now();
+                if std::thread::current().id() != caller {
+                    let wait = std::time::Instant::now();
+                    while !cancelled.load(Ordering::Acquire) {
+                        assert!(wait.elapsed() < std::time::Duration::from_secs(2));
+                        std::thread::yield_now();
+                    }
                 }
                 *blocks += 1;
                 Err(invalid("provisional worker failure"))

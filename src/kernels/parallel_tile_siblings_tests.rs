@@ -106,10 +106,12 @@ fn x1_sibling_tile_workers_preserve_borrows_order_and_cancellation() -> Result<(
         |_, _| Err(invalid("replay four rows")),
         |_, _| -> Result<[f32; 3]> {
             started.store(true, Ordering::Release);
-            let wait = std::time::Instant::now();
-            while !cancelled.load(Ordering::Acquire) {
-                assert!(wait.elapsed() < std::time::Duration::from_secs(2));
-                std::thread::yield_now();
+            if std::thread::current().id() != caller {
+                let wait = std::time::Instant::now();
+                while !cancelled.load(Ordering::Acquire) {
+                    assert!(wait.elapsed() < std::time::Duration::from_secs(2));
+                    std::thread::yield_now();
+                }
             }
             finished.store(true, Ordering::Release);
             Err(invalid("provisional worker failure"))

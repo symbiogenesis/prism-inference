@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -83,15 +83,16 @@ struct WorkerDoneGuard<'a> {
 
 impl Drop for WorkerDoneGuard<'_> {
     fn drop(&mut self) {
-        if self.shared.pending_workers.fetch_sub(1, Ordering::SeqCst) == 1
-            && self.shared.caller_sleeping.load(Ordering::SeqCst)
-        {
-            let _guard = self
-                .shared
-                .done_lock
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.shared.done_cv.notify_all();
+        if self.shared.pending_workers.fetch_sub(1, Ordering::Release) == 1 {
+            fence(Ordering::SeqCst);
+            if self.shared.caller_sleeping.load(Ordering::Relaxed) {
+                let _guard = self
+                    .shared
+                    .done_lock
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                self.shared.done_cv.notify_all();
+            }
         }
     }
 }
@@ -103,36 +104,66 @@ struct ScopeGuard<'a, 'env, F> {
 
 impl<F> Drop for ScopeGuard<'_, '_, F> {
     fn drop(&mut self) {
-        wait_until_workers_idle(self.shared);
-        // SAFETY: All workers for the current generation have exited `Job::invoke`
-        // (`pending_workers == 0`), and no new generation can start while `dispatch_lock`
-        // remains held by the caller.
+        wait_for_workers(self.shared, || {}, false);
+        // SAFETY: All background workers for the current generation have exited
+        // `Job::invoke` (`pending_workers == 0`), and no new generation can start
+        // while `dispatch_lock` remains held by the caller.
         unsafe { *self.shared.job.0.0.get() = None };
     }
 }
 
-fn wait_until_workers_idle(shared: &Shared) {
+fn wait_for_workers<W: FnMut()>(shared: &Shared, mut on_wait: W, use_timeout: bool) {
     let mut spins = 0_u32;
     while shared.pending_workers.load(Ordering::Acquire) != 0 {
         if spins < SPIN_ITERATIONS {
+            if use_timeout && spins.trailing_zeros() >= 8 {
+                on_wait();
+            }
             std::hint::spin_loop();
             spins += 1;
             continue;
+        }
+        if use_timeout {
+            on_wait();
+            if shared.pending_workers.load(Ordering::Acquire) == 0 {
+                break;
+            }
         }
         let mut guard = shared
             .done_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         shared.caller_sleeping.store(true, Ordering::SeqCst);
-        while shared.pending_workers.load(Ordering::SeqCst) != 0 {
-            guard = shared
-                .done_cv
-                .wait(guard)
-                .unwrap_or_else(PoisonError::into_inner);
+        if use_timeout {
+            if shared.pending_workers.load(Ordering::SeqCst) != 0 {
+                guard = shared
+                    .done_cv
+                    .wait_timeout(guard, CHECK_WAIT_INTERVAL)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        } else {
+            while shared.pending_workers.load(Ordering::SeqCst) != 0 {
+                guard = shared
+                    .done_cv
+                    .wait(guard)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
         }
         shared.caller_sleeping.store(false, Ordering::Release);
         drop(guard);
     }
+}
+
+fn take_worker_panic(shared: &Shared) -> Option<Box<dyn Any + Send + 'static>> {
+    if shared.panicked.swap(false, Ordering::AcqRel) {
+        let mut panic_slot = shared
+            .worker_panic
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        return panic_slot.take();
+    }
+    None
 }
 
 unsafe fn invoke_task<F: Fn(usize) + Sync>(ctx: *const (), task_index: usize) {
@@ -171,14 +202,17 @@ impl<T> DisjointSlice<T> {
 // SAFETY: Disjoint indices yield non-overlapping `&mut T` elements and `T: Send`.
 unsafe impl<T: Send> Sync for DisjointSlice<T> {}
 
-/// Persistent pool of `prism-row-{idx}` workers using spin-then-park scheduling.
+/// Persistent caller-participating pool of `prism-row-{idx}` workers using spin-then-park scheduling.
 pub struct NativeRowPool {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl NativeRowPool {
-    /// Spawns `worker_count` persistent worker threads with 512 KiB stacks.
+    /// Spawns `worker_count - 1` persistent background worker threads with 512 KiB stacks.
+    ///
+    /// The calling thread participates directly in task execution, so a
+    /// `worker_count` of `1` spawns zero background threads.
     ///
     /// # Errors
     /// Rejects a zero worker count or propagates any OS thread creation failure
@@ -207,22 +241,25 @@ impl NativeRowPool {
             job: CachePadded::new(JobSlot(UnsafeCell::new(None))),
         });
 
+        let bg_workers = worker_count - 1;
         let mut workers = Vec::new();
-        workers
-            .try_reserve_exact(worker_count)
-            .map_err(|_| io::Error::other("Failed to reserve row worker handles."))?;
+        if bg_workers > 0 {
+            workers
+                .try_reserve_exact(bg_workers)
+                .map_err(|_| io::Error::other("Failed to reserve row worker handles."))?;
 
-        for index in 0..worker_count {
-            let worker_shared = Arc::clone(&shared);
-            let spawn_result = thread::Builder::new()
-                .name(format!("prism-row-{index}"))
-                .stack_size(WORKER_STACK_BYTES)
-                .spawn(move || worker_loop(&worker_shared));
-            match spawn_result {
-                Ok(handle) => workers.push(handle),
-                Err(error) => {
-                    shutdown_workers(&shared, &mut workers);
-                    return Err(error);
+            for index in 0..bg_workers {
+                let worker_shared = Arc::clone(&shared);
+                let spawn_result = thread::Builder::new()
+                    .name(format!("prism-row-{index}"))
+                    .stack_size(WORKER_STACK_BYTES)
+                    .spawn(move || worker_loop(&worker_shared));
+                match spawn_result {
+                    Ok(handle) => workers.push(handle),
+                    Err(error) => {
+                        shutdown_workers(&shared, &mut workers);
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -230,10 +267,10 @@ impl NativeRowPool {
         Ok(Self { shared, workers })
     }
 
-    /// Returns the fixed number of persistent worker threads in this pool.
+    /// Returns the total worker concurrency of this pool (calling thread plus background threads).
     #[must_use]
     pub const fn worker_count(&self) -> usize {
-        self.workers.len()
+        self.workers.len() + 1
     }
 
     /// Executes `task(0..task_count)` across the worker pool and joins all workers.
@@ -241,8 +278,9 @@ impl NativeRowPool {
         self.dispatch_with_wait(task_count, task, || {});
     }
 
-    /// Executes `task(0..task_count)` across the worker pool, invoking `on_wait`
-    /// while workers remain active.
+    /// Executes `task(0..task_count)` across the calling thread and background
+    /// workers, invoking `on_wait` between caller tasks and while waiting for
+    /// background workers.
     pub fn dispatch_with_wait<F: Fn(usize) + Sync, W: FnMut()>(
         &self,
         task_count: usize,
@@ -253,22 +291,24 @@ impl NativeRowPool {
             return;
         }
 
+        let bg_workers = self.workers.len();
+        if bg_workers == 0 {
+            on_wait();
+            for index in 0..task_count {
+                task(index);
+                on_wait();
+            }
+            return;
+        }
+
         let dispatch_guard = self
             .shared
             .dispatch_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
 
-        let worker_count = self.workers.len();
         {
-            if self.shared.panicked.swap(false, Ordering::AcqRel) {
-                let mut panic_slot = self
-                    .shared
-                    .worker_panic
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                *panic_slot = None;
-            }
+            let _ = take_worker_panic(&self.shared);
             let job = Job {
                 invoke: invoke_task::<F>,
                 ctx: ptr::from_ref(&task).cast::<()>(),
@@ -281,7 +321,7 @@ impl NativeRowPool {
             self.shared.next_task.store(0, Ordering::Release);
             self.shared
                 .pending_workers
-                .store(worker_count, Ordering::Release);
+                .store(bg_workers, Ordering::Release);
             self.shared.generation.fetch_add(1, Ordering::SeqCst);
             if self.shared.sleeping_workers.load(Ordering::SeqCst) != 0 {
                 let _state_guard = self
@@ -293,58 +333,43 @@ impl NativeRowPool {
             }
         }
 
+        let mut caller_panic = None;
         {
             let _scope_guard = ScopeGuard::<F> {
                 shared: &self.shared,
                 _closure: PhantomData,
             };
 
-            let mut spins = 0_u32;
-            while self.shared.pending_workers.load(Ordering::Acquire) != 0 {
-                if spins < SPIN_ITERATIONS {
-                    if spins.trailing_zeros() >= 8 {
-                        on_wait();
-                    }
-                    std::hint::spin_loop();
-                    spins += 1;
-                    continue;
-                }
-                on_wait();
-                if self.shared.pending_workers.load(Ordering::Acquire) == 0 {
+            on_wait();
+            loop {
+                let index = self.shared.next_task.fetch_add(1, Ordering::Relaxed);
+                if index >= task_count {
                     break;
                 }
-                let guard = self
-                    .shared
-                    .done_lock
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                self.shared.caller_sleeping.store(true, Ordering::SeqCst);
-                let guard = if self.shared.pending_workers.load(Ordering::SeqCst) != 0 {
-                    self.shared
-                        .done_cv
-                        .wait_timeout(guard, CHECK_WAIT_INTERVAL)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0
-                } else {
-                    guard
-                };
-                self.shared.caller_sleeping.store(false, Ordering::Release);
-                drop(guard);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    task(index);
+                }));
+                if let Err(payload) = result {
+                    caller_panic = Some(payload);
+                    break;
+                }
+                on_wait();
+            }
+
+            if caller_panic.is_none() {
+                wait_for_workers(&self.shared, on_wait, true);
             }
         }
 
-        if self.shared.panicked.swap(false, Ordering::AcqRel) {
-            let mut panic_slot = self
-                .shared
-                .worker_panic
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let payload = panic_slot.take();
-            drop(panic_slot);
-            if let Some(payload) = payload {
-                drop(dispatch_guard);
-                resume_unwind(payload);
-            }
+        if let Some(payload) = caller_panic {
+            let _ = take_worker_panic(&self.shared);
+            drop(dispatch_guard);
+            resume_unwind(payload);
+        }
+
+        if let Some(payload) = take_worker_panic(&self.shared) {
+            drop(dispatch_guard);
+            resume_unwind(payload);
         }
     }
 
@@ -383,6 +408,9 @@ impl Drop for NativeRowPool {
 }
 
 fn shutdown_workers(shared: &Shared, workers: &mut Vec<JoinHandle<()>>) {
+    if workers.is_empty() {
+        return;
+    }
     shared.shutdown.store(true, Ordering::SeqCst);
     if shared.sleeping_workers.load(Ordering::SeqCst) != 0 {
         let _guard = shared
@@ -480,20 +508,34 @@ mod tests {
     fn rejects_zero_workers_and_preserves_names_and_disjoint_updates() -> io::Result<()> {
         assert!(NativeRowPool::new(0).is_err());
 
+        let serial = NativeRowPool::new(1)?;
+        assert_eq!(serial.worker_count(), 1);
+        assert!(serial.workers.is_empty());
+
         let pool = NativeRowPool::new(4)?;
         assert_eq!(pool.worker_count(), 4);
+        assert_eq!(pool.workers.len(), 3);
 
+        let caller_id = thread::current().id();
         let mut items = vec![0_u64; 32];
+        let mut ids = vec![caller_id; 32];
         let mut names = vec![String::new(); 32];
-        let mut slots: Vec<_> = items.iter_mut().zip(names.iter_mut()).collect();
-        pool.dispatch_mut(&mut slots, |index, (value, name)| {
+        let mut slots: Vec<_> = items
+            .iter_mut()
+            .zip(ids.iter_mut().zip(names.iter_mut()))
+            .collect();
+        pool.dispatch_mut(&mut slots, |index, (value, (id, name))| {
             **value = u64::try_from(index * 7 + 3).unwrap_or(0);
-            **name = thread::current().name().unwrap_or("").to_owned();
+            let cur = thread::current();
+            **id = cur.id();
+            **name = cur.name().unwrap_or("").to_owned();
         });
-        for (index, (value, name)) in items.iter().zip(names.iter()).enumerate() {
+        for (index, ((value, id), name)) in
+            items.iter().zip(ids.iter()).zip(names.iter()).enumerate()
+        {
             assert_eq!(*value, u64::try_from(index * 7 + 3).unwrap_or(0));
             assert!(
-                name.starts_with("prism-row-"),
+                *id == caller_id || name.starts_with("prism-row-"),
                 "unexpected worker thread name: {name}"
             );
         }
@@ -540,15 +582,15 @@ mod tests {
             }
         }
 
-        // Wait until all workers finish their spin window and enter idle sleep.
+        // Wait until all 3 background workers finish their spin window and enter idle sleep.
         let mut waited_ms = 0_u32;
-        while pool.shared.sleeping_workers.load(Ordering::Acquire) < 4 && waited_ms < 500 {
+        while pool.shared.sleeping_workers.load(Ordering::Acquire) < 3 && waited_ms < 500 {
             thread::sleep(Duration::from_millis(1));
             waited_ms += 1;
         }
-        assert_eq!(pool.shared.sleeping_workers.load(Ordering::Acquire), 4);
+        assert_eq!(pool.shared.sleeping_workers.load(Ordering::Acquire), 3);
 
-        // Wake all four sleeping workers simultaneously across a 4-way barrier.
+        // Wake all 3 sleeping background workers plus caller across a 4-way barrier.
         let barrier = std::sync::Barrier::new(4);
         let awake_seen = AtomicUsize::new(0);
         pool.dispatch(4, |_| {
@@ -565,6 +607,179 @@ mod tests {
             });
             for (index, value) in slots.iter().enumerate() {
                 assert_eq!(*value, round.wrapping_mul(17).wrapping_add(index));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stress_workers_and_task_counts_cover_caller_and_background_execution() -> io::Result<()> {
+        let caller_id = thread::current().id();
+        for workers in [1_usize, 2, 4, 12, 18] {
+            let pool = NativeRowPool::new(workers)?;
+            assert_eq!(pool.worker_count(), workers);
+            assert_eq!(pool.workers.len(), workers - 1);
+
+            for task_count in [0_usize, 1, 2, 7, 18, 256] {
+                let counts: Vec<AtomicUsize> =
+                    (0..task_count).map(|_| AtomicUsize::new(0)).collect();
+                let wait_ticks = AtomicUsize::new(0);
+                let bad_caller = AtomicBool::new(false);
+                pool.dispatch_with_wait(
+                    task_count,
+                    |index| {
+                        counts[index].fetch_add(1, Ordering::Relaxed);
+                        let cur = thread::current();
+                        let allowed = cur.id() == caller_id
+                            || (workers > 1
+                                && cur.name().is_some_and(|n| n.starts_with("prism-row-")));
+                        assert!(allowed);
+                    },
+                    || {
+                        if thread::current().id() != caller_id {
+                            bad_caller.store(true, Ordering::Release);
+                        }
+                        wait_ticks.fetch_add(1, Ordering::Relaxed);
+                    },
+                );
+                assert!(!bad_caller.load(Ordering::Acquire));
+                for count in &counts {
+                    assert_eq!(count.load(Ordering::Relaxed), 1);
+                }
+                if task_count == 0 {
+                    assert_eq!(wait_ticks.load(Ordering::Relaxed), 0);
+                } else {
+                    assert!(wait_ticks.load(Ordering::Relaxed) >= 1);
+                    if workers == 1 {
+                        assert_eq!(wait_ticks.load(Ordering::Relaxed), task_count + 1);
+                    }
+                }
+
+                let mut slots = vec![0_usize; task_count];
+                pool.dispatch_mut(&mut slots, |index, slot| {
+                    *slot = index.wrapping_mul(31).wrapping_add(7);
+                });
+                for (index, &val) in slots.iter().enumerate() {
+                    assert_eq!(val, index.wrapping_mul(31).wrapping_add(7));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "Injects caller, worker, and on_wait panics to verify recovery and cleanup."
+    )]
+    fn caller_worker_and_wait_panics_propagate_and_recover() -> io::Result<()> {
+        let caller_id = thread::current().id();
+        for workers in [1_usize, 2, 4, 18] {
+            let pool = NativeRowPool::new(workers)?;
+
+            // Caller thread panic propagation and recovery.
+            let caller_panicked = catch_unwind(AssertUnwindSafe(|| {
+                pool.dispatch(workers * 4, |_| {
+                    assert!(thread::current().id() != caller_id, "injected caller panic");
+                    thread::sleep(Duration::from_millis(1));
+                });
+            }));
+            assert!(caller_panicked.is_err());
+
+            if workers > 1 {
+                // Background worker panic propagation and recovery.
+                let worker_panicked = AtomicBool::new(false);
+                let res = catch_unwind(AssertUnwindSafe(|| {
+                    pool.dispatch(workers * 4, |_| {
+                        if thread::current().id() == caller_id {
+                            thread::sleep(Duration::from_millis(2));
+                        } else {
+                            assert!(
+                                worker_panicked.swap(true, Ordering::AcqRel),
+                                "injected worker panic"
+                            );
+                        }
+                    });
+                }));
+                assert!(res.is_err());
+            }
+
+            if workers == 4 {
+                // Simultaneous caller and worker panic propagation and recovery.
+                let worker_panicked = AtomicBool::new(false);
+                let res = catch_unwind(AssertUnwindSafe(|| {
+                    pool.dispatch(16, |_| {
+                        assert!(
+                            thread::current().id() != caller_id,
+                            "injected simultaneous caller panic"
+                        );
+                        assert!(
+                            worker_panicked.swap(true, Ordering::AcqRel),
+                            "injected simultaneous worker panic"
+                        );
+                    });
+                }));
+                assert!(res.is_err());
+            }
+
+            // `on_wait` panic propagation and recovery.
+            let wait_panicked = catch_unwind(AssertUnwindSafe(|| {
+                pool.dispatch_with_wait(
+                    workers * 2,
+                    |_| {
+                        thread::sleep(Duration::from_millis(1));
+                    },
+                    || {
+                        panic!("injected wait callback panic");
+                    },
+                );
+            }));
+            assert!(wait_panicked.is_err());
+
+            let mut recovered = vec![0_usize; workers * 3];
+            pool.dispatch_mut(&mut recovered, |index, slot| {
+                *slot = index + 11;
+            });
+            for (index, &val) in recovered.iter().enumerate() {
+                assert_eq!(val, index + 11);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_sleep_wake_transitions_across_worker_counts() -> io::Result<()> {
+        for workers in [1_usize, 2, 4, 12, 18] {
+            let pool = NativeRowPool::new(workers)?;
+            let bg_workers = workers - 1;
+            for round in 0..4_usize {
+                let mut waited_ms = 0_u32;
+                while pool.shared.sleeping_workers.load(Ordering::Acquire) < bg_workers
+                    && waited_ms < 500
+                {
+                    thread::sleep(Duration::from_millis(1));
+                    waited_ms += 1;
+                }
+                assert_eq!(
+                    pool.shared.sleeping_workers.load(Ordering::Acquire),
+                    bg_workers
+                );
+
+                let barrier = std::sync::Barrier::new(workers);
+                let seen = AtomicUsize::new(0);
+                pool.dispatch(workers, |_| {
+                    barrier.wait();
+                    seen.fetch_add(1, Ordering::Relaxed);
+                });
+                assert_eq!(seen.load(Ordering::Relaxed), workers, "round={round}");
+
+                let mut slots = vec![0_usize; 32];
+                pool.dispatch_mut(&mut slots, |idx, slot| {
+                    *slot = round.wrapping_mul(100).wrapping_add(idx);
+                });
+                for (idx, &val) in slots.iter().enumerate() {
+                    assert_eq!(val, round.wrapping_mul(100).wrapping_add(idx));
+                }
             }
         }
         Ok(())

@@ -3299,6 +3299,59 @@ const fn ptq1_symbol_table() -> [[u8; 5]; 256] {
 
 const PTQ1_SYMBOLS: [[u8; 5]; 256] = ptq1_symbol_table();
 
+const fn widen_u8_to_u32(byte: u8) -> u32 {
+    u32::from_le_bytes([byte, 0, 0, 0])
+}
+
+const fn widen_u8_to_u64(byte: u8) -> u64 {
+    u64::from_le_bytes([byte, 0, 0, 0, 0, 0, 0, 0])
+}
+
+const fn ptq1_wide_u64_table() -> [u64; 256] {
+    let mut table = [0_u64; 256];
+    let mut index = 0_usize;
+    while index < 256 {
+        let [d0, d1, d2, d3, d4] = PTQ1_SYMBOLS[index];
+        table[index] = widen_u8_to_u64(d0)
+            | (widen_u8_to_u64(d1) << 8)
+            | (widen_u8_to_u64(d2) << 16)
+            | (widen_u8_to_u64(d3) << 24)
+            | (widen_u8_to_u64(d4) << 32);
+        index += 1;
+    }
+    table
+}
+
+const fn ptq1_mid_u32_table() -> [u32; 256] {
+    let mut table = [0_u32; 256];
+    let mut index = 0_usize;
+    while index < 256 {
+        let [d0, d1, d2, d3, d4] = PTQ1_SYMBOLS[index];
+        let byte0 = widen_u8_to_u32(d0) | (widen_u8_to_u32(d1) << 4);
+        let byte1 = widen_u8_to_u32(d2) | (widen_u8_to_u32(d3) << 4);
+        table[index] = byte0 | (byte1 << 8) | (widen_u8_to_u32(d4) << 16);
+        index += 1;
+    }
+    table
+}
+
+const fn ptq1_tail_u32_table() -> [u32; 256] {
+    let mut table = [0_u32; 256];
+    let mut index = 0_usize;
+    while index < 256 {
+        let [d0, d1, d2, d3, _] = PTQ1_SYMBOLS[index];
+        let byte0 = (widen_u8_to_u32(d0) << 4) | (widen_u8_to_u32(d2) << 6);
+        let byte2 = (widen_u8_to_u32(d1) << 4) | (widen_u8_to_u32(d3) << 6);
+        table[index] = byte0 | (byte2 << 16);
+        index += 1;
+    }
+    table
+}
+
+const PTQ1_WIDE_U64: [u64; 256] = ptq1_wide_u64_table();
+const PTQ1_MID_U32: [u32; 256] = ptq1_mid_u32_table();
+const PTQ1_TAIL_U32: [u32; 256] = ptq1_tail_u32_table();
+
 fn validate_source_scales(tensor: &Tensor) -> Result<()> {
     match tensor.kind {
         PQ2_KIND => {
@@ -3377,6 +3430,113 @@ fn initialize_native_weights(weights: &mut [u8]) {
     }
 }
 
+#[inline]
+const fn u64_lo_le_bytes(word: u64) -> [u8; 4] {
+    let [b0, b1, b2, b3, ..] = word.to_le_bytes();
+    [b0, b1, b2, b3]
+}
+
+#[inline]
+fn write_tile_pair_row(
+    pair_buf: &mut [u8; 1152],
+    row_in_tile: usize,
+    scale_bytes: [u8; 2],
+    planes: [[u8; 4]; 8],
+) {
+    // Masking proves `row_masked < 32` locally so LLVM eliminates all slice bounds checks
+    // and hoists the invariant offsets when inlined into row-group packing loops.
+    let row_masked = row_in_tile & 31;
+    let q_off = row_masked * 4;
+    let s_off = row_masked * 2;
+    pair_buf[512 + s_off..514 + s_off].copy_from_slice(&scale_bytes);
+    pair_buf[1088 + s_off..1090 + s_off].copy_from_slice(&scale_bytes);
+    pair_buf[q_off..q_off + 4].copy_from_slice(&planes[0]);
+    pair_buf[128 + q_off..132 + q_off].copy_from_slice(&planes[1]);
+    pair_buf[256 + q_off..260 + q_off].copy_from_slice(&planes[2]);
+    pair_buf[384 + q_off..388 + q_off].copy_from_slice(&planes[3]);
+    pair_buf[576 + q_off..580 + q_off].copy_from_slice(&planes[4]);
+    pair_buf[704 + q_off..708 + q_off].copy_from_slice(&planes[5]);
+    pair_buf[832 + q_off..836 + q_off].copy_from_slice(&planes[6]);
+    pair_buf[960 + q_off..964 + q_off].copy_from_slice(&planes[7]);
+}
+
+#[inline]
+fn pack_ptq1_wide_col(b0: u8, b1: u8, b2: u8, b3: u8) -> u64 {
+    PTQ1_WIDE_U64[usize::from(b0)]
+        | (PTQ1_WIDE_U64[usize::from(b1)] << 2)
+        | (PTQ1_WIDE_U64[usize::from(b2)] << 4)
+        | (PTQ1_WIDE_U64[usize::from(b3)] << 6)
+}
+
+#[inline]
+fn pack_ptq1_mid_col(b0: u8, b1: u8) -> u32 {
+    PTQ1_MID_U32[usize::from(b0)] | (PTQ1_MID_U32[usize::from(b1)] << 2)
+}
+
+#[inline]
+fn pack_ptq1_block(
+    original: &[u8; 28],
+    row_in_tile: usize,
+    pair_buf: &mut [u8; 1152],
+) -> Result<()> {
+    let scale_bytes = [original[26], original[27]];
+    if (u16::from_le_bytes(scale_bytes) & 0x7c00) == 0x7c00 {
+        return Err(invalid("nonfinite Hexagon Q2 scale"));
+    }
+
+    let q0 = pack_ptq1_wide_col(original[0], original[4], original[8], original[12]);
+    let q1 = pack_ptq1_wide_col(original[1], original[5], original[9], original[13]);
+    let q2 = pack_ptq1_wide_col(original[2], original[6], original[10], original[14]);
+    let q3 = pack_ptq1_wide_col(original[3], original[7], original[11], original[15]);
+
+    let mask_even = 0x00ff_00ff_00ff_00ff_u64;
+    let t01_even = (q0 & mask_even) | ((q1 & mask_even) << 8);
+    let t23_even = (q2 & mask_even) | ((q3 & mask_even) << 8);
+    let t01_odd = ((q0 >> 8) & 0x00ff_00ff) | (q1 & 0xff00_ff00);
+    let t23_odd = ((q2 >> 8) & 0x00ff_00ff) | (q3 & 0xff00_ff00);
+
+    let word0 = (t01_even & 0xffff) | ((t23_even & 0xffff) << 16);
+    let word1 = (t01_odd & 0xffff) | ((t23_odd & 0xffff) << 16);
+    let word2 = ((t01_even >> 16) & 0xffff) | (t23_even & 0xffff_0000);
+    let word3 = (t01_odd >> 16) | (t23_odd & 0xffff_0000);
+    let word4 = (t01_even >> 32) | ((t23_even >> 16) & 0xffff_0000);
+
+    let mc0 = pack_ptq1_mid_col(original[16], original[20]);
+    let mc1 = pack_ptq1_mid_col(original[17], original[21]);
+    let mc2 = pack_ptq1_mid_col(original[18], original[22]);
+    let mc3 = pack_ptq1_mid_col(original[19], original[23]);
+
+    let m01_even = (mc0 & 0x00ff_00ff) | ((mc1 & 0x00ff_00ff) << 8);
+    let m23_even = (mc2 & 0x00ff_00ff) | ((mc3 & 0x00ff_00ff) << 8);
+    let m01_odd = ((mc0 >> 8) & 0x00ff) | (mc1 & 0xff00);
+    let m23_odd = ((mc2 >> 8) & 0x00ff) | (mc3 & 0xff00);
+
+    let word5 = (m01_even & 0xffff) | ((m23_even & 0xffff) << 16);
+    let word6 = m01_odd | (m23_odd << 16);
+    let word7 = (m01_even >> 16)
+        | (m23_even & 0xffff_0000)
+        | PTQ1_TAIL_U32[usize::from(original[24])]
+        | (PTQ1_TAIL_U32[usize::from(original[25])] << 8);
+
+    write_tile_pair_row(
+        pair_buf,
+        row_in_tile,
+        scale_bytes,
+        [
+            u64_lo_le_bytes(word0),
+            u64_lo_le_bytes(word1),
+            u64_lo_le_bytes(word2),
+            u64_lo_le_bytes(word3),
+            u64_lo_le_bytes(word4),
+            word5.to_le_bytes(),
+            word6.to_le_bytes(),
+            word7.to_le_bytes(),
+        ],
+    );
+    Ok(())
+}
+
+#[inline]
 fn pack_ptq1_tile_into(original: &[u8], row_in_tile: usize, pair_buf: &mut [u8]) -> Result<()> {
     let original: &[u8; 28] = original
         .try_into()
@@ -3387,56 +3547,7 @@ fn pack_ptq1_tile_into(original: &[u8], row_in_tile: usize, pair_buf: &mut [u8])
     let pair_buf: &mut [u8; 1152] = pair_buf
         .try_into()
         .map_err(|_| invalid("invalid HTP Q2 tile pair buffer length"))?;
-
-    let scale_bytes = [original[26], original[27]];
-    if (u16::from_le_bytes(scale_bytes) & 0x7c00) == 0x7c00 {
-        return Err(invalid("nonfinite Hexagon Q2 scale"));
-    }
-    let scale_pos0 = 512 + row_in_tile * 2;
-    let scale_pos1 = 576 + 512 + row_in_tile * 2;
-    pair_buf[scale_pos0..scale_pos0 + 2].copy_from_slice(&scale_bytes);
-    pair_buf[scale_pos1..scale_pos1 + 2].copy_from_slice(&scale_bytes);
-
-    let wide: [[u8; 5]; 16] = std::array::from_fn(|m| PTQ1_SYMBOLS[usize::from(original[m])]);
-    let q_pos = [
-        row_in_tile * 4,
-        128 + row_in_tile * 4,
-        256 + row_in_tile * 4,
-        384 + row_in_tile * 4,
-        576 + row_in_tile * 4,
-    ];
-    for n in 0..5 {
-        let base = q_pos[n];
-        for digit in 0..4 {
-            pair_buf[base + digit] = wide[digit][n]
-                | (wide[digit + 4][n] << 2)
-                | (wide[digit + 8][n] << 4)
-                | (wide[digit + 12][n] << 6);
-        }
-    }
-
-    let mid: [[u8; 5]; 8] = std::array::from_fn(|m| PTQ1_SYMBOLS[usize::from(original[16 + m])]);
-    let q_pos5 = 576 + 128 + row_in_tile * 4;
-    let q_pos6 = 576 + 256 + row_in_tile * 4;
-    for digit in 0..4 {
-        pair_buf[q_pos5 + digit] = mid[digit][0]
-            | (mid[digit + 4][0] << 2)
-            | (mid[digit][1] << 4)
-            | (mid[digit + 4][1] << 6);
-        pair_buf[q_pos6 + digit] = mid[digit][2]
-            | (mid[digit + 4][2] << 2)
-            | (mid[digit][3] << 4)
-            | (mid[digit + 4][3] << 6);
-    }
-
-    let tail0 = PTQ1_SYMBOLS[usize::from(original[24])];
-    let tail1 = PTQ1_SYMBOLS[usize::from(original[25])];
-    let q_pos7 = 576 + 384 + row_in_tile * 4;
-    pair_buf[q_pos7] = mid[0][4] | (mid[4][4] << 2) | (tail0[0] << 4) | (tail0[2] << 6);
-    pair_buf[q_pos7 + 1] = mid[1][4] | (mid[5][4] << 2) | (tail1[0] << 4) | (tail1[2] << 6);
-    pair_buf[q_pos7 + 2] = mid[2][4] | (mid[6][4] << 2) | (tail0[1] << 4) | (tail0[3] << 6);
-    pair_buf[q_pos7 + 3] = mid[3][4] | (mid[7][4] << 2) | (tail1[1] << 4) | (tail1[3] << 6);
-    Ok(())
+    pack_ptq1_block(original, row_in_tile, pair_buf)
 }
 
 fn pack_ptq1_row_group(
@@ -3446,14 +3557,17 @@ fn pack_ptq1_row_group(
     group_rows: usize,
     tile_pairs: &mut [[u8; 1152]],
 ) -> Result<()> {
+    if group_rows > 32 {
+        return Err(invalid("invalid PTQ1 tile row index"));
+    }
     for row_in_tile in 0..group_rows {
         let local_row = group_row_start + row_in_tile;
         let row_block_base =
             (geometry.row_start + local_row) * geometry.total_blocks + geometry.block_start;
-        let row_blocks = tensor_data
-            [row_block_base * 28..(row_block_base + geometry.chunk_blocks) * 28]
-            .as_chunks::<28>()
-            .0;
+        let row_slice = tensor_data
+            .get(row_block_base * 28..(row_block_base + geometry.chunk_blocks) * 28)
+            .ok_or_else(|| invalid("invalid PTQ1 row chunk extent"))?;
+        let row_blocks = row_slice.as_chunks::<28>().0;
         for (original, pair_buf) in row_blocks.iter().zip(tile_pairs.iter_mut()) {
             pack_ptq1_tile_into(original, row_in_tile, pair_buf)?;
         }
@@ -3469,83 +3583,45 @@ fn pack_pq2_row_group(
     tile_pairs: &mut [[u8; 1152]],
 ) -> Result<()> {
     #[inline]
-    const fn permute_q2_dword(bytes: [u8; 8]) -> [u8; 8] {
+    const fn permute_q2_dword(bytes: [u8; 8]) -> ([u8; 4], [u8; 4]) {
         let mut packed = u64::from_le_bytes(bytes);
         let swap = (packed ^ (packed >> 6)) & 0x00cc_00cc_00cc_00cc;
         packed ^= swap ^ (swap << 6);
         let swap = (packed ^ (packed >> 12)) & 0x0000_f0f0_0000_f0f0;
         packed ^= swap ^ (swap << 12);
-        packed.to_le_bytes()
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = packed.to_le_bytes();
+        ([b0, b1, b2, b3], [b4, b5, b6, b7])
     }
 
+    if group_rows > 32 {
+        return Err(invalid("invalid PQ2 tile row index"));
+    }
     for row_in_tile in 0..group_rows {
         let local_row = group_row_start + row_in_tile;
         let row_block_base =
             (geometry.row_start + local_row) * geometry.total_blocks + geometry.block_start;
-        let row_blocks = tensor_data
-            [row_block_base * 34..(row_block_base + geometry.chunk_blocks) * 34]
-            .as_chunks::<34>()
-            .0;
-        let scale_pos0 = 512 + row_in_tile * 2;
-        let scale_pos1 = 576 + 512 + row_in_tile * 2;
-        let q_pos0 = row_in_tile * 4;
-        let q_pos1 = 256 + row_in_tile * 4;
-        let q_pos2 = 576 + row_in_tile * 4;
-        let q_pos3 = 576 + 256 + row_in_tile * 4;
+        let row_slice = tensor_data
+            .get(row_block_base * 34..(row_block_base + geometry.chunk_blocks) * 34)
+            .ok_or_else(|| invalid("invalid PQ2 row chunk extent"))?;
+        let row_blocks = row_slice.as_chunks::<34>().0;
         for (original, pair_buf) in row_blocks.iter().zip(tile_pairs.iter_mut()) {
-            if (u16::from_le_bytes([original[0], original[1]]) & 0x7c00) == 0x7c00 {
+            let scale_bytes = [original[0], original[1]];
+            if (u16::from_le_bytes(scale_bytes) & 0x7c00) == 0x7c00 {
                 return Err(invalid("nonfinite Hexagon Q2 scale"));
             }
-            pair_buf[scale_pos0..scale_pos0 + 2].copy_from_slice(&original[..2]);
-            pair_buf[scale_pos1..scale_pos1 + 2].copy_from_slice(&original[..2]);
-            let b0 = permute_q2_dword([
-                original[2],
-                original[3],
-                original[4],
-                original[5],
-                original[6],
-                original[7],
-                original[8],
-                original[9],
-            ]);
-            let b1 = permute_q2_dword([
-                original[10],
-                original[11],
-                original[12],
-                original[13],
-                original[14],
-                original[15],
-                original[16],
-                original[17],
-            ]);
-            let b2 = permute_q2_dword([
-                original[18],
-                original[19],
-                original[20],
-                original[21],
-                original[22],
-                original[23],
-                original[24],
-                original[25],
-            ]);
-            let b3 = permute_q2_dword([
-                original[26],
-                original[27],
-                original[28],
-                original[29],
-                original[30],
-                original[31],
-                original[32],
-                original[33],
-            ]);
-            pair_buf[q_pos0..q_pos0 + 4].copy_from_slice(&b0[..4]);
-            pair_buf[q_pos0 + 128..q_pos0 + 132].copy_from_slice(&b0[4..8]);
-            pair_buf[q_pos1..q_pos1 + 4].copy_from_slice(&b1[..4]);
-            pair_buf[q_pos1 + 128..q_pos1 + 132].copy_from_slice(&b1[4..8]);
-            pair_buf[q_pos2..q_pos2 + 4].copy_from_slice(&b2[..4]);
-            pair_buf[q_pos2 + 128..q_pos2 + 132].copy_from_slice(&b2[4..8]);
-            pair_buf[q_pos3..q_pos3 + 4].copy_from_slice(&b3[..4]);
-            pair_buf[q_pos3 + 128..q_pos3 + 132].copy_from_slice(&b3[4..8]);
+            let (q_dwords, _) = original[2..].as_chunks::<8>();
+            let [d0, d1, d2, d3] =
+                <[_; 4]>::try_from(q_dwords).map_err(|_| invalid("invalid PQ2 block length"))?;
+            let (p0, p1) = permute_q2_dword(d0);
+            let (p2, p3) = permute_q2_dword(d1);
+            let (p4, p5) = permute_q2_dword(d2);
+            let (p6, p7) = permute_q2_dword(d3);
+            write_tile_pair_row(
+                pair_buf,
+                row_in_tile,
+                scale_bytes,
+                [p0, p1, p2, p3, p4, p5, p6, p7],
+            );
         }
     }
     Ok(())
@@ -7295,6 +7371,121 @@ mod tests {
         assert!(pack_ptq1_tile_into(&[0_u8; 27], 0, &mut pair_buf).is_err());
         assert!(pack_ptq1_tile_into(&[0_u8; 28], 32, &mut pair_buf).is_err());
         assert!(pack_ptq1_tile_into(&[0_u8; 28], 0, &mut [0_u8; 1151]).is_err());
+        Ok(())
+    }
+
+    fn pack_ptq1_tile_reference(
+        original: &[u8; 28],
+        row_in_tile: usize,
+        pair_buf: &mut [u8; 1152],
+    ) {
+        let scale_bytes = [original[26], original[27]];
+        pair_buf[512 + row_in_tile * 2..514 + row_in_tile * 2].copy_from_slice(&scale_bytes);
+        pair_buf[576 + 512 + row_in_tile * 2..576 + 514 + row_in_tile * 2]
+            .copy_from_slice(&scale_bytes);
+        let wide: [[u8; 5]; 16] = std::array::from_fn(|m| PTQ1_SYMBOLS[usize::from(original[m])]);
+        let q_pos = [
+            row_in_tile * 4,
+            128 + row_in_tile * 4,
+            256 + row_in_tile * 4,
+            384 + row_in_tile * 4,
+            576 + row_in_tile * 4,
+        ];
+        for (n, &base) in q_pos.iter().enumerate() {
+            for digit in 0..4 {
+                pair_buf[base + digit] = wide[digit][n]
+                    | (wide[digit + 4][n] << 2)
+                    | (wide[digit + 8][n] << 4)
+                    | (wide[digit + 12][n] << 6);
+            }
+        }
+        let mid: [[u8; 5]; 8] =
+            std::array::from_fn(|m| PTQ1_SYMBOLS[usize::from(original[16 + m])]);
+        let q_pos5 = 576 + 128 + row_in_tile * 4;
+        let q_pos6 = 576 + 256 + row_in_tile * 4;
+        for digit in 0..4 {
+            pair_buf[q_pos5 + digit] = mid[digit][0]
+                | (mid[digit + 4][0] << 2)
+                | (mid[digit][1] << 4)
+                | (mid[digit + 4][1] << 6);
+            pair_buf[q_pos6 + digit] = mid[digit][2]
+                | (mid[digit + 4][2] << 2)
+                | (mid[digit][3] << 4)
+                | (mid[digit + 4][3] << 6);
+        }
+        let tail0 = PTQ1_SYMBOLS[usize::from(original[24])];
+        let tail1 = PTQ1_SYMBOLS[usize::from(original[25])];
+        let q_pos7 = 576 + 384 + row_in_tile * 4;
+        pair_buf[q_pos7] = mid[0][4] | (mid[4][4] << 2) | (tail0[0] << 4) | (tail0[2] << 6);
+        pair_buf[q_pos7 + 1] = mid[1][4] | (mid[5][4] << 2) | (tail1[0] << 4) | (tail1[2] << 6);
+        pair_buf[q_pos7 + 2] = mid[2][4] | (mid[6][4] << 2) | (tail0[1] << 4) | (tail0[3] << 6);
+        pair_buf[q_pos7 + 3] = mid[3][4] | (mid[7][4] << 2) | (tail1[1] << 4) | (tail1[3] << 6);
+    }
+
+    #[test]
+    fn pack_ptq1_tile_into_word_packed_matches_reference_across_rows_bytes_and_scales() -> Result<()>
+    {
+        let scales = [
+            0x3c00_u16, 0xbc00, 0x0001, 0x8001, 0x03ff, 0x7bff, 0xfbff, 0x0000, 0x8000, 0xb555,
+        ];
+        // Sweep all 256 packed byte inputs across all 32 row slots and diverse f16 scales.
+        for seed in 0_u16..256 {
+            let row_in_tile = usize::from(seed) & 31;
+            let mut block = [0_u8; 28];
+            for (slot, byte) in block[..26].iter_mut().enumerate() {
+                *byte = u8::try_from((usize::from(seed) + slot * 37) & 0xff)?;
+            }
+            let scale_bits = scales[usize::from(seed) % scales.len()];
+            block[26..28].copy_from_slice(&scale_bits.to_le_bytes());
+
+            let mut actual = [0xa5_u8; 1152];
+            let mut expected = [0xa5_u8; 1152];
+            pack_ptq1_tile_into(&block, row_in_tile, &mut actual)?;
+            pack_ptq1_tile_reference(&block, row_in_tile, &mut expected);
+            assert_eq!(actual, expected, "seed={seed} row_in_tile={row_in_tile}");
+        }
+
+        // Verify partial row groups and sub-matrix offsets match PQ2_0 byte-for-byte.
+        let (total_blocks, block_start, chunk_blocks, row_start, total_rows) = (5, 1, 3, 5, 70);
+        let pq2 =
+            make_ternary_pq2_tensor("partial-parity", total_blocks * 128, total_rows, &scales);
+        let ptq1 = repack_pq2_to_ptq1_tensor(&pq2)?;
+        for active_rows in [1_usize, 2, 15, 16, 17, 31, 32, 33, 63, 64] {
+            let packed_bytes = active_rows.next_multiple_of(32) * 36 * chunk_blocks;
+            let mut pq2_out = vec![0xaa_u8; packed_bytes];
+            let mut ptq1_out = vec![0xaa_u8; packed_bytes];
+            for (kind, data, out) in [
+                (PQ2_KIND, &pq2.data, &mut pq2_out),
+                (PTQ1_KIND, &ptq1.data, &mut ptq1_out),
+            ] {
+                pack_native_chunk(
+                    data,
+                    ChunkGeometry {
+                        kind,
+                        total_blocks,
+                        row_start,
+                        active_rows,
+                        block_start,
+                        chunk_blocks,
+                    },
+                    out,
+                    None,
+                )?;
+            }
+            assert_eq!(ptq1_out, pq2_out, "active_rows={active_rows}");
+        }
+
+        let mut dummy_tile_pairs = vec![[0_u8; 1152]; 1];
+        let bad_geom = ChunkGeometry {
+            kind: PTQ1_KIND,
+            total_blocks,
+            row_start: 0,
+            active_rows: 32,
+            block_start: 0,
+            chunk_blocks: 1,
+        };
+        assert!(pack_ptq1_row_group(&ptq1.data, bad_geom, 0, 33, &mut dummy_tile_pairs).is_err());
+        assert!(pack_pq2_row_group(&pq2.data, bad_geom, 0, 33, &mut dummy_tile_pairs).is_err());
         Ok(())
     }
 

@@ -382,8 +382,12 @@ impl VulkanLayerPipelines {
             5,
         )?;
         let (gdn_gates, _) = make_pipe(b"gdn_gates_f32", spirv::gdn_gates_f32(), 4, 1)?;
-        let (gdn_gates_batched, _) =
-            make_pipe(b"gdn_gates_batched_f32", spirv::gdn_gates_batched_f32(), 4, 2)?;
+        let (gdn_gates_batched, _) = make_pipe(
+            b"gdn_gates_batched_f32",
+            spirv::gdn_gates_batched_f32(),
+            4,
+            2,
+        )?;
         let (deinterleave_q_gate, _) = make_pipe(
             b"deinterleave_q_gate_f32",
             spirv::deinterleave_q_gate_f32(),
@@ -484,8 +488,12 @@ impl VulkanLayerPipelines {
             4,
         )?;
         let (copy_slice, _) = make_pipe(b"copy_slice_f32", spirv::copy_slice_f32(), 2, 2)?;
-        let (copy_slice_offset, _) =
-            make_pipe(b"copy_slice_offset_f32", spirv::copy_slice_offset_f32(), 2, 3)?;
+        let (copy_slice_offset, _) = make_pipe(
+            b"copy_slice_offset_f32",
+            spirv::copy_slice_offset_f32(),
+            2,
+            3,
+        )?;
 
         let digest_bytes = hasher
             .finish()
@@ -2983,12 +2991,10 @@ impl VulkanBatchedGraphExecutor {
                 copy_back: None,
             });
         }
-        let elem_off = u32::try_from(q_start * q_width).map_err(|_| {
-            Error::ResourceLimit("attention slice offset exceeds u32".to_owned())
-        })?;
-        let slice_len = u32::try_from(chosen_sub_q * q_width).map_err(|_| {
-            Error::ResourceLimit("attention slice length exceeds u32".to_owned())
-        })?;
+        let elem_off = u32::try_from(q_start * q_width)
+            .map_err(|_| Error::ResourceLimit("attention slice offset exceeds u32".to_owned()))?;
+        let slice_len = u32::try_from(chosen_sub_q * q_width)
+            .map_err(|_| Error::ResourceLimit("attention slice length exceeds u32".to_owned()))?;
         self.batch_recorder.push_barrier(
             self.pipelines.copy_slice_offset,
             &[
@@ -3065,7 +3071,11 @@ impl VulkanBatchedGraphExecutor {
             AdrenoAttentionPath::Decomposed3Stage => {
                 self.batch_recorder.push_barrier(
                     qk_pipe,
-                    &[q_in, k_attn_span, BufferSpan::whole(self.scratch.attn_scores)],
+                    &[
+                        q_in,
+                        k_attn_span,
+                        BufferSpan::whole(self.scratch.attn_scores),
+                    ],
                     &attn_push,
                     checked_grid(
                         &self.device,
@@ -3168,8 +3178,7 @@ impl VulkanBatchedGraphExecutor {
                 );
             }
             (VulkanKvPrecision::Fp32, true) => {
-                let grid =
-                    checked_grid(&self.device, [kv_width_u32.div_ceil(WORKGROUP_X), 1, 1])?;
+                let grid = checked_grid(&self.device, [kv_width_u32.div_ceil(WORKGROUP_X), 1, 1])?;
                 self.batch_recorder.push_barrier(
                     self.pipelines.kv_append_f32,
                     &[BufferSpan::whole(key_buf), BufferSpan::whole(k_cache)],
@@ -3450,12 +3459,8 @@ impl VulkanBatchedGraphExecutor {
                 .filter(|(w, _)| w.encoding == WeightEncoding::Ptq1Q8_0)
                 .collect();
             self.dispatch_prepared_projection_group_tokens(act_buf, cols, &q8_0_pq2, tokens)?;
-            return self.dispatch_prepared_projection_group_tokens(
-                act_buf,
-                cols,
-                &q8_0_ptq1,
-                tokens,
-            );
+            return self
+                .dispatch_prepared_projection_group_tokens(act_buf, cols, &q8_0_ptq1, tokens);
         }
 
         let _ = (needs_q8k, needs_q8_0_source_or_pinned, needs_ptq1_q8_0);
@@ -3514,7 +3519,13 @@ impl VulkanBatchedGraphExecutor {
         }
 
         if let Some(&sign_buf) = self.transforms.sign_buffers.get(&cols) {
-            self.record_mul_sign_tokens(cur, sign_buf, self.scratch.sign_tmp, cols_u32, tokens_u32)?;
+            self.record_mul_sign_tokens(
+                cur,
+                sign_buf,
+                self.scratch.sign_tmp,
+                cols_u32,
+                tokens_u32,
+            )?;
             cur = self.scratch.sign_tmp;
         }
 
@@ -3540,7 +3551,12 @@ impl VulkanBatchedGraphExecutor {
                         BufferSpan::whole(cur),
                         BufferSpan::whole(self.scratch.transformed),
                     ],
-                    &[block_u32, hadamard_norm_bits(block_u32), blk_cnt, tokens_u32],
+                    &[
+                        block_u32,
+                        hadamard_norm_bits(block_u32),
+                        blk_cnt,
+                        tokens_u32,
+                    ],
                     checked_grid(&self.device, [blk_cnt, tokens_u32, 1])?,
                 );
             }
@@ -3684,9 +3700,7 @@ impl VulkanBatchedGraphExecutor {
                     let act_words = u32::try_from((cols / 32) * Q8_0_WORDS_PER_BLOCK)
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
                     let pipe = match weight.encoding {
-                        WeightEncoding::Pq2Q8_0 => {
-                            self.pipelines.proj.select_pq2_q8_0(multi_token)
-                        }
+                        WeightEncoding::Pq2Q8_0 => self.pipelines.proj.select_pq2_q8_0(multi_token),
                         WeightEncoding::Ptq1Q8_0 => self
                             .pipelines
                             .proj

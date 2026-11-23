@@ -1654,8 +1654,8 @@ mod tests {
             registry: hexagon_native_rpc::NativeQ2WeightRegistry::new(65_536)
                 .map_err(|_| invalid("registry"))?,
         };
-        let mut npu =
-            crate::NativeQ2Executor::new(submitter, limits, 1024 * 1024).with_resident_weights(4096)?;
+        let mut npu = crate::NativeQ2Executor::new(submitter, limits, 1024 * 1024)
+            .with_resident_weights(4096)?;
         let mut npu_up = model.tensors["blk.0.ffn_up.weight"].clone();
         let mut gpu_up = model.tensors["blk.2.ffn_up.weight"].clone();
         npu.select_and_prewarm_tensors(&[npu_up.clone()])?;

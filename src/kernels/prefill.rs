@@ -1394,7 +1394,8 @@ mod tests {
     }
 
     #[test]
-    fn tiled_ptq1_and_q8_0_16_and_32_token_tiles_match_scalar_bits_and_reject_nonfinite() -> Result<()> {
+    fn tiled_ptq1_and_q8_0_16_and_32_token_tiles_match_scalar_bits_and_reject_nonfinite()
+    -> Result<()> {
         for (kind, columns, rows) in [(PTQ1, 256_usize, 19_usize), (Q8_0, 192_usize, 21_usize)] {
             let mut data = Vec::new();
             for row in 0..rows {
@@ -1454,7 +1455,8 @@ mod tests {
                             .map(|row| row.iter().copied().map(f32::to_bits).collect())
                             .collect();
                         assert_eq!(
-                            actual_bits, expected[..count],
+                            actual_bits,
+                            expected[..count],
                             "mismatch kind={kind} count={count} pinned={pinned}"
                         );
                     }
@@ -1474,8 +1476,14 @@ mod tests {
                 let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
                 let mut out = vec![vec![1.0_f32]; count];
                 assert!(
-                    tile.project(&tensor, &max_inputs[..count], &mut out, kind == PTQ1, &|| Ok(()))
-                        .is_err()
+                    tile.project(
+                        &tensor,
+                        &max_inputs[..count],
+                        &mut out,
+                        kind == PTQ1,
+                        &|| Ok(())
+                    )
+                    .is_err()
                 );
                 assert!(out.iter().all(Vec::is_empty));
             }

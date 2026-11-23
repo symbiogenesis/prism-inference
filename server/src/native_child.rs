@@ -884,42 +884,44 @@ async fn serve_prepared_backend(
                 .and_then(|socket| socket.listen(1))
                 .map_err(|error| startup::at(Stage::Listener, &error))?;
             let result = match backend {
-                PreparedBackend::Cpu { session, placement } => Box::pin(
-                    crate::native_backend::serve_with_options(
+                PreparedBackend::Cpu { session, placement } => {
+                    Box::pin(crate::native_backend::serve_with_options(
                         listener, *session, key, placement, options,
-                    ),
-                )
-                .await,
-                PreparedBackend::Vulkan(session) => Box::pin(
-                    crate::native_backend::serve_vulkan_with_options(
+                    ))
+                    .await
+                }
+                PreparedBackend::Vulkan(session) => {
+                    Box::pin(crate::native_backend::serve_vulkan_with_options(
                         listener, *session, key, options,
-                    ),
-                )
-                .await,
+                    ))
+                    .await
+                }
             };
             drop(guard);
             result
         }
         PreparedTransport::BrokerPipe { endpoint, key } => match backend {
-            PreparedBackend::Cpu { session, placement } => Box::pin(
-                crate::native_backend::serve_broker_pipe_with_options(
+            PreparedBackend::Cpu { session, placement } => {
+                Box::pin(crate::native_backend::serve_broker_pipe_with_options(
                     endpoint,
                     *session,
                     key.as_str(),
                     placement,
                     options,
-                ),
-            )
-            .await,
-            PreparedBackend::Vulkan(session) => Box::pin(
-                crate::native_backend::serve_broker_pipe_vulkan_with_options(
-                    endpoint,
-                    *session,
-                    key.as_str(),
-                    options,
-                ),
-            )
-            .await,
+                ))
+                .await
+            }
+            PreparedBackend::Vulkan(session) => {
+                Box::pin(
+                    crate::native_backend::serve_broker_pipe_vulkan_with_options(
+                        endpoint,
+                        *session,
+                        key.as_str(),
+                        options,
+                    ),
+                )
+                .await
+            }
         },
     };
     served.map_err(|_| {
@@ -937,11 +939,14 @@ fn load_prepared_backend(config: &Config) -> io::Result<PreparedBackend> {
         bonsai_prism_runtime::model::swift::CONTEXT_TOKENS,
         |(tokens, _)| tokens,
     );
-    let daisyrose = config.daisyrose_lora.as_ref().map(|item| MultiRankAdapterSpec {
-        path: &item.path,
-        bytes: item.bytes,
-        sha256: &item.sha256,
-    });
+    let daisyrose = config
+        .daisyrose_lora
+        .as_ref()
+        .map(|item| MultiRankAdapterSpec {
+            path: &item.path,
+            bytes: item.bytes,
+            sha256: &item.sha256,
+        });
     if config.placement == Placement::Vulkan {
         let _ = parallelism;
         let session = crate::native_backend::VulkanSwiftSession::load_profile_with_adapters(
@@ -1041,9 +1046,12 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
         PreparedBackend::Vulkan(session) => {
             runtime.block_on(serve_prepared_vulkan(prepared_transport, *session, options))
         }
-        PreparedBackend::Cpu { session, placement } => {
-            runtime.block_on(serve_prepared(prepared_transport, *session, placement, options))
-        }
+        PreparedBackend::Cpu { session, placement } => runtime.block_on(serve_prepared(
+            prepared_transport,
+            *session,
+            placement,
+            options,
+        )),
     }
 }
 
@@ -2414,7 +2422,10 @@ mod tests {
         ]);
         let variant_cfg = parse(variant)?;
         assert_eq!(variant_cfg.placement, Placement::Vulkan);
-        assert_eq!(variant_cfg.representation, Representation::CurrentRepackedPtq1);
+        assert_eq!(
+            variant_cfg.representation,
+            Representation::CurrentRepackedPtq1
+        );
         assert_eq!(variant_cfg.prompt_reuse, PromptReuse::PromptEndAndLatest);
         Ok(())
     }
@@ -2425,19 +2436,39 @@ mod tests {
         checkpoint: &str,
         memory: &str,
     ) -> Vec<Vec<String>> {
-        let cap = ["--kv-cache", "f16", "--context-tokens", "8192", "--memory-limit-bytes", memory];
-        let prefill = ["--cpu-prefill-tokens", "16", "--cpu-prefill-scratch-bytes", prefill_scratch];
+        let cap = [
+            "--kv-cache",
+            "f16",
+            "--context-tokens",
+            "8192",
+            "--memory-limit-bytes",
+            memory,
+        ];
+        let prefill = [
+            "--cpu-prefill-tokens",
+            "16",
+            "--cpu-prefill-scratch-bytes",
+            prefill_scratch,
+        ];
         let mut suffix_case: Vec<&str> = Vec::from(cap);
         suffix_case.extend(prefill);
         suffix_case.extend([
-            "--spec-type", "suffix", "--cpu-verification-scratch-bytes", verify_scratch,
-            "--cpu-speculative-checkpoint-bytes", checkpoint,
+            "--spec-type",
+            "suffix",
+            "--cpu-verification-scratch-bytes",
+            verify_scratch,
+            "--cpu-speculative-checkpoint-bytes",
+            checkpoint,
         ]);
         let mut spec_tokens_case: Vec<&str> = Vec::from(cap);
         spec_tokens_case.extend(prefill);
         spec_tokens_case.extend([
-            "--cpu-speculative-tokens", "4", "--cpu-verification-scratch-bytes", verify_scratch,
-            "--cpu-speculative-checkpoint-bytes", checkpoint,
+            "--cpu-speculative-tokens",
+            "4",
+            "--cpu-verification-scratch-bytes",
+            verify_scratch,
+            "--cpu-speculative-checkpoint-bytes",
+            checkpoint,
         ]);
         let mut gdn_case: Vec<&str> = Vec::from(cap);
         gdn_case.extend(["--prompt-reuse", "latest"]);

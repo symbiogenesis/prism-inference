@@ -3674,7 +3674,9 @@ pub fn ffn_hadamard_f32() -> Vec<u32> {
     let norm_bits = b.load_push(push_var, 1);
     let norm = b.bitcast(b.f32_t, norm_bits);
 
-    emit_hadamard_workgroup_body(&mut b, in_buf, out_buf, smem, lid, blk_idx, block_size, norm);
+    emit_hadamard_workgroup_body(
+        &mut b, in_buf, out_buf, smem, lid, blk_idx, block_size, norm,
+    );
 
     b.finish()
 }
@@ -4609,7 +4611,9 @@ pub fn rope_f32() -> Vec<u32> {
     b.emit_if(in_bounds, |b| {
         let c0 = b.const_u32(0);
         let head_base = b.umul(h, head_dim);
-        emit_rope_element(b, vec_buf, freqs_buf, head_base, c0, d, rope_dim, round_flag);
+        emit_rope_element(
+            b, vec_buf, freqs_buf, head_base, c0, d, rope_dim, round_flag,
+        );
     });
 
     b.finish()
@@ -4788,7 +4792,15 @@ pub fn conv1d_silu_f32() -> Vec<u32> {
     let c0 = b.const_u32(0);
 
     emit_conv1d_silu_body(
-        &mut b, qkv_buf, state_buf, weight_buf, out_buf, ch, c0, channels, kernel_size,
+        &mut b,
+        qkv_buf,
+        state_buf,
+        weight_buf,
+        out_buf,
+        ch,
+        c0,
+        channels,
+        kernel_size,
     );
 
     b.finish()
@@ -5496,7 +5508,9 @@ pub fn kv_append_batched_f16() -> Vec<u32> {
     b.emit_if(in_bounds, |b| {
         let src_base = b.umul(tok, kv_width);
         let dst_pos = b.uadd(start_pos, tok);
-        emit_kv_append_f16_pair(b, cur_buf, cache_buf, src_base, dst_pos, half_width, pair_idx);
+        emit_kv_append_f16_pair(
+            b, cur_buf, cache_buf, src_base, dst_pos, half_width, pair_idx,
+        );
     });
 
     b.finish()
@@ -5900,8 +5914,7 @@ pub fn lora_b_accum_batched_f32() -> Vec<u32> {
         let c1 = b.const_u32(1);
         let f_zero = b.const_f32(0.0);
         let row_base = b.umul(row, rank);
-        let (tok_clamped, tok_rank_bases) =
-            clamp_four_token_act_bases(b, tok_base, tokens, rank);
+        let (tok_clamped, tok_rank_bases) = clamp_four_token_act_bases(b, tok_base, tokens, rank);
 
         let acc_vars = [
             b.local_f32_var(),
@@ -6063,7 +6076,14 @@ pub fn permute_ssm_heads_f32() -> Vec<u32> {
 
     b.emit_if(in_bounds, |b| {
         emit_permute_ssm_heads_elem(
-            b, in_buf, out_buf, c0, idx, num_k_heads, repetitions, head_dim,
+            b,
+            in_buf,
+            out_buf,
+            c0,
+            idx,
+            num_k_heads,
+            repetitions,
+            head_dim,
         );
     });
 

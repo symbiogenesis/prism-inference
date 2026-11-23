@@ -2025,7 +2025,9 @@ impl Transforms {
                         .take_while(|&(offset, w)| {
                             !completed[index + offset]
                                 && self.basis(w) == basis
-                                && prepared.is_f32_executor_compatible_with(w, exec).unwrap_or(false)
+                                && prepared
+                                    .is_f32_executor_compatible_with(w, exec)
+                                    .unwrap_or(false)
                                 && exec.supports_f32(w)
                         })
                         .count();
@@ -4634,11 +4636,9 @@ impl Evaluation<'_, '_, '_> {
                 input
             };
             let mut prepared = if let Some(exec) = self.executor.as_deref() {
-                self.projection.matvec.prepare_f32_executor_with(
-                    gate_weight,
-                    activation,
-                    exec,
-                )?
+                self.projection
+                    .matvec
+                    .prepare_f32_executor_with(gate_weight, activation, exec)?
             } else {
                 self.projection
                     .matvec
@@ -9995,10 +9995,7 @@ mod tests {
         let actual_logits = crate::Decoder::evaluate(&mut decoder, 1)?;
         assert_eq!(actual_logits, baseline_logits);
         if cfg!(windows) {
-            assert_eq!(
-                released_calls.load(std::sync::atomic::Ordering::Relaxed),
-                3
-            );
+            assert_eq!(released_calls.load(std::sync::atomic::Ordering::Relaxed), 3);
         }
         drop(decoder);
         Ok(())

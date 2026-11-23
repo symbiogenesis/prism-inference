@@ -1316,7 +1316,10 @@ pub(super) fn lora_multi_a_f16(
     let (w_quads, w_tail) = a_weights.split_at(quad_len);
     let (x_chunks8, x_rem8) = input.as_chunks::<8>();
     let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
-    for (w_quad, dst4) in w_quads.chunks_exact(4 * in_features).zip(r_quads.iter_mut()) {
+    for (w_quad, dst4) in w_quads
+        .chunks_exact(4 * in_features)
+        .zip(r_quads.iter_mut())
+    {
         let (r0, rest) = w_quad.split_at(in_features);
         let (r1, rest) = rest.split_at(in_features);
         let (r2, r3) = rest.split_at(in_features);
@@ -1403,7 +1406,10 @@ pub(super) fn lora_multi_a_f32(
     let (w_quads, w_tail) = a_weights.split_at(quad_len);
     let (x_chunks8, x_rem8) = input.as_chunks::<8>();
     let (x_chunks4, x_tail) = x_rem8.as_chunks::<4>();
-    for (w_quad, dst4) in w_quads.chunks_exact(4 * in_features).zip(r_quads.iter_mut()) {
+    for (w_quad, dst4) in w_quads
+        .chunks_exact(4 * in_features)
+        .zip(r_quads.iter_mut())
+    {
         let (r0, rest) = w_quad.split_at(in_features);
         let (r1, rest) = rest.split_at(in_features);
         let (r2, r3) = rest.split_at(in_features);
@@ -8823,7 +8829,12 @@ mod lora_multi_tests {
         sum
     }
 
-    fn sample_lora_pair(rows: usize, cols: usize, mult: usize, salt: usize) -> (Vec<u16>, Vec<f32>) {
+    fn sample_lora_pair(
+        rows: usize,
+        cols: usize,
+        mult: usize,
+        salt: usize,
+    ) -> (Vec<u16>, Vec<f32>) {
         let pool = [0.0_f32, -0.0, 0.25, -0.5, 1.5, -2.25, 0.125, -0.75];
         let f16_vals: Vec<u16> = (0..rows * cols)
             .map(|i| bonsai_ternary::float_to_half(pool[(i * mult + salt) % pool.len()]))
@@ -8836,7 +8847,12 @@ mod lora_multi_tests {
         (f16_vals, f32_vals)
     }
 
-    fn sample_lora_tokens(count: usize, width: usize, mult_t: usize, mult_c: usize) -> Vec<Vec<f32>> {
+    fn sample_lora_tokens(
+        count: usize,
+        width: usize,
+        mult_t: usize,
+        mult_c: usize,
+    ) -> Vec<Vec<f32>> {
         let pool = [0.0_f32, -0.0, 0.25, -0.5, 1.5, -2.25, 0.125, -0.75];
         (0..count)
             .map(|t| {
@@ -8872,10 +8888,14 @@ mod lora_multi_tests {
                             Some(true)
                         );
                         for r in 0..rank {
-                            let exp_f16 =
-                                scalar_dot_f16(&a_f16[r * in_features..(r + 1) * in_features], input);
-                            let exp_f32 =
-                                scalar_dot_f32(&a_f32[r * in_features..(r + 1) * in_features], input);
+                            let exp_f16 = scalar_dot_f16(
+                                &a_f16[r * in_features..(r + 1) * in_features],
+                                input,
+                            );
+                            let exp_f32 = scalar_dot_f32(
+                                &a_f32[r * in_features..(r + 1) * in_features],
+                                input,
+                            );
                             assert_eq!(single_f16[r].to_bits(), exp_f16.to_bits());
                             assert_eq!(single_f32[r].to_bits(), exp_f32.to_bits());
                             expected_f16[t * rank + r] = exp_f16;
@@ -8883,27 +8903,53 @@ mod lora_multi_tests {
                         }
                     }
 
-                    let (mut batch_f16, mut batch_f32) =
-                        (vec![f32::NAN; token_count * rank], vec![f32::NAN; token_count * rank]);
+                    let (mut batch_f16, mut batch_f32) = (
+                        vec![f32::NAN; token_count * rank],
+                        vec![f32::NAN; token_count * rank],
+                    );
                     assert_eq!(
                         super::lora_multi_a_tokens_f16(
-                            &a_f16, in_features, rank, &input_refs, &mut batch_f16,
+                            &a_f16,
+                            in_features,
+                            rank,
+                            &input_refs,
+                            &mut batch_f16,
                         ),
                         Some(true)
                     );
                     assert_eq!(
                         super::lora_multi_a_tokens_f32(
-                            &a_f32, in_features, rank, &input_refs, &mut batch_f32,
+                            &a_f32,
+                            in_features,
+                            rank,
+                            &input_refs,
+                            &mut batch_f32,
                         ),
                         Some(true)
                     );
                     assert_eq!(
-                        batch_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                        expected_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        batch_f16
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        expected_f16
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
                     );
                     assert_eq!(
-                        batch_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                        expected_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        batch_f32
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        expected_f32
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
                     );
                 }
             }
@@ -8928,17 +8974,31 @@ mod lora_multi_tests {
                 let flat_ranks: Vec<f32> = rank_tokens.iter().flatten().copied().collect();
                 let base_outputs = sample_lora_tokens(token_count, out_features, 5, 9);
                 let base_refs: Vec<&[f32]> = base_outputs.iter().map(Vec::as_slice).collect();
-                let (mut corr_f16, mut corr_f32) =
-                    (vec![f32::NAN; sub_rows * token_count], vec![f32::NAN; sub_rows * token_count]);
+                let (mut corr_f16, mut corr_f32) = (
+                    vec![f32::NAN; sub_rows * token_count],
+                    vec![f32::NAN; sub_rows * token_count],
+                );
                 assert_eq!(
                     super::lora_multi_b_scale_and_finish_tokens_f16(
-                        sub_b_f16, &flat_ranks, rank, scale, &base_refs, start_row, &mut corr_f16,
+                        sub_b_f16,
+                        &flat_ranks,
+                        rank,
+                        scale,
+                        &base_refs,
+                        start_row,
+                        &mut corr_f16,
                     ),
                     Some(true)
                 );
                 assert_eq!(
                     super::lora_multi_b_scale_and_finish_tokens_f32(
-                        sub_b_f32, &flat_ranks, rank, scale, &base_refs, start_row, &mut corr_f32,
+                        sub_b_f32,
+                        &flat_ranks,
+                        rank,
+                        scale,
+                        &base_refs,
+                        start_row,
+                        &mut corr_f32,
                     ),
                     Some(true)
                 );
@@ -8950,8 +9010,14 @@ mod lora_multi_tests {
                         let base_val = base_outputs[t][start_row + local_row];
                         let exp16 = scalar_dot_f16(b_row_f16, tok_r).mul_add(scale, base_val);
                         let exp32 = scalar_dot_f32(b_row_f32, tok_r).mul_add(scale, base_val);
-                        assert_eq!(corr_f16[local_row * token_count + t].to_bits(), exp16.to_bits());
-                        assert_eq!(corr_f32[local_row * token_count + t].to_bits(), exp32.to_bits());
+                        assert_eq!(
+                            corr_f16[local_row * token_count + t].to_bits(),
+                            exp16.to_bits()
+                        );
+                        assert_eq!(
+                            corr_f32[local_row * token_count + t].to_bits(),
+                            exp32.to_bits()
+                        );
                     }
                 }
             }

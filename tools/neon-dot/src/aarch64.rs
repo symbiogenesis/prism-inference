@@ -790,7 +790,9 @@ fn pq2_scaled_rows<const ROWS: usize, const FUSED: bool>(
     let mask = vdupq_n_u8(3);
     let mut sums = [zero_f; 4];
     for (index, activation) in activation.iter().enumerate() {
-        if ROWS >= 8 { prefetch_row_blocks(&row_chunks, index, block_count); }
+        if ROWS >= 8 {
+            prefetch_row_blocks(&row_chunks, index, block_count);
+        }
         let blocks: [&[u8; 34]; ROWS] = std::array::from_fn(|row| &row_chunks[row][index]);
         let mut raw_octets = [vdupq_n_u16(0); 2];
         for (octet, dst) in raw_octets.iter_mut().take(octets).enumerate() {
@@ -5053,7 +5055,10 @@ fn ptq1_scaled_8x8_chunks_source_dotprod<const CHUNKS: usize, A: super::Q8Activa
 }
 
 #[inline]
-pub(super) fn ptq1_detected_dot_scaled_8x8_chunks<const PINNED: bool, A: super::Q8ActivationView>(
+pub(super) fn ptq1_detected_dot_scaled_8x8_chunks<
+    const PINNED: bool,
+    A: super::Q8ActivationView,
+>(
     detected: super::Ptq1Dotprod,
     rows: [&[u8]; 8],
     chunks: &[[&[A]; 8]],

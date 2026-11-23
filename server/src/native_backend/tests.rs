@@ -3135,8 +3135,14 @@ fn adreno_vulkan_batched_startup_validates_and_renders_readiness() {
     assert_eq!(entry["placement"], json!("vulkan"));
     assert_eq!(entry["projection_backend"], json!("adreno-vulkan"));
     assert_eq!(entry["startup_projection"]["requested"], json!("vulkan"));
-    assert_eq!(entry["startup_projection"]["effective"], json!("adreno-vulkan"));
-    assert_eq!(entry["startup_projection"]["identity"], json!(identity.as_ref()));
+    assert_eq!(
+        entry["startup_projection"]["effective"],
+        json!("adreno-vulkan")
+    );
+    assert_eq!(
+        entry["startup_projection"]["identity"],
+        json!(identity.as_ref())
+    );
     assert_eq!(entry["startup_projection"]["resident_tensors"], json!(256));
     assert_eq!(
         entry["startup_projection"]["resident_weight_bytes"],
@@ -3383,8 +3389,7 @@ fn vulkan_session_canonical_request_and_error_classification() -> TestResult {
     assert_eq!(parsed.adapter_scale, Some(0.75));
     assert_eq!(parsed.multi_rank_scale, Some(0.25));
     assert_eq!(
-        crate::native_swift::parse_canonical_request(&json!({"messages": []}), false, false)
-            .err(),
+        crate::native_swift::parse_canonical_request(&json!({"messages": []}), false, false).err(),
         Some(Rejection::ChatSchema)
     );
     let generic_err = std::io::Error::other("broken");
@@ -3485,9 +3490,7 @@ fn vulkan_session_active_resident_weights_ignores_inactive_mtp_layers() {
 #[test]
 fn vulkan_session_load_rejects_invalid_profiles_without_gpu() {
     use bonsai_prism_runtime::{
-        model::swift::Representation,
-        runtime::PromptReuse,
-        swift_session::BranchCheckpoints,
+        model::swift::Representation, runtime::PromptReuse, swift_session::BranchCheckpoints,
     };
 
     let missing_path = std::env::temp_dir().join("nonexistent-batched-vulkan-model.gguf");

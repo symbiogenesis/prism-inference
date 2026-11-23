@@ -47,18 +47,13 @@ mod platform {
         sampling::SwiftSampler,
         swift_chat::SwiftChatSession,
         swift_session::{
-            CHECKPOINT_MEMORY_BYTES, MAX_OUTPUT_BYTES, MODEL_MEMORY_BYTES,
-            selected_state_budget, validate_execution_capacity_with_reuse,
+            CHECKPOINT_MEMORY_BYTES, MAX_OUTPUT_BYTES, MODEL_MEMORY_BYTES, selected_state_budget,
+            validate_execution_capacity_with_reuse,
         },
         text_output::Utf8Output,
         vocabulary::Vocabulary,
     };
-    use std::{
-        cell::RefCell,
-        collections::BTreeMap,
-        path::PathBuf,
-        rc::Rc,
-    };
+    use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, rc::Rc};
 
     const MAX_CHECKPOINT_SLOTS: usize =
         bonsai_prism_runtime::swift_session::MAX_REUSABLE_CHECKPOINTS;
@@ -171,9 +166,9 @@ mod platform {
         }
 
         fn batched_evaluation_capacity(&self) -> usize {
-            self.shared
-                .try_borrow()
-                .map_or(0, |inner| Decoder::batched_evaluation_capacity(&inner.executor))
+            self.shared.try_borrow().map_or(0, |inner| {
+                Decoder::batched_evaluation_capacity(&inner.executor)
+            })
         }
 
         fn evaluate_batch_into(
@@ -529,11 +524,10 @@ mod platform {
                     AdapterScaleAction::Reuse => {}
                     AdapterScaleAction::Reset { update_scales } => {
                         if let Some((r1, mr)) = update_scales {
-                            let mut inner = runtime
-                                .decoder()
-                                .shared
-                                .try_borrow_mut()
-                                .map_err(|_| runtime_invalid("Vulkan executor borrow conflict"))?;
+                            let mut inner =
+                                runtime.decoder().shared.try_borrow_mut().map_err(|_| {
+                                    runtime_invalid("Vulkan executor borrow conflict")
+                                })?;
                             inner.pending_scales = Some((r1, mr));
                         }
                         runtime.reset()?;
@@ -639,13 +633,8 @@ mod platform {
                 emit(event)
             };
             let mut timings = GenerationTimings::default();
-            let result = self.complete_with_timings(
-                prepared,
-                cancel,
-                deadline,
-                &mut timings,
-                &mut observe,
-            );
+            let result =
+                self.complete_with_timings(prepared, cancel, deadline, &mut timings, &mut observe);
             let _ = super::super::diagnostics::write_generation(
                 &mut std::io::stderr().lock(),
                 result.is_ok(),
@@ -674,10 +663,7 @@ mod platform {
         }
 
         fn initialize_worker_thread(&mut self) -> Result<ProjectionStartup, NativeBackendError> {
-            self.initialize_worker_thread_with_options(
-                Placement::Vulkan,
-                &WorkerOptions::default(),
-            )
+            self.initialize_worker_thread_with_options(Placement::Vulkan, &WorkerOptions::default())
         }
 
         fn initialize_worker_thread_with_options(
@@ -714,13 +700,13 @@ mod platform {
                         adapter,
                         scale: 1.3,
                     }),
-                multi_rank: multi_rank_model.as_ref().map(|adapter| {
-                    VulkanMultiRankAdapterSpec {
+                multi_rank: multi_rank_model
+                    .as_ref()
+                    .map(|adapter| VulkanMultiRankAdapterSpec {
                         adapter,
                         policy: MultiRankPolicy::NpuFriendly,
                         scale: 0.0,
-                    }
-                }),
+                    }),
             };
             let executor =
                 VulkanBatchedGraphExecutor::open_with_adapters(&model, vk_config, adapters)
@@ -735,8 +721,10 @@ mod platform {
             drop(rank_one_model);
             drop(multi_rank_model);
 
-            let identity: Arc<str> =
-                Arc::from(format!("adreno-vulkan-batched-v1:{}", executor.identity_sha256()));
+            let identity: Arc<str> = Arc::from(format!(
+                "adreno-vulkan-batched-v1:{}",
+                executor.identity_sha256()
+            ));
             let startup = ProjectionStartup::AdrenoVulkan {
                 identity,
                 resident_tensors,
@@ -783,7 +771,11 @@ mod platform {
         match (current_r1, rank_one_scale) {
             (None, None) => {}
             (Some(_), Some(scale)) => validate_adapter_scale(true, Some(scale))?,
-            _ => return Err(runtime_invalid("request scale does not match the loaded adapter")),
+            _ => {
+                return Err(runtime_invalid(
+                    "request scale does not match the loaded adapter",
+                ));
+            }
         }
         let normalized_mr = match (current_mr, multi_rank_scale) {
             (None, None) => None,
@@ -811,7 +803,8 @@ mod platform {
         model: &Model,
         layer_count: usize,
     ) -> Option<(u64, u64)> {
-        let full_interval = if let Some(value) = model.metadata.get("qwen35.full_attention_interval")
+        let full_interval = if let Some(value) =
+            model.metadata.get("qwen35.full_attention_interval")
             && let Some(raw) = value.as_u64()
             && let Ok(parsed) = usize::try_from(raw)
         {
@@ -822,23 +815,23 @@ mod platform {
         if full_interval == 0 {
             return None;
         }
-        let recurrent_flags: Vec<bool> =
-            if let Some(value) = model.metadata.get("qwen35.attention.recurrent_layers")
-                && let Some(arr) = value.as_array()
-            {
-                let mut flags = Vec::with_capacity(layer_count);
-                for item in arr.iter().take(layer_count) {
-                    flags.push(item.as_bool()?);
-                }
-                if flags.len() != layer_count {
-                    return None;
-                }
-                flags
-            } else {
-                (0..layer_count)
-                    .map(|idx| !(idx + 1).is_multiple_of(full_interval))
-                    .collect()
-            };
+        let recurrent_flags: Vec<bool> = if let Some(value) =
+            model.metadata.get("qwen35.attention.recurrent_layers")
+            && let Some(arr) = value.as_array()
+        {
+            let mut flags = Vec::with_capacity(layer_count);
+            for item in arr.iter().take(layer_count) {
+                flags.push(item.as_bool()?);
+            }
+            if flags.len() != layer_count {
+                return None;
+            }
+            flags
+        } else {
+            (0..layer_count)
+                .map(|idx| !(idx + 1).is_multiple_of(full_interval))
+                .collect()
+        };
 
         let mut count = 0_u64;
         let mut bytes = 0_u64;
@@ -990,8 +983,7 @@ mod platform {
             spec.sha256,
             MultiRankAdapter::DEFAULT_MEMORY_LIMIT,
         )?;
-        let validated =
-            MultiRankAdapter::from_model(model, &loaded, MultiRankPolicy::NpuFriendly)?;
+        let validated = MultiRankAdapter::from_model(model, &loaded, MultiRankPolicy::NpuFriendly)?;
         let id: Arc<str> = Arc::from(validated.identity());
         let max_rank = u16::try_from(validated.max_rank())?;
         let meta = (spec.path.to_path_buf(), spec.bytes, spec.sha256.to_owned());
@@ -1082,9 +1074,9 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::{
-        AdmittedChat, BranchCheckpoints, Cancellation, Completion, Engine, Instant,
-        ModelProfile, MultiRankAdapterSpec, NativeBackendError, Path, PendingChat, Placement,
-        ProjectionStartup, PromptReuse, Representation, TextEvent, WorkerOptions,
+        AdmittedChat, BranchCheckpoints, Cancellation, Completion, Engine, Instant, ModelProfile,
+        MultiRankAdapterSpec, NativeBackendError, Path, PendingChat, Placement, ProjectionStartup,
+        PromptReuse, Representation, TextEvent, WorkerOptions,
     };
 
     pub(in super::super) struct VulkanPreparedChat {

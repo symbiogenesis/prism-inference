@@ -1817,10 +1817,9 @@ mod tests {
             for blk in 0..block_count {
                 let start = blk * 28;
                 for i in 0..26 {
-                    row[start + i] = u8::try_from(
-                        (row_idx * 41 + blk * 59 + i * 19 + seed * 13 + 5) % 256,
-                    )
-                    .unwrap_or(0);
+                    row[start + i] =
+                        u8::try_from((row_idx * 41 + blk * 59 + i * 19 + seed * 13 + 5) % 256)
+                            .unwrap_or(0);
                 }
                 let s_bits = f16_pool[(row_idx + blk * 3 + seed) % f16_pool.len()].to_le_bytes();
                 row[start + 26] = s_bits[0];
@@ -2002,38 +2001,90 @@ mod tests {
                 .is_none()
         );
         let mut five_out = [[[0.0_f32; 8]; 8]; 5];
-        let five_chunks = [chunk_slices[0], chunk_slices[1], chunk_slices[2], chunk_slices[3], chunk_slices[0]];
-        assert!(detected.dot_scaled_8x8_chunks::<true, _>(row_refs, &five_chunks, &mut five_out).is_none());
-        assert!(detected.dot_scaled_8x8_chunks::<true, _>(row_refs, &chunk_slices[..1], &mut out[..2]).is_none());
+        let five_chunks = [
+            chunk_slices[0],
+            chunk_slices[1],
+            chunk_slices[2],
+            chunk_slices[3],
+            chunk_slices[0],
+        ];
+        assert!(
+            detected
+                .dot_scaled_8x8_chunks::<true, _>(row_refs, &five_chunks, &mut five_out)
+                .is_none()
+        );
+        assert!(
+            detected
+                .dot_scaled_8x8_chunks::<true, _>(row_refs, &chunk_slices[..1], &mut out[..2])
+                .is_none()
+        );
 
         let mut short_rows = row_refs;
         short_rows[7] = &rows[7][..rows[7].len() - 1];
-        assert!(detected.dot_scaled_8x8_chunks::<false, _>(short_rows, &chunk_slices[..2], &mut out[..2]).is_none());
+        assert!(
+            detected
+                .dot_scaled_8x8_chunks::<false, _>(short_rows, &chunk_slices[..2], &mut out[..2])
+                .is_none()
+        );
 
         let mut bad_rows = rows.clone();
         bad_rows[5][28 + 26..28 + 28].copy_from_slice(&0x7e00_u16.to_le_bytes());
         let bad_row_refs: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
         for &cap in &caps {
-            assert!(cap.dot_scaled_8x8_chunks::<true, _>(bad_row_refs, &chunk_slices[..2], &mut out[..2]).is_none());
-            assert!(cap.dot_scaled_8x8_chunks::<false, _>(bad_row_refs, &chunk_slices[..2], &mut out[..2]).is_none());
+            assert!(
+                cap.dot_scaled_8x8_chunks::<true, _>(
+                    bad_row_refs,
+                    &chunk_slices[..2],
+                    &mut out[..2]
+                )
+                .is_none()
+            );
+            assert!(
+                cap.dot_scaled_8x8_chunks::<false, _>(
+                    bad_row_refs,
+                    &chunk_slices[..2],
+                    &mut out[..2]
+                )
+                .is_none()
+            );
         }
 
         for bad_scale in [f32::NAN, f32::INFINITY] {
             acts[13][3].scale = bad_scale;
             let bad_chunks: [[&[super::Q8ActivationBlock]; 8]; 2] =
                 std::array::from_fn(|c| std::array::from_fn(|t| acts[c * 8 + t].as_slice()));
-            assert!(detected.dot_scaled_8x8_chunks::<true, _>(row_refs, &bad_chunks, &mut out[..2]).is_none());
-            assert!(detected.dot_scaled_8x8_chunks::<false, _>(row_refs, &bad_chunks, &mut out[..2]).is_none());
+            assert!(
+                detected
+                    .dot_scaled_8x8_chunks::<true, _>(row_refs, &bad_chunks, &mut out[..2])
+                    .is_none()
+            );
+            assert!(
+                detected
+                    .dot_scaled_8x8_chunks::<false, _>(row_refs, &bad_chunks, &mut out[..2])
+                    .is_none()
+            );
         }
 
         let mut ovf_row = vec![0xff_u8; 28];
         ovf_row[26..28].copy_from_slice(&0x7bff_u16.to_le_bytes());
         let ovf_refs = [ovf_row.as_slice(); 8];
-        let ovf_act = vec![super::Q8ActivationBlock { scale: f32::MAX, values: [127; 32] }; 4];
+        let ovf_act = vec![
+            super::Q8ActivationBlock {
+                scale: f32::MAX,
+                values: [127; 32]
+            };
+            4
+        ];
         let ovf_chunk = [ovf_act.as_slice(); 8];
         for &cap in &caps {
-            assert!(cap.dot_scaled_8x8_chunks::<true, _>(ovf_refs, &[ovf_chunk], &mut out[..1]).is_none());
-            assert!(cap.dot_scaled_8x8_chunks::<false, _>(ovf_refs, &[ovf_chunk], &mut out[..1]).is_none());
+            assert!(
+                cap.dot_scaled_8x8_chunks::<true, _>(ovf_refs, &[ovf_chunk], &mut out[..1])
+                    .is_none()
+            );
+            assert!(
+                cap.dot_scaled_8x8_chunks::<false, _>(ovf_refs, &[ovf_chunk], &mut out[..1])
+                    .is_none()
+            );
         }
         for (out_c, sen_c) in out.iter().zip(sentinel.iter()) {
             for (out_r, sen_r) in out_c.iter().zip(sen_c.iter()) {
@@ -2104,27 +2155,52 @@ mod tests {
                 .is_none()
         );
         let mut five_out = [[[0.0_f32; 8]; 8]; 5];
-        let five_chunks = [chunk_slices[0], chunk_slices[1], chunk_slices[2], chunk_slices[3], chunk_slices[0]];
-        assert!(detected.dot_scaled_8x8_chunks(row_refs, &five_chunks, &mut five_out).is_none());
-        assert!(detected.dot_scaled_8x8_chunks(row_refs, &chunk_slices[..1], &mut out[..2]).is_none());
+        let five_chunks = [
+            chunk_slices[0],
+            chunk_slices[1],
+            chunk_slices[2],
+            chunk_slices[3],
+            chunk_slices[0],
+        ];
+        assert!(
+            detected
+                .dot_scaled_8x8_chunks(row_refs, &five_chunks, &mut five_out)
+                .is_none()
+        );
+        assert!(
+            detected
+                .dot_scaled_8x8_chunks(row_refs, &chunk_slices[..1], &mut out[..2])
+                .is_none()
+        );
 
         let mut short_rows = row_refs;
         short_rows[4] = &row_refs[4][..33];
-        assert!(detected.dot_scaled_8x8_chunks(short_rows, &chunk_slices[..2], &mut out[..2]).is_none());
+        assert!(
+            detected
+                .dot_scaled_8x8_chunks(short_rows, &chunk_slices[..2], &mut out[..2])
+                .is_none()
+        );
 
         for bad_f16 in [0x7c00_u16, 0x7e00, 0xfc00] {
             let mut bad_rows = rows.clone();
             bad_rows[6][34..36].copy_from_slice(&bad_f16.to_le_bytes());
             let bad_refs: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
             for &cap in &caps {
-                assert!(cap.dot_scaled_8x8_chunks(bad_refs, &chunk_slices[..2], &mut out[..2]).is_none());
+                assert!(
+                    cap.dot_scaled_8x8_chunks(bad_refs, &chunk_slices[..2], &mut out[..2])
+                        .is_none()
+                );
             }
         }
 
         acts[21][1].scale = f32::NAN;
         let bad_chunks: [[&[super::Q8ActivationBlock]; 8]; 3] =
             std::array::from_fn(|c| std::array::from_fn(|t| acts[c * 8 + t].as_slice()));
-        assert!(detected.dot_scaled_8x8_chunks(row_refs, &bad_chunks, &mut out[..3]).is_none());
+        assert!(
+            detected
+                .dot_scaled_8x8_chunks(row_refs, &bad_chunks, &mut out[..3])
+                .is_none()
+        );
 
         let mut big_rows = rows;
         for row in &mut big_rows {
@@ -2133,11 +2209,20 @@ mod tests {
             row[34..36].copy_from_slice(&0x7bff_u16.to_le_bytes());
             row[36..68].fill(0x7f);
         }
-        let big_acts = vec![super::Q8ActivationBlock { scale: 1.0e32, values: [127; 32] }; 2];
+        let big_acts = vec![
+            super::Q8ActivationBlock {
+                scale: 1.0e32,
+                values: [127; 32]
+            };
+            2
+        ];
         let big_refs: [&[u8]; 8] = std::array::from_fn(|r| big_rows[r].as_slice());
         let big_chunk = [big_acts.as_slice(); 8];
         for &cap in &caps {
-            assert!(cap.dot_scaled_8x8_chunks(big_refs, &[big_chunk], &mut out[..1]).is_none());
+            assert!(
+                cap.dot_scaled_8x8_chunks(big_refs, &[big_chunk], &mut out[..1])
+                    .is_none()
+            );
         }
         for (out_c, sen_c) in out.iter().zip(sentinel.iter()) {
             for (out_r, sen_r) in out_c.iter().zip(sen_c.iter()) {

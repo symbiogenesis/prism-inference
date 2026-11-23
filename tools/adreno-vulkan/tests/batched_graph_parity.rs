@@ -563,13 +563,7 @@ fn assert_close(actual: &[f32], expected: &[f32], max_tol: f32, label: &str) {
     );
 }
 
-fn assert_close_rel(
-    actual: &[f32],
-    expected: &[f32],
-    abs_tol: f32,
-    rel_tol: f32,
-    label: &str,
-) {
+fn assert_close_rel(actual: &[f32], expected: &[f32], abs_tol: f32, rel_tol: f32, label: &str) {
     assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
     for (idx, (&a, &e)) in actual.iter().zip(expected).enumerate() {
         let diff = (a - e).abs();
@@ -591,9 +585,15 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         ("rms_norm_f32", spirv::rms_norm_f32()),
         ("rms_norm_batched_f32", spirv::rms_norm_batched_f32()),
         ("add_rms_norm_f32", spirv::add_rms_norm_f32()),
-        ("add_rms_norm_batched_f32", spirv::add_rms_norm_batched_f32()),
+        (
+            "add_rms_norm_batched_f32",
+            spirv::add_rms_norm_batched_f32(),
+        ),
         ("residual_add_f32", spirv::residual_add_f32()),
-        ("residual_add_batched_f32", spirv::residual_add_batched_f32()),
+        (
+            "residual_add_batched_f32",
+            spirv::residual_add_batched_f32(),
+        ),
         ("rope_f32", spirv::rope_f32()),
         ("rope_batched_f32", spirv::rope_batched_f32()),
         ("mul_sigmoid_f32", spirv::mul_sigmoid_f32()),
@@ -618,16 +618,16 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         ("kv_append_f16", spirv::kv_append_f16()),
         ("kv_append_batched_f16", spirv::kv_append_batched_f16()),
         ("kv_unpack_f16_to_f32", spirv::kv_unpack_f16_to_f32()),
-        ("quant_q8k_4plane_src", spirv::quantize_f32_to_q8k_4plane(false)),
+        (
+            "quant_q8k_4plane_src",
+            spirv::quantize_f32_to_q8k_4plane(false),
+        ),
         (
             "quant_q8k_4plane_batched_pinned",
             spirv::quantize_f32_to_q8k_4plane_batched(true),
         ),
         ("quant_q8_0_src", spirv::quantize_f32_to_q8_0(false, false)),
-        (
-            "quant_q8_0_pinned",
-            spirv::quantize_f32_to_q8_0(true, true),
-        ),
+        ("quant_q8_0_pinned", spirv::quantize_f32_to_q8_0(true, true)),
         (
             "quant_q8_0_batched_src",
             spirv::quantize_f32_to_q8_0_batched(false, false),
@@ -640,11 +640,17 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "quant_q8_0_batched_native",
             spirv::quantize_f32_to_q8_0_batched(true, true),
         ),
-        ("ffn_hadamard_batched_f32", spirv::ffn_hadamard_batched_f32()),
+        (
+            "ffn_hadamard_batched_f32",
+            spirv::ffn_hadamard_batched_f32(),
+        ),
         ("f32_matvec", spirv::f32_matvec()),
         ("f32_gemm_batched", spirv::f32_gemm_batched()),
         ("mul_f32_elemwise", spirv::mul_f32_elemwise()),
-        ("mul_f32_elemwise_batched", spirv::mul_f32_elemwise_batched()),
+        (
+            "mul_f32_elemwise_batched",
+            spirv::mul_f32_elemwise_batched(),
+        ),
         ("permute_ssm_heads_f32", spirv::permute_ssm_heads_f32()),
         (
             "permute_ssm_heads_batched_f32",
@@ -663,11 +669,26 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         ("attn_pv_accum", spirv::attn_pv_accum()),
         ("attn_pv_accum_f16kv", spirv::attn_pv_accum_f16kv()),
         ("lora_b_accum_f32", spirv::lora_b_accum_f32()),
-        ("lora_b_accum_batched_f32", spirv::lora_b_accum_batched_f32()),
-        ("pq2_q8k_4tok_false", spirv::pq2_q8k_gemm_4tok_coalesced(false, false, false)),
-        ("pq2_q8_0_4tok_false", spirv::pq2_q8_0_gemm_4tok_coalesced(false)),
-        ("ptq1_q8_0_4tok_false_src", spirv::ptq1_q8_0_gemm_4tok_coalesced(false, false)),
-        ("ptq1_q8_0_4tok_false_pin", spirv::ptq1_q8_0_gemm_4tok_coalesced(false, true)),
+        (
+            "lora_b_accum_batched_f32",
+            spirv::lora_b_accum_batched_f32(),
+        ),
+        (
+            "pq2_q8k_4tok_false",
+            spirv::pq2_q8k_gemm_4tok_coalesced(false, false, false),
+        ),
+        (
+            "pq2_q8_0_4tok_false",
+            spirv::pq2_q8_0_gemm_4tok_coalesced(false),
+        ),
+        (
+            "ptq1_q8_0_4tok_false_src",
+            spirv::ptq1_q8_0_gemm_4tok_coalesced(false, false),
+        ),
+        (
+            "ptq1_q8_0_4tok_false_pin",
+            spirv::ptq1_q8_0_gemm_4tok_coalesced(false, true),
+        ),
     ];
     for (name, words) in portable_modules {
         assert_eq!(
@@ -685,7 +706,10 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "pq2_q8k_4tok_sdot",
             spirv::pq2_q8k_gemm_4tok_coalesced(true, false, false),
         ),
-        ("pq2_q8_0_4tok_sdot", spirv::pq2_q8_0_gemm_4tok_coalesced(true)),
+        (
+            "pq2_q8_0_4tok_sdot",
+            spirv::pq2_q8_0_gemm_4tok_coalesced(true),
+        ),
         (
             "ptq1_q8_0_4tok_sdot_src",
             spirv::ptq1_q8_0_gemm_4tok_coalesced(true, false),
@@ -755,7 +779,8 @@ fn synthetic_hybrid_model_builds_and_config_defaults_are_well_formed() -> TestRe
     assert_eq!(VulkanKvPrecision::Fp32.name(), "fp32");
 
     // Odd-128 width synthetic hybrid model builds cleanly for PQ2_0 x Q8_0 / PTQ1_0 x Q8_0 parity.
-    let odd_model = synthetic_hybrid_qwen35_model_with_layout("offline-odd128-hybrid", 384, 384, 32)?;
+    let odd_model =
+        synthetic_hybrid_qwen35_model_with_layout("offline-odd128-hybrid", 384, 384, 32)?;
     let mut cpu_odd = Qwen35::new(odd_model, 16)?;
     let odd_l0 = cpu_odd.evaluate(0)?;
     assert_eq!(odd_l0.len(), 16);
@@ -1144,7 +1169,9 @@ fn live_batched_prefill_matches_sequential_ingest_and_checkpoint() -> TestResult
         .is_err()
     );
 
-    let full_seq: [u32; 19] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 3, 7, 11];
+    let full_seq: [u32; 19] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 3, 7, 11,
+    ];
     for kv_precision in [VulkanKvPrecision::Fp16, VulkanKvPrecision::Fp32] {
         let mut seq_1tok_exec = VulkanBatchedGraphExecutor::open(
             &synthetic_hybrid_qwen35_model("batched-vs-seq-base")?,

@@ -232,15 +232,8 @@ pub(crate) async fn serve_broker_pipe_vulkan_with_options(
     options: WorkerOptions,
 ) -> Result<(), NativeBackendError> {
     let seed = session.seed();
-    serve_broker_pipe_engine_with_options(
-        endpoint,
-        session,
-        seed,
-        key,
-        Placement::Vulkan,
-        options,
-    )
-    .await
+    serve_broker_pipe_engine_with_options(endpoint, session, seed, key, Placement::Vulkan, options)
+        .await
 }
 
 async fn serve_broker_pipe_engine_with_options<E: worker::Engine>(

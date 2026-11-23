@@ -739,7 +739,8 @@ impl PreparedMatvec<'_> {
         executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<f32> {
         let result = (|| {
-            let (down_cols, down_rows) = self.validate_f32_ffn_chain(tensors, residual, executor)?;
+            let (down_cols, down_rows) =
+                self.validate_f32_ffn_chain(tensors, residual, executor)?;
             if lora_a.len() != down_cols
                 || !is_finite_slice(lora_a)
                 || !executor.supports_f32_ffn_chain_lora(tensors)

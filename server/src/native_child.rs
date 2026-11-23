@@ -226,6 +226,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                     Some("f16") => KvCachePolicy::F16,
                     Some("rsq4") => KvCachePolicy::Rotated4,
                     Some("rsq4vf") => KvCachePolicy::Rotated4FittedValues,
+                    Some("rsq4kvf") => KvCachePolicy::Rotated4FittedKv,
                     Some("rsq4k3v") => KvCachePolicy::Rotated4Keys3Values,
                     _ => return Err(invalid()),
                 });
@@ -1682,6 +1683,7 @@ mod tests {
             ("f16", KvCachePolicy::F16),
             ("rsq4", KvCachePolicy::Rotated4),
             ("rsq4vf", KvCachePolicy::Rotated4FittedValues),
+            ("rsq4kvf", KvCachePolicy::Rotated4FittedKv),
             ("rsq4k3v", KvCachePolicy::Rotated4Keys3Values),
         ] {
             let mut selected = base.clone();
@@ -1912,7 +1914,7 @@ mod tests {
             "42".into(),
         ];
 
-        for kv_flag in ["f16", "rsq4", "rsq4vf", "rsq4k3v"] {
+        for kv_flag in ["f16", "rsq4", "rsq4vf", "rsq4kvf", "rsq4k3v"] {
             for (mode, expected_chunkwise) in [("sequential", false), ("wy-f32", true)] {
                 let mut args = base.clone();
                 args.extend(
@@ -2480,6 +2482,7 @@ mod tests {
         [
             vec!["--kv-cache", "rsq4"],
             vec!["--kv-cache", "rsq4vf"],
+            vec!["--kv-cache", "rsq4kvf"],
             vec!["--kv-cache", "rsq4k3v"],
             suffix_case,
             spec_tokens_case,

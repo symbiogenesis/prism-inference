@@ -903,6 +903,7 @@ fn private_rotated_cache_readiness_reports_startup_identity_and_rejects_request_
         for kv_cache in [
             KvCachePolicy::Rotated4,
             KvCachePolicy::Rotated4FittedValues,
+            KvCachePolicy::Rotated4FittedKv,
             KvCachePolicy::Rotated4Keys3Values,
         ] {
             let identity: Arc<str> = Arc::from(format!(

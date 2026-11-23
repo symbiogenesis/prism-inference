@@ -30,6 +30,7 @@ const MAX_RECORD_BYTES: usize = SCALE_BYTES + HEAD_DIM / 2;
 const ROTATION_PASSES: usize = 3;
 const FORMAT_VERSION: u32 = 1;
 const FITTED_SCALE_VERSION: u32 = 2;
+const COOPTIMIZED_SCALE_VERSION: u32 = 3;
 
 /// Packed scalar precision; both key and value precision are explicit policies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -749,6 +750,17 @@ impl Quantizer {
         self
     }
 
+    /// Select version 3's two-step co-optimized least-squares scale and codes.
+    ///
+    /// Alternates least-squares scale fitting and codebook re-quantization
+    /// under a strict binary64 rotated-reconstruction error guard while keeping
+    /// the identical packed layout and reader arithmetic.
+    #[must_use]
+    pub const fn with_cooptimized_scale(mut self) -> Self {
+        self.identity.version = COOPTIMIZED_SCALE_VERSION;
+        self
+    }
+
     /// Mathematical and wire identity; scalar and native paths share it.
     #[must_use]
     pub const fn identity(&self) -> Identity {
@@ -916,10 +928,19 @@ impl Quantizer {
                 scalar::write_code(codes, bit_width, index, code);
             }
         }
-        let scale = if self.identity.version == FITTED_SCALE_VERSION {
-            fitted_scale::select(&row, codes, self.identity.bits, centroids, scale)
-        } else {
-            scale
+        let scale = match self.identity.version {
+            FITTED_SCALE_VERSION => {
+                fitted_scale::select(&row, codes, self.identity.bits, centroids, scale)
+            }
+            COOPTIMIZED_SCALE_VERSION => fitted_scale::cooptimize(
+                &row,
+                codes,
+                self.identity.bits,
+                centroids,
+                scale,
+                self.scalar_only,
+            ),
+            _ => scale,
         };
         record[..SCALE_BYTES].copy_from_slice(&scale.to_le_bytes());
         out.copy_from_slice(&record[..self.encoded_len()]);

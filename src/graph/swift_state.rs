@@ -20,7 +20,12 @@ pub(super) fn ceiling(
     cache: KvCachePolicy,
 ) -> Result<usize> {
     if !matches!(identity, swift::MODEL_SHA256 | swift::REPACKED_PTQ1_SHA256)
-        || cache != KvCachePolicy::Rotated4
+        || !matches!(
+            cache,
+            KvCachePolicy::Rotated4
+                | KvCachePolicy::Rotated4FittedValues
+                | KvCachePolicy::Rotated4FittedKv
+        )
         || !(1..=CONTEXT_TOKENS).contains(&context_tokens)
         || optional_integer(metadata, "qwen35.nextn_predict_layers", 0)? != 0
     {
@@ -94,12 +99,18 @@ mod tests {
         assert_eq!(SWIFT_RSQ4_FULL_STATE_BYTES, 4_644_798_464);
         assert_eq!(super::super::MAX_STATE_BYTES, 4 * 1024 * 1024 * 1024);
         for identity in [swift::MODEL_SHA256, swift::REPACKED_PTQ1_SHA256] {
-            assert_eq!(
-                ceiling(identity, &metadata, CONTEXT_TOKENS, KvCachePolicy::Rotated4)?,
-                SWIFT_RSQ4_FULL_STATE_BYTES
-            );
-            for tokens in [0, CONTEXT_TOKENS + 1, CONTEXT_TOKENS + 256, usize::MAX] {
-                assert!(ceiling(identity, &metadata, tokens, KvCachePolicy::Rotated4).is_err());
+            for cache in [
+                KvCachePolicy::Rotated4,
+                KvCachePolicy::Rotated4FittedValues,
+                KvCachePolicy::Rotated4FittedKv,
+            ] {
+                assert_eq!(
+                    ceiling(identity, &metadata, CONTEXT_TOKENS, cache)?,
+                    SWIFT_RSQ4_FULL_STATE_BYTES
+                );
+                for tokens in [0, CONTEXT_TOKENS + 1, CONTEXT_TOKENS + 256, usize::MAX] {
+                    assert!(ceiling(identity, &metadata, tokens, cache).is_err());
+                }
             }
         }
         assert!(

@@ -42,7 +42,7 @@ Usage: prism-inference --model <absolute-gguf-path> --bytes <u64>\n\
   [--stop-tokens <id,id,...>] [--backend <auto|scalar|neon>]\n\
   [--timeout-seconds <1..3600>] [--output <tokens|text>]\n\
   [--state-bytes <usize>]\n\
-  [--kv-cache <f16|rsq4|rsq4vf|rsq4k3v>]\n\
+  [--kv-cache <f16|rsq4|rsq4vf|rsq4kvf|rsq4k3v>]\n\
   [--prefill-block-tokens <1..256>]\n\
   [--sampling <greedy|reference>] [--seed <u64>]\n\
   [--temperature <positive-f32>] [--top-k <0..1048576>] [--top-p <0..1>]\n\
@@ -325,8 +325,9 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Arguments> {
         Some("f16") => Some(KvCachePolicy::F16),
         Some("rsq4") => Some(KvCachePolicy::Rotated4),
         Some("rsq4vf") => Some(KvCachePolicy::Rotated4FittedValues),
+        Some("rsq4kvf") => Some(KvCachePolicy::Rotated4FittedKv),
         Some("rsq4k3v") => Some(KvCachePolicy::Rotated4Keys3Values),
-        _ => return Err(bad("KV cache must be f16, rsq4, rsq4vf or rsq4k3v")),
+        _ => return Err(bad("KV cache must be f16, rsq4, rsq4vf, rsq4kvf or rsq4k3v")),
     };
     let backend = match values.remove("--backend").as_deref().unwrap_or("auto") {
         "auto" => MatvecBackend::Auto,
@@ -1048,6 +1049,7 @@ mod tests {
             ("--kv-cache", "f16"),
             ("--kv-cache", "rsq4"),
             ("--kv-cache", "rsq4vf"),
+            ("--kv-cache", "rsq4kvf"),
             ("--kv-cache", "rsq4k3v"),
             ("--prefill-block-tokens", "1"),
             ("--sampling", "greedy"),
@@ -1087,6 +1089,7 @@ mod tests {
             ("f16", KvCachePolicy::F16),
             ("rsq4", KvCachePolicy::Rotated4),
             ("rsq4vf", KvCachePolicy::Rotated4FittedValues),
+            ("rsq4kvf", KvCachePolicy::Rotated4FittedKv),
             ("rsq4k3v", KvCachePolicy::Rotated4Keys3Values),
         ] {
             let mut input = arguments();

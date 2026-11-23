@@ -809,3 +809,83 @@ fn automatic_and_forced_scalar_backends_share_packing_and_arithmetic() -> Result
     }
     Ok(())
 }
+
+fn rotated_squared_error(quantizer: &Quantizer, input: &[f32; HEAD_DIM], packed: &[u8]) -> Result<f64> {
+    let mut rotated_target = [0.0; HEAD_DIM];
+    quantizer.rotate(input, &mut rotated_target)?;
+    let (scale, codes) = quantizer.record(packed)?;
+    let centroids = quantizer.centroids();
+    let bit_width = quantizer.identity().bits.bit_width();
+    let mut err = 0.0_f64;
+    for (index, &target) in rotated_target.iter().enumerate() {
+        let code = scalar::read_code(codes, bit_width, index);
+        let delta = f64::from(target) - f64::from(scale * centroids[code]);
+        err = delta.mul_add(delta, err);
+    }
+    Ok(err)
+}
+
+#[test]
+fn cooptimized_scale_codec_strictly_matches_or_improves_v1_and_v2_with_scalar_parity() -> Result<()> {
+    let mut outlier = [0.05_f32; HEAD_DIM];
+    outlier[0] = 18.0;
+    outlier[63] = -14.5;
+    outlier[128] = 9.25;
+    outlier[200] = -7.75;
+    let rope_nope: [f32; HEAD_DIM] = std::array::from_fn(|i| {
+        if i < 64 {
+            f32::from(u8::try_from(i % 7).unwrap_or(0)) * 0.65 - 1.9
+        } else {
+            f32::from(i8::try_from((i * 13) % 29).unwrap_or(0) - 14) * 0.12
+        }
+    });
+    let mut sparse = [0.0; HEAD_DIM];
+    sparse[19] = -3.0;
+
+    for bits in [Bits::Three, Bits::Four] {
+        let v1 = Quantizer::scalar(bits, 91);
+        let v2 = Quantizer::scalar(bits, 91).with_fitted_scale();
+        let v3_scalar = Quantizer::scalar(bits, 91).with_cooptimized_scale();
+        let v3_auto = Quantizer::new(bits, 91).with_cooptimized_scale();
+        assert_eq!(v3_scalar.identity().version, 3);
+        assert_eq!(v3_auto.encoded_len(), v1.encoded_len());
+
+        for input in [
+            input_row(),
+            outlier,
+            rope_nope,
+            sparse,
+            [0.0; HEAD_DIM],
+            [-0.0; HEAD_DIM],
+            [f32::MIN_POSITIVE; HEAD_DIM],
+            [f32::MAX / 64.0; HEAD_DIM],
+        ] {
+            let mut p1 = vec![0_u8; v1.encoded_len()];
+            let mut p2 = vec![0_u8; v2.encoded_len()];
+            let mut p3_scalar = vec![0_u8; v3_scalar.encoded_len()];
+            let mut p3_auto = vec![0_u8; v3_auto.encoded_len()];
+            v1.encode(&input, &mut p1)?;
+            v2.encode(&input, &mut p2)?;
+            v3_scalar.encode(&input, &mut p3_scalar)?;
+            v3_auto.encode(&input, &mut p3_auto)?;
+            assert_eq!(p3_auto, p3_scalar);
+
+            let e1 = rotated_squared_error(&v1, &input, &p1)?;
+            let e2 = rotated_squared_error(&v2, &input, &p2)?;
+            let e3 = rotated_squared_error(&v3_scalar, &input, &p3_scalar)?;
+            assert!(e3 <= e2 + 1e-12 && e3 <= e1 + 1e-12, "e1={e1}, e2={e2}, e3={e3}");
+        }
+        // On skewed outlier vectors in 4-bit mode, co-optimization strictly beats v1 and v2.
+        if bits == Bits::Four {
+            let mut p2 = vec![0_u8; v2.encoded_len()];
+            let mut p3 = vec![0_u8; v3_scalar.encoded_len()];
+            v2.encode(&outlier, &mut p2)?;
+            v3_scalar.encode(&outlier, &mut p3)?;
+            assert!(
+                rotated_squared_error(&v3_scalar, &outlier, &p3)?
+                    <= rotated_squared_error(&v2, &outlier, &p2)?
+            );
+        }
+    }
+    Ok(())
+}

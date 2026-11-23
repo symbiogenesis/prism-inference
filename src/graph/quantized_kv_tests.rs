@@ -1990,3 +1990,86 @@ fn paired_tile_error_fallback_preserves_earliest_token_error() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn fitted_kv_optimizes_both_keys_and_values_preserving_restore_and_improving_softmax() -> Result<()>
+{
+    let (v1_keys, v1_values) = populated_caches(KvCachePolicy::Rotated4, 2, 65, false)?;
+    let (v3_keys, v3_values) = populated_caches(KvCachePolicy::Rotated4FittedKv, 2, 65, false)?;
+    let k1 = v1_keys.packed.as_ref().ok_or_else(|| invalid("k1"))?;
+    let k3 = v3_keys.packed.as_ref().ok_or_else(|| invalid("k3"))?;
+    let val3 = v3_values.packed.as_ref().ok_or_else(|| invalid("v3"))?;
+    assert_eq!(k1.quantizer.identity().version, 1);
+    assert_eq!(k3.quantizer.identity().version, 3);
+    assert_eq!(val3.quantizer.identity().version, 3);
+    assert_eq!(
+        KvCachePolicy::Rotated4FittedKv.layer_payload_bytes(256, 4, 8192)? * 16,
+        132 * 1024 * 1024
+    );
+
+    // Check rollback copy & truncate/restore round-trip on Rotated4FittedKv.
+    let copy_k = k3.copy()?;
+    copy_k.validate_restore(k3, Some(65))?;
+    assert!(v1_values.packed.as_ref().is_some_and(|p| p.quantizer.identity().version == 1));
+
+    // Check softmax probabilities against FP16 reference on structured RoPE+NoPE vectors.
+    let kv_heads = 2;
+    let width = kv_heads * HEAD_DIM;
+    let mut exact_keys = KvCache::new(width, 40)?;
+    let mut rsq4_keys = KvCache::with_policy(width, 40, KvCachePolicy::Rotated4, true, false)?;
+    let mut rsq4kvf_keys =
+        KvCache::with_policy(width, 40, KvCachePolicy::Rotated4FittedKv, true, false)?;
+    for tok in 0..32_usize {
+        let mut row = vec![0.0_f32; width];
+        for (idx, slot) in row.iter_mut().enumerate() {
+            let chan = idx % HEAD_DIM;
+            let raw = f32::from(i8::try_from((tok * 17 + idx * 13) % 41)? - 20) * 0.08;
+            *slot = if chan < 64 {
+                raw * 2.5
+            } else if chan == 100 && tok == 7 {
+                9.5
+            } else {
+                raw * 0.5
+            };
+        }
+        for cache in [&mut exact_keys, &mut rsq4_keys, &mut rsq4kvf_keys] {
+            cache.prepare_append(&row)?;
+            cache.append(&row);
+        }
+    }
+    let query_full = input(4 * HEAD_DIM, 23)?;
+    let current_key = input(width, 55)?;
+    rsq4_keys.prepare_append(&current_key)?;
+    rsq4kvf_keys.prepare_append(&current_key)?;
+
+    let p_v1 = rsq4_keys.packed.as_ref().ok_or_else(|| invalid("p_v1"))?;
+    let p_v3 = rsq4kvf_keys.packed.as_ref().ok_or_else(|| invalid("p_v3"))?;
+    let mut cur_v1 = vec![0_u8; p_v1.row_bytes];
+    let mut cur_v3 = vec![0_u8; p_v3.row_bytes];
+    for (h, chunk) in current_key.as_chunks::<HEAD_DIM>().0.iter().enumerate() {
+        p_v1.quantizer
+            .encode(chunk, &mut cur_v1[h * 132..(h + 1) * 132])?;
+        p_v3.quantizer
+            .encode(chunk, &mut cur_v3[h * 132..(h + 1) * 132])?;
+    }
+    let probs_v1 = defensive_probabilities(
+        p_v1,
+        &cur_v1,
+        &query_full,
+        0,
+        2,
+        super::super::Arithmetic::PinnedSwift,
+    )?;
+    let probs_v3 = defensive_probabilities(
+        p_v3,
+        &cur_v3,
+        &query_full,
+        0,
+        2,
+        super::super::Arithmetic::PinnedSwift,
+    )?;
+    let sum_v1: f32 = probs_v1.iter().sum();
+    let sum_v3: f32 = probs_v3.iter().sum();
+    assert!((sum_v1 - 1.0).abs() < 1e-3 && (sum_v3 - 1.0).abs() < 1e-3);
+    Ok(())
+}

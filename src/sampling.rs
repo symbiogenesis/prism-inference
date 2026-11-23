@@ -11,7 +11,9 @@ pub(crate) mod selection;
 mod swift;
 pub mod upstream;
 
-pub use swift::SwiftSampler;
+pub use swift::{
+    ReasoningBudgetSequences, SwiftSampler, SwiftSamplerConfig, TokenConfidence,
+};
 
 /// Immutable, bounded, nonempty logits whose values have already been checked finite.
 ///
@@ -77,6 +79,11 @@ pub trait Sampler {
     /// Returns the same sampler-specific errors as [`Self::sample`].
     fn sample_finite(&mut self, logits: FiniteLogits<'_>) -> Result<u32> {
         self.sample(logits.as_slice())
+    }
+
+    /// Optional per-token log-probability confidence captured on the preceding sample.
+    fn take_last_confidence(&mut self) -> Option<TokenConfidence> {
+        None
     }
 }
 

@@ -22,6 +22,43 @@ use crate::tokenization::{
 use crate::{Result, invalid};
 
 const TEMPLATE_SHA256: &str = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
+
+/// Explicit reasoning effort selector supported by the verified Swift chat template.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReasoningEffort {
+    /// Brief, focused reasoning block with minimal elaboration.
+    Low,
+    /// Unmodified chain-of-thought without an extra effort system suffix.
+    Medium,
+    /// Careful validation-oriented reasoning instructions (template default).
+    #[default]
+    XHigh,
+}
+
+impl ReasoningEffort {
+    /// Exact lowercase Jinja keyword expected by the pinned Swift chat template.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::XHigh => "xhigh",
+        }
+    }
+
+    /// Parse a wire `reasoning_effort` string (`"low"`, `"medium"`, `"xhigh"`).
+    ///
+    /// # Errors
+    /// Rejects any unsupported effort string.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "xhigh" => Ok(Self::XHigh),
+            _ => Err(invalid("Swift reasoning_effort must be low, medium or xhigh")),
+        }
+    }
+}
 const VOCAB_SIZE: usize = 248_320;
 // Pinned Prism 73bfe6c llama_vocab_is_eog, including vocabulary-inferred stops.
 const NATIVE_STOPS: [(u32, &str); 5] = [
@@ -409,12 +446,35 @@ impl SwiftChatSession {
         reserved_output_tokens: usize,
         enable_thinking: bool,
     ) -> Result<SwiftPrompt> {
+        self.prepare_with_effort(
+            messages,
+            reserved_output_tokens,
+            enable_thinking,
+            ReasoningEffort::XHigh,
+        )
+    }
+
+    /// Render with explicit thinking mode and [`ReasoningEffort`] and reserve the entire output.
+    ///
+    /// # Errors
+    /// Returns the same message, template and token-budget errors as [`Self::prepare`].
+    pub fn prepare_with_effort(
+        &self,
+        messages: &Value,
+        reserved_output_tokens: usize,
+        enable_thinking: bool,
+        reasoning_effort: ReasoningEffort,
+    ) -> Result<SwiftPrompt> {
         let budget = output_budget(reserved_output_tokens, self.context_tokens)?;
         validate_messages(messages)?;
         let rendered = self.template.render_json(
             messages.clone(),
             true,
-            &json!({"enable_thinking": enable_thinking, "reasoning_effort": "xhigh", "preserve_thinking": true}),
+            &json!({
+                "enable_thinking": enable_thinking,
+                "reasoning_effort": reasoning_effort.as_str(),
+                "preserve_thinking": true,
+            }),
         )?;
         let tokenization = self.tokenization.encode(
             &rendered,
@@ -428,6 +488,68 @@ impl SwiftChatSession {
             rendered,
             tokenization,
         })
+    }
+
+    /// Resolve Swift `<think>`, `</think>`, and forced `\n</think>\n\n` delimiter token sequences.
+    ///
+    /// # Errors
+    /// Rejects vocabulary encoding failures.
+    pub fn reasoning_budget_delimiters(&self) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+        let budget = TokenBudget {
+            context: self.context_tokens,
+            reserved_output_tokens: 0,
+        };
+        let encode_seq = |text: &str| -> Result<Vec<i32>> {
+            let encoded = self.tokenization.encode(
+                text,
+                TextTokenizationPolicy {
+                    special_input: SpecialInputPolicy::Parse,
+                    insert_special: SpecialTokenInsertion::None,
+                    budget,
+                },
+            )?;
+            encoded
+                .token_ids
+                .into_iter()
+                .map(|id| i32::try_from(id).map_err(|_| invalid("Swift token ID exceeds i32")))
+                .collect()
+        };
+        Ok((
+            encode_seq("<think>")?,
+            encode_seq("</think>")?,
+            encode_seq("\n</think>\n\n")?,
+        ))
+    }
+
+    /// Resolve default DRY sequence-breaker token IDs for Swift generation.
+    ///
+    /// # Errors
+    /// Rejects vocabulary encoding failures.
+    pub fn dry_sequence_breakers(&self) -> Result<Vec<Vec<i32>>> {
+        let budget = TokenBudget {
+            context: self.context_tokens,
+            reserved_output_tokens: 0,
+        };
+        let mut out = Vec::new();
+        for breaker in ["\n", ":", "\"", "*"] {
+            if let Ok(encoded) = self.tokenization.encode(
+                breaker,
+                TextTokenizationPolicy {
+                    special_input: SpecialInputPolicy::Parse,
+                    insert_special: SpecialTokenInsertion::None,
+                    budget,
+                },
+            ) && !encoded.token_ids.is_empty()
+            {
+                let ids = encoded
+                    .token_ids
+                    .into_iter()
+                    .map(|id| i32::try_from(id).map_err(|_| invalid("Swift token ID exceeds i32")))
+                    .collect::<Result<Vec<_>>>()?;
+                out.push(ids);
+            }
+        }
+        Ok(out)
     }
 
     /// Render, expand visual patch placeholders and reserve output before any graph execution.
@@ -450,15 +572,35 @@ impl SwiftChatSession {
     /// # Errors
     /// Returns the same validation, vocabulary, template and token-budget errors as
     /// [`Self::prepare_multimodal`].
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep multimodal message validation, marker expansion and exact TokenLimitExceeded accounting in one auditable sequence."
-    )]
     pub fn prepare_multimodal_with_thinking(
         &self,
         messages: &[MultimodalMessage<'_>],
         reserved_output_tokens: usize,
         enable_thinking: bool,
+    ) -> Result<PreparedMultimodalPrompt> {
+        self.prepare_multimodal_with_effort(
+            messages,
+            reserved_output_tokens,
+            enable_thinking,
+            ReasoningEffort::XHigh,
+        )
+    }
+
+    /// Render multimodal messages with explicit thinking mode and [`ReasoningEffort`].
+    ///
+    /// # Errors
+    /// Returns the same validation, vocabulary, template and token-budget errors as
+    /// [`Self::prepare_multimodal`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep multimodal message validation, marker expansion and exact TokenLimitExceeded accounting in one auditable sequence."
+    )]
+    pub fn prepare_multimodal_with_effort(
+        &self,
+        messages: &[MultimodalMessage<'_>],
+        reserved_output_tokens: usize,
+        enable_thinking: bool,
+        reasoning_effort: ReasoningEffort,
     ) -> Result<PreparedMultimodalPrompt> {
         let budget = output_budget(reserved_output_tokens, self.context_tokens)?;
         let prompt_limit = budget.prompt_token_limit()?;
@@ -537,7 +679,11 @@ impl SwiftChatSession {
         let rendered = self.template.render_json(
             Value::Array(json_messages),
             true,
-            &json!({"enable_thinking": enable_thinking, "reasoning_effort": "xhigh", "preserve_thinking": true}),
+            &json!({
+                "enable_thinking": enable_thinking,
+                "reasoning_effort": reasoning_effort.as_str(),
+                "preserve_thinking": true,
+            }),
         )?;
         if image_plans.is_empty() {
             let tokenization = self.tokenization.encode(

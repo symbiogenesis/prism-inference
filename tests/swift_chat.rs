@@ -79,6 +79,54 @@ fn swift_pinned_template_disables_reasoning_without_losing_supplied_history() ->
 }
 
 #[test]
+fn swift_pinned_template_supports_low_medium_and_xhigh_reasoning_efforts() -> Result<()> {
+    let model = synthetic_swift_metadata()?;
+    let session = SwiftChatSession::from_metadata(&model)?;
+    let messages = json!([{"role": "user", "content": "Solve 2 + 2."}]);
+
+    let xhigh = session.prepare_with_effort(
+        &messages,
+        512,
+        true,
+        bonsai_prism_runtime::swift_chat::ReasoningEffort::XHigh,
+    )?;
+    let medium = session.prepare_with_effort(
+        &messages,
+        512,
+        true,
+        bonsai_prism_runtime::swift_chat::ReasoningEffort::Medium,
+    )?;
+    let low = session.prepare_with_effort(
+        &messages,
+        512,
+        true,
+        bonsai_prism_runtime::swift_chat::ReasoningEffort::Low,
+    )?;
+
+    assert_eq!(xhigh, session.prepare_with_thinking(&messages, 512, true)?);
+    assert!(xhigh.rendered.contains("Reasoning effort is set to xhigh."));
+    assert!(!medium.rendered.contains("Reasoning effort is set to"));
+    assert!(low.rendered.contains("Reasoning effort is set to low."));
+    assert!(low.rendered.ends_with("<|im_start|>assistant\n<think>\n"));
+    assert!(medium.rendered.ends_with("<|im_start|>assistant\n<think>\n"));
+
+    // Turning off thinking omits effort suffix regardless of reasoning_effort.
+    let no_think_low = session.prepare_with_effort(
+        &messages,
+        512,
+        false,
+        bonsai_prism_runtime::swift_chat::ReasoningEffort::Low,
+    )?;
+    assert!(!no_think_low.rendered.contains("Reasoning effort is set to"));
+    assert!(
+        no_think_low
+            .rendered
+            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    );
+    Ok(())
+}
+
+#[test]
 fn swift_chat_rejects_foreign_model_and_unverified_template_before_tokenizer_build() -> Result<()> {
     let fixture = capture()?;
     let mut metadata = ModelMetadata {

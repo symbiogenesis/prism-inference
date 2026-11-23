@@ -1,6 +1,6 @@
 //! Direct controls for private GDN staging, independent of SIMD dispatch fallback.
 
-use super::super::{ChunkInput, dot_scalar, scalar_add_scaled};
+use super::super::{ChunkInput, StateStepInput, dot_scalar, scalar_add_scaled};
 use crate::{Result, invalid};
 
 fn bits(values: &[f32]) -> Vec<u32> {
@@ -1159,6 +1159,129 @@ fn pinned_gdn_dot_pair_four_and_eight_rows_match_scalar_zero_ulp() -> Result<()>
                 exp1.to_bits(),
                 "8-row width={width} r={r}"
             );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pinned_gdn_neon_state_only_four_rows_matches_scalar_zero_ulp() -> Result<()> {
+    for width in [32_usize, 64, 128, 131] {
+        let mut previous = values(width * 4);
+        previous[0] = -0.0;
+        previous[2 * width] = f32::from_bits(1);
+        previous[4 * width - 1] = -f32::MIN_POSITIVE;
+        let prev_rows: [&[f32]; 4] = std::array::from_fn(|r| &previous[r * width..(r + 1) * width]);
+        for count in [1_usize, 2, 4, 16, 32] {
+            let keys: Vec<Vec<f32>> = (0..count)
+                .map(|t| {
+                    let mut key = values(width);
+                    key.rotate_left(t % width);
+                    key
+                })
+                .collect();
+            let token_vals: Vec<Vec<f32>> = (0..count)
+                .map(|t| {
+                    let mut v = values(6);
+                    v[t % 6] = -0.0;
+                    v
+                })
+                .collect();
+            let inputs: Vec<StateStepInput<'_>> = (0..count)
+                .map(|t| StateStepInput {
+                    key: &keys[t],
+                    value: &token_vals[t],
+                    decay: [0.875, 0.0, -0.0, -0.25, 1.0][t % 5],
+                    beta: [0.625, 0.375, 0.0, -0.0, 0.5][t % 5],
+                })
+                .collect();
+            let row = 2_usize;
+            let mut expected = previous.clone();
+            for input in &inputs {
+                for (sub, state_row) in expected.chunks_exact_mut(width).enumerate() {
+                    for elem in &mut *state_row {
+                        *elem *= input.decay;
+                    }
+                    let dot_k = dot_scalar(state_row, input.key)?;
+                    let delta = (input.value[row + sub] - dot_k) * input.beta;
+                    scalar_add_scaled(state_row, input.key, delta)?;
+                }
+            }
+            let mut actual = vec![f32::NAN; width * 4];
+            assert!(super::step_four_rows_state_only_tokens_from(
+                prev_rows,
+                mutable_rows(&mut actual, width)?,
+                &inputs,
+                row,
+            ));
+            assert_eq!(
+                bits(&actual),
+                bits(&expected),
+                "width={width} count={count}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pinned_gdn_neon_state_only_rejects_nonfinite_and_masked_overflow() -> Result<()> {
+    for width in [32_usize, 131] {
+        for overflow_idx in [0_usize, width - 1] {
+            let previous = vec![0.0_f32; width * 4];
+            let prev_rows: [&[f32]; 4] =
+                std::array::from_fn(|r| &previous[r * width..(r + 1) * width]);
+            let mut k0 = vec![0.0_f32; width];
+            k0[overflow_idx] = f32::MAX;
+            let k1 = vec![0.0_f32; width];
+            let vals = [0.0_f32, 0.0, 4.0, 0.0];
+            let masked_inputs = [
+                StateStepInput {
+                    key: &k0,
+                    value: &vals,
+                    decay: 1.0,
+                    beta: 1.0,
+                },
+                StateStepInput {
+                    key: &k1,
+                    value: &vals,
+                    decay: 0.0,
+                    beta: 1.0,
+                },
+            ];
+            let mut actual = vec![-3.0_f32; width * 4];
+            assert!(!super::step_four_rows_state_only_tokens_from(
+                prev_rows,
+                mutable_rows(&mut actual, width)?,
+                &masked_inputs,
+                0,
+            ));
+
+            // Single-token overflow on the final token must also fail.
+            assert!(!super::step_four_rows_state_only_tokens_from(
+                prev_rows,
+                mutable_rows(&mut actual, width)?,
+                &masked_inputs[..1],
+                0,
+            ));
+
+            // Non-finite `dot_k` via `previous` must fail even with `decay == 0.0`.
+            let mut bad_prev = previous.clone();
+            bad_prev[overflow_idx] = f32::INFINITY;
+            let bad_prev_rows: [&[f32]; 4] =
+                std::array::from_fn(|r| &bad_prev[r * width..(r + 1) * width]);
+            let zero_inputs = [StateStepInput {
+                key: &k1,
+                value: &[0.0_f32; 4],
+                decay: 0.0,
+                beta: 1.0,
+            }];
+            assert!(!super::step_four_rows_state_only_tokens_from(
+                bad_prev_rows,
+                mutable_rows(&mut actual, width)?,
+                &zero_inputs,
+                0,
+            ));
         }
     }
     Ok(())

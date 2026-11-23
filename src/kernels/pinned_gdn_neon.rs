@@ -1977,3 +1977,257 @@ fn step_eight_rows_tokens_in_place_blocks<const BLOCKS: usize>(
     }
     true
 }
+
+#[inline]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Pinned scalar remainder retains separate multiply/add rounding."
+)]
+fn decay_four_rows_state_only_from(
+    neon: Neon,
+    previous: [&[f32]; 4],
+    states: &mut [&mut [f32]; 4],
+    key: &[f32],
+    decay: f32,
+) -> [f32; 4] {
+    let width = key.len();
+    let vectorized = width / 16 * 16;
+    let decays = f32x4::splat(neon, decay);
+    let mut s0 = [f32x4::splat(neon, 0.0); 4];
+    let mut s1 = [f32x4::splat(neon, 0.0); 4];
+    let mut s2 = [f32x4::splat(neon, 0.0); 4];
+    let mut s3 = [f32x4::splat(neon, 0.0); 4];
+    for (b, key_block) in key[..vectorized].as_chunks::<16>().0.iter().enumerate() {
+        let offset = b * 16;
+        let k0 = f32x4::from_slice(neon, &key_block[0..4]);
+        let k1 = f32x4::from_slice(neon, &key_block[4..8]);
+        let k2 = f32x4::from_slice(neon, &key_block[8..12]);
+        let k3 = f32x4::from_slice(neon, &key_block[12..16]);
+        for r in 0..4 {
+            let prev_block = &previous[r][offset..offset + 16];
+            let st_block = &mut states[r][offset..offset + 16];
+            let d0 = f32x4::from_slice(neon, &prev_block[0..4]) * decays;
+            let d1 = f32x4::from_slice(neon, &prev_block[4..8]) * decays;
+            let d2 = f32x4::from_slice(neon, &prev_block[8..12]) * decays;
+            let d3 = f32x4::from_slice(neon, &prev_block[12..16]) * decays;
+            d0.store_slice(&mut st_block[0..4]);
+            d1.store_slice(&mut st_block[4..8]);
+            d2.store_slice(&mut st_block[8..12]);
+            d3.store_slice(&mut st_block[12..16]);
+            s0[r] = d0.mul_add_precise(k0, s0[r]);
+            s1[r] = d1.mul_add_precise(k1, s1[r]);
+            s2[r] = d2.mul_add_precise(k2, s2[r]);
+            s3[r] = d3.mul_add_precise(k3, s3[r]);
+        }
+    }
+    let mut dots: [f32; 4] =
+        std::array::from_fn(|r| ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum());
+    for (idx, &k) in key[vectorized..].iter().enumerate() {
+        let col = vectorized + idx;
+        for r in 0..4 {
+            let d = previous[r][col] * decay;
+            states[r][col] = d;
+            dots[r] += d * k;
+        }
+    }
+    dots
+}
+
+#[inline]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Pinned scalar remainder retains separate multiply/add rounding."
+)]
+fn fused_step_four_rows_state_only_next(
+    neon: Neon,
+    states: &mut [&mut [f32]; 4],
+    key_cur: &[f32],
+    key_next: &[f32],
+    deltas: [f32; 4],
+    decay_next: f32,
+) -> Option<[f32; 4]> {
+    let width = key_cur.len();
+    let vectorized = width / 16 * 16;
+    let decay_next_vec = f32x4::splat(neon, decay_next);
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let mut n0 = [f32x4::splat(neon, 0.0); 4];
+    let mut n1 = [f32x4::splat(neon, 0.0); 4];
+    let mut n2 = [f32x4::splat(neon, 0.0); 4];
+    let mut n3 = [f32x4::splat(neon, 0.0); 4];
+    for (b, (key_cur_block, key_next_block)) in key_cur[..vectorized]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(key_next[..vectorized].as_chunks::<16>().0)
+        .enumerate()
+    {
+        let offset = b * 16;
+        // Process two 8-float halves per 16-float block to keep live NEON registers <= 26 (zero spills).
+        let kc0 = f32x4::from_slice(neon, &key_cur_block[0..4]);
+        let kc1 = f32x4::from_slice(neon, &key_cur_block[4..8]);
+        let kn0 = f32x4::from_slice(neon, &key_next_block[0..4]);
+        let kn1 = f32x4::from_slice(neon, &key_next_block[4..8]);
+        for r in 0..4 {
+            let st_half = &mut states[r][offset..offset + 8];
+            let delta_vec = f32x4::splat(neon, deltas[r]);
+            let u0 = delta_vec.mul_add_precise(kc0, f32x4::from_slice(neon, &st_half[0..4]));
+            let u1 = delta_vec.mul_add_precise(kc1, f32x4::from_slice(neon, &st_half[4..8]));
+            finite_mask &= u0.is_finite() & u1.is_finite();
+            let d0 = u0 * decay_next_vec;
+            let d1 = u1 * decay_next_vec;
+            d0.store_slice(&mut st_half[0..4]);
+            d1.store_slice(&mut st_half[4..8]);
+            n0[r] = d0.mul_add_precise(kn0, n0[r]);
+            n1[r] = d1.mul_add_precise(kn1, n1[r]);
+        }
+        let kc2 = f32x4::from_slice(neon, &key_cur_block[8..12]);
+        let kc3 = f32x4::from_slice(neon, &key_cur_block[12..16]);
+        let kn2 = f32x4::from_slice(neon, &key_next_block[8..12]);
+        let kn3 = f32x4::from_slice(neon, &key_next_block[12..16]);
+        for r in 0..4 {
+            let st_half = &mut states[r][offset + 8..offset + 16];
+            let delta_vec = f32x4::splat(neon, deltas[r]);
+            let u2 = delta_vec.mul_add_precise(kc2, f32x4::from_slice(neon, &st_half[0..4]));
+            let u3 = delta_vec.mul_add_precise(kc3, f32x4::from_slice(neon, &st_half[4..8]));
+            finite_mask &= u2.is_finite() & u3.is_finite();
+            let d2 = u2 * decay_next_vec;
+            let d3 = u3 * decay_next_vec;
+            d2.store_slice(&mut st_half[0..4]);
+            d3.store_slice(&mut st_half[4..8]);
+            n2[r] = d2.mul_add_precise(kn2, n2[r]);
+            n3[r] = d3.mul_add_precise(kn3, n3[r]);
+        }
+    }
+    if !finite_mask.all_true() {
+        return None;
+    }
+    let mut dots: [f32; 4] =
+        std::array::from_fn(|r| ((n0[r] + n2[r]) + (n1[r] + n3[r])).reduce_sum());
+    for (idx, (&kc, &kn)) in key_cur[vectorized..]
+        .iter()
+        .zip(&key_next[vectorized..])
+        .enumerate()
+    {
+        let col = vectorized + idx;
+        for r in 0..4 {
+            let u = states[r][col] + deltas[r] * kc;
+            if !u.is_finite() {
+                return None;
+            }
+            let d = u * decay_next;
+            states[r][col] = d;
+            dots[r] += d * kn;
+        }
+    }
+    Some(dots)
+}
+
+#[inline]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Pinned scalar remainder retains separate multiply/add rounding."
+)]
+fn finish_four_rows_state_only(
+    neon: Neon,
+    states: &mut [&mut [f32]; 4],
+    key_cur: &[f32],
+    deltas: [f32; 4],
+) -> bool {
+    let width = key_cur.len();
+    let vectorized = width / 16 * 16;
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    for (b, key_cur_block) in key_cur[..vectorized].as_chunks::<16>().0.iter().enumerate() {
+        let offset = b * 16;
+        let k0 = f32x4::from_slice(neon, &key_cur_block[0..4]);
+        let k1 = f32x4::from_slice(neon, &key_cur_block[4..8]);
+        let k2 = f32x4::from_slice(neon, &key_cur_block[8..12]);
+        let k3 = f32x4::from_slice(neon, &key_cur_block[12..16]);
+        for r in 0..4 {
+            let st_block = &mut states[r][offset..offset + 16];
+            let delta_vec = f32x4::splat(neon, deltas[r]);
+            let u0 = delta_vec.mul_add_precise(k0, f32x4::from_slice(neon, &st_block[0..4]));
+            let u1 = delta_vec.mul_add_precise(k1, f32x4::from_slice(neon, &st_block[4..8]));
+            let u2 = delta_vec.mul_add_precise(k2, f32x4::from_slice(neon, &st_block[8..12]));
+            let u3 = delta_vec.mul_add_precise(k3, f32x4::from_slice(neon, &st_block[12..16]));
+            finite_mask &= u0.is_finite() & u1.is_finite() & u2.is_finite() & u3.is_finite();
+            u0.store_slice(&mut st_block[0..4]);
+            u1.store_slice(&mut st_block[4..8]);
+            u2.store_slice(&mut st_block[8..12]);
+            u3.store_slice(&mut st_block[12..16]);
+        }
+    }
+    if !finite_mask.all_true() {
+        return false;
+    }
+    for (idx, &kc) in key_cur[vectorized..].iter().enumerate() {
+        let col = vectorized + idx;
+        for r in 0..4 {
+            let u = states[r][col] + deltas[r] * kc;
+            if !u.is_finite() {
+                return false;
+            }
+            states[r][col] = u;
+        }
+    }
+    true
+}
+
+/// Steps 4 GDN state rows simultaneously from `previous` into `states` across `inputs.len()`
+/// tokens without computing query outputs, fusing token `t`'s update with token `t + 1`'s
+/// decay-and-key-dot into one read-modify-write pass over `states`. Returns `false` if NEON
+/// is unavailable or any non-finite value occurs, allowing exact replay from `previous`.
+#[inline]
+pub(super) fn step_four_rows_state_only_tokens_from(
+    previous: [&[f32]; 4],
+    mut states: [&mut [f32]; 4],
+    inputs: &[super::StateStepInput<'_>],
+    row: usize,
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let Some(first) = inputs.first() else {
+        return false;
+    };
+    let width = first.key.len();
+    if width == 0
+        || previous.iter().any(|prev| prev.len() != width)
+        || states.iter().any(|state| state.len() != width)
+        || inputs
+            .iter()
+            .any(|input| input.key.len() != width || input.value.len() < row.saturating_add(4))
+    {
+        return false;
+    }
+    let mut dot_k =
+        decay_four_rows_state_only_from(neon, previous, &mut states, first.key, first.decay);
+    for (token, input) in inputs.iter().enumerate() {
+        let mut deltas = [0.0_f32; 4];
+        for (r, slot) in deltas.iter_mut().enumerate() {
+            if !dot_k[r].is_finite() {
+                return false;
+            }
+            let delta = (input.value[row + r] - dot_k[r]) * input.beta;
+            if !delta.is_finite() {
+                return false;
+            }
+            *slot = delta;
+        }
+        if let Some(next_input) = inputs.get(token + 1) {
+            let Some(next_dots) = fused_step_four_rows_state_only_next(
+                neon,
+                &mut states,
+                input.key,
+                next_input.key,
+                deltas,
+                next_input.decay,
+            ) else {
+                return false;
+            };
+            dot_k = next_dots;
+        } else {
+            return finish_four_rows_state_only(neon, &mut states, input.key, deltas);
+        }
+    }
+    true
+}

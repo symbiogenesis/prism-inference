@@ -10,6 +10,7 @@ use super::{
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
+    pinned_gdn::{StateStepInput, step_four_rows_state_only_tokens_from},
     prefill::{ProjectionTile, ROW_TASK_SCRATCH_BYTES},
     round_f16_slice,
 };
@@ -1465,6 +1466,130 @@ fn step_recurrent_state_only_conv(
     finite(convolution, "convolution state")
 }
 
+fn step_recurrent_state_only_rows_single(
+    arithmetic: Arithmetic,
+    step_inputs: &[StateStepInput<'_>],
+    row_start: usize,
+    width: usize,
+    prev_head: &[f32],
+    state_head: &mut [f32],
+) -> Result<()> {
+    for (token, input) in step_inputs.iter().enumerate() {
+        for (offset, &v_val) in input.value[row_start..width].iter().enumerate() {
+            let row_idx = row_start + offset;
+            let state_row = &mut state_head[row_idx * width..(row_idx + 1) * width];
+            let dot_k = if token == 0 {
+                let prev_row = &prev_head[row_idx * width..(row_idx + 1) * width];
+                arithmetic.gdn_decay_and_dot_from(prev_row, state_row, input.key, input.decay)?
+            } else {
+                arithmetic.gdn_decay_and_dot(state_row, input.key, input.decay)?
+            };
+            let step_delta = (v_val - dot_k) * input.beta;
+            arithmetic.gdn_add_scaled(state_row, input.key, step_delta)?;
+            finite(state_row, "GDN state")?;
+        }
+    }
+    Ok(())
+}
+
+fn step_recurrent_state_only_head_pinned(
+    arithmetic: Arithmetic,
+    step_inputs: &[StateStepInput<'_>],
+    width: usize,
+    prev_head: &[f32],
+    state_head: &mut [f32],
+) -> Result<()> {
+    let row_groups = width / 4;
+    for group_idx in 0..row_groups {
+        let row_base = group_idx * 4;
+        let prev_rows: [&[f32]; 4] =
+            std::array::from_fn(|r| &prev_head[(row_base + r) * width..(row_base + r + 1) * width]);
+        let state_group = &mut state_head[row_base * width..(row_base + 4) * width];
+        let (s01, s23) = state_group.split_at_mut(2 * width);
+        let (s0, s1) = s01.split_at_mut(width);
+        let (s2, s3) = s23.split_at_mut(width);
+        step_four_rows_state_only_tokens_from(
+            prev_rows,
+            [s0, s1, s2, s3],
+            step_inputs,
+            row_base,
+            width,
+        )?;
+    }
+    let tail_start = row_groups * 4;
+    if tail_start < width {
+        step_recurrent_state_only_rows_single(
+            arithmetic,
+            step_inputs,
+            tail_start,
+            width,
+            prev_head,
+            state_head,
+        )?;
+    }
+    Ok(())
+}
+
+fn step_recurrent_state_only_matrix(
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    tile: &TiledPrefill,
+    count: usize,
+    previous: &[f32],
+    matrix: &mut [f32],
+) -> Result<()> {
+    let width = geometry.ssm_head;
+    let key_width = geometry.key_width();
+    let head_state_len = width * width;
+    let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
+    let alpha_ref: &[Vec<f32>] = &tile.alpha[..count];
+    let beta_ref: &[Vec<f32>] = &tile.beta[..count];
+    let use_pinned_four_row =
+        matches!(arithmetic, Arithmetic::PinnedSwift) && width >= 4 && count > 0;
+    tile.projector.row_parallelism().update_chunks(
+        matrix,
+        head_state_len,
+        |base_head, state_chunk| {
+            let mut step_inputs = Vec::with_capacity(count);
+            for (offset, state_head) in state_chunk.chunks_exact_mut(head_state_len).enumerate() {
+                let head = base_head + offset;
+                let prev_head = &previous[head * head_state_len..(head + 1) * head_state_len];
+                let key_head = head % geometry.ssm_keys;
+                step_inputs.clear();
+                for ((mixed, alpha), beta) in mixed_ref.iter().zip(alpha_ref).zip(beta_ref) {
+                    step_inputs.push(StateStepInput {
+                        key: &mixed
+                            [key_width + key_head * width..key_width + (key_head + 1) * width],
+                        value: &mixed
+                            [2 * key_width + head * width..2 * key_width + (head + 1) * width],
+                        decay: alpha[head],
+                        beta: beta[head],
+                    });
+                }
+                if use_pinned_four_row {
+                    step_recurrent_state_only_head_pinned(
+                        arithmetic,
+                        &step_inputs,
+                        width,
+                        prev_head,
+                        state_head,
+                    )?;
+                } else {
+                    step_recurrent_state_only_rows_single(
+                        arithmetic,
+                        &step_inputs,
+                        0,
+                        width,
+                        prev_head,
+                        state_head,
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Keep causal recurrent state updates, projection reuse and tile scratch explicit."
@@ -1537,46 +1662,7 @@ fn recurrent_state_only_tile<'a>(
     convolution.copy_from_slice(history);
     resize_into(previous.len(), matrix)?;
     step_recurrent_state_only_conv(layer, geometry, arithmetic, convolution, tile, count, check)?;
-    let width = geometry.ssm_head;
-    let key_width = geometry.key_width();
-    let head_state_len = width * width;
-    let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
-    let alpha_ref: &[Vec<f32>] = &tile.alpha[..count];
-    let beta_ref: &[Vec<f32>] = &tile.beta[..count];
-    tile.projector.row_parallelism().update_chunks(
-        matrix,
-        head_state_len,
-        |base_head, state_chunk| {
-            for (offset, state_head) in state_chunk.chunks_exact_mut(head_state_len).enumerate() {
-                let head = base_head + offset;
-                let prev_head = &previous[head * head_state_len..(head + 1) * head_state_len];
-                let key_head = head % geometry.ssm_keys;
-                for (token, ((mixed, alpha), beta)) in
-                    mixed_ref.iter().zip(alpha_ref).zip(beta_ref).enumerate()
-                {
-                    let k =
-                        &mixed[key_width + key_head * width..key_width + (key_head + 1) * width];
-                    let v =
-                        &mixed[2 * key_width + head * width..2 * key_width + (head + 1) * width];
-                    let decay = alpha[head];
-                    let beta = beta[head];
-                    for (row_idx, &v_val) in v.iter().enumerate() {
-                        let state_row = &mut state_head[row_idx * width..(row_idx + 1) * width];
-                        let dot_k = if token == 0 {
-                            let prev_row = &prev_head[row_idx * width..(row_idx + 1) * width];
-                            arithmetic.gdn_decay_and_dot_from(prev_row, state_row, k, decay)?
-                        } else {
-                            arithmetic.gdn_decay_and_dot(state_row, k, decay)?
-                        };
-                        let step_delta = (v_val - dot_k) * beta;
-                        arithmetic.gdn_add_scaled(state_row, k, step_delta)?;
-                        finite(state_row, "GDN state")?;
-                    }
-                }
-            }
-            Ok(())
-        },
-    )?;
+    step_recurrent_state_only_matrix(geometry, arithmetic, tile, count, previous, matrix)?;
     check()?;
     std::mem::swap(history, convolution);
     std::mem::swap(previous, matrix);
@@ -4242,6 +4328,458 @@ mod ptq1_executor_tests {
         assert_eq!(cpu_exec.f32_tokens_calls, 0);
         assert_eq!(cpu_exec.q8_calls, 0);
         assert_eq!(outputs, expected);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod state_only_gdn_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use bonsai_gguf::MetadataValue;
+
+    use super::super::{
+        ActiveAdapters, AdapterScratch, Attention, LayerState, MAX_STATE_BYTES, Qwen35,
+    };
+    use super::{
+        Arithmetic, StateStepInput, TileReuse, recurrent_state_only_tile,
+        step_recurrent_state_only_head_pinned, step_recurrent_state_only_rows_single,
+    };
+    use crate::kernels::{MatvecBackend, MatvecScratch};
+    use crate::model::{Model, Tensor};
+    use crate::{Result, invalid};
+
+    fn values(len: usize, mut seed: u32) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let mag = f32::from_bits((seed & 0x007f_ffff) | 0x3d00_0000);
+                if (seed >> 31) != 0 { -mag } else { mag }
+            })
+            .collect()
+    }
+
+    fn f32_tensor(name: &str, dims: &[usize], data: &[f32]) -> Tensor {
+        Tensor {
+            name: name.to_owned(),
+            dimensions: dims.to_vec(),
+            kind: 0,
+            data: Arc::<[u8]>::from(
+                data.iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        }
+    }
+
+    fn single_recurrent_metadata(head_dim: usize) -> BTreeMap<String, MetadataValue> {
+        let dim = u32::try_from(head_dim).unwrap_or(32);
+        BTreeMap::from([
+            ("general.architecture".into(), MetadataValue::from("qwen35")),
+            ("qwen35.block_count".into(), MetadataValue::from(1_u32)),
+            ("qwen35.context_length".into(), MetadataValue::from(32_u32)),
+            ("qwen35.embedding_length".into(), MetadataValue::from(dim)),
+            (
+                "qwen35.feed_forward_length".into(),
+                MetadataValue::from(dim),
+            ),
+            (
+                "qwen35.attention.head_count".into(),
+                MetadataValue::from(1_u32),
+            ),
+            (
+                "qwen35.attention.head_count_kv".into(),
+                MetadataValue::from(1_u32),
+            ),
+            (
+                "qwen35.attention.key_length".into(),
+                MetadataValue::from(dim),
+            ),
+            (
+                "qwen35.attention.value_length".into(),
+                MetadataValue::from(dim),
+            ),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon".into(),
+                MetadataValue::from(1e-6_f32),
+            ),
+            (
+                "qwen35.rope.dimension_count".into(),
+                MetadataValue::from(dim),
+            ),
+            (
+                "qwen35.rope.dimension_sections".into(),
+                MetadataValue::from(vec![8_u32, 8, 0, 0]),
+            ),
+            (
+                "qwen35.rope.freq_base".into(),
+                MetadataValue::from(10_000.0_f32),
+            ),
+            ("qwen35.ssm.state_size".into(), MetadataValue::from(dim)),
+            ("qwen35.ssm.group_count".into(), MetadataValue::from(1_u32)),
+            (
+                "qwen35.ssm.time_step_rank".into(),
+                MetadataValue::from(1_u32),
+            ),
+            ("qwen35.ssm.inner_size".into(), MetadataValue::from(dim)),
+            ("qwen35.ssm.conv_kernel".into(), MetadataValue::from(2_u32)),
+            (
+                "qwen35.full_attention_interval".into(),
+                MetadataValue::from(1_u32),
+            ),
+            (
+                "qwen35.attention.recurrent_layers".into(),
+                MetadataValue::from(vec![true]),
+            ),
+        ])
+    }
+
+    fn single_recurrent_layer_fixture(head_dim: usize) -> Model {
+        let mut seed = 0x1357_9bdf_u32;
+        let mut pat = |len: usize| -> Vec<f32> {
+            seed = seed.wrapping_add(1);
+            values(len, seed)
+        };
+        let ones = |len: usize| vec![1.0_f32; len];
+        let vocab = 6_usize;
+        let metadata = single_recurrent_metadata(head_dim);
+        let tensors = BTreeMap::from([
+            (
+                "token_embd.weight".into(),
+                f32_tensor(
+                    "token_embd.weight",
+                    &[head_dim, vocab],
+                    &pat(head_dim * vocab),
+                ),
+            ),
+            (
+                "output.weight".into(),
+                f32_tensor("output.weight", &[head_dim, vocab], &pat(head_dim * vocab)),
+            ),
+            (
+                "output_norm.weight".into(),
+                f32_tensor("output_norm.weight", &[head_dim], &ones(head_dim)),
+            ),
+            (
+                "blk.0.attn_norm.weight".into(),
+                f32_tensor("blk.0.attn_norm.weight", &[head_dim], &ones(head_dim)),
+            ),
+            (
+                "blk.0.post_attention_norm.weight".into(),
+                f32_tensor(
+                    "blk.0.post_attention_norm.weight",
+                    &[head_dim],
+                    &ones(head_dim),
+                ),
+            ),
+            (
+                "blk.0.ffn_up.weight".into(),
+                f32_tensor(
+                    "blk.0.ffn_up.weight",
+                    &[head_dim, head_dim],
+                    &pat(head_dim * head_dim),
+                ),
+            ),
+            (
+                "blk.0.ffn_gate.weight".into(),
+                f32_tensor(
+                    "blk.0.ffn_gate.weight",
+                    &[head_dim, head_dim],
+                    &pat(head_dim * head_dim),
+                ),
+            ),
+            (
+                "blk.0.ffn_down.weight".into(),
+                f32_tensor(
+                    "blk.0.ffn_down.weight",
+                    &[head_dim, head_dim],
+                    &pat(head_dim * head_dim),
+                ),
+            ),
+            (
+                "blk.0.attn_qkv.weight".into(),
+                f32_tensor(
+                    "blk.0.attn_qkv.weight",
+                    &[head_dim, 3 * head_dim],
+                    &pat(head_dim * 3 * head_dim),
+                ),
+            ),
+            (
+                "blk.0.attn_gate.weight".into(),
+                f32_tensor(
+                    "blk.0.attn_gate.weight",
+                    &[head_dim, head_dim],
+                    &pat(head_dim * head_dim),
+                ),
+            ),
+            (
+                "blk.0.ssm_conv1d.weight".into(),
+                f32_tensor(
+                    "blk.0.ssm_conv1d.weight",
+                    &[2, 3 * head_dim],
+                    &pat(2 * 3 * head_dim),
+                ),
+            ),
+            (
+                "blk.0.ssm_dt.bias".into(),
+                f32_tensor("blk.0.ssm_dt.bias", &[1], &[0.125]),
+            ),
+            (
+                "blk.0.ssm_a".into(),
+                f32_tensor("blk.0.ssm_a", &[1], &[-0.25]),
+            ),
+            (
+                "blk.0.ssm_beta.weight".into(),
+                f32_tensor("blk.0.ssm_beta.weight", &[head_dim, 1], &pat(head_dim)),
+            ),
+            (
+                "blk.0.ssm_alpha.weight".into(),
+                f32_tensor("blk.0.ssm_alpha.weight", &[head_dim, 1], &pat(head_dim)),
+            ),
+            (
+                "blk.0.ssm_norm.weight".into(),
+                f32_tensor("blk.0.ssm_norm.weight", &[head_dim], &ones(head_dim)),
+            ),
+            (
+                "blk.0.ssm_out.weight".into(),
+                f32_tensor(
+                    "blk.0.ssm_out.weight",
+                    &[head_dim, head_dim],
+                    &pat(head_dim * head_dim),
+                ),
+            ),
+        ]);
+        Model {
+            metadata,
+            tensors,
+            identity: "state-only-gdn-test-fixture".into(),
+        }
+    }
+
+    #[test]
+    fn state_only_gdn_pinned_four_row_matches_single_row_zero_ulp() -> Result<()> {
+        for width in [4_usize, 32, 64, 128, 131] {
+            let mut prev = values(width * width, 0x9e37_79b9);
+            prev[0] = -0.0;
+            prev[width - 1] = f32::from_bits(1);
+            for count in [1_usize, 2, 4, 16, 32] {
+                let mut mixed = Vec::with_capacity(count);
+                let mut alpha = Vec::with_capacity(count);
+                let mut beta = Vec::with_capacity(count);
+                let mut step_inputs = Vec::with_capacity(count);
+                let key_width = width;
+                for token in 0..count {
+                    let row = values(3 * width, 0x1000_0001 + u32::try_from(token).unwrap_or(0));
+                    mixed.push(row);
+                    alpha.push(vec![[0.875_f32, 0.0, -0.0, -0.25, 1.0][token % 5]]);
+                    beta.push(vec![[0.625_f32, 0.375, 0.0, -0.0, 0.5][token % 5]]);
+                }
+                for ((m, a), b) in mixed.iter().zip(&alpha).zip(&beta) {
+                    step_inputs.push(StateStepInput {
+                        key: &m[key_width..2 * key_width],
+                        value: &m[2 * key_width..3 * key_width],
+                        decay: a[0],
+                        beta: b[0],
+                    });
+                }
+
+                let mut pinned_state = vec![f32::NAN; width * width];
+                step_recurrent_state_only_head_pinned(
+                    Arithmetic::PinnedSwift,
+                    &step_inputs,
+                    width,
+                    &prev,
+                    &mut pinned_state,
+                )?;
+
+                let mut ref_state = vec![f32::NAN; width * width];
+                step_recurrent_state_only_rows_single(
+                    Arithmetic::PinnedSwift,
+                    &step_inputs,
+                    0,
+                    width,
+                    &prev,
+                    &mut ref_state,
+                )?;
+                assert_eq!(
+                    pinned_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    ref_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "width={width} count={count}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn state_only_gdn_pinned_rejects_nonfinite_without_masking() {
+        for width in [32_usize, 131] {
+            let prev = vec![0.0_f32; width * width];
+            let mut k0 = vec![0.0_f32; width];
+            k0[width - 1] = f32::MAX;
+            let k1 = vec![0.0_f32; width];
+            let mut v0 = vec![0.0_f32; width];
+            v0[2] = 4.0;
+            let inputs = [
+                StateStepInput {
+                    key: &k0,
+                    value: &v0,
+                    decay: 1.0,
+                    beta: 1.0,
+                },
+                StateStepInput {
+                    key: &k1,
+                    value: &v0,
+                    decay: 0.0,
+                    beta: 1.0,
+                },
+            ];
+            let mut state = vec![-1.0_f32; width * width];
+            assert!(
+                step_recurrent_state_only_head_pinned(
+                    Arithmetic::PinnedSwift,
+                    &inputs,
+                    width,
+                    &prev,
+                    &mut state,
+                )
+                .is_err()
+            );
+
+            let mut bad_val = vec![0.0_f32; width];
+            bad_val[width - 1] = f32::NAN;
+            let bad_inputs = [StateStepInput {
+                key: &k1,
+                value: &bad_val,
+                decay: 1.0,
+                beta: 1.0,
+            }];
+            assert!(
+                step_recurrent_state_only_head_pinned(
+                    Arithmetic::PinnedSwift,
+                    &bad_inputs,
+                    width,
+                    &prev,
+                    &mut state,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn recurrent_state_only_tile_matches_sequential_pinned_and_source_zero_ulp() -> Result<()> {
+        let count = 8_usize;
+        let head_dim = 32_usize;
+        let norm_inputs: Vec<Vec<f32>> = (0..count)
+            .map(|t| values(head_dim, 0x5555_0001 + u32::try_from(t).unwrap_or(0)))
+            .collect();
+        for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+            let mut single = Qwen35::with_adapters_and_kv(
+                single_recurrent_layer_fixture(head_dim),
+                32,
+                MAX_STATE_BYTES,
+                MatvecBackend::Auto,
+                None,
+                None,
+                super::super::KvCachePolicy::F16,
+            )?
+            .with_tiled_prefill(8, 1 << 20)?;
+            let mut tiled = Qwen35::with_adapters_and_kv(
+                single_recurrent_layer_fixture(head_dim),
+                32,
+                MAX_STATE_BYTES,
+                MatvecBackend::Auto,
+                None,
+                None,
+                super::super::KvCachePolicy::F16,
+            )?
+            .with_tiled_prefill(count, 1 << 20)?;
+
+            let Attention::Recurrent(ref single_layer) = single.layers[0].attention else {
+                return Err(invalid("expected recurrent layer"));
+            };
+            let Attention::Recurrent(ref tiled_layer) = tiled.layers[0].attention else {
+                return Err(invalid("expected recurrent layer"));
+            };
+            let mut single_tile = single
+                .tiled_prefill
+                .take()
+                .ok_or_else(|| invalid("missing single tile"))?;
+            let mut multi_tile = tiled
+                .tiled_prefill
+                .take()
+                .ok_or_else(|| invalid("missing multi tile"))?;
+            let mut adapter_scratch = AdapterScratch::default();
+            let mut proj_scratch = MatvecScratch::default();
+
+            for input in &norm_inputs {
+                single_tile.normalized[0].resize(head_dim, 0.0);
+                single_tile.normalized[0].copy_from_slice(input);
+                recurrent_state_only_tile(
+                    single_layer,
+                    &mut single.state[0],
+                    &mut single.workspace.deltas[0],
+                    &single.geometry,
+                    arithmetic,
+                    &single.transforms,
+                    ActiveAdapters::default(),
+                    &mut adapter_scratch,
+                    &mut proj_scratch,
+                    TileReuse::default(),
+                    1,
+                    &|| Ok(()),
+                    &mut single_tile,
+                    None,
+                )?;
+            }
+
+            for (t, input) in norm_inputs.iter().enumerate() {
+                multi_tile.normalized[t].resize(head_dim, 0.0);
+                multi_tile.normalized[t].copy_from_slice(input);
+            }
+            recurrent_state_only_tile(
+                tiled_layer,
+                &mut tiled.state[0],
+                &mut tiled.workspace.deltas[0],
+                &tiled.geometry,
+                arithmetic,
+                &tiled.transforms,
+                ActiveAdapters::default(),
+                &mut adapter_scratch,
+                &mut proj_scratch,
+                TileReuse::default(),
+                count,
+                &|| Ok(()),
+                &mut multi_tile,
+                None,
+            )?;
+
+            match (&single.state[0], &tiled.state[0]) {
+                (
+                    LayerState::Recurrent {
+                        convolution: sc,
+                        matrix: sm,
+                    },
+                    LayerState::Recurrent {
+                        convolution: tc,
+                        matrix: tm,
+                    },
+                ) => {
+                    assert_eq!(
+                        tc.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        sc.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        tm.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        sm.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                }
+                _ => return Err(invalid("expected recurrent layer state")),
+            }
+        }
         Ok(())
     }
 }

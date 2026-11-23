@@ -21,6 +21,15 @@ pub(crate) struct ChunkInput<'a> {
     pub(crate) beta: f32,
 }
 
+/// Per-token GDN recurrence inputs for state-only updates (no query or output projection).
+#[derive(Clone, Copy)]
+pub(crate) struct StateStepInput<'a> {
+    pub(crate) key: &'a [f32],
+    pub(crate) value: &'a [f32],
+    pub(crate) decay: f32,
+    pub(crate) beta: f32,
+}
+
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -550,6 +559,62 @@ pub(crate) fn step_four_rows_tokens_from(
     step_row_tokens_from(previous[3], s3, inputs, row + 3, stride, scale, output)
 }
 
+/// Steps 4 GDN state rows across `inputs.len()` tokens from `previous` into `states`
+/// without computing query outputs, fusing token `t`'s update with token `t + 1`'s
+/// decay-and-key-dot into a single memory pass over `states`.
+///
+/// # Errors
+/// Rejects invalid geometry before mutation, or a nonfinite updated element, delta, or dot result.
+pub(crate) fn step_four_rows_state_only_tokens_from(
+    previous: [&[f32]; 4],
+    states: [&mut [f32]; 4],
+    inputs: &[StateStepInput<'_>],
+    row: usize,
+    stride: usize,
+) -> Result<()> {
+    if inputs.is_empty() {
+        return Err(invalid("empty GDN chunk"));
+    }
+    if row.checked_add(4).is_none_or(|end| end > stride)
+        || previous.iter().any(|prev| prev.len() != stride)
+        || states.iter().any(|state| state.len() != stride)
+        || inputs
+            .iter()
+            .any(|input| input.key.len() != stride || input.value.len() < row.saturating_add(4))
+    {
+        return Err(invalid("pinned GDN step requires matching vectors"));
+    }
+    let [s0, s1, s2, s3] = states;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::step_four_rows_state_only_tokens_from(
+        previous,
+        [&mut *s0, &mut *s1, &mut *s2, &mut *s3],
+        inputs,
+        row,
+    ) {
+        return Ok(());
+    }
+    let mut rows = [s0, s1, s2, s3];
+    for (token, input) in inputs.iter().enumerate() {
+        for (sub, state_row) in rows.iter_mut().enumerate() {
+            let dot_k = if token == 0 {
+                decay_and_dot_from(previous[sub], state_row, input.key, input.decay)?
+            } else {
+                decay_and_dot(state_row, input.key, input.decay)?
+            };
+            let step_delta = (input.value[row + sub] - dot_k) * input.beta;
+            add_scaled(state_row, input.key, step_delta)?;
+        }
+    }
+    Ok(())
+}
+
 /// Steps 8 GDN state rows transactionally from `previous` into `states`.
 /// Eligible NEON execution shares `key` and `query` loads within four-row
 /// arithmetic phases while retaining atomic eight-row publication.
@@ -987,11 +1052,11 @@ fn scalar_add_scaled(target: &mut [f32], input: &[f32], scale: f32) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkInput, add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_four, dot_pair,
-        dot_pair_eight_rows, dot_pair_four_rows, dot_scalar, scalar_add_scaled,
+        ChunkInput, StateStepInput, add_scaled, decay_and_dot, decay_and_dot_from, dot, dot_four,
+        dot_pair, dot_pair_eight_rows, dot_pair_four_rows, dot_scalar, scalar_add_scaled,
         step_eight_rows_from, step_eight_rows_tokens_from, step_four_rows_from,
-        step_four_rows_tokens_from, step_row_from, step_row_in_place, step_row_tokens_from,
-        update_and_dot,
+        step_four_rows_state_only_tokens_from, step_four_rows_tokens_from, step_row_from,
+        step_row_in_place, step_row_tokens_from, update_and_dot,
     };
     use crate::Result;
 
@@ -1478,5 +1543,147 @@ mod tests {
             assert_eq!(bits(&in_place_head), bits(&tok8_ref_states));
         }
         Ok(())
+    }
+
+    #[test]
+    fn pinned_gdn_state_only_four_rows_matches_single_row_zero_ulp() -> Result<()> {
+        for width in [4_usize, 17, 32, 64, 128, 131] {
+            let (mut prev_buf, _) = vectors(width * 4);
+            prev_buf[0] = -0.0;
+            prev_buf[width] = f32::from_bits(1);
+            prev_buf[4 * width - 1] = -f32::MIN_POSITIVE;
+            let prev_rows: [&[f32]; 4] =
+                std::array::from_fn(|r| &prev_buf[r * width..(r + 1) * width]);
+            for count in [1_usize, 2, 4, 16, 32] {
+                let (keys_buf, vals_buf) = vectors(count * width.max(8));
+                let keys: Vec<&[f32]> = (0..count)
+                    .map(|t| &keys_buf[t * width..(t + 1) * width])
+                    .collect();
+                let vals: Vec<&[f32]> = (0..count).map(|t| &vals_buf[t * 8..(t + 1) * 8]).collect();
+                let inputs: Vec<StateStepInput<'_>> = (0..count)
+                    .map(|t| StateStepInput {
+                        key: keys[t],
+                        value: vals[t],
+                        decay: [0.875, 0.0, -0.25, -0.0, 0.5][t % 5],
+                        beta: [0.625, 0.375, 0.0, -0.5, 1.0][t % 5],
+                    })
+                    .collect();
+                let row = if width > 4 { 3_usize } else { 0_usize };
+                let mut actual = vec![f32::NAN; width * 4];
+                {
+                    let (s01, s23) = actual.split_at_mut(2 * width);
+                    let (s0, s1) = s01.split_at_mut(width);
+                    let (s2, s3) = s23.split_at_mut(width);
+                    step_four_rows_state_only_tokens_from(
+                        prev_rows,
+                        [s0, s1, s2, s3],
+                        &inputs,
+                        row,
+                        width,
+                    )?;
+                }
+                let mut expected = vec![0.0_f32; width * 4];
+                for (t, input) in inputs.iter().enumerate() {
+                    for sub in 0..4 {
+                        let st = &mut expected[sub * width..(sub + 1) * width];
+                        let dot_k = if t == 0 {
+                            decay_and_dot_from(prev_rows[sub], st, input.key, input.decay)?
+                        } else {
+                            decay_and_dot(st, input.key, input.decay)?
+                        };
+                        let step_delta = (input.value[row + sub] - dot_k) * input.beta;
+                        add_scaled(st, input.key, step_delta)?;
+                    }
+                }
+                assert_eq!(
+                    bits(&actual),
+                    bits(&expected),
+                    "width={width}, count={count}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_gdn_state_only_four_rows_rejects_geometry_and_nonfinite() {
+        for width in [32_usize, 131] {
+            let prev = vec![0.0_f32; width * 4];
+            let prev_rows: [&[f32]; 4] = std::array::from_fn(|r| &prev[r * width..(r + 1) * width]);
+            let mut st = vec![-7.0_f32; width * 4];
+            let untouched = bits(&st);
+            let empty: [StateStepInput<'_>; 0] = [];
+            {
+                let (s01, s23) = st.split_at_mut(2 * width);
+                let (s0, s1) = s01.split_at_mut(width);
+                let (s2, s3) = s23.split_at_mut(width);
+                assert!(
+                    step_four_rows_state_only_tokens_from(
+                        prev_rows,
+                        [s0, s1, s2, s3],
+                        &empty,
+                        0,
+                        width
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(bits(&st), untouched);
+
+            // Overflow `s_new` on token 0 followed by `decay == 0.0` on token 1 must not be masked.
+            let mut k0 = vec![0.0_f32; width];
+            k0[width - 1] = f32::MAX;
+            let k1 = vec![0.0_f32; width];
+            let vals = [0.0_f32, 0.0, 4.0, 0.0];
+            let inputs = [
+                StateStepInput {
+                    key: &k0,
+                    value: &vals,
+                    decay: 1.0,
+                    beta: 1.0,
+                },
+                StateStepInput {
+                    key: &k1,
+                    value: &vals,
+                    decay: 0.0,
+                    beta: 1.0,
+                },
+            ];
+            let (s01, s23) = st.split_at_mut(2 * width);
+            let (s0, s1) = s01.split_at_mut(width);
+            let (s2, s3) = s23.split_at_mut(width);
+            assert!(
+                step_four_rows_state_only_tokens_from(
+                    prev_rows,
+                    [s0, s1, s2, s3],
+                    &inputs,
+                    0,
+                    width
+                )
+                .is_err()
+            );
+
+            // Non-finite `dot_k` or `step_delta` rejected cleanly.
+            let bad_vals = [0.0_f32, f32::NAN, 0.0, 0.0];
+            let bad_inputs = [StateStepInput {
+                key: &k1,
+                value: &bad_vals,
+                decay: 1.0,
+                beta: 1.0,
+            }];
+            let (s01, s23) = st.split_at_mut(2 * width);
+            let (s0, s1) = s01.split_at_mut(width);
+            let (s2, s3) = s23.split_at_mut(width);
+            assert!(
+                step_four_rows_state_only_tokens_from(
+                    prev_rows,
+                    [s0, s1, s2, s3],
+                    &bad_inputs,
+                    0,
+                    width,
+                )
+                .is_err()
+            );
+        }
     }
 }

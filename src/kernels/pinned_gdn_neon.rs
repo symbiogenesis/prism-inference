@@ -213,6 +213,126 @@ fn dot_pair_two_rows(
     results
 }
 
+type TwoRowFourTokenVectors = ([[f32x4<Neon>; 4]; 2], [[f32x4<Neon>; 4]; 2]);
+
+#[inline]
+fn dot_pair_two_rows_four_tokens_lane(
+    neon: Neon,
+    st0: &[f32],
+    st1: &[f32],
+    keys: [&[f32]; 4],
+    queries: [&[f32]; 4],
+    lane_offset: usize,
+) -> TwoRowFourTokenVectors {
+    let zero = f32x4::splat(neon, 0.0);
+    let mut fk = [[zero; 4]; 2];
+    let mut sq = [[zero; 4]; 2];
+    let vectorized = keys[0].len() / 16 * 16;
+    for offset in (0..vectorized).step_by(16) {
+        let idx = offset + lane_offset;
+        let v0 = f32x4::from_slice(neon, &st0[idx..idx + 4]);
+        let v1 = f32x4::from_slice(neon, &st1[idx..idx + 4]);
+        for t in 0..4 {
+            let k = f32x4::from_slice(neon, &keys[t][idx..idx + 4]);
+            fk[0][t] = v0.mul_add_precise(k, fk[0][t]);
+            fk[1][t] = v1.mul_add_precise(k, fk[1][t]);
+        }
+        for t in 0..4 {
+            let q = f32x4::from_slice(neon, &queries[t][idx..idx + 4]);
+            sq[0][t] = v0.mul_add_precise(q, sq[0][t]);
+            sq[1][t] = v1.mul_add_precise(q, sq[1][t]);
+        }
+    }
+    (fk, sq)
+}
+
+#[inline]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Pinned scalar remainder retains separate multiply/add rounding."
+)]
+fn dot_pair_two_rows_four_tokens(
+    neon: Neon,
+    st0: &[f32],
+    st1: &[f32],
+    keys: [&[f32]; 4],
+    queries: [&[f32]; 4],
+) -> ([[f32; 4]; 2], [[f32; 4]; 2]) {
+    let len = keys[0].len();
+    let vectorized = len / 16 * 16;
+    let (fk0, sq0) = dot_pair_two_rows_four_tokens_lane(neon, st0, st1, keys, queries, 0);
+    let (fk2, sq2) = dot_pair_two_rows_four_tokens_lane(neon, st0, st1, keys, queries, 8);
+    let key_even_pair: [[f32x4<Neon>; 4]; 2] =
+        std::array::from_fn(|r| std::array::from_fn(|t| fk0[r][t] + fk2[r][t]));
+    let query_even_pair: [[f32x4<Neon>; 4]; 2] =
+        std::array::from_fn(|r| std::array::from_fn(|t| sq0[r][t] + sq2[r][t]));
+    let (fk1, sq1) = dot_pair_two_rows_four_tokens_lane(neon, st0, st1, keys, queries, 4);
+    let (fk3, sq3) = dot_pair_two_rows_four_tokens_lane(neon, st0, st1, keys, queries, 12);
+    let mut out_k: [[f32; 4]; 2] = std::array::from_fn(|r| {
+        std::array::from_fn(|t| (key_even_pair[r][t] + (fk1[r][t] + fk3[r][t])).reduce_sum())
+    });
+    let mut out_q: [[f32; 4]; 2] = std::array::from_fn(|r| {
+        std::array::from_fn(|t| (query_even_pair[r][t] + (sq1[r][t] + sq3[r][t])).reduce_sum())
+    });
+    for idx in vectorized..len {
+        let a = st0[idx];
+        let b = st1[idx];
+        for t in 0..4 {
+            let k = keys[t][idx];
+            let q = queries[t][idx];
+            out_k[0][t] += a * k;
+            out_q[0][t] += a * q;
+            out_k[1][t] += b * k;
+            out_q[1][t] += b * q;
+        }
+    }
+    (out_k, out_q)
+}
+
+/// Computes `(dot(states[r], key_t), dot(states[r], query_t))` across eight state rows for up
+/// to 32 tokens, batching two state rows by four tokens across quarter-stride vector passes
+/// (<= 22 NEON registers, zero spills, 0-ULP bit-exact with `dot_pair_eight_rows`).
+#[inline]
+pub(super) fn dot_pair_eight_rows_tokens(
+    states: [&[f32]; 8],
+    tokens: &[(&[f32], &[f32])],
+    key_dots: &mut [[f32; 32]; 8],
+    query_dots: &mut [[f32; 32]; 8],
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let (chunks4, remainder) = tokens.as_chunks::<4>();
+    for (chunk_idx, chunk) in chunks4.iter().enumerate() {
+        let base_t = chunk_idx * 4;
+        let keys = [chunk[0].0, chunk[1].0, chunk[2].0, chunk[3].0];
+        let queries = [chunk[0].1, chunk[1].1, chunk[2].1, chunk[3].1];
+        for pair in 0..4 {
+            let r0 = pair * 2;
+            let (out_k, out_q) =
+                dot_pair_two_rows_four_tokens(neon, states[r0], states[r0 + 1], keys, queries);
+            for t in 0..4 {
+                key_dots[r0][base_t + t] = out_k[0][t];
+                query_dots[r0][base_t + t] = out_q[0][t];
+                key_dots[r0 + 1][base_t + t] = out_k[1][t];
+                query_dots[r0 + 1][base_t + t] = out_q[1][t];
+            }
+        }
+    }
+    let rem_base = chunks4.len() * 4;
+    for (offset, &(first, second)) in remainder.iter().enumerate() {
+        let token = rem_base + offset;
+        let Some(pairs) = dot_pair_eight_rows(states, first, second) else {
+            return false;
+        };
+        for (row, &(k_val, q_val)) in pairs.iter().enumerate() {
+            key_dots[row][token] = k_val;
+            query_dots[row][token] = q_val;
+        }
+    }
+    true
+}
+
 /// Computes `(dot(states[r], first), dot(states[r], second))` across four state rows in two
 /// spill-free two-row passes, sharing `first` and `second` vector loads per pair.
 #[inline]

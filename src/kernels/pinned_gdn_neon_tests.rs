@@ -1286,3 +1286,74 @@ fn pinned_gdn_neon_state_only_rejects_nonfinite_and_masked_overflow() -> Result<
     }
     Ok(())
 }
+
+#[test]
+fn pinned_gdn_neon_dot_pair_eight_rows_tokens_matches_single_zero_ulp() -> Result<()> {
+    for width in [4_usize, 15, 16, 32, 64, 128, 131] {
+        let mut state_buf = values(width * 8);
+        state_buf[0] = -0.0;
+        state_buf[width - 1] = f32::from_bits(1);
+        state_buf[7 * width] = -f32::MIN_POSITIVE;
+        let states: [&[f32]; 8] = std::array::from_fn(|r| &state_buf[r * width..(r + 1) * width]);
+        let keys: Vec<Vec<f32>> = (0..32)
+            .map(|t| {
+                let mut v = values(width);
+                v.rotate_left(t % width);
+                v[0] = if t % 2 == 0 { -0.0 } else { 0.0 };
+                v
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..32)
+            .map(|t| {
+                let mut v = values(width);
+                v.rotate_right((t * 3 + 1) % width);
+                v[width - 1] = -f32::from_bits(1);
+                v
+            })
+            .collect();
+        let all_pairs: Vec<(&[f32], &[f32])> = keys
+            .iter()
+            .zip(&queries)
+            .map(|(k, q)| (k.as_slice(), q.as_slice()))
+            .collect();
+        for count in [1_usize, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32] {
+            let mut key_dots = [[f32::NAN; 32]; 8];
+            let mut query_dots = [[f32::NAN; 32]; 8];
+            assert!(super::dot_pair_eight_rows_tokens(
+                states,
+                &all_pairs[..count],
+                &mut key_dots,
+                &mut query_dots,
+            ));
+            for token in 0..count {
+                let single = super::dot_pair_eight_rows(states, &keys[token], &queries[token])
+                    .ok_or_else(|| invalid("baseline NEON was unavailable"))?;
+                for row in 0..8 {
+                    let scalar_k = dot_scalar(states[row], &keys[token])?;
+                    let scalar_q = dot_scalar(states[row], &queries[token])?;
+                    assert_eq!(
+                        key_dots[row][token].to_bits(),
+                        single[row].0.to_bits(),
+                        "k vs single mismatch width={width} count={count} tok={token} row={row}"
+                    );
+                    assert_eq!(
+                        query_dots[row][token].to_bits(),
+                        single[row].1.to_bits(),
+                        "q vs single mismatch width={width} count={count} tok={token} row={row}"
+                    );
+                    assert_eq!(
+                        key_dots[row][token].to_bits(),
+                        scalar_k.to_bits(),
+                        "k vs scalar mismatch width={width} count={count} tok={token} row={row}"
+                    );
+                    assert_eq!(
+                        query_dots[row][token].to_bits(),
+                        scalar_q.to_bits(),
+                        "q vs scalar mismatch width={width} count={count} tok={token} row={row}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}

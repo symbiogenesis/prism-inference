@@ -5,7 +5,7 @@ use crate::graph::{
     ActiveAdapters, Arithmetic, Geometry, LayerDelta, LayerState, RecurrentAttention, Transforms,
     copy_into, finite, l2_norm, resize_into, sigmoid, small_float,
 };
-use crate::kernels::pinned_gdn::ChunkInput as Input;
+use crate::kernels::pinned_gdn::{ChunkInput as Input, StateStepInput};
 use crate::kernels::prefill::ProjectionTile;
 use crate::kernels::{
     RmsNormWeights, add_scaled_slice_in_place, gdn_wy_update_eight_rows, gdn_wy_update_four_rows,
@@ -272,6 +272,47 @@ fn head_into_eight_row_block_scalar(
     target_env = "msvc",
     target_feature = "neon"
 ))]
+fn collect_eight_row_state_dots(
+    arithmetic: Arithmetic,
+    states: [&[f32]; 8],
+    inputs: &[Input<'_>],
+    key_dots: &mut [[f32; 32]; 8],
+    query_dots: &mut [[f32; 32]; 8],
+) -> Result<()> {
+    match arithmetic {
+        Arithmetic::PinnedSwift => {
+            let count = inputs.len();
+            let mut pairs = [(&[][..], &[][..]); 32];
+            for (slot, input) in pairs[..count].iter_mut().zip(inputs) {
+                *slot = (input.key, input.query);
+            }
+            crate::kernels::pinned_gdn::dot_pair_eight_rows_tokens(
+                states,
+                &pairs[..count],
+                key_dots,
+                query_dots,
+            )
+        }
+        Arithmetic::Source => {
+            for (token, input) in inputs.iter().enumerate() {
+                let pairs = arithmetic.gdn_dot_pair_eight_rows(states, input.key, input.query)?;
+                for row in 0..8 {
+                    key_dots[row][token] = pairs[row].0;
+                    query_dots[row][token] = pairs[row].1;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
 #[expect(
     clippy::too_many_arguments,
     reason = "Matches the scalar 8-row triangular WY helper contract without altering buffer ownership."
@@ -300,20 +341,49 @@ fn head_into_eight_row_block_neon(
     let mut deltas_lo = [zero; 32];
     let mut deltas_hi = [zero; 32];
     let scale_vec = f32x4::splat(neon, scale);
+    let mut key_dots = [[0.0_f32; 32]; 8];
+    let mut query_dots = [[0.0_f32; 32]; 8];
+    collect_eight_row_state_dots(arithmetic, states, inputs, &mut key_dots, &mut query_dots)?;
 
     for token in 0..count {
-        let pairs =
-            arithmetic.gdn_dot_pair_eight_rows(states, inputs[token].key, inputs[token].query)?;
         let cum_vec = f32x4::splat(neon, cumulative[token]);
         let beta_vec = f32x4::splat(neon, inputs[token].beta);
-        let key_dots_lo =
-            f32x4::from_slice(neon, &[pairs[0].0, pairs[1].0, pairs[2].0, pairs[3].0]);
-        let key_dots_hi =
-            f32x4::from_slice(neon, &[pairs[4].0, pairs[5].0, pairs[6].0, pairs[7].0]);
-        let query_dots_lo =
-            f32x4::from_slice(neon, &[pairs[0].1, pairs[1].1, pairs[2].1, pairs[3].1]);
-        let query_dots_hi =
-            f32x4::from_slice(neon, &[pairs[4].1, pairs[5].1, pairs[6].1, pairs[7].1]);
+        let key_dots_lo = f32x4::from_slice(
+            neon,
+            &[
+                key_dots[0][token],
+                key_dots[1][token],
+                key_dots[2][token],
+                key_dots[3][token],
+            ],
+        );
+        let key_dots_hi = f32x4::from_slice(
+            neon,
+            &[
+                key_dots[4][token],
+                key_dots[5][token],
+                key_dots[6][token],
+                key_dots[7][token],
+            ],
+        );
+        let query_dots_lo = f32x4::from_slice(
+            neon,
+            &[
+                query_dots[0][token],
+                query_dots[1][token],
+                query_dots[2][token],
+                query_dots[3][token],
+            ],
+        );
+        let query_dots_hi = f32x4::from_slice(
+            neon,
+            &[
+                query_dots[4][token],
+                query_dots[5][token],
+                query_dots[6][token],
+                query_dots[7][token],
+            ],
+        );
 
         let mut pred_lo = cum_vec * key_dots_lo;
         let mut pred_hi = cum_vec * key_dots_hi;
@@ -348,11 +418,36 @@ fn head_into_eight_row_block_neon(
         out_lo.store_slice(&mut output[out_base..out_base + 4]);
         out_hi.store_slice(&mut output[out_base + 4..out_base + 8]);
     }
+    scatter_scaled_deltas_neon(
+        neon,
+        &last_products[..count],
+        &deltas_lo[..count],
+        &deltas_hi[..count],
+        scaled_deltas,
+    );
+    Ok(true)
+}
 
-    for (prior, ((&lp_scalar, &d_lo), &d_hi)) in last_products[..count]
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn scatter_scaled_deltas_neon(
+    neon: fearless_simd::Neon,
+    last_products: &[f32],
+    deltas_lo: &[fearless_simd::f32x4<fearless_simd::Neon>],
+    deltas_hi: &[fearless_simd::f32x4<fearless_simd::Neon>],
+    scaled_deltas: &mut [[f32; 32]; 8],
+) {
+    use fearless_simd::{f32x4, prelude::*};
+
+    for (prior, ((&lp_scalar, &d_lo), &d_hi)) in last_products
         .iter()
-        .zip(&deltas_lo[..count])
-        .zip(&deltas_hi[..count])
+        .zip(deltas_lo)
+        .zip(deltas_hi)
         .enumerate()
     {
         let lp = f32x4::splat(neon, lp_scalar);
@@ -367,7 +462,6 @@ fn head_into_eight_row_block_neon(
             slot[prior] = val;
         }
     }
-    Ok(true)
 }
 
 #[expect(
@@ -887,13 +981,64 @@ fn advance_convolution_history(
     Ok(())
 }
 
-const EMPTY_GDN_INPUT: Input<'static> = Input {
-    query: &[],
-    key: &[],
-    value: &[],
-    decay: 0.0,
-    beta: 0.0,
-};
+fn flush_carry_single_head(
+    layer_tape: &FoldedRecurrentLayerTape,
+    head_index: usize,
+    kept: usize,
+    arithmetic: Arithmetic,
+    prev_head: &[f32],
+    head_matrix: &mut [f32],
+) -> Result<()> {
+    let width = layer_tape.ssm_head;
+    let num_keys = layer_tape.ssm_keys;
+    let num_heads = layer_tape.ssm_values;
+    let key_width = layer_tape.key_width;
+    let value_width = layer_tape.value_width;
+    let mut step_inputs = [StateStepInput {
+        key: &[],
+        value: &[],
+        decay: 0.0,
+        beta: 0.0,
+    }; crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS];
+    let key_head = head_index % num_keys;
+    for (token, slot) in step_inputs[..kept].iter_mut().enumerate() {
+        let k_start = token * key_width + key_head * width;
+        let v_start = token * value_width + head_index * width;
+        let decay = layer_tape.carried_decay[token * num_heads + head_index];
+        let beta = layer_tape.carried_beta[token * num_heads + head_index];
+        if !decay.is_finite()
+            || !beta.is_finite()
+            || !(0.0..=1.0).contains(&decay)
+            || !(0.0..=1.0).contains(&beta)
+        {
+            return Err(invalid("invalid carried GDN gate bounds"));
+        }
+        *slot = StateStepInput {
+            key: &layer_tape.carried_keys[k_start..k_start + width],
+            value: &layer_tape.carried_values[v_start..v_start + width],
+            decay,
+            beta,
+        };
+    }
+    if matches!(arithmetic, Arithmetic::PinnedSwift) && width >= 4 {
+        super::step_recurrent_state_only_head_pinned(
+            arithmetic,
+            &step_inputs[..kept],
+            width,
+            prev_head,
+            head_matrix,
+        )
+    } else {
+        super::step_recurrent_state_only_rows_single(
+            arithmetic,
+            &step_inputs[..kept],
+            0,
+            width,
+            prev_head,
+            head_matrix,
+        )
+    }
+}
 
 #[expect(
     clippy::too_many_arguments,
@@ -906,91 +1051,47 @@ fn flush_carry_heads(
     geometry: &Geometry,
     arithmetic: Arithmetic,
     projector: &ProjectionTile,
-    head_outputs: &mut Vec<f32>,
+    _head_outputs: &mut Vec<f32>,
     kept: usize,
 ) -> Result<()> {
     let width = geometry.ssm_head;
     let head_state_len = width * width;
     let num_heads = geometry.ssm_values;
-    let num_keys = geometry.ssm_keys;
-    let key_width = layer_tape.key_width;
-    let value_width = layer_tape.value_width;
 
     if projector.row_parallelism().workers() > 1 && num_heads > 1 {
-        let head_out_len = kept * width;
-        resize_into(num_heads * head_out_len, head_outputs)?;
-        let keys_ref: &[f32] = &layer_tape.carried_keys;
-        let values_ref: &[f32] = &layer_tape.carried_values;
-        let decay_ref: &[f32] = &layer_tape.carried_decay;
-        let beta_ref: &[f32] = &layer_tape.carried_beta;
-        projector.row_parallelism().update_paired_chunks(
+        return projector.row_parallelism().update_chunks(
             matrix,
             head_state_len,
-            head_outputs,
-            head_out_len,
-            |base_head, matrix_chunk, out_chunk| {
-                let mut inputs =
-                    [EMPTY_GDN_INPUT; crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS];
-                for (offset, (head_matrix, head_out)) in matrix_chunk
-                    .chunks_exact_mut(head_state_len)
-                    .zip(out_chunk.chunks_exact_mut(head_out_len))
-                    .enumerate()
+            |base_head, matrix_chunk| {
+                for (offset, head_matrix) in
+                    matrix_chunk.chunks_exact_mut(head_state_len).enumerate()
                 {
                     let head_index = base_head + offset;
-                    let key_head = head_index % num_keys;
-                    for (token, slot) in inputs[..kept].iter_mut().enumerate() {
-                        let k_start = token * key_width + key_head * width;
-                        let v_start = token * value_width + head_index * width;
-                        let k = &keys_ref[k_start..k_start + width];
-                        let v = &values_ref[v_start..v_start + width];
-                        *slot = Input {
-                            query: k,
-                            key: k,
-                            value: v,
-                            decay: decay_ref[token * num_heads + head_index],
-                            beta: beta_ref[token * num_heads + head_index],
-                        };
-                    }
                     let prev_head =
                         &previous[head_index * head_state_len..(head_index + 1) * head_state_len];
-                    exact_head_into(
+                    flush_carry_single_head(
+                        layer_tape,
+                        head_index,
+                        kept,
                         arithmetic,
                         prev_head,
-                        &inputs[..kept],
                         head_matrix,
-                        head_out,
                     )?;
                 }
                 Ok(())
             },
+        );
+    }
+    for (head_index, head_matrix) in matrix.chunks_exact_mut(head_state_len).enumerate() {
+        let range = head_index * head_state_len..(head_index + 1) * head_state_len;
+        flush_carry_single_head(
+            layer_tape,
+            head_index,
+            kept,
+            arithmetic,
+            &previous[range],
+            head_matrix,
         )?;
-    } else {
-        resize_into(kept * width, head_outputs)?;
-        let mut inputs = [EMPTY_GDN_INPUT; crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS];
-        for head_index in 0..num_heads {
-            let key_head = head_index % num_keys;
-            for (token, slot) in inputs[..kept].iter_mut().enumerate() {
-                let k_start = token * key_width + key_head * width;
-                let v_start = token * value_width + head_index * width;
-                let k = &layer_tape.carried_keys[k_start..k_start + width];
-                let v = &layer_tape.carried_values[v_start..v_start + width];
-                *slot = Input {
-                    query: k,
-                    key: k,
-                    value: v,
-                    decay: layer_tape.carried_decay[token * num_heads + head_index],
-                    beta: layer_tape.carried_beta[token * num_heads + head_index],
-                };
-            }
-            let range = head_index * head_state_len..(head_index + 1) * head_state_len;
-            exact_head_into(
-                arithmetic,
-                &previous[range.clone()],
-                &inputs[..kept],
-                &mut matrix[range],
-                head_outputs,
-            )?;
-        }
     }
     Ok(())
 }
@@ -2126,6 +2227,138 @@ mod tests {
         for width in [64_usize, 128] {
             for count in 1..=32_usize {
                 verify_eight_row_neon_case(width, count)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_folded_carry_flush_case(width: usize, kept: usize) -> Result<()> {
+        #[cfg(feature = "parallel-rows")]
+        let worker_counts = [1_usize, 4];
+        #[cfg(not(feature = "parallel-rows"))]
+        let worker_counts = [1_usize];
+        let num_keys = 2;
+        let num_values = 4;
+        let geometry = Geometry {
+            embedding: 16,
+            feed_forward: 16,
+            heads: 1,
+            kv_heads: 1,
+            head: 16,
+            rope: 4,
+            rope_sections: [2, 0, 0, 0],
+            rope_base: 10_000.0,
+            epsilon: 1e-6,
+            ssm_head: width,
+            ssm_keys: num_keys,
+            ssm_values: num_values,
+            convolution: 2,
+        };
+        let max_tokens = crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS;
+        let conv_width = geometry.convolution_width();
+        for arithmetic in [Arithmetic::PinnedSwift, Arithmetic::Source] {
+            let mut initial_conv = vec![0.125_f32; conv_width];
+            initial_conv[0] = -0.0;
+            let mut initial_matrix = vec![0.0_f32; num_values * width * width];
+            for (i, slot) in initial_matrix.iter_mut().enumerate() {
+                *slot = (f32::from(i8::try_from(i % 13).unwrap_or(0)) - 6.0) * 0.03125;
+            }
+            let mut tape = FoldedRecurrentLayerTape::new(max_tokens, &geometry)?;
+            for tok in 0..kept {
+                for c in 0..conv_width {
+                    tape.carried_raw_conv
+                        .push((f32::from(i8::try_from((tok + c) % 7).unwrap_or(0)) - 3.0) * 0.125);
+                }
+                for c in 0..geometry.key_width() {
+                    tape.carried_keys.push(
+                        (f32::from(i8::try_from((tok * 3 + c) % 9).unwrap_or(0)) - 4.0) * 0.0625,
+                    );
+                }
+                for c in 0..geometry.value_width() {
+                    tape.carried_values.push(
+                        (f32::from(i8::try_from((tok * 5 + c) % 9).unwrap_or(0)) - 4.0) * 0.0625,
+                    );
+                }
+                for h in 0..num_values {
+                    tape.carried_decay
+                        .push([0.875_f32, 0.0, 0.5, 1.0][(tok + h) % 4]);
+                    tape.carried_beta
+                        .push([0.625_f32, 0.25, 0.0, 0.75][(tok + h) % 4]);
+                }
+            }
+            tape.carried_len = kept;
+
+            let head_state_len = width * width;
+            let mut ref_matrix = vec![0.0_f32; initial_matrix.len()];
+            let mut ref_head_out = vec![0.0_f32; kept * width];
+            for head_idx in 0..num_values {
+                let key_head = head_idx % num_keys;
+                let head_inputs: Vec<Input<'_>> = (0..kept)
+                    .map(|tok| {
+                        let ks = tok * tape.key_width + key_head * width;
+                        let vs = tok * tape.value_width + head_idx * width;
+                        let k = &tape.carried_keys[ks..ks + width];
+                        Input {
+                            query: k,
+                            key: k,
+                            value: &tape.carried_values[vs..vs + width],
+                            decay: tape.carried_decay[tok * num_values + head_idx],
+                            beta: tape.carried_beta[tok * num_values + head_idx],
+                        }
+                    })
+                    .collect();
+                let r = head_idx * head_state_len..(head_idx + 1) * head_state_len;
+                exact_head_into(
+                    arithmetic,
+                    &initial_matrix[r.clone()],
+                    &head_inputs,
+                    &mut ref_matrix[r],
+                    &mut ref_head_out,
+                )?;
+            }
+
+            for workers in worker_counts {
+                let mut test_tape = tape.clone();
+                let mut state = LayerState::Recurrent {
+                    convolution: initial_conv.clone(),
+                    matrix: initial_matrix.clone(),
+                };
+                let mut delta = LayerDelta::Recurrent {
+                    convolution: Vec::new(),
+                    matrix: Vec::new(),
+                };
+                let mut projector =
+                    ProjectionTile::with_backend(crate::kernels::MatvecBackend::Scalar);
+                projector.set_row_parallelism(crate::kernels::RowParallelism::new(workers)?);
+                let mut scratch_out = Vec::new();
+                flush_recurrent_carry_layer(
+                    &mut test_tape,
+                    &mut state,
+                    &mut delta,
+                    &geometry,
+                    arithmetic,
+                    &projector,
+                    &mut scratch_out,
+                )?;
+                let LayerState::Recurrent { matrix, .. } = state else {
+                    return Err(invalid("expected recurrent state"));
+                };
+                assert!(scratch_out.is_empty());
+                assert_eq!(
+                    matrix.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    ref_matrix.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "carry flush mismatch width={width} kept={kept} workers={workers}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn folded_carry_flush_state_only_matches_exact_head_zero_ulp() -> Result<()> {
+        for width in [32_usize, 64, 128, 131] {
+            for kept in 1..=crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS {
+                check_folded_carry_flush_case(width, kept)?;
             }
         }
         Ok(())

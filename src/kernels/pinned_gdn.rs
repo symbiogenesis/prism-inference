@@ -205,6 +205,70 @@ pub(crate) fn dot_pair_eight_rows(
     ])
 }
 
+/// Computes `(dot(states[r], key_t), dot(states[r], query_t))` across eight state rows for
+/// each `(key_t, query_t)` pair in `tokens`, writing into stack-shaped `key_dots` and `query_dots`.
+///
+/// # Errors
+/// Rejects batches exceeding 32 tokens, mismatched vector lengths, or a nonfinite result.
+#[cfg_attr(
+    not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )),
+    expect(
+        dead_code,
+        reason = "Dispatched from NEON 8-row GDN prefill and NEON parity tests."
+    )
+)]
+pub(crate) fn dot_pair_eight_rows_tokens(
+    states: [&[f32]; 8],
+    tokens: &[(&[f32], &[f32])],
+    key_dots: &mut [[f32; 32]; 8],
+    query_dots: &mut [[f32; 32]; 8],
+) -> Result<()> {
+    if tokens.len() > 32 {
+        return Err(invalid("pinned GDN batch exceeds 32-token chunk limit"));
+    }
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let width = tokens[0].0.len();
+    if states.iter().any(|state| state.len() != width)
+        || tokens
+            .iter()
+            .any(|(key, query)| key.len() != width || query.len() != width)
+    {
+        return Err(invalid("pinned GDN dot requires matching vectors"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::dot_pair_eight_rows_tokens(states, tokens, key_dots, query_dots) {
+        for token in 0..tokens.len() {
+            for row in 0..8 {
+                key_dots[row][token] = super::finite(key_dots[row][token])?;
+                query_dots[row][token] = super::finite(query_dots[row][token])?;
+            }
+        }
+        return Ok(());
+    }
+    for (token, &(first, second)) in tokens.iter().enumerate() {
+        let pairs = dot_pair_eight_rows(states, first, second)?;
+        for row in 0..8 {
+            key_dots[row][token] = pairs[row].0;
+            query_dots[row][token] = pairs[row].1;
+        }
+    }
+    Ok(())
+}
+
 // Floating matrix projections deliberately retain scalar diagnostics and their
 // explicit scalar policy. Only the graph's pinned GDN helper selects NEON.
 #[expect(

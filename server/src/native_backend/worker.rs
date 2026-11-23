@@ -7,7 +7,7 @@ use super::{
 use bonsai_prism_runtime::{
     graph::KvCachePolicy,
     runtime::{Cancellation, Completion, GenerationTimings},
-    swift_session::{SwiftSession, TextEvent},
+    swift_session::{RichTextEvent, SwiftSession, TextEvent, TokenLogprobInfo},
 };
 use std::{
     path::{Path, PathBuf},
@@ -46,6 +46,21 @@ pub(super) trait Engine: Send + 'static {
         deadline: Option<Instant>,
         emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
     ) -> bonsai_prism_runtime::Result<Completion>;
+    fn complete_rich(
+        &mut self,
+        prepared: &Self::Prepared,
+        cancel: &Cancellation,
+        deadline: Option<Instant>,
+        mut emit: impl FnMut(RichTextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+    ) -> bonsai_prism_runtime::Result<Completion> {
+        self.complete(prepared, cancel, deadline, |event| match event {
+            TextEvent::Delta(text) => emit(RichTextEvent::Delta {
+                text,
+                logprobs: None,
+            }),
+            TextEvent::Complete(value) => emit(RichTextEvent::Complete(value)),
+        })
+    }
     fn reset(&mut self) -> bonsai_prism_runtime::Result<()>;
     fn initialize_worker_thread(&mut self) -> Result<ProjectionStartup, NativeBackendError> {
         Ok(ProjectionStartup::Cpu)
@@ -128,10 +143,25 @@ impl Engine for SwiftSession {
         deadline: Option<Instant>,
         mut emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
     ) -> bonsai_prism_runtime::Result<Completion> {
+        Engine::complete_rich(self, prepared, cancel, deadline, |event| match event {
+            RichTextEvent::Delta { text, .. } if !text.is_empty() => emit(TextEvent::Delta(text)),
+            RichTextEvent::Delta { .. } => Ok(()),
+            RichTextEvent::Complete(value) => emit(TextEvent::Complete(value)),
+        })
+    }
+    fn complete_rich(
+        &mut self,
+        prepared: &Self::Prepared,
+        cancel: &Cancellation,
+        deadline: Option<Instant>,
+        mut emit: impl FnMut(RichTextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+    ) -> bonsai_prism_runtime::Result<Completion> {
         let started = Instant::now();
         let mut first_text = None;
-        let mut observe = |event: TextEvent<'_>| {
-            if matches!(event, TextEvent::Delta(text) if !text.is_empty()) && first_text.is_none() {
+        let mut observe = |event: RichTextEvent<'_>| {
+            if matches!(event, RichTextEvent::Delta { text, .. } if !text.is_empty())
+                && first_text.is_none()
+            {
                 first_text = Some(started.elapsed());
             }
             emit(event)
@@ -139,7 +169,7 @@ impl Engine for SwiftSession {
         let mut timings = GenerationTimings::default();
         let measured = self.cpu_speculation().is_none();
         let result = if measured {
-            crate::native_swift::complete_with_timings(
+            crate::native_swift::complete_rich_with_timings(
                 self,
                 prepared,
                 cancel,
@@ -148,7 +178,7 @@ impl Engine for SwiftSession {
                 &mut observe,
             )
         } else {
-            crate::native_swift::complete(self, prepared, cancel, deadline, &mut observe)
+            crate::native_swift::complete_rich(self, prepared, cancel, deadline, &mut observe)
         };
         let _ = super::diagnostics::write_generation(
             &mut std::io::stderr().lock(),
@@ -1379,7 +1409,10 @@ pub(super) enum Output {
         streaming: bool,
         thinking: bool,
     },
-    Delta(String),
+    Delta {
+        text: String,
+        confidence: Option<TokenLogprobInfo>,
+    },
     Complete(Completion),
     Reset,
     Done(Result<(), NativeBackendError>),
@@ -1743,10 +1776,13 @@ impl<E: Engine> State<E> {
             },
         )?;
         self.engine
-            .complete(&prepared, &context.cancel, context.deadline, |event| {
+            .complete_rich(&prepared, &context.cancel, context.deadline, |event| {
                 let output = match event {
-                    TextEvent::Delta(text) => Output::Delta(text.to_owned()),
-                    TextEvent::Complete(value) => Output::Complete(value),
+                    RichTextEvent::Delta { text, logprobs } => Output::Delta {
+                        text: text.to_owned(),
+                        confidence: logprobs,
+                    },
+                    RichTextEvent::Complete(value) => Output::Complete(value),
                 };
                 acknowledge(context, output).map_err(|_| {
                     std::io::Error::other("native output acknowledgement failed").into()

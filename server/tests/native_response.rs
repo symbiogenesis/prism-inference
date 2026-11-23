@@ -2,7 +2,10 @@
 
 #![forbid(unsafe_code)]
 
-use bonsai_prism_runtime::runtime::{Completion, Finish};
+use bonsai_prism_runtime::{
+    runtime::{Completion, Finish},
+    swift_session::{TokenLogprobEntry, TokenLogprobInfo},
+};
 use prism_inference_server::{
     native_response::NativeResponse,
     response::{MAX_RESPONSE_BYTES, ResponseError},
@@ -319,6 +322,57 @@ fn native_output_bounds_framing_expansion_and_client_write_time() -> TestResult 
             Err(ResponseError::Deadline)
         );
         assert_eq!(Instant::now() - start, Duration::from_secs(5));
+        Ok(())
+    })
+}
+
+#[test]
+fn native_output_streams_optional_logprobs_only_when_supplied() -> TestResult {
+    run(async {
+        let (client, state) = writer();
+        let mut output =
+            NativeResponse::new(client, true, 100, Instant::now() + Duration::from_mins(1));
+        output
+            .delta_with_confidence("plain", None)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let conf = TokenLogprobInfo {
+            token: "hi".to_owned(),
+            logprob: -0.25,
+            top_logprobs: vec![TokenLogprobEntry {
+                token: "hi".to_owned(),
+                logprob: -0.25,
+            }],
+        };
+        output
+            .delta_with_confidence("hi", Some(conf.clone()))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        output
+            .delta_with_confidence("", Some(conf))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        output
+            .complete(completion(Finish::Stop))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let decoded = body(&state.borrow().bytes, true)?;
+        let sse = std::str::from_utf8(&decoded)?;
+        let frames: Vec<Value> = sse
+            .split("\n\n")
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(frames[1]["choices"][0].get("logprobs").is_none());
+        assert_eq!(
+            frames[2]["choices"][0]["logprobs"]["content"][0]["token"],
+            "hi"
+        );
+        assert_eq!(
+            frames[3]["choices"][0]["logprobs"]["content"][0]["token"],
+            "hi"
+        );
         Ok(())
     })
 }

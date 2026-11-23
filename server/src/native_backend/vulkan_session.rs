@@ -428,12 +428,19 @@ mod platform {
                     .map_err(|_| Rejection::ChatSchema)?;
                 validate_multi_rank_scale(has_multi_rank, request.multi_rank_scale)
                     .map_err(|_| Rejection::ChatSchema)?;
+                if !request.sampler.is_canonical_default_sampling()
+                    || request.sampler.reasoning_budget.is_some()
+                    || request.sampler.top_logprobs.is_some()
+                {
+                    return Err(Rejection::ChatSchema);
+                }
                 let prompt = self
                     .chat
-                    .prepare_with_thinking(
+                    .prepare_with_effort(
                         request.messages,
                         request.output_tokens,
                         request.enable_thinking,
+                        request.reasoning_effort,
                     )
                     .map_err(|error| {
                         crate::native_swift::classify_preparation_error(error.as_ref())

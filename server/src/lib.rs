@@ -272,27 +272,40 @@ impl AuthorizedHead {
             return Err(Rejection::CompletionLimit);
         }
         let max_completion_tokens = chat.max_completion_tokens;
-        let body = serde_json::to_vec(&BackendChat {
-            messages: &chat.messages,
-            max_completion_tokens,
-            stream: chat.stream,
-            n: 1,
-            cache_prompt: false,
-            n_cache_reuse: 0,
-            ignore_eos: false,
-            temperature: 1.0,
-            top_p: 0.95,
-            top_k: 20,
-            min_p: 0.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repeat_penalty: 1.0,
-            chat_template_kwargs: ChatTemplateKwargs {
-                enable_thinking: true,
-                reasoning_effort: "xhigh",
-                preserve_thinking: true,
-            },
+        let controls = validate_cognitive_controls(CognitiveControlInput {
+            temperature: chat.temperature.unwrap_or(1.0),
+            top_p: chat.top_p.unwrap_or(0.95),
+            top_k: chat.top_k.unwrap_or(20),
+            min_p: chat.min_p.unwrap_or(0.0),
+            presence_penalty: chat.presence_penalty.unwrap_or(0.0),
+            frequency_penalty: chat.frequency_penalty.unwrap_or(0.0),
+            repeat_penalty: chat.repeat_penalty.unwrap_or(1.0),
+            enable_thinking: chat
+                .chat_template_kwargs
+                .as_ref()
+                .and_then(|Object(kwargs)| kwargs.enable_thinking)
+                .unwrap_or(true),
+            reasoning_effort: resolve_client_reasoning_effort(
+                chat.reasoning_effort.as_deref(),
+                chat.chat_template_kwargs
+                    .as_ref()
+                    .and_then(|Object(kwargs)| kwargs.reasoning_effort.as_deref()),
+            )?,
+            preserve_thinking: chat
+                .chat_template_kwargs
+                .as_ref()
+                .and_then(|Object(kwargs)| kwargs.preserve_thinking)
+                .unwrap_or(true),
+            reasoning_budget: chat.reasoning_budget,
+            dry_multiplier: chat.dry_multiplier,
+            dry_base: chat.dry_base,
+            dry_allowed_length: chat.dry_allowed_length,
+            dry_penalty_last_n: chat.dry_penalty_last_n,
+            logprobs: chat.logprobs,
+            top_logprobs: chat.top_logprobs,
         })
+        .ok_or(Rejection::ChatSchema)?;
+        let body = serde_json::to_vec(&controls.to_backend_chat(&chat.messages, max_completion_tokens, chat.stream))
         .map_err(|_| Rejection::ChatSchema)?;
         Ok(PendingChat {
             body,
@@ -304,6 +317,15 @@ impl AuthorizedHead {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ClientTemplateKwargs<'a> {
+    enable_thinking: Option<bool>,
+    #[serde(borrow)]
+    reasoning_effort: Option<Cow<'a, str>>,
+    preserve_thinking: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClientChat<'a> {
     #[serde(borrow, deserialize_with = "deserialize_messages")]
     messages: Vec<Message<'a>>,
@@ -311,6 +333,38 @@ struct ClientChat<'a> {
     max_completion_tokens: u32,
     #[serde(default = "default_stream")]
     stream: bool,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    repeat_penalty: Option<f32>,
+    #[serde(default, borrow)]
+    reasoning_effort: Option<Cow<'a, str>>,
+    #[serde(default)]
+    reasoning_budget: Option<u32>,
+    #[serde(default)]
+    dry_multiplier: Option<f32>,
+    #[serde(default)]
+    dry_base: Option<f32>,
+    #[serde(default)]
+    dry_allowed_length: Option<u32>,
+    #[serde(default)]
+    dry_penalty_last_n: Option<u32>,
+    #[serde(default)]
+    logprobs: Option<bool>,
+    #[serde(default)]
+    top_logprobs: Option<u8>,
+    #[serde(default, borrow)]
+    chat_template_kwargs: Option<Object<ClientTemplateKwargs<'a>>>,
 }
 
 const fn default_cap() -> u32 {
@@ -792,11 +846,25 @@ struct BackendChat<'a, 'b> {
     ignore_eos: bool,
     temperature: f32,
     top_p: f32,
-    top_k: u8,
+    top_k: u32,
     min_p: f32,
     presence_penalty: f32,
     frequency_penalty: f32,
     repeat_penalty: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_multiplier: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_base: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_allowed_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_penalty_last_n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_logprobs: Option<u8>,
     chat_template_kwargs: ChatTemplateKwargs,
 }
 
@@ -805,6 +873,170 @@ struct ChatTemplateKwargs {
     enable_thinking: bool,
     reasoning_effort: &'static str,
     preserve_thinking: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CognitiveControlInput<'a> {
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    min_p: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    repeat_penalty: f32,
+    enable_thinking: bool,
+    reasoning_effort: &'a str,
+    preserve_thinking: bool,
+    reasoning_budget: Option<u32>,
+    dry_multiplier: Option<f32>,
+    dry_base: Option<f32>,
+    dry_allowed_length: Option<u32>,
+    dry_penalty_last_n: Option<u32>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<u8>,
+}
+
+struct ValidatedCognitiveControls {
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    min_p: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    repeat_penalty: f32,
+    enable_thinking: bool,
+    reasoning_effort: &'static str,
+    reasoning_budget: Option<u32>,
+    dry_multiplier: Option<f32>,
+    dry_base: Option<f32>,
+    dry_allowed_length: Option<u32>,
+    dry_penalty_last_n: Option<u32>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<u8>,
+}
+
+impl ValidatedCognitiveControls {
+    const fn to_backend_chat<'a, 'b>(
+        &self,
+        messages: &'a [Message<'b>],
+        max_completion_tokens: u32,
+        stream: bool,
+    ) -> BackendChat<'a, 'b> {
+        BackendChat {
+            messages,
+            max_completion_tokens,
+            stream,
+            n: 1,
+            cache_prompt: false,
+            n_cache_reuse: 0,
+            ignore_eos: false,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            repeat_penalty: self.repeat_penalty,
+            reasoning_budget: self.reasoning_budget,
+            dry_multiplier: self.dry_multiplier,
+            dry_base: self.dry_base,
+            dry_allowed_length: self.dry_allowed_length,
+            dry_penalty_last_n: self.dry_penalty_last_n,
+            logprobs: self.logprobs,
+            top_logprobs: self.top_logprobs,
+            chat_template_kwargs: ChatTemplateKwargs {
+                enable_thinking: self.enable_thinking,
+                reasoning_effort: self.reasoning_effort,
+                preserve_thinking: true,
+            },
+        }
+    }
+}
+
+fn resolve_client_reasoning_effort<'a>(
+    top_level: Option<&'a str>,
+    kwarg: Option<&'a str>,
+) -> Result<&'a str, Rejection> {
+    match (top_level, kwarg) {
+        (Some(a), Some(b)) if a != b => Err(Rejection::ChatSchema),
+        (Some(a), _) | (None, Some(a)) => Ok(a),
+        (None, None) => Ok("xhigh"),
+    }
+}
+
+const fn is_non_neg_zero_finite(value: f32) -> bool {
+    value.is_finite() && !(value == 0.0 && value.is_sign_negative())
+}
+
+fn validate_cognitive_controls(
+    input: CognitiveControlInput<'_>,
+) -> Option<ValidatedCognitiveControls> {
+    let effort = match input.reasoning_effort {
+        "low" => "low",
+        "medium" => "medium",
+        "xhigh" => "xhigh",
+        _ => return None,
+    };
+    let dry_active = input.dry_multiplier.is_some_and(|mult| mult > 0.0);
+    if !(input.preserve_thinking
+        && is_non_neg_zero_finite(input.temperature)
+        && 0.0 < input.temperature
+        && input.temperature <= 2.0
+        && is_non_neg_zero_finite(input.top_p)
+        && 0.0 < input.top_p
+        && input.top_p <= 1.0
+        && input.top_k <= 248_320
+        && is_non_neg_zero_finite(input.min_p)
+        && (0.0..=1.0).contains(&input.min_p)
+        && is_non_neg_zero_finite(input.presence_penalty)
+        && (-2.0..=2.0).contains(&input.presence_penalty)
+        && is_non_neg_zero_finite(input.frequency_penalty)
+        && (-2.0..=2.0).contains(&input.frequency_penalty)
+        && is_non_neg_zero_finite(input.repeat_penalty)
+        && 0.0 < input.repeat_penalty
+        && input.repeat_penalty <= 2.0
+        && input
+            .reasoning_budget
+            .is_none_or(|budget| (1..=262_144).contains(&budget))
+        && input
+            .dry_multiplier
+            .is_none_or(|mult| is_non_neg_zero_finite(mult) && (0.0..=4.0).contains(&mult))
+        && input
+            .dry_base
+            .is_none_or(|base| base.is_finite() && (1.0..=4.0).contains(&base))
+        && input.dry_allowed_length.is_none_or(|len| {
+            if dry_active {
+                (1..=64).contains(&len)
+            } else {
+                len <= 64
+            }
+        })
+        && input.dry_penalty_last_n.is_none_or(|n| n <= 8192)
+        && !(input.top_logprobs.is_some() && input.logprobs != Some(true))
+        && input
+            .top_logprobs
+            .is_none_or(|count| (1..=20).contains(&count)))
+    {
+        return None;
+    }
+    Some(ValidatedCognitiveControls {
+        temperature: input.temperature,
+        top_p: input.top_p,
+        top_k: input.top_k,
+        min_p: input.min_p,
+        presence_penalty: input.presence_penalty,
+        frequency_penalty: input.frequency_penalty,
+        repeat_penalty: input.repeat_penalty,
+        enable_thinking: input.enable_thinking,
+        reasoning_effort: effort,
+        reasoning_budget: input.reasoning_budget,
+        dry_multiplier: input.dry_multiplier,
+        dry_base: input.dry_base,
+        dry_allowed_length: input.dry_allowed_length,
+        dry_penalty_last_n: input.dry_penalty_last_n,
+        logprobs: input.logprobs,
+        top_logprobs: input.top_logprobs,
+    })
 }
 
 #[cfg(test)]

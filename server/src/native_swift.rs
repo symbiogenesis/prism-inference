@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use bonsai_prism_runtime::{
     runtime::{Cancellation, Completion},
-    swift_session::{PreparedChat, SwiftSession, TextEvent},
+    sampling::SwiftSamplerConfig,
+    swift_chat::ReasoningEffort,
+    swift_session::{PreparedChat, RichTextEvent, SwiftRequestOptions, SwiftSession, TextEvent},
 };
 
 use crate::{AdmittedChat, PendingChat, Rejection};
@@ -43,8 +45,42 @@ pub(crate) struct CanonicalRequest<'a> {
     pub(crate) messages: &'a serde_json::Value,
     pub(crate) output_tokens: usize,
     pub(crate) enable_thinking: bool,
+    pub(crate) reasoning_effort: ReasoningEffort,
     pub(crate) adapter_scale: Option<f32>,
     pub(crate) multi_rank_scale: Option<f32>,
+    pub(crate) sampler: SwiftSamplerConfig,
+}
+
+fn parse_f32_or_default(value: &serde_json::Value, key: &str, default: f32) -> Result<f32, Rejection> {
+    let Some(raw) = value.get(key) else {
+        return Ok(default);
+    };
+    let val = serde_json::from_value::<f32>(raw.clone()).map_err(|_| Rejection::ChatSchema)?;
+    if !val.is_finite() || (val == 0.0 && val.is_sign_negative()) {
+        return Err(Rejection::ChatSchema);
+    }
+    Ok(val)
+}
+
+fn parse_optional_f32(value: &serde_json::Value, key: &str) -> Result<Option<f32>, Rejection> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    let val = serde_json::from_value::<f32>(raw.clone()).map_err(|_| Rejection::ChatSchema)?;
+    if !val.is_finite() || (val == 0.0 && val.is_sign_negative()) {
+        return Err(Rejection::ChatSchema);
+    }
+    Ok(Some(val))
+}
+
+fn parse_optional_u32(value: &serde_json::Value, key: &str) -> Result<Option<u32>, Rejection> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    raw.as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .map(Some)
+        .ok_or(Rejection::ChatSchema)
 }
 
 pub(crate) fn parse_canonical_request(
@@ -53,9 +89,20 @@ pub(crate) fn parse_canonical_request(
     has_multi_rank: bool,
 ) -> Result<CanonicalRequest<'_>, Rejection> {
     let messages = value.get("messages").ok_or(Rejection::ChatSchema)?;
-    let enable_thinking = value["chat_template_kwargs"]["enable_thinking"]
-        .as_bool()
+    let kwargs = value
+        .get("chat_template_kwargs")
         .ok_or(Rejection::ChatSchema)?;
+    let enable_thinking = kwargs
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(Rejection::ChatSchema)?;
+    let reasoning_effort = match kwargs.get("reasoning_effort") {
+        None => ReasoningEffort::XHigh,
+        Some(raw) => {
+            let text = raw.as_str().ok_or(Rejection::ChatSchema)?;
+            ReasoningEffort::parse(text).map_err(|_| Rejection::ChatSchema)?
+        }
+    };
     let output_tokens = value
         .get("max_completion_tokens")
         .and_then(serde_json::Value::as_u64)
@@ -63,20 +110,81 @@ pub(crate) fn parse_canonical_request(
         .ok_or(Rejection::CompletionLimit)?;
     let (adapter_scale, multi_rank_scale) =
         parse_adapter_scales(value, has_rank_one, has_multi_rank)?;
+    let top_k = match value.get("top_k") {
+        None => SwiftSamplerConfig::default().top_k,
+        Some(raw) => raw
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or(Rejection::ChatSchema)?,
+    };
+    let logprobs = match value.get("logprobs") {
+        None => None,
+        Some(raw) => Some(raw.as_bool().ok_or(Rejection::ChatSchema)?),
+    };
+    let top_logprobs_raw = match value.get("top_logprobs") {
+        None => None,
+        Some(raw) => Some(
+            raw.as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or(Rejection::ChatSchema)?,
+        ),
+    };
+    let top_logprobs = match (logprobs, top_logprobs_raw) {
+        (Some(true), Some(n)) => Some(n),
+        (Some(true), None) => Some(1),
+        (None | Some(false), None) => None,
+        (None | Some(false), Some(_)) => return Err(Rejection::ChatSchema),
+    };
+    let defaults = SwiftSamplerConfig::default();
+    let mut sampler = SwiftSamplerConfig {
+        temperature: parse_f32_or_default(value, "temperature", defaults.temperature)?,
+        top_p: parse_f32_or_default(value, "top_p", defaults.top_p)?,
+        top_k,
+        min_p: parse_f32_or_default(value, "min_p", defaults.min_p)?,
+        presence_penalty: parse_f32_or_default(
+            value,
+            "presence_penalty",
+            defaults.presence_penalty,
+        )?,
+        frequency_penalty: parse_f32_or_default(
+            value,
+            "frequency_penalty",
+            defaults.frequency_penalty,
+        )?,
+        repeat_penalty: parse_f32_or_default(value, "repeat_penalty", defaults.repeat_penalty)?,
+        reasoning_budget: parse_optional_u32(value, "reasoning_budget")?,
+        top_logprobs,
+        ..defaults
+    };
+    if let Some(mult) = parse_optional_f32(value, "dry_multiplier")? {
+        sampler.dry_multiplier = mult;
+    }
+    if let Some(base) = parse_optional_f32(value, "dry_base")? {
+        sampler.dry_base = base;
+    }
+    if let Some(allowed) = parse_optional_u32(value, "dry_allowed_length")? {
+        sampler.dry_allowed_length = usize::try_from(allowed).map_err(|_| Rejection::ChatSchema)?;
+    }
+    if let Some(last_n) = parse_optional_u32(value, "dry_penalty_last_n")? {
+        sampler.dry_penalty_last_n = usize::try_from(last_n).map_err(|_| Rejection::ChatSchema)?;
+    }
+    sampler.validate().map_err(|_| Rejection::ChatSchema)?;
     Ok(CanonicalRequest {
         messages,
         output_tokens,
         enable_thinking,
+        reasoning_effort,
         adapter_scale,
         multi_rank_scale,
+        sampler,
     })
 }
 
 /// Render, tokenize and admit an already authenticated strict broker request.
 ///
-/// The existing broker canonicalization fixes sampling and selects thinking.
-/// Counting and execution share the prepared token allocation, and preserve the
-/// existing conservative template margin in addition to exact accounting.
+/// The existing broker canonicalization validates sampling, cognitive controls
+/// and thinking. Counting and execution share the prepared token allocation,
+/// and preserve the existing conservative template margin in addition to exact accounting.
 ///
 /// # Errors
 /// Returns value-free schema/count/context rejection; no prompt escapes in errors.
@@ -90,14 +198,15 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
             session.adapter_identity().is_some(),
             session.secondary_adapter_identity().is_some(),
         )?;
+        let options = SwiftRequestOptions {
+            enable_thinking: request.enable_thinking,
+            reasoning_effort: request.reasoning_effort,
+            adapter_scale: request.adapter_scale,
+            multi_rank_scale: request.multi_rank_scale,
+            sampler: request.sampler,
+        };
         let prompt = session
-            .prepare_with_adapter_scales(
-                request.messages,
-                request.output_tokens,
-                request.enable_thinking,
-                request.adapter_scale,
-                request.multi_rank_scale,
-            )
+            .prepare_with_options(request.messages, request.output_tokens, &options)
             .map_err(|error| classify_preparation_error(error.as_ref()))?;
         let count = prompt.prompt_tokens();
         prepared = Some(prompt);
@@ -229,6 +338,35 @@ pub fn complete_with_timings(
     emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
 ) -> bonsai_prism_runtime::Result<Completion> {
     session.complete_with_timings(&chat.prompt, cancellation, deadline, timings, emit)
+}
+
+/// Complete with optional per-token raw log-probability telemetry.
+///
+/// # Errors
+/// Returns the errors of [`complete`] with the same recovery semantics.
+pub fn complete_rich(
+    session: &mut SwiftSession,
+    chat: &NativeChat,
+    cancellation: &Cancellation,
+    deadline: impl Into<Option<Instant>>,
+    emit: impl FnMut(RichTextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+) -> bonsai_prism_runtime::Result<Completion> {
+    session.complete_rich(&chat.prompt, cancellation, deadline, emit)
+}
+
+/// Complete with value-free phase attribution and optional per-token raw log-probability telemetry.
+///
+/// # Errors
+/// Returns the errors of [`complete_with_timings`] with the same recovery semantics.
+pub fn complete_rich_with_timings(
+    session: &mut SwiftSession,
+    chat: &NativeChat,
+    cancellation: &Cancellation,
+    deadline: impl Into<Option<Instant>>,
+    timings: &mut bonsai_prism_runtime::runtime::GenerationTimings,
+    emit: impl FnMut(RichTextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+) -> bonsai_prism_runtime::Result<Completion> {
+    session.complete_rich_with_timings(&chat.prompt, cancellation, deadline, timings, emit)
 }
 
 #[cfg(test)]

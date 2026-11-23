@@ -262,6 +262,7 @@ impl ModelProfile {
             },
             "object": "model", "model_sha256": self.representation.model_sha256(),
             "template_sha256": swift::TEMPLATE_SHA256, "runtime": "prism-inference",
+            "supports_cognitive_controls": self.placement != Placement::Vulkan,
             "context_tokens": self.context_tokens, "seed": seed,
             "row_workers": self.row_workers,
             "startup_projection": self.projection_startup.readiness(self.placement),

@@ -13,12 +13,12 @@ mod vulkan_session;
 mod worker;
 
 use crate::{
-    BackendChat, ChatTemplateKwargs, MAX_BODY_BYTES, MAX_COMPLETION_TOKENS, MAX_HEADER_BYTES,
+    BackendChat, CognitiveControlInput, MAX_BODY_BYTES, MAX_COMPLETION_TOKENS, MAX_HEADER_BYTES,
     MAX_HEADERS, Message, Object, PendingChat, Rejection, RequestPolicy,
     native_response::NativeResponse,
     reception::{HEADER_TIMEOUT, INTAKE_TIMEOUT},
     response::{CLIENT_WRITE_TIMEOUT, ResponseError},
-    singleton, wire,
+    singleton, validate_cognitive_controls, wire,
 };
 use bonsai_prism_runtime::{runtime::Cancellation, swift_session::SwiftSession};
 
@@ -470,10 +470,10 @@ async fn deliver<W: AsyncWrite + Unpin>(
                     thinking,
                 ));
             }
-            Output::Delta(text) => response
+            Output::Delta { text, confidence } => response
                 .as_mut()
                 .ok_or(NativeBackendError::Engine)?
-                .delta(&text)
+                .delta_with_confidence(&text, confidence)
                 .await
                 .map_err(NativeBackendError::Response)?,
             Output::Complete(value) => {
@@ -638,11 +638,25 @@ struct FixedBody<'a> {
     ignore_eos: bool,
     temperature: f32,
     top_p: f32,
-    top_k: u8,
+    top_k: u32,
     min_p: f32,
     presence_penalty: f32,
     frequency_penalty: f32,
     repeat_penalty: f32,
+    #[serde(default)]
+    reasoning_budget: Option<u32>,
+    #[serde(default)]
+    dry_multiplier: Option<f32>,
+    #[serde(default)]
+    dry_base: Option<f32>,
+    #[serde(default)]
+    dry_allowed_length: Option<u32>,
+    #[serde(default)]
+    dry_penalty_last_n: Option<u32>,
+    #[serde(default)]
+    logprobs: Option<bool>,
+    #[serde(default)]
+    top_logprobs: Option<u8>,
     #[serde(borrow)]
     chat_template_kwargs: Object<FixedTemplate<'a>>,
     #[serde(default, deserialize_with = "optional_lora")]
@@ -741,44 +755,31 @@ fn canonical_for_profile(
         || body.cache_prompt
         || body.n_cache_reuse != 0
         || body.ignore_eos
-        || body.top_k != 20
-        || body.chat_template_kwargs.0.reasoning_effort != "xhigh"
-        || !body.chat_template_kwargs.0.preserve_thinking
-        || [
-            body.temperature,
-            body.top_p,
-            body.min_p,
-            body.presence_penalty,
-            body.frequency_penalty,
-            body.repeat_penalty,
-        ]
-        .map(f32::to_bits)
-            != [1.0, 0.95, 0.0, 0.0, 0.0, 1.0].map(f32::to_bits)
     {
         return Err(NativeBackendError::Schema);
     }
+    let controls = validate_cognitive_controls(CognitiveControlInput {
+        temperature: body.temperature,
+        top_p: body.top_p,
+        top_k: body.top_k,
+        min_p: body.min_p,
+        presence_penalty: body.presence_penalty,
+        frequency_penalty: body.frequency_penalty,
+        repeat_penalty: body.repeat_penalty,
+        enable_thinking: body.chat_template_kwargs.0.enable_thinking,
+        reasoning_effort: body.chat_template_kwargs.0.reasoning_effort.as_ref(),
+        preserve_thinking: body.chat_template_kwargs.0.preserve_thinking,
+        reasoning_budget: body.reasoning_budget,
+        dry_multiplier: body.dry_multiplier,
+        dry_base: body.dry_base,
+        dry_allowed_length: body.dry_allowed_length,
+        dry_penalty_last_n: body.dry_penalty_last_n,
+        logprobs: body.logprobs,
+        top_logprobs: body.top_logprobs,
+    })
+    .ok_or(NativeBackendError::Schema)?;
     let canonical = serde_json::to_vec(&PrivateBody {
-        body: BackendChat {
-            messages: &body.messages,
-            max_completion_tokens: body.max_completion_tokens,
-            stream: body.stream,
-            n: 1,
-            cache_prompt: false,
-            n_cache_reuse: 0,
-            ignore_eos: false,
-            temperature: 1.0,
-            top_p: 0.95,
-            top_k: 20,
-            min_p: 0.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repeat_penalty: 1.0,
-            chat_template_kwargs: ChatTemplateKwargs {
-                enable_thinking: body.chat_template_kwargs.0.enable_thinking,
-                reasoning_effort: "xhigh",
-                preserve_thinking: true,
-            },
-        },
+        body: controls.to_backend_chat(&body.messages, body.max_completion_tokens, body.stream),
         lora,
     })
     .map_err(|_| NativeBackendError::Schema)?;

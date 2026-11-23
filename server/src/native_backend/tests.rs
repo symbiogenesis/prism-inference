@@ -570,6 +570,43 @@ fn private_typed_context_rejection_clears_count_seal_without_faulting_owner() ->
 }
 
 #[test]
+fn private_canonical_body_accepts_bounded_cognitive_and_sampling_controls() -> TestResult {
+    let original = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
+    for (name, value) in [
+        ("temperature", json!(0.7)),
+        ("top_p", json!(0.9)),
+        ("top_k", json!(40)),
+        ("min_p", json!(0.05)),
+        ("repeat_penalty", json!(1.1)),
+        ("presence_penalty", json!(0.5)),
+        ("frequency_penalty", json!(0.25)),
+        ("reasoning_budget", json!(256)),
+        ("dry_multiplier", json!(0.8)),
+        ("dry_base", json!(1.75)),
+        ("dry_allowed_length", json!(2)),
+        ("dry_penalty_last_n", json!(512)),
+    ] {
+        let mut value_body: Value = serde_json::from_slice(&original)?;
+        value_body[name] = value.clone();
+        let parsed = canonical(&serde_json::to_vec(&value_body)?).map_err(|e| format!("{e:?}"))?;
+        let out: Value = serde_json::from_slice(&parsed.body)?;
+        assert_eq!(out[name], value, "field={name}");
+    }
+    for effort in ["low", "medium", "xhigh"] {
+        let mut value_body: Value = serde_json::from_slice(&original)?;
+        value_body["chat_template_kwargs"]["reasoning_effort"] = json!(effort);
+        let parsed = canonical(&serde_json::to_vec(&value_body)?).map_err(|e| format!("{e:?}"))?;
+        let out: Value = serde_json::from_slice(&parsed.body)?;
+        assert_eq!(out["chat_template_kwargs"]["reasoning_effort"], effort);
+    }
+    let mut lp_body: Value = serde_json::from_slice(&original)?;
+    lp_body["logprobs"] = json!(true);
+    lp_body["top_logprobs"] = json!(5);
+    assert!(canonical(&serde_json::to_vec(&lp_body)?).is_ok());
+    Ok(())
+}
+
+#[test]
 fn private_canonical_body_rejects_overrides_duplicates_and_unknown_fields() -> TestResult {
     let original = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
     assert_eq!(
@@ -577,13 +614,24 @@ fn private_canonical_body_rejects_overrides_duplicates_and_unknown_fields() -> T
         original
     );
     for (name, value) in [
-        ("temperature", json!(0.5)),
-        ("top_p", json!(0.5)),
-        ("top_k", json!(40)),
-        ("min_p", json!(0.1)),
-        ("repeat_penalty", json!(1.1)),
-        ("presence_penalty", json!(1.0)),
-        ("frequency_penalty", json!(1.0)),
+        ("temperature", json!(0.0)),
+        ("temperature", json!(2.5)),
+        ("top_p", json!(0.0)),
+        ("top_p", json!(1.5)),
+        ("top_k", json!(248_321)),
+        ("min_p", json!(-0.1)),
+        ("min_p", json!(1.1)),
+        ("repeat_penalty", json!(0.0)),
+        ("repeat_penalty", json!(2.5)),
+        ("presence_penalty", json!(2.5)),
+        ("frequency_penalty", json!(-2.5)),
+        ("reasoning_budget", json!(0)),
+        ("reasoning_budget", json!(262_145)),
+        ("dry_multiplier", json!(-0.1)),
+        ("dry_multiplier", json!(4.5)),
+        ("dry_base", json!(0.9)),
+        ("dry_penalty_last_n", json!(8193)),
+        ("top_logprobs", json!(5)),
         ("cache_prompt", json!(true)),
         ("n_cache_reuse", json!(1)),
         ("ignore_eos", json!(true)),
@@ -602,7 +650,7 @@ fn private_canonical_body_rejects_overrides_duplicates_and_unknown_fields() -> T
         ("enable_thinking", json!(null)),
         ("enable_thinking", json!("false")),
         ("enable_thinking", json!(0)),
-        ("reasoning_effort", json!("low")),
+        ("reasoning_effort", json!("extreme")),
         ("preserve_thinking", json!(false)),
         ("other", json!(true)),
     ] {
@@ -780,7 +828,8 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
         legacy,
         json!({"data":[{"id":"Swift-Bonsai-2-PQ2_0", "object":"model",
         "model_sha256":swift::MODEL_SHA256, "template_sha256":swift::TEMPLATE_SHA256,
-        "runtime":"prism-inference", "context_tokens":8192, "seed":42, "row_workers":1,
+        "runtime":"prism-inference", "supports_cognitive_controls":true,
+        "context_tokens":8192, "seed":42, "row_workers":1,
         "startup_projection":{"schema_version":1,"requested":"auto","effective":"cpu",
             "identity":null,"resident_tensors":0,"resident_weight_bytes":0,"host_metadata_bytes":0}}]})
     );
@@ -1999,7 +2048,7 @@ async fn fail_acknowledgement(worker: &mut Worker, body: &[u8], terminal: bool) 
         let target = if terminal {
             matches!(output, Output::Complete(_))
         } else {
-            matches!(output, Output::Delta(_))
+            matches!(output, Output::Delta { .. })
         };
         if target {
             break ack;

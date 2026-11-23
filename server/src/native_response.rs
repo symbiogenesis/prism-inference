@@ -5,7 +5,10 @@
 //! process-memory policy. Await every operation before acknowledging its native
 //! generation callback; failed or abandoned terminal writes require reset.
 
-use bonsai_prism_runtime::runtime::{Completion, Finish};
+use bonsai_prism_runtime::{
+    runtime::{Completion, Finish},
+    swift_session::TokenLogprobInfo,
+};
 use serde::Serialize;
 use std::{
     io::Write as _,
@@ -40,10 +43,50 @@ struct StreamChunk<D> {
 }
 
 #[derive(Serialize)]
+struct StreamTopLogprob {
+    token: String,
+    logprob: f32,
+}
+
+#[derive(Serialize)]
+struct StreamLogprobContent {
+    token: String,
+    logprob: f32,
+    top_logprobs: Vec<StreamTopLogprob>,
+}
+
+#[derive(Serialize)]
+struct StreamLogprobs {
+    content: [StreamLogprobContent; 1],
+}
+
+impl StreamLogprobs {
+    fn from_info(info: TokenLogprobInfo) -> Self {
+        let top_logprobs = info
+            .top_logprobs
+            .into_iter()
+            .map(|entry| StreamTopLogprob {
+                token: entry.token,
+                logprob: entry.logprob,
+            })
+            .collect();
+        Self {
+            content: [StreamLogprobContent {
+                token: info.token,
+                logprob: info.logprob,
+                top_logprobs,
+            }],
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct StreamChoice<D> {
     delta: D,
     finish_reason: Option<&'static str>,
     index: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<StreamLogprobs>,
 }
 
 #[derive(Serialize)]
@@ -103,11 +146,21 @@ const fn stream_chunk<D>(
     finish_reason: Option<&'static str>,
     usage: Option<UsagePayload>,
 ) -> StreamChunk<D> {
+    stream_chunk_with_logprobs(delta, finish_reason, usage, None)
+}
+
+const fn stream_chunk_with_logprobs<D>(
+    delta: D,
+    finish_reason: Option<&'static str>,
+    usage: Option<UsagePayload>,
+    logprobs: Option<StreamLogprobs>,
+) -> StreamChunk<D> {
     StreamChunk {
         choices: [StreamChoice {
             delta,
             finish_reason,
             index: 0,
+            logprobs,
         }],
         id: RESPONSE_ID,
         model: MODEL_ID,
@@ -273,15 +326,45 @@ impl<W: AsyncWrite + Unpin> NativeResponse<W> {
     /// # Errors
     /// Returns value-free byte, deadline or I/O errors. Never retry on this
     /// writer after an error; the transport may already contain partial bytes.
-    pub async fn delta(&mut self, mut text: &str) -> Result<(), ResponseError> {
+    pub async fn delta(&mut self, text: &str) -> Result<(), ResponseError> {
+        self.delta_with_confidence(text, None).await
+    }
+
+    /// Deliver a provisional UTF-8 chunk with optional per-token raw log-probability
+    /// metadata under bounded client backpressure.
+    ///
+    /// # Errors
+    /// Returns value-free byte, deadline or I/O errors. Never retry on this
+    /// writer after an error; the transport may already contain partial bytes.
+    pub async fn delta_with_confidence(
+        &mut self,
+        mut text: &str,
+        confidence: Option<TokenLogprobInfo>,
+    ) -> Result<(), ResponseError> {
+        let mut pending_logprobs = confidence.map(StreamLogprobs::from_info);
         while !text.is_empty() {
             let mut end = text.len().min(INPUT_CHUNK_BYTES);
             while !text.is_char_boundary(end) {
                 end -= 1;
             }
             let segments = self.parser.push(&text[..end]);
-            self.delivery.deliver(segments).await?;
+            self.delivery
+                .deliver_with_confidence(segments, &mut pending_logprobs)
+                .await?;
             text = &text[end..];
+        }
+        if let Some(logprobs) = pending_logprobs.take()
+            && self.delivery.streaming
+        {
+            self.delivery.start_stream().await?;
+            self.delivery
+                .frame(&stream_chunk_with_logprobs(
+                    EmptyDelta {},
+                    None,
+                    None,
+                    Some(logprobs),
+                ))
+                .await?;
         }
         ensure_time(self.delivery.deadline)
     }
@@ -386,26 +469,43 @@ impl<W: AsyncWrite + Unpin> Delivery<W> {
     }
 
     async fn deliver(&mut self, segments: Segments<'_>) -> Result<(), ResponseError> {
+        let mut none = None;
+        self.deliver_with_confidence(segments, &mut none).await
+    }
+
+    async fn deliver_with_confidence(
+        &mut self,
+        segments: Segments<'_>,
+        pending_logprobs: &mut Option<StreamLogprobs>,
+    ) -> Result<(), ResponseError> {
         if self.streaming {
             if !segments.reasoning.is_empty() {
                 self.start_stream().await?;
-                self.frame(&stream_chunk(
+                let logprobs = if segments.content.is_empty() {
+                    pending_logprobs.take()
+                } else {
+                    None
+                };
+                self.frame(&stream_chunk_with_logprobs(
                     ReasoningDelta {
                         reasoning_content: segments.reasoning,
                     },
                     None,
                     None,
+                    logprobs,
                 ))
                 .await?;
             }
             if !segments.content.is_empty() {
                 self.start_stream().await?;
-                self.frame(&stream_chunk(
+                let logprobs = pending_logprobs.take();
+                self.frame(&stream_chunk_with_logprobs(
                     ContentDelta {
                         content: segments.content,
                     },
                     None,
                     None,
+                    logprobs,
                 ))
                 .await?;
             }

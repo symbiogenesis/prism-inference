@@ -11,15 +11,15 @@ use std::{
 };
 
 use bonsai_adreno_vulkan::{
-    AttentionStrategy, CommandBatchRecorder, TdrChunkPolicy, VulkanBatchedAdapters,
-    VulkanBatchedConfig, VulkanBatchedGraphExecutor, VulkanKvPrecision, VulkanMultiRankAdapterSpec,
-    VulkanRankOneAdapterSpec, spirv,
+    AttentionStrategy, CommandBatchRecorder, ProjectionKernelPath, TdrChunkPolicy,
+    VulkanBatchedAdapters, VulkanBatchedConfig, VulkanBatchedGraphExecutor, VulkanKvPrecision,
+    VulkanMultiRankAdapterSpec, VulkanPq2Executor, VulkanRankOneAdapterSpec, spirv,
 };
 use bonsai_gguf::MetadataValue;
 use bonsai_prism_runtime::{
     Decoder,
     graph::{KvCachePolicy, Qwen35},
-    kernels::MatvecBackend,
+    kernels::{MatvecBackend, Pq2ProjectionExecutor, Q8Block},
     model::{
         Model, Tensor,
         lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
@@ -210,6 +210,34 @@ fn build_pq2_tensor(name: &str, cols: usize, rows: usize, seed: usize) -> Tensor
         name: name.to_owned(),
         dimensions: vec![cols, rows],
         kind: 142,
+        data: Arc::<[u8]>::from(data).into(),
+    }
+}
+
+fn build_q8_0_tensor(name: &str, cols: usize, rows: usize, seed: usize) -> Tensor {
+    let blocks_per_row = cols / 32;
+    let mut data = Vec::with_capacity(rows * blocks_per_row * 34);
+    for r in 0..rows {
+        for b in 0..blocks_per_row {
+            let sign = if (r + b + seed).is_multiple_of(3) {
+                -1.0_f32
+            } else {
+                1.0_f32
+            };
+            let scale_val = sign
+                * 0.007_812_5_f32
+                * f32::from(u8::try_from((r + b + seed) % 7 + 1).unwrap_or(1));
+            data.extend_from_slice(&f16_scale(scale_val));
+            for i in 0..32 {
+                let raw = i32::try_from((r * 13 + b * 7 + i * 5 + seed) % 241).unwrap_or(0) - 120;
+                data.push(i8::try_from(raw).unwrap_or(0).cast_unsigned());
+            }
+        }
+    }
+    Tensor {
+        name: name.to_owned(),
+        dimensions: vec![cols, rows],
+        kind: 8,
         data: Arc::<[u8]>::from(data).into(),
     }
 }
@@ -689,6 +717,11 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "ptq1_q8_0_4tok_false_pin",
             spirv::ptq1_q8_0_gemm_4tok_coalesced(false, true),
         ),
+        ("q8_0_q8_0_false", spirv::q8_0_q8_0_gemv_coalesced(false)),
+        (
+            "q8_0_q8_0_4tok_false",
+            spirv::q8_0_q8_0_gemm_4tok_coalesced(false),
+        ),
     ];
     for (name, words) in portable_modules {
         assert_eq!(
@@ -717,6 +750,11 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         (
             "ptq1_q8_0_4tok_sdot_pin",
             spirv::ptq1_q8_0_gemm_4tok_coalesced(true, true),
+        ),
+        ("q8_0_q8_0_sdot", spirv::q8_0_q8_0_gemv_coalesced(true)),
+        (
+            "q8_0_q8_0_4tok_sdot",
+            spirv::q8_0_q8_0_gemm_4tok_coalesced(true),
         ),
     ] {
         assert_eq!(
@@ -1400,5 +1438,195 @@ fn live_batched_prefill_odd128_q8_0_lora_subtile_and_cancellation() -> TestResul
     cancel_exec.restore(&good_cp)?;
     assert_eq!(cancel_exec.position(), 2);
     assert_eq!(cancel_exec.evaluate_token(2)?.len(), 16);
+    Ok(())
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Scalar reference preserves exact left-to-right (w_scale * a_scale) * isum rounding."
+)]
+fn cpu_q8_0_q8_0_reference(tensor: &Tensor, activation: &[Q8Block]) -> Vec<f32> {
+    let cols = tensor.dimensions[0];
+    let rows = tensor.dimensions[1];
+    let blocks_per_row = cols / 32;
+    let row_bytes = blocks_per_row * 34;
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut acc = 0.0_f32;
+        for (b, act) in activation.iter().enumerate() {
+            let off = r * row_bytes + b * 34;
+            let scale_bits = u16::from_le_bytes([tensor.data[off], tensor.data[off + 1]]);
+            let w_scale = bonsai_ternary::half_to_float(scale_bits);
+            let mut isum = 0_i32;
+            for (i, &av) in act.values.iter().enumerate() {
+                let wv = i8::from_le_bytes([tensor.data[off + 2 + i]]);
+                isum += i32::from(wv) * i32::from(av);
+            }
+            // All Q8_0 32-elem integer dot sums satisfy |isum| <= 32*128*127 = 520_192, which fits in i16*32768 + i16 exact f32.
+            let hi = isum >> 15;
+            let lo = isum - (hi << 15);
+            let exact_f32 = f32::from(i16::try_from(hi).unwrap_or(0)) * 32768.0_f32
+                + f32::from(i16::try_from(lo).unwrap_or(0));
+            acc += (w_scale * act.scale) * exact_f32;
+        }
+        out.push(acc);
+    }
+    out
+}
+
+fn clone_with_q8_0_weights(base: &Model, seed: usize) -> Model {
+    let mut tensors = base.tensors.clone();
+    let embd = tensors["output.weight"].dimensions[0];
+    let vocab = tensors["output.weight"].dimensions[1];
+    tensors.insert(
+        "output.weight".to_owned(),
+        build_q8_0_tensor("output.weight", embd, vocab, seed + 1),
+    );
+    // Mix Q8_0 with PQ2 (`ffn_up`) and PTQ1 (`attn_q`, `attn_v`) inside sibling projection groups.
+    let ffn = tensors["blk.0.ffn_gate.weight"].dimensions[1];
+    tensors.insert(
+        "blk.0.ffn_gate.weight".to_owned(),
+        build_q8_0_tensor("blk.0.ffn_gate.weight", embd, ffn, seed + 2),
+    );
+    let ssm_values = tensors["blk.1.ssm_alpha.weight"].dimensions[1];
+    tensors.insert(
+        "blk.1.ssm_alpha.weight".to_owned(),
+        build_q8_0_tensor("blk.1.ssm_alpha.weight", embd, ssm_values, seed + 3),
+    );
+    let kv_width = tensors["blk.2.attn_k.weight"].dimensions[1];
+    tensors.insert(
+        "blk.2.attn_k.weight".to_owned(),
+        build_q8_0_tensor("blk.2.attn_k.weight", embd, kv_width, seed + 4),
+    );
+    Model {
+        metadata: base.metadata.clone(),
+        tensors,
+        identity: format!("{}-q8_0", base.identity),
+    }
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_q8_0_direct_projection_matches_cpu() -> TestResult {
+    // Direct Q8_0 x Q8_0 projection parity on both OpSDot and Portable fallback with non-64 rows
+    // and non-128-multiple width (`cols = 160`, `rows = 71`).
+    let tensor = build_q8_0_tensor("direct.q8_0", 160, 71, 9);
+    let act: Vec<Q8Block> = (0..5)
+        .map(|b| {
+            let values = std::array::from_fn(|i| {
+                let raw = i32::try_from((b * 17 + i * 9) % 251).unwrap_or(0) - 125;
+                i8::try_from(raw).unwrap_or(0)
+            });
+            Q8Block {
+                scale: 0.015_625_f32 * f32::from(u8::try_from(b + 1).unwrap_or(1)),
+                sum: 0.0,
+                values,
+            }
+        })
+        .collect();
+    let expected = cpu_q8_0_q8_0_reference(&tensor, &act);
+
+    for path in [
+        ProjectionKernelPath::IntegerDotPacked4x8,
+        ProjectionKernelPath::PortableIntegerFallback,
+    ] {
+        let mut exec = match VulkanPq2Executor::open_with_path(path, 64 * 1024 * 1024) {
+            Ok(e) => e,
+            Err(bonsai_adreno_vulkan::Error::Unsupported)
+                if path == ProjectionKernelPath::IntegerDotPacked4x8 =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        assert!(exec.supports_q8(&tensor));
+        assert_eq!(exec.prewarm_tensors(&[&tensor])?, 1);
+        let mut out = Vec::new();
+        exec.project_q8(&tensor, &act, false, &mut out)?;
+        assert_eq!(out.len(), expected.len());
+        for (idx, (&a, &e)) in out.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "{path:?} direct Q8_0 row {idx} bit mismatch: {a} != {e}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_q8_0_coalesced_projection_and_lm_head_matches_cpu() -> TestResult {
+    // End-to-end graph parity with Q8_0 output.weight (lm_head) + mixed sibling groups,
+    // both single-token and batched multi-token (T = 5), pinned and unpinned, sdot and portable.
+    let base = synthetic_hybrid_qwen35_model_with_layout("q8-0-hybrid", 256, 256, 32)?;
+    let q8_model = clone_with_q8_0_weights(&base, 17);
+
+    for pinned in [false, true] {
+        for path in [
+            ProjectionKernelPath::IntegerDotPacked4x8,
+            ProjectionKernelPath::PortableIntegerFallback,
+        ] {
+            let mut cpu = (!pinned)
+                .then(|| Qwen35::new(clone_with_q8_0_weights(&base, 17), 16))
+                .transpose()?;
+            let mut seq_exec = match VulkanBatchedGraphExecutor::open(
+                &q8_model,
+                VulkanBatchedConfig {
+                    kernel_path: Some(path),
+                    pinned_arithmetic: Some(pinned),
+                    prefill_tile_tokens: 1,
+                    ..VulkanBatchedConfig::default()
+                },
+            ) {
+                Ok(e) => e,
+                Err(bonsai_adreno_vulkan::Error::Unsupported)
+                    if path == ProjectionKernelPath::IntegerDotPacked4x8 =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let mut bat_exec = VulkanBatchedGraphExecutor::open(
+                &q8_model,
+                VulkanBatchedConfig {
+                    kernel_path: Some(path),
+                    pinned_arithmetic: Some(pinned),
+                    prefill_tile_tokens: 16,
+                    ..VulkanBatchedConfig::default()
+                },
+            )?;
+
+            let prompt = [0_u32, 3, 5, 7, 9];
+            for &tok in &prompt {
+                if let Some(cpu_ref) = cpu.as_mut() {
+                    cpu_ref.ingest(tok)?;
+                }
+                seq_exec.ingest_token(tok)?;
+            }
+            bat_exec.ingest_tokens_batched(&prompt)?;
+
+            let seq_logits = seq_exec.evaluate_token(4)?;
+            let bat_logits = bat_exec.evaluate_token(4)?;
+
+            if let Some(cpu_ref) = cpu.as_mut() {
+                let cpu_logits = cpu_ref.evaluate(4)?;
+                assert_close_rel(
+                    &seq_logits,
+                    &cpu_logits,
+                    5e-3,
+                    5e-3,
+                    &format!("Q8_0 seq vs cpu pinned={pinned} {path:?}"),
+                );
+            }
+            assert_close(
+                &bat_logits,
+                &seq_logits,
+                1e-5,
+                &format!("Q8_0 bat vs seq pinned={pinned} {path:?}"),
+            );
+        }
+    }
     Ok(())
 }

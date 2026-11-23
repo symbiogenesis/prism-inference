@@ -31,10 +31,10 @@ use crate::{
         MAX_DESCRIPTOR_SETS_PER_SUBMIT, PipelineId, WeightArena,
     },
     executor::{
-        KIND_PQ2, KIND_PTQ1, MIN_SCRATCH_BYTES, ProjectionPipelines, Q8_0_WORDS_PER_BLOCK,
-        Q8K_4PLANE_WORDS_PER_HALF, attention_push_constants, checked_grid, ensure_finite_f32,
-        f32_slice_bytes, hadamard_norm_bits, repack_coalesced_into, u32_slice_bytes,
-        validate_matrix, validate_weight_scales,
+        KIND_PQ2, KIND_PTQ1, KIND_Q8_0, MIN_SCRATCH_BYTES, ProjectionPipelines,
+        Q8_0_WORDS_PER_BLOCK, Q8K_4PLANE_WORDS_PER_HALF, attention_push_constants, checked_grid,
+        ensure_finite_f32, f32_slice_bytes, hadamard_norm_bits, repack_coalesced_into,
+        u32_slice_bytes, validate_matrix, validate_weight_scales,
     },
     hash_bytes, hash_str, hash_u32, hash_u64, hash_usize, select_attention_plan, spirv,
 };
@@ -739,6 +739,7 @@ enum WeightEncoding {
     Pq2Q8k,
     Pq2Q8_0,
     Ptq1Q8_0,
+    Q8_0,
     F32,
 }
 
@@ -3443,7 +3444,7 @@ impl VulkanBatchedGraphExecutor {
             .any(|(w, _)| w.encoding == WeightEncoding::Pq2Q8k);
         let needs_q8_0_source_or_pinned = group
             .iter()
-            .any(|(w, _)| w.encoding == WeightEncoding::Pq2Q8_0);
+            .any(|(w, _)| matches!(w.encoding, WeightEncoding::Pq2Q8_0 | WeightEncoding::Q8_0));
         let needs_ptq1_q8_0 = group
             .iter()
             .any(|(w, _)| w.encoding == WeightEncoding::Ptq1Q8_0);
@@ -3597,6 +3598,7 @@ impl VulkanBatchedGraphExecutor {
         let q8_0_kind = group.iter().find_map(|(w, _)| match w.encoding {
             WeightEncoding::Pq2Q8_0 => Some(WeightEncoding::Pq2Q8_0),
             WeightEncoding::Ptq1Q8_0 => Some(WeightEncoding::Ptq1Q8_0),
+            WeightEncoding::Q8_0 => Some(WeightEncoding::Q8_0),
             WeightEncoding::Pq2Q8k | WeightEncoding::F32 => None,
         });
 
@@ -3692,8 +3694,12 @@ impl VulkanBatchedGraphExecutor {
                         barrier_before,
                     );
                 }
-                WeightEncoding::Pq2Q8_0 | WeightEncoding::Ptq1Q8_0 => {
-                    let blocks_per_row = cols / 128;
+                WeightEncoding::Pq2Q8_0 | WeightEncoding::Ptq1Q8_0 | WeightEncoding::Q8_0 => {
+                    let blocks_per_row = if weight.encoding == WeightEncoding::Q8_0 {
+                        cols / 32
+                    } else {
+                        cols / 128
+                    };
                     let blocks_u32 = u32::try_from(blocks_per_row).map_err(|_| {
                         Error::ResourceLimit("blocks_per_row exceed u32".to_owned())
                     })?;
@@ -3705,6 +3711,7 @@ impl VulkanBatchedGraphExecutor {
                             .pipelines
                             .proj
                             .select_ptq1_q8_0(self.resolved_pinned_arithmetic, multi_token),
+                        WeightEncoding::Q8_0 => self.pipelines.proj.select_q8_0_q8_0(multi_token),
                         WeightEncoding::Pq2Q8k | WeightEncoding::F32 => {
                             return Err(Error::InvalidInput("unexpected encoding".to_owned()));
                         }
@@ -4749,6 +4756,12 @@ fn upload_matrix_tensor(
             validate_weight_scales(KIND_PTQ1, &tensor.data)?;
             repack_coalesced_into(KIND_PTQ1, &tensor.data, cols, rows, repack_scratch)?;
             (WeightEncoding::Ptq1Q8_0, repack_scratch.len())
+        }
+        KIND_Q8_0 if cols.is_multiple_of(32) => {
+            validate_matrix(tensor, KIND_Q8_0, 32)?;
+            validate_weight_scales(KIND_Q8_0, &tensor.data)?;
+            repack_coalesced_into(KIND_Q8_0, &tensor.data, cols, rows, repack_scratch)?;
+            (WeightEncoding::Q8_0, repack_scratch.len())
         }
         _ => {
             let total = cols

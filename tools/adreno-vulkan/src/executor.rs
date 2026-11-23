@@ -23,12 +23,15 @@ use crate::{
     hash_bytes, hash_u32, select_attention_plan, spirv,
 };
 
+pub(crate) const KIND_Q8_0: u32 = 8;
 pub(crate) const KIND_PQ2: u32 = 142;
 pub(crate) const KIND_PTQ1: u32 = 143;
 const PQ2_BLOCK_BYTES: usize = 34;
 const PTQ1_BLOCK_BYTES: usize = 28;
+const Q8_0_BLOCK_BYTES: usize = 34;
 const PQ2_COALESCED_TILE_WORDS: usize = 544;
 const PTQ1_COALESCED_TILE_WORDS: usize = 448;
+const Q8_0_COALESCED_TILE_WORDS: usize = 544;
 const Q8K_WORDS_PER_BLOCK: usize = 65;
 pub(crate) const Q8K_4PLANE_WORDS_PER_HALF: usize = 34;
 pub(crate) const Q8_0_WORDS_PER_BLOCK: usize = 9;
@@ -249,6 +252,8 @@ pub(crate) struct ProjectionPipelines {
     pub(crate) ptq1_q8_0_pinned: PipelineId,
     pub(crate) ptq1_q8_0_4tok: PipelineId,
     pub(crate) ptq1_q8_0_4tok_pinned: PipelineId,
+    pub(crate) q8_0_q8_0: PipelineId,
+    pub(crate) q8_0_q8_0_4tok: PipelineId,
     pub(crate) ptq1_q8k: PipelineId,
     pub(crate) quant_q8k_pinned: PipelineId,
     pub(crate) quant_q8k_unpinned: PipelineId,
@@ -266,7 +271,7 @@ impl ProjectionPipelines {
     )]
     pub(crate) fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"projection-pipelines-v2:")?;
+        hash_bytes(&mut hasher, b"projection-pipelines-v3:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
         let mut make_pipe = |tag: &[u8],
                              words: Vec<u32>,
@@ -358,6 +363,18 @@ impl ProjectionPipelines {
             3,
             4,
         )?;
+        let q8_0_q8_0 = make_pipe(
+            b"q8_0_q8_0",
+            spirv::q8_0_q8_0_gemv_coalesced(use_sdot),
+            3,
+            4,
+        )?;
+        let q8_0_q8_0_4tok = make_pipe(
+            b"q8_0_q8_0_4tok",
+            spirv::q8_0_q8_0_gemm_4tok_coalesced(use_sdot),
+            3,
+            4,
+        )?;
         let ptq1_q8k = make_pipe(b"ptq1_q8k", spirv::ptq1_q8k_gemv_coalesced(use_sdot), 3, 4)?;
         let quant_q8k_pinned = make_pipe(
             b"quant_q8k_pinned",
@@ -394,6 +411,8 @@ impl ProjectionPipelines {
             ptq1_q8_0_pinned,
             ptq1_q8_0_4tok,
             ptq1_q8_0_4tok_pinned,
+            q8_0_q8_0,
+            q8_0_q8_0_4tok,
             ptq1_q8k,
             quant_q8k_pinned,
             quant_q8k_unpinned,
@@ -437,6 +456,14 @@ impl ProjectionPipelines {
             (false, true) => self.ptq1_q8_0_pinned,
             (true, false) => self.ptq1_q8_0_4tok,
             (true, true) => self.ptq1_q8_0_4tok_pinned,
+        }
+    }
+
+    pub(crate) const fn select_q8_0_q8_0(&self, multi_token: bool) -> PipelineId {
+        if multi_token {
+            self.q8_0_q8_0_4tok
+        } else {
+            self.q8_0_q8_0
         }
     }
 }
@@ -579,7 +606,7 @@ impl VulkanPq2Executor {
         released
     }
 
-    /// Repacks and uploads all supported `PQ2_0`/`PTQ1_0` tensors into GPU resident storage ahead
+    /// Repacks and uploads all supported `PQ2_0`/`PTQ1_0`/`Q8_0` tensors into GPU resident storage ahead
     /// of execution, returning the number of tensors prepared or refreshed.
     ///
     /// # Errors
@@ -590,6 +617,7 @@ impl VulkanPq2Executor {
             let valid = match tensor.kind {
                 KIND_PQ2 => validate_matrix(tensor, KIND_PQ2, 128).ok(),
                 KIND_PTQ1 => validate_matrix(tensor, KIND_PTQ1, 128).ok(),
+                KIND_Q8_0 => validate_matrix(tensor, KIND_Q8_0, 32).ok(),
                 _ => None,
             };
             let Some((cols, rows)) = valid else {
@@ -630,6 +658,7 @@ impl VulkanPq2Executor {
         let words = std::mem::take(&mut self.act_pack_scratch);
         let res = self.dispatch_single_word_gemv(
             tensor,
+            cols,
             rows,
             blocks_per_row,
             1,
@@ -679,6 +708,7 @@ impl VulkanPq2Executor {
         let words = std::mem::take(&mut self.act_pack_scratch);
         let res = self.dispatch_single_word_gemv(
             tensor,
+            cols,
             rows,
             blocks_per_row,
             tokens,
@@ -698,6 +728,7 @@ impl VulkanPq2Executor {
     fn dispatch_single_word_gemv(
         &mut self,
         tensor: &Tensor,
+        cols: usize,
         rows: usize,
         blocks_per_row: usize,
         tokens: usize,
@@ -724,7 +755,7 @@ impl VulkanPq2Executor {
         let out_buf = ensure_scratch(&mut self.device, &mut self.scratch.out_a, out_bytes)?;
         self.device.write_buffer_u32(act_buf, act_words)?;
 
-        let lease = self.acquire_weight_buffer(tensor, blocks_per_row * 128, rows, &[])?;
+        let lease = self.acquire_weight_buffer(tensor, cols, rows, &[])?;
         let push = [rows_u32, blocks_u32, tokens_u32, act_words_per_token];
         let bufs = [
             lease.span(),
@@ -1646,6 +1677,7 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
         let words = std::mem::take(&mut self.act_pack_scratch);
         let res = self.dispatch_single_word_gemv(
             tensor,
+            cols,
             rows,
             blocks_per_row,
             1,
@@ -1661,7 +1693,8 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
     fn supports_q8(&self, tensor: &Tensor) -> bool {
         !self.is_faulted()
             && (validate_matrix(tensor, KIND_PQ2, 128).is_ok()
-                || validate_matrix(tensor, KIND_PTQ1, 128).is_ok())
+                || validate_matrix(tensor, KIND_PTQ1, 128).is_ok()
+                || validate_matrix(tensor, KIND_Q8_0, 32).is_ok())
     }
 
     fn project_q8(
@@ -1675,13 +1708,18 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
         let (cols, rows) = match tensor.kind {
             KIND_PQ2 => validate_matrix(tensor, KIND_PQ2, 128),
             KIND_PTQ1 => validate_matrix(tensor, KIND_PTQ1, 128),
+            KIND_Q8_0 => validate_matrix(tensor, KIND_Q8_0, 32),
             other => Err(Error::InvalidInput(format!(
                 "unsupported Q8 projection tensor kind {other}"
             ))),
         }
         .map_err(Error::into_runtime_error)?;
 
-        let blocks_per_row = cols / 128;
+        let blocks_per_row = if tensor.kind == KIND_Q8_0 {
+            cols / 32
+        } else {
+            cols / 128
+        };
         let expected_q8 = cols / 32;
         if activation.len() != expected_q8 {
             return Err(Error::InvalidInput(format!(
@@ -1699,11 +1737,18 @@ impl Pq2ProjectionExecutor for VulkanPq2Executor {
             KIND_PQ2 => self.pipes.pq2_q8_0,
             KIND_PTQ1 if pinned => self.pipes.ptq1_q8_0_pinned,
             KIND_PTQ1 => self.pipes.ptq1_q8_0,
-            _ => unreachable!(),
+            KIND_Q8_0 => self.pipes.q8_0_q8_0,
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "unsupported Q8 projection tensor kind {other}"
+                ))
+                .into_runtime_error());
+            }
         };
         let words = std::mem::take(&mut self.act_pack_scratch);
         let res = self.dispatch_single_word_gemv(
             tensor,
+            cols,
             rows,
             blocks_per_row,
             1,
@@ -2484,6 +2529,7 @@ fn is_4tok_pipeline(pipes: &ProjectionPipelines, pipe: PipelineId) -> bool {
         || pipe == pipes.pq2_q8_0_4tok
         || pipe == pipes.ptq1_q8_0_4tok
         || pipe == pipes.ptq1_q8_0_4tok_pinned
+        || pipe == pipes.q8_0_q8_0_4tok
 }
 
 fn ensure_scratch(
@@ -2661,12 +2707,23 @@ pub(crate) fn validate_matrix(
             tensor.name
         )));
     }
-    let block_bytes = match expected_kind {
-        KIND_PQ2 => PQ2_BLOCK_BYTES,
-        KIND_PTQ1 => PTQ1_BLOCK_BYTES,
-        _ => unreachable!(),
+    let (block_cols, block_bytes) = match expected_kind {
+        KIND_PQ2 => (128_usize, PQ2_BLOCK_BYTES),
+        KIND_PTQ1 => (128_usize, PTQ1_BLOCK_BYTES),
+        KIND_Q8_0 => (32_usize, Q8_0_BLOCK_BYTES),
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "unsupported matrix kind {other}"
+            )));
+        }
     };
-    let expected_bytes = (cols / 128)
+    if !cols.is_multiple_of(block_cols) {
+        return Err(Error::InvalidInput(format!(
+            "tensor '{}' has invalid extents [{cols}, {rows}] for block alignment {block_cols}",
+            tensor.name
+        )));
+    }
+    let expected_bytes = (cols / block_cols)
         .checked_mul(block_bytes)
         .and_then(|row_bytes| row_bytes.checked_mul(rows))
         .ok_or_else(|| Error::ResourceLimit("tensor byte size overflow".to_owned()))?;
@@ -2684,6 +2741,12 @@ pub(crate) fn validate_weight_scales(kind: u32, data: &[u8]) -> Result<(), Error
     match kind {
         KIND_PQ2 => {
             for block in data.as_chunks::<PQ2_BLOCK_BYTES>().0 {
+                let bits = u16::from_le_bytes([block[0], block[1]]);
+                check_f16_scale(bits)?;
+            }
+        }
+        KIND_Q8_0 => {
+            for block in data.as_chunks::<Q8_0_BLOCK_BYTES>().0 {
                 let bits = u16::from_le_bytes([block[0], block[1]]);
                 check_f16_scale(bits)?;
             }
@@ -2724,40 +2787,57 @@ pub(crate) fn repack_coalesced_into(
             repack_ptq1_coalesced_64(raw, cols, rows, dst)?;
             Ok(())
         }
+        KIND_Q8_0 => {
+            repack_q8_0_coalesced_64(raw, cols, rows, dst)?;
+            Ok(())
+        }
         other => Err(Error::InvalidInput(format!(
             "unsupported coalesced weight kind {other}"
         ))),
     }
 }
 
-fn repack_pq2_coalesced_64(
+fn repack_scale_and_32b_coalesced_64(
     raw: &[u8],
     cols: usize,
     rows: usize,
+    block_cols: usize,
+    tile_words: usize,
     dst: &mut Vec<u32>,
 ) -> Result<(), Error> {
-    let blocks_per_row = cols / 128;
-    let row_bytes = blocks_per_row * PQ2_BLOCK_BYTES;
+    if cols == 0 || rows == 0 || !cols.is_multiple_of(block_cols) {
+        return Err(Error::InvalidInput(format!(
+            "invalid coalesced matrix dimensions [{cols}, {rows}] for block {block_cols}"
+        )));
+    }
+    let blocks_per_row = cols / block_cols;
+    let row_bytes = blocks_per_row
+        .checked_mul(Q8_0_BLOCK_BYTES)
+        .ok_or_else(|| Error::ResourceLimit("coalesced row byte count overflow".to_owned()))?;
+    let expected_raw_bytes = rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| Error::ResourceLimit("coalesced raw byte count overflow".to_owned()))?;
+    if raw.len() != expected_raw_bytes {
+        return Err(Error::InvalidInput(format!(
+            "coalesced raw byte length {} != expected {expected_raw_bytes}",
+            raw.len()
+        )));
+    }
     let row_groups = rows.div_ceil(64);
     let total_words = row_groups
         .checked_mul(blocks_per_row)
-        .and_then(|t| t.checked_mul(PQ2_COALESCED_TILE_WORDS))
-        .ok_or_else(|| Error::ResourceLimit("coalesced PQ2 word count overflow".to_owned()))?;
+        .and_then(|t| t.checked_mul(tile_words))
+        .ok_or_else(|| Error::ResourceLimit("coalesced weight word count overflow".to_owned()))?;
     dst.clear();
     dst.resize(total_words, 0);
 
     for (rg, rg_words) in dst
-        .chunks_exact_mut(blocks_per_row * PQ2_COALESCED_TILE_WORDS)
+        .chunks_exact_mut(blocks_per_row * tile_words)
         .enumerate()
     {
         let r_base = rg * 64;
-        for (blk, tile) in rg_words
-            .as_chunks_mut::<PQ2_COALESCED_TILE_WORDS>()
-            .0
-            .iter_mut()
-            .enumerate()
-        {
-            let blk_off = blk * PQ2_BLOCK_BYTES;
+        for (blk, tile) in rg_words.chunks_exact_mut(tile_words).enumerate() {
+            let blk_off = blk * Q8_0_BLOCK_BYTES;
             for (pair, scale_slot) in tile[..32].iter_mut().enumerate() {
                 let r_ev = r_base + pair * 2;
                 let r_od = r_ev + 1;
@@ -2780,7 +2860,7 @@ fn repack_pq2_coalesced_64(
                 if r >= rows {
                     continue;
                 }
-                let block = &raw[r * row_bytes + blk_off..][..PQ2_BLOCK_BYTES];
+                let block = &raw[r * row_bytes + blk_off..][..Q8_0_BLOCK_BYTES];
                 for word_j in 0..8 {
                     let c_off = 2 + word_j * 4;
                     let word = u32::from_le_bytes([
@@ -2795,6 +2875,24 @@ fn repack_pq2_coalesced_64(
         }
     }
     Ok(())
+}
+
+fn repack_pq2_coalesced_64(
+    raw: &[u8],
+    cols: usize,
+    rows: usize,
+    dst: &mut Vec<u32>,
+) -> Result<(), Error> {
+    repack_scale_and_32b_coalesced_64(raw, cols, rows, 128, PQ2_COALESCED_TILE_WORDS, dst)
+}
+
+fn repack_q8_0_coalesced_64(
+    raw: &[u8],
+    cols: usize,
+    rows: usize,
+    dst: &mut Vec<u32>,
+) -> Result<(), Error> {
+    repack_scale_and_32b_coalesced_64(raw, cols, rows, 32, Q8_0_COALESCED_TILE_WORDS, dst)
 }
 
 fn repack_ptq1_coalesced_64(
@@ -2911,4 +3009,117 @@ fn pack_q8_blocks_into(blocks: &[Q8Block], out: &mut Vec<u32>) -> Result<(), Err
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn repack_q8_0_coalesced_64_packs_scales_and_words_with_tail_zero_pad() -> Result<(), Error> {
+        let cols = 64_usize; // 2 blocks per row
+        let rows = 67_usize; // 2 row groups (64 + 3)
+        let blocks_per_row = cols / 32;
+        let row_bytes = blocks_per_row * Q8_0_BLOCK_BYTES;
+        let mut raw = vec![0_u8; rows * row_bytes];
+
+        for r in 0..rows {
+            for blk in 0..blocks_per_row {
+                let off = r * row_bytes + blk * Q8_0_BLOCK_BYTES;
+                let scale_bits = u16::try_from(0x3C00 + r + blk * 7).unwrap_or(0x3C00);
+                raw[off..off + 2].copy_from_slice(&scale_bits.to_le_bytes());
+                for i in 0..32 {
+                    let raw_i32 = i32::try_from((r * 5 + blk * 11 + i) % 251).unwrap_or(0) - 125;
+                    let byte = i8::try_from(raw_i32).unwrap_or(0).cast_unsigned();
+                    raw[off + 2 + i] = byte;
+                }
+            }
+        }
+
+        validate_weight_scales(KIND_Q8_0, &raw)?;
+        let tensor = Tensor {
+            name: "test.q8_0".to_owned(),
+            dimensions: vec![cols, rows],
+            kind: KIND_Q8_0,
+            data: Arc::<[u8]>::from(raw.clone()).into(),
+        };
+        assert_eq!(validate_matrix(&tensor, KIND_Q8_0, 32)?, (cols, rows));
+
+        let mut dst = Vec::new();
+        repack_coalesced_into(KIND_Q8_0, &raw, cols, rows, &mut dst)?;
+        assert_eq!(dst.len(), 2 * blocks_per_row * Q8_0_COALESCED_TILE_WORDS);
+
+        for r in 0..rows {
+            let rg = r / 64;
+            let lane = r % 64;
+            for blk in 0..blocks_per_row {
+                let tile_base = (rg * blocks_per_row + blk) * Q8_0_COALESCED_TILE_WORDS;
+                let pair_word = dst[tile_base + (lane / 2)];
+                let scale_u16 = if lane.is_multiple_of(2) {
+                    u16::try_from(pair_word & 0xFFFF).unwrap_or(0)
+                } else {
+                    u16::try_from(pair_word >> 16).unwrap_or(0)
+                };
+                let raw_off = r * row_bytes + blk * Q8_0_BLOCK_BYTES;
+                assert_eq!(
+                    scale_u16,
+                    u16::from_le_bytes([raw[raw_off], raw[raw_off + 1]])
+                );
+                for word_j in 0..8 {
+                    let c_off = raw_off + 2 + word_j * 4;
+                    let expected_word = u32::from_le_bytes([
+                        raw[c_off],
+                        raw[c_off + 1],
+                        raw[c_off + 2],
+                        raw[c_off + 3],
+                    ]);
+                    assert_eq!(dst[tile_base + 32 + word_j * 64 + lane], expected_word);
+                }
+            }
+        }
+
+        // Tail rows in the second row group (`lane >= 3`) must remain zero-padded.
+        for blk in 0..blocks_per_row {
+            let tile_base = (blocks_per_row + blk) * Q8_0_COALESCED_TILE_WORDS;
+            let pair1 = dst[tile_base + 1];
+            assert_eq!(pair1 >> 16, 0);
+            for pair in 2..32 {
+                assert_eq!(dst[tile_base + pair], 0);
+            }
+            for word_j in 0..8 {
+                for lane in 3..64 {
+                    assert_eq!(dst[tile_base + 32 + word_j * 64 + lane], 0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_q8_0_matrix_and_scales_reject_invalid_inputs() {
+        let mut raw = vec![0_u8; Q8_0_BLOCK_BYTES];
+        raw[0..2].copy_from_slice(&0x7C00_u16.to_le_bytes()); // +Inf f16 scale
+        assert!(validate_weight_scales(KIND_Q8_0, &raw).is_err());
+
+        raw[0..2].copy_from_slice(&0x7E00_u16.to_le_bytes()); // NaN f16 scale
+        assert!(validate_weight_scales(KIND_Q8_0, &raw).is_err());
+
+        let bad_cols = Tensor {
+            name: "bad.cols".to_owned(),
+            dimensions: vec![48, 2],
+            kind: KIND_Q8_0,
+            data: Arc::<[u8]>::from(vec![0_u8; 4 * Q8_0_BLOCK_BYTES]).into(),
+        };
+        assert!(validate_matrix(&bad_cols, KIND_Q8_0, 32).is_err());
+
+        let bad_len = Tensor {
+            name: "bad.len".to_owned(),
+            dimensions: vec![32, 2],
+            kind: KIND_Q8_0,
+            data: Arc::<[u8]>::from(vec![0_u8; Q8_0_BLOCK_BYTES]).into(),
+        };
+        assert!(validate_matrix(&bad_len, KIND_Q8_0, 32).is_err());
+    }
 }

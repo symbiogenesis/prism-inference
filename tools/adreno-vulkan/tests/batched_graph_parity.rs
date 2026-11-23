@@ -627,12 +627,21 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         ("mul_sigmoid_f32", spirv::mul_sigmoid_f32()),
         ("conv1d_silu_f32", spirv::conv1d_silu_f32()),
         ("conv1d_silu_offset_f32", spirv::conv1d_silu_offset_f32()),
+        (
+            "conv1d_silu_batched_inplace_f32",
+            spirv::conv1d_silu_batched_inplace_f32(),
+        ),
         ("l2_norm_f32", spirv::l2_norm_f32()),
+        (
+            "l2_norm_batched_strided_f32",
+            spirv::l2_norm_batched_strided_f32(),
+        ),
         ("gdn_step_f32", spirv::gdn_step_f32()),
         (
             "gdn_step_batched_token_f32",
             spirv::gdn_step_batched_token_f32(),
         ),
+        ("gdn_scan_batched_f32", spirv::gdn_scan_batched_f32()),
         ("gdn_gates_f32", spirv::gdn_gates_f32()),
         ("gdn_gates_batched_f32", spirv::gdn_gates_batched_f32()),
         ("deinterleave_q_gate_f32", spirv::deinterleave_q_gate_f32()),
@@ -1627,6 +1636,163 @@ fn live_q8_0_coalesced_projection_and_lm_head_matches_cpu() -> TestResult {
                 &format!("Q8_0 bat vs seq pinned={pinned} {path:?}"),
             );
         }
+    }
+    Ok(())
+}
+
+fn synthetic_gdn_edge_model(
+    identity: &str,
+    ssm_head: usize,
+    ssm_keys: usize,
+    ssm_values: usize,
+    conv_k: usize,
+) -> ModelResult {
+    let mut model = synthetic_hybrid_qwen35_model_with_layout(identity, 256, 256, 32)?;
+    let embd = 256_usize;
+    let ssm_inner = ssm_head * ssm_values;
+    let conv_ch = 2 * ssm_head * ssm_keys + ssm_inner;
+    model
+        .metadata
+        .insert("qwen35.block_count".to_owned(), MetadataValue::from(1_u32));
+    model.metadata.insert(
+        "qwen35.attention.recurrent_layers".to_owned(),
+        MetadataValue::from(vec![true]),
+    );
+    model.metadata.insert(
+        "qwen35.ssm.state_size".to_owned(),
+        MetadataValue::from(u32::try_from(ssm_head)?),
+    );
+    model.metadata.insert(
+        "qwen35.ssm.group_count".to_owned(),
+        MetadataValue::from(u32::try_from(ssm_keys)?),
+    );
+    model.metadata.insert(
+        "qwen35.ssm.time_step_rank".to_owned(),
+        MetadataValue::from(u32::try_from(ssm_values)?),
+    );
+    model.metadata.insert(
+        "qwen35.ssm.inner_size".to_owned(),
+        MetadataValue::from(u32::try_from(ssm_inner)?),
+    );
+    model.metadata.insert(
+        "qwen35.ssm.conv_kernel".to_owned(),
+        MetadataValue::from(u32::try_from(conv_k)?),
+    );
+    model
+        .tensors
+        .retain(|k, _| !k.starts_with("blk.1.") && !k.starts_with("blk.2."));
+    model.tensors.insert(
+        "blk.0.attn_qkv.weight".to_owned(),
+        build_pq2_tensor("blk.0.attn_qkv.weight", embd, conv_ch, 21),
+    );
+    model.tensors.insert(
+        "blk.0.attn_gate.weight".to_owned(),
+        build_pq2_tensor("blk.0.attn_gate.weight", embd, ssm_inner, 22),
+    );
+    model.tensors.insert(
+        "blk.0.ssm_beta.weight".to_owned(),
+        f32_tensor(
+            "blk.0.ssm_beta.weight",
+            &[embd, ssm_values],
+            &fill_pattern(embd * ssm_values, 0.02, 23),
+        ),
+    );
+    model.tensors.insert(
+        "blk.0.ssm_alpha.weight".to_owned(),
+        f32_tensor(
+            "blk.0.ssm_alpha.weight",
+            &[embd, ssm_values],
+            &fill_pattern(embd * ssm_values, 0.02, 24),
+        ),
+    );
+    model.tensors.insert(
+        "blk.0.ssm_conv1d.weight".to_owned(),
+        f32_tensor(
+            "blk.0.ssm_conv1d.weight",
+            &[conv_k, conv_ch],
+            &fill_pattern(conv_k * conv_ch, 0.05, 25),
+        ),
+    );
+    model.tensors.insert(
+        "blk.0.ssm_dt.bias".to_owned(),
+        f32_tensor(
+            "blk.0.ssm_dt.bias",
+            &[ssm_values],
+            &vec![0.1_f32; ssm_values],
+        ),
+    );
+    model.tensors.insert(
+        "blk.0.ssm_a".to_owned(),
+        f32_tensor("blk.0.ssm_a", &[ssm_values], &vec![-0.25_f32; ssm_values]),
+    );
+    model.tensors.insert(
+        "blk.0.ssm_norm.weight".to_owned(),
+        f32_tensor(
+            "blk.0.ssm_norm.weight",
+            &[ssm_head],
+            &vec![1.0_f32; ssm_head],
+        ),
+    );
+    model.tensors.insert(
+        "blk.0.ssm_out.weight".to_owned(),
+        build_pq2_tensor("blk.0.ssm_out.weight", ssm_inner, embd, 26),
+    );
+    Ok(model)
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_batched_gdn_scan_and_conv1d_edge_geometries_match_sequential() -> TestResult {
+    let prompt = [0_u32, 3, 6, 9, 12, 2];
+    for (ssm_head, ssm_keys, ssm_values, conv_k) in [
+        (64_usize, 2_usize, 4_usize, 1_usize), // conv_k = 1 (0 history taps)
+        (128, 1, 2, 8),                        // conv_k = 8 (7 history taps), 2 floats/lane
+        (256, 1, 2, 4),                        // ssm_head = 256 (4 floats/lane)
+        (64, 2, 4, 9),                         // conv_k = 9 (>8 serial fallback)
+    ] {
+        let id = format!("gdn-edge-h{ssm_head}-k{conv_k}");
+        let cpu_model = synthetic_gdn_edge_model(&id, ssm_head, ssm_keys, ssm_values, conv_k)?;
+        let gpu_seq_model = synthetic_gdn_edge_model(&id, ssm_head, ssm_keys, ssm_values, conv_k)?;
+        let gpu_bat_model = synthetic_gdn_edge_model(&id, ssm_head, ssm_keys, ssm_values, conv_k)?;
+
+        let mut cpu = Qwen35::new(cpu_model, 16)?;
+        let cfg = VulkanBatchedConfig {
+            prefill_tile_tokens: 16,
+            ..VulkanBatchedConfig::default()
+        };
+        let mut seq_exec = VulkanBatchedGraphExecutor::open(&gpu_seq_model, cfg.clone())?;
+        let mut bat_exec = VulkanBatchedGraphExecutor::open(&gpu_bat_model, cfg)?;
+
+        for &tok in &prompt {
+            cpu.ingest(tok)?;
+            seq_exec.ingest_token(tok)?;
+        }
+        bat_exec.ingest_tokens_batched(&prompt)?;
+
+        let seq_cp = seq_exec.checkpoint()?;
+        let bat_cp = bat_exec.checkpoint()?;
+        assert_eq!(
+            bat_cp.identity_sha256()?,
+            seq_cp.identity_sha256()?,
+            "GDN checkpoint SHA-256 mismatch for ssm_head={ssm_head}, conv_k={conv_k}"
+        );
+
+        let cpu_logits = cpu.evaluate(5)?;
+        let seq_logits = seq_exec.evaluate_token(5)?;
+        let bat_logits = bat_exec.evaluate_token(5)?;
+        assert_close(
+            &bat_logits,
+            &seq_logits,
+            1e-5,
+            &format!("bat vs seq ssm_head={ssm_head} conv_k={conv_k}"),
+        );
+        assert_close_rel(
+            &bat_logits,
+            &cpu_logits,
+            5e-3,
+            5e-3,
+            &format!("bat vs cpu ssm_head={ssm_head} conv_k={conv_k}"),
+        );
     }
     Ok(())
 }

@@ -265,9 +265,12 @@ pub struct VulkanLayerPipelines {
     mul_sigmoid: PipelineId,
     conv1d_silu: PipelineId,
     conv1d_silu_offset: PipelineId,
+    conv1d_silu_batched_inplace: PipelineId,
     l2_norm: PipelineId,
+    l2_norm_batched_strided: PipelineId,
     gdn_step: PipelineId,
     gdn_step_batched_token: PipelineId,
+    gdn_scan_batched: PipelineId,
     gdn_gates: PipelineId,
     gdn_gates_batched: PipelineId,
     deinterleave_q_gate: PipelineId,
@@ -318,7 +321,7 @@ impl VulkanLayerPipelines {
     pub fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         let proj = ProjectionPipelines::compile(device, use_sdot)?;
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v3:")?;
+        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v4:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
         hash_bytes(&mut hasher, b"proj_bundle:")?;
         hash_bytes(&mut hasher, proj.digest_sha256.as_bytes())?;
@@ -373,7 +376,19 @@ impl VulkanLayerPipelines {
             4,
             3,
         )?;
+        let (conv1d_silu_batched_inplace, _) = make_pipe(
+            b"conv1d_silu_batched_inplace_f32",
+            spirv::conv1d_silu_batched_inplace_f32(),
+            3,
+            3,
+        )?;
         let (l2_norm, _) = make_pipe(b"l2_norm_f32", spirv::l2_norm_f32(), 1, 3)?;
+        let (l2_norm_batched_strided, _) = make_pipe(
+            b"l2_norm_batched_strided_f32",
+            spirv::l2_norm_batched_strided_f32(),
+            1,
+            5,
+        )?;
         let (gdn_step, _) = make_pipe(b"gdn_step_f32", spirv::gdn_step_f32(), 7, 4)?;
         let (gdn_step_batched_token, _) = make_pipe(
             b"gdn_step_batched_token_f32",
@@ -381,6 +396,8 @@ impl VulkanLayerPipelines {
             5,
             5,
         )?;
+        let (gdn_scan_batched, _) =
+            make_pipe(b"gdn_scan_batched_f32", spirv::gdn_scan_batched_f32(), 5, 5)?;
         let (gdn_gates, _) = make_pipe(b"gdn_gates_f32", spirv::gdn_gates_f32(), 4, 1)?;
         let (gdn_gates_batched, _) = make_pipe(
             b"gdn_gates_batched_f32",
@@ -518,9 +535,12 @@ impl VulkanLayerPipelines {
             mul_sigmoid,
             conv1d_silu,
             conv1d_silu_offset,
+            conv1d_silu_batched_inplace,
             l2_norm,
+            l2_norm_batched_strided,
             gdn_step,
             gdn_step_batched_token,
+            gdn_scan_batched,
             gdn_gates,
             gdn_gates_batched,
             deinterleave_q_gate,
@@ -2447,6 +2467,68 @@ impl VulkanBatchedGraphExecutor {
                 checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?,
             );
             (out_buf, conv_out_buf)
+        } else if self.geometry.convolution <= 8 && self.geometry.ssm_head <= 256 {
+            let batched_out_buf = self.scratch.proj_e;
+            let conv_grid = checked_grid(&self.device, [channels_u32.div_ceil(WORKGROUP_X), 1, 1])?;
+            let gates_grid = checked_grid(
+                &self.device,
+                [v_heads_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
+            )?;
+            let l2_grid = checked_grid(&self.device, [1, qk_heads_u32, tokens_u32])?;
+            let gdn_grid = checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?;
+
+            self.batch_recorder.push_barrier(
+                self.pipelines.conv1d_silu_batched_inplace,
+                &[
+                    BufferSpan::whole(proj_qkv_buf),
+                    BufferSpan::whole(active_conv_state),
+                    BufferSpan::whole(convolution_w),
+                ],
+                &[channels_u32, kernel_u32, tokens_u32],
+                conv_grid,
+            );
+            self.batch_recorder.push_concurrent(
+                self.pipelines.gdn_gates_batched,
+                &[
+                    BufferSpan::whole(proj_alpha_buf),
+                    BufferSpan::whole(proj_beta_buf),
+                    BufferSpan::whole(time_bias),
+                    BufferSpan::whole(ssm_a),
+                ],
+                &[v_heads_u32, tokens_u32],
+                gates_grid,
+            );
+            self.batch_recorder.push_barrier(
+                self.pipelines.l2_norm_batched_strided,
+                &[BufferSpan::whole(proj_qkv_buf)],
+                &[
+                    qk_heads_u32,
+                    ssm_head_u32,
+                    self.geometry.epsilon.to_bits(),
+                    channels_u32,
+                    tokens_u32,
+                ],
+                l2_grid,
+            );
+            self.batch_recorder.push_barrier(
+                self.pipelines.gdn_scan_batched,
+                &[
+                    BufferSpan::whole(matrix_state),
+                    BufferSpan::whole(proj_qkv_buf),
+                    BufferSpan::whole(proj_alpha_buf),
+                    BufferSpan::whole(proj_beta_buf),
+                    BufferSpan::whole(batched_out_buf),
+                ],
+                &[
+                    v_heads_u32,
+                    k_heads_u32,
+                    ssm_head_u32,
+                    gdn_scale_bits,
+                    tokens_u32,
+                ],
+                gdn_grid,
+            );
+            (batched_out_buf, self.scratch.perm_tmp)
         } else {
             // `perm_tmp` holds single-token [q, k, v] during the serial recurrence while `proj_e` accumulates `[T, val_width]`.
             let conv_tmp_buf = self.scratch.perm_tmp;

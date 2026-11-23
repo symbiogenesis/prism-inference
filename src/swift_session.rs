@@ -20,10 +20,11 @@ use crate::{
         Cancellation, Completion, GenerationTimings, Limits, MediaSpan, MultimodalChunk, Prefill,
         PromptReuse, Runtime,
     },
-    sampling::SwiftSampler,
+    sampling::{ReasoningBudgetSequences, SwiftSampler, SwiftSamplerConfig, TokenConfidence},
     speculative::{SpeculativeStats, SuffixDraftConfig},
     swift_chat::{
-        ContentPart, ImageChunkPlan, MultimodalContent, MultimodalMessage, SwiftChatSession,
+        ContentPart, ImageChunkPlan, MultimodalContent, MultimodalMessage, ReasoningEffort,
+        SwiftChatSession,
     },
     text_output::Utf8Output,
     vision::{EncodedImage, SwiftVisionEncoder, VisionConfig},
@@ -811,6 +812,34 @@ pub struct MultiRankAdapterSpec<'a> {
     pub sha256: &'a str,
 }
 
+/// Per-request template, sampling, anti-repetition, soft reasoning-budget, and
+/// log-probability configuration for [`SwiftSession`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwiftRequestOptions {
+    /// Whether the chat template opens a `<think>` block for reasoning (default `true`).
+    pub enable_thinking: bool,
+    /// Prompt reasoning effort preset passed via `chat_template_kwargs` (default `XHigh`).
+    pub reasoning_effort: ReasoningEffort,
+    /// Optional rank-one `LoRA` adapter correction scale.
+    pub adapter_scale: Option<f32>,
+    /// Optional secondary multi-rank `LoRA` adapter correction scale.
+    pub multi_rank_scale: Option<f32>,
+    /// Per-request sampler, penalty, DRY, reasoning-budget, and logprob settings.
+    pub sampler: SwiftSamplerConfig,
+}
+
+impl Default for SwiftRequestOptions {
+    fn default() -> Self {
+        Self {
+            enable_thinking: true,
+            reasoning_effort: ReasoningEffort::XHigh,
+            adapter_scale: None,
+            multi_rank_scale: None,
+            sampler: SwiftSamplerConfig::default(),
+        }
+    }
+}
+
 /// Exact rendered and counted input, sealed by its originating verified session.
 pub struct PreparedChat {
     owner: Arc<()>,
@@ -820,6 +849,8 @@ pub struct PreparedChat {
     media_chunks: Vec<PreparedMediaChunk>,
     output_tokens: usize,
     enable_thinking: bool,
+    reasoning_effort: ReasoningEffort,
+    sampler: SwiftSamplerConfig,
 }
 
 impl PreparedChat {
@@ -858,6 +889,52 @@ impl PreparedChat {
     pub const fn thinking_enabled(&self) -> bool {
         self.enable_thinking
     }
+
+    /// Prompt reasoning effort preset sealed inside this prepared prompt.
+    #[must_use]
+    pub const fn reasoning_effort(&self) -> ReasoningEffort {
+        self.reasoning_effort
+    }
+
+    /// Per-request sampler configuration sealed inside this prepared prompt.
+    #[must_use]
+    pub const fn sampler_config(&self) -> &SwiftSamplerConfig {
+        &self.sampler
+    }
+}
+
+/// Candidate vocabulary piece and raw `log_softmax` score for `top_logprobs`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenLogprobEntry {
+    /// Display string decoded for the vocabulary token.
+    pub token: String,
+    /// Raw `log_softmax` score before sampling penalties (`<= 0.0`).
+    pub logprob: f32,
+}
+
+/// Selected token raw log-probability and optional top-k alternative distribution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenLogprobInfo {
+    /// Display string decoded for the selected vocabulary token.
+    pub token: String,
+    /// Raw `log_softmax` score of the selected token (`<= 0.0`).
+    pub logprob: f32,
+    /// Top candidate entries sorted descending by logprob.
+    pub top_logprobs: Vec<TokenLogprobEntry>,
+}
+
+/// A provisional rich text event carrying optional per-token raw log-probabilities.
+#[derive(Debug)]
+pub enum RichTextEvent<'a> {
+    /// Incrementally decoded UTF-8 delta with optional raw log-probability telemetry.
+    Delta {
+        /// Incrementally decoded UTF-8 slice (empty only when buffering UTF-8 with logprobs).
+        text: &'a str,
+        /// Per-token raw `log_softmax` telemetry when requested via `top_logprobs`.
+        logprobs: Option<TokenLogprobInfo>,
+    },
+    /// Terminal accounting. Failure to deliver this event closes admission.
+    Complete(Completion),
 }
 
 /// A provisional text event; callers commit displayed output only on completion.
@@ -1722,31 +1799,58 @@ impl SwiftSession {
         adapter_scale: Option<f32>,
         multi_rank_scale: Option<f32>,
     ) -> Result<PreparedChat> {
+        let options = SwiftRequestOptions {
+            enable_thinking,
+            reasoning_effort: ReasoningEffort::XHigh,
+            adapter_scale,
+            multi_rank_scale,
+            sampler: SwiftSamplerConfig::default(),
+        };
+        self.prepare_with_options(messages, output_tokens, &options)
+    }
+
+    /// Render and seal exact prompt tokens together with per-request cognitive,
+    /// sampling, DRY, soft reasoning-budget, and log-probability options.
+    ///
+    /// # Errors
+    /// Rejects closed admission, out-of-range sampler options, mismatched adapter
+    /// scales, malformed/multimodal input errors, and prompt/output budget overflow.
+    pub fn prepare_with_options(
+        &self,
+        messages: &Value,
+        output_tokens: usize,
+        options: &SwiftRequestOptions,
+    ) -> Result<PreparedChat> {
+        options.sampler.validate()?;
         if messages_have_array_content(messages) {
-            return self.prepare_multimodal_with_adapter_scales(
-                messages,
-                output_tokens,
-                enable_thinking,
-                adapter_scale,
-                multi_rank_scale,
-            );
+            return self.prepare_multimodal_with_options(messages, output_tokens, options);
         }
-        validate_adapter_scale(self.adapter_identity.is_some(), adapter_scale)?;
-        validate_multi_rank_scale(self.secondary_adapter_identity.is_some(), multi_rank_scale)?;
+        validate_adapter_scale(self.adapter_identity.is_some(), options.adapter_scale)?;
+        validate_multi_rank_scale(
+            self.secondary_adapter_identity.is_some(),
+            options.multi_rank_scale,
+        )?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }
-        let prompt = self
-            .chat
-            .prepare_with_thinking(messages, output_tokens, enable_thinking)?;
+        let prompt = self.chat.prepare_with_effort(
+            messages,
+            output_tokens,
+            options.enable_thinking,
+            options.reasoning_effort,
+        )?;
         Ok(PreparedChat {
             owner: self.owner.clone(),
-            adapter_scale,
-            multi_rank_scale: multi_rank_scale.map(MultiRankAdapter::normalize_scale),
+            adapter_scale: options.adapter_scale,
+            multi_rank_scale: options
+                .multi_rank_scale
+                .map(MultiRankAdapter::normalize_scale),
             tokens: prompt.tokenization.token_ids,
             media_chunks: Vec::new(),
             output_tokens,
-            enable_thinking,
+            enable_thinking: options.enable_thinking,
+            reasoning_effort: options.reasoning_effort,
+            sampler: options.sampler.clone(),
         })
     }
 
@@ -1785,8 +1889,28 @@ impl SwiftSession {
         adapter_scale: Option<f32>,
         multi_rank_scale: Option<f32>,
     ) -> Result<PreparedChat> {
-        validate_adapter_scale(self.adapter_identity.is_some(), adapter_scale)?;
-        validate_multi_rank_scale(self.secondary_adapter_identity.is_some(), multi_rank_scale)?;
+        let options = SwiftRequestOptions {
+            enable_thinking,
+            reasoning_effort: ReasoningEffort::XHigh,
+            adapter_scale,
+            multi_rank_scale,
+            sampler: SwiftSamplerConfig::default(),
+        };
+        self.prepare_multimodal_with_options(messages, output_tokens, &options)
+    }
+
+    fn prepare_multimodal_with_options(
+        &self,
+        messages: &Value,
+        output_tokens: usize,
+        options: &SwiftRequestOptions,
+    ) -> Result<PreparedChat> {
+        options.sampler.validate()?;
+        validate_adapter_scale(self.adapter_identity.is_some(), options.adapter_scale)?;
+        validate_multi_rank_scale(
+            self.secondary_adapter_identity.is_some(),
+            options.multi_rank_scale,
+        )?;
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
         }
@@ -1827,10 +1951,11 @@ impl SwiftSession {
                 reasoning_content: message.reasoning_content.as_deref(),
             })
             .collect();
-        let prepared = self.chat.prepare_multimodal_with_thinking(
+        let prepared = self.chat.prepare_multimodal_with_effort(
             &mm_messages,
             output_tokens,
-            enable_thinking,
+            options.enable_thinking,
+            options.reasoning_effort,
         )?;
         if prepared.image_spans.len() != encoded_images.len() {
             return Err(invalid("multimodal image span count mismatch"));
@@ -1852,12 +1977,16 @@ impl SwiftSession {
             .collect();
         Ok(PreparedChat {
             owner: self.owner.clone(),
-            adapter_scale,
-            multi_rank_scale: multi_rank_scale.map(MultiRankAdapter::normalize_scale),
+            adapter_scale: options.adapter_scale,
+            multi_rank_scale: options
+                .multi_rank_scale
+                .map(MultiRankAdapter::normalize_scale),
             tokens: prepared.tokenization.token_ids,
             media_chunks,
             output_tokens,
-            enable_thinking,
+            enable_thinking: options.enable_thinking,
+            reasoning_effort: options.reasoning_effort,
+            sampler: options.sampler.clone(),
         })
     }
 
@@ -1918,6 +2047,37 @@ impl SwiftSession {
     ) -> Result<Completion> {
         *timings = GenerationTimings::default();
         self.complete_observed(prompt, cancellation, deadline.into(), Some(timings), emit)
+    }
+
+    /// Generate sampled text with optional per-token raw log-probability telemetry.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::complete`] with the same recovery semantics.
+    pub fn complete_rich(
+        &mut self,
+        prompt: &PreparedChat,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+        emit: impl FnMut(RichTextEvent<'_>) -> Result<()>,
+    ) -> Result<Completion> {
+        self.complete_observed_rich(prompt, cancellation, deadline.into(), None, emit)
+    }
+
+    /// Generate sampled text with optional runtime attribution and per-token raw
+    /// log-probability telemetry.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::complete_with_timings`] with the same recovery semantics.
+    pub fn complete_rich_with_timings(
+        &mut self,
+        prompt: &PreparedChat,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+        timings: &mut GenerationTimings,
+        emit: impl FnMut(RichTextEvent<'_>) -> Result<()>,
+    ) -> Result<Completion> {
+        *timings = GenerationTimings::default();
+        self.complete_observed_rich(prompt, cancellation, deadline.into(), Some(timings), emit)
     }
 
     /// Generate greedy text with prompt/history suffix speculation (`SuffixDecoding`)
@@ -2010,40 +2170,105 @@ impl SwiftSession {
         timings: Option<&mut GenerationTimings>,
         mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<Completion> {
+        self.complete_observed_rich(prompt, cancellation, deadline, timings, |event| match event {
+            RichTextEvent::Delta { text, .. } => {
+                if text.is_empty() {
+                    Ok(())
+                } else {
+                    emit(TextEvent::Delta(text))
+                }
+            }
+            RichTextEvent::Complete(completion) => emit(TextEvent::Complete(completion)),
+        })
+    }
+
+    fn configure_request_sampler(&mut self, prompt: &PreparedChat) -> Result<()> {
+        let saved_sampler = self.sampler.clone();
+        let setup = (|| -> Result<()> {
+            let budget_sequences = if prompt.sampler.reasoning_budget.is_some() {
+                let (start, end, forced) = self.chat.reasoning_budget_delimiters()?;
+                Some(ReasoningBudgetSequences {
+                    start: if start.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![start]
+                    },
+                    end: if end.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![end]
+                    },
+                    forced,
+                    initial_thinking: prompt.enable_thinking,
+                })
+            } else {
+                None
+            };
+            let dry_breakers = if prompt.sampler.dry_multiplier > 0.0
+                && prompt.sampler.dry_penalty_last_n > 0
+            {
+                self.chat.dry_sequence_breakers()?
+            } else {
+                Vec::new()
+            };
+            self.sampler.apply_request_config(
+                prompt.sampler.clone(),
+                budget_sequences,
+                &dry_breakers,
+            )?;
+            self.sampler.seed_history(&prompt.tokens);
+            Ok(())
+        })();
+        if setup.is_err() {
+            self.sampler = saved_sampler;
+        }
+        setup
+    }
+
+    fn complete_observed_rich(
+        &mut self,
+        prompt: &PreparedChat,
+        cancellation: &Cancellation,
+        deadline: Option<Instant>,
+        timings: Option<&mut GenerationTimings>,
+        mut emit: impl FnMut(RichTextEvent<'_>) -> Result<()>,
+    ) -> Result<Completion> {
         let is_multimodal = !prompt.media_chunks.is_empty();
-        if timings.is_some() && self.cpu_speculation.is_some() && !is_multimodal {
+        let use_speculation = self.cpu_speculation.is_some()
+            && !is_multimodal
+            && prompt.sampler.top_logprobs.is_none();
+        if timings.is_some() && use_speculation {
             return Err(invalid(
                 "runtime phase timings are unavailable for CPU speculation",
             ));
         }
         self.last_speculative_stats = None;
         self.prepare_completion_prompt(prompt, cancellation, deadline)?;
+        self.configure_request_sampler(prompt)?;
         let options = self.chat.generation(prompt.output_tokens)?;
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
-        let consume = |token| {
-            emit_decoded_token(
-                &self.vocabulary,
-                &mut display,
-                &mut output_bytes,
-                token,
-                &mut emit,
-            )
-        };
+        let chunks: Vec<MultimodalChunk<'_>> = prompt
+            .media_chunks
+            .iter()
+            .map(|chunk| MultimodalChunk {
+                span: chunk.span,
+                embeddings: &chunk.encoded.embeddings,
+            })
+            .collect();
+        let reset_only = self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0;
         let mut recorded_stats = None;
-        let completion = if is_multimodal {
-            execute_multimodal_completion(
-                &mut self.runtime,
-                self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0,
-                &mut self.sampler,
-                prompt,
-                &options,
-                cancellation,
-                deadline,
-                timings,
-                consume,
-            )?
-        } else if let Some(speculation) = self.cpu_speculation {
+        let completion = if use_speculation && let Some(speculation) = self.cpu_speculation {
+            let consume = |token| {
+                emit_decoded_token_rich(
+                    &self.vocabulary,
+                    &mut display,
+                    &mut output_bytes,
+                    token,
+                    None,
+                    &mut emit,
+                )
+            };
             let (completion, stats) = self.runtime.generate_sampled_speculative_until(
                 &prompt.tokens,
                 &options,
@@ -2056,36 +2281,27 @@ impl SwiftSession {
             )?;
             recorded_stats = Some(stats);
             completion
-        } else if self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0 {
-            self.runtime.generate_sampled_until_for_reset(
-                &prompt.tokens,
-                &options,
-                Prefill { block_tokens: 64 },
-                cancellation,
-                deadline,
-                &mut self.sampler,
-                timings,
-                consume,
-            )?
-        } else if let Some(timings) = timings {
-            self.runtime.generate_sampled_until_with_timings(
-                &prompt.tokens,
-                &options,
-                Prefill { block_tokens: 64 },
-                cancellation,
-                deadline,
-                &mut self.sampler,
-                timings,
-                consume,
-            )?
         } else {
-            self.runtime.generate_sampled_until(
+            let consume = |token, confidence: Option<TokenConfidence>| {
+                emit_decoded_token_rich(
+                    &self.vocabulary,
+                    &mut display,
+                    &mut output_bytes,
+                    token,
+                    confidence,
+                    &mut emit,
+                )
+            };
+            self.runtime.generate_swift_until(
                 &prompt.tokens,
+                &chunks,
                 &options,
                 Prefill { block_tokens: 64 },
                 cancellation,
                 deadline,
                 &mut self.sampler,
+                timings,
+                reset_only,
                 consume,
             )?
         };
@@ -2093,75 +2309,17 @@ impl SwiftSession {
         let suffix = display.finish();
         charge_output(&mut output_bytes, suffix.len())?;
         if !suffix.is_empty() {
-            emit(TextEvent::Delta(suffix))?;
+            emit(RichTextEvent::Delta {
+                text: suffix,
+                logprobs: None,
+            })?;
         }
         check_request(cancellation, deadline)?;
-        emit(TextEvent::Complete(completion))?;
+        emit(RichTextEvent::Complete(completion))?;
         check_request(cancellation, deadline)?;
         self.delivery_fault = false;
         self.last_speculative_stats = recorded_stats;
         Ok(completion)
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Borrowing disjoint session fields keeps the token output closure free of mutable session overlap."
-)]
-fn execute_multimodal_completion(
-    runtime: &mut Runtime<Qwen35>,
-    reset_only: bool,
-    sampler: &mut SwiftSampler,
-    prompt: &PreparedChat,
-    options: &crate::runtime::Generation,
-    cancellation: &Cancellation,
-    deadline: Option<Instant>,
-    timings: Option<&mut GenerationTimings>,
-    consume: impl FnMut(u32) -> Result<()>,
-) -> Result<Completion> {
-    let chunks: Vec<MultimodalChunk<'_>> = prompt
-        .media_chunks
-        .iter()
-        .map(|chunk| MultimodalChunk {
-            span: chunk.span,
-            embeddings: &chunk.encoded.embeddings,
-        })
-        .collect();
-    if reset_only {
-        runtime.generate_multimodal_sampled_until_for_reset(
-            &prompt.tokens,
-            &chunks,
-            options,
-            Prefill { block_tokens: 64 },
-            cancellation,
-            deadline,
-            sampler,
-            timings,
-            consume,
-        )
-    } else if let Some(timings) = timings {
-        runtime.generate_multimodal_sampled_until_with_timings(
-            &prompt.tokens,
-            &chunks,
-            options,
-            Prefill { block_tokens: 64 },
-            cancellation,
-            deadline,
-            sampler,
-            timings,
-            consume,
-        )
-    } else {
-        runtime.generate_multimodal_sampled_until(
-            &prompt.tokens,
-            &chunks,
-            options,
-            Prefill { block_tokens: 64 },
-            cancellation,
-            deadline,
-            sampler,
-            consume,
-        )
     }
 }
 
@@ -2370,6 +2528,68 @@ fn encode_parsed_images(
     Ok(encoded)
 }
 
+fn resolve_token_logprob_info(
+    vocabulary: &Vocabulary,
+    confidence: TokenConfidence,
+) -> TokenLogprobInfo {
+    let decode_token = |token_id: u32| -> String {
+        vocabulary
+            .piece(token_id)
+            .map_or_default(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    };
+    let mut top_logprobs = Vec::with_capacity(confidence.top_logprobs.len());
+    for (id, logprob) in confidence.top_logprobs {
+        top_logprobs.push(TokenLogprobEntry {
+            token: decode_token(id),
+            logprob,
+        });
+    }
+    TokenLogprobInfo {
+        token: decode_token(confidence.token),
+        logprob: confidence.logprob,
+        top_logprobs,
+    }
+}
+
+fn emit_decoded_token_rich(
+    vocabulary: &Vocabulary,
+    display: &mut Utf8Output,
+    output_bytes: &mut usize,
+    token: u32,
+    confidence: Option<TokenConfidence>,
+    emit: &mut impl FnMut(RichTextEvent<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut pending_info = confidence.map(|conf| resolve_token_logprob_info(vocabulary, conf));
+    if vocabulary.is_control(token)? {
+        let pending = display.flush_incomplete();
+        if !pending.is_empty() {
+            charge_output(output_bytes, pending.len())?;
+            emit(RichTextEvent::Delta {
+                text: pending.as_ref(),
+                logprobs: None,
+            })?;
+        }
+    }
+    crate::text_output::push_with(display, vocabulary.piece(token)?, |piece| {
+        let text = piece.as_ref();
+        charge_output(output_bytes, text.len())?;
+        if !text.is_empty() {
+            emit(RichTextEvent::Delta {
+                text,
+                logprobs: pending_info.take(),
+            })?;
+        }
+        Ok(())
+    })?;
+    if let Some(info) = pending_info.take() {
+        emit(RichTextEvent::Delta {
+            text: "",
+            logprobs: Some(info),
+        })?;
+    }
+    Ok(())
+}
+
 fn emit_decoded_token(
     vocabulary: &Vocabulary,
     display: &mut Utf8Output,
@@ -2377,17 +2597,10 @@ fn emit_decoded_token(
     token: u32,
     emit: &mut impl FnMut(TextEvent<'_>) -> Result<()>,
 ) -> Result<()> {
-    if vocabulary.is_control(token)? {
-        let pending = display.flush_incomplete();
-        if !pending.is_empty() {
-            charge_output(output_bytes, pending.len())?;
-            emit(TextEvent::Delta(pending.as_ref()))?;
-        }
-    }
-    crate::text_output::push_with(display, vocabulary.piece(token)?, |piece| {
-        let text = piece.as_ref();
-        charge_output(output_bytes, text.len())?;
-        if !text.is_empty() {
+    emit_decoded_token_rich(vocabulary, display, output_bytes, token, None, &mut |event| {
+        if let RichTextEvent::Delta { text, .. } = event
+            && !text.is_empty()
+        {
             emit(TextEvent::Delta(text))?;
         }
         Ok(())
@@ -2496,6 +2709,8 @@ mod tests {
         graph::KvCachePolicy,
         kernels::{MatvecBackend, RowParallelism},
         model::swift::Representation,
+        sampling::SwiftSamplerConfig,
+        swift_chat::ReasoningEffort,
         text_output::Utf8Output,
         vocabulary::Vocabulary,
     };
@@ -2710,6 +2925,8 @@ mod tests {
             media_chunks: Vec::new(),
             output_tokens: 3,
             enable_thinking: false,
+            reasoning_effort: ReasoningEffort::XHigh,
+            sampler: SwiftSamplerConfig::default(),
         };
         validate_prompt_owner(&owner, &prompt)?;
         assert!(validate_prompt_owner(&Arc::new(()), &prompt).is_err());

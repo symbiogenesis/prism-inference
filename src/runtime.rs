@@ -2,7 +2,7 @@
 
 use crate::{
     Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid,
-    sampling::{FiniteLogits, Greedy, Sampler},
+    sampling::{FiniteLogits, Greedy, Sampler, TokenConfidence},
     speculative::{
         MAX_SPECULATIVE_DRAFT_TOKENS, SpeculativeStats, SuffixDraftConfig, SuffixTree,
         VerifiedRound,
@@ -904,6 +904,7 @@ impl<D: Decoder> Runtime<D> {
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
         let deadline = deadline.into();
+        let mut emit = emit;
         self.generate_sampled_observed(
             prompt,
             &[],
@@ -912,9 +913,49 @@ impl<D: Decoder> Runtime<D> {
             &|| check_deadline(cancellation, deadline, Instant::now()),
             GenerationEffects {
                 sampler,
-                emit,
+                emit: move |token, _| emit(token),
                 timings: Some(timings),
                 terminal_state_only: false,
+            },
+        )
+    }
+
+    /// Generate sampled tokens with optional multimodal chunks, reset-only tail mode,
+    /// phase timings, and per-token confidence metadata emitted alongside each token.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Unified Swift internal generation path forwards chunks, reset mode, timings and confidence."
+    )]
+    pub(crate) fn generate_swift_until<S: Sampler + Clone>(
+        &mut self,
+        prompt: &[u32],
+        chunks: &[MultimodalChunk<'_>],
+        options: &Generation,
+        prefill: Prefill,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+        sampler: &mut S,
+        timings: Option<&mut GenerationTimings>,
+        terminal_state_only: bool,
+        emit: impl FnMut(u32, Option<TokenConfidence>) -> Result<()>,
+    ) -> Result<Completion> {
+        let deadline = deadline.into();
+        if terminal_state_only && self.limits.checkpoints != 0 {
+            return Err(invalid(
+                "reset-only generation cannot retain prefix checkpoints",
+            ));
+        }
+        self.generate_sampled_observed(
+            prompt,
+            chunks,
+            options,
+            prefill,
+            &|| check_deadline(cancellation, deadline, Instant::now()),
+            GenerationEffects {
+                sampler,
+                emit,
+                timings,
+                terminal_state_only,
             },
         )
     }
@@ -943,6 +984,7 @@ impl<D: Decoder> Runtime<D> {
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
         let deadline = deadline.into();
+        let mut emit = emit;
         self.generate_sampled_observed(
             prompt,
             chunks,
@@ -951,7 +993,7 @@ impl<D: Decoder> Runtime<D> {
             &|| check_deadline(cancellation, deadline, Instant::now()),
             GenerationEffects {
                 sampler,
-                emit,
+                emit: move |token, _| emit(token),
                 timings: None,
                 terminal_state_only: false,
             },
@@ -979,6 +1021,7 @@ impl<D: Decoder> Runtime<D> {
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
         let deadline = deadline.into();
+        let mut emit = emit;
         self.generate_sampled_observed(
             prompt,
             chunks,
@@ -987,7 +1030,7 @@ impl<D: Decoder> Runtime<D> {
             &|| check_deadline(cancellation, deadline, Instant::now()),
             GenerationEffects {
                 sampler,
-                emit,
+                emit: move |token, _| emit(token),
                 timings: Some(timings),
                 terminal_state_only: false,
             },
@@ -999,7 +1042,7 @@ impl<D: Decoder> Runtime<D> {
         clippy::too_many_arguments,
         reason = "The reset-only multimodal service preserves deadline, sampler and timing attribution arguments."
     )]
-    #[cfg(any(feature = "cli", test))]
+    #[cfg(test)]
     pub(crate) fn generate_multimodal_sampled_until_for_reset<S: Sampler + Clone>(
         &mut self,
         prompt: &[u32],
@@ -1013,6 +1056,7 @@ impl<D: Decoder> Runtime<D> {
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
         let deadline = deadline.into();
+        let mut emit = emit;
         if self.limits.checkpoints != 0 {
             return Err(invalid(
                 "reset-only generation cannot retain prefix checkpoints",
@@ -1026,7 +1070,7 @@ impl<D: Decoder> Runtime<D> {
             &|| check_deadline(cancellation, deadline, Instant::now()),
             GenerationEffects {
                 sampler,
-                emit,
+                emit: move |token, _| emit(token),
                 timings,
                 terminal_state_only: true,
             },
@@ -1043,7 +1087,7 @@ impl<D: Decoder> Runtime<D> {
         clippy::too_many_arguments,
         reason = "The reset-only service keeps the existing deadline, sampler and optional attribution arguments."
     )]
-    #[cfg(any(feature = "cli", test))]
+    #[cfg(test)]
     pub(crate) fn generate_sampled_until_for_reset<S: Sampler + Clone>(
         &mut self,
         prompt: &[u32],
@@ -1056,6 +1100,7 @@ impl<D: Decoder> Runtime<D> {
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
         let deadline = deadline.into();
+        let mut emit = emit;
         if self.limits.checkpoints != 0 {
             return Err(invalid(
                 "reset-only generation cannot retain prefix checkpoints",
@@ -1069,7 +1114,7 @@ impl<D: Decoder> Runtime<D> {
             &|| check_deadline(cancellation, deadline, Instant::now()),
             GenerationEffects {
                 sampler,
-                emit,
+                emit: move |token, _| emit(token),
                 timings,
                 terminal_state_only: true,
             },
@@ -1096,6 +1141,7 @@ impl<D: Decoder> Runtime<D> {
         sampler: &mut S,
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
+        let mut emit = emit;
         self.generate_sampled_observed(
             prompt,
             &[],
@@ -1104,7 +1150,7 @@ impl<D: Decoder> Runtime<D> {
             check,
             GenerationEffects {
                 sampler,
-                emit,
+                emit: move |token, _| emit(token),
                 timings: None,
                 terminal_state_only: false,
             },
@@ -1118,7 +1164,7 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
-        mut effects: GenerationEffects<'_, S, impl FnMut(u32) -> Result<()>>,
+        mut effects: GenerationEffects<'_, S, impl FnMut(u32, Option<TokenConfidence>) -> Result<()>>,
     ) -> Result<Completion> {
         let started = effects.timings.as_deref_mut().map(|timings| {
             *timings = GenerationTimings::started(prompt.len());
@@ -1159,7 +1205,11 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
-        effects: &mut GenerationEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
+        effects: &mut GenerationEffects<
+            '_,
+            impl Sampler,
+            impl FnMut(u32, Option<TokenConfidence>) -> Result<()>,
+        >,
     ) -> Result<Completion> {
         if self.faulted {
             return Err(invalid(
@@ -1958,7 +2008,11 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
-        effects: &mut GenerationEffects<'_, impl Sampler, impl FnMut(u32) -> Result<()>>,
+        effects: &mut GenerationEffects<
+            '_,
+            impl Sampler,
+            impl FnMut(u32, Option<TokenConfidence>) -> Result<()>,
+        >,
         prompt_end: &mut PromptEndCapture<'_, D::Checkpoint>,
     ) -> Result<Completion> {
         check()?;
@@ -1996,6 +2050,7 @@ impl<D: Decoder> Runtime<D> {
                     .sampler
                     .sample_finite(FiniteLogits::from_validated(&self.logits)?)
             })?;
+            let confidence = effects.sampler.take_last_confidence();
             check()?;
             if !usize::try_from(token).is_ok_and(|value| value < self.decoder.vocab_size()) {
                 return Err(invalid(
@@ -2026,7 +2081,7 @@ impl<D: Decoder> Runtime<D> {
             }
             check()?;
             measure(&mut effects.timings, GenerationPhase::Callback, 1, || {
-                (effects.emit)(token)
+                (effects.emit)(token, confidence)
             })?;
             check()?;
             completion.generated_tokens += 1;

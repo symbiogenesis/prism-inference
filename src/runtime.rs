@@ -4418,7 +4418,10 @@ mod ptq1_host_release_tests {
     use crate::kernels::{PQ2, PTQ1, Pq2ProjectionExecutor, Q8KBlock};
     use crate::model::{Model, Tensor, TensorBytes};
 
-    struct ClaimFfnMixedExecutor;
+    #[derive(Default)]
+    struct ClaimFfnMixedExecutor {
+        released: Vec<TensorBytes>,
+    }
 
     impl Pq2ProjectionExecutor for ClaimFfnMixedExecutor {
         fn identity(&self) -> &'static str {
@@ -4441,6 +4444,31 @@ mod ptq1_host_release_tests {
             _output: &mut Vec<f32>,
         ) -> Result<()> {
             Err(invalid("not invoked in runtime host-weight release test"))
+        }
+
+        fn release_host_weight_binding(
+            &mut self,
+            previous_tensor: &Tensor,
+            released_data: &TensorBytes,
+        ) -> bool {
+            if self.supports_f32(previous_tensor)
+                && released_data.is_empty()
+                && !released_data.is_mapped()
+            {
+                self.released.push(released_data.clone());
+                true
+            } else {
+                false
+            }
+        }
+
+        fn has_released_host_weight(&self, tensor: &Tensor) -> bool {
+            tensor.data.is_empty()
+                && self.supports_f32(tensor)
+                && self
+                    .released
+                    .iter()
+                    .any(|token| TensorBytes::ptr_eq(token, &tensor.data))
         }
     }
 
@@ -4650,7 +4678,7 @@ mod ptq1_host_release_tests {
                 checkpoint_bytes: 16_384,
             },
         )?;
-        tiled_runtime.set_projection_executor(Some(Box::new(ClaimFfnMixedExecutor)));
+        tiled_runtime.set_projection_executor(Some(Box::new(ClaimFfnMixedExecutor::default())));
         assert!(
             tiled_runtime
                 .release_executor_resident_host_weights()
@@ -4659,7 +4687,7 @@ mod ptq1_host_release_tests {
         drop(tiled_runtime);
 
         // 3. Releases both mapped PQ2_0 and mapped PTQ1_0 FFN tensors claimed by supports_f32.
-        runtime.set_projection_executor(Some(Box::new(ClaimFfnMixedExecutor)));
+        runtime.set_projection_executor(Some(Box::new(ClaimFfnMixedExecutor::default())));
         let released = runtime.release_executor_resident_host_weights()?;
         assert_eq!(released, expected_ffn_bytes);
         assert!(

@@ -3,7 +3,7 @@
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::{
     kernels::{Pq2ProjectionExecutor, Q8Block},
-    model::Tensor,
+    model::{Tensor, TensorBytes},
 };
 use bonsai_ternary::Q8KBlock;
 
@@ -574,6 +574,30 @@ impl<N: Pq2ProjectionExecutor, G: Pq2ProjectionExecutor> Pq2ProjectionExecutor
             && (self.core.plan_npu_layers == 0 || self.npu.supports_tile_tokens())
             && (self.core.plan_npu_layers == self.core.plan_total_layers
                 || self.gpu.supports_tile_tokens())
+    }
+
+    fn release_host_weight_binding(
+        &mut self,
+        previous_tensor: &Tensor,
+        released_data: &TensorBytes,
+    ) -> bool {
+        match self.core.single_target(&previous_tensor.name) {
+            Some(RouteTarget::Npu) => self
+                .npu
+                .release_host_weight_binding(previous_tensor, released_data),
+            Some(RouteTarget::Gpu) => self
+                .gpu
+                .release_host_weight_binding(previous_tensor, released_data),
+            None => false,
+        }
+    }
+
+    fn has_released_host_weight(&self, tensor: &Tensor) -> bool {
+        match self.core.single_target(&tensor.name) {
+            Some(RouteTarget::Npu) => self.npu.has_released_host_weight(tensor),
+            Some(RouteTarget::Gpu) => self.gpu.has_released_host_weight(tensor),
+            None => false,
+        }
     }
 
     fn project_f32_ffn_chain(
@@ -1553,6 +1577,119 @@ mod tests {
             true,
             &mut out,
         )?;
+        assert_eq!(out, [9.25; 32]);
+        assert_eq!(owned.telemetry().npu_projections, 1);
+        Ok(())
+    }
+
+    struct CompositeResidentSubmitter {
+        registry: hexagon_native_rpc::NativeQ2WeightRegistry,
+    }
+
+    impl hexagon_native_rpc::NativeQ2Submitter for CompositeResidentSubmitter {
+        fn residency_capacity_bytes(&self) -> usize {
+            self.registry.remaining_bytes()
+        }
+
+        fn prepare_weights(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+        ) -> std::result::Result<
+            Option<hexagon_native_rpc::NativeQ2WeightHandle>,
+            hexagon_native_rpc::Error,
+        > {
+            self.registry.prepare(columns, rows, weights)
+        }
+
+        fn submit(
+            &mut self,
+            _columns: usize,
+            _rows: usize,
+            _weights: &[u8],
+            _activation: &[f32],
+            _output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            Err(hexagon_native_rpc::Error::Contract)
+        }
+
+        fn submit_resident(
+            &mut self,
+            handle: &hexagon_native_rpc::NativeQ2WeightHandle,
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.registry.range(handle)?;
+            if activation.len() != handle.columns() || output.len() != handle.rows() {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            output.fill(9.25);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn owned_composite_forwards_host_weight_release_only_to_resident_npu() -> Result<()> {
+        let model = build_vtcm_ptq1_test_model();
+        let vtcm_plan =
+            crate::plan_native_q2_layers_for_budget(&model, 73, 29_952, 1, 4 * 1024 * 1024)?;
+        let het_plan = crate::plan_three_processor_placement(
+            vtcm_plan.total_layers,
+            vtcm_plan.admitted_layers,
+            vtcm_plan.total_layers - vtcm_plan.admitted_layers,
+            4,
+            AcceleratorTarget::AdrenoGpuVulkan,
+        )?;
+        let limits = hexagon_native_rpc::NativeQ2ProjectionLimits::new(
+            256,
+            32,
+            16,
+            std::time::Duration::from_secs(4),
+        )
+        .map_err(|_| invalid("limits"))?
+        .with_resident_weights(65_536)
+        .map_err(|_| invalid("residency"))?;
+        let submitter = CompositeResidentSubmitter {
+            registry: hexagon_native_rpc::NativeQ2WeightRegistry::new(65_536)
+                .map_err(|_| invalid("registry"))?,
+        };
+        let mut npu =
+            crate::NativeQ2Executor::new(submitter, limits, 1024 * 1024).with_resident_weights(4096)?;
+        let mut npu_up = model.tensors["blk.0.ffn_up.weight"].clone();
+        let mut gpu_up = model.tensors["blk.2.ffn_up.weight"].clone();
+        npu.select_and_prewarm_tensors(&[npu_up.clone()])?;
+
+        let gpu = MockExecutor {
+            id: "adreno-no-host-release",
+            capacity: Some(64),
+            fail_on: None,
+            tile_tokens: false,
+            calls: 0,
+        };
+        let mut owned = OwnedCompositeProjectionExecutor::new(&het_plan, npu, gpu)?;
+
+        let orig_npu_data = npu_up.data.clone();
+        let before_release_refs = TensorBytes::strong_count(&orig_npu_data);
+        assert_eq!(before_release_refs, 5);
+        let npu_token = TensorBytes::default();
+        assert!(owned.release_host_weight_binding(&npu_up, &npu_token));
+        npu_up.data = npu_token;
+        assert_eq!(
+            TensorBytes::strong_count(&orig_npu_data),
+            before_release_refs - 3
+        );
+        assert!(owned.has_released_host_weight(&npu_up));
+
+        // MockExecutor on GPU does not opt in to host-weight release, leaving overflow intact.
+        let gpu_token = TensorBytes::default();
+        assert!(!owned.release_host_weight_binding(&gpu_up, &gpu_token));
+        assert!(!owned.has_released_host_weight(&gpu_up));
+        gpu_up.data = TensorBytes::default();
+        assert!(!owned.has_released_host_weight(&gpu_up));
+
+        let mut out = Vec::new();
+        owned.project_f32(&npu_up, &vec![1.0_f32; 256], true, &mut out)?;
         assert_eq!(out, [9.25; 32]);
         assert_eq!(owned.telemetry().npu_projections, 1);
         Ok(())

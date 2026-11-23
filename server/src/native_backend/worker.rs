@@ -310,6 +310,35 @@ macro_rules! impl_tls_pq2_executor {
                 })
             }
 
+            fn release_host_weight_binding(
+                &mut self,
+                previous_tensor: &bonsai_prism_runtime::model::Tensor,
+                released_data: &bonsai_prism_runtime::model::TensorBytes,
+            ) -> bool {
+                $tls.with_borrow_mut(|slot| {
+                    slot.as_mut().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::release_host_weight_binding(
+                            executor,
+                            previous_tensor,
+                            released_data,
+                        )
+                    })
+                })
+            }
+
+            fn has_released_host_weight(
+                &self,
+                tensor: &bonsai_prism_runtime::model::Tensor,
+            ) -> bool {
+                $tls.with_borrow(|slot| {
+                    slot.as_ref().is_some_and(|executor| {
+                        bonsai_prism_runtime::kernels::Pq2ProjectionExecutor::has_released_host_weight(
+                            executor, tensor,
+                        )
+                    })
+                })
+            }
+
             fn project(
                 &mut self,
                 tensor: &bonsai_prism_runtime::model::Tensor,

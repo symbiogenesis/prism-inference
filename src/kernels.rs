@@ -118,7 +118,7 @@ fn layout(kind: u32) -> Result<(usize, usize)> {
     }
 }
 
-fn dimensions(tensor: &Tensor) -> Result<(usize, usize, usize)> {
+pub(crate) fn dimensions_geometry(tensor: &Tensor) -> Result<(usize, usize, usize)> {
     let Some(&columns) = tensor.dimensions.first() else {
         return Err(invalid("tensor requires at least one dimension"));
     };
@@ -135,6 +135,14 @@ fn dimensions(tensor: &Tensor) -> Result<(usize, usize, usize)> {
     let row_bytes = (columns / group)
         .checked_mul(bytes)
         .ok_or_else(|| invalid("tensor row byte length overflow"))?;
+    if row_bytes.checked_mul(rows).is_none() {
+        return Err(invalid("tensor byte length overflow"));
+    }
+    Ok((columns, rows, row_bytes))
+}
+
+fn dimensions(tensor: &Tensor) -> Result<(usize, usize, usize)> {
+    let (columns, rows, row_bytes) = dimensions_geometry(tensor)?;
     if row_bytes.checked_mul(rows) != Some(tensor.data.len()) {
         return Err(invalid("tensor data length does not match its dimensions"));
     }
@@ -1951,12 +1959,37 @@ impl MatvecScratch {
         tensor: &Tensor,
         input: &'a [f32],
     ) -> Result<PreparedMatvec<'a>> {
-        self.prepare_with_quantization(tensor, input, false)
+        self.prepare_with_quantization_dims(tensor, input, false, false)
     }
 
-    pub(crate) fn shares_contract(&self, first: &Tensor, second: &Tensor) -> Result<bool> {
-        let (first_columns, _, _) = dimensions(first)?;
-        let (second_columns, _, _) = dimensions(second)?;
+    pub(crate) fn prepare_with_executor<'a>(
+        &'a mut self,
+        tensor: &Tensor,
+        input: &'a [f32],
+        executor: &(impl Pq2ProjectionExecutor + ?Sized),
+    ) -> Result<PreparedMatvec<'a>> {
+        let allow_released = tensor.data.is_empty() && executor.has_released_host_weight(tensor);
+        self.prepare_with_quantization_dims(tensor, input, true, allow_released)
+    }
+
+    pub(crate) fn prepare_f32_executor_with<'a>(
+        &'a mut self,
+        tensor: &Tensor,
+        input: &'a [f32],
+        executor: &(impl Pq2ProjectionExecutor + ?Sized),
+    ) -> Result<PreparedMatvec<'a>> {
+        let allow_released = tensor.data.is_empty() && executor.has_released_host_weight(tensor);
+        self.prepare_with_quantization_dims(tensor, input, false, allow_released)
+    }
+
+    pub(crate) fn shares_contract_with(
+        &self,
+        first: &Tensor,
+        second: &Tensor,
+        executor: &(impl Pq2ProjectionExecutor + ?Sized),
+    ) -> Result<bool> {
+        let (first_columns, _, _) = projection::executor_tensor_dimensions(first, executor)?;
+        let (second_columns, _, _) = projection::executor_tensor_dimensions(second, executor)?;
         Ok(first_columns == second_columns
             && ActivationContract::for_tensor(first, first_columns, self.pinned_accumulation)
                 == ActivationContract::for_tensor(second, second_columns, self.pinned_accumulation))
@@ -1968,16 +2001,27 @@ impl MatvecScratch {
         input: &'a [f32],
         quantized: bool,
     ) -> Result<PreparedMatvec<'a>> {
+        self.prepare_with_quantization_dims(tensor, input, quantized, false)
+    }
+
+    fn prepare_with_quantization_dims<'a>(
+        &'a mut self,
+        tensor: &Tensor,
+        input: &'a [f32],
+        quantized: bool,
+        allow_released: bool,
+    ) -> Result<PreparedMatvec<'a>> {
         self.reset_diagnostics();
         self.statistics.preparations = self.statistics.preparations.saturating_add(1);
-        let contract = match self.prepare_input_with_quantization(tensor, input, quantized) {
-            Ok(contract) => contract,
-            Err(error) => {
-                self.statistics.preparation_failures =
-                    self.statistics.preparation_failures.saturating_add(1);
-                return Err(error);
-            }
-        };
+        let contract =
+            match self.prepare_input_with_quantization(tensor, input, quantized, allow_released) {
+                Ok(contract) => contract,
+                Err(error) => {
+                    self.statistics.preparation_failures =
+                        self.statistics.preparation_failures.saturating_add(1);
+                    return Err(error);
+                }
+            };
         Ok(PreparedMatvec {
             input,
             contract,
@@ -1987,7 +2031,7 @@ impl MatvecScratch {
     }
 
     fn prepare_input(&mut self, tensor: &Tensor, input: &[f32]) -> Result<ActivationContract> {
-        self.prepare_input_with_quantization(tensor, input, true)
+        self.prepare_input_with_quantization(tensor, input, true, false)
     }
 
     #[expect(
@@ -1999,6 +2043,7 @@ impl MatvecScratch {
         tensor: &Tensor,
         input: &[f32],
         quantized: bool,
+        allow_released: bool,
     ) -> Result<ActivationContract> {
         // A new scoped preparation invalidates every rearranged activation,
         // including a preparation which fails before dispatch. Capacity alone
@@ -2014,7 +2059,11 @@ impl MatvecScratch {
             )
         ))]
         self.pq2_consumption.clear();
-        let (columns, _, _) = dimensions(tensor)?;
+        let (columns, _, _) = if allow_released {
+            dimensions_geometry(tensor)?
+        } else {
+            dimensions(tensor)?
+        };
         if input.len() != columns {
             return Err(invalid(
                 "matvec requires a matching finite activation vector",

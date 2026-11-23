@@ -1971,7 +1971,7 @@ impl Transforms {
                                 || self.basis(weight) != basis
                                 || !scratch
                                     .matvec
-                                    .shares_contract(weights[index], weight)
+                                    .shares_contract_with(weights[index], weight, exec)
                                     .unwrap_or(false)
                                 || (matches!(
                                     weight.kind,
@@ -1983,7 +1983,19 @@ impl Transforms {
                                     && exec.supports_f32(weight))
                         })
                 });
-                let mut prepared = if skip_cpu_quantization {
+                let mut prepared = if let Some(exec) = executor.as_deref() {
+                    if skip_cpu_quantization {
+                        scratch.matvec.prepare_f32_executor_with(
+                            weights[index],
+                            activation,
+                            exec,
+                        )?
+                    } else {
+                        scratch
+                            .matvec
+                            .prepare_with_executor(weights[index], activation, exec)?
+                    }
+                } else if skip_cpu_quantization {
                     scratch
                         .matvec
                         .prepare_f32_executor(weights[index], activation)?
@@ -1996,7 +2008,13 @@ impl Transforms {
                     .take_while(|&(offset, w)| {
                         !completed[index + offset]
                             && self.basis(w) == basis
-                            && prepared.is_compatible(w).unwrap_or(false)
+                            && executor
+                                .as_deref()
+                                .map_or_else(
+                                    || prepared.is_compatible(w),
+                                    |exec| prepared.is_compatible_with_executor(w, exec),
+                                )
+                                .unwrap_or(false)
                     })
                     .count();
                 let f32_batch_len = if skip_cpu_quantization && let Some(exec) = executor.as_deref()
@@ -2007,7 +2025,7 @@ impl Transforms {
                         .take_while(|&(offset, w)| {
                             !completed[index + offset]
                                 && self.basis(w) == basis
-                                && prepared.is_f32_executor_compatible(w).unwrap_or(false)
+                                && prepared.is_f32_executor_compatible_with(w, exec).unwrap_or(false)
                                 && exec.supports_f32(w)
                         })
                         .count();
@@ -2058,7 +2076,13 @@ impl Transforms {
                         |(candidate, weight)| {
                             completed[candidate]
                                 || self.basis(weight) != basis
-                                || !prepared.is_compatible(weight).unwrap_or(false)
+                                || !executor
+                                    .as_deref()
+                                    .map_or_else(
+                                        || prepared.is_compatible(weight),
+                                        |exec| prepared.is_compatible_with_executor(weight, exec),
+                                    )
+                                    .unwrap_or(false)
                         },
                     )
                 {
@@ -2081,7 +2105,10 @@ impl Transforms {
                 {
                     if !completed[candidate]
                         && self.basis(weight) == basis
-                        && prepared.is_compatible(weight)?
+                        && executor.as_deref().map_or_else(
+                            || prepared.is_compatible(weight),
+                            |exec| prepared.is_compatible_with_executor(weight, exec),
+                        )?
                     {
                         if let Some(executor) = executor.as_deref_mut() {
                             prepared.matvec_with_executor(weight, output, executor)?;
@@ -3735,15 +3762,22 @@ impl Qwen35 {
                 "cannot release host weights while CPU tiled prefill is enabled",
             ));
         }
-        let Some(executor) = self.projection_executor.as_deref() else {
+        let Some(executor) = self.projection_executor.as_deref_mut() else {
             return Err(invalid(
                 "cannot release executor-resident host weights without an installed executor",
             ));
         };
         let mut released = 0_usize;
         let mut release_if_claimed = |tensor: &mut Tensor| {
-            if Transforms::executor_claims_weight(Some(executor), tensor) {
-                released = released.saturating_add(tensor.data.release_mapped());
+            if tensor.data.is_mapped()
+                && Transforms::executor_claims_weight(Some(&*executor), tensor)
+            {
+                let released_token = crate::model::TensorBytes::default();
+                if executor.release_host_weight_binding(tensor, &released_token) {
+                    let bytes = tensor.data.len();
+                    tensor.data = released_token;
+                    released = released.saturating_add(bytes);
+                }
             }
         };
         for layer in &mut self.layers {
@@ -4454,6 +4488,31 @@ impl Evaluation<'_, '_, '_> {
             .add_normalize(values, delta, weight, self.geometry.epsilon, output)
     }
 
+    fn prepare_ffn_activation(&mut self, gate_weight: &Tensor, input: &[f32]) -> Result<bool> {
+        let pre_transformed = self.projection.pre_transformed_len.take();
+        let basis = self.transforms.basis(gate_weight);
+        if !basis.0 {
+            return Ok(false);
+        }
+        if basis.1
+            || pre_transformed != Some(input.len())
+            || self.projection.transformed.len() != input.len()
+        {
+            self.transforms.transform_into_with_parallelism(
+                gate_weight,
+                input,
+                self.geometry,
+                self.projection.matvec.row_parallelism(),
+                &mut self.projection.transformed,
+            )?;
+        }
+        #[cfg(test)]
+        {
+            self.projection.transforms += 1;
+        }
+        Ok(true)
+    }
+
     fn try_project_ffn_chain_into(
         &mut self,
         gate_weight: &Tensor,
@@ -4497,33 +4556,21 @@ impl Evaluation<'_, '_, '_> {
             }
             None
         };
-        let pre_transformed = self.projection.pre_transformed_len.take();
-        let basis = self.transforms.basis(gate_weight);
-        let activation = if basis.0 {
-            if basis.1
-                || pre_transformed != Some(input.len())
-                || self.projection.transformed.len() != input.len()
-            {
-                self.transforms.transform_into_with_parallelism(
-                    gate_weight,
-                    input,
-                    self.geometry,
-                    self.projection.matvec.row_parallelism(),
-                    &mut self.projection.transformed,
-                )?;
-            }
-            #[cfg(test)]
-            {
-                self.projection.transforms += 1;
-            }
+        let use_transformed = self.prepare_ffn_activation(gate_weight, input)?;
+        let activation = if use_transformed {
             self.projection.transformed.as_slice()
         } else {
             input
         };
-        let mut prepared = self
-            .projection
-            .matvec
-            .prepare_f32_executor(gate_weight, activation)?;
+        let mut prepared = if let Some(exec) = self.executor.as_deref() {
+            self.projection
+                .matvec
+                .prepare_f32_executor_with(gate_weight, activation, exec)?
+        } else {
+            self.projection
+                .matvec
+                .prepare_f32_executor(gate_weight, activation)?
+        };
         if let Some(executor) = self.executor.as_deref_mut() {
             self.projection.fusions.external_ffn_chain.attempt();
             if let Some((lora_a, effective_scale, lora_b)) = down_lora {
@@ -4580,33 +4627,23 @@ impl Evaluation<'_, '_, '_> {
                 .as_deref()
                 .is_some_and(|exec| exec.supports_f32_ffn_swiglu(gate_weight, up_weight))
         {
-            let pre_transformed = self.projection.pre_transformed_len.take();
-            let basis = self.transforms.basis(gate_weight);
-            let activation = if basis.0 {
-                if basis.1
-                    || pre_transformed != Some(input.len())
-                    || self.projection.transformed.len() != input.len()
-                {
-                    self.transforms.transform_into_with_parallelism(
-                        gate_weight,
-                        input,
-                        self.geometry,
-                        self.projection.matvec.row_parallelism(),
-                        &mut self.projection.transformed,
-                    )?;
-                }
-                #[cfg(test)]
-                {
-                    self.projection.transforms += 1;
-                }
+            let use_transformed = self.prepare_ffn_activation(gate_weight, input)?;
+            let activation = if use_transformed {
                 self.projection.transformed.as_slice()
             } else {
                 input
             };
-            let mut prepared = self
-                .projection
-                .matvec
-                .prepare_f32_executor(gate_weight, activation)?;
+            let mut prepared = if let Some(exec) = self.executor.as_deref() {
+                self.projection.matvec.prepare_f32_executor_with(
+                    gate_weight,
+                    activation,
+                    exec,
+                )?
+            } else {
+                self.projection
+                    .matvec
+                    .prepare_f32_executor(gate_weight, activation)?
+            };
             if let Some(executor) = self.executor.as_deref_mut() {
                 self.projection.fusions.external_ffn_swiglu.attempt();
                 prepared.matvec_ffn_swiglu_with_executor(gate_weight, up_weight, up, executor)?;
@@ -9462,7 +9499,11 @@ mod tests {
         }
     }
 
-    struct ClaimFfnOnlyExecutor;
+    #[derive(Default)]
+    struct ClaimFfnOnlyExecutor {
+        released: Vec<crate::model::TensorBytes>,
+        released_f32_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    }
 
     impl crate::kernels::Pq2ProjectionExecutor for ClaimFfnOnlyExecutor {
         fn identity(&self) -> &'static str {
@@ -9486,6 +9527,79 @@ mod tests {
             _output: &mut Vec<f32>,
         ) -> Result<()> {
             Err(crate::invalid("not invoked in host-weight release test"))
+        }
+
+        fn project_f32(
+            &mut self,
+            tensor: &Tensor,
+            _activation: &[f32],
+            _pinned: bool,
+            output: &mut Vec<f32>,
+        ) -> Result<()> {
+            let &[_, rows] = tensor.dimensions.as_slice() else {
+                return Err(crate::invalid("expected rank-2 tensor"));
+            };
+            if tensor.data.is_empty()
+                && self.has_released_host_weight(tensor)
+                && let Some(counter) = &self.released_f32_calls
+            {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            output.clear();
+            output.resize(rows, 0.25);
+            Ok(())
+        }
+
+        fn release_host_weight_binding(
+            &mut self,
+            previous_tensor: &Tensor,
+            released_data: &crate::model::TensorBytes,
+        ) -> bool {
+            if self.supports_f32(previous_tensor)
+                && released_data.is_empty()
+                && !released_data.is_mapped()
+            {
+                self.released.push(released_data.clone());
+                true
+            } else {
+                false
+            }
+        }
+
+        fn has_released_host_weight(&self, tensor: &Tensor) -> bool {
+            tensor.data.is_empty()
+                && self.supports_f32(tensor)
+                && self
+                    .released
+                    .iter()
+                    .any(|token| crate::model::TensorBytes::ptr_eq(token, &tensor.data))
+        }
+    }
+
+    struct NoReleaseExecutor;
+
+    impl crate::kernels::Pq2ProjectionExecutor for NoReleaseExecutor {
+        fn identity(&self) -> &'static str {
+            "no-host-release-test"
+        }
+
+        fn supports(&self, _tensor: &Tensor) -> bool {
+            false
+        }
+
+        fn supports_f32(&self, tensor: &Tensor) -> bool {
+            matches!(tensor.kind, crate::kernels::PQ2 | crate::kernels::PTQ1)
+                && tensor.name.contains(".ffn_")
+        }
+
+        fn project(
+            &mut self,
+            _tensor: &Tensor,
+            _activation: &[crate::kernels::Q8KBlock],
+            _fused: bool,
+            _output: &mut Vec<f32>,
+        ) -> Result<()> {
+            Err(crate::invalid("not invoked"))
         }
     }
 
@@ -9714,13 +9828,13 @@ mod tests {
         let mut tiled = super::Qwen35::new(tiled_model, 32)?;
         let scratch = tiled.tiled_prefill_scratch_bytes(8)?;
         tiled = tiled.with_tiled_prefill(8, scratch)?;
-        tiled.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor)));
+        tiled.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor::default())));
         assert!(tiled.release_executor_resident_host_weights().is_err());
         assert_eq!(tiled.layers[0].up.data.is_mapped(), cfg!(windows));
         drop(tiled);
 
         // 3. Releases only mapped weights claimed by the installed executor.
-        decoder.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor)));
+        decoder.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor::default())));
         let released = decoder.release_executor_resident_host_weights()?;
         assert_eq!(released, expected_ffn_bytes);
         assert!(!decoder.layers[0].up.data.is_mapped());
@@ -9820,7 +9934,7 @@ mod tests {
             expected_ffn_bytes += 2 * ptq1_128x128.len();
         }
         let mut decoder = super::Qwen35::new(model, 32)?;
-        decoder.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor)));
+        decoder.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor::default())));
         let released = decoder.release_executor_resident_host_weights()?;
         assert_eq!(released, expected_ffn_bytes);
         assert!(!decoder.layers[0].gate.data.is_mapped());
@@ -9833,6 +9947,59 @@ mod tests {
             return Err(crate::invalid("expected full attention layer"));
         }
         assert_eq!(decoder.release_executor_resident_host_weights()?, 0);
+        drop(decoder);
+        Ok(())
+    }
+
+    #[test]
+    fn release_executor_resident_host_weights_keeps_mapped_slices_for_non_opting_executor()
+    -> Result<()> {
+        let (model, guard, _) = build_mapped_pq2_release_fixture()?;
+        let _guard = guard;
+        let mut decoder = super::Qwen35::new(model, 32)?;
+        decoder.set_projection_executor(Some(Box::new(NoReleaseExecutor)));
+        assert_eq!(decoder.release_executor_resident_host_weights()?, 0);
+        assert_eq!(decoder.layers[0].gate.data.is_mapped(), cfg!(windows));
+        assert!(!decoder.layers[0].gate.data.is_empty());
+        assert_eq!(decoder.layers[0].up.data.is_mapped(), cfg!(windows));
+        assert!(!decoder.layers[0].up.data.is_empty());
+        drop(decoder);
+        Ok(())
+    }
+
+    #[test]
+    fn release_executor_resident_host_weights_evaluates_after_releasing_mapped_weights()
+    -> Result<()> {
+        let (baseline_model, baseline_guard, _) = build_mapped_pq2_release_fixture()?;
+        let _baseline_guard = baseline_guard;
+        let mut baseline = super::Qwen35::new(baseline_model, 32)?;
+        baseline.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor::default())));
+        let baseline_logits = crate::Decoder::evaluate(&mut baseline, 1)?;
+        drop(baseline);
+
+        let (model, guard, expected_ffn_bytes) = build_mapped_pq2_release_fixture()?;
+        let _guard = guard;
+        let mut decoder = super::Qwen35::new(model, 32)?;
+        let released_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        decoder.set_projection_executor(Some(Box::new(ClaimFfnOnlyExecutor {
+            released: Vec::new(),
+            released_f32_calls: Some(Arc::clone(&released_calls)),
+        })));
+        let released = decoder.release_executor_resident_host_weights()?;
+        assert_eq!(released, expected_ffn_bytes);
+        if cfg!(windows) {
+            assert!(decoder.layers[0].gate.data.is_empty());
+            assert!(decoder.layers[0].up.data.is_empty());
+            assert!(decoder.layers[0].down.data.is_empty());
+        }
+        let actual_logits = crate::Decoder::evaluate(&mut decoder, 1)?;
+        assert_eq!(actual_logits, baseline_logits);
+        if cfg!(windows) {
+            assert_eq!(
+                released_calls.load(std::sync::atomic::Ordering::Relaxed),
+                3
+            );
+        }
         drop(decoder);
         Ok(())
     }

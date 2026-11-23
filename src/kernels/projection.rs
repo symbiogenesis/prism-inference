@@ -2,8 +2,14 @@
 
 use bonsai_ternary::Q8KBlock;
 
-use super::{ActivationContract, PQ2, PTQ1, PreparedMatvec, Q8Block, dimensions, is_finite_slice};
-use crate::{Result, invalid, model::Tensor};
+use super::{
+    ActivationContract, PQ2, PTQ1, PreparedMatvec, Q8Block, dimensions, dimensions_geometry,
+    is_finite_slice,
+};
+use crate::{
+    Result, invalid,
+    model::{Tensor, TensorBytes},
+};
 
 /// Scoped executor for original PQ2 rows and already prepared `Q8_K` activations.
 ///
@@ -352,6 +358,27 @@ pub trait Pq2ProjectionExecutor {
         }
         Ok(())
     }
+
+    /// Opt in to host-weight release for a weight already resident on this executor.
+    ///
+    /// Returns `true` only if the executor has atomically dropped its own host
+    /// reference to `_previous_tensor.data`, rebound its resident handle to
+    /// `_released_data` (an empty `TensorBytes::Shared` token), and can execute
+    /// subsequent projections without reading host bytes. Default `false` keeps
+    /// host backing bytes mapped.
+    fn release_host_weight_binding(
+        &mut self,
+        _previous_tensor: &Tensor,
+        _released_data: &TensorBytes,
+    ) -> bool {
+        false
+    }
+
+    /// Returns `true` only when `_tensor.data.is_empty()` and this executor holds
+    /// an active resident handle rebound to `_tensor.data`'s exact identity.
+    fn has_released_host_weight(&self, _tensor: &Tensor) -> bool {
+        false
+    }
 }
 
 macro_rules! forward_pq2_projection_executor {
@@ -561,6 +588,18 @@ macro_rules! forward_pq2_projection_executor {
                     outputs,
                 )
             }
+
+            fn release_host_weight_binding(
+                &mut self,
+                previous_tensor: &Tensor,
+                released_data: &TensorBytes,
+            ) -> bool {
+                (**self).release_host_weight_binding(previous_tensor, released_data)
+            }
+
+            fn has_released_host_weight(&self, tensor: &Tensor) -> bool {
+                (**self).has_released_host_weight(tensor)
+            }
         }
     };
 }
@@ -572,9 +611,24 @@ const fn is_f32_executor_kind(kind: u32) -> bool {
     matches!(kind, PQ2 | PTQ1)
 }
 
+pub(super) fn executor_tensor_dimensions(
+    tensor: &Tensor,
+    executor: &(impl Pq2ProjectionExecutor + ?Sized),
+) -> Result<(usize, usize, usize)> {
+    if tensor.data.is_empty() && executor.has_released_host_weight(tensor) {
+        dimensions_geometry(tensor)
+    } else {
+        dimensions(tensor)
+    }
+}
+
 impl PreparedMatvec<'_> {
-    pub(crate) fn is_f32_executor_compatible(&self, tensor: &Tensor) -> Result<bool> {
-        let (columns, _, _) = dimensions(tensor)?;
+    pub(crate) fn is_f32_executor_compatible_with(
+        &self,
+        tensor: &Tensor,
+        executor: &(impl Pq2ProjectionExecutor + ?Sized),
+    ) -> Result<bool> {
+        let (columns, _, _) = executor_tensor_dimensions(tensor, executor)?;
         Ok(columns == self.input.len()
             && columns.is_multiple_of(128)
             && is_f32_executor_kind(tensor.kind)
@@ -584,17 +638,29 @@ impl PreparedMatvec<'_> {
             ))
     }
 
+    pub(crate) fn is_compatible_with_executor(
+        &self,
+        tensor: &Tensor,
+        executor: &(impl Pq2ProjectionExecutor + ?Sized),
+    ) -> Result<bool> {
+        let (columns, _, _) = executor_tensor_dimensions(tensor, executor)?;
+        Ok(columns == self.input.len()
+            && ActivationContract::for_tensor(tensor, columns, self.scratch.pinned_accumulation)
+                == self.contract)
+    }
+
     fn validate_f32_ffn_chain(
         &self,
         tensors: [&Tensor; 3],
         residual: Option<&[f32]>,
+        executor: &(impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<(usize, usize)> {
         let [gate, up, down] = tensors;
-        let (gate_cols, gate_rows, _) = dimensions(gate)?;
-        let (up_cols, up_rows, _) = dimensions(up)?;
-        let (down_cols, down_rows, _) = dimensions(down)?;
-        if !self.is_f32_executor_compatible(gate)?
-            || !self.is_f32_executor_compatible(up)?
+        let (gate_cols, gate_rows, _) = executor_tensor_dimensions(gate, executor)?;
+        let (up_cols, up_rows, _) = executor_tensor_dimensions(up, executor)?;
+        let (down_cols, down_rows, _) = executor_tensor_dimensions(down, executor)?;
+        if !self.is_f32_executor_compatible_with(gate, executor)?
+            || !self.is_f32_executor_compatible_with(up, executor)?
             || !is_f32_executor_kind(down.kind)
             || gate_cols != up_cols
             || gate_rows != up_rows
@@ -626,7 +692,7 @@ impl PreparedMatvec<'_> {
         executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<()> {
         let result = (|| {
-            let (_, down_rows) = self.validate_f32_ffn_chain(tensors, residual)?;
+            let (_, down_rows) = self.validate_f32_ffn_chain(tensors, residual, executor)?;
             if !executor.supports_f32_ffn_chain(tensors) {
                 return Err(invalid(
                     "incompatible prepared projection executor activation",
@@ -673,7 +739,7 @@ impl PreparedMatvec<'_> {
         executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<f32> {
         let result = (|| {
-            let (down_cols, down_rows) = self.validate_f32_ffn_chain(tensors, residual)?;
+            let (down_cols, down_rows) = self.validate_f32_ffn_chain(tensors, residual, executor)?;
             if lora_a.len() != down_cols
                 || !is_finite_slice(lora_a)
                 || !executor.supports_f32_ffn_chain_lora(tensors)
@@ -717,10 +783,10 @@ impl PreparedMatvec<'_> {
         executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<()> {
         let result = (|| {
-            let (gate_cols, gate_rows, _) = dimensions(gate)?;
-            let (up_cols, up_rows, _) = dimensions(up)?;
-            if !self.is_f32_executor_compatible(gate)?
-                || !self.is_f32_executor_compatible(up)?
+            let (gate_cols, gate_rows, _) = executor_tensor_dimensions(gate, executor)?;
+            let (up_cols, up_rows, _) = executor_tensor_dimensions(up, executor)?;
+            if !self.is_f32_executor_compatible_with(gate, executor)?
+                || !self.is_f32_executor_compatible_with(up, executor)?
                 || gate_cols != up_cols
                 || gate_rows != up_rows
                 || !gate_cols.is_multiple_of(128)
@@ -766,8 +832,10 @@ impl PreparedMatvec<'_> {
         }
         let result = (|| {
             for &tensor in tensors {
-                let (columns, _, _) = dimensions(tensor)?;
-                if !self.is_f32_executor_compatible(tensor)? || !columns.is_multiple_of(128) {
+                let (columns, _, _) = executor_tensor_dimensions(tensor, executor)?;
+                if !self.is_f32_executor_compatible_with(tensor, executor)?
+                    || !columns.is_multiple_of(128)
+                {
                     return Err(invalid(
                         "incompatible prepared projection executor activation",
                     ));
@@ -785,7 +853,7 @@ impl PreparedMatvec<'_> {
                 outputs,
             )?;
             for (output, &tensor) in outputs.iter().zip(tensors) {
-                let (_, rows, _) = dimensions(tensor)?;
+                let (_, rows, _) = executor_tensor_dimensions(tensor, executor)?;
                 if output.len() != rows {
                     return Err(invalid("projection executor returned incomplete output"));
                 }
@@ -820,8 +888,8 @@ impl PreparedMatvec<'_> {
         executor: &mut (impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<()> {
         let result = (|| {
-            let (columns, rows, _) = dimensions(tensor)?;
-            if !self.is_compatible(tensor)? {
+            let (columns, rows, _) = executor_tensor_dimensions(tensor, executor)?;
+            if !self.is_compatible_with_executor(tensor, executor)? {
                 return Err(invalid(
                     "incompatible prepared projection executor activation",
                 ));

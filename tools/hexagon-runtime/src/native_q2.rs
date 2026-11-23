@@ -230,6 +230,7 @@ struct ResidentProjection {
     rows: usize,
     first_handle: usize,
     evaluated: bool,
+    host_released: bool,
 }
 
 struct ResidentCache {
@@ -357,10 +358,82 @@ impl ResidentCache {
             rows: tensor.dimensions[1],
             first_handle,
             evaluated,
+            host_released: false,
         });
         self.by_storage.insert(position, index);
         self.statistics.tensors_prepared = self.statistics.tensors_prepared.saturating_add(1);
         index
+    }
+
+    fn rebind_released(
+        &mut self,
+        index: usize,
+        released: bonsai_prism_runtime::model::TensorBytes,
+    ) -> bool {
+        let Some(projection) = self.projections.get(index) else {
+            return false;
+        };
+        if projection.host_released || !released.is_empty() || released.is_mapped() {
+            return false;
+        }
+        let old_key = (
+            projection.source.as_ptr().addr(),
+            projection.kind,
+            projection.columns,
+            projection.rows,
+        );
+        let new_key = (
+            released.as_ptr().addr(),
+            projection.kind,
+            projection.columns,
+            projection.rows,
+        );
+        if self
+            .by_storage
+            .binary_search_by_key(&new_key, |&existing| {
+                let entry = &self.projections[existing];
+                (
+                    entry.source.as_ptr().addr(),
+                    entry.kind,
+                    entry.columns,
+                    entry.rows,
+                )
+            })
+            .is_ok()
+        {
+            return false;
+        }
+        let Ok(old_pos) = self.by_storage.binary_search_by_key(&old_key, |&existing| {
+            let entry = &self.projections[existing];
+            (
+                entry.source.as_ptr().addr(),
+                entry.kind,
+                entry.columns,
+                entry.rows,
+            )
+        }) else {
+            return false;
+        };
+        if self.by_storage[old_pos] != index {
+            return false;
+        }
+        self.by_storage.remove(old_pos);
+        let projection = &mut self.projections[index];
+        projection.source = released;
+        projection.host_released = true;
+        let Err(new_pos) = self.by_storage.binary_search_by_key(&new_key, |&existing| {
+            let entry = &self.projections[existing];
+            (
+                entry.source.as_ptr().addr(),
+                entry.kind,
+                entry.columns,
+                entry.rows,
+            )
+        }) else {
+            return false;
+        };
+        self.by_storage.insert(new_pos, index);
+        true
     }
 }
 
@@ -661,6 +734,16 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         result
     }
 
+    fn tensor_dimensions(&self, tensor: &Tensor) -> Result<(usize, usize)> {
+        if let Some(cache) = &self.residency
+            && let Some(index) = cache.find(tensor)
+            && cache.projections[index].host_released
+        {
+            return native_dimensions_released(tensor);
+        }
+        native_dimensions(tensor)
+    }
+
     fn prewarm_tensor_with_scratch(
         &mut self,
         tensor: &Tensor,
@@ -671,7 +754,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 "native Q2 Hexagon executor requires terminal teardown",
             ));
         }
-        let (columns, rows) = native_dimensions(tensor)?;
+        let (columns, rows) = self.tensor_dimensions(tensor)?;
         if !self.supports_f32(tensor) {
             return Err(invalid("unsupported native Q2 Hexagon projection contract"));
         }
@@ -870,7 +953,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                 "native Q2 Hexagon executor requires terminal teardown",
             ));
         }
-        let (columns, rows) = native_dimensions(tensor)?;
+        let (columns, rows) = self.tensor_dimensions(tensor)?;
         if !self.supports_f32(tensor) || activation.len() != columns {
             return Err(invalid("unsupported native Q2 Hexagon projection contract"));
         }
@@ -983,7 +1066,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             return None;
         }
         let cache = self.residency.as_ref()?;
-        let (columns, _) = native_dimensions(tensors[0]).ok()?;
+        let (columns, _) = self.tensor_dimensions(tensors[0]).ok()?;
         if columns > self.maximum_columns {
             return None;
         }
@@ -996,7 +1079,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             if !self.supports_f32(tensor) {
                 return None;
             }
-            let (cols, rows) = native_dimensions(tensor).ok()?;
+            let (cols, rows) = self.tensor_dimensions(tensor).ok()?;
             if cols != columns || rows > self.maximum_rows || !rows.is_multiple_of(32) {
                 return None;
             }
@@ -1166,7 +1249,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         if activations.is_empty() {
             return Ok(());
         }
-        let (columns, rows) = native_dimensions(tensor)?;
+        let (columns, rows) = self.tensor_dimensions(tensor)?;
         if !self.supports_f32(tensor) {
             return Err(invalid("unsupported native Q2 Hexagon projection contract"));
         }
@@ -2209,7 +2292,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         if gate_up_rows[1] != ffn_dim || !self.supports_f32(down) {
             return false;
         }
-        let Ok((down_cols, down_rows)) = native_dimensions(down) else {
+        let Ok((down_cols, down_rows)) = self.tensor_dimensions(down) else {
             return false;
         };
         down_cols == ffn_dim
@@ -2409,7 +2492,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         adapter_b: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<()> {
-        let (columns, rows) = native_dimensions(tensor)?;
+        let (columns, rows) = self.tensor_dimensions(tensor)?;
         if activation.len() != columns || adapter_a.len() != columns || adapter_b.len() != rows {
             return Err(invalid("mismatched rank-1 adapter dimensions"));
         }
@@ -2532,7 +2615,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         if gate_up_rows[1] != ffn_dim || activation.len() != hidden || !self.supports_f32(down) {
             return Err(invalid("unsupported native Q2 Hexagon projection contract"));
         }
-        let (down_cols, down_rows) = native_dimensions(down)?;
+        let (down_cols, down_rows) = self.tensor_dimensions(down)?;
         if down_cols != ffn_dim
             || down_rows != hidden
             || down_cols > self.maximum_columns
@@ -2681,7 +2764,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         {
             return Err(invalid("unsupported native Q2 Hexagon projection contract"));
         }
-        let (down_cols, down_rows) = native_dimensions(down)?;
+        let (down_cols, down_rows) = self.tensor_dimensions(down)?;
         if down_cols != ffn_dim
             || down_rows != hidden
             || down_cols > self.maximum_columns
@@ -2841,7 +2924,7 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
     }
 
     fn operation_count(&self, tensor: &Tensor) -> Option<u64> {
-        let (columns, rows) = native_dimensions(tensor).ok()?;
+        let (columns, rows) = self.tensor_dimensions(tensor).ok()?;
         let col_tiles = columns.div_ceil(self.maximum_columns);
         let row_tiles = rows.div_ceil(self.maximum_rows);
         u64::try_from(col_tiles.checked_mul(row_tiles)?).ok()
@@ -2884,10 +2967,79 @@ impl<S: NativeQ2Submitter> Pq2ProjectionExecutor for NativeQ2Executor<S> {
                 return false;
             }
         }
-        native_dimensions(tensor).is_ok_and(|(columns, rows)| {
+        self.tensor_dimensions(tensor).is_ok_and(|(columns, rows)| {
             self.payload_bytes(columns, rows)
                 .is_some_and(|bytes| bytes <= self.maximum_owned_payload_bytes)
         })
+    }
+
+    fn release_host_weight_binding(
+        &mut self,
+        previous_tensor: &Tensor,
+        released_data: &bonsai_prism_runtime::model::TensorBytes,
+    ) -> bool {
+        if self.failed || !released_data.is_empty() || released_data.is_mapped() {
+            return false;
+        }
+        let Some(resident_idx) = self
+            .residency
+            .as_ref()
+            .and_then(|cache| cache.find(previous_tensor))
+        else {
+            return false;
+        };
+        let allowed_idx = if let Some(allowed) = &self.allowed_tensors {
+            let addr = previous_tensor.data.as_ptr().addr();
+            let (min_addr, max_addr) = self.allowed_addr_range;
+            if addr < min_addr || addr > max_addr {
+                return false;
+            }
+            let Ok(idx) = allowed.binary_search_by(|candidate| {
+                selected_tensor_key(candidate).cmp(&selected_tensor_key(previous_tensor))
+            }) else {
+                return false;
+            };
+            let candidate = &allowed[idx];
+            if !bonsai_prism_runtime::model::TensorBytes::ptr_eq(
+                &candidate.data,
+                &previous_tensor.data,
+            ) || candidate.kind != previous_tensor.kind
+                || candidate.dimensions != previous_tensor.dimensions
+                || candidate.name != previous_tensor.name
+            {
+                return false;
+            }
+            Some(idx)
+        } else {
+            None
+        };
+        let Some(cache) = &mut self.residency else {
+            return false;
+        };
+        if !cache.rebind_released(resident_idx, released_data.clone()) {
+            return false;
+        }
+        if let (Some(allowed), Some(idx)) = (&mut self.allowed_tensors, allowed_idx) {
+            allowed[idx].data = released_data.clone();
+            allowed.sort_by(|left, right| selected_tensor_key(left).cmp(&selected_tensor_key(right)));
+            let min_addr = allowed
+                .first()
+                .map_or(0, |tensor| tensor.data.as_ptr().addr());
+            let max_addr = allowed
+                .last()
+                .map_or(0, |tensor| tensor.data.as_ptr().addr());
+            self.allowed_addr_range = (min_addr, max_addr);
+        }
+        true
+    }
+
+    fn has_released_host_weight(&self, tensor: &Tensor) -> bool {
+        tensor.data.is_empty()
+            && self.residency.as_ref().is_some_and(|cache| {
+                cache
+                    .find(tensor)
+                    .is_some_and(|index| cache.projections[index].host_released)
+            })
     }
 
     fn project_f32(
@@ -3163,7 +3315,7 @@ fn validate_source_scales(tensor: &Tensor) -> Result<()> {
     Ok(())
 }
 
-fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
+fn native_dimensions_geometry(tensor: &Tensor) -> Result<(usize, usize, usize)> {
     let Some(block_bytes) = source_block_bytes(tensor.kind) else {
         return Err(invalid("unsupported Hexagon native Q2 tensor type or rank"));
     };
@@ -3171,14 +3323,35 @@ fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
         return Err(invalid("unsupported Hexagon native Q2 tensor type or rank"));
     }
     let (columns, rows) = (tensor.dimensions[0], tensor.dimensions[1]);
-    if columns == 0
-        || rows == 0
-        || !columns.is_multiple_of(128)
-        || (columns / 128)
-            .checked_mul(block_bytes)
-            .and_then(|bytes| bytes.checked_mul(rows))
-            != Some(tensor.data.len())
-    {
+    let Some(expected_bytes) = (columns / 128)
+        .checked_mul(block_bytes)
+        .and_then(|bytes| bytes.checked_mul(rows))
+    else {
+        return Err(invalid(
+            "invalid Hexagon native Q2 tensor geometry or extent",
+        ));
+    };
+    if columns == 0 || rows == 0 || !columns.is_multiple_of(128) {
+        return Err(invalid(
+            "invalid Hexagon native Q2 tensor geometry or extent",
+        ));
+    }
+    Ok((columns, rows, expected_bytes))
+}
+
+fn native_dimensions(tensor: &Tensor) -> Result<(usize, usize)> {
+    let (columns, rows, expected_bytes) = native_dimensions_geometry(tensor)?;
+    if tensor.data.len() != expected_bytes {
+        return Err(invalid(
+            "invalid Hexagon native Q2 tensor geometry or extent",
+        ));
+    }
+    Ok((columns, rows))
+}
+
+fn native_dimensions_released(tensor: &Tensor) -> Result<(usize, usize)> {
+    let (columns, rows, _) = native_dimensions_geometry(tensor)?;
+    if !tensor.data.is_empty() {
         return Err(invalid(
             "invalid Hexagon native Q2 tensor geometry or extent",
         ));
@@ -7742,5 +7915,322 @@ mod tests {
         assert!(
             plan_native_q2_layers_for_budget(&bad_kind, 81, max_arena, 6, 8 * 1024 * 1024).is_err()
         );
+    }
+
+    struct HostReleaseTestSubmitter {
+        registry: hexagon_native_rpc::NativeQ2WeightRegistry,
+    }
+
+    impl HostReleaseTestSubmitter {
+        fn new(capacity: usize) -> Result<Self> {
+            Ok(Self {
+                registry: hexagon_native_rpc::NativeQ2WeightRegistry::new(capacity)
+                    .map_err(|_| invalid("registry"))?,
+            })
+        }
+
+        fn check_handles(&self, handles: &[&NativeQ2WeightHandle]) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            for &handle in handles {
+                let _ = self.registry.range(handle)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[expect(
+        clippy::suspicious_operation_groupings,
+        reason = "Test mock compares handle geometry against activation/output slice lengths."
+    )]
+    impl NativeQ2Submitter for HostReleaseTestSubmitter {
+        fn residency_capacity_bytes(&self) -> usize {
+            self.registry.remaining_bytes()
+        }
+
+        fn prepare_weights(
+            &mut self,
+            columns: usize,
+            rows: usize,
+            weights: &[u8],
+        ) -> std::result::Result<Option<NativeQ2WeightHandle>, hexagon_native_rpc::Error> {
+            self.registry.prepare(columns, rows, weights)
+        }
+
+        fn submit(
+            &mut self,
+            _columns: usize,
+            _rows: usize,
+            _weights: &[u8],
+            _activation: &[f32],
+            _output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            Err(hexagon_native_rpc::Error::Contract)
+        }
+
+        fn submit_resident(
+            &mut self,
+            handle: &NativeQ2WeightHandle,
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.check_handles(&[handle])?;
+            if activation.len() != handle.columns() || output.len() != handle.rows() {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            let sum: f32 = activation.iter().sum();
+            output.fill(sum);
+            Ok(())
+        }
+
+        fn submit_resident_batch2(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 2],
+            activation: &[f32],
+            outputs: [&mut [f32]; 2],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.check_handles(&handles)?;
+            for (member, handle) in handles.into_iter().enumerate() {
+                if activation.len() != handle.columns() || outputs[member].len() != handle.rows() {
+                    return Err(hexagon_native_rpc::Error::Contract);
+                }
+                let sum: f32 = activation.iter().sum();
+                outputs[member].fill(sum + f32::from(u8::try_from(member).unwrap_or(0)));
+            }
+            Ok(())
+        }
+
+        fn submit_resident_ffn_swiglu(
+            &mut self,
+            gate_handle: &NativeQ2WeightHandle,
+            up_handle: &NativeQ2WeightHandle,
+            activation: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.check_handles(&[gate_handle, up_handle])?;
+            if activation.len() != gate_handle.columns()
+                || gate_handle.columns() != up_handle.columns()
+                || gate_handle.rows() != up_handle.rows()
+                || output.len() != gate_handle.rows()
+            {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            let sum: f32 = activation.iter().sum();
+            output.fill(sum * 2.0);
+            Ok(())
+        }
+
+        fn submit_resident_ffn_chain(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 3],
+            activation: &[f32],
+            residual: Option<&[f32]>,
+            _hadamard_block_size: Option<u32>,
+            output: &mut [f32],
+        ) -> std::result::Result<(), hexagon_native_rpc::Error> {
+            self.check_handles(&handles)?;
+            let [gate, up, down] = handles;
+            if gate.columns() != up.columns()
+                || gate.rows() != up.rows()
+                || down.columns() != gate.rows()
+                || down.rows() != gate.columns()
+                || activation.len() != gate.columns()
+                || output.len() != down.rows()
+            {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            let sum: f32 = activation.iter().sum();
+            let res0 = residual.and_then(|r| r.first().copied()).unwrap_or(0.0);
+            output.fill(sum.mul_add(3.0, res0));
+            Ok(())
+        }
+
+        fn supports_ffn_chain_lora(&self) -> bool {
+            true
+        }
+
+        fn submit_resident_ffn_chain_lora(
+            &mut self,
+            handles: [&NativeQ2WeightHandle; 3],
+            activation: &[f32],
+            residual: Option<&[f32]>,
+            hadamard_block_size: Option<u32>,
+            lora_a: &[f32],
+            output: &mut [f32],
+        ) -> std::result::Result<f32, hexagon_native_rpc::Error> {
+            self.submit_resident_ffn_chain(
+                handles,
+                activation,
+                residual,
+                hadamard_block_size,
+                output,
+            )?;
+            if lora_a.len() != handles[2].columns() {
+                return Err(hexagon_native_rpc::Error::Contract);
+            }
+            Ok(lora_a.iter().sum())
+        }
+    }
+
+    fn host_release_test_tensor(name: &str, kind: u32) -> Result<Tensor> {
+        let mut block = [0x55_u8; 34];
+        block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        let data = if kind == PTQ1_KIND {
+            bonsai_ternary::pack_ptq(&block)?.repeat(128)
+        } else {
+            block.repeat(128)
+        };
+        Ok(Tensor {
+            name: name.to_owned(),
+            dimensions: vec![128, 128],
+            kind,
+            data: Arc::<[u8]>::from(data).into(),
+        })
+    }
+
+    #[test]
+    fn resident_host_weight_release_preserves_f32_and_ffn_chain_execution_and_rejects_forged()
+    -> Result<()> {
+        use bonsai_prism_runtime::model::TensorBytes;
+
+        let tok_a = TensorBytes::default();
+        let tok_b = TensorBytes::default();
+        assert!(!TensorBytes::ptr_eq(&tok_a, &tok_b));
+        assert_ne!(tok_a.as_ptr().addr(), tok_b.as_ptr().addr());
+
+        let limits = NativeQ2ProjectionLimits::new(128, 128, 256, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(65_536)
+            .map_err(|_| invalid("residency"))?;
+        let mut executor =
+            NativeQ2Executor::new(HostReleaseTestSubmitter::new(65_536)?, limits, 1024 * 1024)
+                .with_resident_weights(4096)?;
+
+        let mut gate = host_release_test_tensor("blk.0.ffn_gate.weight", PQ2_KIND)?;
+        let mut up = host_release_test_tensor("blk.0.ffn_up.weight", PTQ1_KIND)?;
+        let mut down = host_release_test_tensor("blk.0.ffn_down.weight", PTQ1_KIND)?;
+        executor.select_and_prewarm_tensors(&[gate.clone(), up.clone(), down.clone()])?;
+
+        let act = vec![0.5_f32; 128];
+        let res = vec![1.25_f32; 128];
+        let lora_a = vec![0.25_f32; 128];
+        let (mut b_gate, mut b_up, mut b_grp0, mut b_grp1, mut b_swi, mut b_chn, mut b_lora) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        executor.project_f32(&gate, &act, true, &mut b_gate)?;
+        executor.project_f32(&up, &act, true, &mut b_up)?;
+        executor.project_f32_group(&[&gate, &up], &act, true, &mut [&mut b_grp0, &mut b_grp1])?;
+        executor.project_f32_ffn_swiglu(&gate, &up, &act, &mut b_swi)?;
+        executor.project_f32_ffn_chain([&gate, &up, &down], &act, Some(&res), Some(64), &mut b_chn)?;
+        let b_dot = executor.project_f32_ffn_chain_lora(
+            [&gate, &up, &down],
+            &act,
+            Some(&res),
+            Some(64),
+            &lora_a,
+            &mut b_lora,
+        )?;
+
+        for tensor in [&mut gate, &mut up, &mut down] {
+            let orig = tensor.data.clone();
+            assert_eq!(TensorBytes::strong_count(&orig), 4);
+            let token = TensorBytes::default();
+            assert!(executor.release_host_weight_binding(tensor, &token));
+            tensor.data = token;
+            assert_eq!(TensorBytes::strong_count(&orig), 1);
+            assert!(!executor.release_host_weight_binding(tensor, &TensorBytes::default()));
+            assert!(executor.has_released_host_weight(tensor));
+            assert!(executor.supports_f32(tensor));
+        }
+
+        let (mut r_gate, mut r_up, mut r_grp0, mut r_grp1, mut r_swi, mut r_chn, mut r_lora) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        executor.project_f32(&gate, &act, true, &mut r_gate)?;
+        executor.project_f32(&up, &act, true, &mut r_up)?;
+        executor.project_f32_group(&[&gate, &up], &act, true, &mut [&mut r_grp0, &mut r_grp1])?;
+        executor.project_f32_ffn_swiglu(&gate, &up, &act, &mut r_swi)?;
+        executor.project_f32_ffn_chain([&gate, &up, &down], &act, Some(&res), Some(64), &mut r_chn)?;
+        let r_dot = executor.project_f32_ffn_chain_lora(
+            [&gate, &up, &down],
+            &act,
+            Some(&res),
+            Some(64),
+            &lora_a,
+            &mut r_lora,
+        )?;
+        assert_eq!(r_gate.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b_gate.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(r_up.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b_up.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(r_grp0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b_grp0.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(r_grp1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b_grp1.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(r_swi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b_swi.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(r_chn.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b_chn.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(r_lora.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b_lora.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(r_dot.to_bits(), b_dot.to_bits());
+
+        let mut forged = gate.clone();
+        forged.data = TensorBytes::default();
+        assert!(!executor.has_released_host_weight(&forged));
+        assert!(!executor.supports_f32(&forged));
+        assert!(executor.project_f32(&forged, &act, true, &mut r_gate).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn resident_host_weight_release_interoperates_with_prepared_matvec() -> Result<()> {
+        use bonsai_prism_runtime::{kernels::MatvecScratch, model::TensorBytes};
+
+        let limits = NativeQ2ProjectionLimits::new(128, 128, 256, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(65_536)
+            .map_err(|_| invalid("residency"))?;
+        let mut executor =
+            NativeQ2Executor::new(HostReleaseTestSubmitter::new(65_536)?, limits, 1024 * 1024)
+                .with_resident_weights(4096)?;
+
+        let mut gate = host_release_test_tensor("blk.0.ffn_gate.weight", PQ2_KIND)?;
+        let mut up = host_release_test_tensor("blk.0.ffn_up.weight", PTQ1_KIND)?;
+        let mut down = host_release_test_tensor("blk.0.ffn_down.weight", PTQ1_KIND)?;
+        let compat_unreleased = gate.clone();
+        executor.select_and_prewarm_tensors(&[gate.clone(), up.clone(), down.clone()])?;
+
+        let act = vec![0.5_f32; 128];
+        let res = vec![1.25_f32; 128];
+        let mut base_gate = Vec::new();
+        let (mut base_g0, mut base_g1, mut base_chain) = (Vec::new(), Vec::new(), Vec::new());
+        executor.project_f32(&gate, &act, false, &mut base_gate)?;
+        executor.project_f32_group(&[&gate, &up], &act, false, &mut [&mut base_g0, &mut base_g1])?;
+        executor.project_f32_ffn_chain([&gate, &up, &down], &act, Some(&res), Some(64), &mut base_chain)?;
+
+        for tensor in [&mut gate, &mut up, &mut down] {
+            let token = TensorBytes::default();
+            assert!(executor.release_host_weight_binding(tensor, &token));
+            tensor.data = token;
+        }
+
+        let mut scratch = MatvecScratch::default();
+        assert!(scratch.prepare(&gate, &act).is_err());
+        let mut prepared = scratch.prepare(&compat_unreleased, &act)?;
+
+        let (mut out_single, mut out_g0, mut out_g1, mut out_chain) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        prepared.matvec_with_executor(&gate, &mut out_single, &mut executor)?;
+        prepared.matvec_group_with_executor(
+            &[&gate, &up],
+            &mut [&mut out_g0, &mut out_g1],
+            &mut executor,
+        )?;
+        prepared.matvec_ffn_chain_with_executor(
+            [&gate, &up, &down],
+            Some(&res),
+            Some(64),
+            &mut out_chain,
+            &mut executor,
+        )?;
+        assert_eq!(out_single, base_gate);
+        assert_eq!(out_g0, base_g0);
+        assert_eq!(out_g1, base_g1);
+        assert_eq!(out_chain, base_chain);
+
+        let mut forged = gate.clone();
+        forged.data = TensorBytes::default();
+        assert!(prepared.matvec_with_executor(&forged, &mut out_single, &mut executor).is_err());
+        Ok(())
     }
 }

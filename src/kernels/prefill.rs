@@ -1393,6 +1393,51 @@ mod tests {
         Ok(())
     }
 
+    fn assert_tiled_16_32_rejects_nonfinite(
+        kind: u32,
+        columns: usize,
+        tensor: &mut Tensor,
+        max_inputs: &[Vec<f32>],
+    ) {
+        let block_bytes = if kind == PTQ1 { 28 } else { 34 };
+        let scale_off = if kind == PTQ1 { 26 } else { 0 };
+        let valid = tensor.data.clone();
+        let mut bad_weight = valid.to_vec();
+        let corrupt_off = 3 * (columns / if kind == PTQ1 { 128 } else { 32 }) * block_bytes
+            + block_bytes
+            + scale_off;
+        bad_weight[corrupt_off..corrupt_off + 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
+        tensor.data = Arc::<[u8]>::from(bad_weight).into();
+        for count in [16_usize, 32] {
+            let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
+            let mut out = vec![vec![1.0_f32]; count];
+            assert!(
+                tile.project(
+                    tensor,
+                    &max_inputs[..count],
+                    &mut out,
+                    kind == PTQ1,
+                    &|| Ok(())
+                )
+                .is_err()
+            );
+            assert!(out.iter().all(Vec::is_empty));
+        }
+
+        tensor.data = valid;
+        for count in [16_usize, 32] {
+            let mut bad_inputs = max_inputs[..count].to_vec();
+            bad_inputs[count - 3][columns - 1] = f32::NAN;
+            let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
+            let mut out = vec![vec![1.0_f32]; count];
+            assert!(
+                tile.project(tensor, &bad_inputs, &mut out, kind == PTQ1, &|| Ok(()))
+                    .is_err()
+            );
+            assert!(out.iter().all(Vec::is_empty));
+        }
+    }
+
     #[test]
     fn tiled_ptq1_and_q8_0_16_and_32_token_tiles_match_scalar_bits_and_reject_nonfinite()
     -> Result<()> {
@@ -1463,43 +1508,7 @@ mod tests {
                 }
             }
 
-            let block_bytes = if kind == PTQ1 { 28 } else { 34 };
-            let scale_off = if kind == PTQ1 { 26 } else { 0 };
-            let valid = tensor.data.clone();
-            let mut bad_weight = valid.to_vec();
-            let corrupt_off = 3 * (columns / if kind == PTQ1 { 128 } else { 32 }) * block_bytes
-                + block_bytes
-                + scale_off;
-            bad_weight[corrupt_off..corrupt_off + 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
-            tensor.data = Arc::<[u8]>::from(bad_weight).into();
-            for count in [16_usize, 32] {
-                let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
-                let mut out = vec![vec![1.0_f32]; count];
-                assert!(
-                    tile.project(
-                        &tensor,
-                        &max_inputs[..count],
-                        &mut out,
-                        kind == PTQ1,
-                        &|| Ok(())
-                    )
-                    .is_err()
-                );
-                assert!(out.iter().all(Vec::is_empty));
-            }
-
-            tensor.data = valid;
-            for count in [16_usize, 32] {
-                let mut bad_inputs = max_inputs[..count].to_vec();
-                bad_inputs[count - 3][columns - 1] = f32::NAN;
-                let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
-                let mut out = vec![vec![1.0_f32]; count];
-                assert!(
-                    tile.project(&tensor, &bad_inputs, &mut out, kind == PTQ1, &|| Ok(()))
-                        .is_err()
-                );
-                assert!(out.iter().all(Vec::is_empty));
-            }
+            assert_tiled_16_32_rejects_nonfinite(kind, columns, &mut tensor, &max_inputs);
         }
         Ok(())
     }

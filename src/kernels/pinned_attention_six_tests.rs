@@ -412,6 +412,42 @@ fn group_scores_and_packed_values_match_six_head_oracle() -> crate::Result<()> {
     Ok(())
 }
 
+fn assert_partial_head_two_keys(key0: &[u16], key1: &[u16], q0: [&[f32]; 6]) -> crate::Result<()> {
+    let q_three: [&[f32]; 3] = [q0[0], q0[1], q0[2]];
+    let two_keys3 = dot_two_keys([key0, key1], q_three)?;
+    assert_eq!(
+        dot_group(key0, q_three)?.map(f32::to_bits),
+        two_keys3[0].map(f32::to_bits)
+    );
+    assert_eq!(
+        dot_group(key1, q_three)?.map(f32::to_bits),
+        two_keys3[1].map(f32::to_bits)
+    );
+
+    let q_two: [&[f32]; 2] = [q0[4], q0[5]];
+    let two_keys2 = dot_two_keys([key0, key1], q_two)?;
+    assert_eq!(
+        dot_group(key0, q_two)?.map(f32::to_bits),
+        two_keys2[0].map(f32::to_bits)
+    );
+    assert_eq!(
+        dot_group(key1, q_two)?.map(f32::to_bits),
+        two_keys2[1].map(f32::to_bits)
+    );
+    Ok(())
+}
+
+fn assert_six_head_dot_rejects_invalid_inputs() {
+    assert!(dot_pair(&[0x3c00; 1025], [[&[1.0; 1025]; 6]; 2]).is_err());
+    assert!(dot_two_keys::<6>([&[0x3c00; 1025], &[0x3c00; 1025]], [&[1.0; 1025]; 6]).is_err());
+    assert!(dot_two_keys::<4>([&[0x3c00; 4], &[0x3c00; 4]], [&[1.0; 4]; 4]).is_err());
+    assert!(dot_two_keys::<6>([&[], &[]], [&[]; 6]).is_err());
+    assert!(dot_two_keys::<6>([&[0x3c00; 4], &[0x3c00; 3]], [&[1.0; 4]; 6]).is_err());
+    let mut bad_q = [&[1.0_f32; 4][..]; 6];
+    bad_q[5] = &[1.0_f32, 1.0, 1.0, f32::NAN];
+    assert!(dot_two_keys::<6>([&[0x3c00; 4], &[0x3c00; 4]], bad_q).is_err());
+}
+
 #[test]
 fn six_head_dot_pair_and_two_keys_match_scalar_zero_ulp_exact_lengths() -> crate::Result<()> {
     let key_pattern = [
@@ -489,38 +525,11 @@ fn six_head_dot_pair_and_two_keys_match_scalar_zero_ulp_exact_lengths() -> crate
                 }
             }
 
-            let q_three: [&[f32]; 3] = [q0[0], q0[1], q0[2]];
-            let two_keys3 = dot_two_keys([key0.as_slice(), key1.as_slice()], q_three)?;
-            assert_eq!(
-                dot_group(&key0, q_three)?.map(f32::to_bits),
-                two_keys3[0].map(f32::to_bits)
-            );
-            assert_eq!(
-                dot_group(&key1, q_three)?.map(f32::to_bits),
-                two_keys3[1].map(f32::to_bits)
-            );
-
-            let q_two: [&[f32]; 2] = [q0[4], q0[5]];
-            let two_keys2 = dot_two_keys([key0.as_slice(), key1.as_slice()], q_two)?;
-            assert_eq!(
-                dot_group(&key0, q_two)?.map(f32::to_bits),
-                two_keys2[0].map(f32::to_bits)
-            );
-            assert_eq!(
-                dot_group(&key1, q_two)?.map(f32::to_bits),
-                two_keys2[1].map(f32::to_bits)
-            );
+            assert_partial_head_two_keys(&key0, &key1, q0)?;
         }
     }
 
-    assert!(dot_pair(&[0x3c00; 1025], [[&[1.0; 1025]; 6]; 2]).is_err());
-    assert!(dot_two_keys::<6>([&[0x3c00; 1025], &[0x3c00; 1025]], [&[1.0; 1025]; 6]).is_err());
-    assert!(dot_two_keys::<4>([&[0x3c00; 4], &[0x3c00; 4]], [&[1.0; 4]; 4]).is_err());
-    assert!(dot_two_keys::<6>([&[], &[]], [&[]; 6]).is_err());
-    assert!(dot_two_keys::<6>([&[0x3c00; 4], &[0x3c00; 3]], [&[1.0; 4]; 6]).is_err());
-    let mut bad_q = [&[1.0_f32; 4][..]; 6];
-    bad_q[5] = &[1.0_f32, 1.0, 1.0, f32::NAN];
-    assert!(dot_two_keys::<6>([&[0x3c00; 4], &[0x3c00; 4]], bad_q).is_err());
+    assert_six_head_dot_rejects_invalid_inputs();
     Ok(())
 }
 

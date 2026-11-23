@@ -4723,112 +4723,63 @@ mod state_only_gdn_tests {
         let ones = |len: usize| vec![1.0_f32; len];
         let vocab = 6_usize;
         let metadata = single_recurrent_metadata(head_dim);
-        let tensors = BTreeMap::from([
-            (
-                "token_embd.weight".into(),
-                f32_tensor(
-                    "token_embd.weight",
-                    &[head_dim, vocab],
-                    &pat(head_dim * vocab),
-                ),
-            ),
-            (
-                "output.weight".into(),
-                f32_tensor("output.weight", &[head_dim, vocab], &pat(head_dim * vocab)),
-            ),
-            (
-                "output_norm.weight".into(),
-                f32_tensor("output_norm.weight", &[head_dim], &ones(head_dim)),
-            ),
-            (
-                "blk.0.attn_norm.weight".into(),
-                f32_tensor("blk.0.attn_norm.weight", &[head_dim], &ones(head_dim)),
-            ),
-            (
-                "blk.0.post_attention_norm.weight".into(),
-                f32_tensor(
-                    "blk.0.post_attention_norm.weight",
-                    &[head_dim],
-                    &ones(head_dim),
-                ),
-            ),
-            (
-                "blk.0.ffn_up.weight".into(),
-                f32_tensor(
-                    "blk.0.ffn_up.weight",
-                    &[head_dim, head_dim],
-                    &pat(head_dim * head_dim),
-                ),
-            ),
-            (
-                "blk.0.ffn_gate.weight".into(),
-                f32_tensor(
-                    "blk.0.ffn_gate.weight",
-                    &[head_dim, head_dim],
-                    &pat(head_dim * head_dim),
-                ),
-            ),
-            (
-                "blk.0.ffn_down.weight".into(),
-                f32_tensor(
-                    "blk.0.ffn_down.weight",
-                    &[head_dim, head_dim],
-                    &pat(head_dim * head_dim),
-                ),
-            ),
-            (
-                "blk.0.attn_qkv.weight".into(),
-                f32_tensor(
-                    "blk.0.attn_qkv.weight",
-                    &[head_dim, 3 * head_dim],
-                    &pat(head_dim * 3 * head_dim),
-                ),
-            ),
-            (
-                "blk.0.attn_gate.weight".into(),
-                f32_tensor(
-                    "blk.0.attn_gate.weight",
-                    &[head_dim, head_dim],
-                    &pat(head_dim * head_dim),
-                ),
-            ),
-            (
-                "blk.0.ssm_conv1d.weight".into(),
-                f32_tensor(
-                    "blk.0.ssm_conv1d.weight",
-                    &[2, 3 * head_dim],
-                    &pat(2 * 3 * head_dim),
-                ),
-            ),
-            (
-                "blk.0.ssm_dt.bias".into(),
-                f32_tensor("blk.0.ssm_dt.bias", &[1], &[0.125]),
-            ),
-            (
-                "blk.0.ssm_a".into(),
-                f32_tensor("blk.0.ssm_a", &[1], &[-0.25]),
-            ),
-            (
-                "blk.0.ssm_beta.weight".into(),
-                f32_tensor("blk.0.ssm_beta.weight", &[head_dim, 1], &pat(head_dim)),
-            ),
-            (
-                "blk.0.ssm_alpha.weight".into(),
-                f32_tensor("blk.0.ssm_alpha.weight", &[head_dim, 1], &pat(head_dim)),
-            ),
-            (
-                "blk.0.ssm_norm.weight".into(),
-                f32_tensor("blk.0.ssm_norm.weight", &[head_dim], &ones(head_dim)),
-            ),
-            (
-                "blk.0.ssm_out.weight".into(),
-                f32_tensor(
-                    "blk.0.ssm_out.weight",
-                    &[head_dim, head_dim],
-                    &pat(head_dim * head_dim),
-                ),
-            ),
-        ]);
+        let mut tensors = BTreeMap::new();
+        let mut add = |name: &str, dims: &[usize], data: Vec<f32>| {
+            tensors.insert(name.into(), f32_tensor(name, dims, &data));
+        };
+        add(
+            "token_embd.weight",
+            &[head_dim, vocab],
+            pat(head_dim * vocab),
+        );
+        add("output.weight", &[head_dim, vocab], pat(head_dim * vocab));
+        add("output_norm.weight", &[head_dim], ones(head_dim));
+        add("blk.0.attn_norm.weight", &[head_dim], ones(head_dim));
+        add(
+            "blk.0.post_attention_norm.weight",
+            &[head_dim],
+            ones(head_dim),
+        );
+        add(
+            "blk.0.ffn_up.weight",
+            &[head_dim, head_dim],
+            pat(head_dim * head_dim),
+        );
+        add(
+            "blk.0.ffn_gate.weight",
+            &[head_dim, head_dim],
+            pat(head_dim * head_dim),
+        );
+        add(
+            "blk.0.ffn_down.weight",
+            &[head_dim, head_dim],
+            pat(head_dim * head_dim),
+        );
+        add(
+            "blk.0.attn_qkv.weight",
+            &[head_dim, 3 * head_dim],
+            pat(head_dim * 3 * head_dim),
+        );
+        add(
+            "blk.0.attn_gate.weight",
+            &[head_dim, head_dim],
+            pat(head_dim * head_dim),
+        );
+        add(
+            "blk.0.ssm_conv1d.weight",
+            &[2, 3 * head_dim],
+            pat(2 * 3 * head_dim),
+        );
+        add("blk.0.ssm_dt.bias", &[1], vec![0.125]);
+        add("blk.0.ssm_a", &[1], vec![-0.25]);
+        add("blk.0.ssm_beta.weight", &[head_dim, 1], pat(head_dim));
+        add("blk.0.ssm_alpha.weight", &[head_dim, 1], pat(head_dim));
+        add("blk.0.ssm_norm.weight", &[head_dim], ones(head_dim));
+        add(
+            "blk.0.ssm_out.weight",
+            &[head_dim, head_dim],
+            pat(head_dim * head_dim),
+        );
         Model {
             metadata,
             tensors,
@@ -4947,6 +4898,19 @@ mod state_only_gdn_tests {
         }
     }
 
+    fn build_single_recurrent_tiled_session(head_dim: usize, tile_tokens: usize) -> Result<Qwen35> {
+        Qwen35::with_adapters_and_kv(
+            single_recurrent_layer_fixture(head_dim),
+            32,
+            MAX_STATE_BYTES,
+            MatvecBackend::Auto,
+            None,
+            None,
+            super::super::KvCachePolicy::F16,
+        )?
+        .with_tiled_prefill(tile_tokens, 1 << 20)
+    }
+
     #[test]
     fn recurrent_state_only_tile_matches_sequential_pinned_and_source_zero_ulp() -> Result<()> {
         let count = 8_usize;
@@ -4955,26 +4919,8 @@ mod state_only_gdn_tests {
             .map(|t| values(head_dim, 0x5555_0001 + u32::try_from(t).unwrap_or(0)))
             .collect();
         for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
-            let mut single = Qwen35::with_adapters_and_kv(
-                single_recurrent_layer_fixture(head_dim),
-                32,
-                MAX_STATE_BYTES,
-                MatvecBackend::Auto,
-                None,
-                None,
-                super::super::KvCachePolicy::F16,
-            )?
-            .with_tiled_prefill(8, 1 << 20)?;
-            let mut tiled = Qwen35::with_adapters_and_kv(
-                single_recurrent_layer_fixture(head_dim),
-                32,
-                MAX_STATE_BYTES,
-                MatvecBackend::Auto,
-                None,
-                None,
-                super::super::KvCachePolicy::F16,
-            )?
-            .with_tiled_prefill(count, 1 << 20)?;
+            let mut single = build_single_recurrent_tiled_session(head_dim, 8)?;
+            let mut tiled = build_single_recurrent_tiled_session(head_dim, count)?;
 
             let Attention::Recurrent(ref single_layer) = single.layers[0].attention else {
                 return Err(invalid("expected recurrent layer"));

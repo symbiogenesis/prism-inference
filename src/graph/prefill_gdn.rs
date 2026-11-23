@@ -2232,6 +2232,77 @@ mod tests {
         Ok(())
     }
 
+    fn build_folded_carry_tape(
+        kept: usize,
+        geometry: &Geometry,
+    ) -> Result<FoldedRecurrentLayerTape> {
+        let max_tokens = crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS;
+        let conv_width = geometry.convolution_width();
+        let mut tape = FoldedRecurrentLayerTape::new(max_tokens, geometry)?;
+        for tok in 0..kept {
+            for c in 0..conv_width {
+                tape.carried_raw_conv
+                    .push((f32::from(i8::try_from((tok + c) % 7).unwrap_or(0)) - 3.0) * 0.125);
+            }
+            for c in 0..geometry.key_width() {
+                tape.carried_keys
+                    .push((f32::from(i8::try_from((tok * 3 + c) % 9).unwrap_or(0)) - 4.0) * 0.0625);
+            }
+            for c in 0..geometry.value_width() {
+                tape.carried_values
+                    .push((f32::from(i8::try_from((tok * 5 + c) % 9).unwrap_or(0)) - 4.0) * 0.0625);
+            }
+            for h in 0..geometry.ssm_values {
+                tape.carried_decay
+                    .push([0.875_f32, 0.0, 0.5, 1.0][(tok + h) % 4]);
+                tape.carried_beta
+                    .push([0.625_f32, 0.25, 0.0, 0.75][(tok + h) % 4]);
+            }
+        }
+        tape.carried_len = kept;
+        Ok(tape)
+    }
+
+    fn expected_folded_carry_matrix(
+        arithmetic: Arithmetic,
+        initial_matrix: &[f32],
+        tape: &FoldedRecurrentLayerTape,
+        geometry: &Geometry,
+    ) -> Result<Vec<f32>> {
+        let width = geometry.ssm_head;
+        let num_keys = geometry.ssm_keys;
+        let num_values = geometry.ssm_values;
+        let head_state_len = width * width;
+        let mut ref_matrix = vec![0.0_f32; initial_matrix.len()];
+        let mut ref_head_out = vec![0.0_f32; tape.carried_len * width];
+        for head_idx in 0..num_values {
+            let key_head = head_idx % num_keys;
+            let head_inputs: Vec<Input<'_>> = (0..tape.carried_len)
+                .map(|tok| {
+                    let ks = tok * tape.key_width + key_head * width;
+                    let vs = tok * tape.value_width + head_idx * width;
+                    let k = &tape.carried_keys[ks..ks + width];
+                    Input {
+                        query: k,
+                        key: k,
+                        value: &tape.carried_values[vs..vs + width],
+                        decay: tape.carried_decay[tok * num_values + head_idx],
+                        beta: tape.carried_beta[tok * num_values + head_idx],
+                    }
+                })
+                .collect();
+            let r = head_idx * head_state_len..(head_idx + 1) * head_state_len;
+            exact_head_into(
+                arithmetic,
+                &initial_matrix[r.clone()],
+                &head_inputs,
+                &mut ref_matrix[r],
+                &mut ref_head_out,
+            )?;
+        }
+        Ok(ref_matrix)
+    }
+
     fn check_folded_carry_flush_case(width: usize, kept: usize) -> Result<()> {
         #[cfg(feature = "parallel-rows")]
         let worker_counts = [1_usize, 4];
@@ -2254,7 +2325,6 @@ mod tests {
             ssm_values: num_values,
             convolution: 2,
         };
-        let max_tokens = crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS;
         let conv_width = geometry.convolution_width();
         for arithmetic in [Arithmetic::PinnedSwift, Arithmetic::Source] {
             let mut initial_conv = vec![0.125_f32; conv_width];
@@ -2263,59 +2333,9 @@ mod tests {
             for (i, slot) in initial_matrix.iter_mut().enumerate() {
                 *slot = (f32::from(i8::try_from(i % 13).unwrap_or(0)) - 6.0) * 0.03125;
             }
-            let mut tape = FoldedRecurrentLayerTape::new(max_tokens, &geometry)?;
-            for tok in 0..kept {
-                for c in 0..conv_width {
-                    tape.carried_raw_conv
-                        .push((f32::from(i8::try_from((tok + c) % 7).unwrap_or(0)) - 3.0) * 0.125);
-                }
-                for c in 0..geometry.key_width() {
-                    tape.carried_keys.push(
-                        (f32::from(i8::try_from((tok * 3 + c) % 9).unwrap_or(0)) - 4.0) * 0.0625,
-                    );
-                }
-                for c in 0..geometry.value_width() {
-                    tape.carried_values.push(
-                        (f32::from(i8::try_from((tok * 5 + c) % 9).unwrap_or(0)) - 4.0) * 0.0625,
-                    );
-                }
-                for h in 0..num_values {
-                    tape.carried_decay
-                        .push([0.875_f32, 0.0, 0.5, 1.0][(tok + h) % 4]);
-                    tape.carried_beta
-                        .push([0.625_f32, 0.25, 0.0, 0.75][(tok + h) % 4]);
-                }
-            }
-            tape.carried_len = kept;
-
-            let head_state_len = width * width;
-            let mut ref_matrix = vec![0.0_f32; initial_matrix.len()];
-            let mut ref_head_out = vec![0.0_f32; kept * width];
-            for head_idx in 0..num_values {
-                let key_head = head_idx % num_keys;
-                let head_inputs: Vec<Input<'_>> = (0..kept)
-                    .map(|tok| {
-                        let ks = tok * tape.key_width + key_head * width;
-                        let vs = tok * tape.value_width + head_idx * width;
-                        let k = &tape.carried_keys[ks..ks + width];
-                        Input {
-                            query: k,
-                            key: k,
-                            value: &tape.carried_values[vs..vs + width],
-                            decay: tape.carried_decay[tok * num_values + head_idx],
-                            beta: tape.carried_beta[tok * num_values + head_idx],
-                        }
-                    })
-                    .collect();
-                let r = head_idx * head_state_len..(head_idx + 1) * head_state_len;
-                exact_head_into(
-                    arithmetic,
-                    &initial_matrix[r.clone()],
-                    &head_inputs,
-                    &mut ref_matrix[r],
-                    &mut ref_head_out,
-                )?;
-            }
+            let tape = build_folded_carry_tape(kept, &geometry)?;
+            let ref_matrix =
+                expected_folded_carry_matrix(arithmetic, &initial_matrix, &tape, &geometry)?;
 
             for workers in worker_counts {
                 let mut test_tape = tape.clone();
@@ -2343,7 +2363,7 @@ mod tests {
                 let LayerState::Recurrent { matrix, .. } = state else {
                     return Err(invalid("expected recurrent state"));
                 };
-                assert!(scratch_out.is_empty());
+                assert_eq!(scratch_out, Vec::<f32>::new());
                 assert_eq!(
                     matrix.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                     ref_matrix.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),

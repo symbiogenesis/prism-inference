@@ -878,13 +878,12 @@ fn build_decode_only_mixed_session(
 fn assert_missing_host_weight_rejects_tiled_verification(
     cfg: &HybridConfig,
     decode_calls: Arc<std::sync::atomic::AtomicUsize>,
-) -> Result<()> {
+) {
     let mut released_model = pq2_mixed_hybrid_model(cfg);
     if let Some(tensor) = released_model.tensors.get_mut("blk.0.ffn_up.weight") {
         tensor.data = crate::model::TensorBytes::default();
     }
     assert!(build_decode_only_mixed_session(released_model, cfg.context, decode_calls).is_err());
-    Ok(())
 }
 
 #[test]
@@ -946,7 +945,7 @@ fn folded_verification_with_decode_only_executor_matches_cpu_and_preserves_rollb
             .evaluate_verification_block_folded(&[1, 2], &[3, 4], &mut rows, &cancel)
             .is_err()
     );
-    assert!(rows.is_empty());
+    assert_eq!(rows, Vec::<Vec<f32>>::new());
     assert_full_state_bit_eq(&seq, &mixed)?;
 
     // Standard verification also falls back to CPU tiles cleanly when executor lacks tile support.
@@ -971,5 +970,6 @@ fn folded_verification_with_decode_only_executor_matches_cpu_and_preserves_rollb
         mixed.checkpoint()?.layers.len()
     );
 
-    assert_missing_host_weight_rejects_tiled_verification(&cfg, decode_calls)
+    assert_missing_host_weight_rejects_tiled_verification(&cfg, decode_calls);
+    Ok(())
 }

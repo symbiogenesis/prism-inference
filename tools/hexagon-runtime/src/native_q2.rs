@@ -8594,6 +8594,52 @@ mod tests {
         })
     }
 
+    fn run_host_release_outputs(
+        executor: &mut NativeQ2Executor<HostReleaseTestSubmitter>,
+        tensors: [&Tensor; 3],
+        act: &[f32],
+        res: &[f32],
+        lora_a: &[f32],
+    ) -> Result<([Vec<f32>; 7], f32)> {
+        let [gate, up, down] = tensors;
+        let (
+            mut out_gate,
+            mut out_up,
+            mut out_grp0,
+            mut out_grp1,
+            mut out_swi,
+            mut out_chn,
+            mut out_lora,
+        ) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        executor.project_f32(gate, act, true, &mut out_gate)?;
+        executor.project_f32(up, act, true, &mut out_up)?;
+        executor.project_f32_group(&[gate, up], act, true, &mut [&mut out_grp0, &mut out_grp1])?;
+        executor.project_f32_ffn_swiglu(gate, up, act, &mut out_swi)?;
+        executor.project_f32_ffn_chain([gate, up, down], act, Some(res), Some(64), &mut out_chn)?;
+        let dot = executor.project_f32_ffn_chain_lora(
+            [gate, up, down],
+            act,
+            Some(res),
+            Some(64),
+            lora_a,
+            &mut out_lora,
+        )?;
+        Ok((
+            [
+                out_gate, out_up, out_grp0, out_grp1, out_swi, out_chn, out_lora,
+            ],
+            dot,
+        ))
+    }
+
     #[test]
     fn resident_host_weight_release_preserves_f32_and_ffn_chain_execution_and_rejects_forged()
     -> Result<()> {
@@ -8620,34 +8666,8 @@ mod tests {
         let act = vec![0.5_f32; 128];
         let res = vec![1.25_f32; 128];
         let lora_a = vec![0.25_f32; 128];
-        let (mut b_gate, mut b_up, mut b_grp0, mut b_grp1, mut b_swi, mut b_chn, mut b_lora) = (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        executor.project_f32(&gate, &act, true, &mut b_gate)?;
-        executor.project_f32(&up, &act, true, &mut b_up)?;
-        executor.project_f32_group(&[&gate, &up], &act, true, &mut [&mut b_grp0, &mut b_grp1])?;
-        executor.project_f32_ffn_swiglu(&gate, &up, &act, &mut b_swi)?;
-        executor.project_f32_ffn_chain(
-            [&gate, &up, &down],
-            &act,
-            Some(&res),
-            Some(64),
-            &mut b_chn,
-        )?;
-        let b_dot = executor.project_f32_ffn_chain_lora(
-            [&gate, &up, &down],
-            &act,
-            Some(&res),
-            Some(64),
-            &lora_a,
-            &mut b_lora,
-        )?;
+        let (baseline, b_dot) =
+            run_host_release_outputs(&mut executor, [&gate, &up, &down], &act, &res, &lora_a)?;
 
         for tensor in [&mut gate, &mut up, &mut down] {
             let orig = tensor.data.clone();
@@ -8661,71 +8681,24 @@ mod tests {
             assert!(executor.supports_f32(tensor));
         }
 
-        let (mut r_gate, mut r_up, mut r_grp0, mut r_grp1, mut r_swi, mut r_chn, mut r_lora) = (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        executor.project_f32(&gate, &act, true, &mut r_gate)?;
-        executor.project_f32(&up, &act, true, &mut r_up)?;
-        executor.project_f32_group(&[&gate, &up], &act, true, &mut [&mut r_grp0, &mut r_grp1])?;
-        executor.project_f32_ffn_swiglu(&gate, &up, &act, &mut r_swi)?;
-        executor.project_f32_ffn_chain(
-            [&gate, &up, &down],
-            &act,
-            Some(&res),
-            Some(64),
-            &mut r_chn,
-        )?;
-        let r_dot = executor.project_f32_ffn_chain_lora(
-            [&gate, &up, &down],
-            &act,
-            Some(&res),
-            Some(64),
-            &lora_a,
-            &mut r_lora,
-        )?;
-        assert_eq!(
-            r_gate.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            b_gate.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            r_up.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            b_up.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            r_grp0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            b_grp0.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            r_grp1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            b_grp1.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            r_swi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            b_swi.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            r_chn.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            b_chn.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            r_lora.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            b_lora.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
+        let (released, r_dot) =
+            run_host_release_outputs(&mut executor, [&gate, &up, &down], &act, &res, &lora_a)?;
+        for (actual, expected) in released.iter().zip(&baseline) {
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
         assert_eq!(r_dot.to_bits(), b_dot.to_bits());
 
         let mut forged = gate.clone();
         forged.data = TensorBytes::default();
         assert!(!executor.has_released_host_weight(&forged));
         assert!(!executor.supports_f32(&forged));
+        let mut forged_out = Vec::new();
         assert!(
             executor
-                .project_f32(&forged, &act, true, &mut r_gate)
+                .project_f32(&forged, &act, true, &mut forged_out)
                 .is_err()
         );
         Ok(())

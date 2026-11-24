@@ -327,7 +327,11 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Arguments> {
         Some("rsq4vf") => Some(KvCachePolicy::Rotated4FittedValues),
         Some("rsq4kvf") => Some(KvCachePolicy::Rotated4FittedKv),
         Some("rsq4k3v") => Some(KvCachePolicy::Rotated4Keys3Values),
-        _ => return Err(bad("KV cache must be f16, rsq4, rsq4vf, rsq4kvf or rsq4k3v")),
+        _ => {
+            return Err(bad(
+                "KV cache must be f16, rsq4, rsq4vf, rsq4kvf or rsq4k3v",
+            ));
+        }
     };
     let backend = match values.remove("--backend").as_deref().unwrap_or("auto") {
         "auto" => MatvecBackend::Auto,

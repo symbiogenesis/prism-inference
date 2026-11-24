@@ -1062,8 +1062,11 @@ impl Qwen35 {
         let mrope_base = self.mrope_position;
         for (token, hidden) in tokens.iter().zip(&mut tile.hidden) {
             check()?;
-            self.embedding
-                .row_into(usize::try_from(*token)?, hidden, &mut tile.projector.trellis.tmp)?;
+            self.embedding.row_into(
+                usize::try_from(*token)?,
+                hidden,
+                &mut tile.projector.trellis.tmp,
+            )?;
             if self.transforms.inverse_embedding {
                 self.transforms
                     .rotate_with_parallelism(hidden, tile.projector.row_parallelism())?;

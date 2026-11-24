@@ -305,7 +305,11 @@ impl AuthorizedHead {
             top_logprobs: chat.top_logprobs,
         })
         .ok_or(Rejection::ChatSchema)?;
-        let body = serde_json::to_vec(&controls.to_backend_chat(&chat.messages, max_completion_tokens, chat.stream))
+        let body = serde_json::to_vec(&controls.to_backend_chat(
+            &chat.messages,
+            max_completion_tokens,
+            chat.stream,
+        ))
         .map_err(|_| Rejection::ChatSchema)?;
         Ok(PendingChat {
             body,

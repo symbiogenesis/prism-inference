@@ -572,8 +572,7 @@ fn verify(
     } else {
         validate_metadata_for(reader.metadata(), representation)?;
     }
-    let (tensor_counts, tensor_payload_bytes, largest_tensor_bytes) = if representation.is_nariq()
-    {
+    let (tensor_counts, tensor_payload_bytes, largest_tensor_bytes) = if representation.is_nariq() {
         validate_nariq_inventory(reader.tensors(), representation)?
     } else {
         validate_inventory(reader.tensors(), representation)?
@@ -603,9 +602,14 @@ fn verify(
 )]
 fn validate_nariq_metadata(metadata: &Metadata, representation: Representation) -> Result<()> {
     if !representation.is_nariq() {
-        return Err(invalid("non-NariQ representation passed to NariQ metadata validator"));
+        return Err(invalid(
+            "non-NariQ representation passed to NariQ metadata validator",
+        ));
     }
-    if metadata.keys().any(|key| key.starts_with("prism.hadamard.")) {
+    if metadata
+        .keys()
+        .any(|key| key.starts_with("prism.hadamard."))
+    {
         return Err(invalid("NariQ metadata forbids prism.hadamard transforms"));
     }
     for (key, value) in [
@@ -656,7 +660,9 @@ fn validate_nariq_metadata(metadata: &Metadata, representation: Representation) 
         }
         Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => {
             if metadata.contains_key("trellis.embed_bands") {
-                return Err(invalid("unbanded NariQ artifact forbids trellis.embed_bands"));
+                return Err(invalid(
+                    "unbanded NariQ artifact forbids trellis.embed_bands",
+                ));
             }
         }
         Representation::Pq2 | Representation::CurrentRepackedPtq1 => {}
@@ -679,12 +685,16 @@ fn validate_nariq_metadata(metadata: &Metadata, representation: Representation) 
         .and_then(MetadataValue::as_bool)
         != Some(false)
     {
-        return Err(invalid("NariQ metadata mismatch: tokenizer.ggml.add_bos_token"));
+        return Err(invalid(
+            "NariQ metadata mismatch: tokenizer.ggml.add_bos_token",
+        ));
     }
     if let Some(add_eos) = metadata.get("tokenizer.ggml.add_eos_token")
         && add_eos.as_bool() != Some(false)
     {
-        return Err(invalid("NariQ metadata mismatch: tokenizer.ggml.add_eos_token"));
+        return Err(invalid(
+            "NariQ metadata mismatch: tokenizer.ggml.add_eos_token",
+        ));
     }
     let template = metadata
         .get("tokenizer.chat_template")
@@ -1014,9 +1024,13 @@ fn validate_nariq_inventory(
 ) -> Result<([usize; 3], usize, usize)> {
     let expected_count = match representation {
         Representation::NariQ2_0Bpw => EXPECTED_NARIQ_BANDED_TENSORS,
-        Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => EXPECTED_NARIQ_UNBANDED_TENSORS,
+        Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => {
+            EXPECTED_NARIQ_UNBANDED_TENSORS
+        }
         Representation::Pq2 | Representation::CurrentRepackedPtq1 => {
-            return Err(invalid("non-NariQ representation passed to NariQ inventory validator"));
+            return Err(invalid(
+                "non-NariQ representation passed to NariQ inventory validator",
+            ));
         }
     };
     if tensors.len() != expected_count {
@@ -1045,27 +1059,61 @@ fn validate_nariq_inventory(
             0 => {
                 let elems = dims
                     .iter()
-                    .try_fold(1_u64, |acc, &d| (d > 0).then_some(()).and_then(|()| acc.checked_mul(d)))
-                    .ok_or_else(|| invalid(format!("NariQ F32 tensor dimension overflow: {name}")))?;
-                (0_usize, elems.checked_mul(4).ok_or_else(|| invalid("NariQ tensor byte overflow"))?)
+                    .try_fold(1_u64, |acc, &d| {
+                        (d > 0).then_some(()).and_then(|()| acc.checked_mul(d))
+                    })
+                    .ok_or_else(|| {
+                        invalid(format!("NariQ F32 tensor dimension overflow: {name}"))
+                    })?;
+                (
+                    0_usize,
+                    elems
+                        .checked_mul(4)
+                        .ok_or_else(|| invalid("NariQ tensor byte overflow"))?,
+                )
             }
             1 | 30 => {
                 let elems = dims
                     .iter()
-                    .try_fold(1_u64, |acc, &d| (d > 0).then_some(()).and_then(|()| acc.checked_mul(d)))
-                    .ok_or_else(|| invalid(format!("NariQ 16-bit tensor dimension overflow: {name}")))?;
-                (0_usize, elems.checked_mul(2).ok_or_else(|| invalid("NariQ tensor byte overflow"))?)
+                    .try_fold(1_u64, |acc, &d| {
+                        (d > 0).then_some(()).and_then(|()| acc.checked_mul(d))
+                    })
+                    .ok_or_else(|| {
+                        invalid(format!("NariQ 16-bit tensor dimension overflow: {name}"))
+                    })?;
+                (
+                    0_usize,
+                    elems
+                        .checked_mul(2)
+                        .ok_or_else(|| invalid("NariQ tensor byte overflow"))?,
+                )
             }
             26 => {
                 let elems = dims
                     .iter()
-                    .try_fold(1_u64, |acc, &d| (d > 0).then_some(()).and_then(|()| acc.checked_mul(d)))
-                    .ok_or_else(|| invalid(format!("NariQ I32 tensor dimension overflow: {name}")))?;
-                (1_usize, elems.checked_mul(4).ok_or_else(|| invalid("NariQ tensor byte overflow"))?)
+                    .try_fold(1_u64, |acc, &d| {
+                        (d > 0).then_some(()).and_then(|()| acc.checked_mul(d))
+                    })
+                    .ok_or_else(|| {
+                        invalid(format!("NariQ I32 tensor dimension overflow: {name}"))
+                    })?;
+                (
+                    1_usize,
+                    elems
+                        .checked_mul(4)
+                        .ok_or_else(|| invalid("NariQ tensor byte overflow"))?,
+                )
             }
             44..=49 => {
-                if dims.len() != 2 || !dims[0].is_multiple_of(16) || !dims[1].is_multiple_of(16) || dims[0] == 0 || dims[1] == 0 {
-                    return Err(invalid(format!("NariQ trellis tensor dimensions misaligned: {name}")));
+                if dims.len() != 2
+                    || !dims[0].is_multiple_of(16)
+                    || !dims[1].is_multiple_of(16)
+                    || dims[0] == 0
+                    || dims[1] == 0
+                {
+                    return Err(invalid(format!(
+                        "NariQ trellis tensor dimensions misaligned: {name}"
+                    )));
                 }
                 let bits = u64::from(tensor.type_id - 43);
                 let expected = (dims[0] / 16)
@@ -1074,10 +1122,16 @@ fn validate_nariq_inventory(
                     .ok_or_else(|| invalid("NariQ trellis payload overflow"))?;
                 (2_usize, expected)
             }
-            _ => return Err(invalid(format!("unsupported NariQ tensor encoding in {name}"))),
+            _ => {
+                return Err(invalid(format!(
+                    "unsupported NariQ tensor encoding in {name}"
+                )));
+            }
         };
         if tensor.bytes != expected_bytes {
-            return Err(invalid(format!("NariQ tensor payload byte mismatch: {name}")));
+            return Err(invalid(format!(
+                "NariQ tensor payload byte mismatch: {name}"
+            )));
         }
 
         if name == "output.vocab_gather" {
@@ -1091,13 +1145,24 @@ fn validate_nariq_inventory(
             }
             output_band_cols[idx] = dims[1];
         } else if name == "token_embd.vocab_gather" {
-            if representation != Representation::NariQ2_0Bpw || tensor.type_id != 26 || dims != [vocab_u64] {
-                return Err(invalid("unexpected or malformed NariQ token_embd.vocab_gather"));
+            if representation != Representation::NariQ2_0Bpw
+                || tensor.type_id != 26
+                || dims != [vocab_u64]
+            {
+                return Err(invalid(
+                    "unexpected or malformed NariQ token_embd.vocab_gather",
+                ));
             }
             saw_embed_gather = true;
         } else if let Some(idx) = validate_nariq_band_name(name, "token_embd.band") {
-            if representation != Representation::NariQ2_0Bpw || slot != 2 || dims.len() != 2 || dims[0] != 5_120 {
-                return Err(invalid(format!("unexpected or malformed NariQ embed band: {name}")));
+            if representation != Representation::NariQ2_0Bpw
+                || slot != 2
+                || dims.len() != 2
+                || dims[0] != 5_120
+            {
+                return Err(invalid(format!(
+                    "unexpected or malformed NariQ embed band: {name}"
+                )));
             }
             embed_band_cols[idx] = dims[1];
         } else if name.starts_with("token_embd.band") || name.starts_with("output.band") {
@@ -1119,7 +1184,10 @@ fn validate_nariq_inventory(
         largest = largest.max(length);
     }
 
-    if !saw_output_gather || output_band_cols.contains(&0) || output_band_cols.iter().sum::<u64>() != vocab_u64 {
+    if !saw_output_gather
+        || output_band_cols.contains(&0)
+        || output_band_cols.iter().sum::<u64>() != vocab_u64
+    {
         return Err(invalid("incomplete NariQ banded output head inventory"));
     }
     match representation {
@@ -1129,7 +1197,9 @@ fn validate_nariq_inventory(
                 || embed_band_cols.contains(&0)
                 || embed_band_cols.iter().sum::<u64>() != vocab_u64
             {
-                return Err(invalid("incomplete NariQ 2.0bpw banded embedding inventory"));
+                return Err(invalid(
+                    "incomplete NariQ 2.0bpw banded embedding inventory",
+                ));
             }
         }
         Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => {

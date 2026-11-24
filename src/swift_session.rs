@@ -66,9 +66,7 @@ pub const fn calibrated_non_context_memory_bytes(representation: Representation)
     match representation {
         Representation::Pq2 => NON_CONTEXT_MEMORY_BYTES,
         Representation::CurrentRepackedPtq1 => PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES,
-        Representation::NariQ2_5Bpw
-        | Representation::NariQ3_0Bpw
-        | Representation::NariQ2_0Bpw => {
+        Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw | Representation::NariQ2_0Bpw => {
             (NON_CONTEXT_MEMORY_BYTES - swift::MODEL_BYTES)
                 + representation.model_bytes()
                 + NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES
@@ -2203,16 +2201,22 @@ impl SwiftSession {
         timings: Option<&mut GenerationTimings>,
         mut emit: impl FnMut(TextEvent<'_>) -> Result<()>,
     ) -> Result<Completion> {
-        self.complete_observed_rich(prompt, cancellation, deadline, timings, |event| match event {
-            RichTextEvent::Delta { text, .. } => {
-                if text.is_empty() {
-                    Ok(())
-                } else {
-                    emit(TextEvent::Delta(text))
+        self.complete_observed_rich(
+            prompt,
+            cancellation,
+            deadline,
+            timings,
+            |event| match event {
+                RichTextEvent::Delta { text, .. } => {
+                    if text.is_empty() {
+                        Ok(())
+                    } else {
+                        emit(TextEvent::Delta(text))
+                    }
                 }
-            }
-            RichTextEvent::Complete(completion) => emit(TextEvent::Complete(completion)),
-        })
+                RichTextEvent::Complete(completion) => emit(TextEvent::Complete(completion)),
+            },
+        )
     }
 
     fn configure_request_sampler(&mut self, prompt: &PreparedChat) -> Result<()> {
@@ -2237,13 +2241,12 @@ impl SwiftSession {
             } else {
                 None
             };
-            let dry_breakers = if prompt.sampler.dry_multiplier > 0.0
-                && prompt.sampler.dry_penalty_last_n > 0
-            {
-                self.chat.dry_sequence_breakers()?
-            } else {
-                Vec::new()
-            };
+            let dry_breakers =
+                if prompt.sampler.dry_multiplier > 0.0 && prompt.sampler.dry_penalty_last_n > 0 {
+                    self.chat.dry_sequence_breakers()?
+                } else {
+                    Vec::new()
+                };
             self.sampler.apply_request_config(
                 prompt.sampler.clone(),
                 budget_sequences,
@@ -2289,7 +2292,8 @@ impl SwiftSession {
                 embeddings: &chunk.encoded.embeddings,
             })
             .collect();
-        let reset_only = self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0;
+        let reset_only =
+            self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0;
         let mut recorded_stats = None;
         let completion = if use_speculation && let Some(speculation) = self.cpu_speculation {
             let consume = |token| {
@@ -2630,14 +2634,21 @@ fn emit_decoded_token(
     token: u32,
     emit: &mut impl FnMut(TextEvent<'_>) -> Result<()>,
 ) -> Result<()> {
-    emit_decoded_token_rich(vocabulary, display, output_bytes, token, None, &mut |event| {
-        if let RichTextEvent::Delta { text, .. } = event
-            && !text.is_empty()
-        {
-            emit(TextEvent::Delta(text))?;
-        }
-        Ok(())
-    })
+    emit_decoded_token_rich(
+        vocabulary,
+        display,
+        output_bytes,
+        token,
+        None,
+        &mut |event| {
+            if let RichTextEvent::Delta { text, .. } = event
+                && !text.is_empty()
+            {
+                emit(TextEvent::Delta(text))?;
+            }
+            Ok(())
+        },
+    )
 }
 
 fn validate_prompt_owner(owner: &Arc<()>, prompt: &PreparedChat) -> Result<()> {
@@ -3613,10 +3624,7 @@ mod tests {
                 PromptReuse::Latest,
                 BranchCheckpoints::default(),
             )?;
-            assert_eq!(
-                nariq,
-                pq2 + nariq_fixed - NON_CONTEXT_MEMORY_BYTES
-            );
+            assert_eq!(nariq, pq2 + nariq_fixed - NON_CONTEXT_MEMORY_BYTES);
         }
         Ok(())
     }

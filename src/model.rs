@@ -261,13 +261,8 @@ impl ModelMetadata {
         expected_sha256: &str,
         memory_limit: usize,
     ) -> Result<Self> {
-        let reader = VerifiedModel::open(
-            path,
-            dialect,
-            expected_bytes,
-            expected_sha256,
-            memory_limit,
-        )?;
+        let reader =
+            VerifiedModel::open(path, dialect, expected_bytes, expected_sha256, memory_limit)?;
         let vocab_size = reader
             .tensors()
             .iter()
@@ -389,13 +384,8 @@ impl Model {
         memory_limit: usize,
         progress: &mut impl FnMut(f32) -> Result<bool>,
     ) -> Result<Self> {
-        let reader = VerifiedModel::open(
-            path,
-            dialect,
-            expected_bytes,
-            expected_sha256,
-            memory_limit,
-        )?;
+        let reader =
+            VerifiedModel::open(path, dialect, expected_bytes, expected_sha256, memory_limit)?;
         Self::load_verified(reader, expected_sha256, memory_limit, progress)
     }
 

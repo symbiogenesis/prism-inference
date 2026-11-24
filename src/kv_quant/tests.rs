@@ -810,7 +810,11 @@ fn automatic_and_forced_scalar_backends_share_packing_and_arithmetic() -> Result
     Ok(())
 }
 
-fn rotated_squared_error(quantizer: &Quantizer, input: &[f32; HEAD_DIM], packed: &[u8]) -> Result<f64> {
+fn rotated_squared_error(
+    quantizer: &Quantizer,
+    input: &[f32; HEAD_DIM],
+    packed: &[u8],
+) -> Result<f64> {
     let mut rotated_target = [0.0; HEAD_DIM];
     quantizer.rotate(input, &mut rotated_target)?;
     let (scale, codes) = quantizer.record(packed)?;
@@ -826,7 +830,8 @@ fn rotated_squared_error(quantizer: &Quantizer, input: &[f32; HEAD_DIM], packed:
 }
 
 #[test]
-fn cooptimized_scale_codec_strictly_matches_or_improves_v1_and_v2_with_scalar_parity() -> Result<()> {
+fn cooptimized_scale_codec_strictly_matches_or_improves_v1_and_v2_with_scalar_parity() -> Result<()>
+{
     let mut outlier = [0.05_f32; HEAD_DIM];
     outlier[0] = 18.0;
     outlier[63] = -14.5;
@@ -873,7 +878,10 @@ fn cooptimized_scale_codec_strictly_matches_or_improves_v1_and_v2_with_scalar_pa
             let e1 = rotated_squared_error(&v1, &input, &p1)?;
             let e2 = rotated_squared_error(&v2, &input, &p2)?;
             let e3 = rotated_squared_error(&v3_scalar, &input, &p3_scalar)?;
-            assert!(e3 <= e2 + 1e-12 && e3 <= e1 + 1e-12, "e1={e1}, e2={e2}, e3={e3}");
+            assert!(
+                e3 <= e2 + 1e-12 && e3 <= e1 + 1e-12,
+                "e1={e1}, e2={e2}, e3={e3}"
+            );
         }
         // On skewed outlier vectors in 4-bit mode, co-optimization strictly beats v1 and v2.
         if bits == Bits::Four {

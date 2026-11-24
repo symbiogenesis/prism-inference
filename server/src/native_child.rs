@@ -1451,9 +1451,7 @@ mod tests {
         Vec<OsString>,
         u64,
     )> {
-        use bonsai_prism_runtime::swift_session::{
-            CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES,
-        };
+        use bonsai_prism_runtime::swift_session::{CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES};
         let (directory, [model, key, _adapter]) = files()?;
         let tile = 64 * 1024 * 1024;
         let logits = 16 * 1024 * 1024;
@@ -1697,7 +1695,8 @@ mod tests {
     }
 
     #[test]
-    fn native_child_selects_nariq_with_daisyrose_and_rejects_incompatible_modes() -> io::Result<()> {
+    fn native_child_selects_nariq_with_daisyrose_and_rejects_incompatible_modes() -> io::Result<()>
+    {
         let (directory, [model, key, adapter]) = files()?;
         let daisy = directory.path().join("daisyrose.gguf");
         std::fs::write(&daisy, [])?;
@@ -2022,9 +2021,7 @@ mod tests {
     #[test]
     fn native_child_cpu_prefill_gdn_allows_f16_and_rotated_and_enforces_non_speculative_pairing()
     -> io::Result<()> {
-        use bonsai_prism_runtime::swift_session::{
-            CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES,
-        };
+        use bonsai_prism_runtime::swift_session::{CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES};
         let (_directory, [model, key, _adapter]) = files()?;
         let reserve = 64 * 1024 * 1024_u64;
         let prefill_mem = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES + reserve;
@@ -2492,9 +2489,7 @@ mod tests {
 
     #[test]
     fn native_child_vulkan_placement_defaults_and_accepts_f16_configurations() -> io::Result<()> {
-        use bonsai_prism_runtime::swift_session::{
-            CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES,
-        };
+        use bonsai_prism_runtime::swift_session::{CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES};
 
         let (_directory, [model, key, adapter]) = files()?;
         let base: Vec<OsString> = vec![

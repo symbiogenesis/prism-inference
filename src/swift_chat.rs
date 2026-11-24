@@ -55,7 +55,9 @@ impl ReasoningEffort {
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
             "xhigh" => Ok(Self::XHigh),
-            _ => Err(invalid("Swift reasoning_effort must be low, medium or xhigh")),
+            _ => Err(invalid(
+                "Swift reasoning_effort must be low, medium or xhigh",
+            )),
         }
     }
 }
@@ -1008,22 +1010,62 @@ mod tests {
         let merges: Vec<String> = (0..247_587).map(|i| format!("a{i} b{i}")).collect();
         let template = format!(
             "{{#- if add_generation_prompt -#}}{}<|im_start|>user\n<|im_end|>\n{{- endif -}}",
-            " ".repeat(8_952 - "{{- if add_generation_prompt -}}<|im_start|>user\n<|im_end|>\n{{- endif -}}".len())
+            " ".repeat(
+                8_952
+                    - "{{- if add_generation_prompt -}}<|im_start|>user\n<|im_end|>\n{{- endif -}}"
+                        .len()
+            )
         );
         // Validate template digest mismatch still rejects while checking banded vocab_gather resolution.
         let mut meta = BTreeMap::new();
-        meta.insert("general.architecture".to_owned(), bonsai_gguf::MetadataValue::from("qwen35"));
-        meta.insert("tokenizer.ggml.model".to_owned(), bonsai_gguf::MetadataValue::from("gpt2"));
-        meta.insert("tokenizer.ggml.pre".to_owned(), bonsai_gguf::MetadataValue::from("qwen35"));
-        meta.insert("tokenizer.ggml.bos_token_id".to_owned(), bonsai_gguf::MetadataValue::from(248_044_u32));
-        meta.insert("tokenizer.ggml.eos_token_id".to_owned(), bonsai_gguf::MetadataValue::from(248_046_u32));
-        meta.insert("tokenizer.ggml.padding_token_id".to_owned(), bonsai_gguf::MetadataValue::from(248_044_u32));
-        meta.insert("tokenizer.ggml.add_bos_token".to_owned(), bonsai_gguf::MetadataValue::from(false));
-        meta.insert("tokenizer.ggml.add_eos_token".to_owned(), bonsai_gguf::MetadataValue::from(false));
-        meta.insert("tokenizer.ggml.tokens".to_owned(), bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::String(tokens)));
-        meta.insert("tokenizer.ggml.token_type".to_owned(), bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::I32(vec![1; vocab])));
-        meta.insert("tokenizer.ggml.merges".to_owned(), bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::String(merges)));
-        meta.insert("tokenizer.chat_template".to_owned(), bonsai_gguf::MetadataValue::from(template));
+        meta.insert(
+            "general.architecture".to_owned(),
+            bonsai_gguf::MetadataValue::from("qwen35"),
+        );
+        meta.insert(
+            "tokenizer.ggml.model".to_owned(),
+            bonsai_gguf::MetadataValue::from("gpt2"),
+        );
+        meta.insert(
+            "tokenizer.ggml.pre".to_owned(),
+            bonsai_gguf::MetadataValue::from("qwen35"),
+        );
+        meta.insert(
+            "tokenizer.ggml.bos_token_id".to_owned(),
+            bonsai_gguf::MetadataValue::from(248_044_u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.eos_token_id".to_owned(),
+            bonsai_gguf::MetadataValue::from(248_046_u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.padding_token_id".to_owned(),
+            bonsai_gguf::MetadataValue::from(248_044_u32),
+        );
+        meta.insert(
+            "tokenizer.ggml.add_bos_token".to_owned(),
+            bonsai_gguf::MetadataValue::from(false),
+        );
+        meta.insert(
+            "tokenizer.ggml.add_eos_token".to_owned(),
+            bonsai_gguf::MetadataValue::from(false),
+        );
+        meta.insert(
+            "tokenizer.ggml.tokens".to_owned(),
+            bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::String(tokens)),
+        );
+        meta.insert(
+            "tokenizer.ggml.token_type".to_owned(),
+            bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::I32(vec![1; vocab])),
+        );
+        meta.insert(
+            "tokenizer.ggml.merges".to_owned(),
+            bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::String(merges)),
+        );
+        meta.insert(
+            "tokenizer.chat_template".to_owned(),
+            bonsai_gguf::MetadataValue::from(template),
+        );
 
         let gather = Tensor {
             name: "token_embd.vocab_gather".to_owned(),
@@ -1037,15 +1079,26 @@ mod tests {
             tensors: BTreeMap::from([("token_embd.vocab_gather".to_owned(), gather)]),
         };
         // Rejects PQ2/PTQ1 when `token_embd.weight` is missing
-        assert!(SwiftChatSession::from_model_representation(&banded_model, Representation::Pq2).is_err());
+        assert!(
+            SwiftChatSession::from_model_representation(&banded_model, Representation::Pq2)
+                .is_err()
+        );
         // Rejects add_eos_token = true on NariQ
-        banded_model.metadata.insert("tokenizer.ggml.add_eos_token".to_owned(), bonsai_gguf::MetadataValue::from(true));
-        let _ = SwiftChatSession::from_model_representation(&banded_model, Representation::NariQ2_0Bpw);
+        banded_model.metadata.insert(
+            "tokenizer.ggml.add_eos_token".to_owned(),
+            bonsai_gguf::MetadataValue::from(true),
+        );
+        let _ =
+            SwiftChatSession::from_model_representation(&banded_model, Representation::NariQ2_0Bpw);
         // Restore false -> fails only on synthetic template SHA mismatch after passing vocab_gather + add_eos check!
-        banded_model.metadata.insert("tokenizer.ggml.add_eos_token".to_owned(), bonsai_gguf::MetadataValue::from(false));
-        let err = SwiftChatSession::from_model_representation(&banded_model, Representation::NariQ2_0Bpw)
-            .err()
-            .ok_or_else(|| crate::invalid("expected synthetic template digest rejection"))?;
+        banded_model.metadata.insert(
+            "tokenizer.ggml.add_eos_token".to_owned(),
+            bonsai_gguf::MetadataValue::from(false),
+        );
+        let err =
+            SwiftChatSession::from_model_representation(&banded_model, Representation::NariQ2_0Bpw)
+                .err()
+                .ok_or_else(|| crate::invalid("expected synthetic template digest rejection"))?;
         assert!(err.to_string().contains("template identity mismatch"));
         Ok(())
     }

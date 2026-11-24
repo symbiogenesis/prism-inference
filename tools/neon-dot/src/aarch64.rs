@@ -7497,7 +7497,10 @@ const fn trellis_quad(planar: &[u32; 16], offset: usize) -> [u32; 4] {
 fn trellis_decode_half_column(
     planar: &[[u32; 16]; 6],
     sched: &super::trellis::ColHalfSchedule,
-) -> (core::arch::aarch64::float32x4_t, core::arch::aarch64::float32x4_t) {
+) -> (
+    core::arch::aarch64::float32x4_t,
+    core::arch::aarch64::float32x4_t,
+) {
     use core::arch::aarch64::{
         vaddq_u32, vandq_u32, vcvtq_f32_s32, vdupq_n_u32, vmulq_u32, vorrq_u32,
         vreinterpretq_s32_u32, vshlq_u32, vshrq_n_u32,
@@ -7512,8 +7515,14 @@ fn trellis_decode_half_column(
     let bias126 = vdupq_n_s32(126);
 
     let decode_four = |row_offset: usize| {
-        let w0 = load_u32x4(&trellis_quad(&planar[sched.w0_rem], sched.w0_q + row_offset));
-        let w1 = load_u32x4(&trellis_quad(&planar[sched.w1_rem], sched.w1_q + row_offset));
+        let w0 = load_u32x4(&trellis_quad(
+            &planar[sched.w0_rem],
+            sched.w0_q + row_offset,
+        ));
+        let w1 = load_u32x4(&trellis_quad(
+            &planar[sched.w1_rem],
+            sched.w1_q + row_offset,
+        ));
         let part0 = vshlq_u32(w0, s0);
         let part1 = vandq_u32(vshlq_u32(w1, s1), m1);
         let state = vandq_u32(vorrq_u32(part0, part1), low16);

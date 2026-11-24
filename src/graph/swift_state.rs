@@ -26,14 +26,12 @@ pub(super) fn ceiling(
             | swift::NARIQ_2_5BPW_SHA256
             | swift::NARIQ_3_0BPW_SHA256
             | swift::NARIQ_2_0BPW_SHA256
-    )
-        || !matches!(
-            cache,
-            KvCachePolicy::Rotated4
-                | KvCachePolicy::Rotated4FittedValues
-                | KvCachePolicy::Rotated4FittedKv
-        )
-        || !(1..=CONTEXT_TOKENS).contains(&context_tokens)
+    ) || !matches!(
+        cache,
+        KvCachePolicy::Rotated4
+            | KvCachePolicy::Rotated4FittedValues
+            | KvCachePolicy::Rotated4FittedKv
+    ) || !(1..=CONTEXT_TOKENS).contains(&context_tokens)
         || optional_integer(metadata, "qwen35.nextn_predict_layers", 0)? != 0
     {
         return Err(invalid("extended Swift state scope rejected"));

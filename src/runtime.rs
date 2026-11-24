@@ -1164,7 +1164,11 @@ impl<D: Decoder> Runtime<D> {
         options: &Generation,
         prefill: Prefill,
         check: &impl Fn() -> Result<()>,
-        mut effects: GenerationEffects<'_, S, impl FnMut(u32, Option<TokenConfidence>) -> Result<()>>,
+        mut effects: GenerationEffects<
+            '_,
+            S,
+            impl FnMut(u32, Option<TokenConfidence>) -> Result<()>,
+        >,
     ) -> Result<Completion> {
         let started = effects.timings.as_deref_mut().map(|timings| {
             *timings = GenerationTimings::started(prompt.len());

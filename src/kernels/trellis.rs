@@ -6,9 +6,9 @@
     reason = "Keep graph-consumed trellis types crate scoped under -D unreachable-pub."
 )]
 
-use bonsai_gguf::{MetadataArray, MetadataValue};
 use crate::model::{Tensor, TensorBytes};
 use crate::{Result, invalid};
+use bonsai_gguf::{MetadataArray, MetadataValue};
 
 use super::parallel_rows::RowParallelism;
 use super::{F16, F32, I32, MatvecBackend, scale, trellis_bits};
@@ -117,7 +117,9 @@ impl Parts {
             let mut cum = 0_usize;
             for (idx, &size) in parts.iter().enumerate() {
                 if size == 0 || !size.is_multiple_of(shards) {
-                    return Err(invalid("trellis fused part size is not divisible by shards"));
+                    return Err(invalid(
+                        "trellis fused part size is not divisible by shards",
+                    ));
                 }
                 let shard_len = size / shards;
                 out.start[idx] = offset;
@@ -182,7 +184,9 @@ fn fwht_scaled(values: &mut [f32], block: usize, scale_factor: f32) {
 /// Returns an error if `block` is zero, not a power of two, or does not divide `values.len()`.
 pub(crate) fn rht(values: &mut [f32], block: usize) -> Result<()> {
     if !block.is_power_of_two() || !values.len().is_multiple_of(block) {
-        return Err(invalid("trellis rht requires power-of-two block dividing vector length"));
+        return Err(invalid(
+            "trellis rht requires power-of-two block dividing vector length",
+        ));
     }
     let factor = inv_sqrt_f32(block)?;
     for chunk in values.chunks_exact_mut(block) {
@@ -367,7 +371,9 @@ impl TrellisDesc {
 
     pub(crate) fn from_i32_slice(k: usize, n: usize, raw: &[i32]) -> Result<Self> {
         if !k.is_multiple_of(TILE_DIM) || !n.is_multiple_of(TILE_DIM) || k == 0 || n == 0 {
-            return Err(invalid("trellis matrix dimensions must be positive multiples of 16"));
+            return Err(invalid(
+                "trellis matrix dimensions must be positive multiples of 16",
+            ));
         }
         if raw.len() < 7 {
             return Err(invalid("trellis.desc requires at least 7 entries"));
@@ -378,16 +384,11 @@ impl TrellisDesc {
         }
         let mut parts_vec = Vec::with_capacity(nparts);
         for &entry in &raw[7..] {
-            parts_vec.push(usize::try_from(entry).map_err(|_| invalid("negative trellis part size"))?);
+            parts_vec
+                .push(usize::try_from(entry).map_err(|_| invalid("negative trellis part size"))?);
         }
         let rows_parts = (!parts_vec.is_empty()).then_some(parts_vec);
-        let rows = parse_side(
-            n,
-            raw[0],
-            raw[1],
-            raw[2],
-            rows_parts,
-        )?;
+        let rows = parse_side(n, raw[0], raw[1], raw[2], rows_parts)?;
         let cols = parse_side(k, raw[3], raw[4], raw[5], None)?;
         Ok(Self { rows, cols })
     }
@@ -426,7 +427,9 @@ fn parse_side(
 
 fn read_f16_vector(tensor: &Tensor, expected_len: usize, label: &str) -> Result<Box<[f32]>> {
     if tensor.kind != F16 || tensor.dimensions != [expected_len] {
-        return Err(invalid(format!("{label} must be 1D F16 of length {expected_len}")));
+        return Err(invalid(format!(
+            "{label} must be 1D F16 of length {expected_len}"
+        )));
     }
     let bytes: &[u8] = &tensor.data;
     if bytes.len() != expected_len * 2 {
@@ -442,7 +445,9 @@ fn read_f16_vector(tensor: &Tensor, expected_len: usize, label: &str) -> Result<
 
 fn read_f32_vector(tensor: &Tensor, expected_len: usize, label: &str) -> Result<Box<[f32]>> {
     if tensor.kind != F32 || tensor.dimensions != [expected_len] {
-        return Err(invalid(format!("{label} must be 1D F32 of length {expected_len}")));
+        return Err(invalid(format!(
+            "{label} must be 1D F32 of length {expected_len}"
+        )));
     }
     let bytes: &[u8] = &tensor.data;
     if bytes.len() != expected_len * 4 {
@@ -486,7 +491,10 @@ pub(crate) fn validate_permutation_i32(tensor: &Tensor, expected_len: usize) -> 
             .get_mut(idx)
             .ok_or_else(|| invalid(format!("out-of-range gather index in {}", tensor.name)))?;
         if *slot {
-            return Err(invalid(format!("duplicate gather index in {}", tensor.name)));
+            return Err(invalid(format!(
+                "duplicate gather index in {}",
+                tensor.name
+            )));
         }
         *slot = true;
         indices.push(u32::try_from(idx)?);
@@ -528,7 +536,10 @@ impl TrellisWeight {
         let bits = trellis_bits(weight.kind)
             .ok_or_else(|| invalid(format!("{} is not a TRL1..TRL6 tensor", weight.name)))?;
         if weight.dimensions.len() != 2 {
-            return Err(invalid(format!("{} must be a 2D coded tensor", weight.name)));
+            return Err(invalid(format!(
+                "{} must be a 2D coded tensor",
+                weight.name
+            )));
         }
         let k = weight.dimensions[0];
         let n = weight.dimensions[1];
@@ -554,7 +565,9 @@ impl TrellisWeight {
         let s16_vec = read_f16_vector(s16, tile_cols, &s16.name)?;
         let pre_vec = read_f32_vector(pre, k, &pre.name)?;
         let post_vec = read_f32_vector(post, n, &post.name)?;
-        let pin_vec = pin.map(|tensor| validate_permutation_i32(tensor, k)).transpose()?;
+        let pin_vec = pin
+            .map(|tensor| validate_permutation_i32(tensor, k))
+            .transpose()?;
         let out_perm_vec = out_perm
             .map(|tensor| validate_permutation_i32(tensor, n))
             .transpose()?;
@@ -746,7 +759,12 @@ fn apply_side_transform(
     Ok(())
 }
 
-fn transform_input_into(weight: &TrellisWeight, input: &[f32], xr: &mut [f32], tmp: &mut [f32]) -> Result<()> {
+fn transform_input_into(
+    weight: &TrellisWeight,
+    input: &[f32],
+    xr: &mut [f32],
+    tmp: &mut [f32],
+) -> Result<()> {
     if input.len() != weight.k {
         return Err(invalid(format!(
             "trellis {} expected {} input values, got {}",
@@ -765,7 +783,12 @@ fn transform_input_into(weight: &TrellisWeight, input: &[f32], xr: &mut [f32], t
         }
     }
     apply_side_transform(xr, &weight.desc.cols, false, None, None, tmp)?;
-    for (chunk, &tile_scale) in xr.as_chunks_mut::<TILE_DIM>().0.iter_mut().zip(weight.s16.iter()) {
+    for (chunk, &tile_scale) in xr
+        .as_chunks_mut::<TILE_DIM>()
+        .0
+        .iter_mut()
+        .zip(weight.s16.iter())
+    {
         for dst in chunk {
             *dst *= tile_scale;
         }
@@ -884,7 +907,12 @@ pub(crate) fn trellis_matvec_into(
             Ok(())
         })?;
     } else {
-        for (strip_idx, out_strip) in scratch.yb.as_chunks_mut::<TILE_DIM>().0.iter_mut().enumerate()
+        for (strip_idx, out_strip) in scratch
+            .yb
+            .as_chunks_mut::<TILE_DIM>()
+            .0
+            .iter_mut()
+            .enumerate()
         {
             let row_tiles = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
             let mut local = [0.0_f32; TILE_DIM];
@@ -930,7 +958,9 @@ pub(crate) fn trellis_matmul_tokens_into(
     scratch: &mut TrellisScratch,
 ) -> Result<()> {
     if inputs.len() != outputs.len() {
-        return Err(invalid("trellis token batch input and output counts differ"));
+        return Err(invalid(
+            "trellis token batch input and output counts differ",
+        ));
     }
     let token_count = inputs.len();
     if token_count == 0 {
@@ -981,27 +1011,39 @@ pub(crate) fn trellis_matmul_tokens_into(
     let strip_bytes = weight.strip_bytes();
     let data: &[u8] = &weight.data;
 
-    let compute_strip = |strip_idx: usize, flat_chunk: &mut [f32], local_outs: &mut [[f32; TILE_DIM]]| -> Result<()> {
+    let compute_strip = |strip_idx: usize,
+                         flat_chunk: &mut [f32],
+                         local_outs: &mut [[f32; TILE_DIM]]|
+     -> Result<()> {
         let row_tiles = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
         for slot in local_outs.iter_mut() {
             *slot = [0.0_f32; TILE_DIM];
         }
         let mut out_refs: Vec<&mut [f32; TILE_DIM]> = local_outs.iter_mut().collect();
         dispatch_strip_matmul_tokens(row_tiles, weight.bits, &x_refs, &mut out_refs, backend)?;
-        for (dst, src) in flat_chunk.as_chunks_mut::<TILE_DIM>().0.iter_mut().zip(local_outs.iter()) {
+        for (dst, src) in flat_chunk
+            .as_chunks_mut::<TILE_DIM>()
+            .0
+            .iter_mut()
+            .zip(local_outs.iter())
+        {
             dst.copy_from_slice(src);
         }
         Ok(())
     };
 
     if parallelism.workers() > 1 && strip_count >= 2 {
-        parallelism.update_chunks(&mut scratch.multi_yb_flat, strip_stride, |base_strip, chunk| {
-            let mut local_outs = vec![[0.0_f32; TILE_DIM]; token_count];
-            for (local_idx, strip_chunk) in chunk.chunks_exact_mut(strip_stride).enumerate() {
-                compute_strip(base_strip + local_idx, strip_chunk, &mut local_outs)?;
-            }
-            Ok(())
-        })?;
+        parallelism.update_chunks(
+            &mut scratch.multi_yb_flat,
+            strip_stride,
+            |base_strip, chunk| {
+                let mut local_outs = vec![[0.0_f32; TILE_DIM]; token_count];
+                for (local_idx, strip_chunk) in chunk.chunks_exact_mut(strip_stride).enumerate() {
+                    compute_strip(base_strip + local_idx, strip_chunk, &mut local_outs)?;
+                }
+                Ok(())
+            },
+        )?;
     } else {
         let mut local_outs = vec![[0.0_f32; TILE_DIM]; token_count];
         for (strip_idx, strip_chunk) in scratch
@@ -1013,11 +1055,7 @@ pub(crate) fn trellis_matmul_tokens_into(
         }
     }
 
-    for (strip_idx, strip_chunk) in scratch
-        .multi_yb_flat
-        .chunks_exact(strip_stride)
-        .enumerate()
-    {
+    for (strip_idx, strip_chunk) in scratch.multi_yb_flat.chunks_exact(strip_stride).enumerate() {
         let row_offset = strip_idx * TILE_DIM;
         for (t, token_vals) in strip_chunk.as_chunks::<TILE_DIM>().0.iter().enumerate() {
             scratch.multi_yb_token[t][row_offset..row_offset + TILE_DIM]
@@ -1053,8 +1091,8 @@ pub(crate) fn trellis_matmul_tokens_into(
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use crate::model::{Tensor, TensorBytes};
     use crate::Result;
+    use crate::model::{Tensor, TensorBytes};
 
     use super::{
         MatvecBackend, RowParallelism, SideTransform, TILE_DIM, TrellisDesc, TrellisScratch,
@@ -1127,7 +1165,8 @@ pub(crate) mod tests {
         let data: &[u8] = &weight.data;
         for j in 0..tile_rows {
             for i in 0..tile_cols {
-                let tile = &data[(j * tile_cols + i) * tile_bytes..(j * tile_cols + i + 1) * tile_bytes];
+                let tile =
+                    &data[(j * tile_cols + i) * tile_bytes..(j * tile_cols + i + 1) * tile_bytes];
                 let s16 = weight.s16[i];
                 for r in 0..TILE_DIM {
                     for c in 0..TILE_DIM {
@@ -1159,7 +1198,14 @@ pub(crate) mod tests {
             for row_idx in 0..n {
                 col[row_idx] = out[row_idx * k + c_idx];
             }
-            apply_side_transform(&mut col, &weight.desc.rows, true, None, Some(&weight.post), &mut tmp)?;
+            apply_side_transform(
+                &mut col,
+                &weight.desc.rows,
+                true,
+                None,
+                Some(&weight.post),
+                &mut tmp,
+            )?;
             for row_idx in 0..n {
                 out[row_idx * k + c_idx] = col[row_idx];
             }
@@ -1169,7 +1215,8 @@ pub(crate) mod tests {
             let mut permuted = vec![0.0_f32; n * k];
             for (dst_row, &src_row) in pout.iter().enumerate() {
                 let src = usize::try_from(src_row)?;
-                permuted[dst_row * k..(dst_row + 1) * k].copy_from_slice(&out[src * k..(src + 1) * k]);
+                permuted[dst_row * k..(dst_row + 1) * k]
+                    .copy_from_slice(&out[src * k..(src + 1) * k]);
             }
             out = permuted;
         }
@@ -1210,7 +1257,10 @@ pub(crate) mod tests {
             .collect();
         // Ensure `pin` is a valid permutation only when gcd(5, k) == 1 (k powers of 2 / multiples not div by 5)
         let pin_perm: Vec<i32> = if k.is_multiple_of(5) {
-            (0..k).rev().map(|i| i32::try_from(i).unwrap_or(0)).collect()
+            (0..k)
+                .rev()
+                .map(|i| i32::try_from(i).unwrap_or(0))
+                .collect()
         } else {
             pin_vals
         };
@@ -1256,7 +1306,9 @@ pub(crate) mod tests {
             let inputs: Vec<Vec<f32>> = (0..5)
                 .map(|t| {
                     (0..k)
-                        .map(|j| f32::from(i16::try_from((j * 11 + t * 7) % 19).unwrap_or(0) - 9) * 0.25)
+                        .map(|j| {
+                            f32::from(i16::try_from((j * 11 + t * 7) % 19).unwrap_or(0) - 9) * 0.25
+                        })
                         .collect()
                 })
                 .collect();
@@ -1278,7 +1330,14 @@ pub(crate) mod tests {
             for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
                 for par in [&serial, &parallel4] {
                     let mut actual = Vec::new();
-                    trellis_matvec_into(&weight, &inputs[0], &mut actual, backend, par, &mut scratch)?;
+                    trellis_matvec_into(
+                        &weight,
+                        &inputs[0],
+                        &mut actual,
+                        backend,
+                        par,
+                        &mut scratch,
+                    )?;
                     for (r, (&a, &e)) in actual.iter().zip(&expected_outputs[0]).enumerate() {
                         assert!(
                             (a - e).abs() <= 2e-2,
@@ -1287,8 +1346,17 @@ pub(crate) mod tests {
                     }
 
                     let mut batch_outs = vec![Vec::new(); inputs.len()];
-                    trellis_matmul_tokens_into(&weight, &inputs, &mut batch_outs, backend, par, &mut scratch)?;
-                    for (t, (actual_t, exp_t)) in batch_outs.iter().zip(&expected_outputs).enumerate() {
+                    trellis_matmul_tokens_into(
+                        &weight,
+                        &inputs,
+                        &mut batch_outs,
+                        backend,
+                        par,
+                        &mut scratch,
+                    )?;
+                    for (t, (actual_t, exp_t)) in
+                        batch_outs.iter().zip(&expected_outputs).enumerate()
+                    {
                         for (r, (&a, &e)) in actual_t.iter().zip(exp_t).enumerate() {
                             assert!(
                                 (a - e).abs() <= 2e-2,
@@ -1304,7 +1372,11 @@ pub(crate) mod tests {
                 let mut row_tmp = Vec::new();
                 for probe_row in [0_usize, 15, 16, n - 1] {
                     trellis_get_row(&weight, probe_row, &mut row_out, &mut row_tmp)?;
-                    for (c, (&a, &e)) in row_out.iter().zip(&w_dense[probe_row * k..(probe_row + 1) * k]).enumerate() {
+                    for (c, (&a, &e)) in row_out
+                        .iter()
+                        .zip(&w_dense[probe_row * k..(probe_row + 1) * k])
+                        .enumerate()
+                    {
                         assert!(
                             (a - e).abs() <= 1e-4,
                             "get_row case={case_idx} row={probe_row} col={c}: actual={a} vs expected={e}"

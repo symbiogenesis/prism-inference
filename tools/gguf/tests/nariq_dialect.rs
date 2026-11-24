@@ -78,7 +78,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn write_fixture(dir: &ScratchDirectory, name: &str, bytes: &[u8]) -> Result<(PathBuf, u64, String)> {
+fn write_fixture(
+    dir: &ScratchDirectory,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(PathBuf, u64, String)> {
     let path = dir.path().join(name);
     fs::write(&path, bytes)?;
     Ok((path, u64::try_from(bytes.len())?, sha256_hex(bytes)))
@@ -136,7 +140,8 @@ fn nariq_and_other_dialects_stay_mutually_isolated() -> Result<()> {
 
     for prism_only in [(142_u32, 34_usize), (143_u32, 28_usize)] {
         let bytes = build_gguf(&[("prism_tensor", &[128], prism_only.0, prism_only.1)])?;
-        let (path, total, hash) = write_fixture(&dir, &format!("prism-{}.gguf", prism_only.0), &bytes)?;
+        let (path, total, hash) =
+            write_fixture(&dir, &format!("prism-{}.gguf", prism_only.0), &bytes)?;
         assert!(inspect(&path, NARIQ_DIALECT, false, total, &hash).is_err());
     }
     dir.close()?;

@@ -2010,7 +2010,12 @@ fn fitted_kv_optimizes_both_keys_and_values_preserving_restore_and_improving_sof
     // Check rollback copy & truncate/restore round-trip on Rotated4FittedKv.
     let copy_k = k3.copy()?;
     copy_k.validate_restore(k3, Some(65))?;
-    assert!(v1_values.packed.as_ref().is_some_and(|p| p.quantizer.identity().version == 1));
+    assert!(
+        v1_values
+            .packed
+            .as_ref()
+            .is_some_and(|p| p.quantizer.identity().version == 1)
+    );
 
     // Check softmax probabilities against FP16 reference on structured RoPE+NoPE vectors.
     let kv_heads = 2;
@@ -2043,7 +2048,10 @@ fn fitted_kv_optimizes_both_keys_and_values_preserving_restore_and_improving_sof
     rsq4kvf_keys.prepare_append(&current_key)?;
 
     let p_v1 = rsq4_keys.packed.as_ref().ok_or_else(|| invalid("p_v1"))?;
-    let p_v3 = rsq4kvf_keys.packed.as_ref().ok_or_else(|| invalid("p_v3"))?;
+    let p_v3 = rsq4kvf_keys
+        .packed
+        .as_ref()
+        .ok_or_else(|| invalid("p_v3"))?;
     let mut cur_v1 = vec![0_u8; p_v1.row_bytes];
     let mut cur_v3 = vec![0_u8; p_v3.row_bytes];
     for (h, chunk) in current_key.as_chunks::<HEAD_DIM>().0.iter().enumerate() {

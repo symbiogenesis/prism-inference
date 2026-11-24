@@ -155,11 +155,7 @@ const fn f64_to_f32(value: f64) -> f32 {
     value as f32
 }
 
-fn compute_token_confidence(
-    logits: &[f32],
-    chosen: u32,
-    top_k: usize,
-) -> Result<TokenConfidence> {
+fn compute_token_confidence(logits: &[f32], chosen: u32, top_k: usize) -> Result<TokenConfidence> {
     let mut max_logit = f32::NEG_INFINITY;
     for &logit in logits {
         if !logit.is_finite() {
@@ -469,7 +465,13 @@ impl Sampler for SwiftSampler {
 
 impl SwiftSampler {
     fn sample_with_logits<const VALIDATE: bool>(&mut self, logits: &[f32]) -> Result<u32> {
-        if VALIDATE && self.budget.as_ref().and_then(ReasoningBudget::forced_token).is_some() {
+        if VALIDATE
+            && self
+                .budget
+                .as_ref()
+                .and_then(ReasoningBudget::forced_token)
+                .is_some()
+        {
             for &value in logits {
                 if !value.is_finite() {
                     return Err(invalid(
@@ -478,7 +480,9 @@ impl SwiftSampler {
                 }
             }
         }
-        let token = if let Some(forced) = self.budget.as_ref().and_then(ReasoningBudget::forced_token) {
+        let token = if let Some(forced) =
+            self.budget.as_ref().and_then(ReasoningBudget::forced_token)
+        {
             let forced_idx = usize::try_from(forced)?;
             let forced_logit = *logits
                 .get(forced_idx)
@@ -1220,19 +1224,18 @@ mod tests {
     fn swift_sampler_config_preserves_canonical_default_and_supports_calibrated_controls()
     -> crate::Result<()> {
         let mut baseline = SwiftSampler::new(777)?;
-        let mut configured_default = SwiftSampler::with_config(
-            777,
-            super::SwiftSamplerConfig::default(),
-            None,
-            &[],
-        )?;
+        let mut configured_default =
+            SwiftSampler::with_config(777, super::SwiftSamplerConfig::default(), None, &[])?;
         let mut logits = vec![-2.0_f32; SwiftSampler::VOCABULARY];
         logits[10] = 4.5;
         logits[11] = 4.25;
         logits[12] = 4.0;
         logits[13] = 3.75;
         for _ in 0..8 {
-            assert_eq!(baseline.sample(&logits)?, configured_default.sample(&logits)?);
+            assert_eq!(
+                baseline.sample(&logits)?,
+                configured_default.sample(&logits)?
+            );
             assert!(configured_default.take_last_confidence().is_none());
         }
 

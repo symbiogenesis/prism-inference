@@ -11,9 +11,7 @@ pub(crate) mod selection;
 mod swift;
 pub mod upstream;
 
-pub use swift::{
-    ReasoningBudgetSequences, SwiftSampler, SwiftSamplerConfig, TokenConfidence,
-};
+pub use swift::{ReasoningBudgetSequences, SwiftSampler, SwiftSamplerConfig, TokenConfidence};
 
 /// Immutable, bounded, nonempty logits whose values have already been checked finite.
 ///

@@ -582,9 +582,7 @@ fn inspect_with_vocabulary_version(
     legacy_vocabulary: bool,
 ) -> Result<Inspection> {
     if dialect != "Stock" && dialect != PRISM_DIALECT && dialect != NARIQ_DIALECT {
-        return Err(bad(
-            "unknown dialect; use Stock, Prism, or NariQ dialect.",
-        ));
+        return Err(bad("unknown dialect; use Stock, Prism, or NariQ dialect."));
     }
     file.seek(SeekFrom::Start(0))?;
     let file_bytes = file.metadata()?.len();

@@ -108,7 +108,11 @@ fn swift_pinned_template_supports_low_medium_and_xhigh_reasoning_efforts() -> Re
     assert!(!medium.rendered.contains("Reasoning effort is set to"));
     assert!(low.rendered.contains("Reasoning effort is set to low."));
     assert!(low.rendered.ends_with("<|im_start|>assistant\n<think>\n"));
-    assert!(medium.rendered.ends_with("<|im_start|>assistant\n<think>\n"));
+    assert!(
+        medium
+            .rendered
+            .ends_with("<|im_start|>assistant\n<think>\n")
+    );
 
     // Turning off thinking omits effort suffix regardless of reasoning_effort.
     let no_think_low = session.prepare_with_effort(

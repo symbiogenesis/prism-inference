@@ -51,7 +51,11 @@ pub(crate) struct CanonicalRequest<'a> {
     pub(crate) sampler: SwiftSamplerConfig,
 }
 
-fn parse_f32_or_default(value: &serde_json::Value, key: &str, default: f32) -> Result<f32, Rejection> {
+fn parse_f32_or_default(
+    value: &serde_json::Value,
+    key: &str,
+    default: f32,
+) -> Result<f32, Rejection> {
     let Some(raw) = value.get(key) else {
         return Ok(default);
     };

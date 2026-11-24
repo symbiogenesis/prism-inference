@@ -300,7 +300,9 @@ mod tests {
         let mut state = seed | 1;
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             out.push(u8::try_from((state >> 24) & 0xff).unwrap_or(0));
         }
         out
@@ -328,7 +330,10 @@ mod tests {
         for bits in 1..=6 {
             let cols = 64_usize;
             let row_bytes = (cols / TILE_DIM) * tile_bytes(bits).ok_or("invalid bits")?;
-            let weights = synthetic_bytes(row_bytes, 0x9e37_79b9_u64 + u64::try_from(bits).unwrap_or(0));
+            let weights = synthetic_bytes(
+                row_bytes,
+                0x9e37_79b9_u64 + u64::try_from(bits).unwrap_or(0),
+            );
 
             let x_data: Vec<Vec<f32>> = (0..6)
                 .map(|t| {

@@ -30,6 +30,7 @@ pub use bf16::dot_bf16_rows;
 
 /// Packed rotated scalar KV consumption with portable and baseline-NEON paths.
 pub mod kv_quant;
+pub mod trellis;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(

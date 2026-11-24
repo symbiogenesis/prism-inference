@@ -12,7 +12,8 @@ use bonsai_prism_runtime::{
     runtime::PromptReuse,
     swift_session::{
         BranchCheckpoints, CpuPrefill, CpuSpeculation, DEFAULT_MAX_IMAGE_TOKENS, MAX_IMAGE_TOKENS,
-        MIN_IMAGE_TOKENS, MMPROJ_MEMORY_BYTES, MultiRankAdapterSpec, SwiftSession,
+        MIN_IMAGE_TOKENS, MMPROJ_MEMORY_BYTES, MultiRankAdapterSpec, NON_CONTEXT_MEMORY_BYTES,
+        SwiftSession, calibrated_non_context_memory_bytes,
         validate_calibrated_cow_execution_capacity, validate_context_capacity_with_kv,
         validate_execution_capacity_with_reuse,
     },
@@ -109,6 +110,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut row_workers = None;
     let mut cpu_family = None;
     let mut repacked_ptq1 = false;
+    let mut nariq: Option<Representation> = None;
     let mut adapter = None;
     let (mut daisyrose_path, mut daisyrose_bytes, mut daisyrose_sha256) = (None, None, None);
     let mut mmproj = None;
@@ -132,12 +134,20 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             broker_pipe = true;
             continue;
         }
-        if argument == "--use-repacked-ptq1" && !repacked_ptq1 {
+        if argument == "--use-repacked-ptq1" && !repacked_ptq1 && nariq.is_none() {
             repacked_ptq1 = true;
             continue;
         }
         let value = arguments.next().ok_or_else(invalid)?;
         match argument.to_str() {
+            Some("--nariq") if nariq.is_none() && !repacked_ptq1 => {
+                nariq = Some(match value.to_str() {
+                    Some("2.5bpw") => Representation::NariQ2_5Bpw,
+                    Some("3.0bpw") => Representation::NariQ3_0Bpw,
+                    Some("2.0bpw") => Representation::NariQ2_0Bpw,
+                    _ => return Err(invalid()),
+                });
+            }
             Some("--model") if model.is_none() => model = Some(PathBuf::from(value)),
             Some("--key-file") if key.is_none() => key = Some(PathBuf::from(value)),
             Some("--abliterate-lora") if adapter.is_none() => adapter = Some(PathBuf::from(value)),
@@ -325,11 +335,11 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
         row_workers: row_workers
             .unwrap_or_else(|| cpu_family.map_or(1, CpuFamily::default_row_workers)),
-        representation: if repacked_ptq1 {
+        representation: nariq.unwrap_or(if repacked_ptq1 {
             Representation::CurrentRepackedPtq1
         } else {
             Representation::Pq2
-        },
+        }),
         adapter,
         daisyrose_lora,
         mmproj,
@@ -363,6 +373,14 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         }
     }
     if config.mmproj.is_some() && config.cpu_speculation.is_some() {
+        return Err(invalid());
+    }
+    if config.representation.is_nariq()
+        && (config.adapter.is_some()
+            || config.mmproj.is_some()
+            || config.hexagon_arena_cache.is_some()
+            || matches!(config.placement, Placement::Vulkan | Placement::Composite))
+    {
         return Err(invalid());
     }
     if !placement_supports_config(&config) {
@@ -811,10 +829,24 @@ fn prepare_transport(transport: &ChildTransport) -> io::Result<PreparedTransport
 
 fn required_memory_bytes(config: &Config) -> io::Result<u64> {
     const DAISYROSE_SCRATCH_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
-    let base_required_bytes = config.capacity.map_or(
-        crate::configuration::REQUIRED_AVAILABLE_BYTES,
-        |(_, memory)| memory + 4 * 1024 * 1024 * 1024,
-    );
+    let base_required_bytes = if let Some((_, memory)) = config.capacity {
+        memory + 4 * 1024 * 1024 * 1024
+    } else {
+        let extra = if config.representation.is_nariq() {
+            calibrated_non_context_memory_bytes(config.representation)
+                .saturating_sub(NON_CONTEXT_MEMORY_BYTES)
+        } else {
+            0
+        };
+        crate::configuration::REQUIRED_AVAILABLE_BYTES
+            .checked_add(extra)
+            .ok_or_else(|| {
+                startup::at(
+                    Stage::Memory,
+                    &io::Error::other("native Swift startup memory limit overflow"),
+                )
+            })?
+    };
     let vision_reserve_bytes = if config.mmproj.is_some() {
         u64::try_from(MMPROJ_MEMORY_BYTES).map_err(|_| startup::at(Stage::Arguments, &invalid()))?
     } else {
@@ -1420,7 +1452,7 @@ mod tests {
         u64,
     )> {
         use bonsai_prism_runtime::swift_session::{
-            CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES,
+            CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES,
         };
         let (directory, [model, key, _adapter]) = files()?;
         let tile = 64 * 1024 * 1024;
@@ -1665,6 +1697,100 @@ mod tests {
     }
 
     #[test]
+    fn native_child_selects_nariq_with_daisyrose_and_rejects_incompatible_modes() -> io::Result<()> {
+        let (directory, [model, key, adapter]) = files()?;
+        let daisy = directory.path().join("daisyrose.gguf");
+        std::fs::write(&daisy, [])?;
+        let mmproj = directory.path().join("mmproj.gguf");
+        std::fs::write(&mmproj, [])?;
+        let cache_dir = directory.path().join("cache");
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8080".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        for (flag_val, expected_repr) in [
+            ("2.5bpw", Representation::NariQ2_5Bpw),
+            ("3.0bpw", Representation::NariQ3_0Bpw),
+            ("2.0bpw", Representation::NariQ2_0Bpw),
+        ] {
+            let mut args = base.clone();
+            args.extend([
+                OsString::from("--nariq"),
+                OsString::from(flag_val),
+                OsString::from("--daisyrose-lora"),
+                daisy.clone().into_os_string(),
+                OsString::from("--daisyrose-lora-bytes"),
+                "128".into(),
+                OsString::from("--daisyrose-lora-sha256"),
+                "ab".repeat(32).into(),
+                OsString::from("--kv-cache"),
+                "rsq4".into(),
+                OsString::from("--placement"),
+                "cpu".into(),
+            ]);
+            let cfg = parse(args)?;
+            assert_eq!(cfg.representation, expected_repr);
+            assert!(cfg.daisyrose_lora.is_some());
+            assert!(cfg.adapter.is_none());
+            assert!(cfg.mmproj.is_none());
+        }
+
+        // Uncalibrated required_memory_bytes accounts for 2.5bpw / 3.0bpw size + 256 MiB headroom.
+        let mut args_30 = base.clone();
+        args_30.extend([OsString::from("--nariq"), "3.0bpw".into()]);
+        let cfg_30 = parse(args_30)?;
+        assert!(required_memory_bytes(&cfg_30)? > crate::configuration::REQUIRED_AVAILABLE_BYTES);
+
+        for bad in [
+            vec!["--nariq", "2.5bpw", "--use-repacked-ptq1"],
+            vec!["--use-repacked-ptq1", "--nariq", "2.5bpw"],
+            vec!["--nariq", "2.5bpw", "--nariq", "3.0bpw"],
+            vec!["--nariq", "4.0bpw"],
+            vec!["--nariq", "2.5bpw", "--placement", "vulkan"],
+            vec!["--nariq", "2.5bpw", "--placement", "composite"],
+        ] {
+            let mut invalid_args = base.clone();
+            invalid_args.extend(bad.into_iter().map(OsString::from));
+            assert!(parse(invalid_args).is_err());
+        }
+        let mut with_abliterate = base.clone();
+        with_abliterate.extend([
+            OsString::from("--nariq"),
+            "2.5bpw".into(),
+            OsString::from("--abliterate-lora"),
+            adapter,
+        ]);
+        assert!(parse(with_abliterate).is_err());
+
+        let mut with_mmproj = base.clone();
+        with_mmproj.extend([
+            OsString::from("--nariq"),
+            "2.5bpw".into(),
+            OsString::from("--mmproj"),
+            mmproj.into(),
+        ]);
+        assert!(parse(with_mmproj).is_err());
+
+        let mut with_cache = base;
+        with_cache.extend([
+            OsString::from("--nariq"),
+            "2.5bpw".into(),
+            OsString::from("--hexagon-arena-cache"),
+            cache_dir.into_os_string(),
+        ]);
+        assert!(parse(with_cache).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn native_child_kv_cache_defaults_to_k4v4_with_explicit_unique_recovery() -> io::Result<()> {
         let (_directory, [model, key, _adapter]) = files()?;
         let base = vec![
@@ -1897,7 +2023,7 @@ mod tests {
     fn native_child_cpu_prefill_gdn_allows_f16_and_rotated_and_enforces_non_speculative_pairing()
     -> io::Result<()> {
         use bonsai_prism_runtime::swift_session::{
-            CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES,
+            CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES,
         };
         let (_directory, [model, key, _adapter]) = files()?;
         let reserve = 64 * 1024 * 1024_u64;
@@ -2367,7 +2493,7 @@ mod tests {
     #[test]
     fn native_child_vulkan_placement_defaults_and_accepts_f16_configurations() -> io::Result<()> {
         use bonsai_prism_runtime::swift_session::{
-            CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES, STATE_MEMORY_BYTES,
+            CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES,
         };
 
         let (_directory, [model, key, adapter]) = files()?;

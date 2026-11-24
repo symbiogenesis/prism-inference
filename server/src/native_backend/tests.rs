@@ -2888,6 +2888,13 @@ fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
     assert!(worker::supports_hexagon_native_q2_representation(
         Representation::CurrentRepackedPtq1
     ));
+    for nariq in [
+        Representation::NariQ2_5Bpw,
+        Representation::NariQ3_0Bpw,
+        Representation::NariQ2_0Bpw,
+    ] {
+        assert!(!worker::supports_hexagon_native_q2_representation(nariq));
+    }
 
     let pq2_hex = Representation::Pq2.model_sha256();
     let ptq1_hex = Representation::CurrentRepackedPtq1.model_sha256();
@@ -3048,6 +3055,22 @@ fn models_readiness_preserves_hexagon_and_ptq1_schema_keys() {
         "hexagon-native-q2-partial"
     );
     assert_eq!(ptq1_entry["startup_projection"]["resident_tensors"], 84);
+
+    let nariq_daisy = ModelProfile {
+        representation: Representation::NariQ2_5Bpw,
+        daisyrose_adapter: true,
+        daisyrose_adapter_sha256: Some("cd".repeat(32).into()),
+        daisyrose_adapter_max_rank: Some(4),
+        ..ModelProfile::default()
+    };
+    let nariq_json = nariq_daisy.readiness(42);
+    let nariq_entry = &nariq_json["data"][0];
+    assert_eq!(nariq_entry["id"], "Qwen3.8-27B-NariQ-2.5bpw");
+    assert_eq!(nariq_entry["model_sha256"], swift::NARIQ_2_5BPW_SHA256);
+    assert_eq!(nariq_entry["weight_representation"], "NariQ-2.5bpw");
+    assert_eq!(nariq_entry["supports_abliteration_scale"], false);
+    assert_eq!(nariq_entry["adapter_sha256"], Value::Null);
+    assert_eq!(nariq_entry["supports_daisyrose_scale"], true);
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]

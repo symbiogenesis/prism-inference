@@ -256,10 +256,7 @@ impl Default for ModelProfile {
 impl ModelProfile {
     pub(super) fn readiness(&self, seed: u32) -> Value {
         let mut model = json!({
-            "id": match self.representation {
-                Representation::Pq2 => "Swift-Bonsai-2-PQ2_0",
-                Representation::CurrentRepackedPtq1 => "Swift-Bonsai-2-current-repacked-PTQ1_0",
-            },
+            "id": self.representation.model_id(),
             "object": "model", "model_sha256": self.representation.model_sha256(),
             "template_sha256": swift::TEMPLATE_SHA256, "runtime": "prism-inference",
             "supports_cognitive_controls": self.placement != Placement::Vulkan,

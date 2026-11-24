@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use bonsai_gguf::{
-    Metadata, MetadataArray, MetadataValue, MetadataValueRef, PRISM_DIALECT, TensorDescriptor,
-    VerifiedModel,
+    Metadata, MetadataArray, MetadataValue, MetadataValueRef, NARIQ_DIALECT, PRISM_DIALECT,
+    TensorDescriptor, VerifiedModel,
 };
 use bonsai_native_hash::{Hasher, hash_bytes};
 
@@ -25,6 +25,21 @@ pub const REPACKED_PTQ1_BYTES: u64 = 5_946_648_928;
 /// Immutable current-weight export identity from Runner's PTQ1 export receipt.
 pub const REPACKED_PTQ1_SHA256: &str =
     "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5";
+/// Exact length of the pinned `Qwen3.8-27B-NariQ-2.5bpw.gguf` artifact.
+pub const NARIQ_2_5BPW_BYTES: u64 = 8_443_119_712;
+/// Immutable pinned `Qwen3.8-27B-NariQ-2.5bpw.gguf` SHA-256 identity.
+pub const NARIQ_2_5BPW_SHA256: &str =
+    "2445372e6de20620b940fbfab53aa718af9ba741f202da30cd2f02b5df78d05c";
+/// Exact length of the pinned `Qwen3.8-27B-NariQ-3.0bpw.gguf` artifact.
+pub const NARIQ_3_0BPW_BYTES: u64 = 10_123_626_592;
+/// Immutable pinned `Qwen3.8-27B-NariQ-3.0bpw.gguf` SHA-256 identity.
+pub const NARIQ_3_0BPW_SHA256: &str =
+    "1eaad934aa05579b8eba47ed9b26450392f9875fc2354efe8cfa8b29be8f4419";
+/// Exact length of the pinned `Qwen3.8-27B-NariQ-2.0bpw.gguf` artifact.
+pub const NARIQ_2_0BPW_BYTES: u64 = 6_753_954_304;
+/// Immutable pinned `Qwen3.8-27B-NariQ-2.0bpw.gguf` SHA-256 identity.
+pub const NARIQ_2_0BPW_SHA256: &str =
+    "3a9e4955329dba8ba0be5509a9552220e5ccdae2f66bcc72c21c4580cd49bbb2";
 /// Exact embedded UTF-8 template identity in the verified artifact.
 pub const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
@@ -50,6 +65,8 @@ pub const MMPROJ_TENSOR_PAYLOAD_BYTES: usize = 629_227_328;
 const SIGN_SHA256: &str = "3d1ea9136a6044cd680cc1e92cde65e9dd7238e1288fe2effabec5d201c48bed";
 const EXPECTED_MMPROJ_TENSORS: usize = 334;
 const EXPECTED_SWIFT_TENSORS: usize = 851;
+const EXPECTED_NARIQ_UNBANDED_TENSORS: usize = 2_710;
+const EXPECTED_NARIQ_BANDED_TENSORS: usize = 2_771;
 
 /// Exact current-weight artifact selected for an offline correctness capture.
 ///
@@ -62,15 +79,36 @@ pub enum Representation {
     Pq2,
     /// Verified lossless repack of the current PQ2 weights, not older PTQ weights.
     CurrentRepackedPtq1,
+    /// Verified `NariQ` 2.5bpw trellis artifact (`Qwen3.8-27B-NariQ-2.5bpw.gguf`).
+    NariQ2_5Bpw,
+    /// Verified `NariQ` 3.0bpw trellis artifact (`Qwen3.8-27B-NariQ-3.0bpw.gguf`).
+    NariQ3_0Bpw,
+    /// Verified `NariQ` 2.0bpw trellis artifact (`Qwen3.8-27B-NariQ-2.0bpw.gguf`).
+    NariQ2_0Bpw,
 }
 
 impl Representation {
-    /// Stable evidence identity distinguishing the source from its exact export.
+    /// Stable evidence identity distinguishing the source from its exact export or `NariQ` pack.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Pq2 => "PQ2_0",
             Self::CurrentRepackedPtq1 => "current-repacked-PTQ1_0",
+            Self::NariQ2_5Bpw => "NariQ-2.5bpw",
+            Self::NariQ3_0Bpw => "NariQ-3.0bpw",
+            Self::NariQ2_0Bpw => "NariQ-2.0bpw",
+        }
+    }
+
+    /// Stable model identifier surfaced on readiness responses.
+    #[must_use]
+    pub const fn model_id(self) -> &'static str {
+        match self {
+            Self::Pq2 => "Swift-Bonsai-2-PQ2_0",
+            Self::CurrentRepackedPtq1 => "Swift-Bonsai-2-current-repacked-PTQ1_0",
+            Self::NariQ2_5Bpw => "Qwen3.8-27B-NariQ-2.5bpw",
+            Self::NariQ3_0Bpw => "Qwen3.8-27B-NariQ-3.0bpw",
+            Self::NariQ2_0Bpw => "Qwen3.8-27B-NariQ-2.0bpw",
         }
     }
 
@@ -80,6 +118,9 @@ impl Representation {
         match self {
             Self::Pq2 => MODEL_BYTES,
             Self::CurrentRepackedPtq1 => REPACKED_PTQ1_BYTES,
+            Self::NariQ2_5Bpw => NARIQ_2_5BPW_BYTES,
+            Self::NariQ3_0Bpw => NARIQ_3_0BPW_BYTES,
+            Self::NariQ2_0Bpw => NARIQ_2_0BPW_BYTES,
         }
     }
 
@@ -89,6 +130,38 @@ impl Representation {
         match self {
             Self::Pq2 => MODEL_SHA256,
             Self::CurrentRepackedPtq1 => REPACKED_PTQ1_SHA256,
+            Self::NariQ2_5Bpw => NARIQ_2_5BPW_SHA256,
+            Self::NariQ3_0Bpw => NARIQ_3_0BPW_SHA256,
+            Self::NariQ2_0Bpw => NARIQ_2_0BPW_SHA256,
+        }
+    }
+
+    /// Whether this representation selects an opt-in `NariQ` trellis artifact.
+    #[must_use]
+    pub const fn is_nariq(self) -> bool {
+        matches!(
+            self,
+            Self::NariQ2_5Bpw | Self::NariQ3_0Bpw | Self::NariQ2_0Bpw
+        )
+    }
+
+    /// GGUF inspection dialect required when opening this artifact.
+    #[must_use]
+    pub const fn dialect(self) -> &'static str {
+        if self.is_nariq() {
+            NARIQ_DIALECT
+        } else {
+            PRISM_DIALECT
+        }
+    }
+
+    /// Maximum retained host weight-loading budget appropriate for this representation.
+    #[must_use]
+    pub const fn model_memory_limit_bytes(self) -> usize {
+        match self {
+            Self::Pq2 | Self::CurrentRepackedPtq1 | Self::NariQ2_0Bpw => 8 * 1024 * 1024 * 1024,
+            Self::NariQ2_5Bpw => 9 * 1024 * 1024 * 1024,
+            Self::NariQ3_0Bpw => 11 * 1024 * 1024 * 1024,
         }
     }
 
@@ -96,6 +169,8 @@ impl Representation {
         match self {
             Self::Pq2 => 142,
             Self::CurrentRepackedPtq1 => 143,
+            Self::NariQ2_5Bpw | Self::NariQ2_0Bpw => 45,
+            Self::NariQ3_0Bpw => 46,
         }
     }
 
@@ -103,6 +178,7 @@ impl Representation {
         match self {
             Self::Pq2 => 141,
             Self::CurrentRepackedPtq1 => 143,
+            Self::NariQ2_5Bpw | Self::NariQ3_0Bpw | Self::NariQ2_0Bpw => 32,
         }
     }
 
@@ -110,6 +186,7 @@ impl Representation {
         match self {
             Self::Pq2 => TENSOR_PAYLOAD_BYTES,
             Self::CurrentRepackedPtq1 => 5_935_527_936,
+            Self::NariQ2_5Bpw | Self::NariQ3_0Bpw | Self::NariQ2_0Bpw => 0,
         }
     }
 }
@@ -485,14 +562,22 @@ fn verify(
 ) -> Result<(VerifiedModel, LoadReceipt)> {
     let reader = VerifiedModel::open(
         path,
-        PRISM_DIALECT,
+        representation.dialect(),
         representation.model_bytes(),
         representation.model_sha256(),
         memory_limit,
     )?;
-    validate_metadata_for(reader.metadata(), representation)?;
-    let (tensor_counts, tensor_payload_bytes, largest_tensor_bytes) =
-        validate_inventory(reader.tensors(), representation)?;
+    if representation.is_nariq() {
+        validate_nariq_metadata(reader.metadata(), representation)?;
+    } else {
+        validate_metadata_for(reader.metadata(), representation)?;
+    }
+    let (tensor_counts, tensor_payload_bytes, largest_tensor_bytes) = if representation.is_nariq()
+    {
+        validate_nariq_inventory(reader.tensors(), representation)?
+    } else {
+        validate_inventory(reader.tensors(), representation)?
+    };
     let header_charge_bytes = reader.retained_bytes();
     let retained_storage_bytes = header_charge_bytes
         .checked_add(tensor_payload_bytes)
@@ -510,6 +595,123 @@ fn verify(
             tensor_counts,
         },
     ))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the exact NariQ metadata contract auditable in one helper."
+)]
+fn validate_nariq_metadata(metadata: &Metadata, representation: Representation) -> Result<()> {
+    if !representation.is_nariq() {
+        return Err(invalid("non-NariQ representation passed to NariQ metadata validator"));
+    }
+    if metadata.keys().any(|key| key.starts_with("prism.hadamard.")) {
+        return Err(invalid("NariQ metadata forbids prism.hadamard transforms"));
+    }
+    for (key, value) in [
+        ("general.architecture", "qwen35"),
+        ("tokenizer.ggml.model", "gpt2"),
+        ("tokenizer.ggml.pre", "qwen35"),
+    ] {
+        if metadata.get(key).and_then(MetadataValue::as_str) != Some(value) {
+            return Err(invalid(format!("NariQ metadata mismatch: {key}")));
+        }
+    }
+    for (key, value) in [
+        ("general.file_type", representation.file_type()),
+        ("trellis.version", 1),
+        ("trellis.lm_head_bands", 16),
+        ("qwen35.block_count", 64),
+        ("qwen35.context_length", 262_144),
+        ("qwen35.embedding_length", 5_120),
+        ("qwen35.feed_forward_length", 17_408),
+        ("qwen35.attention.head_count", 24),
+        ("qwen35.attention.head_count_kv", 4),
+        ("qwen35.attention.key_length", 256),
+        ("qwen35.attention.value_length", 256),
+        ("qwen35.ssm.conv_kernel", 4),
+        ("qwen35.ssm.state_size", 128),
+        ("qwen35.ssm.group_count", 16),
+        ("qwen35.ssm.time_step_rank", 48),
+        ("qwen35.ssm.inner_size", 6_144),
+        ("qwen35.full_attention_interval", 4),
+        ("qwen35.rope.dimension_count", 64),
+        ("tokenizer.ggml.eos_token_id", 248_046),
+        ("tokenizer.ggml.padding_token_id", 248_044),
+        ("tokenizer.ggml.bos_token_id", 248_044),
+    ] {
+        if metadata.get(key).and_then(MetadataValue::as_u64) != Some(value) {
+            return Err(invalid(format!("NariQ metadata mismatch: {key}")));
+        }
+    }
+    match representation {
+        Representation::NariQ2_0Bpw => {
+            if metadata
+                .get("trellis.embed_bands")
+                .and_then(MetadataValue::as_u64)
+                != Some(16)
+            {
+                return Err(invalid("NariQ 2.0bpw requires trellis.embed_bands = 16"));
+            }
+        }
+        Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => {
+            if metadata.contains_key("trellis.embed_bands") {
+                return Err(invalid("unbanded NariQ artifact forbids trellis.embed_bands"));
+            }
+        }
+        Representation::Pq2 | Representation::CurrentRepackedPtq1 => {}
+    }
+    for (key, value) in [
+        ("qwen35.rope.freq_base", 10_000_000.0_f32),
+        ("qwen35.attention.layer_norm_rms_epsilon", 0.000_001_f32),
+    ] {
+        if metadata
+            .get(key)
+            .and_then(MetadataValue::as_f64)
+            .map(f64::to_bits)
+            != Some(f64::from(value).to_bits())
+        {
+            return Err(invalid(format!("NariQ metadata mismatch: {key}")));
+        }
+    }
+    if metadata
+        .get("tokenizer.ggml.add_bos_token")
+        .and_then(MetadataValue::as_bool)
+        != Some(false)
+    {
+        return Err(invalid("NariQ metadata mismatch: tokenizer.ggml.add_bos_token"));
+    }
+    if let Some(add_eos) = metadata.get("tokenizer.ggml.add_eos_token")
+        && add_eos.as_bool() != Some(false)
+    {
+        return Err(invalid("NariQ metadata mismatch: tokenizer.ggml.add_eos_token"));
+    }
+    let template = metadata
+        .get("tokenizer.chat_template")
+        .and_then(MetadataValue::as_str)
+        .ok_or_else(|| invalid("NariQ embedded template is missing"))?;
+    if template.len() != 8_952 || !digest_matches(hash_bytes(template.as_bytes())?, TEMPLATE_SHA256)
+    {
+        return Err(invalid("NariQ embedded template identity mismatch"));
+    }
+    check_integers(metadata, "qwen35.rope.dimension_sections", &[11, 11, 10, 0])?;
+    for (key, count, strings) in [
+        ("tokenizer.ggml.tokens", VOCAB_SIZE, true),
+        ("tokenizer.ggml.token_type", VOCAB_SIZE, false),
+        ("tokenizer.ggml.merges", 247_587, true),
+    ] {
+        let array = metadata
+            .get(key)
+            .and_then(MetadataValue::as_array)
+            .ok_or_else(|| invalid(format!("NariQ array missing: {key}")))?;
+        if array.len() != count
+            || (strings && !matches!(array, MetadataArray::String(_)))
+            || (!strings && !matches!(array, MetadataArray::I32(_)))
+        {
+            return Err(invalid(format!("NariQ tokenizer array mismatch: {key}")));
+        }
+    }
+    Ok(())
 }
 
 /// Checks the pinned Swift metadata contract without executing or loading weights.
@@ -790,6 +992,154 @@ fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Ve
         }
     }
     tensors
+}
+
+fn validate_nariq_band_name(name: &str, prefix: &str) -> Option<usize> {
+    let rest = name.strip_prefix(prefix)?;
+    let band_str = rest.strip_suffix(".weight")?;
+    if band_str.len() != 2 || !band_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let idx = band_str.parse::<usize>().ok()?;
+    (idx < 16).then_some(idx)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Validate complete NariQ tensor inventory and band geometry in one pass."
+)]
+fn validate_nariq_inventory(
+    tensors: &[TensorDescriptor],
+    representation: Representation,
+) -> Result<([usize; 3], usize, usize)> {
+    let expected_count = match representation {
+        Representation::NariQ2_0Bpw => EXPECTED_NARIQ_BANDED_TENSORS,
+        Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => EXPECTED_NARIQ_UNBANDED_TENSORS,
+        Representation::Pq2 | Representation::CurrentRepackedPtq1 => {
+            return Err(invalid("non-NariQ representation passed to NariQ inventory validator"));
+        }
+    };
+    if tensors.len() != expected_count {
+        return Err(invalid("NariQ tensor inventory count mismatch"));
+    }
+    let vocab_u64 = u64::try_from(VOCAB_SIZE)?;
+    let mut counts = [0_usize; 3];
+    let mut bytes = 0_usize;
+    let mut largest = 0_usize;
+    let mut seen = HashSet::new();
+    seen.try_reserve(expected_count)?;
+
+    let mut saw_output_gather = false;
+    let mut output_band_cols = [0_u64; 16];
+    let mut saw_embed_weight = false;
+    let mut saw_embed_gather = false;
+    let mut embed_band_cols = [0_u64; 16];
+
+    for tensor in tensors {
+        let name = tensor.name.as_str();
+        if !seen.insert(name) {
+            return Err(invalid(format!("duplicate NariQ tensor: {name}")));
+        }
+        let dims = tensor.dimensions.as_slice();
+        let (slot, expected_bytes) = match tensor.type_id {
+            0 => {
+                let elems = dims
+                    .iter()
+                    .try_fold(1_u64, |acc, &d| (d > 0).then_some(()).and_then(|()| acc.checked_mul(d)))
+                    .ok_or_else(|| invalid(format!("NariQ F32 tensor dimension overflow: {name}")))?;
+                (0_usize, elems.checked_mul(4).ok_or_else(|| invalid("NariQ tensor byte overflow"))?)
+            }
+            1 | 30 => {
+                let elems = dims
+                    .iter()
+                    .try_fold(1_u64, |acc, &d| (d > 0).then_some(()).and_then(|()| acc.checked_mul(d)))
+                    .ok_or_else(|| invalid(format!("NariQ 16-bit tensor dimension overflow: {name}")))?;
+                (0_usize, elems.checked_mul(2).ok_or_else(|| invalid("NariQ tensor byte overflow"))?)
+            }
+            26 => {
+                let elems = dims
+                    .iter()
+                    .try_fold(1_u64, |acc, &d| (d > 0).then_some(()).and_then(|()| acc.checked_mul(d)))
+                    .ok_or_else(|| invalid(format!("NariQ I32 tensor dimension overflow: {name}")))?;
+                (1_usize, elems.checked_mul(4).ok_or_else(|| invalid("NariQ tensor byte overflow"))?)
+            }
+            44..=49 => {
+                if dims.len() != 2 || !dims[0].is_multiple_of(16) || !dims[1].is_multiple_of(16) || dims[0] == 0 || dims[1] == 0 {
+                    return Err(invalid(format!("NariQ trellis tensor dimensions misaligned: {name}")));
+                }
+                let bits = u64::from(tensor.type_id - 43);
+                let expected = (dims[0] / 16)
+                    .checked_mul(dims[1] / 16)
+                    .and_then(|tiles| tiles.checked_mul(32 * bits))
+                    .ok_or_else(|| invalid("NariQ trellis payload overflow"))?;
+                (2_usize, expected)
+            }
+            _ => return Err(invalid(format!("unsupported NariQ tensor encoding in {name}"))),
+        };
+        if tensor.bytes != expected_bytes {
+            return Err(invalid(format!("NariQ tensor payload byte mismatch: {name}")));
+        }
+
+        if name == "output.vocab_gather" {
+            if tensor.type_id != 26 || dims != [vocab_u64] {
+                return Err(invalid("invalid NariQ output.vocab_gather layout"));
+            }
+            saw_output_gather = true;
+        } else if let Some(idx) = validate_nariq_band_name(name, "output.band") {
+            if slot != 2 || dims.len() != 2 || dims[0] != 5_120 {
+                return Err(invalid(format!("invalid NariQ output band layout: {name}")));
+            }
+            output_band_cols[idx] = dims[1];
+        } else if name == "token_embd.vocab_gather" {
+            if representation != Representation::NariQ2_0Bpw || tensor.type_id != 26 || dims != [vocab_u64] {
+                return Err(invalid("unexpected or malformed NariQ token_embd.vocab_gather"));
+            }
+            saw_embed_gather = true;
+        } else if let Some(idx) = validate_nariq_band_name(name, "token_embd.band") {
+            if representation != Representation::NariQ2_0Bpw || slot != 2 || dims.len() != 2 || dims[0] != 5_120 {
+                return Err(invalid(format!("unexpected or malformed NariQ embed band: {name}")));
+            }
+            embed_band_cols[idx] = dims[1];
+        } else if name.starts_with("token_embd.band") || name.starts_with("output.band") {
+            if name.ends_with(".weight") {
+                return Err(invalid(format!("unexpected NariQ head band index: {name}")));
+            }
+        } else if name == "token_embd.weight" {
+            if representation == Representation::NariQ2_0Bpw || dims != [5_120, vocab_u64] {
+                return Err(invalid("unexpected or malformed NariQ token_embd.weight"));
+            }
+            saw_embed_weight = true;
+        }
+
+        counts[slot] += 1;
+        let length = usize::try_from(tensor.bytes)?;
+        bytes = bytes
+            .checked_add(length)
+            .ok_or_else(|| invalid("NariQ tensor accounting overflow"))?;
+        largest = largest.max(length);
+    }
+
+    if !saw_output_gather || output_band_cols.contains(&0) || output_band_cols.iter().sum::<u64>() != vocab_u64 {
+        return Err(invalid("incomplete NariQ banded output head inventory"));
+    }
+    match representation {
+        Representation::NariQ2_0Bpw => {
+            if saw_embed_weight
+                || !saw_embed_gather
+                || embed_band_cols.contains(&0)
+                || embed_band_cols.iter().sum::<u64>() != vocab_u64
+            {
+                return Err(invalid("incomplete NariQ 2.0bpw banded embedding inventory"));
+            }
+        }
+        Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => {
+            if !saw_embed_weight || saw_embed_gather || embed_band_cols.iter().any(|&c| c != 0) {
+                return Err(invalid("invalid unbanded NariQ embedding inventory"));
+            }
+        }
+        Representation::Pq2 | Representation::CurrentRepackedPtq1 => {}
+    }
+    Ok((counts, bytes, largest))
 }
 
 fn validate_inventory(
@@ -1116,6 +1466,125 @@ mod tests {
             "v.blk.0.unknown",
         ] {
             assert!(expected_mmproj_spec(bad_name).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nariq_representations_verify_identities_limits_metadata_and_inventories() -> Result<()> {
+        let cases = [
+            (
+                Representation::NariQ2_5Bpw,
+                "NariQ-2.5bpw",
+                "Qwen3.8-27B-NariQ-2.5bpw",
+                NARIQ_2_5BPW_BYTES,
+                NARIQ_2_5BPW_SHA256,
+                9 * 1024 * 1024 * 1024,
+                false,
+                EXPECTED_NARIQ_UNBANDED_TENSORS,
+            ),
+            (
+                Representation::NariQ3_0Bpw,
+                "NariQ-3.0bpw",
+                "Qwen3.8-27B-NariQ-3.0bpw",
+                NARIQ_3_0BPW_BYTES,
+                NARIQ_3_0BPW_SHA256,
+                11 * 1024 * 1024 * 1024,
+                false,
+                EXPECTED_NARIQ_UNBANDED_TENSORS,
+            ),
+            (
+                Representation::NariQ2_0Bpw,
+                "NariQ-2.0bpw",
+                "Qwen3.8-27B-NariQ-2.0bpw",
+                NARIQ_2_0BPW_BYTES,
+                NARIQ_2_0BPW_SHA256,
+                8 * 1024 * 1024 * 1024,
+                true,
+                EXPECTED_NARIQ_BANDED_TENSORS,
+            ),
+        ];
+
+        for (repr, name, model_id, bytes, sha, mem_limit, banded, expected_count) in cases {
+            assert!(repr.is_nariq());
+            assert_eq!(repr.name(), name);
+            assert_eq!(repr.model_id(), model_id);
+            assert_eq!(repr.model_bytes(), bytes);
+            assert_eq!(repr.model_sha256(), sha);
+            assert_eq!(repr.dialect(), NARIQ_DIALECT);
+            assert_eq!(repr.model_memory_limit_bytes(), mem_limit);
+            assert_eq!(repr.file_type(), 32);
+
+            let mut descs = Vec::with_capacity(expected_count);
+            descs.push(TensorDescriptor {
+                name: "output.vocab_gather".to_owned(),
+                type_id: 26,
+                dimensions: vec![u64::try_from(VOCAB_SIZE)?],
+                elements: u64::try_from(VOCAB_SIZE)?,
+                offset: 0,
+                bytes: u64::try_from(VOCAB_SIZE)? * 4,
+            });
+            let cols = [15_520_u64; 16];
+            for (idx, &band_n) in cols.iter().enumerate() {
+                descs.push(TensorDescriptor {
+                    name: format!("output.band{idx:02}.weight"),
+                    type_id: 45,
+                    dimensions: vec![5_120, band_n],
+                    elements: 5_120 * band_n,
+                    offset: 0,
+                    bytes: (5_120 / 16) * (band_n / 16) * 32 * 2,
+                });
+            }
+            if banded {
+                descs.push(TensorDescriptor {
+                    name: "token_embd.vocab_gather".to_owned(),
+                    type_id: 26,
+                    dimensions: vec![u64::try_from(VOCAB_SIZE)?],
+                    elements: u64::try_from(VOCAB_SIZE)?,
+                    offset: 0,
+                    bytes: u64::try_from(VOCAB_SIZE)? * 4,
+                });
+                for (idx, &band_n) in cols.iter().enumerate() {
+                    descs.push(TensorDescriptor {
+                        name: format!("token_embd.band{idx:02}.weight"),
+                        type_id: 44,
+                        dimensions: vec![5_120, band_n],
+                        elements: 5_120 * band_n,
+                        offset: 0,
+                        bytes: (5_120 / 16) * (band_n / 16) * 32,
+                    });
+                }
+            } else {
+                descs.push(TensorDescriptor {
+                    name: "token_embd.weight".to_owned(),
+                    type_id: 1,
+                    dimensions: vec![5_120, u64::try_from(VOCAB_SIZE)?],
+                    elements: 5_120 * u64::try_from(VOCAB_SIZE)?,
+                    offset: 0,
+                    bytes: 5_120 * u64::try_from(VOCAB_SIZE)? * 2,
+                });
+            }
+            while descs.len() < expected_count {
+                let extra_idx = descs.len();
+                descs.push(TensorDescriptor {
+                    name: format!("blk.{extra_idx}.filler_norm.weight"),
+                    type_id: 0,
+                    dimensions: vec![5_120],
+                    elements: 5_120,
+                    offset: 0,
+                    bytes: 5_120 * 4,
+                });
+            }
+            let (counts, total_bytes, _) = validate_nariq_inventory(&descs, repr)?;
+            assert!(total_bytes > 0);
+            assert_eq!(counts[0] + counts[1] + counts[2], expected_count);
+            // Cross-representation inventory must fail closed between banded 2.0bpw and unbanded 2.5/3.0bpw.
+            let other = if banded {
+                Representation::NariQ2_5Bpw
+            } else {
+                Representation::NariQ2_0Bpw
+            };
+            assert!(validate_nariq_inventory(&descs, other).is_err());
         }
         Ok(())
     }

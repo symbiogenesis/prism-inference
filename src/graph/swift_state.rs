@@ -19,7 +19,14 @@ pub(super) fn ceiling(
     context_tokens: usize,
     cache: KvCachePolicy,
 ) -> Result<usize> {
-    if !matches!(identity, swift::MODEL_SHA256 | swift::REPACKED_PTQ1_SHA256)
+    if !matches!(
+        identity,
+        swift::MODEL_SHA256
+            | swift::REPACKED_PTQ1_SHA256
+            | swift::NARIQ_2_5BPW_SHA256
+            | swift::NARIQ_3_0BPW_SHA256
+            | swift::NARIQ_2_0BPW_SHA256
+    )
         || !matches!(
             cache,
             KvCachePolicy::Rotated4
@@ -98,7 +105,13 @@ mod tests {
         assert_eq!(RECURRENT_BYTES, 156_893_184);
         assert_eq!(SWIFT_RSQ4_FULL_STATE_BYTES, 4_644_798_464);
         assert_eq!(super::super::MAX_STATE_BYTES, 4 * 1024 * 1024 * 1024);
-        for identity in [swift::MODEL_SHA256, swift::REPACKED_PTQ1_SHA256] {
+        for identity in [
+            swift::MODEL_SHA256,
+            swift::REPACKED_PTQ1_SHA256,
+            swift::NARIQ_2_5BPW_SHA256,
+            swift::NARIQ_3_0BPW_SHA256,
+            swift::NARIQ_2_0BPW_SHA256,
+        ] {
             for cache in [
                 KvCachePolicy::Rotated4,
                 KvCachePolicy::Rotated4FittedValues,

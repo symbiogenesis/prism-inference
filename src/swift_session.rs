@@ -57,6 +57,24 @@ pub const CHECKPOINT_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 pub const NON_CONTEXT_MEMORY_BYTES: u64 = 11 * 1024 * 1024 * 1024;
 /// Calibrated fixed model/runtime allowance for the repacked PTQ1 export (`PQ2 - PTQ1 = 1_259_520_000`).
 pub const PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES: u64 = NON_CONTEXT_MEMORY_BYTES - 1_259_520_000;
+/// Additional CPU scratch headroom budgeted for `NariQ` trellis transforms and banded heads.
+pub const NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Returns the calibrated fixed model/runtime allowance for `representation`.
+#[must_use]
+pub const fn calibrated_non_context_memory_bytes(representation: Representation) -> u64 {
+    match representation {
+        Representation::Pq2 => NON_CONTEXT_MEMORY_BYTES,
+        Representation::CurrentRepackedPtq1 => PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES,
+        Representation::NariQ2_5Bpw
+        | Representation::NariQ3_0Bpw
+        | Representation::NariQ2_0Bpw => {
+            (NON_CONTEXT_MEMORY_BYTES - swift::MODEL_BYTES)
+                + representation.model_bytes()
+                + NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES
+        }
+    }
+}
 /// Maximum unsealed tail page tokens kept writable across copy-on-write rollback copies.
 pub const COW_UNSEALED_TAIL_TOKENS: usize = 64;
 /// Native sequential FP16 live/rollback KV, attention scores and bookkeeping.
@@ -487,10 +505,7 @@ pub fn calibrated_cow_execution_memory_bytes(
         prompt_reuse,
         branch_checkpoints,
     )?;
-    let fixed_bytes = match representation {
-        Representation::Pq2 => NON_CONTEXT_MEMORY_BYTES,
-        Representation::CurrentRepackedPtq1 => PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES,
-    };
+    let fixed_bytes = calibrated_non_context_memory_bytes(representation);
     let reuse_slots = match prompt_reuse {
         PromptReuse::Disabled => 0_usize,
         PromptReuse::Latest => branch_checkpoints.checkpoints(),
@@ -1354,6 +1369,16 @@ impl SwiftSession {
         if let AdapterSelection::Edited(candidate) = &adapter_selection {
             candidate.validate_identity()?;
         }
+        if representation.is_nariq()
+            && matches!(
+                adapter_selection,
+                AdapterSelection::Approved(Some(_)) | AdapterSelection::Edited(_)
+            )
+        {
+            return Err(invalid(
+                "NariQ representation does not support rank-one Orca adapters",
+            ));
+        }
         validate_execution_capacity_with_reuse(
             context_tokens,
             u64::MAX,
@@ -1372,8 +1397,11 @@ impl SwiftSession {
             .and_then(|bytes| bytes.checked_add(branch_budget))
             .ok_or_else(|| invalid("Swift checkpoint reservation overflow"))?;
         let sampler = SwiftSampler::new(seed)?;
-        let (model, receipt) =
-            swift::load_representation(path, MODEL_MEMORY_BYTES, representation)?;
+        let (model, receipt) = swift::load_representation(
+            path,
+            representation.model_memory_limit_bytes(),
+            representation,
+        )?;
         let chat = SwiftChatSession::from_model_representation(&model, representation)?
             .with_context_tokens(context_tokens)?;
         let vocabulary = Vocabulary::from_metadata(&model.metadata, swift::VOCAB_SIZE)?;
@@ -1671,6 +1699,11 @@ impl SwiftSession {
     ) -> Result<&MmprojLoadReceipt> {
         if self.is_faulted() {
             return Err(invalid("Swift session requires reset"));
+        }
+        if self.representation.is_nariq() {
+            return Err(invalid(
+                "NariQ representation does not support Swift vision projector loading",
+            ));
         }
         validate_vision_token_budget(max_image_tokens)?;
         let (encoder, receipt) = SwiftVisionEncoder::load(
@@ -3524,12 +3557,67 @@ mod tests {
             REPACKED_PTQ1_SHA256
         );
         assert_ne!(MODEL_SHA256, REPACKED_PTQ1_SHA256);
-        for sha in [MODEL_SHA256, REPACKED_PTQ1_SHA256] {
+        for sha in [
+            MODEL_SHA256,
+            REPACKED_PTQ1_SHA256,
+            crate::model::swift::NARIQ_2_5BPW_SHA256,
+            crate::model::swift::NARIQ_3_0BPW_SHA256,
+            crate::model::swift::NARIQ_2_0BPW_SHA256,
+        ] {
             assert_eq!(sha.len(), 64);
             assert!(
                 sha.bytes()
                     .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
             );
         }
+    }
+
+    #[test]
+    fn calibrated_cow_execution_capacity_accounts_for_nariq_sizes_and_headroom() -> Result<()> {
+        use super::{
+            BranchCheckpoints, NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES, NON_CONTEXT_MEMORY_BYTES,
+            Representation, calibrated_cow_execution_memory_bytes,
+            calibrated_non_context_memory_bytes,
+        };
+        use crate::runtime::PromptReuse;
+
+        let ctx = 262_144;
+        let kv = KvCachePolicy::Rotated4;
+        let pq2 = calibrated_cow_execution_memory_bytes(
+            ctx,
+            Representation::Pq2,
+            None,
+            None,
+            kv,
+            PromptReuse::Latest,
+            BranchCheckpoints::default(),
+        )?;
+        for repr in [
+            Representation::NariQ2_5Bpw,
+            Representation::NariQ3_0Bpw,
+            Representation::NariQ2_0Bpw,
+        ] {
+            let nariq_fixed = calibrated_non_context_memory_bytes(repr);
+            assert_eq!(
+                nariq_fixed,
+                (NON_CONTEXT_MEMORY_BYTES - crate::model::swift::MODEL_BYTES)
+                    + repr.model_bytes()
+                    + NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES
+            );
+            let nariq = calibrated_cow_execution_memory_bytes(
+                ctx,
+                repr,
+                None,
+                None,
+                kv,
+                PromptReuse::Latest,
+                BranchCheckpoints::default(),
+            )?;
+            assert_eq!(
+                nariq,
+                pq2 + nariq_fixed - NON_CONTEXT_MEMORY_BYTES
+            );
+        }
+        Ok(())
     }
 }

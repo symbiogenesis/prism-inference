@@ -202,8 +202,9 @@ impl SwiftChatSession {
         memory_limit: usize,
         representation: Representation,
     ) -> Result<Self> {
-        let model = ModelMetadata::load(
+        let model = ModelMetadata::load_with_dialect(
             path,
+            representation.dialect(),
             representation.model_bytes(),
             representation.model_sha256(),
             memory_limit,
@@ -267,16 +268,25 @@ impl SwiftChatSession {
         model: &Model,
         representation: Representation,
     ) -> Result<Self> {
-        let embedding = model
-            .tensors
-            .get("token_embd.weight")
-            .ok_or_else(|| invalid("Swift chat requires a token embedding"))?;
-        let vocab_size = embedding
-            .dimensions
-            .get(1)
-            .copied()
-            .filter(|_| embedding.dimensions.len() == 2)
-            .ok_or_else(|| invalid("Swift chat requires a rank-two token embedding"))?;
+        let vocab_size = if let Some(embedding) = model.tensors.get("token_embd.weight") {
+            embedding
+                .dimensions
+                .get(1)
+                .copied()
+                .filter(|_| embedding.dimensions.len() == 2)
+                .ok_or_else(|| invalid("Swift chat requires a rank-two token embedding"))?
+        } else if representation.is_nariq()
+            && let Some(gather) = model.tensors.get("token_embd.vocab_gather")
+        {
+            gather
+                .dimensions
+                .first()
+                .copied()
+                .filter(|_| gather.dimensions.len() == 1)
+                .ok_or_else(|| invalid("Swift chat requires a rank-one banded token gather"))?
+        } else {
+            return Err(invalid("Swift chat requires a token embedding"));
+        };
         Self::from_parts(&model.metadata, vocab_size, &model.identity, representation)
     }
 
@@ -307,11 +317,16 @@ impl SwiftChatSession {
             return Err(invalid("Swift embedded chat template identity mismatch"));
         }
         let special = SpecialTokens::from_metadata(metadata, vocab_size)?;
+        let add_eos_invalid = if representation.is_nariq() {
+            matches!(special.add_eos_token(), Some(true))
+        } else {
+            special.add_eos_token().is_some()
+        };
         if special.bos_token() != Some(248_044)
             || special.eos_token() != 248_046
             || special.padding_token() != Some(248_044)
             || special.add_bos_token() != Some(false)
-            || special.add_eos_token().is_some()
+            || add_eos_invalid
             || special.eot_token().is_some()
             || special.eom_token().is_some()
         {
@@ -962,5 +977,76 @@ mod tests {
         ] {
             assert!(validate_messages(&messages).is_err());
         }
+    }
+
+    #[test]
+    fn nariq_chat_accepts_banded_vocab_gather_and_explicit_false_add_eos() -> crate::Result<()> {
+        use super::{Representation, SwiftChatSession};
+        use crate::model::{Model, Tensor, TensorBytes};
+        use std::{collections::BTreeMap, sync::Arc};
+
+        let vocab = crate::model::swift::VOCAB_SIZE;
+        let tokens: Vec<String> = (0..vocab)
+            .map(|i| match i {
+                248_044 => "<|endoftext|>".to_owned(),
+                248_046 => "<|im_end|>".to_owned(),
+                248_045 => "<|im_start|>".to_owned(),
+                248_052 => "<|object_ref_start|>".to_owned(),
+                248_053 => "<|object_ref_end|>".to_owned(),
+                248_054 => "<|box_start|>".to_owned(),
+                248_055 => "<|box_end|>".to_owned(),
+                248_056 => "<|vision_start|>".to_owned(),
+                248_057 => "<|vision_end|>".to_owned(),
+                248_058 => "<|vision_pad|>".to_owned(),
+                248_059 => "<|image_pad|>".to_owned(),
+                248_060 => "<|video_pad|>".to_owned(),
+                248_068 => "<think>".to_owned(),
+                248_069 => "</think>".to_owned(),
+                _ => format!("t{i}"),
+            })
+            .collect();
+        let merges: Vec<String> = (0..247_587).map(|i| format!("a{i} b{i}")).collect();
+        let template = format!(
+            "{{#- if add_generation_prompt -#}}{}<|im_start|>user\n<|im_end|>\n{{- endif -}}",
+            " ".repeat(8_952 - "{{- if add_generation_prompt -}}<|im_start|>user\n<|im_end|>\n{{- endif -}}".len())
+        );
+        // Validate template digest mismatch still rejects while checking banded vocab_gather resolution.
+        let mut meta = BTreeMap::new();
+        meta.insert("general.architecture".to_owned(), bonsai_gguf::MetadataValue::from("qwen35"));
+        meta.insert("tokenizer.ggml.model".to_owned(), bonsai_gguf::MetadataValue::from("gpt2"));
+        meta.insert("tokenizer.ggml.pre".to_owned(), bonsai_gguf::MetadataValue::from("qwen35"));
+        meta.insert("tokenizer.ggml.bos_token_id".to_owned(), bonsai_gguf::MetadataValue::from(248_044_u32));
+        meta.insert("tokenizer.ggml.eos_token_id".to_owned(), bonsai_gguf::MetadataValue::from(248_046_u32));
+        meta.insert("tokenizer.ggml.padding_token_id".to_owned(), bonsai_gguf::MetadataValue::from(248_044_u32));
+        meta.insert("tokenizer.ggml.add_bos_token".to_owned(), bonsai_gguf::MetadataValue::from(false));
+        meta.insert("tokenizer.ggml.add_eos_token".to_owned(), bonsai_gguf::MetadataValue::from(false));
+        meta.insert("tokenizer.ggml.tokens".to_owned(), bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::String(tokens)));
+        meta.insert("tokenizer.ggml.token_type".to_owned(), bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::I32(vec![1; vocab])));
+        meta.insert("tokenizer.ggml.merges".to_owned(), bonsai_gguf::MetadataValue::Array(bonsai_gguf::MetadataArray::String(merges)));
+        meta.insert("tokenizer.chat_template".to_owned(), bonsai_gguf::MetadataValue::from(template));
+
+        let gather = Tensor {
+            name: "token_embd.vocab_gather".to_owned(),
+            dimensions: vec![vocab],
+            kind: 26,
+            data: TensorBytes::Shared(Arc::from([])),
+        };
+        let mut banded_model = Model {
+            identity: crate::model::swift::NARIQ_2_0BPW_SHA256.to_owned(),
+            metadata: meta,
+            tensors: BTreeMap::from([("token_embd.vocab_gather".to_owned(), gather)]),
+        };
+        // Rejects PQ2/PTQ1 when `token_embd.weight` is missing
+        assert!(SwiftChatSession::from_model_representation(&banded_model, Representation::Pq2).is_err());
+        // Rejects add_eos_token = true on NariQ
+        banded_model.metadata.insert("tokenizer.ggml.add_eos_token".to_owned(), bonsai_gguf::MetadataValue::from(true));
+        let _ = SwiftChatSession::from_model_representation(&banded_model, Representation::NariQ2_0Bpw);
+        // Restore false -> fails only on synthetic template SHA mismatch after passing vocab_gather + add_eos check!
+        banded_model.metadata.insert("tokenizer.ggml.add_eos_token".to_owned(), bonsai_gguf::MetadataValue::from(false));
+        let err = SwiftChatSession::from_model_representation(&banded_model, Representation::NariQ2_0Bpw)
+            .err()
+            .ok_or_else(|| crate::invalid("expected synthetic template digest rejection"))?;
+        assert!(err.to_string().contains("template identity mismatch"));
+        Ok(())
     }
 }

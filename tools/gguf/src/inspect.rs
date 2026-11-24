@@ -5,7 +5,7 @@
 )]
 
 use crate::{Metadata, MetadataArray, MetadataValue};
-use crate::{PRISM_DIALECT, Result};
+use crate::{NARIQ_DIALECT, PRISM_DIALECT, Result};
 #[cfg(feature = "report")]
 use bonsai_native_hash::Hasher;
 #[cfg(feature = "report")]
@@ -65,7 +65,7 @@ struct Kind {
     bytes: u64,
 }
 
-const fn kind(id: u32, prism: bool) -> Option<Kind> {
+const fn kind(id: u32, prism: bool, nariq: bool) -> Option<Kind> {
     let (name, block, bytes) = match id {
         0 => ("F32", 1, 4),
         1 => ("F16", 1, 2),
@@ -102,6 +102,12 @@ const fn kind(id: u32, prism: bool) -> Option<Kind> {
         40 => ("NVFP4", 64, 36),
         41 => ("Q1_0", 128, 18),
         42 => ("Q2_0", 64, 18),
+        44 if nariq => ("TRL1", 16, 2),
+        45 if nariq => ("TRL2", 16, 4),
+        46 if nariq => ("TRL3", 16, 6),
+        47 if nariq => ("TRL4", 16, 8),
+        48 if nariq => ("TRL5", 16, 10),
+        49 if nariq => ("TRL6", 16, 12),
         142 if prism => ("PQ2_0", 128, 34),
         143 if prism => ("PTQ1_0", 128, 28),
         _ => return None,
@@ -139,7 +145,7 @@ const fn width(type_id: u32) -> Option<u64> {
 }
 
 pub(crate) const fn stock_tensor_layout(type_id: u32, prism: bool) -> Option<(u64, u64)> {
-    match kind(type_id, prism) {
+    match kind(type_id, prism, false) {
         Some(info) => Some((info.block, info.bytes)),
         None => None,
     }
@@ -575,9 +581,9 @@ fn inspect_with_vocabulary_version(
     memory_limit: Option<usize>,
     legacy_vocabulary: bool,
 ) -> Result<Inspection> {
-    if dialect != "Stock" && dialect != PRISM_DIALECT {
+    if dialect != "Stock" && dialect != PRISM_DIALECT && dialect != NARIQ_DIALECT {
         return Err(bad(
-            "unknown dialect; use Stock or the explicitly pinned Prism dialect.",
+            "unknown dialect; use Stock, Prism, or NariQ dialect.",
         ));
     }
     file.seek(SeekFrom::Start(0))?;
@@ -782,7 +788,7 @@ fn inspect_with_vocabulary_version(
         #[cfg(feature = "report")]
         let type_position = parser.position();
         let type_id = parser.u32()?;
-        let kind = kind(type_id, dialect == PRISM_DIALECT)
+        let kind = kind(type_id, dialect == PRISM_DIALECT, dialect == NARIQ_DIALECT)
             .ok_or_else(|| bad(format!("unknown/unsupported tensor type ID {type_id}.")))?;
         if !first.is_multiple_of(kind.block) {
             return Err(bad(
@@ -865,7 +871,7 @@ fn inspect_with_vocabulary_version(
         }
         let mut histogram = Vec::with_capacity(groups.len());
         for (type_id, (count, bytes, elements)) in groups {
-            let kind = kind(type_id, dialect == PRISM_DIALECT)
+            let kind = kind(type_id, dialect == PRISM_DIALECT, dialect == NARIQ_DIALECT)
                 .ok_or_else(|| bad("unknown tensor kind."))?;
             histogram.push(json!({"TypeId": type_id, "Name": kind.name, "Count": count, "Bytes": bytes, "Elements": elements}));
         }

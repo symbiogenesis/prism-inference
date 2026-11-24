@@ -35,6 +35,8 @@ pub use stream::{
 
 /// The only supported private GGUF tensor dialect.
 pub const PRISM_DIALECT: &str = "Prism-73bfe6cc485554822f80c473a3c0c4f25e80f41b";
+/// `NariQ` trellis-quantized GGUF tensor dialect (`TRL1`–`TRL6`, `I32`).
+pub const NARIQ_DIALECT: &str = "NariQ-trellis-v1";
 /// Immutable Prism codec revision used by the private dialect.
 pub const CODEC_COMMIT: &str = "73bfe6cc485554822f80c473a3c0c4f25e80f41b";
 /// A failed I/O, artifact verification, or bounded format operation.

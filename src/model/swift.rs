@@ -1541,6 +1541,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Checks NariQ identity, limit, metadata, and tensor inventory tables in one cohesive suite."
+    )]
     fn nariq_representations_verify_identities_limits_metadata_and_inventories() -> Result<()> {
         let cases = [
             (

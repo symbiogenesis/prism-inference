@@ -732,6 +732,420 @@ fn folded_verification_guards_observers_and_rolls_back_mid_block_cancellation() 
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Build explicit 4-layer hybrid Qwen35 model with 256-channel full-attention heads for rsq4kvf tests."
+)]
+fn four_layer_hybrid_model(cfg: &HybridConfig, arithmetic: Arithmetic) -> Model {
+    let key_w = cfg.ssm_keys * cfg.ssm_head;
+    let val_w = cfg.ssm_values * cfg.ssm_head;
+    let conv_w = 2 * key_w + val_w;
+    let q_gate_w = cfg.heads * cfg.head * 2;
+    let kv_w = cfg.kv_heads * cfg.head;
+    let attn_out_in = cfg.heads * cfg.head;
+
+    let mut model = hybrid_model_with_identity(cfg, arithmetic);
+    model
+        .metadata
+        .insert("qwen35.block_count".to_owned(), MetadataValue::from(4_u32));
+    model.metadata.insert(
+        "qwen35.full_attention_interval".to_owned(),
+        MetadataValue::from(4_u32),
+    );
+    model.metadata.insert(
+        "qwen35.attention.recurrent_layers".to_owned(),
+        MetadataValue::from(vec![true, true, true, false]),
+    );
+
+    let mut tensors = BTreeMap::new();
+    for common in ["token_embd.weight", "output.weight", "output_norm.weight"] {
+        if let Some(t) = model.tensors.get(common) {
+            tensors.insert(common.to_owned(), t.clone());
+        }
+    }
+    let mut insert = |name: &str, dims: &[usize], vals: Vec<f32>| {
+        tensors.insert(name.to_owned(), f32_tensor(name, dims, &vals));
+    };
+
+    for layer in 0..4_usize {
+        let p = format!("blk.{layer}");
+        let seed_off = layer * 19;
+        insert(
+            &format!("{p}.attn_norm.weight"),
+            &[cfg.embedding],
+            vec![1.0; cfg.embedding],
+        );
+        insert(
+            &format!("{p}.post_attention_norm.weight"),
+            &[cfg.embedding],
+            vec![1.0; cfg.embedding],
+        );
+        insert(
+            &format!("{p}.ffn_up.weight"),
+            &[cfg.embedding, cfg.ffn],
+            pattern(cfg.embedding * cfg.ffn, 9 + seed_off, 0.25),
+        );
+        insert(
+            &format!("{p}.ffn_gate.weight"),
+            &[cfg.embedding, cfg.ffn],
+            pattern(cfg.embedding * cfg.ffn, 10 + seed_off, 0.25),
+        );
+        insert(
+            &format!("{p}.ffn_down.weight"),
+            &[cfg.ffn, cfg.embedding],
+            pattern(cfg.ffn * cfg.embedding, 11 + seed_off, 0.25),
+        );
+        if layer < 3 {
+            insert(
+                &format!("{p}.attn_qkv.weight"),
+                &[cfg.embedding, conv_w],
+                pattern(cfg.embedding * conv_w, 3 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.attn_gate.weight"),
+                &[cfg.embedding, val_w],
+                pattern(cfg.embedding * val_w, 4 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.ssm_conv1d.weight"),
+                &[cfg.conv, conv_w],
+                pattern(cfg.conv * conv_w, 5 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.ssm_dt.bias"),
+                &[cfg.ssm_values],
+                vec![0.125; cfg.ssm_values],
+            );
+            insert(
+                &format!("{p}.ssm_a"),
+                &[cfg.ssm_values],
+                vec![-0.25; cfg.ssm_values],
+            );
+            insert(
+                &format!("{p}.ssm_beta.weight"),
+                &[cfg.embedding, cfg.ssm_values],
+                pattern(cfg.embedding * cfg.ssm_values, 6 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.ssm_alpha.weight"),
+                &[cfg.embedding, cfg.ssm_values],
+                pattern(cfg.embedding * cfg.ssm_values, 7 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.ssm_norm.weight"),
+                &[cfg.ssm_head],
+                vec![1.0; cfg.ssm_head],
+            );
+            insert(
+                &format!("{p}.ssm_out.weight"),
+                &[val_w, cfg.embedding],
+                pattern(val_w * cfg.embedding, 8 + seed_off, 0.25),
+            );
+        } else {
+            insert(
+                &format!("{p}.attn_q.weight"),
+                &[cfg.embedding, q_gate_w],
+                pattern(cfg.embedding * q_gate_w, 12 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.attn_k.weight"),
+                &[cfg.embedding, kv_w],
+                pattern(cfg.embedding * kv_w, 13 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.attn_v.weight"),
+                &[cfg.embedding, kv_w],
+                pattern(cfg.embedding * kv_w, 14 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.attn_output.weight"),
+                &[attn_out_in, cfg.embedding],
+                pattern(attn_out_in * cfg.embedding, 15 + seed_off, 0.25),
+            );
+            insert(
+                &format!("{p}.attn_q_norm.weight"),
+                &[cfg.head],
+                vec![1.0; cfg.head],
+            );
+            insert(
+                &format!("{p}.attn_k_norm.weight"),
+                &[cfg.head],
+                vec![1.0; cfg.head],
+            );
+        }
+    }
+    model.tensors = tensors;
+    model
+}
+
+fn build_folded_rank_one_adapter(model: &Model, cfg: &HybridConfig) -> Result<RankOneAdapter> {
+    let val_w = cfg.ssm_values * cfg.ssm_head;
+    let attn_out_in = cfg.heads * cfg.head;
+    let mut r1_tensors = BTreeMap::new();
+    for (idx, (target, in_f, out_f)) in [
+        ("blk.0.ffn_down.weight", cfg.ffn, cfg.embedding),
+        ("blk.0.ssm_out.weight", val_w, cfg.embedding),
+        ("blk.1.ffn_down.weight", cfg.ffn, cfg.embedding),
+        ("blk.2.ssm_out.weight", val_w, cfg.embedding),
+        ("blk.3.ffn_down.weight", cfg.ffn, cfg.embedding),
+        ("blk.3.attn_output.weight", attn_out_in, cfg.embedding),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        r1_tensors.insert(
+            format!("{target}.lora_a"),
+            f32_tensor(
+                &format!("{target}.lora_a"),
+                &[in_f, 1],
+                &pattern(in_f, 21 + idx, 0.125),
+            ),
+        );
+        r1_tensors.insert(
+            format!("{target}.lora_b"),
+            f32_tensor(
+                &format!("{target}.lora_b"),
+                &[1, out_f],
+                &pattern(out_f, 29 + idx, 0.125),
+            ),
+        );
+    }
+    RankOneAdapter::from_model(
+        Model {
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_owned(),
+                    MetadataValue::from("qwen35"),
+                ),
+                ("general.type".to_owned(), MetadataValue::from("adapter")),
+                ("adapter.type".into(), MetadataValue::from("lora")),
+                (
+                    "adapter.lora_alpha".to_owned(),
+                    MetadataValue::from(1.0_f32),
+                ),
+            ]),
+            tensors: r1_tensors,
+            identity: "r1-folded-heterogeneous".to_owned(),
+        },
+        model,
+    )
+}
+
+fn build_sparse_heterogeneous_folded_adapters(
+    model: &Model,
+    cfg: &HybridConfig,
+) -> Result<(RankOneAdapter, MultiRankAdapter)> {
+    let r1 = build_folded_rank_one_adapter(model, cfg)?;
+    let val_w = cfg.ssm_values * cfg.ssm_head;
+    let conv_w = 2 * cfg.ssm_keys * cfg.ssm_head + val_w;
+    let q_gate_w = cfg.heads * cfg.head * 2;
+    let kv_w = cfg.kv_heads * cfg.head;
+    let attn_out_in = cfg.heads * cfg.head;
+
+    let mut mr_tensors = BTreeMap::new();
+    // blk.1.ffn_down.weight omitted intentionally; ranks vary across sites (2, 3, 4).
+    for (idx, (target, in_f, out_f, rank)) in [
+        ("blk.0.ffn_down.weight", cfg.ffn, cfg.embedding, 2_usize),
+        ("blk.2.attn_qkv.weight", cfg.embedding, conv_w, 3),
+        ("blk.3.ffn_down.weight", cfg.ffn, cfg.embedding, 4),
+        ("blk.3.attn_q.weight", cfg.embedding, q_gate_w, 4),
+        ("blk.3.attn_k.weight", cfg.embedding, kv_w, 4),
+        ("blk.3.attn_v.weight", cfg.embedding, kv_w, 4),
+        ("blk.3.attn_output.weight", attn_out_in, cfg.embedding, 4),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        mr_tensors.insert(
+            format!("{target}.lora_a"),
+            f32_tensor(
+                &format!("{target}.lora_a"),
+                &[in_f, rank],
+                &pattern(in_f * rank, 41 + idx, 0.125),
+            ),
+        );
+        mr_tensors.insert(
+            format!("{target}.lora_b"),
+            f32_tensor(
+                &format!("{target}.lora_b"),
+                &[rank, out_f],
+                &pattern(rank * out_f, 53 + idx, 0.125),
+            ),
+        );
+    }
+    let mr = MultiRankAdapter::from_model(
+        model,
+        &Model {
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_owned(),
+                    MetadataValue::from("qwen35"),
+                ),
+                ("general.type".to_owned(), MetadataValue::from("adapter")),
+                ("adapter.type".to_owned(), MetadataValue::from("lora")),
+                (
+                    "adapter.lora.alpha".to_owned(),
+                    MetadataValue::from(4.0_f32),
+                ),
+                (
+                    "adapter.lora_alpha".to_owned(),
+                    MetadataValue::from(4.0_f32),
+                ),
+            ]),
+            tensors: mr_tensors,
+            identity: "mr-folded-heterogeneous".to_owned(),
+        },
+        MultiRankPolicy::NpuFriendly,
+    )?;
+    assert_eq!(mr.max_rank(), 4);
+    assert!(!mr.has_target("blk.1.ffn_down.weight"));
+    Ok((r1, mr))
+}
+
+fn configure_four_layer_folded(
+    cfg: &HybridConfig,
+    arithmetic: Arithmetic,
+    workers: usize,
+    mr_scale: Option<f32>,
+) -> Result<Qwen35> {
+    let model = four_layer_hybrid_model(cfg, arithmetic);
+    let (r1, mr) = build_sparse_heterogeneous_folded_adapters(&model, cfg)?;
+    let mut decoder = Qwen35::with_adapters_and_kv(
+        model,
+        cfg.context,
+        64 * 1024 * 1024,
+        MatvecBackend::Scalar,
+        Some((r1, 1.3)),
+        mr_scale.map(|scale| (mr, scale)),
+        KvCachePolicy::Rotated4FittedKv,
+    )?;
+    let prefill_scratch = decoder.tiled_prefill_scratch_bytes(8)?;
+    let parallelism = RowParallelism::new(workers)?;
+    decoder = decoder.with_tiled_prefill(8, prefill_scratch)?;
+    if let Some(tile) = decoder.tiled_prefill.as_mut() {
+        tile.set_row_parallelism(parallelism);
+    }
+    let verify_scratch = decoder.tiled_verification_scratch_bytes()?;
+    decoder.with_tiled_verification(verify_scratch)
+}
+
+fn verify_folded_heterogeneous_zero_scale(
+    cfg: &HybridConfig,
+    arithmetic: Arithmetic,
+    workers: usize,
+) -> Result<Vec<f32>> {
+    let mut orca_seq = configure_four_layer_folded(cfg, arithmetic, workers, None)?;
+    let mut zero_seq = configure_four_layer_folded(cfg, arithmetic, workers, Some(0.0))?;
+    let mut zero_folded = configure_four_layer_folded(cfg, arithmetic, workers, Some(0.0))?;
+
+    let orca_l0 = orca_seq.evaluate(0)?;
+    let zero_l0 = zero_seq.evaluate(0)?;
+    assert_logits_bit_eq(&zero_l0, &orca_l0, "rsq4kvf scale=0.0 init vs Orca-only");
+    let mut zf_l0 = Vec::new();
+    zero_folded.evaluate_into(0, &mut zf_l0)?;
+    assert_logits_bit_eq(
+        &zf_l0,
+        &orca_l0,
+        "rsq4kvf scale=0.0 folded init vs Orca-only",
+    );
+
+    let mut rows = Vec::new();
+    zero_folded.evaluate_verification_block_folded(&[], &[1, 2, 3, 4], &mut rows, &|| Ok(()))?;
+    let orca_l1 = orca_seq.evaluate(1)?;
+    let orca_l2 = orca_seq.evaluate(2)?;
+    assert_logits_bit_eq(&rows[0], &orca_l1, "rsq4kvf scale=0.0 round1 tok 1");
+    assert_logits_bit_eq(&rows[1], &orca_l2, "rsq4kvf scale=0.0 round1 tok 2");
+    zero_folded.commit_folded_verification(2)?;
+    zero_folded.evaluate_verification_block_folded(&[1, 2], &[5, 0, 1], &mut rows, &|| Ok(()))?;
+    let orca_l5 = orca_seq.evaluate(5)?;
+    assert_logits_bit_eq(&rows[0], &orca_l5, "rsq4kvf scale=0.0 round2 tok 5");
+    zero_folded.commit_folded_verification(1)?;
+    zero_folded.flush_folded_verification(&|| Ok(()))?;
+    assert_full_state_bit_eq(&orca_seq, &zero_folded)?;
+    Ok(orca_l0)
+}
+
+#[test]
+fn folded_speculative_verification_with_stacked_orca_sparse_heterogeneous_multi_rank_and_rsq4kvf()
+-> Result<()> {
+    let cfg = HybridConfig::pinned_swift_aligned();
+    #[allow(
+        unused_mut,
+        reason = "Parallel-rows worker cases are appended only when the parallel-rows feature is enabled."
+    )]
+    let mut workers_list = vec![1_usize];
+    #[cfg(feature = "parallel-rows")]
+    workers_list.push(2);
+
+    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+        for &workers in &workers_list {
+            let orca_l0 = verify_folded_heterogeneous_zero_scale(&cfg, arithmetic, workers)?;
+
+            // Scale 1.0: bit-exact parity between folded speculative verification and eager single-token decode.
+            let mut rows = Vec::new();
+            let mut seq = configure_four_layer_folded(&cfg, arithmetic, workers, Some(1.0))?;
+            let mut folded = configure_four_layer_folded(&cfg, arithmetic, workers, Some(1.0))?;
+            let seq_l0 = seq.evaluate(0)?;
+            assert_ne!(
+                seq_l0.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                orca_l0
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            );
+            let mut fold_l0 = Vec::new();
+            folded.evaluate_into(0, &mut fold_l0)?;
+            assert_logits_bit_eq(&fold_l0, &seq_l0, "rsq4kvf scale=1.0 init");
+
+            folded.evaluate_verification_block_folded(&[], &[1, 2, 3, 4], &mut rows, &|| Ok(()))?;
+            let s1 = seq.evaluate(1)?;
+            let s2 = seq.evaluate(2)?;
+            assert_logits_bit_eq(&rows[0], &s1, "rsq4kvf scale=1.0 round1 tok 1");
+            assert_logits_bit_eq(&rows[1], &s2, "rsq4kvf scale=1.0 round1 tok 2");
+            folded.commit_folded_verification(2)?;
+
+            folded.evaluate_verification_block_folded(
+                &[1, 2],
+                &[5, 0, 1],
+                &mut rows,
+                &|| Ok(()),
+            )?;
+            let s5 = seq.evaluate(5)?;
+            let s0 = seq.evaluate(0)?;
+            let s1b = seq.evaluate(1)?;
+            assert_logits_bit_eq(&rows[0], &s5, "rsq4kvf scale=1.0 round2 tok 5");
+            assert_logits_bit_eq(&rows[1], &s0, "rsq4kvf scale=1.0 round2 tok 0");
+            assert_logits_bit_eq(&rows[2], &s1b, "rsq4kvf scale=1.0 round2 tok 1");
+            folded.commit_folded_verification(3)?;
+
+            folded.evaluate_verification_block_folded(
+                &[5, 0, 1],
+                &[2, 3],
+                &mut rows,
+                &|| Ok(()),
+            )?;
+            folded.commit_folded_verification(0)?;
+            assert!(!folded.has_pending_folded_verification());
+            assert_full_state_bit_eq(&seq, &folded)?;
+
+            folded.evaluate_verification_block_folded(&[], &[4, 5], &mut rows, &|| Ok(()))?;
+            let s4 = seq.evaluate(4)?;
+            assert_logits_bit_eq(&rows[0], &s4, "rsq4kvf scale=1.0 round4 tok 4");
+            folded.commit_folded_verification(1)?;
+            folded.flush_folded_verification(&|| Ok(()))?;
+            assert_full_state_bit_eq(&seq, &folded)?;
+
+            let tail_seq = seq.evaluate(2)?;
+            let mut tail_folded = Vec::new();
+            folded.evaluate_into(2, &mut tail_folded)?;
+            assert_logits_bit_eq(&tail_folded, &tail_seq, "rsq4kvf scale=1.0 tail");
+            assert_full_state_bit_eq(&seq, &folded)?;
+        }
+    }
+    Ok(())
+}
+
 fn pq2_mixed_hybrid_model(cfg: &HybridConfig) -> Model {
     let mut model = hybrid_model(cfg);
     for (idx, (name, tensor)) in model.tensors.iter_mut().enumerate() {

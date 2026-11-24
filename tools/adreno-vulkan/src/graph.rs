@@ -4894,19 +4894,44 @@ fn upload_arena_words(
     Ok(span)
 }
 
+struct PreparedRankOneEmbed {
+    a_values: Vec<f32>,
+    b_words: Vec<u32>,
+    alpha: f32,
+}
+
+struct PreparedLinearLoraFactor {
+    a_words: Vec<u32>,
+    b_words: Vec<u32>,
+    in_features: usize,
+    out_features: usize,
+    rank: usize,
+    scaling: f32,
+}
+
+#[derive(Default)]
+struct PreparedAdapters {
+    rank_one_linear: BTreeMap<String, PreparedLinearLoraFactor>,
+    rank_one_embed: Option<PreparedRankOneEmbed>,
+    multi_rank_linear: BTreeMap<String, PreparedLinearLoraFactor>,
+    max_rank: usize,
+    content_sha256: String,
+    rank_one_scale: Option<f32>,
+    multi_rank_scale: Option<f32>,
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "Validates RankOneAdapter and MultiRankAdapter contracts, uploads factors to GPU WeightArena, and hashes deterministic adapter provenance."
+    reason = "Validates RankOneAdapter and MultiRankAdapter contracts, preserves per-site heterogeneous ranks, and hashes deterministic adapter provenance."
 )]
-fn parse_and_upload_adapters(
+fn prepare_adapters_upload(
     base_model: &Model,
     geometry: &GraphGeometry,
     recurrent_flags: &[bool],
     has_separate_output: bool,
     adapters: VulkanBatchedAdapters<'_>,
-    guard: &mut BufferCleanupGuard<'_>,
-) -> Result<UploadedAdapters, Error> {
-    let mut uploaded = UploadedAdapters::default();
+) -> Result<PreparedAdapters, Error> {
+    let mut prepared = PreparedAdapters::default();
     let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
     hash_bytes(&mut hasher, b"vk-batched-adapters-v1:")?;
 
@@ -4963,30 +4988,27 @@ fn parse_and_upload_adapters(
                         "rank-one embedding adapter shape mismatch".to_owned(),
                     ));
                 }
-                let b_span = upload_arena_words(&b_words, guard)?;
-                uploaded.rank_one_embed = Some(GpuRankOneEmbed {
+                prepared.rank_one_embed = Some(PreparedRankOneEmbed {
                     a_values,
-                    b_span,
+                    b_words,
                     alpha,
                 });
             } else {
-                let a_span = upload_arena_words(&a_words, guard)?;
-                let b_span = upload_arena_words(&b_words, guard)?;
-                uploaded.rank_one_linear.insert(
+                prepared.rank_one_linear.insert(
                     target.to_owned(),
-                    GpuLoraFactor {
-                        a_span,
-                        b_span,
+                    PreparedLinearLoraFactor {
+                        a_words,
+                        b_words,
                         in_features: *in_features,
                         out_features: *out_features,
                         rank: 1,
                         scaling: alpha,
                     },
                 );
-                uploaded.max_rank = uploaded.max_rank.max(1);
+                prepared.max_rank = prepared.max_rank.max(1);
             }
         }
-        uploaded.rank_one_scale = Some(spec.scale);
+        prepared.rank_one_scale = Some(spec.scale);
     } else {
         hash_bytes(&mut hasher, b"r1-none")?;
     }
@@ -5055,22 +5077,20 @@ fn parse_and_upload_adapters(
             for &w in &b_words {
                 hash_u32(&mut hasher, w)?;
             }
-            let a_span = upload_arena_words(&a_words, guard)?;
-            let b_span = upload_arena_words(&b_words, guard)?;
-            uploaded.multi_rank_linear.insert(
+            prepared.multi_rank_linear.insert(
                 target.to_owned(),
-                GpuLoraFactor {
-                    a_span,
-                    b_span,
+                PreparedLinearLoraFactor {
+                    a_words,
+                    b_words,
                     in_features: *in_features,
                     out_features: *out_features,
                     rank: *rank,
                     scaling,
                 },
             );
-            uploaded.max_rank = uploaded.max_rank.max(*rank);
+            prepared.max_rank = prepared.max_rank.max(*rank);
         }
-        uploaded.multi_rank_scale = Some(mr_scale);
+        prepared.multi_rank_scale = Some(mr_scale);
     } else {
         hash_bytes(&mut hasher, b"mr-none")?;
     }
@@ -5078,7 +5098,70 @@ fn parse_and_upload_adapters(
     let digest = hasher
         .finish()
         .map_err(|err| Error::InvalidInput(err.to_string()))?;
-    uploaded.content_sha256 = hex::encode(digest);
+    prepared.content_sha256 = hex::encode(digest);
+    Ok(prepared)
+}
+
+fn parse_and_upload_adapters(
+    base_model: &Model,
+    geometry: &GraphGeometry,
+    recurrent_flags: &[bool],
+    has_separate_output: bool,
+    adapters: VulkanBatchedAdapters<'_>,
+    guard: &mut BufferCleanupGuard<'_>,
+) -> Result<UploadedAdapters, Error> {
+    let prepared = prepare_adapters_upload(
+        base_model,
+        geometry,
+        recurrent_flags,
+        has_separate_output,
+        adapters,
+    )?;
+    let mut uploaded = UploadedAdapters {
+        max_rank: prepared.max_rank,
+        content_sha256: prepared.content_sha256,
+        rank_one_scale: prepared.rank_one_scale,
+        multi_rank_scale: prepared.multi_rank_scale,
+        ..UploadedAdapters::default()
+    };
+    if let Some(embed) = prepared.rank_one_embed {
+        let b_span = upload_arena_words(&embed.b_words, guard)?;
+        uploaded.rank_one_embed = Some(GpuRankOneEmbed {
+            a_values: embed.a_values,
+            b_span,
+            alpha: embed.alpha,
+        });
+    }
+    for (target, factor) in prepared.rank_one_linear {
+        let a_span = upload_arena_words(&factor.a_words, guard)?;
+        let b_span = upload_arena_words(&factor.b_words, guard)?;
+        uploaded.rank_one_linear.insert(
+            target,
+            GpuLoraFactor {
+                a_span,
+                b_span,
+                in_features: factor.in_features,
+                out_features: factor.out_features,
+                rank: factor.rank,
+                scaling: factor.scaling,
+            },
+        );
+    }
+    for (target, factor) in prepared.multi_rank_linear {
+        let a_span = upload_arena_words(&factor.a_words, guard)?;
+        let b_span = upload_arena_words(&factor.b_words, guard)?;
+        uploaded.multi_rank_linear.insert(
+            target,
+            GpuLoraFactor {
+                a_span,
+                b_span,
+                in_features: factor.in_features,
+                out_features: factor.out_features,
+                rank: factor.rank,
+                scaling: factor.scaling,
+            },
+        );
+    }
     Ok(uploaded)
 }
 
@@ -6037,6 +6120,266 @@ mod tests {
         let shrunk = plan_tile_scratch(&geometry, 8, 16, min_needed, u32::MAX, wg)?;
         assert_eq!(shrunk.allocated_tile_tokens, 1);
         assert!(plan_tile_scratch(&geometry, 8, 16, min_needed - 1, u32::MAX, wg).is_err());
+        Ok(())
+    }
+
+    fn test_heterogeneous_f32_tensor(name: &str, dims: &[usize], val: f32) -> Tensor {
+        let count: usize = dims.iter().product();
+        let bytes: Vec<u8> = vec![val; count]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        Tensor {
+            name: name.to_owned(),
+            dimensions: dims.to_vec(),
+            kind: 0,
+            data: std::sync::Arc::<[u8]>::from(bytes).into(),
+        }
+    }
+
+    fn test_heterogeneous_f16_tensor(name: &str, dims: &[usize]) -> Tensor {
+        let count: usize = dims.iter().product();
+        let mut bytes = Vec::with_capacity(count * 2);
+        for i in 0..count {
+            let half: u16 = if i % 2 == 0 { 0x3000 } else { 0xb000 };
+            bytes.extend_from_slice(&half.to_le_bytes());
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: dims.to_vec(),
+            kind: 1,
+            data: std::sync::Arc::<[u8]>::from(bytes).into(),
+        }
+    }
+
+    fn test_heterogeneous_base_model(geometry: &GraphGeometry) -> Model {
+        let mut base_tensors = BTreeMap::new();
+        for layer in 0..4_usize {
+            base_tensors.insert(
+                format!("blk.{layer}.ffn_down.weight"),
+                test_heterogeneous_f32_tensor(
+                    &format!("blk.{layer}.ffn_down.weight"),
+                    &[geometry.feed_forward, geometry.embedding],
+                    0.125,
+                ),
+            );
+            if layer < 3 {
+                base_tensors.insert(
+                    format!("blk.{layer}.attn_qkv.weight"),
+                    test_heterogeneous_f32_tensor(
+                        &format!("blk.{layer}.attn_qkv.weight"),
+                        &[geometry.embedding, geometry.convolution_width()],
+                        0.125,
+                    ),
+                );
+            } else {
+                for (suffix, in_f, out_f) in [
+                    ("attn_q.weight", geometry.embedding, 2 * geometry.q_width()),
+                    ("attn_k.weight", geometry.embedding, geometry.kv_width()),
+                    ("attn_v.weight", geometry.embedding, geometry.kv_width()),
+                    ("attn_output.weight", geometry.q_width(), geometry.embedding),
+                ] {
+                    let name = format!("blk.{layer}.{suffix}");
+                    base_tensors.insert(
+                        name.clone(),
+                        test_heterogeneous_f32_tensor(&name, &[in_f, out_f], 0.125),
+                    );
+                }
+            }
+        }
+        Model {
+            metadata: BTreeMap::from([(
+                "general.architecture".to_owned(),
+                bonsai_gguf::MetadataValue::from("qwen35"),
+            )]),
+            tensors: base_tensors,
+            identity: "vk-heterogeneous-mr-base".to_owned(),
+        }
+    }
+
+    fn test_heterogeneous_r1_adapter() -> Model {
+        use bonsai_gguf::MetadataValue;
+
+        Model {
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_owned(),
+                    MetadataValue::from("qwen35"),
+                ),
+                ("general.type".to_owned(), MetadataValue::from("adapter")),
+                ("adapter.type".to_owned(), MetadataValue::from("lora")),
+                (
+                    "adapter.lora_alpha".to_owned(),
+                    MetadataValue::from(1.0_f32),
+                ),
+            ]),
+            tensors: BTreeMap::from([
+                (
+                    "blk.0.ffn_down.weight.lora_a".to_owned(),
+                    test_heterogeneous_f32_tensor("blk.0.ffn_down.weight.lora_a", &[32, 1], 0.25),
+                ),
+                (
+                    "blk.0.ffn_down.weight.lora_b".to_owned(),
+                    test_heterogeneous_f32_tensor("blk.0.ffn_down.weight.lora_b", &[1, 16], 0.5),
+                ),
+                (
+                    "blk.1.ffn_down.weight.lora_a".to_owned(),
+                    test_heterogeneous_f32_tensor("blk.1.ffn_down.weight.lora_a", &[32, 1], 0.25),
+                ),
+                (
+                    "blk.1.ffn_down.weight.lora_b".to_owned(),
+                    test_heterogeneous_f32_tensor("blk.1.ffn_down.weight.lora_b", &[1, 16], 0.5),
+                ),
+            ]),
+            identity: "vk-r1-id".to_owned(),
+        }
+    }
+
+    fn test_heterogeneous_mr_adapter(blk3_rank: usize) -> Model {
+        use bonsai_gguf::MetadataValue;
+
+        let mut tensors = BTreeMap::new();
+        let specs = [
+            ("blk.0.ffn_down.weight", 32, 16, 2),
+            // blk.1.ffn_down.weight intentionally omitted!
+            ("blk.2.attn_qkv.weight", 16, 32, 3),
+            ("blk.3.ffn_down.weight", 32, 16, blk3_rank),
+            ("blk.3.attn_q.weight", 16, 64, 4),
+            ("blk.3.attn_k.weight", 16, 16, 4),
+            ("blk.3.attn_v.weight", 16, 16, 4),
+            ("blk.3.attn_output.weight", 32, 16, 4),
+        ];
+        for (target, in_f, out_f, rank) in specs {
+            tensors.insert(
+                format!("{target}.lora_a"),
+                test_heterogeneous_f16_tensor(&format!("{target}.lora_a"), &[in_f, rank]),
+            );
+            tensors.insert(
+                format!("{target}.lora_b"),
+                test_heterogeneous_f16_tensor(&format!("{target}.lora_b"), &[rank, out_f]),
+            );
+        }
+        Model {
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_owned(),
+                    MetadataValue::from("qwen35"),
+                ),
+                ("general.type".to_owned(), MetadataValue::from("adapter")),
+                ("adapter.type".to_owned(), MetadataValue::from("lora")),
+                (
+                    "adapter.lora.alpha".to_owned(),
+                    MetadataValue::from(6.0_f32),
+                ),
+                (
+                    "adapter.lora_alpha".to_owned(),
+                    MetadataValue::from(6.0_f32),
+                ),
+            ]),
+            tensors,
+            identity: "vk-mr-heterogeneous".to_owned(),
+        }
+    }
+
+    #[test]
+    fn sparse_heterogeneous_multi_rank_adapter_prepares_per_site_ranks_and_scratch_layout()
+    -> Result<(), Error> {
+        let geometry = GraphGeometry {
+            embedding: 16,
+            feed_forward: 32,
+            vocabulary: 8,
+            heads: 2,
+            kv_heads: 1,
+            head: 16,
+            rope: 8,
+            rope_sections: [4, 0, 0, 0],
+            rope_base: 10_000.0,
+            epsilon: 1e-6,
+            ssm_head: 8,
+            ssm_keys: 1,
+            ssm_values: 2,
+            convolution: 2,
+            context_limit: 32,
+        };
+        let base_model = test_heterogeneous_base_model(&geometry);
+        let r1_model = test_heterogeneous_r1_adapter();
+        let mr_model = test_heterogeneous_mr_adapter(6);
+        let recurrent_flags = [true, true, true, false];
+        let prepare = |mr: &Model| {
+            prepare_adapters_upload(
+                &base_model,
+                &geometry,
+                &recurrent_flags,
+                true,
+                VulkanBatchedAdapters {
+                    rank_one: Some(VulkanRankOneAdapterSpec {
+                        adapter: &r1_model,
+                        scale: 1.3,
+                    }),
+                    multi_rank: Some(VulkanMultiRankAdapterSpec {
+                        adapter: mr,
+                        policy: MultiRankPolicy::NpuFriendly,
+                        scale: 0.5,
+                    }),
+                },
+            )
+        };
+        let prepared = prepare(&mr_model)?;
+        assert_eq!(prepared.max_rank, 6);
+        assert_eq!(prepared.rank_one_linear.len(), 2);
+        assert_eq!(prepared.multi_rank_linear.len(), 7);
+        assert!(
+            !prepared
+                .multi_rank_linear
+                .contains_key("blk.1.ffn_down.weight")
+        );
+
+        for (name, exp_rank, exp_scaling, exp_a, exp_b) in [
+            ("blk.0.ffn_down.weight", 2_usize, 3.0_f32, 32 * 2, 2 * 16),
+            ("blk.2.attn_qkv.weight", 3, 2.0, 16 * 3, 3 * 32),
+            ("blk.3.ffn_down.weight", 6, 1.0, 32 * 6, 6 * 16),
+            ("blk.3.attn_q.weight", 4, 1.5, 16 * 4, 4 * 64),
+        ] {
+            let factor = &prepared.multi_rank_linear[name];
+            assert_eq!(factor.rank, exp_rank);
+            assert_eq!(factor.scaling.to_bits(), exp_scaling.to_bits());
+            assert_eq!(factor.a_words.len(), exp_a);
+            assert_eq!(factor.b_words.len(), exp_b);
+        }
+
+        let plan_small = plan_tile_scratch(
+            &geometry,
+            prepared.max_rank,
+            16,
+            64 * 1024 * 1024,
+            u32::MAX,
+            [65_535, 65_535, 65_535],
+        )?;
+        assert_eq!(plan_small.sizes[16], MIN_SCRATCH_BYTES);
+        let plan_large = plan_tile_scratch(
+            &geometry,
+            prepared.max_rank,
+            256,
+            64 * 1024 * 1024,
+            u32::MAX,
+            [65_535, 65_535, 65_535],
+        )?;
+        assert_eq!(plan_large.allocated_tile_tokens, 256);
+        assert_eq!(plan_large.sizes[16], 256 * 6 * 4);
+
+        let mr_alt = test_heterogeneous_mr_adapter(4);
+        let prepared_alt = prepare(&mr_alt)?;
+        assert_eq!(prepared_alt.max_rank, 4);
+        assert_ne!(prepared.content_sha256, prepared_alt.content_sha256);
+        let plan_alt = plan_tile_scratch(
+            &geometry,
+            prepared_alt.max_rank,
+            256,
+            64 * 1024 * 1024,
+            u32::MAX,
+            [65_535, 65_535, 65_535],
+        )?;
+        assert_eq!(plan_alt.sizes[16], (256 * 4 * 4).max(MIN_SCRATCH_BYTES));
         Ok(())
     }
 }

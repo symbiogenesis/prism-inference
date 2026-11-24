@@ -982,6 +982,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Exercises NariQ banded vocab_gather chat initialization and add_eos handling."
+    )]
     fn nariq_chat_accepts_banded_vocab_gather_and_explicit_false_add_eos() -> crate::Result<()> {
         use super::{Representation, SwiftChatSession};
         use crate::model::{Model, Tensor, TensorBytes};

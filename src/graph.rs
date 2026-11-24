@@ -10579,19 +10579,65 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    fn trellis_test_prng_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            out.push(u8::try_from((s >> 24) & 0xff).unwrap_or(0));
+        }
+        out
+    }
+
+    fn trellis_test_f32_tensor(name: &str, dims: Vec<usize>, values: &[f32]) -> Tensor {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for &v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: dims,
+            kind: 0,
+            data: crate::model::TensorBytes::Shared(Arc::from(bytes)),
+        }
+    }
+
+    fn trellis_test_f16_tensor(name: &str, len: usize) -> Tensor {
+        let mut bytes = Vec::with_capacity(len * 2);
+        for i in 0..len {
+            let bits: u16 = if i % 2 == 0 { 0x3800 } else { 0x2c00 };
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: vec![len],
+            kind: 1,
+            data: crate::model::TensorBytes::Shared(Arc::from(bytes)),
+        }
+    }
+
+    fn trellis_test_i32_tensor(name: &str, values: &[i32]) -> Tensor {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for &v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: vec![values.len()],
+            kind: crate::kernels::I32,
+            data: crate::model::TensorBytes::Shared(Arc::from(bytes)),
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
-        reason = "End-to-end 4-layer trellis graph test covers decode, prefill, rollback, banded/unbanded heads, and stacked MultiRankAdapter."
+        reason = "Builds matching 4-layer trellis and dequantized F32 Qwen35 test models with banded/unbanded heads."
     )]
-    fn qwen35_four_layer_trellis_graph_matches_dequantized_f32_with_rotated4_prefill_and_daisyrose()
-    -> Result<()> {
-        use crate::Decoder as _;
+    fn build_four_layer_trellis_test_models(
+        banded_embed: bool,
+    ) -> Result<(super::Model, super::Model)> {
         use crate::kernels::trellis::{TrellisDesc, TrellisWeight, tests::dequantize_reference};
-        use crate::model::{
-            Model, TensorBytes,
-            lora::{MultiRankAdapter, MultiRankPolicy},
-        };
+        use crate::model::Model;
         use bonsai_gguf::{Metadata, MetadataArray, MetadataValue};
 
         let emb = 32_usize;
@@ -10606,53 +10652,6 @@ mod tests {
         let conv_kernel = 4_usize;
         let conv_width = ssm_inner + 2 * ssm_groups * ssm_head_dim; // 64
         let vocab = 64_usize;
-
-        let prng_bytes = |len: usize, seed: u64| -> Vec<u8> {
-            let mut s = seed | 1;
-            let mut out = Vec::with_capacity(len);
-            for _ in 0..len {
-                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                out.push(u8::try_from((s >> 24) & 0xff).unwrap_or(0));
-            }
-            out
-        };
-        let f32_tensor = |name: &str, dims: Vec<usize>, values: &[f32]| -> Tensor {
-            let mut bytes = Vec::with_capacity(values.len() * 4);
-            for &v in values {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            Tensor {
-                name: name.to_owned(),
-                dimensions: dims,
-                kind: 0,
-                data: TensorBytes::Shared(Arc::from(bytes)),
-            }
-        };
-        let f16_tensor = |name: &str, len: usize| -> Tensor {
-            let mut bytes = Vec::with_capacity(len * 2);
-            for i in 0..len {
-                let bits: u16 = if i % 2 == 0 { 0x3800 } else { 0x2c00 }; // 0.5 / 0.0625
-                bytes.extend_from_slice(&bits.to_le_bytes());
-            }
-            Tensor {
-                name: name.to_owned(),
-                dimensions: vec![len],
-                kind: 1,
-                data: TensorBytes::Shared(Arc::from(bytes)),
-            }
-        };
-        let i32_tensor = |name: &str, values: &[i32]| -> Tensor {
-            let mut bytes = Vec::with_capacity(values.len() * 4);
-            for &v in values {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            Tensor {
-                name: name.to_owned(),
-                dimensions: vec![values.len()],
-                kind: crate::kernels::I32,
-                data: TensorBytes::Shared(Arc::from(bytes)),
-            }
-        };
 
         let add_coded_matrix = |tensors: &mut BTreeMap<String, Tensor>,
                                 metadata: &mut Metadata,
@@ -10672,17 +10671,21 @@ mod tests {
                 name: weight_name.clone(),
                 dimensions: vec![k, n],
                 kind: u32::try_from(43 + bits)?,
-                data: TensorBytes::Shared(Arc::from(prng_bytes(byte_len, seed))),
+                data: crate::model::TensorBytes::Shared(Arc::from(trellis_test_prng_bytes(
+                    byte_len, seed,
+                ))),
             };
-            let s16_tensor = f16_tensor(&format!("{stem}.trellis_s16"), k / 16);
+            let s16_tensor = trellis_test_f16_tensor(&format!("{stem}.trellis_s16"), k / 16);
             let pre_vals: Vec<f32> = (0..k)
                 .map(|i| if i % 3 == 0 { 0.0625 } else { -0.03125 })
                 .collect();
             let post_vals: Vec<f32> = (0..n)
                 .map(|i| if i % 2 == 0 { 0.0625 } else { -0.03125 })
                 .collect();
-            let pre_tensor = f32_tensor(&format!("{stem}.trellis_pre"), vec![k], &pre_vals);
-            let post_tensor = f32_tensor(&format!("{stem}.trellis_post"), vec![n], &post_vals);
+            let pre_tensor =
+                trellis_test_f32_tensor(&format!("{stem}.trellis_pre"), vec![k], &pre_vals);
+            let post_tensor =
+                trellis_test_f32_tensor(&format!("{stem}.trellis_post"), vec![n], &post_vals);
 
             let pin_perm: Vec<i32> = (0..k)
                 .rev()
@@ -10691,9 +10694,10 @@ mod tests {
             let pout_perm: Vec<i32> = (0..n)
                 .map(|i| i32::try_from((i * 3 + 1) % n).unwrap_or(0))
                 .collect();
-            let pin_opt = with_perms.then(|| i32_tensor(&format!("{stem}.trellis_pin"), &pin_perm));
+            let pin_opt = with_perms
+                .then(|| trellis_test_i32_tensor(&format!("{stem}.trellis_pin"), &pin_perm));
             let pout_opt = (with_perms && !n.is_multiple_of(3))
-                .then(|| i32_tensor(&format!("{stem}.trellis_pout"), &pout_perm));
+                .then(|| trellis_test_i32_tensor(&format!("{stem}.trellis_pout"), &pout_perm));
 
             let desc = TrellisDesc::from_i32_slice(k, n, desc_raw)?;
             let built = TrellisWeight::from_tensors(
@@ -10708,7 +10712,7 @@ mod tests {
             let dense = dequantize_reference(&built)?;
             dequant_tensors.insert(
                 target_name.to_owned(),
-                f32_tensor(target_name, vec![k, n], &dense),
+                trellis_test_f32_tensor(target_name, vec![k, n], &dense),
             );
 
             metadata.insert(
@@ -10728,439 +10732,452 @@ mod tests {
             Ok(())
         };
 
-        let build_models = |banded_embed: bool| -> Result<(Model, Model)> {
-            let mut trl_meta = Metadata::new();
-            let mut f32_meta = Metadata::new();
-            for (k, v) in [
-                ("general.architecture", MetadataValue::from("qwen35")),
-                ("qwen35.block_count", MetadataValue::from(4_u32)),
-                ("qwen35.context_length", MetadataValue::from(64_u32)),
-                (
-                    "qwen35.embedding_length",
-                    MetadataValue::from(u32::try_from(emb).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.feed_forward_length",
-                    MetadataValue::from(u32::try_from(ffn).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.attention.head_count",
-                    MetadataValue::from(u32::try_from(heads).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.attention.head_count_kv",
-                    MetadataValue::from(u32::try_from(kv_heads).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.attention.key_length",
-                    MetadataValue::from(u32::try_from(head_dim).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.attention.value_length",
-                    MetadataValue::from(u32::try_from(head_dim).unwrap_or(0)),
-                ),
-                ("qwen35.rope.dimension_count", MetadataValue::from(64_u32)),
-                ("qwen35.rope.freq_base", MetadataValue::from(10_000.0_f32)),
-                (
-                    "qwen35.attention.layer_norm_rms_epsilon",
-                    MetadataValue::from(1e-6_f32),
-                ),
-                ("qwen35.full_attention_interval", MetadataValue::from(4_u32)),
-                (
-                    "qwen35.ssm.state_size",
-                    MetadataValue::from(u32::try_from(ssm_head_dim).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.ssm.group_count",
-                    MetadataValue::from(u32::try_from(ssm_groups).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.ssm.time_step_rank",
-                    MetadataValue::from(u32::try_from(ssm_heads).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.ssm.inner_size",
-                    MetadataValue::from(u32::try_from(ssm_inner).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.ssm.conv_kernel",
-                    MetadataValue::from(u32::try_from(conv_kernel).unwrap_or(0)),
-                ),
-                (
-                    "qwen35.rope.dimension_sections",
-                    MetadataValue::Array(MetadataArray::U32(vec![11, 11, 10, 0])),
-                ),
-            ] {
-                trl_meta.insert(k.to_owned(), v.clone());
-                f32_meta.insert(k.to_owned(), v);
-            }
-            trl_meta.insert("trellis.version".to_owned(), MetadataValue::from(1_u32));
-            trl_meta.insert(
-                "trellis.lm_head_bands".to_owned(),
-                MetadataValue::from(2_u32),
+        let mut trl_meta = Metadata::new();
+        let mut f32_meta = Metadata::new();
+        for (k, v) in [
+            ("general.architecture", MetadataValue::from("qwen35")),
+            ("qwen35.block_count", MetadataValue::from(4_u32)),
+            ("qwen35.context_length", MetadataValue::from(64_u32)),
+            (
+                "qwen35.embedding_length",
+                MetadataValue::from(u32::try_from(emb).unwrap_or(0)),
+            ),
+            (
+                "qwen35.feed_forward_length",
+                MetadataValue::from(u32::try_from(ffn).unwrap_or(0)),
+            ),
+            (
+                "qwen35.attention.head_count",
+                MetadataValue::from(u32::try_from(heads).unwrap_or(0)),
+            ),
+            (
+                "qwen35.attention.head_count_kv",
+                MetadataValue::from(u32::try_from(kv_heads).unwrap_or(0)),
+            ),
+            (
+                "qwen35.attention.key_length",
+                MetadataValue::from(u32::try_from(head_dim).unwrap_or(0)),
+            ),
+            (
+                "qwen35.attention.value_length",
+                MetadataValue::from(u32::try_from(head_dim).unwrap_or(0)),
+            ),
+            ("qwen35.rope.dimension_count", MetadataValue::from(64_u32)),
+            ("qwen35.rope.freq_base", MetadataValue::from(10_000.0_f32)),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon",
+                MetadataValue::from(1e-6_f32),
+            ),
+            ("qwen35.full_attention_interval", MetadataValue::from(4_u32)),
+            (
+                "qwen35.ssm.state_size",
+                MetadataValue::from(u32::try_from(ssm_head_dim).unwrap_or(0)),
+            ),
+            (
+                "qwen35.ssm.group_count",
+                MetadataValue::from(u32::try_from(ssm_groups).unwrap_or(0)),
+            ),
+            (
+                "qwen35.ssm.time_step_rank",
+                MetadataValue::from(u32::try_from(ssm_heads).unwrap_or(0)),
+            ),
+            (
+                "qwen35.ssm.inner_size",
+                MetadataValue::from(u32::try_from(ssm_inner).unwrap_or(0)),
+            ),
+            (
+                "qwen35.ssm.conv_kernel",
+                MetadataValue::from(u32::try_from(conv_kernel).unwrap_or(0)),
+            ),
+            (
+                "qwen35.rope.dimension_sections",
+                MetadataValue::Array(MetadataArray::U32(vec![11, 11, 10, 0])),
+            ),
+        ] {
+            trl_meta.insert(k.to_owned(), v.clone());
+            f32_meta.insert(k.to_owned(), v);
+        }
+        trl_meta.insert("trellis.version".to_owned(), MetadataValue::from(1_u32));
+        trl_meta.insert(
+            "trellis.lm_head_bands".to_owned(),
+            MetadataValue::from(2_u32),
+        );
+        if banded_embed {
+            trl_meta.insert("trellis.embed_bands".to_owned(), MetadataValue::from(2_u32));
+        }
+
+        let mut trl_tensors = BTreeMap::new();
+        let mut f32_tensors = BTreeMap::new();
+
+        if banded_embed {
+            let mut e0 = BTreeMap::new();
+            let mut e1 = BTreeMap::new();
+            add_coded_matrix(
+                &mut trl_tensors,
+                &mut trl_meta,
+                &mut e0,
+                "token_embd.band00",
+                "band00",
+                2,
+                emb,
+                32,
+                &[0, 0, 1, 1, 16, 1, 0],
+                false,
+                11,
+            )?;
+            add_coded_matrix(
+                &mut trl_tensors,
+                &mut trl_meta,
+                &mut e1,
+                "token_embd.band01",
+                "band01",
+                3,
+                emb,
+                32,
+                &[0, 0, 1, 2, 1, 1, 0],
+                false,
+                12,
+            )?;
+            let gather: Vec<i32> = (0..vocab)
+                .map(|i| i32::try_from((vocab - 1) - i).unwrap_or(0))
+                .collect();
+            trl_tensors.insert(
+                "token_embd.vocab_gather".to_owned(),
+                trellis_test_i32_tensor("token_embd.vocab_gather", &gather),
             );
-            if banded_embed {
-                trl_meta.insert("trellis.embed_bands".to_owned(), MetadataValue::from(2_u32));
-            }
-
-            let mut trl_tensors = BTreeMap::new();
-            let mut f32_tensors = BTreeMap::new();
-
-            if banded_embed {
-                let mut e0 = BTreeMap::new();
-                let mut e1 = BTreeMap::new();
-                add_coded_matrix(
-                    &mut trl_tensors,
-                    &mut trl_meta,
-                    &mut e0,
-                    "token_embd.band00",
-                    "band00",
-                    2,
-                    emb,
-                    32,
-                    &[0, 0, 1, 1, 16, 1, 0],
-                    false,
-                    11,
-                )?;
-                add_coded_matrix(
-                    &mut trl_tensors,
-                    &mut trl_meta,
-                    &mut e1,
-                    "token_embd.band01",
-                    "band01",
-                    3,
-                    emb,
-                    32,
-                    &[0, 0, 1, 2, 1, 1, 0],
-                    false,
-                    12,
-                )?;
-                let gather: Vec<i32> = (0..vocab)
-                    .map(|i| i32::try_from((vocab - 1) - i).unwrap_or(0))
-                    .collect();
-                trl_tensors.insert(
-                    "token_embd.vocab_gather".to_owned(),
-                    i32_tensor("token_embd.vocab_gather", &gather),
-                );
-                let b0 = &e0["band00"];
-                let b1 = &e1["band01"];
-                let mut dense_emb = vec![0.0_f32; emb * vocab];
-                let read_f32 = |t: &Tensor| -> Vec<f32> {
-                    t.data
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect()
+            let read_f32 = |t: &Tensor| -> Vec<f32> {
+                t.data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect()
+            };
+            let b0f = read_f32(&e0["band00"]);
+            let b1f = read_f32(&e1["band01"]);
+            let mut dense_emb = vec![0.0_f32; emb * vocab];
+            for (tok, &src) in gather.iter().enumerate() {
+                let s = usize::try_from(src)?;
+                let row = if s < 32 {
+                    &b0f[s * emb..(s + 1) * emb]
+                } else {
+                    &b1f[(s - 32) * emb..(s - 31) * emb]
                 };
-                let b0f = read_f32(b0);
-                let b1f = read_f32(b1);
-                for (tok, &src) in gather.iter().enumerate() {
-                    let s = usize::try_from(src)?;
-                    let row = if s < 32 {
-                        &b0f[s * emb..(s + 1) * emb]
-                    } else {
-                        &b1f[(s - 32) * emb..(s - 31) * emb]
-                    };
-                    dense_emb[tok * emb..(tok + 1) * emb].copy_from_slice(row);
-                }
-                f32_tensors.insert(
-                    "token_embd.weight".to_owned(),
-                    f32_tensor("token_embd.weight", vec![emb, vocab], &dense_emb),
+                dense_emb[tok * emb..(tok + 1) * emb].copy_from_slice(row);
+            }
+            f32_tensors.insert(
+                "token_embd.weight".to_owned(),
+                trellis_test_f32_tensor("token_embd.weight", vec![emb, vocab], &dense_emb),
+            );
+        } else {
+            add_coded_matrix(
+                &mut trl_tensors,
+                &mut trl_meta,
+                &mut f32_tensors,
+                "token_embd",
+                "token_embd.weight",
+                3,
+                emb,
+                vocab,
+                &[0, 0, 1, 1, 16, 1, 0],
+                true,
+                13,
+            )?;
+        }
+
+        let mut o0 = BTreeMap::new();
+        let mut o1 = BTreeMap::new();
+        add_coded_matrix(
+            &mut trl_tensors,
+            &mut trl_meta,
+            &mut o0,
+            "output.band00",
+            "band00",
+            4,
+            emb,
+            32,
+            &[1, 16, 1, 1, 16, 1, 0],
+            true,
+            21,
+        )?;
+        add_coded_matrix(
+            &mut trl_tensors,
+            &mut trl_meta,
+            &mut o1,
+            "output.band01",
+            "band01",
+            5,
+            emb,
+            32,
+            &[2, 1, 1, 2, 1, 1, 0],
+            true,
+            22,
+        )?;
+        let out_gather: Vec<i32> = (0..vocab)
+            .map(|i| i32::try_from((i * 7 + 5) % vocab).unwrap_or(0))
+            .collect();
+        trl_tensors.insert(
+            "output.vocab_gather".to_owned(),
+            trellis_test_i32_tensor("output.vocab_gather", &out_gather),
+        );
+        let read_f32 = |t: &Tensor| -> Vec<f32> {
+            t.data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect()
+        };
+        let o0f = read_f32(&o0["band00"]);
+        let o1f = read_f32(&o1["band01"]);
+        let mut dense_out = vec![0.0_f32; emb * vocab];
+        for (tok, &src) in out_gather.iter().enumerate() {
+            let s = usize::try_from(src)?;
+            let row = if s < 32 {
+                &o0f[s * emb..(s + 1) * emb]
+            } else {
+                &o1f[(s - 32) * emb..(s - 31) * emb]
+            };
+            dense_out[tok * emb..(tok + 1) * emb].copy_from_slice(row);
+        }
+        f32_tensors.insert(
+            "output.weight".to_owned(),
+            trellis_test_f32_tensor("output.weight", vec![emb, vocab], &dense_out),
+        );
+
+        let norm_ones = vec![1.0_f32; emb];
+        let out_norm = trellis_test_f32_tensor("output_norm.weight", vec![emb], &norm_ones);
+        trl_tensors.insert(out_norm.name.clone(), out_norm.clone());
+        f32_tensors.insert(out_norm.name.clone(), out_norm);
+
+        for layer in 0..4_usize {
+            let p = format!("blk.{layer}");
+            for nname in ["attn_norm.weight", "post_attention_norm.weight"] {
+                let full = format!("{p}.{nname}");
+                let t = trellis_test_f32_tensor(&full, vec![emb], &norm_ones);
+                trl_tensors.insert(full.clone(), t.clone());
+                f32_tensors.insert(full, t);
+            }
+            let bits_ffn = 2 + (layer % 5);
+            add_coded_matrix(
+                &mut trl_tensors,
+                &mut trl_meta,
+                &mut f32_tensors,
+                &format!("{p}.ffn_up"),
+                &format!("{p}.ffn_up.weight"),
+                bits_ffn,
+                emb,
+                ffn,
+                &[1, 16, 1, 2, 1, 1, 0],
+                true,
+                100 + u64::try_from(layer)?,
+            )?;
+            add_coded_matrix(
+                &mut trl_tensors,
+                &mut trl_meta,
+                &mut f32_tensors,
+                &format!("{p}.ffn_gate"),
+                &format!("{p}.ffn_gate.weight"),
+                3,
+                emb,
+                ffn,
+                &[2, 1, 1, 1, 16, 1, 0],
+                false,
+                200 + u64::try_from(layer)?,
+            )?;
+            add_coded_matrix(
+                &mut trl_tensors,
+                &mut trl_meta,
+                &mut f32_tensors,
+                &format!("{p}.ffn_down"),
+                &format!("{p}.ffn_down.weight"),
+                6,
+                ffn,
+                emb,
+                &[0, 0, 1, 2, 1, 1, 0],
+                true,
+                300 + u64::try_from(layer)?,
+            )?;
+
+            if layer < 3 {
+                add_coded_matrix(
+                    &mut trl_tensors,
+                    &mut trl_meta,
+                    &mut f32_tensors,
+                    &format!("{p}.attn_qkv"),
+                    &format!("{p}.attn_qkv.weight"),
+                    4,
+                    emb,
+                    conv_width,
+                    &[1, 16, 1, 1, 16, 1, 0],
+                    false,
+                    400 + u64::try_from(layer)?,
+                )?;
+                add_coded_matrix(
+                    &mut trl_tensors,
+                    &mut trl_meta,
+                    &mut f32_tensors,
+                    &format!("{p}.attn_gate"),
+                    &format!("{p}.attn_gate.weight"),
+                    5,
+                    emb,
+                    ssm_inner,
+                    &[0, 0, 1, 1, 16, 1, 0],
+                    true,
+                    500 + u64::try_from(layer)?,
+                )?;
+                add_coded_matrix(
+                    &mut trl_tensors,
+                    &mut trl_meta,
+                    &mut f32_tensors,
+                    &format!("{p}.ssm_out"),
+                    &format!("{p}.ssm_out.weight"),
+                    4,
+                    ssm_inner,
+                    emb,
+                    &[2, 1, 1, 1, 16, 1, 0],
+                    true,
+                    600 + u64::try_from(layer)?,
+                )?;
+                let tiny = trellis_test_f32_tensor(
+                    &format!("{p}.ssm_beta.weight"),
+                    vec![emb, ssm_heads],
+                    &vec![0.05; emb * ssm_heads],
                 );
+                let alpha_w = trellis_test_f32_tensor(
+                    &format!("{p}.ssm_alpha.weight"),
+                    vec![emb, ssm_heads],
+                    &vec![-0.03; emb * ssm_heads],
+                );
+                let conv = trellis_test_f32_tensor(
+                    &format!("{p}.ssm_conv1d.weight"),
+                    vec![conv_kernel, conv_width],
+                    &vec![0.125; conv_kernel * conv_width],
+                );
+                let dt = trellis_test_f32_tensor(
+                    &format!("{p}.ssm_dt.bias"),
+                    vec![ssm_heads],
+                    &vec![0.0; ssm_heads],
+                );
+                let a_dec = trellis_test_f32_tensor(
+                    &format!("{p}.ssm_a"),
+                    vec![ssm_heads],
+                    &vec![-0.5; ssm_heads],
+                );
+                let snorm = trellis_test_f32_tensor(
+                    &format!("{p}.ssm_norm.weight"),
+                    vec![ssm_head_dim],
+                    &vec![1.0; ssm_head_dim],
+                );
+                for t in [tiny, alpha_w, conv, dt, a_dec, snorm] {
+                    trl_tensors.insert(t.name.clone(), t.clone());
+                    f32_tensors.insert(t.name.clone(), t);
+                }
             } else {
                 add_coded_matrix(
                     &mut trl_tensors,
                     &mut trl_meta,
                     &mut f32_tensors,
-                    "token_embd",
-                    "token_embd.weight",
-                    3,
+                    &format!("{p}.attn_q"),
+                    &format!("{p}.attn_q.weight"),
+                    5,
                     emb,
-                    vocab,
-                    &[0, 0, 1, 1, 16, 1, 0],
+                    heads * head_dim * 2,
+                    &[2, 1, 1, 1, 16, 1, 0],
                     true,
-                    13,
+                    701,
                 )?;
-            }
-
-            // Banded output head (2 bands of 32 rows each) with vocab_gather permutation
-            let mut o0 = BTreeMap::new();
-            let mut o1 = BTreeMap::new();
-            add_coded_matrix(
-                &mut trl_tensors,
-                &mut trl_meta,
-                &mut o0,
-                "output.band00",
-                "band00",
-                4,
-                emb,
-                32,
-                &[1, 16, 1, 1, 16, 1, 0],
-                true,
-                21,
-            )?;
-            add_coded_matrix(
-                &mut trl_tensors,
-                &mut trl_meta,
-                &mut o1,
-                "output.band01",
-                "band01",
-                5,
-                emb,
-                32,
-                &[2, 1, 1, 2, 1, 1, 0],
-                true,
-                22,
-            )?;
-            let out_gather: Vec<i32> = (0..vocab)
-                .map(|i| i32::try_from((i * 7 + 5) % vocab).unwrap_or(0))
-                .collect();
-            trl_tensors.insert(
-                "output.vocab_gather".to_owned(),
-                i32_tensor("output.vocab_gather", &out_gather),
-            );
-            let read_f32 = |t: &Tensor| -> Vec<f32> {
-                t.data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect()
-            };
-            let o0f = read_f32(&o0["band00"]);
-            let o1f = read_f32(&o1["band01"]);
-            let mut dense_out = vec![0.0_f32; emb * vocab];
-            for (tok, &src) in out_gather.iter().enumerate() {
-                let s = usize::try_from(src)?;
-                let row = if s < 32 {
-                    &o0f[s * emb..(s + 1) * emb]
-                } else {
-                    &o1f[(s - 32) * emb..(s - 31) * emb]
-                };
-                dense_out[tok * emb..(tok + 1) * emb].copy_from_slice(row);
-            }
-            f32_tensors.insert(
-                "output.weight".to_owned(),
-                f32_tensor("output.weight", vec![emb, vocab], &dense_out),
-            );
-
-            let norm_ones = vec![1.0_f32; emb];
-            for (name, t) in [(
-                "output_norm.weight",
-                f32_tensor("output_norm.weight", vec![emb], &norm_ones),
-            )] {
-                trl_tensors.insert(name.to_owned(), t.clone());
-                f32_tensors.insert(name.to_owned(), t);
-            }
-
-            for layer in 0..4_usize {
-                let p = format!("blk.{layer}");
-                for nname in ["attn_norm.weight", "post_attention_norm.weight"] {
-                    let full = format!("{p}.{nname}");
-                    let t = f32_tensor(&full, vec![emb], &norm_ones);
-                    trl_tensors.insert(full.clone(), t.clone());
-                    f32_tensors.insert(full, t);
-                }
-                let bits_ffn = 2 + (layer % 5);
                 add_coded_matrix(
                     &mut trl_tensors,
                     &mut trl_meta,
                     &mut f32_tensors,
-                    &format!("{p}.ffn_up"),
-                    &format!("{p}.ffn_up.weight"),
-                    bits_ffn,
+                    &format!("{p}.attn_k"),
+                    &format!("{p}.attn_k.weight"),
+                    4,
                     emb,
-                    ffn,
+                    kv_heads * head_dim,
+                    &[1, 16, 1, 2, 1, 1, 0],
+                    false,
+                    702,
+                )?;
+                add_coded_matrix(
+                    &mut trl_tensors,
+                    &mut trl_meta,
+                    &mut f32_tensors,
+                    &format!("{p}.attn_v"),
+                    &format!("{p}.attn_v.weight"),
+                    3,
+                    emb,
+                    kv_heads * head_dim,
+                    &[0, 0, 1, 0, 0, 1, 0],
+                    true,
+                    703,
+                )?;
+                add_coded_matrix(
+                    &mut trl_tensors,
+                    &mut trl_meta,
+                    &mut f32_tensors,
+                    &format!("{p}.attn_output"),
+                    &format!("{p}.attn_output.weight"),
+                    6,
+                    heads * head_dim,
+                    emb,
                     &[1, 16, 1, 2, 1, 1, 0],
                     true,
-                    100 + u64::try_from(layer)?,
+                    704,
                 )?;
-                add_coded_matrix(
-                    &mut trl_tensors,
-                    &mut trl_meta,
-                    &mut f32_tensors,
-                    &format!("{p}.ffn_gate"),
-                    &format!("{p}.ffn_gate.weight"),
-                    3,
-                    emb,
-                    ffn,
-                    &[2, 1, 1, 1, 16, 1, 0],
-                    false,
-                    200 + u64::try_from(layer)?,
-                )?;
-                add_coded_matrix(
-                    &mut trl_tensors,
-                    &mut trl_meta,
-                    &mut f32_tensors,
-                    &format!("{p}.ffn_down"),
-                    &format!("{p}.ffn_down.weight"),
-                    6,
-                    ffn,
-                    emb,
-                    &[0, 0, 1, 2, 1, 1, 0],
-                    true,
-                    300 + u64::try_from(layer)?,
-                )?;
-
-                if layer < 3 {
-                    // Recurrent GDN layer
-                    add_coded_matrix(
-                        &mut trl_tensors,
-                        &mut trl_meta,
-                        &mut f32_tensors,
-                        &format!("{p}.attn_qkv"),
-                        &format!("{p}.attn_qkv.weight"),
-                        4,
-                        emb,
-                        conv_width,
-                        &[1, 16, 1, 1, 16, 1, 0],
-                        false,
-                        400 + u64::try_from(layer)?,
-                    )?;
-                    add_coded_matrix(
-                        &mut trl_tensors,
-                        &mut trl_meta,
-                        &mut f32_tensors,
-                        &format!("{p}.attn_gate"),
-                        &format!("{p}.attn_gate.weight"),
-                        5,
-                        emb,
-                        ssm_inner,
-                        &[0, 0, 1, 1, 16, 1, 0],
-                        true,
-                        500 + u64::try_from(layer)?,
-                    )?;
-                    add_coded_matrix(
-                        &mut trl_tensors,
-                        &mut trl_meta,
-                        &mut f32_tensors,
-                        &format!("{p}.ssm_out"),
-                        &format!("{p}.ssm_out.weight"),
-                        4,
-                        ssm_inner,
-                        emb,
-                        &[2, 1, 1, 1, 16, 1, 0],
-                        true,
-                        600 + u64::try_from(layer)?,
-                    )?;
-                    // Small beta/alpha projections (rows < 16) stay uncoded F32 just like NariQ models with small SSM time steps
-                    let tiny = f32_tensor(
-                        &format!("{p}.ssm_beta.weight"),
-                        vec![emb, ssm_heads],
-                        &vec![0.05; emb * ssm_heads],
-                    );
-                    let alpha_w = f32_tensor(
-                        &format!("{p}.ssm_alpha.weight"),
-                        vec![emb, ssm_heads],
-                        &vec![-0.03; emb * ssm_heads],
-                    );
-                    let conv = f32_tensor(
-                        &format!("{p}.ssm_conv1d.weight"),
-                        vec![conv_kernel, conv_width],
-                        &vec![0.125; conv_kernel * conv_width],
-                    );
-                    let dt = f32_tensor(
-                        &format!("{p}.ssm_dt.bias"),
-                        vec![ssm_heads],
-                        &vec![0.0; ssm_heads],
-                    );
-                    let a_dec = f32_tensor(
-                        &format!("{p}.ssm_a"),
-                        vec![ssm_heads],
-                        &vec![-0.5; ssm_heads],
-                    );
-                    let snorm = f32_tensor(
-                        &format!("{p}.ssm_norm.weight"),
-                        vec![ssm_head_dim],
-                        &vec![1.0; ssm_head_dim],
-                    );
-                    for t in [tiny, alpha_w, conv, dt, a_dec, snorm] {
-                        trl_tensors.insert(t.name.clone(), t.clone());
-                        f32_tensors.insert(t.name.clone(), t);
-                    }
-                } else {
-                    // Full attention layer (heads*head_dim*2 = 64, kv*head_dim = 16)
-                    add_coded_matrix(
-                        &mut trl_tensors,
-                        &mut trl_meta,
-                        &mut f32_tensors,
-                        &format!("{p}.attn_q"),
-                        &format!("{p}.attn_q.weight"),
-                        5,
-                        emb,
-                        heads * head_dim * 2,
-                        &[2, 1, 1, 1, 16, 1, 0],
-                        true,
-                        701,
-                    )?;
-                    add_coded_matrix(
-                        &mut trl_tensors,
-                        &mut trl_meta,
-                        &mut f32_tensors,
-                        &format!("{p}.attn_k"),
-                        &format!("{p}.attn_k.weight"),
-                        4,
-                        emb,
-                        kv_heads * head_dim,
-                        &[1, 16, 1, 2, 1, 1, 0],
-                        false,
-                        702,
-                    )?;
-                    add_coded_matrix(
-                        &mut trl_tensors,
-                        &mut trl_meta,
-                        &mut f32_tensors,
-                        &format!("{p}.attn_v"),
-                        &format!("{p}.attn_v.weight"),
-                        3,
-                        emb,
-                        kv_heads * head_dim,
-                        &[0, 0, 1, 0, 0, 1, 0],
-                        true,
-                        703,
-                    )?;
-                    add_coded_matrix(
-                        &mut trl_tensors,
-                        &mut trl_meta,
-                        &mut f32_tensors,
-                        &format!("{p}.attn_output"),
-                        &format!("{p}.attn_output.weight"),
-                        6,
-                        heads * head_dim,
-                        emb,
-                        &[1, 16, 1, 2, 1, 1, 0],
-                        true,
-                        704,
-                    )?;
-                    let qn = f32_tensor(
-                        &format!("{p}.attn_q_norm.weight"),
-                        vec![head_dim],
-                        &vec![1.0; head_dim],
-                    );
-                    let kn = f32_tensor(
-                        &format!("{p}.attn_k_norm.weight"),
-                        vec![head_dim],
-                        &vec![1.0; head_dim],
-                    );
-                    for t in [qn, kn] {
-                        trl_tensors.insert(t.name.clone(), t.clone());
-                        f32_tensors.insert(t.name.clone(), t);
-                    }
+                let qn = trellis_test_f32_tensor(
+                    &format!("{p}.attn_q_norm.weight"),
+                    vec![head_dim],
+                    &vec![1.0; head_dim],
+                );
+                let kn = trellis_test_f32_tensor(
+                    &format!("{p}.attn_k_norm.weight"),
+                    vec![head_dim],
+                    &vec![1.0; head_dim],
+                );
+                for t in [qn, kn] {
+                    trl_tensors.insert(t.name.clone(), t.clone());
+                    f32_tensors.insert(t.name.clone(), t);
                 }
             }
+        }
 
-            let trl_model = Model {
-                identity: "synthetic-trellis-qwen35-model".to_owned(),
-                metadata: trl_meta,
-                tensors: trl_tensors,
-            };
-            let f32_model = Model {
-                identity: "synthetic-trellis-qwen35-model".to_owned(),
-                metadata: f32_meta,
-                tensors: f32_tensors,
-            };
-            Ok((trl_model, f32_model))
+        let trl_model = Model {
+            identity: "synthetic-trellis-qwen35-model".to_owned(),
+            metadata: trl_meta,
+            tensors: trl_tensors,
         };
+        let f32_model = Model {
+            identity: "synthetic-trellis-qwen35-model".to_owned(),
+            metadata: f32_meta,
+            tensors: f32_tensors,
+        };
+        Ok((trl_model, f32_model))
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "End-to-end 4-layer trellis graph test covers decode, prefill, rollback, banded/unbanded heads, and stacked MultiRankAdapter."
+    )]
+    fn qwen35_four_layer_trellis_graph_matches_dequantized_f32_with_rotated4_prefill_and_daisyrose()
+    -> Result<()> {
+        use crate::Decoder as _;
+        use crate::model::{
+            Model,
+            lora::{MultiRankAdapter, MultiRankPolicy},
+        };
+        use bonsai_gguf::{Metadata, MetadataArray, MetadataValue};
+
+        let emb = 32_usize;
+        let ffn = 64_usize;
+        let head_dim = 256_usize;
+        let heads = 1_usize;
+        let vocab = 64_usize;
 
         for banded_embed in [false, true] {
-            let (trl_model, f32_model) = build_models(banded_embed)?;
+            let (trl_model, f32_model) = build_four_layer_trellis_test_models(banded_embed)?;
             let mut lora_meta = Metadata::new();
             lora_meta.insert(
                 "general.architecture".to_owned(),
@@ -11173,22 +11190,22 @@ mod tests {
                 MetadataValue::from(16.0_f32),
             );
             let mut lora_tensors = BTreeMap::new();
-            let a_ffn = f32_tensor(
+            let a_ffn = trellis_test_f32_tensor(
                 "blk.0.ffn_down.weight.lora_a",
                 vec![ffn, 4],
                 &vec![0.02_f32; ffn * 4],
             );
-            let b_ffn = f32_tensor(
+            let b_ffn = trellis_test_f32_tensor(
                 "blk.0.ffn_down.weight.lora_b",
                 vec![4, emb],
                 &vec![0.03_f32; 4 * emb],
             );
-            let a_q = f32_tensor(
+            let a_q = trellis_test_f32_tensor(
                 "blk.3.attn_q.weight.lora_a",
                 vec![emb, 4],
                 &vec![-0.015_f32; emb * 4],
             );
-            let b_q = f32_tensor(
+            let b_q = trellis_test_f32_tensor(
                 "blk.3.attn_q.weight.lora_b",
                 vec![4, heads * head_dim * 2],
                 &vec![0.025_f32; 4 * heads * head_dim * 2],
@@ -11268,8 +11285,8 @@ mod tests {
             assert_eq!(step_a, step_b);
 
             // Tiled prefill state + logits vs sequential decode
-            let (trl_model2, _) = build_models(banded_embed)?;
-            let (trl_model3, _) = build_models(banded_embed)?;
+            let (trl_model2, _) = build_four_layer_trellis_test_models(banded_embed)?;
+            let (trl_model3, _) = build_four_layer_trellis_test_models(banded_embed)?;
             let mut seq_dec = super::Qwen35::with_adapters_and_kv(
                 trl_model2,
                 32,
@@ -11315,40 +11332,43 @@ mod tests {
         }
 
         // Negative checks: wrong trellis.version, orphan side tensor, extra band
-        let (mut bad_ver, _) = build_models(false)?;
+        let (mut bad_ver, _) = build_four_layer_trellis_test_models(false)?;
         bad_ver
             .metadata
             .insert("trellis.version".to_owned(), MetadataValue::from(2_u32));
         assert!(super::Qwen35::new(bad_ver, 32).is_err());
 
-        let (mut bad_orphan, _) = build_models(false)?;
+        let (mut bad_orphan, _) = build_four_layer_trellis_test_models(false)?;
         bad_orphan.tensors.insert(
             "rogue.trellis_s16".to_owned(),
-            f16_tensor("rogue.trellis_s16", 2),
+            trellis_test_f16_tensor("rogue.trellis_s16", 2),
         );
         assert!(super::Qwen35::new(bad_orphan, 32).is_err());
 
-        let (mut extra_band, _) = build_models(false)?;
+        let (mut extra_band, _) = build_four_layer_trellis_test_models(false)?;
         extra_band.tensors.insert(
             "output.band99.weight".to_owned(),
             Tensor {
                 name: "output.band99.weight".to_owned(),
                 dimensions: vec![emb, 16],
                 kind: 45,
-                data: TensorBytes::Shared(Arc::from(prng_bytes((emb / 16) * 64, 999))),
+                data: crate::model::TensorBytes::Shared(Arc::from(trellis_test_prng_bytes(
+                    (emb / 16) * 64,
+                    999,
+                ))),
             },
         );
         extra_band.tensors.insert(
             "output.band99.trellis_s16".to_owned(),
-            f16_tensor("output.band99.trellis_s16", emb / 16),
+            trellis_test_f16_tensor("output.band99.trellis_s16", emb / 16),
         );
         extra_band.tensors.insert(
             "output.band99.trellis_pre".to_owned(),
-            f32_tensor("output.band99.trellis_pre", vec![emb], &vec![1.0; emb]),
+            trellis_test_f32_tensor("output.band99.trellis_pre", vec![emb], &vec![1.0; emb]),
         );
         extra_band.tensors.insert(
             "output.band99.trellis_post".to_owned(),
-            f32_tensor("output.band99.trellis_post", vec![16], &vec![1.0; 16]),
+            trellis_test_f32_tensor("output.band99.trellis_post", vec![16], &[1.0; 16]),
         );
         extra_band.metadata.insert(
             "trellis.desc.output.band99".to_owned(),
@@ -11356,6 +11376,224 @@ mod tests {
         );
         assert!(super::Qwen35::new(extra_band, 32).is_err());
 
+        Ok(())
+    }
+
+    fn build_trellis_heterogeneous_multi_rank_model() -> super::Model {
+        use bonsai_gguf::{Metadata, MetadataValue};
+
+        let emb = 32_usize;
+        let ffn = 64_usize;
+        let head_dim = 256_usize;
+        let conv_width = 64_usize;
+        let mut lora_meta = Metadata::new();
+        lora_meta.insert(
+            "general.architecture".to_owned(),
+            MetadataValue::from("qwen35"),
+        );
+        lora_meta.insert("general.type".to_owned(), MetadataValue::from("adapter"));
+        lora_meta.insert("adapter.type".to_owned(), MetadataValue::from("lora"));
+        lora_meta.insert(
+            "adapter.lora.alpha".to_owned(),
+            MetadataValue::from(12.0_f32),
+        );
+
+        let mut lora_tensors = BTreeMap::new();
+        // Sparse heterogeneous ranks: blk.0 rank 2, blk.1 omitted, blk.2 rank 3, blk.3 rank 4.
+        let specs = [
+            ("blk.0.ffn_down.weight", ffn, emb, 2_usize, 0.025_f32),
+            ("blk.2.attn_qkv.weight", emb, conv_width, 3, -0.02),
+            ("blk.3.ffn_down.weight", ffn, emb, 4, 0.03),
+            ("blk.3.attn_q.weight", emb, head_dim * 2, 4, -0.015),
+            ("blk.3.attn_k.weight", emb, head_dim, 4, 0.02),
+            ("blk.3.attn_v.weight", emb, head_dim, 4, -0.025),
+            ("blk.3.attn_output.weight", head_dim, emb, 4, 0.035),
+        ];
+        for (idx, (target, in_f, out_f, rank, mag)) in specs.into_iter().enumerate() {
+            let a_vals: Vec<f32> = (0..in_f * rank)
+                .map(|i| if (i + idx) % 2 == 0 { mag } else { -mag * 0.5 })
+                .collect();
+            let b_vals: Vec<f32> = (0..rank * out_f)
+                .map(|i| if (i + idx) % 3 == 0 { mag * 1.2 } else { -mag })
+                .collect();
+            lora_tensors.insert(
+                format!("{target}.lora_a"),
+                trellis_test_f32_tensor(&format!("{target}.lora_a"), vec![in_f, rank], &a_vals),
+            );
+            lora_tensors.insert(
+                format!("{target}.lora_b"),
+                trellis_test_f32_tensor(&format!("{target}.lora_b"), vec![rank, out_f], &b_vals),
+            );
+        }
+        super::Model {
+            identity: "synthetic-trellis-heterogeneous-mr".to_owned(),
+            metadata: lora_meta,
+            tensors: lora_tensors,
+        }
+    }
+
+    fn verify_trellis_heterogeneous_folded_rsq4kvf(
+        banded_embed: bool,
+        mr_trl: crate::model::lora::MultiRankAdapter,
+        vocab: usize,
+    ) -> Result<()> {
+        let (trl_seq_m, _) = build_four_layer_trellis_test_models(banded_embed)?;
+        let (trl_fold_m, _) = build_four_layer_trellis_test_models(banded_embed)?;
+        let mut seq_dec = super::Qwen35::with_adapters_and_kv(
+            trl_seq_m,
+            32,
+            MAX_STATE_BYTES,
+            super::MatvecBackend::Auto,
+            None,
+            Some((mr_trl.clone(), 1.0)),
+            super::KvCachePolicy::Rotated4FittedKv,
+        )?;
+        let scratch = seq_dec.tiled_prefill_scratch_bytes(8)?;
+        let fold_base = super::Qwen35::with_adapters_and_kv(
+            trl_fold_m,
+            32,
+            MAX_STATE_BYTES,
+            super::MatvecBackend::Auto,
+            None,
+            Some((mr_trl, 1.0)),
+            super::KvCachePolicy::Rotated4FittedKv,
+        )?
+        .with_tiled_prefill(8, scratch)?;
+        let vscratch = fold_base.tiled_verification_scratch_bytes()?;
+        let mut fold_dec = fold_base.with_tiled_verification(vscratch)?;
+
+        let mut rows = Vec::new();
+        fold_dec.evaluate_verification_block_folded(&[], &[1, 5, 19], &mut rows, &|| Ok(()))?;
+        let s1 = crate::Decoder::evaluate(&mut seq_dec, 1)?;
+        let s5 = crate::Decoder::evaluate(&mut seq_dec, 5)?;
+        for (i, (&g, &s)) in rows[0].iter().zip(&s1).enumerate() {
+            assert!(
+                (g - s).abs() <= 1e-3,
+                "folded r1 tok1 banded={banded_embed} logit={i}: {g} vs {s}"
+            );
+        }
+        for (i, (&g, &s)) in rows[1].iter().zip(&s5).enumerate() {
+            assert!(
+                (g - s).abs() <= 1e-3,
+                "folded r1 tok5 banded={banded_embed} logit={i}: {g} vs {s}"
+            );
+        }
+        fold_dec.commit_folded_verification(2)?;
+        fold_dec.evaluate_verification_block_folded(&[1, 5], &[31, 42], &mut rows, &|| Ok(()))?;
+        let s31 = crate::Decoder::evaluate(&mut seq_dec, 31)?;
+        let s42 = crate::Decoder::evaluate(&mut seq_dec, 42)?;
+        assert_eq!(rows[1].len(), vocab);
+        for (i, (&g, &s)) in rows[0].iter().zip(&s31).enumerate() {
+            assert!(
+                (g - s).abs() <= 1e-3,
+                "folded r2 tok31 banded={banded_embed} logit={i}: {g} vs {s}"
+            );
+        }
+        for (i, (&g, &s)) in rows[1].iter().zip(&s42).enumerate() {
+            assert!(
+                (g - s).abs() <= 1e-3,
+                "folded r2 tok42 banded={banded_embed} logit={i}: {g} vs {s}"
+            );
+        }
+        fold_dec.commit_folded_verification(2)?;
+        fold_dec.flush_folded_verification(&|| Ok(()))?;
+        let tail_seq = crate::Decoder::evaluate(&mut seq_dec, 60)?;
+        let tail_fold = crate::Decoder::evaluate(&mut fold_dec, 60)?;
+        for (i, (&g, &s)) in tail_fold.iter().zip(&tail_seq).enumerate() {
+            assert!(
+                (g - s).abs() <= 1e-3,
+                "post-flush tail banded={banded_embed} logit={i}: {g} vs {s}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35_four_layer_trellis_heterogeneous_multi_rank_and_rsq4kvf_parity() -> Result<()> {
+        use crate::model::lora::{MultiRankAdapter, MultiRankPolicy};
+
+        let vocab = 64_usize;
+        let raw_mr = build_trellis_heterogeneous_multi_rank_model();
+
+        for banded_embed in [false, true] {
+            let (trl_model, f32_model) = build_four_layer_trellis_test_models(banded_embed)?;
+            let mr_trl =
+                MultiRankAdapter::from_model(&trl_model, &raw_mr, MultiRankPolicy::NpuFriendly)?;
+            let mr_f32 =
+                MultiRankAdapter::from_model(&f32_model, &raw_mr, MultiRankPolicy::NpuFriendly)?;
+            assert_eq!(mr_trl.max_rank(), 4);
+            assert!(!mr_trl.has_target("blk.1.ffn_down.weight"));
+
+            let (trl_unadapted_model, _) = build_four_layer_trellis_test_models(banded_embed)?;
+            let mut trl_unadapted = super::Qwen35::with_adapters_and_kv(
+                trl_unadapted_model,
+                32,
+                MAX_STATE_BYTES,
+                super::MatvecBackend::Auto,
+                None,
+                None,
+                super::KvCachePolicy::Rotated4FittedKv,
+            )?;
+            let mut trl_dec = super::Qwen35::with_adapters_and_kv(
+                trl_model,
+                32,
+                MAX_STATE_BYTES,
+                super::MatvecBackend::Auto,
+                None,
+                Some((mr_trl.clone(), 0.0)),
+                super::KvCachePolicy::Rotated4FittedKv,
+            )?;
+            let mut f32_dec = super::Qwen35::with_adapters_and_kv(
+                f32_model,
+                32,
+                MAX_STATE_BYTES,
+                super::MatvecBackend::Auto,
+                None,
+                Some((mr_f32, 1.0)),
+                super::KvCachePolicy::Rotated4FittedKv,
+            )?;
+
+            // Scale 0.0 matches unadapted trellis + rsq4kvf bit-for-bit.
+            let trl_zero = crate::Decoder::evaluate(&mut trl_dec, 3)?;
+            let trl_base = crate::Decoder::evaluate(&mut trl_unadapted, 3)?;
+            assert_eq!(
+                trl_zero
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+                trl_base
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            );
+
+            // Scale 1.0 matches dequantized F32 reference + rsq4kvf across multiple tokens.
+            trl_dec.reset_with_adapter_scales(None, Some(1.0))?;
+            for tok in [3_u32, 17, 45] {
+                let got = crate::Decoder::evaluate(&mut trl_dec, tok)?;
+                let exp = crate::Decoder::evaluate(&mut f32_dec, tok)?;
+                if tok == 3 {
+                    assert_ne!(
+                        got.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        trl_zero
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
+                    );
+                }
+                for (i, (&g, &e)) in got.iter().zip(&exp).enumerate() {
+                    assert!(
+                        (g - e).abs() <= 1e-3,
+                        "rsq4kvf banded_embed={banded_embed} tok={tok} logit={i}: {g} vs {e}"
+                    );
+                }
+            }
+
+            verify_trellis_heterogeneous_folded_rsq4kvf(banded_embed, mr_trl, vocab)?;
+        }
         Ok(())
     }
 }

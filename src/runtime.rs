@@ -926,6 +926,7 @@ impl<D: Decoder> Runtime<D> {
         clippy::too_many_arguments,
         reason = "Unified Swift internal generation path forwards chunks, reset mode, timings and confidence."
     )]
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn generate_swift_until<S: Sampler + Clone>(
         &mut self,
         prompt: &[u32],

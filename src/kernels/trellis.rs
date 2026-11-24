@@ -1252,7 +1252,7 @@ pub(crate) mod tests {
         let pin_vals: Vec<i32> = (0..k)
             .map(|i| i32::try_from((i * 5 + 3) % k).unwrap_or(0))
             .collect();
-        let pout_vals: Vec<i32> = (0..n)
+        let perm_out_vals: Vec<i32> = (0..n)
             .map(|i| i32::try_from((n - 1) - i).unwrap_or(0))
             .collect();
         // Ensure `pin` is a valid permutation only when gcd(5, k) == 1 (k powers of 2 / multiples not div by 5)
@@ -1265,7 +1265,7 @@ pub(crate) mod tests {
             pin_vals
         };
         let pin_tensor = make_i32_tensor("test.trellis_pin", &pin_perm);
-        let pout_tensor = make_i32_tensor("test.trellis_pout", &pout_vals);
+        let perm_out_tensor = make_i32_tensor("test.trellis_pout", &perm_out_vals);
 
         let desc = TrellisDesc::from_i32_slice(k, n, desc_raw)?;
         TrellisWeight::from_tensors(
@@ -1274,7 +1274,7 @@ pub(crate) mod tests {
             &pre_tensor,
             &post_tensor,
             with_perms.then_some(&pin_tensor),
-            with_perms.then_some(&pout_tensor),
+            with_perms.then_some(&perm_out_tensor),
             desc,
         )
     }
@@ -1398,7 +1398,7 @@ pub(crate) mod tests {
         assert!(rht(&mut [1.0, 2.0, 3.0], 2).is_err());
 
         let base = build_synthetic_weight(2, 16, 16, &[0, 0, 1, 0, 0, 1, 0], false, 7)?;
-        let dup_pin = make_i32_tensor("bad.trellis_pin", &vec![0_i32; 16]);
+        let dup_pin = make_i32_tensor("bad.trellis_pin", &[0_i32; 16]);
         let neg_pin = make_i32_tensor(
             "bad.trellis_pin",
             &[-1_i32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],

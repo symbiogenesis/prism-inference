@@ -1655,3 +1655,822 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
     }
     Ok(())
 }
+
+fn pq2_rect(name: &str, cols: usize, rows: usize, seed: u8) -> Tensor {
+    let mut block = [0_u8; 34];
+    block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+    for (index, byte) in block[2..].iter_mut().enumerate() {
+        *byte = match (usize::from(seed) + index) % 4 {
+            0 => 0xaa,
+            1 => 0x00,
+            2 => 0x56,
+            _ => 0x91,
+        };
+    }
+    Tensor {
+        name: name.to_owned(),
+        dimensions: vec![cols, rows],
+        kind: 142,
+        data: Arc::<[u8]>::from(block.repeat((cols / 128) * rows)).into(),
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Constructs a complete 4-layer hybrid PQ2 + Hadamard test fixture for FFN fusion tests."
+)]
+fn build_sparse_heterogeneous_four_layer_pq2_model() -> Model {
+    let mut metadata = BTreeMap::from([
+        (
+            "general.architecture".to_owned(),
+            MetadataValue::from("qwen35"),
+        ),
+        ("qwen35.block_count".to_owned(), MetadataValue::from(4_u32)),
+        (
+            "qwen35.context_length".to_owned(),
+            MetadataValue::from(32_u32),
+        ),
+        (
+            "qwen35.embedding_length".to_owned(),
+            MetadataValue::from(128_u32),
+        ),
+        (
+            "qwen35.feed_forward_length".to_owned(),
+            MetadataValue::from(128_u32),
+        ),
+        (
+            "qwen35.attention.head_count".to_owned(),
+            MetadataValue::from(1_u32),
+        ),
+        (
+            "qwen35.attention.head_count_kv".to_owned(),
+            MetadataValue::from(1_u32),
+        ),
+        (
+            "qwen35.attention.key_length".to_owned(),
+            MetadataValue::from(128_u32),
+        ),
+        (
+            "qwen35.attention.value_length".to_owned(),
+            MetadataValue::from(128_u32),
+        ),
+        (
+            "qwen35.rope.dimension_count".to_owned(),
+            MetadataValue::from(64_u32),
+        ),
+        (
+            "qwen35.rope.freq_base".to_owned(),
+            MetadataValue::from(10_000.0_f32),
+        ),
+        (
+            "qwen35.attention.layer_norm_rms_epsilon".to_owned(),
+            MetadataValue::from(1e-6_f32),
+        ),
+        (
+            "qwen35.full_attention_interval".to_owned(),
+            MetadataValue::from(4_u32),
+        ),
+        (
+            "qwen35.ssm.state_size".to_owned(),
+            MetadataValue::from(128_u32),
+        ),
+        (
+            "qwen35.ssm.group_count".to_owned(),
+            MetadataValue::from(1_u32),
+        ),
+        (
+            "qwen35.ssm.time_step_rank".to_owned(),
+            MetadataValue::from(1_u32),
+        ),
+        (
+            "qwen35.ssm.inner_size".to_owned(),
+            MetadataValue::from(128_u32),
+        ),
+        (
+            "qwen35.ssm.conv_kernel".to_owned(),
+            MetadataValue::from(4_u32),
+        ),
+        (
+            "qwen35.rope.dimension_sections".to_owned(),
+            MetadataValue::from(vec![32_u32, 0, 0, 0]),
+        ),
+        (
+            "qwen35.attention.recurrent_layers".to_owned(),
+            MetadataValue::from(vec![true, true, true, false]),
+        ),
+        (
+            "prism.hadamard.version".to_owned(),
+            MetadataValue::from(1_u32),
+        ),
+        (
+            "prism.hadamard.block_size".to_owned(),
+            MetadataValue::from(32_u32),
+        ),
+        (
+            "prism.hadamard.transform".to_owned(),
+            MetadataValue::from("normalized-sylvester-walsh-hadamard"),
+        ),
+        (
+            "prism.hadamard.axis".to_owned(),
+            MetadataValue::from("input-last-dimension"),
+        ),
+        (
+            "prism.hadamard.sign_mode".to_owned(),
+            MetadataValue::from("explicit"),
+        ),
+        (
+            "prism.hadamard.sign_widths".to_owned(),
+            MetadataValue::from(vec![128_u32]),
+        ),
+        (
+            "prism.hadamard.sign_values".to_owned(),
+            MetadataValue::from(vec![1_i32; 128]),
+        ),
+    ]);
+    let hadamard_weights = vec![
+        "blk.0.ffn_down.weight",
+        "blk.1.ffn_down.weight",
+        "blk.2.ffn_down.weight",
+        "blk.3.ffn_down.weight",
+        "blk.0.ssm_out.weight",
+        "blk.1.ssm_out.weight",
+        "blk.2.ssm_out.weight",
+        "blk.3.attn_output.weight",
+    ];
+    metadata.insert(
+        "prism.hadamard.weight_names".to_owned(),
+        MetadataValue::from(hadamard_weights),
+    );
+
+    let f32_pattern = |name: &str, dims: &[usize], val: f32| -> Tensor {
+        let len: usize = dims.iter().product();
+        let vals: Vec<f32> = (0..len)
+            .map(|idx| if idx % 2 == 0 { val } else { -val * 0.5 })
+            .collect();
+        tensor(name, dims, &vals)
+    };
+    let mut tensors = BTreeMap::from([
+        (
+            "token_embd.weight".to_owned(),
+            f32_pattern("token_embd.weight", &[128, 4], 0.25),
+        ),
+        (
+            "output.weight".to_owned(),
+            f32_pattern("output.weight", &[128, 4], -0.25),
+        ),
+        (
+            "output_norm.weight".to_owned(),
+            tensor("output_norm.weight", &[128], &vec![1.0_f32; 128]),
+        ),
+    ]);
+    for layer in 0..4_usize {
+        let p = format!("blk.{layer}");
+        let seed_base = u8::try_from(layer * 16).unwrap_or(0);
+        tensors.insert(
+            format!("{p}.attn_norm.weight"),
+            tensor(&format!("{p}.attn_norm.weight"), &[128], &vec![1.0; 128]),
+        );
+        tensors.insert(
+            format!("{p}.post_attention_norm.weight"),
+            tensor(
+                &format!("{p}.post_attention_norm.weight"),
+                &[128],
+                &vec![1.0; 128],
+            ),
+        );
+        tensors.insert(
+            format!("{p}.ffn_up.weight"),
+            pq2_rect(&format!("{p}.ffn_up.weight"), 128, 128, seed_base + 1),
+        );
+        tensors.insert(
+            format!("{p}.ffn_gate.weight"),
+            pq2_rect(&format!("{p}.ffn_gate.weight"), 128, 128, seed_base + 2),
+        );
+        tensors.insert(
+            format!("{p}.ffn_down.weight"),
+            pq2_rect(&format!("{p}.ffn_down.weight"), 128, 128, seed_base + 3),
+        );
+        if layer < 3 {
+            tensors.insert(
+                format!("{p}.attn_qkv.weight"),
+                pq2_rect(&format!("{p}.attn_qkv.weight"), 128, 384, seed_base + 4),
+            );
+            tensors.insert(
+                format!("{p}.attn_gate.weight"),
+                pq2_rect(&format!("{p}.attn_gate.weight"), 128, 128, seed_base + 5),
+            );
+            tensors.insert(
+                format!("{p}.ssm_conv1d.weight"),
+                f32_pattern(&format!("{p}.ssm_conv1d.weight"), &[4, 384], 0.125),
+            );
+            tensors.insert(
+                format!("{p}.ssm_dt.bias"),
+                tensor(&format!("{p}.ssm_dt.bias"), &[1], &[0.125]),
+            );
+            tensors.insert(
+                format!("{p}.ssm_a"),
+                tensor(&format!("{p}.ssm_a"), &[1], &[-0.25]),
+            );
+            tensors.insert(
+                format!("{p}.ssm_beta.weight"),
+                f32_pattern(&format!("{p}.ssm_beta.weight"), &[128, 1], 0.0625),
+            );
+            tensors.insert(
+                format!("{p}.ssm_alpha.weight"),
+                f32_pattern(&format!("{p}.ssm_alpha.weight"), &[128, 1], -0.0625),
+            );
+            tensors.insert(
+                format!("{p}.ssm_norm.weight"),
+                tensor(&format!("{p}.ssm_norm.weight"), &[128], &vec![1.0; 128]),
+            );
+            tensors.insert(
+                format!("{p}.ssm_out.weight"),
+                pq2_rect(&format!("{p}.ssm_out.weight"), 128, 128, seed_base + 6),
+            );
+        } else {
+            tensors.insert(
+                format!("{p}.attn_q.weight"),
+                pq2_rect(&format!("{p}.attn_q.weight"), 128, 256, seed_base + 4),
+            );
+            tensors.insert(
+                format!("{p}.attn_k.weight"),
+                pq2_rect(&format!("{p}.attn_k.weight"), 128, 128, seed_base + 5),
+            );
+            tensors.insert(
+                format!("{p}.attn_v.weight"),
+                pq2_rect(&format!("{p}.attn_v.weight"), 128, 128, seed_base + 6),
+            );
+            tensors.insert(
+                format!("{p}.attn_output.weight"),
+                pq2_rect(&format!("{p}.attn_output.weight"), 128, 128, seed_base + 7),
+            );
+            tensors.insert(
+                format!("{p}.attn_q_norm.weight"),
+                tensor(&format!("{p}.attn_q_norm.weight"), &[128], &vec![1.0; 128]),
+            );
+            tensors.insert(
+                format!("{p}.attn_k_norm.weight"),
+                tensor(&format!("{p}.attn_k_norm.weight"), &[128], &vec![1.0; 128]),
+            );
+        }
+    }
+    Model {
+        metadata,
+        tensors,
+        identity: "four-layer-sparse-heterogeneous-pq2".to_owned(),
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Builds stacked RankOne + sparse heterogeneous-rank MultiRankAdapter pairs across 4 layers."
+)]
+fn build_sparse_heterogeneous_adapters(base: &Model) -> Result<(RankOneAdapter, MultiRankAdapter)> {
+    let mut r1_tensors = BTreeMap::new();
+    for (idx, target) in [
+        "blk.0.ffn_down.weight",
+        "blk.1.ffn_down.weight",
+        "blk.2.ffn_down.weight",
+        "blk.3.ffn_down.weight",
+        "blk.0.ssm_out.weight",
+        "blk.3.attn_output.weight",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a_vals: Vec<f32> = (0..128)
+            .map(|i| if (i + idx) % 3 == 0 { 0.125 } else { -0.0625 })
+            .collect();
+        let b_vals: Vec<f32> = (0..128)
+            .map(|i| if (i + idx) % 2 == 0 { 0.25 } else { -0.125 })
+            .collect();
+        r1_tensors.insert(
+            format!("{target}.lora_a"),
+            tensor(&format!("{target}.lora_a"), &[128, 1], &a_vals),
+        );
+        r1_tensors.insert(
+            format!("{target}.lora_b"),
+            tensor(&format!("{target}.lora_b"), &[1, 128], &b_vals),
+        );
+    }
+    let r1_model = Model {
+        metadata: BTreeMap::from([
+            ("general.architecture".into(), MetadataValue::from("qwen35")),
+            ("general.type".into(), MetadataValue::from("adapter")),
+            ("adapter.type".into(), MetadataValue::from("lora")),
+            ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
+        ]),
+        tensors: r1_tensors,
+        identity: "r1-sparse-heterogeneous".into(),
+    };
+    let rank_one = RankOneAdapter::from_model(r1_model, base)?;
+
+    let f16_bytes = |vals: &[f32]| -> crate::model::TensorBytes {
+        vals.iter()
+            .flat_map(|v| crate::kernels::half_bits(*v).to_le_bytes())
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let mut mr_tensors = BTreeMap::new();
+    // blk.1.ffn_down.weight and blk.2.ffn_down.weight are omitted intentionally!
+    for (idx, (target, in_f, out_f, rank)) in [
+        ("blk.0.ffn_down.weight", 128_usize, 128_usize, 2_usize),
+        ("blk.3.ffn_down.weight", 128, 128, 4),
+        ("blk.3.attn_q.weight", 128, 256, 4),
+        ("blk.3.attn_k.weight", 128, 128, 4),
+        ("blk.3.attn_v.weight", 128, 128, 4),
+        ("blk.3.attn_output.weight", 128, 128, 4),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a_vals: Vec<f32> = (0..in_f * rank)
+            .map(|i| match (i + idx) % 5 {
+                0 => 0.125,
+                1 => -0.0625,
+                2 => 0.03125,
+                3 => -0.125,
+                _ => 0.0625,
+            })
+            .collect();
+        let b_vals: Vec<f32> = (0..rank * out_f)
+            .map(|i| match (i + idx) % 4 {
+                0 => 0.25,
+                1 => -0.125,
+                2 => 0.0625,
+                _ => -0.03125,
+            })
+            .collect();
+        mr_tensors.insert(
+            format!("{target}.lora_a"),
+            Tensor {
+                name: format!("{target}.lora_a"),
+                dimensions: vec![in_f, rank],
+                kind: 1,
+                data: f16_bytes(&a_vals),
+            },
+        );
+        mr_tensors.insert(
+            format!("{target}.lora_b"),
+            Tensor {
+                name: format!("{target}.lora_b"),
+                dimensions: vec![rank, out_f],
+                kind: 1,
+                data: f16_bytes(&b_vals),
+            },
+        );
+    }
+    let mr_model = Model {
+        metadata: BTreeMap::from([
+            ("general.architecture".into(), MetadataValue::from("qwen35")),
+            ("general.type".into(), MetadataValue::from("adapter")),
+            ("adapter.type".into(), MetadataValue::from("lora")),
+            ("adapter.lora.alpha".into(), MetadataValue::from(4.0_f32)),
+            ("adapter.lora_alpha".into(), MetadataValue::from(4.0_f32)),
+        ]),
+        tensors: mr_tensors,
+        identity: "d".repeat(64),
+    };
+    let multi_rank = MultiRankAdapter::from_model(base, &mr_model, MultiRankPolicy::NpuFriendly)?;
+    assert_eq!(multi_rank.max_rank(), 4);
+    assert!(!multi_rank.has_target("blk.1.ffn_down.weight"));
+    Ok((rank_one, multi_rank))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Evaluates a single layer FFN decode with explicit executor and stacked adapters."
+)]
+fn eval_layer_ffn_decode(
+    geometry: &Geometry,
+    transforms: &Transforms,
+    arithmetic: Arithmetic,
+    tensors: [&Tensor; 3],
+    adapters: ActiveAdapters<'_>,
+    input: &[f32],
+    residual: Option<&[f32]>,
+    executor: Option<&mut RecordingFfnExecutor>,
+) -> Result<(Vec<f32>, crate::graph::fusion::FusionStatistics)> {
+    let mut projection = ProjectionScratch {
+        matvec: arithmetic.scratch(MatvecBackend::Scalar),
+        ..ProjectionScratch::default()
+    };
+    let mut adapter_scratch = AdapterScratch::new(
+        MatvecBackend::Scalar,
+        matches!(arithmetic, Arithmetic::PinnedSwift),
+    );
+    let mut evaluation = Evaluation {
+        geometry,
+        arithmetic,
+        transforms,
+        position: 0,
+        mrope_positions: [0; 4],
+        frequencies_ready: false,
+        projection: &mut projection,
+        adapters,
+        adapter_scratch: &mut adapter_scratch,
+        executor: executor.map(as_executor),
+    };
+    let mut output = Vec::new();
+    let [gate, up, down] = tensors;
+    if !evaluation.try_project_ffn_chain_into(gate, up, down, input, residual, &mut output)? {
+        let mut gate_out = Vec::new();
+        let mut up_out = Vec::new();
+        evaluation.project_ffn_swiglu_into(gate, up, down, input, &mut gate_out, &mut up_out)?;
+        evaluation.project_into(down, &up_out, &mut output)?;
+        if let Some(res) = residual {
+            output.iter_mut().zip(res).for_each(|(out, r)| *out += *r);
+        }
+    }
+    Ok((output, evaluation.projection.fusions))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Evaluates tiled FFN prefill with explicit executor and stacked adapters."
+)]
+fn eval_layer_ffn_tile(
+    geometry: &Geometry,
+    transforms: &Transforms,
+    arithmetic: Arithmetic,
+    tensors: [&Tensor; 3],
+    adapters: ActiveAdapters<'_>,
+    inputs: &[Vec<f32>],
+    residuals: &[Vec<f32>],
+    executor: &mut RecordingFfnExecutor,
+) -> Result<Vec<Vec<f32>>> {
+    let [gate, up, down] = tensors;
+    let mut projector = ProjectionTile::with_backend(MatvecBackend::Scalar);
+    let mut projection_scratch = arithmetic.scratch(MatvecBackend::Scalar);
+    let mut adapter_scratch = AdapterScratch::new(
+        MatvecBackend::Scalar,
+        matches!(arithmetic, Arithmetic::PinnedSwift),
+    );
+    let mut outputs = vec![Vec::new(); inputs.len()];
+    let mut transformed = vec![Vec::new(); inputs.len()];
+    let mut gate_out = vec![Vec::new(); inputs.len()];
+    let mut up_out = vec![Vec::new(); inputs.len()];
+    assert!(!try_project_tile_ffn_chain(
+        transforms,
+        geometry,
+        arithmetic,
+        adapters,
+        TileReuse::default(),
+        tensors,
+        inputs,
+        Some(residuals),
+        &mut outputs,
+        &mut transformed,
+        &projector,
+        Some(as_executor(executor)),
+        &|| Ok(()),
+    )?);
+    let reuse = project_tile_ffn_swiglu(
+        transforms,
+        geometry,
+        arithmetic,
+        adapters,
+        &mut adapter_scratch,
+        &mut projection_scratch,
+        TileReuse::default(),
+        gate,
+        up,
+        down,
+        inputs,
+        &mut gate_out,
+        &mut up_out,
+        &mut transformed,
+        &mut projector,
+        Some(as_executor(executor)),
+        &|| Ok(()),
+    )?;
+    assert_eq!(executor.chain_calls, 0);
+    assert_eq!(executor.swiglu_calls, inputs.len());
+    let _ = project_tile(
+        transforms,
+        geometry,
+        arithmetic,
+        adapters,
+        &mut adapter_scratch,
+        &mut projection_scratch,
+        reuse,
+        down,
+        &up_out,
+        &mut outputs,
+        &mut transformed,
+        &mut projector,
+        Some(as_executor(executor)),
+        &|| Ok(()),
+    )?;
+    for (out_row, res_row) in outputs.iter_mut().zip(residuals) {
+        out_row
+            .iter_mut()
+            .zip(res_row)
+            .for_each(|(out, res)| *out += *res);
+    }
+    Ok(outputs)
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Verifies per-layer omitted chain retention, targeted SwiGLU retention, 0-ULP decode/tiled parity, and full 4-layer graph execution for sparse heterogeneous MultiRankAdapter."
+)]
+fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp_decode_and_tiled()
+-> Result<()> {
+    use crate::Decoder as _;
+    use crate::graph::{KvCachePolicy, Qwen35};
+
+    let base_model = build_sparse_heterogeneous_four_layer_pq2_model();
+    let (rank_one, multi_rank) = build_sparse_heterogeneous_adapters(&base_model)?;
+    let geometry = Geometry {
+        embedding: 128,
+        feed_forward: 128,
+        heads: 1,
+        kv_heads: 1,
+        head: 128,
+        rope: 64,
+        rope_sections: [32, 0, 0, 0],
+        rope_base: 10_000.0,
+        epsilon: 1e-6,
+        ssm_head: 128,
+        ssm_keys: 1,
+        ssm_values: 1,
+        convolution: 4,
+    };
+    let transforms = Transforms::read(&base_model, &geometry)?;
+    let inputs: Vec<Vec<f32>> = vec![
+        (0..128)
+            .map(|i| if i % 2 == 0 { 0.375 } else { -0.25 })
+            .collect(),
+        (0..128)
+            .map(|i| if i % 3 == 0 { -0.5 } else { 0.125 })
+            .collect(),
+    ];
+    let residuals: Vec<Vec<f32>> = vec![vec![0.125; 128], vec![-0.25; 128]];
+
+    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+        // 1. blk.1 (omitted from MultiRankAdapter) retains fused external_ffn_chain_lora even at scale=0.5!
+        let blk1_tensors = [
+            &base_model.tensors["blk.1.ffn_gate.weight"],
+            &base_model.tensors["blk.1.ffn_up.weight"],
+            &base_model.tensors["blk.1.ffn_down.weight"],
+        ];
+        let mut blk1_exec = RecordingFfnExecutor {
+            arithmetic,
+            transforms: Transforms::read(&base_model, &geometry)?,
+            geometry: geometry.clone(),
+            allow_chain_lora: true,
+            chain_calls: 0,
+            swiglu_calls: 0,
+            project_calls: 0,
+        };
+        let (blk1_active, blk1_stats) = eval_layer_ffn_decode(
+            &geometry,
+            &transforms,
+            arithmetic,
+            blk1_tensors,
+            ActiveAdapters {
+                rank_one: Some(&rank_one),
+                rank_one_scale: 1.3,
+                multi_rank: Some(&multi_rank),
+                multi_rank_scale: 0.5,
+            },
+            &inputs[0],
+            None,
+            Some(&mut blk1_exec),
+        )?;
+        assert_eq!(blk1_stats.external_ffn_chain.completed, 1);
+        assert_eq!(blk1_stats.external_ffn_swiglu.completed, 0);
+        assert_eq!(blk1_exec.chain_calls, 1);
+        assert_eq!(blk1_exec.swiglu_calls, 0);
+        let (blk1_cpu_oracle, _) = eval_layer_ffn_decode(
+            &geometry,
+            &transforms,
+            arithmetic,
+            blk1_tensors,
+            ActiveAdapters::rank_one(Some(&rank_one), 1.3),
+            &inputs[0],
+            None,
+            None,
+        )?;
+        same_bits(
+            &blk1_active,
+            &blk1_cpu_oracle,
+            "blk.1 omitted MultiRank retains chain_lora with 0-ULP parity",
+        );
+
+        // 2. Targeted ffn_down layers (blk.0 rank 2, blk.3 rank 4) keep chain_lora at scale=0.0
+        //    (0-ULP with Orca-only) and keep external_ffn_swiglu fused at scale=0.5 (0-ULP vs CPU decode & tiled prefill).
+        for layer_idx in [0_usize, 3] {
+            let layer_tensors = [
+                &base_model.tensors[&format!("blk.{layer_idx}.ffn_gate.weight")],
+                &base_model.tensors[&format!("blk.{layer_idx}.ffn_up.weight")],
+                &base_model.tensors[&format!("blk.{layer_idx}.ffn_down.weight")],
+            ];
+            let mut orca_exec = RecordingFfnExecutor {
+                arithmetic,
+                transforms: Transforms::read(&base_model, &geometry)?,
+                geometry: geometry.clone(),
+                allow_chain_lora: true,
+                chain_calls: 0,
+                swiglu_calls: 0,
+                project_calls: 0,
+            };
+            let (orca_only, orca_stats) = eval_layer_ffn_decode(
+                &geometry,
+                &transforms,
+                arithmetic,
+                layer_tensors,
+                ActiveAdapters::rank_one(Some(&rank_one), 1.3),
+                &inputs[0],
+                Some(&residuals[0]),
+                Some(&mut orca_exec),
+            )?;
+            let mut zero_exec = RecordingFfnExecutor {
+                arithmetic,
+                transforms: Transforms::read(&base_model, &geometry)?,
+                geometry: geometry.clone(),
+                allow_chain_lora: true,
+                chain_calls: 0,
+                swiglu_calls: 0,
+                project_calls: 0,
+            };
+            let (stacked_zero, zero_stats) = eval_layer_ffn_decode(
+                &geometry,
+                &transforms,
+                arithmetic,
+                layer_tensors,
+                ActiveAdapters {
+                    rank_one: Some(&rank_one),
+                    rank_one_scale: 1.3,
+                    multi_rank: Some(&multi_rank),
+                    multi_rank_scale: 0.0,
+                },
+                &inputs[0],
+                Some(&residuals[0]),
+                Some(&mut zero_exec),
+            )?;
+            assert_eq!(orca_stats.external_ffn_chain.completed, 1);
+            assert_eq!(zero_stats.external_ffn_chain.completed, 1);
+            same_bits(
+                &stacked_zero,
+                &orca_only,
+                &format!("blk.{layer_idx} scale=0.0 matches Orca-only 0-ULP"),
+            );
+
+            let active_adapters = ActiveAdapters {
+                rank_one: Some(&rank_one),
+                rank_one_scale: 1.3,
+                multi_rank: Some(&multi_rank),
+                multi_rank_scale: 0.5,
+            };
+            let mut active_exec = RecordingFfnExecutor {
+                arithmetic,
+                transforms: Transforms::read(&base_model, &geometry)?,
+                geometry: geometry.clone(),
+                allow_chain_lora: true,
+                chain_calls: 0,
+                swiglu_calls: 0,
+                project_calls: 0,
+            };
+            let (stacked_active, active_stats) = eval_layer_ffn_decode(
+                &geometry,
+                &transforms,
+                arithmetic,
+                layer_tensors,
+                active_adapters,
+                &inputs[0],
+                Some(&residuals[0]),
+                Some(&mut active_exec),
+            )?;
+            assert_eq!(active_stats.external_ffn_chain.completed, 0);
+            assert_eq!(active_stats.external_ffn_swiglu.completed, 1);
+            assert_eq!(active_exec.chain_calls, 0);
+            assert_eq!(active_exec.swiglu_calls, 1);
+            assert_eq!(active_exec.project_calls, 1);
+            let (cpu_oracle, _) = eval_layer_ffn_decode(
+                &geometry,
+                &transforms,
+                arithmetic,
+                layer_tensors,
+                active_adapters,
+                &inputs[0],
+                Some(&residuals[0]),
+                None,
+            )?;
+            same_bits(
+                &stacked_active,
+                &cpu_oracle,
+                &format!("blk.{layer_idx} scale=0.5 decode vs CPU oracle"),
+            );
+            let mut tile_exec = RecordingFfnExecutor {
+                arithmetic,
+                transforms: Transforms::read(&base_model, &geometry)?,
+                geometry: geometry.clone(),
+                allow_chain_lora: true,
+                chain_calls: 0,
+                swiglu_calls: 0,
+                project_calls: 0,
+            };
+            let tiled = eval_layer_ffn_tile(
+                &geometry,
+                &transforms,
+                arithmetic,
+                layer_tensors,
+                active_adapters,
+                &inputs,
+                &residuals,
+                &mut tile_exec,
+            )?;
+            same_bits(
+                &tiled[0],
+                &cpu_oracle,
+                &format!("blk.{layer_idx} scale=0.5 tiled[0] vs CPU oracle"),
+            );
+        }
+    }
+
+    // 3. Full 4-layer Qwen35 graph verification (scale=0.0 bit-exact with Orca-only,
+    //    scale=0.5 mixed chain_lora=2 + swiglu=2 fusion counts, and 0-ULP tiled vs CPU decode).
+    let make_graph = |mr: Option<(MultiRankAdapter, f32)>| -> Result<Qwen35> {
+        let m = build_sparse_heterogeneous_four_layer_pq2_model();
+        let (r1, _) = build_sparse_heterogeneous_adapters(&m)?;
+        Qwen35::with_adapters_and_kv(
+            m,
+            32,
+            64 * 1024 * 1024,
+            MatvecBackend::Scalar,
+            Some((r1, 1.3)),
+            mr,
+            KvCachePolicy::F16,
+        )
+    };
+    let make_exec = |allow_chain_lora: bool| -> Result<RecordingFfnExecutor> {
+        Ok(RecordingFfnExecutor {
+            arithmetic: Arithmetic::Source,
+            transforms: Transforms::read(&base_model, &geometry)?,
+            geometry: geometry.clone(),
+            allow_chain_lora,
+            chain_calls: 0,
+            swiglu_calls: 0,
+            project_calls: 0,
+        })
+    };
+
+    let mut orca_graph = make_graph(None)?;
+    orca_graph.set_projection_executor(Some(Box::new(make_exec(true)?)));
+    let orca_logits = orca_graph.evaluate(0)?;
+
+    let mut zero_graph = make_graph(Some((multi_rank.clone(), 0.0)))?;
+    zero_graph.set_projection_executor(Some(Box::new(make_exec(true)?)));
+    let zero_logits = zero_graph.evaluate(0)?;
+    assert_eq!(
+        zero_graph.fusion_statistics().external_ffn_chain.completed,
+        4
+    );
+    assert_eq!(
+        zero_graph.fusion_statistics().external_ffn_swiglu.completed,
+        0
+    );
+    same_bits(
+        &zero_logits,
+        &orca_logits,
+        "4-layer graph scale=0.0 vs Orca-only",
+    );
+
+    let mut active_graph = make_graph(Some((multi_rank.clone(), 0.5)))?;
+    active_graph.set_projection_executor(Some(Box::new(make_exec(true)?)));
+    let _ = active_graph.evaluate(0)?;
+    assert_eq!(
+        active_graph
+            .fusion_statistics()
+            .external_ffn_chain
+            .completed,
+        2
+    );
+    assert_eq!(
+        active_graph
+            .fusion_statistics()
+            .external_ffn_swiglu
+            .completed,
+        2
+    );
+
+    let mut cpu_seq = make_graph(Some((multi_rank.clone(), 0.5)))?;
+    cpu_seq.ingest(0)?;
+    cpu_seq.ingest(1)?;
+    let seq_logits = cpu_seq.evaluate(2)?;
+
+    let mut cpu_tiled = make_graph(Some((multi_rank, 0.5)))?;
+    let scratch = cpu_tiled.tiled_prefill_scratch_bytes(8)?;
+    cpu_tiled = cpu_tiled.with_tiled_prefill(8, scratch)?;
+    cpu_tiled.ingest_block(&[0, 1], &|| Ok(()))?;
+    let tiled_logits = cpu_tiled.evaluate(2)?;
+    same_bits(
+        &tiled_logits,
+        &seq_logits,
+        "4-layer graph scale=0.5 tiled prefill vs CPU decode",
+    );
+    Ok(())
+}

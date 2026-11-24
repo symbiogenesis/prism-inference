@@ -103,6 +103,7 @@ pub(crate) struct ProjectionTile {
     row_parallelism: RowParallelism,
     pub(crate) packed_projections: u64,
     pub(crate) decoded_blocks: u64,
+    pub(crate) trellis: super::trellis::TrellisScratch,
 }
 
 impl ProjectionTile {
@@ -126,6 +127,16 @@ impl ProjectionTile {
 
     pub(crate) const fn row_parallelism(&self) -> &RowParallelism {
         &self.row_parallelism
+    }
+
+    pub(crate) const fn requested_backend(&self) -> MatvecBackend {
+        self.backend
+    }
+
+    pub(crate) const fn row_parallelism_and_trellis(
+        &mut self,
+    ) -> (&RowParallelism, &mut super::trellis::TrellisScratch) {
+        (&self.row_parallelism, &mut self.trellis)
     }
 
     #[cfg(test)]

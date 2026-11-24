@@ -6,7 +6,7 @@ use super::{
     ActiveAdapters, Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, Layer,
     LayerDelta, LayerState, Qwen35, RecurrentAttention, Transforms, add, add_finite,
     attention_gate, checked_product, finite, l2_norm, recurrent_decay, resize_attention_scores,
-    resize_into, rope_frequencies, row_into, sigmoid, small_float,
+    resize_into, rope_frequencies, sigmoid, small_float,
 };
 use crate::kernels::{
     MatvecBackend, RowParallelism,
@@ -1062,7 +1062,8 @@ impl Qwen35 {
         let mrope_base = self.mrope_position;
         for (token, hidden) in tokens.iter().zip(&mut tile.hidden) {
             check()?;
-            row_into(&self.embedding, usize::try_from(*token)?, hidden)?;
+            self.embedding
+                .row_into(usize::try_from(*token)?, hidden, &mut tile.projector.trellis.tmp)?;
             if self.transforms.inverse_embedding {
                 self.transforms
                     .rotate_with_parallelism(hidden, tile.projector.row_parallelism())?;
@@ -1392,34 +1393,79 @@ impl Qwen35 {
             check()?;
         }
         if let Some(logits) = logits {
-            let reuse = normalize_for_tile_into(
-                &self.transforms,
-                &self.geometry,
-                self.arithmetic,
-                &self.output_norm,
-                &self.output,
-                &tile.hidden[..count],
-                &mut tile.normalized[..count],
-                &mut tile.transformed[..count],
-                tile.projector.row_parallelism(),
-            )?;
-            check()?;
-            let _ = project_tile(
-                &self.transforms,
-                &self.geometry,
-                self.arithmetic,
-                adapters,
-                &mut self.workspace.adapter,
-                &mut self.workspace.projection.matvec,
-                reuse,
-                &self.output,
-                &tile.normalized[..count],
-                logits,
-                &mut tile.transformed[..count],
-                &mut tile.projector,
-                executor,
-                check,
-            )?;
+            match &self.output {
+                super::OutputHead::Plain(output_tensor) => {
+                    let reuse = normalize_for_tile_into(
+                        &self.transforms,
+                        &self.geometry,
+                        self.arithmetic,
+                        &self.output_norm,
+                        output_tensor,
+                        &tile.hidden[..count],
+                        &mut tile.normalized[..count],
+                        &mut tile.transformed[..count],
+                        tile.projector.row_parallelism(),
+                    )?;
+                    check()?;
+                    let _ = project_tile(
+                        &self.transforms,
+                        &self.geometry,
+                        self.arithmetic,
+                        adapters,
+                        &mut self.workspace.adapter,
+                        &mut self.workspace.projection.matvec,
+                        reuse,
+                        output_tensor,
+                        &tile.normalized[..count],
+                        logits,
+                        &mut tile.transformed[..count],
+                        &mut tile.projector,
+                        executor,
+                        check,
+                    )?;
+                }
+                super::OutputHead::Trellis(weight) => {
+                    super::normalize_tile_plain_into(
+                        &self.geometry,
+                        self.arithmetic,
+                        &self.output_norm,
+                        &tile.hidden[..count],
+                        &mut tile.normalized[..count],
+                        tile.projector.row_parallelism(),
+                    )?;
+                    check()?;
+                    let backend = tile.projector.requested_backend();
+                    let (row_parallelism, trellis) = tile.projector.row_parallelism_and_trellis();
+                    crate::kernels::trellis::trellis_matmul_tokens_into(
+                        weight,
+                        &tile.normalized[..count],
+                        logits,
+                        backend,
+                        row_parallelism,
+                        trellis,
+                    )?;
+                }
+                super::OutputHead::TrellisBanded(head) => {
+                    super::normalize_tile_plain_into(
+                        &self.geometry,
+                        self.arithmetic,
+                        &self.output_norm,
+                        &tile.hidden[..count],
+                        &mut tile.normalized[..count],
+                        tile.projector.row_parallelism(),
+                    )?;
+                    check()?;
+                    let backend = tile.projector.requested_backend();
+                    let (row_parallelism, trellis) = tile.projector.row_parallelism_and_trellis();
+                    head.matmul_tokens_into(
+                        &tile.normalized[..count],
+                        logits,
+                        backend,
+                        row_parallelism,
+                        trellis,
+                    )?;
+                }
+            }
             for row in logits {
                 if row.len() != self.vocabulary {
                     return Err(invalid("invalid tiled verification vocabulary extent"));
@@ -3715,7 +3761,8 @@ fn project_tile_triple<'a>(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Keep exact transforms, original-basis adapter and bounded tile storage explicit."
+    clippy::too_many_lines,
+    reason = "Keep exact transforms, trellis branch, original-basis adapter and bounded tile storage explicit."
 )]
 fn project_tile<'a>(
     transforms: &Transforms,
@@ -3730,9 +3777,32 @@ fn project_tile<'a>(
     outputs: &mut [Vec<f32>],
     transformed: &mut [Vec<f32>],
     projector: &mut ProjectionTile,
-    executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+    mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<TileReuse<'a>> {
+    if let Some(tw) = transforms.trellis_weight(&tensor.name) {
+        if let Some(exec) = executor.as_deref_mut()
+            && Transforms::executor_claims_weight(Some(&*exec), tensor)
+        {
+            return Err(invalid(
+                "trellis weight cannot be offloaded to an external executor",
+            ));
+        }
+        let backend = projector.requested_backend();
+        let (row_parallelism, trellis) = projector.row_parallelism_and_trellis();
+        crate::kernels::trellis::trellis_matmul_tokens_into(
+            tw,
+            inputs,
+            outputs,
+            backend,
+            row_parallelism,
+            trellis,
+        )?;
+        if adapters.is_any_loaded() {
+            adapters.apply_linear_tokens(&tensor.name, inputs, outputs, adapter_scratch)?;
+        }
+        return Ok(TileReuse::default());
+    }
     let basis = transforms.basis(tensor);
     let reuse_basis = previous
         .basis

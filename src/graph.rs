@@ -1482,6 +1482,7 @@ struct ProjectionScratch {
     transformed: Vec<f32>,
     pre_transformed_len: Option<usize>,
     matvec: MatvecScratch,
+    trellis: crate::kernels::trellis::TrellisScratch,
     fusions: FusionStatistics,
     #[cfg(test)]
     transforms: usize,
@@ -1623,6 +1624,195 @@ struct StagedFfnCompaction {
 }
 
 #[derive(Default)]
+#[derive(Clone)]
+pub(super) struct TrellisBandedHead {
+    pub(super) bands: Vec<crate::kernels::trellis::TrellisWeight>,
+    pub(super) band_row_offsets: Vec<usize>,
+    pub(super) vocab_gather: Box<[u32]>,
+}
+
+impl TrellisBandedHead {
+    pub(super) fn row_into(
+        &self,
+        token: usize,
+        output: &mut Vec<f32>,
+        tmp: &mut Vec<f32>,
+    ) -> Result<()> {
+        let &concat_row = self
+            .vocab_gather
+            .get(token)
+            .ok_or_else(|| invalid("token id out of banded embedding vocabulary range"))?;
+        let row = usize::try_from(concat_row)?;
+        let band_idx = self
+            .band_row_offsets
+            .partition_point(|&start| start <= row)
+            .checked_sub(1)
+            .ok_or_else(|| invalid("banded embedding offset underflow"))?;
+        let band = self
+            .bands
+            .get(band_idx)
+            .ok_or_else(|| invalid("banded embedding band index out of range"))?;
+        let local_row = row - self.band_row_offsets[band_idx];
+        crate::kernels::trellis::trellis_get_row(band, local_row, output, tmp)
+    }
+
+    pub(super) fn matvec_into(
+        &self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+        backend: MatvecBackend,
+        parallelism: &RowParallelism,
+        scratch: &mut crate::kernels::trellis::TrellisScratch,
+    ) -> Result<()> {
+        let total = self.vocab_gather.len();
+        if scratch.head_concat.len() != total {
+            scratch.head_concat.resize(total, 0.0);
+        }
+        let mut concat = std::mem::take(&mut scratch.head_concat);
+        let mut band_out = std::mem::take(&mut scratch.band_out);
+        let result = (|| -> Result<()> {
+            for (band, &row0) in self.bands.iter().zip(self.band_row_offsets.iter()) {
+                crate::kernels::trellis::trellis_matvec_into(
+                    band,
+                    input,
+                    &mut band_out,
+                    backend,
+                    parallelism,
+                    scratch,
+                )?;
+                concat[row0..row0 + band.n].copy_from_slice(&band_out);
+            }
+            prepare(output, total)?;
+            for &concat_idx in &self.vocab_gather {
+                output.push(concat[usize::try_from(concat_idx)?]);
+            }
+            Ok(())
+        })();
+        scratch.head_concat = concat;
+        scratch.band_out = band_out;
+        result
+    }
+
+    pub(super) fn matmul_tokens_into(
+        &self,
+        inputs: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+        backend: MatvecBackend,
+        parallelism: &RowParallelism,
+        scratch: &mut crate::kernels::trellis::TrellisScratch,
+    ) -> Result<()> {
+        if inputs.len() != outputs.len() {
+            return Err(invalid("banded trellis token batch counts differ"));
+        }
+        let count = inputs.len();
+        if count == 0 {
+            return Ok(());
+        }
+        let total = self.vocab_gather.len();
+        let mut concat_tokens = std::mem::take(&mut scratch.head_concat_tokens);
+        if concat_tokens.len() < count {
+            concat_tokens.resize_with(count, Vec::new);
+        }
+        for token_buf in &mut concat_tokens[..count] {
+            if token_buf.len() != total {
+                token_buf.resize(total, 0.0);
+            }
+        }
+        let mut band_outs = vec![Vec::new(); count];
+        let result = (|| -> Result<()> {
+            for (band, &row0) in self.bands.iter().zip(self.band_row_offsets.iter()) {
+                crate::kernels::trellis::trellis_matmul_tokens_into(
+                    band,
+                    inputs,
+                    &mut band_outs,
+                    backend,
+                    parallelism,
+                    scratch,
+                )?;
+                for (token_idx, band_out) in band_outs.iter().enumerate() {
+                    concat_tokens[token_idx][row0..row0 + band.n].copy_from_slice(band_out);
+                }
+            }
+            for (out_row, concat) in outputs.iter_mut().zip(&concat_tokens[..count]) {
+                prepare(out_row, total)?;
+                for &concat_idx in &self.vocab_gather {
+                    out_row.push(concat[usize::try_from(concat_idx)?]);
+                }
+            }
+            Ok(())
+        })();
+        scratch.head_concat_tokens = concat_tokens;
+        result
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct TrellisWeights {
+    pub(super) weights: BTreeMap<String, crate::kernels::trellis::TrellisWeight>,
+}
+
+#[derive(Clone)]
+pub(super) enum EmbeddingSource {
+    Plain(Tensor),
+    Trellis(crate::kernels::trellis::TrellisWeight),
+    TrellisBanded(TrellisBandedHead),
+}
+
+impl EmbeddingSource {
+    const fn is_plain(&self) -> bool {
+        matches!(self, Self::Plain(_))
+    }
+
+    pub(super) fn row_into(&self, token: usize, output: &mut Vec<f32>, tmp: &mut Vec<f32>) -> Result<()> {
+        match self {
+            Self::Plain(tensor) => row_into(tensor, token, output),
+            Self::Trellis(weight) => crate::kernels::trellis::trellis_get_row(weight, token, output, tmp),
+            Self::TrellisBanded(head) => head.row_into(token, output, tmp),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum OutputHead {
+    Plain(Tensor),
+    Trellis(crate::kernels::trellis::TrellisWeight),
+    TrellisBanded(TrellisBandedHead),
+}
+
+impl OutputHead {
+    const fn plain(&self) -> Option<&Tensor> {
+        match self {
+            Self::Plain(tensor) => Some(tensor),
+            Self::Trellis(_) | Self::TrellisBanded(_) => None,
+        }
+    }
+}
+
+fn normalize_tile_plain_into(
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    weight: &[f32],
+    hidden: &[Vec<f32>],
+    normalized: &mut [Vec<f32>],
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    if hidden.len() > 1 && parallelism.workers() > 1 {
+        let epsilon = geometry.epsilon;
+        parallelism.update_chunks(normalized, 1, |base_tok, chunk| {
+            for (offset, norm_out) in chunk.iter_mut().enumerate() {
+                arithmetic.normalize(&hidden[base_tok + offset], weight, epsilon, norm_out)?;
+            }
+            Ok(())
+        })
+    } else {
+        for (h, norm_out) in hidden.iter().zip(normalized.iter_mut()) {
+            arithmetic.normalize(h, weight, geometry.epsilon, norm_out)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 struct Transforms {
     block: usize,
     weights: BTreeSet<String>,
@@ -1631,9 +1821,13 @@ struct Transforms {
     signs: BTreeMap<usize, Vec<f32>>,
     tensor_signs: BTreeMap<String, Vec<f32>>,
     compacted_ffn: weight_patch::CompactedFfnRuntime,
+    trellis: Option<TrellisWeights>,
 }
 
 impl Transforms {
+    pub(super) fn trellis_weight(&self, name: &str) -> Option<&crate::kernels::trellis::TrellisWeight> {
+        self.trellis.as_ref().and_then(|map| map.weights.get(name))
+    }
     #[expect(
         clippy::too_many_lines,
         reason = "Keep validation and graph operation order auditable together."
@@ -1785,6 +1979,7 @@ impl Transforms {
             signs,
             tensor_signs: BTreeMap::new(),
             compacted_ffn: weight_patch::CompactedFfnRuntime::default(),
+            trellis: None,
         })
     }
 
@@ -1933,6 +2128,29 @@ impl Transforms {
                 return Err(invalid("projection group exceeds four siblings"));
             }
             let mut completed = [false; N];
+            if let Some(trellis) = &self.trellis {
+                for (index, (weight, output)) in weights.iter().zip(outputs.iter_mut()).enumerate() {
+                    if let Some(tw) = trellis.weights.get(&weight.name) {
+                        if Self::executor_claims_weight(executor.as_deref(), weight) {
+                            return Err(invalid(
+                                "trellis weights cannot be offloaded to an external executor",
+                            ));
+                        }
+                        crate::kernels::trellis::trellis_matvec_into(
+                            tw,
+                            input,
+                            output,
+                            scratch.matvec.requested_backend(),
+                            scratch.matvec.row_parallelism(),
+                            &mut scratch.trellis,
+                        )?;
+                        completed[index] = true;
+                    }
+                }
+                if completed.iter().all(|&done| done) {
+                    return Ok(());
+                }
+            }
             for index in 0..N {
                 if completed[index] {
                     continue;
@@ -2400,8 +2618,8 @@ pub struct Qwen35 {
     identity: String,
     geometry: Geometry,
     arithmetic: Arithmetic,
-    embedding: Tensor,
-    output: Tensor,
+    embedding: EmbeddingSource,
+    output: OutputHead,
     output_norm: Vec<f32>,
     transforms: Transforms,
     adapter: Option<RankOneAdapter>,
@@ -2601,12 +2819,18 @@ impl Qwen35 {
             swift_full_state,
         )?;
         for target in adapter.targets() {
-            if target == graph.embedding.name && graph.output.name == graph.embedding.name {
+            if target == "token_embd.weight"
+                && (!graph.embedding.is_plain()
+                    || graph
+                        .output
+                        .plain()
+                        .is_some_and(|out| out.name == "token_embd.weight"))
+            {
                 return Err(invalid(
                     "rank-one embedding adapter requires a separate output head",
                 ));
             }
-            if target != graph.embedding.name
+            if target != "token_embd.weight"
                 && !graph.layers.iter().any(|layer| {
                     target == layer.down.name
                         || target
@@ -2692,12 +2916,18 @@ impl Qwen35 {
         )?;
         if let Some((adapter, scale)) = rank_one_adapter {
             for target in adapter.targets() {
-                if target == graph.embedding.name && graph.output.name == graph.embedding.name {
+                if target == "token_embd.weight"
+                    && (!graph.embedding.is_plain()
+                        || graph
+                            .output
+                            .plain()
+                            .is_some_and(|out| out.name == "token_embd.weight"))
+                {
                     return Err(invalid(
                         "rank-one embedding adapter requires a separate output head",
                     ));
                 }
-                if target != graph.embedding.name
+                if target != "token_embd.weight"
                     && !graph.layers.iter().any(|layer| {
                         target == layer.down.name
                             || target
@@ -3315,18 +3545,25 @@ impl Qwen35 {
         for (destination, value) in geometry.rope_sections.iter_mut().zip(sections.iter()) {
             *destination = metadata_usize(value, "RoPE section")?;
         }
-        let embedding = tensor(&model, "token_embd.weight", &[geometry.embedding, 0])?;
-        let vocabulary = embedding.dimensions[1];
-        if vocabulary == 0 || vocabulary > 2_097_152 {
-            return Err(invalid("vocabulary size exceeds decoder bounds"));
-        }
-        let output = if model.tensors.contains_key("output.weight") {
-            tensor(&model, "output.weight", &[geometry.embedding, vocabulary])?
-        } else {
-            embedding.clone()
-        };
+        let mut trellis_consumed = BTreeSet::new();
+        let (embedding, output, vocabulary, mut trellis_map, has_trellis) =
+            load_trellis_heads_and_weights(&model, metadata, geometry.embedding, &mut trellis_consumed)?;
         let output_norm = vector(&model, "output_norm.weight", geometry.embedding)?;
-        let transforms = Transforms::read(&model, &geometry)?;
+        let mut transforms = Transforms::read(&model, &geometry)?;
+        if has_trellis {
+            if transforms.inverse_embedding
+                || transforms.weights.contains("output.weight")
+                || transforms
+                    .weights
+                    .iter()
+                    .any(|name| trellis_map.weights.contains_key(name))
+            {
+                return Err(invalid(
+                    "Hadamard transforms cannot be combined with coded trellis tensors",
+                ));
+            }
+            transforms.trellis = Some(std::mem::take(&mut trellis_map));
+        }
         let full_interval = optional_integer(metadata, "qwen35.full_attention_interval", 4)?;
         if full_interval == 0 {
             return Err(invalid("full attention interval must be positive"));
@@ -3379,7 +3616,11 @@ impl Qwen35 {
         }
         let verified_swift = matches!(
             model.identity.as_str(),
-            crate::model::swift::MODEL_SHA256 | crate::model::swift::REPACKED_PTQ1_SHA256
+            crate::model::swift::MODEL_SHA256
+                | crate::model::swift::REPACKED_PTQ1_SHA256
+                | crate::model::swift::NARIQ_2_5BPW_SHA256
+                | crate::model::swift::NARIQ_3_0BPW_SHA256
+                | crate::model::swift::NARIQ_2_0BPW_SHA256
         );
         // Model owns immutable Arc payloads throughout construction. Validate
         // every payload once, including allowed unused MTP tensors, instead of
@@ -3531,7 +3772,7 @@ impl Qwen35 {
                 )?,
             });
         }
-        reject_unconsumed_tensors(&model, &layers, block_count, mtp)?;
+        reject_unconsumed_tensors(&model, &layers, block_count, mtp, &trellis_consumed)?;
         let mut state = capacity(layer_count)?;
         for layer in &layers {
             state.push(match &layer.attention {
@@ -3583,7 +3824,10 @@ impl Qwen35 {
                 &format!("kv-{}-d256-rht3-v1", kv_cache_policy.name()),
             )
         };
-        let identity = model.identity + ":" + &contract;
+        let mut identity = model.identity + ":" + &contract;
+        if has_trellis {
+            identity.push_str(":trellis-v1");
+        }
         Ok(Self {
             provenance: Arc::new(()),
             identity,
@@ -3861,8 +4105,10 @@ impl Qwen35 {
                 }
             }
         }
-        if self.output.name == name {
-            return Some(&self.output);
+        if let Some(output) = self.output.plain()
+            && output.name == name
+        {
+            return Some(output);
         }
         None
     }
@@ -4072,7 +4318,11 @@ impl Qwen35 {
             ));
         }
         let hidden = &mut self.workspace.hidden;
-        row_into(&self.embedding, token, hidden)?;
+        self.embedding.row_into(
+            token,
+            hidden,
+            &mut self.workspace.projection.trellis.tmp,
+        )?;
         if self.transforms.inverse_embedding {
             self.transforms.rotate_with_parallelism(
                 hidden,
@@ -4311,8 +4561,38 @@ impl Qwen35 {
             timing::complete(ffn_timer);
         }
         if let Some(logits) = logits {
-            evaluation.normalize_for_into(hidden, &self.output_norm, normalized, &self.output)?;
-            evaluation.project_into(&self.output, normalized, logits)?;
+            match &self.output {
+                OutputHead::Plain(output_tensor) => {
+                    evaluation.normalize_for_into(
+                        hidden,
+                        &self.output_norm,
+                        normalized,
+                        output_tensor,
+                    )?;
+                    evaluation.project_into(output_tensor, normalized, logits)?;
+                }
+                OutputHead::Trellis(weight) => {
+                    evaluation.normalize_plain_into(hidden, &self.output_norm, normalized)?;
+                    crate::kernels::trellis::trellis_matvec_into(
+                        weight,
+                        normalized,
+                        logits,
+                        evaluation.projection.matvec.requested_backend(),
+                        evaluation.projection.matvec.row_parallelism(),
+                        &mut evaluation.projection.trellis,
+                    )?;
+                }
+                OutputHead::TrellisBanded(head) => {
+                    evaluation.normalize_plain_into(hidden, &self.output_norm, normalized)?;
+                    head.matvec_into(
+                        normalized,
+                        logits,
+                        evaluation.projection.matvec.requested_backend(),
+                        evaluation.projection.matvec.row_parallelism(),
+                        &mut evaluation.projection.trellis,
+                    )?;
+                }
+            }
             finite(logits, "output logits")?;
         }
         // Reserve every append before changing numerical state. Deltas retain
@@ -4401,6 +4681,17 @@ impl Evaluation<'_, '_, '_> {
         output: &mut Vec<f32>,
     ) -> Result<()> {
         self.project_group_into([tensor], input, [output])
+    }
+
+    fn normalize_plain_into(
+        &mut self,
+        input: &[f32],
+        weight: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.projection.pre_transformed_len = None;
+        self.arithmetic
+            .normalize(input, weight, self.geometry.epsilon, output)
     }
 
     fn normalize_for_into(
@@ -6048,17 +6339,282 @@ fn reject_unsupported(metadata: &Metadata) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keeps complete trellis validation, banded head binding, and orphan rejection together."
+)]
+fn load_trellis_heads_and_weights(
+    model: &Model,
+    metadata: &Metadata,
+    embedding_width: usize,
+    consumed: &mut BTreeSet<String>,
+) -> Result<(EmbeddingSource, OutputHead, usize, TrellisWeights, bool)> {
+    use crate::kernels::trellis::{SideTransform, TrellisDesc, TrellisWeight, validate_permutation_i32};
+
+    let trellis_meta_present = metadata.keys().any(|key| key.starts_with("trellis."));
+    let has_coded_tensor = model
+        .tensors
+        .values()
+        .any(|t| crate::kernels::is_trellis_kind(t.kind));
+    let has_trellis_side = model
+        .tensors
+        .keys()
+        .any(|name| name.contains(".trellis_") || name.ends_with(".vocab_gather"));
+
+    if !trellis_meta_present && !has_coded_tensor && !has_trellis_side {
+        let embedding = tensor(model, "token_embd.weight", &[embedding_width, 0])?;
+        let vocabulary = embedding.dimensions[1];
+        if vocabulary == 0 || vocabulary > 2_097_152 {
+            return Err(invalid("vocabulary size exceeds decoder bounds"));
+        }
+        let output = if model.tensors.contains_key("output.weight") {
+            tensor(model, "output.weight", &[embedding_width, vocabulary])?
+        } else {
+            embedding.clone()
+        };
+        return Ok((
+            EmbeddingSource::Plain(embedding),
+            OutputHead::Plain(output),
+            vocabulary,
+            TrellisWeights::default(),
+            false,
+        ));
+    }
+
+    if integer(metadata, "trellis.version")? != 1 {
+        return Err(invalid("trellis.version must equal 1"));
+    }
+
+    let mut coded_map: BTreeMap<String, TrellisWeight> = BTreeMap::new();
+    for (name, w_tensor) in &model.tensors {
+        if !crate::kernels::is_trellis_kind(w_tensor.kind) {
+            continue;
+        }
+        let stem = name
+            .strip_suffix(".weight")
+            .ok_or_else(|| invalid(format!("coded trellis tensor {name} must end in .weight")))?;
+        if w_tensor.dimensions.len() != 2 {
+            return Err(invalid(format!("coded trellis tensor {name} must be 2D")));
+        }
+        let k = w_tensor.dimensions[0];
+        let n = w_tensor.dimensions[1];
+        let req_side = |suffix: &str| -> Result<(&Tensor, String)> {
+            let side_name = format!("{stem}.{suffix}");
+            let found = model
+                .tensors
+                .get(&side_name)
+                .ok_or_else(|| invalid(format!("missing trellis side tensor: {side_name}")))?;
+            Ok((found, side_name))
+        };
+        let (s16, s16_name) = req_side("trellis_s16")?;
+        let (pre, pre_name) = req_side("trellis_pre")?;
+        let (post, post_name) = req_side("trellis_post")?;
+        let pin_name = format!("{stem}.trellis_pin");
+        let out_perm_name = format!("{stem}.trellis_pout");
+        let pin = model.tensors.get(&pin_name);
+        let out_perm = model.tensors.get(&out_perm_name);
+        let desc_key = format!("trellis.desc.{stem}");
+        let desc_val = metadata
+            .get(&desc_key)
+            .ok_or_else(|| invalid(format!("missing trellis descriptor {desc_key}")))?;
+        let desc = TrellisDesc::from_metadata(k, n, desc_val)?;
+        let built = TrellisWeight::from_tensors(w_tensor, s16, pre, post, pin, out_perm, desc)?;
+        consumed.insert(s16_name);
+        consumed.insert(pre_name);
+        consumed.insert(post_name);
+        if pin.is_some() {
+            consumed.insert(pin_name);
+        }
+        if out_perm.is_some() {
+            consumed.insert(out_perm_name);
+        }
+        coded_map.insert(name.clone(), built);
+    }
+
+    for key in metadata.keys() {
+        if let Some(rest) = key.strip_prefix("trellis.") {
+            if matches!(rest, "version" | "lm_head_bands" | "embed_bands") {
+                continue;
+            }
+            if let Some(stem) = rest.strip_prefix("desc.")
+                && coded_map.contains_key(&format!("{stem}.weight"))
+            {
+                continue;
+            }
+            return Err(invalid(format!("unsupported or orphan trellis metadata key: {key}")));
+        }
+    }
+    for name in model.tensors.keys() {
+        if name.contains(".trellis_") && !consumed.contains(name) {
+            return Err(invalid(format!("orphan trellis side tensor: {name}")));
+        }
+    }
+
+    let embed_bands = if metadata.contains_key("trellis.embed_bands") {
+        let count = integer(metadata, "trellis.embed_bands")?;
+        if count == 0 || count > 256 {
+            return Err(invalid("trellis.embed_bands must be between 1 and 256"));
+        }
+        Some(count)
+    } else {
+        None
+    };
+
+    let (embedding, vocabulary) = if let Some(count) = embed_bands {
+        if model.tensors.contains_key("token_embd.weight") {
+            return Err(invalid(
+                "trellis.embed_bands cannot coexist with token_embd.weight",
+            ));
+        }
+        let mut bands = Vec::with_capacity(count);
+        let mut offsets = Vec::with_capacity(count);
+        let mut total_rows = 0_usize;
+        for idx in 0..count {
+            let name = format!("token_embd.band{idx:02}.weight");
+            let tw = coded_map
+                .remove(&name)
+                .ok_or_else(|| invalid(format!("missing or uncoded embedding band: {name}")))?;
+            if tw.k != embedding_width || tw.desc.rows != SideTransform::Identity {
+                return Err(invalid(format!(
+                    "embedding band {name} has mismatched width or non-identity row transform"
+                )));
+            }
+            consumed.insert(name);
+            offsets.push(total_rows);
+            total_rows = total_rows
+                .checked_add(tw.n)
+                .ok_or_else(|| invalid("embedding band vocabulary overflow"))?;
+            bands.push(tw);
+        }
+        if total_rows == 0 || total_rows > 2_097_152 {
+            return Err(invalid("vocabulary size exceeds decoder bounds"));
+        }
+        let gather_tensor = model
+            .tensors
+            .get("token_embd.vocab_gather")
+            .ok_or_else(|| invalid("missing token_embd.vocab_gather tensor"))?;
+        let vocab_gather = validate_permutation_i32(gather_tensor, total_rows)?;
+        consumed.insert("token_embd.vocab_gather".to_owned());
+        (
+            EmbeddingSource::TrellisBanded(TrellisBandedHead {
+                bands,
+                band_row_offsets: offsets,
+                vocab_gather,
+            }),
+            total_rows,
+        )
+    } else if let Some(tw) = coded_map.remove("token_embd.weight") {
+        if tw.k != embedding_width || tw.desc.rows != SideTransform::Identity {
+            return Err(invalid(
+                "coded token_embd.weight requires embedding width match and identity row transform",
+            ));
+        }
+        let vocab = tw.n;
+        if vocab == 0 || vocab > 2_097_152 {
+            return Err(invalid("vocabulary size exceeds decoder bounds"));
+        }
+        (EmbeddingSource::Trellis(tw), vocab)
+    } else {
+        let emb = tensor(model, "token_embd.weight", &[embedding_width, 0])?;
+        let vocab = emb.dimensions[1];
+        if vocab == 0 || vocab > 2_097_152 {
+            return Err(invalid("vocabulary size exceeds decoder bounds"));
+        }
+        (EmbeddingSource::Plain(emb), vocab)
+    };
+
+    let lm_head_bands = if metadata.contains_key("trellis.lm_head_bands") {
+        let count = integer(metadata, "trellis.lm_head_bands")?;
+        if count == 0 || count > 256 {
+            return Err(invalid("trellis.lm_head_bands must be between 1 and 256"));
+        }
+        Some(count)
+    } else {
+        None
+    };
+
+    let output = if let Some(count) = lm_head_bands {
+        if model.tensors.contains_key("output.weight") {
+            return Err(invalid(
+                "trellis.lm_head_bands cannot coexist with output.weight",
+            ));
+        }
+        let mut bands = Vec::with_capacity(count);
+        let mut offsets = Vec::with_capacity(count);
+        let mut total_rows = 0_usize;
+        for idx in 0..count {
+            let name = format!("output.band{idx:02}.weight");
+            let tw = coded_map
+                .remove(&name)
+                .ok_or_else(|| invalid(format!("missing or uncoded output band: {name}")))?;
+            if tw.k != embedding_width {
+                return Err(invalid(format!("output band {name} width mismatch")));
+            }
+            consumed.insert(name);
+            offsets.push(total_rows);
+            total_rows = total_rows
+                .checked_add(tw.n)
+                .ok_or_else(|| invalid("output band vocabulary overflow"))?;
+            bands.push(tw);
+        }
+        if total_rows != vocabulary {
+            return Err(invalid("output bands row count does not match vocabulary"));
+        }
+        let gather_tensor = model
+            .tensors
+            .get("output.vocab_gather")
+            .ok_or_else(|| invalid("missing output.vocab_gather tensor"))?;
+        let vocab_gather = validate_permutation_i32(gather_tensor, vocabulary)?;
+        consumed.insert("output.vocab_gather".to_owned());
+        OutputHead::TrellisBanded(TrellisBandedHead {
+            bands,
+            band_row_offsets: offsets,
+            vocab_gather,
+        })
+    } else if let Some(tw) = coded_map.remove("output.weight") {
+        if tw.k != embedding_width || tw.n != vocabulary {
+            return Err(invalid("coded output.weight dimensions do not match model geometry"));
+        }
+        OutputHead::Trellis(tw)
+    } else if model.tensors.contains_key("output.weight") {
+        OutputHead::Plain(tensor(model, "output.weight", &[embedding_width, vocabulary])?)
+    } else if let EmbeddingSource::Plain(emb) = &embedding {
+        OutputHead::Plain(emb.clone())
+    } else {
+        return Err(invalid(
+            "coded trellis models cannot tie output head to coded embeddings",
+        ));
+    };
+
+    if coded_map
+        .keys()
+        .any(|name| name.starts_with("token_embd.band") || name.starts_with("output.band"))
+    {
+        return Err(invalid("unexpected extra coded embedding or output band"));
+    }
+
+    Ok((
+        embedding,
+        output,
+        vocabulary,
+        TrellisWeights { weights: coded_map },
+        true,
+    ))
+}
+
 fn reject_unconsumed_tensors(
     model: &Model,
     layers: &[Layer],
     block_count: usize,
     mtp: usize,
+    extra_consumed: &BTreeSet<String>,
 ) -> Result<()> {
     let mut consumed: BTreeSet<String> =
         ["token_embd.weight", "output.weight", "output_norm.weight"]
             .into_iter()
             .map(str::to_owned)
             .collect();
+    consumed.extend(extra_consumed.iter().cloned());
     for (index, layer) in layers.iter().enumerate() {
         for suffix in [
             "attn_norm.weight",
@@ -9998,6 +10554,439 @@ mod tests {
             assert_eq!(released_calls.load(std::sync::atomic::Ordering::Relaxed), 3);
         }
         drop(decoder);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "End-to-end 4-layer trellis graph test covers decode, prefill, rollback, banded/unbanded heads, and stacked MultiRankAdapter."
+    )]
+    fn qwen35_four_layer_trellis_graph_matches_dequantized_f32_with_rotated4_prefill_and_daisyrose()
+    -> Result<()> {
+        use bonsai_gguf::{Metadata, MetadataArray, MetadataValue};
+        use crate::Decoder as _;
+        use crate::kernels::trellis::{TrellisDesc, TrellisWeight, tests::dequantize_reference};
+        use crate::model::{
+            Model, TensorBytes,
+            lora::{MultiRankAdapter, MultiRankPolicy},
+        };
+
+        let emb = 32_usize;
+        let ffn = 64_usize;
+        let head_dim = 256_usize;
+        let heads = 1_usize;
+        let kv_heads = 1_usize;
+        let ssm_groups = 1_usize;
+        let ssm_heads = 2_usize;
+        let ssm_head_dim = 16_usize;
+        let ssm_inner = ssm_heads * ssm_head_dim; // 32
+        let conv_kernel = 4_usize;
+        let conv_width = ssm_inner + 2 * ssm_groups * ssm_head_dim; // 64
+        let vocab = 64_usize;
+
+        let prng_bytes = |len: usize, seed: u64| -> Vec<u8> {
+            let mut s = seed | 1;
+            let mut out = Vec::with_capacity(len);
+            for _ in 0..len {
+                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                out.push(u8::try_from((s >> 24) & 0xff).unwrap_or(0));
+            }
+            out
+        };
+        let f32_tensor = |name: &str, dims: Vec<usize>, values: &[f32]| -> Tensor {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for &v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Tensor {
+                name: name.to_owned(),
+                dimensions: dims,
+                kind: 0,
+                data: TensorBytes::Shared(Arc::from(bytes)),
+            }
+        };
+        let f16_tensor = |name: &str, len: usize| -> Tensor {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let bits: u16 = if i % 2 == 0 { 0x3800 } else { 0x2c00 }; // 0.5 / 0.0625
+                bytes.extend_from_slice(&bits.to_le_bytes());
+            }
+            Tensor {
+                name: name.to_owned(),
+                dimensions: vec![len],
+                kind: 1,
+                data: TensorBytes::Shared(Arc::from(bytes)),
+            }
+        };
+        let i32_tensor = |name: &str, values: &[i32]| -> Tensor {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for &v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Tensor {
+                name: name.to_owned(),
+                dimensions: vec![values.len()],
+                kind: crate::kernels::I32,
+                data: TensorBytes::Shared(Arc::from(bytes)),
+            }
+        };
+
+        let add_coded_matrix = |tensors: &mut BTreeMap<String, Tensor>,
+                                metadata: &mut Metadata,
+                                dequant_tensors: &mut BTreeMap<String, Tensor>,
+                                stem: &str,
+                                target_name: &str,
+                                bits: usize,
+                                k: usize,
+                                n: usize,
+                                desc_raw: &[i32],
+                                with_perms: bool,
+                                seed: u64|
+         -> Result<()> {
+            let weight_name = format!("{stem}.weight");
+            let byte_len = (k / 16) * (n / 16) * 32 * bits;
+            let w_tensor = Tensor {
+                name: weight_name.clone(),
+                dimensions: vec![k, n],
+                kind: u32::try_from(43 + bits)?,
+                data: TensorBytes::Shared(Arc::from(prng_bytes(byte_len, seed))),
+            };
+            let s16_tensor = f16_tensor(&format!("{stem}.trellis_s16"), k / 16);
+            let pre_vals: Vec<f32> = (0..k).map(|i| if i % 3 == 0 { 0.0625 } else { -0.03125 }).collect();
+            let post_vals: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 0.0625 } else { -0.03125 }).collect();
+            let pre_tensor = f32_tensor(&format!("{stem}.trellis_pre"), vec![k], &pre_vals);
+            let post_tensor = f32_tensor(&format!("{stem}.trellis_post"), vec![n], &post_vals);
+
+            let pin_perm: Vec<i32> = (0..k).rev().map(|i| i32::try_from(i).unwrap_or(0)).collect();
+            let pout_perm: Vec<i32> = (0..n).map(|i| i32::try_from((i * 3 + 1) % n).unwrap_or(0)).collect();
+            let pin_opt = with_perms.then(|| i32_tensor(&format!("{stem}.trellis_pin"), &pin_perm));
+            let pout_opt = (with_perms && !n.is_multiple_of(3))
+                .then(|| i32_tensor(&format!("{stem}.trellis_pout"), &pout_perm));
+
+            let desc = TrellisDesc::from_i32_slice(k, n, desc_raw)?;
+            let built = TrellisWeight::from_tensors(
+                &w_tensor,
+                &s16_tensor,
+                &pre_tensor,
+                &post_tensor,
+                pin_opt.as_ref(),
+                pout_opt.as_ref(),
+                desc,
+            )?;
+            let dense = dequantize_reference(&built)?;
+            dequant_tensors.insert(target_name.to_owned(), f32_tensor(target_name, vec![k, n], &dense));
+
+            metadata.insert(
+                format!("trellis.desc.{stem}"),
+                MetadataValue::Array(MetadataArray::I32(desc_raw.to_vec())),
+            );
+            tensors.insert(weight_name, w_tensor);
+            tensors.insert(s16_tensor.name.clone(), s16_tensor);
+            tensors.insert(pre_tensor.name.clone(), pre_tensor);
+            tensors.insert(post_tensor.name.clone(), post_tensor);
+            if let Some(pin) = pin_opt {
+                tensors.insert(pin.name.clone(), pin);
+            }
+            if let Some(pout) = pout_opt {
+                tensors.insert(pout.name.clone(), pout);
+            }
+            Ok(())
+        };
+
+        let build_models = |banded_embed: bool| -> Result<(Model, Model)> {
+            let mut trl_meta = Metadata::new();
+            let mut f32_meta = Metadata::new();
+            for (k, v) in [
+                ("general.architecture", MetadataValue::from("qwen35")),
+                ("qwen35.block_count", MetadataValue::from(4_u32)),
+                ("qwen35.context_length", MetadataValue::from(64_u32)),
+                ("qwen35.embedding_length", MetadataValue::from(u32::try_from(emb).unwrap_or(0))),
+                ("qwen35.feed_forward_length", MetadataValue::from(u32::try_from(ffn).unwrap_or(0))),
+                ("qwen35.attention.head_count", MetadataValue::from(u32::try_from(heads).unwrap_or(0))),
+                ("qwen35.attention.head_count_kv", MetadataValue::from(u32::try_from(kv_heads).unwrap_or(0))),
+                ("qwen35.attention.key_length", MetadataValue::from(u32::try_from(head_dim).unwrap_or(0))),
+                ("qwen35.attention.value_length", MetadataValue::from(u32::try_from(head_dim).unwrap_or(0))),
+                ("qwen35.rope.dimension_count", MetadataValue::from(64_u32)),
+                ("qwen35.rope.freq_base", MetadataValue::from(10_000.0_f32)),
+                ("qwen35.attention.layer_norm_rms_epsilon", MetadataValue::from(1e-6_f32)),
+                ("qwen35.full_attention_interval", MetadataValue::from(4_u32)),
+                ("qwen35.ssm.state_size", MetadataValue::from(u32::try_from(ssm_head_dim).unwrap_or(0))),
+                ("qwen35.ssm.group_count", MetadataValue::from(u32::try_from(ssm_groups).unwrap_or(0))),
+                ("qwen35.ssm.time_step_rank", MetadataValue::from(u32::try_from(ssm_heads).unwrap_or(0))),
+                ("qwen35.ssm.inner_size", MetadataValue::from(u32::try_from(ssm_inner).unwrap_or(0))),
+                ("qwen35.ssm.conv_kernel", MetadataValue::from(u32::try_from(conv_kernel).unwrap_or(0))),
+                (
+                    "qwen35.rope.dimension_sections",
+                    MetadataValue::Array(MetadataArray::U32(vec![11, 11, 10, 0])),
+                ),
+            ] {
+                trl_meta.insert(k.to_owned(), v.clone());
+                f32_meta.insert(k.to_owned(), v);
+            }
+            trl_meta.insert("trellis.version".to_owned(), MetadataValue::from(1_u32));
+            trl_meta.insert("trellis.lm_head_bands".to_owned(), MetadataValue::from(2_u32));
+            if banded_embed {
+                trl_meta.insert("trellis.embed_bands".to_owned(), MetadataValue::from(2_u32));
+            }
+
+            let mut trl_tensors = BTreeMap::new();
+            let mut f32_tensors = BTreeMap::new();
+
+            if banded_embed {
+                let mut e0 = BTreeMap::new();
+                let mut e1 = BTreeMap::new();
+                add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut e0, "token_embd.band00", "band00", 2, emb, 32, &[0, 0, 1, 1, 16, 1, 0], false, 11)?;
+                add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut e1, "token_embd.band01", "band01", 3, emb, 32, &[0, 0, 1, 2, 1, 1, 0], false, 12)?;
+                let gather: Vec<i32> = (0..vocab).map(|i| i32::try_from((vocab - 1) - i).unwrap_or(0)).collect();
+                trl_tensors.insert("token_embd.vocab_gather".to_owned(), i32_tensor("token_embd.vocab_gather", &gather));
+                let b0 = &e0["band00"];
+                let b1 = &e1["band01"];
+                let mut dense_emb = vec![0.0_f32; emb * vocab];
+                let read_f32 = |t: &Tensor| -> Vec<f32> {
+                    t.data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                };
+                let b0f = read_f32(b0);
+                let b1f = read_f32(b1);
+                for (tok, &src) in gather.iter().enumerate() {
+                    let s = usize::try_from(src)?;
+                    let row = if s < 32 { &b0f[s * emb..(s + 1) * emb] } else { &b1f[(s - 32) * emb..(s - 31) * emb] };
+                    dense_emb[tok * emb..(tok + 1) * emb].copy_from_slice(row);
+                }
+                f32_tensors.insert("token_embd.weight".to_owned(), f32_tensor("token_embd.weight", vec![emb, vocab], &dense_emb));
+            } else {
+                add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, "token_embd", "token_embd.weight", 3, emb, vocab, &[0, 0, 1, 1, 16, 1, 0], true, 13)?;
+            }
+
+            // Banded output head (2 bands of 32 rows each) with vocab_gather permutation
+            let mut o0 = BTreeMap::new();
+            let mut o1 = BTreeMap::new();
+            add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut o0, "output.band00", "band00", 4, emb, 32, &[1, 16, 1, 1, 16, 1, 0], true, 21)?;
+            add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut o1, "output.band01", "band01", 5, emb, 32, &[2, 1, 1, 2, 1, 1, 0], true, 22)?;
+            let out_gather: Vec<i32> = (0..vocab).map(|i| i32::try_from((i * 7 + 5) % vocab).unwrap_or(0)).collect();
+            trl_tensors.insert("output.vocab_gather".to_owned(), i32_tensor("output.vocab_gather", &out_gather));
+            let read_f32 = |t: &Tensor| -> Vec<f32> {
+                t.data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            };
+            let o0f = read_f32(&o0["band00"]);
+            let o1f = read_f32(&o1["band01"]);
+            let mut dense_out = vec![0.0_f32; emb * vocab];
+            for (tok, &src) in out_gather.iter().enumerate() {
+                let s = usize::try_from(src)?;
+                let row = if s < 32 { &o0f[s * emb..(s + 1) * emb] } else { &o1f[(s - 32) * emb..(s - 31) * emb] };
+                dense_out[tok * emb..(tok + 1) * emb].copy_from_slice(row);
+            }
+            f32_tensors.insert("output.weight".to_owned(), f32_tensor("output.weight", vec![emb, vocab], &dense_out));
+
+            let norm_ones = vec![1.0_f32; emb];
+            for (name, t) in [("output_norm.weight", f32_tensor("output_norm.weight", vec![emb], &norm_ones))] {
+                trl_tensors.insert(name.to_owned(), t.clone());
+                f32_tensors.insert(name.to_owned(), t);
+            }
+
+            for layer in 0..4_usize {
+                let p = format!("blk.{layer}");
+                for nname in ["attn_norm.weight", "post_attention_norm.weight"] {
+                    let full = format!("{p}.{nname}");
+                    let t = f32_tensor(&full, vec![emb], &norm_ones);
+                    trl_tensors.insert(full.clone(), t.clone());
+                    f32_tensors.insert(full, t);
+                }
+                let bits_ffn = 2 + (layer % 5);
+                add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.ffn_up"), &format!("{p}.ffn_up.weight"), bits_ffn, emb, ffn, &[1, 16, 1, 2, 1, 1, 0], true, 100 + u64::try_from(layer)?)?;
+                add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.ffn_gate"), &format!("{p}.ffn_gate.weight"), 3, emb, ffn, &[2, 1, 1, 1, 16, 1, 0], false, 200 + u64::try_from(layer)?)?;
+                add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.ffn_down"), &format!("{p}.ffn_down.weight"), 6, ffn, emb, &[0, 0, 1, 2, 1, 1, 0], true, 300 + u64::try_from(layer)?)?;
+
+                if layer < 3 {
+                    // Recurrent GDN layer
+                    add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.attn_qkv"), &format!("{p}.attn_qkv.weight"), 4, emb, conv_width, &[1, 16, 1, 1, 16, 1, 0], false, 400 + u64::try_from(layer)?)?;
+                    add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.attn_gate"), &format!("{p}.attn_gate.weight"), 5, emb, ssm_inner, &[0, 0, 1, 1, 16, 1, 0], true, 500 + u64::try_from(layer)?)?;
+                    add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.ssm_out"), &format!("{p}.ssm_out.weight"), 4, ssm_inner, emb, &[2, 1, 1, 1, 16, 1, 0], true, 600 + u64::try_from(layer)?)?;
+                    // Small beta/alpha projections (rows < 16) stay uncoded F32 just like NariQ models with small SSM time steps
+                    let tiny = f32_tensor(&format!("{p}.ssm_beta.weight"), vec![emb, ssm_heads], &vec![0.05; emb * ssm_heads]);
+                    let alpha_w = f32_tensor(&format!("{p}.ssm_alpha.weight"), vec![emb, ssm_heads], &vec![-0.03; emb * ssm_heads]);
+                    let conv = f32_tensor(&format!("{p}.ssm_conv1d.weight"), vec![conv_kernel, conv_width], &vec![0.125; conv_kernel * conv_width]);
+                    let dt = f32_tensor(&format!("{p}.ssm_dt.bias"), vec![ssm_heads], &vec![0.0; ssm_heads]);
+                    let a_dec = f32_tensor(&format!("{p}.ssm_a"), vec![ssm_heads], &vec![-0.5; ssm_heads]);
+                    let snorm = f32_tensor(&format!("{p}.ssm_norm.weight"), vec![ssm_head_dim], &vec![1.0; ssm_head_dim]);
+                    for t in [tiny, alpha_w, conv, dt, a_dec, snorm] {
+                        trl_tensors.insert(t.name.clone(), t.clone());
+                        f32_tensors.insert(t.name.clone(), t);
+                    }
+                } else {
+                    // Full attention layer (heads*head_dim*2 = 64, kv*head_dim = 16)
+                    add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.attn_q"), &format!("{p}.attn_q.weight"), 5, emb, heads * head_dim * 2, &[2, 1, 1, 1, 16, 1, 0], true, 701)?;
+                    add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.attn_k"), &format!("{p}.attn_k.weight"), 4, emb, kv_heads * head_dim, &[1, 16, 1, 2, 1, 1, 0], false, 702)?;
+                    add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.attn_v"), &format!("{p}.attn_v.weight"), 3, emb, kv_heads * head_dim, &[0, 0, 1, 0, 0, 1, 0], true, 703)?;
+                    add_coded_matrix(&mut trl_tensors, &mut trl_meta, &mut f32_tensors, &format!("{p}.attn_output"), &format!("{p}.attn_output.weight"), 6, heads * head_dim, emb, &[1, 16, 1, 2, 1, 1, 0], true, 704)?;
+                    let qn = f32_tensor(&format!("{p}.attn_q_norm.weight"), vec![head_dim], &vec![1.0; head_dim]);
+                    let kn = f32_tensor(&format!("{p}.attn_k_norm.weight"), vec![head_dim], &vec![1.0; head_dim]);
+                    for t in [qn, kn] {
+                        trl_tensors.insert(t.name.clone(), t.clone());
+                        f32_tensors.insert(t.name.clone(), t);
+                    }
+                }
+            }
+
+            let trl_model = Model {
+                identity: "synthetic-trellis-qwen35-model".to_owned(),
+                metadata: trl_meta,
+                tensors: trl_tensors,
+            };
+            let f32_model = Model {
+                identity: "synthetic-trellis-qwen35-model".to_owned(),
+                metadata: f32_meta,
+                tensors: f32_tensors,
+            };
+            Ok((trl_model, f32_model))
+        };
+
+        for banded_embed in [false, true] {
+            let (trl_model, f32_model) = build_models(banded_embed)?;
+            let mut lora_meta = Metadata::new();
+            lora_meta.insert("general.architecture".to_owned(), MetadataValue::from("qwen35"));
+            lora_meta.insert("general.type".to_owned(), MetadataValue::from("adapter"));
+            lora_meta.insert("adapter.type".to_owned(), MetadataValue::from("lora"));
+            lora_meta.insert("adapter.lora.alpha".to_owned(), MetadataValue::from(16.0_f32));
+            let mut lora_tensors = BTreeMap::new();
+            let a_ffn = f32_tensor("blk.0.ffn_down.weight.lora_a", vec![ffn, 4], &vec![0.02_f32; ffn * 4]);
+            let b_ffn = f32_tensor("blk.0.ffn_down.weight.lora_b", vec![4, emb], &vec![0.03_f32; 4 * emb]);
+            let a_q = f32_tensor("blk.3.attn_q.weight.lora_a", vec![emb, 4], &vec![-0.015_f32; emb * 4]);
+            let b_q = f32_tensor("blk.3.attn_q.weight.lora_b", vec![4, heads * head_dim * 2], &vec![0.025_f32; 4 * heads * head_dim * 2]);
+            for t in [a_ffn, b_ffn, a_q, b_q] {
+                lora_tensors.insert(t.name.clone(), t);
+            }
+            let mr_trl = MultiRankAdapter::from_model(
+                &trl_model,
+                &Model {
+                    identity: "synthetic-daisyrose-mr".to_owned(),
+                    metadata: lora_meta.clone(),
+                    tensors: lora_tensors.clone(),
+                },
+                MultiRankPolicy::NpuFriendly,
+            )?;
+            let mr_f32 = MultiRankAdapter::from_model(
+                &f32_model,
+                &Model {
+                    identity: "synthetic-daisyrose-mr".to_owned(),
+                    metadata: lora_meta,
+                    tensors: lora_tensors,
+                },
+                MultiRankPolicy::NpuFriendly,
+            )?;
+
+            let mut trl_dec = super::Qwen35::with_adapters_and_kv(
+                trl_model,
+                32,
+                MAX_STATE_BYTES,
+                super::MatvecBackend::Auto,
+                None,
+                Some((mr_trl, 1.0)),
+                super::KvCachePolicy::Rotated4,
+            )?;
+            let mut f32_dec = super::Qwen35::with_adapters_and_kv(
+                f32_model,
+                32,
+                MAX_STATE_BYTES,
+                super::MatvecBackend::Auto,
+                None,
+                Some((mr_f32, 1.0)),
+                super::KvCachePolicy::Rotated4,
+            )?;
+
+            assert!(trl_dec.identity().contains(":trellis-v1:multi-rank-lora-v1:"));
+            trl_dec.reset_with_adapter_scales(None, Some(0.5))?;
+            assert!(trl_dec.identity().contains(":trellis-v1:multi-rank-lora-v1:"));
+            trl_dec.reset_with_adapter_scales(None, Some(1.0))?;
+
+            for tok in [3_u32, 17, 45] {
+                let got = crate::Decoder::evaluate(&mut trl_dec, tok)?;
+                let exp = crate::Decoder::evaluate(&mut f32_dec, tok)?;
+                assert_eq!(got.len(), vocab);
+                assert_eq!(exp.len(), vocab);
+                for (i, (&g, &e)) in got.iter().zip(&exp).enumerate() {
+                    assert!(
+                        (g - e).abs() <= 1e-3,
+                        "banded_embed={banded_embed} tok={tok} logit={i}: got={g} vs exp={e}"
+                    );
+                }
+            }
+
+            // Checkpoint & rollback invariance
+            let cp = trl_dec.checkpoint()?;
+            let step_a = crate::Decoder::evaluate(&mut trl_dec, 9)?;
+            trl_dec.restore(&cp)?;
+            let step_b = crate::Decoder::evaluate(&mut trl_dec, 9)?;
+            assert_eq!(step_a, step_b);
+
+            // Tiled prefill state + logits vs sequential decode
+            let (trl_model2, _) = build_models(banded_embed)?;
+            let (trl_model3, _) = build_models(banded_embed)?;
+            let mut seq_dec = super::Qwen35::with_adapters_and_kv(
+                trl_model2,
+                32,
+                MAX_STATE_BYTES,
+                super::MatvecBackend::Auto,
+                None,
+                None,
+                super::KvCachePolicy::Rotated4,
+            )?;
+            let scratch = seq_dec.tiled_prefill_scratch_bytes(8)?;
+            let tiled_dec = super::Qwen35::with_adapters_and_kv(
+                trl_model3,
+                32,
+                MAX_STATE_BYTES,
+                super::MatvecBackend::Auto,
+                None,
+                None,
+                super::KvCachePolicy::Rotated4,
+            )?
+            .with_tiled_prefill(8, scratch)?;
+            let vscratch = tiled_dec.tiled_verification_scratch_bytes()?;
+            let mut tiled_dec = tiled_dec.with_tiled_verification(vscratch)?;
+            let prompt = [1_u32, 5, 19, 31, 42, 60];
+            let mut seq_logits = Vec::new();
+            for &tok in &prompt[..prompt.len() - 1] {
+                crate::Decoder::ingest(&mut seq_dec, tok)?;
+            }
+            seq_dec.evaluate_into(prompt[prompt.len() - 1], &mut seq_logits)?;
+            let mut tiled_logits = vec![Vec::new(); prompt.len()];
+            tiled_dec.evaluate_verification_block(&prompt, &mut tiled_logits, &|| Ok(()))?;
+            assert_eq!(seq_logits.len(), vocab);
+            assert_eq!(tiled_logits[prompt.len() - 1].len(), vocab);
+            for (i, (&t, &s)) in tiled_logits[prompt.len() - 1].iter().zip(&seq_logits).enumerate() {
+                assert!(
+                    (t - s).abs() <= 1e-3,
+                    "tiled vs seq banded_embed={banded_embed} logit={i}: {t} vs {s}"
+                );
+            }
+        }
+
+        // Negative checks: wrong trellis.version, orphan side tensor, extra band
+        let (mut bad_ver, _) = build_models(false)?;
+        bad_ver.metadata.insert("trellis.version".to_owned(), MetadataValue::from(2_u32));
+        assert!(super::Qwen35::new(bad_ver, 32).is_err());
+
+        let (mut bad_orphan, _) = build_models(false)?;
+        bad_orphan.tensors.insert("rogue.trellis_s16".to_owned(), f16_tensor("rogue.trellis_s16", 2));
+        assert!(super::Qwen35::new(bad_orphan, 32).is_err());
+
+        let (mut extra_band, _) = build_models(false)?;
+        extra_band.tensors.insert(
+            "output.band99.weight".to_owned(),
+            Tensor {
+                name: "output.band99.weight".to_owned(),
+                dimensions: vec![emb, 16],
+                kind: 45,
+                data: TensorBytes::Shared(Arc::from(prng_bytes((emb / 16) * 64, 999))),
+            },
+        );
+        extra_band.tensors.insert("output.band99.trellis_s16".to_owned(), f16_tensor("output.band99.trellis_s16", emb / 16));
+        extra_band.tensors.insert("output.band99.trellis_pre".to_owned(), f32_tensor("output.band99.trellis_pre", vec![emb], &vec![1.0; emb]));
+        extra_band.tensors.insert("output.band99.trellis_post".to_owned(), f32_tensor("output.band99.trellis_post", vec![16], &vec![1.0; 16]));
+        extra_band.metadata.insert("trellis.desc.output.band99".to_owned(), MetadataValue::Array(MetadataArray::I32(vec![0, 0, 1, 0, 0, 1, 0])));
+        assert!(super::Qwen35::new(extra_band, 32).is_err());
+
         Ok(())
     }
 }

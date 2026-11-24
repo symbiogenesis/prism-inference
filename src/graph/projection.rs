@@ -108,7 +108,20 @@ fn projection_plan_digest(
         ])?;
         hasher.update(&hadamard_block.to_le_bytes())?;
     }
-    hash_tensor_plan(&mut hasher, decoder, executor, &decoder.output)?;
+    match &decoder.output {
+        super::OutputHead::Plain(output_tensor) => {
+            hash_tensor_plan(&mut hasher, decoder, executor, output_tensor)?;
+        }
+        super::OutputHead::Trellis(tw) => {
+            hasher.update(&[2])?;
+            hash_usize(&mut hasher, tw.name.len())?;
+            hasher.update(tw.name.as_bytes())?;
+        }
+        super::OutputHead::TrellisBanded(head) => {
+            hasher.update(&[3])?;
+            hash_usize(&mut hasher, head.bands.len())?;
+        }
+    }
     Ok(hasher.finish()?)
 }
 
@@ -200,7 +213,10 @@ impl Work {
             .hidden
             .checked_add(extra_hidden)
             .ok_or_else(|| invalid("projection work count overflow"))?;
-        work.output = projection_operations(executor, &decoder.output)?;
+        work.output = decoder
+            .output
+            .plain()
+            .map_or(Ok(0), |tensor| projection_operations(executor, tensor))?;
         Ok(Some(work))
     }
 
@@ -495,8 +511,8 @@ mod tests {
                 convolution: 4,
             },
             arithmetic: super::super::Arithmetic::Source,
-            embedding: stub_tensor("token_embd.weight"),
-            output: stub_tensor("output.weight"),
+            embedding: super::super::EmbeddingSource::Plain(stub_tensor("token_embd.weight")),
+            output: super::super::OutputHead::Plain(stub_tensor("output.weight")),
             output_norm: vec![1.0; 128],
             transforms: super::super::Transforms::default(),
             adapter: None,
@@ -729,7 +745,12 @@ mod tests {
     fn projected_qwen35_accounts_work_and_digest_for_ptq1_supports_f32() -> Result<()> {
         let provenance = Arc::new(());
         let mut decoder = tiny_decoder(Arc::clone(&provenance))?;
-        decoder.output.kind = 143;
+        match &mut decoder.output {
+            crate::graph::OutputHead::Plain(output) => output.kind = 143,
+            crate::graph::OutputHead::Trellis(_) | crate::graph::OutputHead::TrellisBanded(_) => {
+                return Err(invalid("expected plain test output head"));
+            }
+        }
         if let Attention::Full(attn) = &mut decoder.layers[0].attention {
             attn.query.kind = 143;
             attn.key.kind = 143;
@@ -752,7 +773,12 @@ mod tests {
         drop(proj_on);
 
         let mut decoder_off = tiny_decoder(provenance)?;
-        decoder_off.output.kind = 143;
+        match &mut decoder_off.output {
+            crate::graph::OutputHead::Plain(output) => output.kind = 143,
+            crate::graph::OutputHead::Trellis(_) | crate::graph::OutputHead::TrellisBanded(_) => {
+                return Err(invalid("expected plain test output head"));
+            }
+        }
         if let Attention::Full(attn) = &mut decoder_off.layers[0].attention {
             attn.query.kind = 143;
             attn.key.kind = 143;

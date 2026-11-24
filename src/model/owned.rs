@@ -31,7 +31,10 @@ pub struct TensorSpec {
 }
 
 pub(super) const fn supported_kind(kind: u32) -> bool {
-    matches!(kind, 0..=3 | 6..=23 | 29 | 30 | 34 | 35 | 39..=42 | 142 | 143)
+    matches!(
+        kind,
+        0..=3 | 6..=23 | 26 | 29 | 30 | 34 | 35 | 39..=42 | 44..=49 | 142 | 143
+    )
 }
 
 fn overflow() -> crate::Error {
@@ -55,6 +58,32 @@ fn tensor_bytes(name: &str, kind: u32, dimensions: &[usize]) -> Result<usize> {
     let mut shape = [1_u64; 4];
     for (out, &size) in shape.iter_mut().zip(dimensions) {
         *out = u64::try_from(size)?;
+    }
+    if kind == 26 {
+        let elements = shape
+            .into_iter()
+            .try_fold(1_u64, u64::checked_mul)
+            .ok_or_else(|| invalid("tensor byte count overflow"))?;
+        let bytes = elements
+            .checked_mul(4)
+            .ok_or_else(|| invalid("tensor byte count overflow"))?;
+        return Ok(usize::try_from(bytes)?);
+    }
+    if let 44..=49 = kind {
+        let block_bytes = 2 * u64::from(kind - 43);
+        if !shape[0].is_multiple_of(16) {
+            return Err(invalid("trellis tensor inner dimension must divide 16"));
+        }
+        let rows = shape[1..]
+            .iter()
+            .copied()
+            .try_fold(1_u64, u64::checked_mul)
+            .ok_or_else(|| invalid("tensor byte count overflow"))?;
+        let bytes = (shape[0] / 16)
+            .checked_mul(block_bytes)
+            .and_then(|b| b.checked_mul(rows))
+            .ok_or_else(|| invalid("tensor byte count overflow"))?;
+        return Ok(usize::try_from(bytes)?);
     }
     Ok(usize::try_from(gguf_context::tensor_bytes(kind, shape)?)?)
 }

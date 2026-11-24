@@ -25,6 +25,7 @@ mod iquants;
 mod kquants;
 mod legacy;
 mod parallel_rows;
+pub(crate) mod trellis;
 pub use parallel_rows::{MAX_ROW_WORKERS, RowParallelism};
 #[cfg(any(
     test,
@@ -82,8 +83,27 @@ const Q8_0: u32 = 8;
 const Q8_1: u32 = 9;
 const Q8_K: u32 = 15;
 pub(crate) const BF16: u32 = 30;
+pub(crate) const I32: u32 = 26;
+pub(crate) const TRL1: u32 = 44;
+pub(crate) const TRL6: u32 = 49;
 pub(crate) const PQ2: u32 = 142;
 pub(crate) const PTQ1: u32 = 143;
+
+pub(crate) const fn is_trellis_kind(kind: u32) -> bool {
+    matches!(kind, TRL1..=TRL6)
+}
+
+pub(crate) const fn trellis_bits(kind: u32) -> Option<usize> {
+    match kind {
+        44 => Some(1),
+        45 => Some(2),
+        46 => Some(3),
+        47 => Some(4),
+        48 => Some(5),
+        49 => Some(6),
+        _ => None,
+    }
+}
 
 fn layout(kind: u32) -> Result<(usize, usize)> {
     if let Some(layout) = fp4::layout(kind)
@@ -112,6 +132,13 @@ fn layout(kind: u32) -> Result<(usize, usize)> {
             256,
             kquants::block_bytes(kind).ok_or_else(|| invalid("unknown K quantization type"))?,
         )),
+        I32 => Ok((1, 4)),
+        44 => Ok((16, 2)),
+        45 => Ok((16, 4)),
+        46 => Ok((16, 6)),
+        47 => Ok((16, 8)),
+        48 => Ok((16, 10)),
+        49 => Ok((16, 12)),
         PQ2 => Ok((128, 34)),
         PTQ1 => Ok((128, 28)),
         _ => Err(invalid(format!("unsupported runtime tensor type {kind}"))),
@@ -209,6 +236,7 @@ pub(crate) fn validate_tensor_dimensions(tensor: &Tensor) -> Result<()> {
 pub fn validate_tensor(tensor: &Tensor) -> Result<()> {
     dimensions(tensor)?;
     match tensor.kind {
+        I32 | TRL1..=TRL6 => return Ok(()),
         16 | 17 | 22 => return iq2::validate(tensor.kind, &tensor.data),
         18 | 21 => return iq3::validate(tensor.kind, &tensor.data),
         19 | 29 => return iq1::validate(tensor.kind, &tensor.data),
@@ -399,6 +427,12 @@ fn decode_row_impl(kind: u32, columns: usize, bytes: &[u8], output: &mut Vec<f32
             for block in bytes.chunks_exact(layout(kind)?.1) {
                 legacy::decode(kind, block, output)?;
             }
+        }
+        I32 => return Err(invalid("cannot decode I32 tensor as f32 row")),
+        TRL1..=TRL6 => {
+            return Err(invalid(
+                "trellis row decoding requires trellis side metadata",
+            ));
         }
         _ => return Err(invalid("unsupported row decoder")),
     }

@@ -7,7 +7,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use bonsai_gguf::{MappedSlice, Metadata, PRISM_DIALECT, VerifiedModel, WeakMappedSlice};
+use bonsai_gguf::{
+    MappedSlice, Metadata, NARIQ_DIALECT, PRISM_DIALECT, VerifiedModel, WeakMappedSlice,
+};
 use bonsai_prism::{Layout, Pool};
 
 use crate::{Error, Result, invalid};
@@ -239,9 +241,29 @@ impl ModelMetadata {
         expected_sha256: &str,
         memory_limit: usize,
     ) -> Result<Self> {
-        let reader = VerifiedModel::open(
+        Self::load_with_dialect(
             path,
             PRISM_DIALECT,
+            expected_bytes,
+            expected_sha256,
+            memory_limit,
+        )
+    }
+
+    /// Reads verified GGUF header metadata under an explicit tensor dialect without decoding weights.
+    ///
+    /// # Errors
+    /// Rejects files that fail integrity verification, dialect checks, or memory limits.
+    pub fn load_with_dialect(
+        path: &Path,
+        dialect: &str,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        memory_limit: usize,
+    ) -> Result<Self> {
+        let reader = VerifiedModel::open(
+            path,
+            dialect,
             expected_bytes,
             expected_sha256,
             memory_limit,
@@ -253,6 +275,19 @@ impl ModelMetadata {
             .filter(|tensor| tensor.dimensions.len() == 2)
             .and_then(|tensor| tensor.dimensions.get(1))
             .copied()
+            .or_else(|| {
+                (dialect == NARIQ_DIALECT)
+                    .then(|| {
+                        reader
+                            .tensors()
+                            .iter()
+                            .find(|tensor| tensor.name == "token_embd.vocab_gather")
+                            .filter(|tensor| tensor.dimensions.len() == 1)
+                            .and_then(|tensor| tensor.dimensions.first())
+                            .copied()
+                    })
+                    .flatten()
+            })
             .ok_or_else(|| invalid("missing token embedding vocabulary dimension"))?;
         Ok(Self {
             metadata: reader.into_metadata(),
@@ -310,9 +345,53 @@ impl Model {
         memory_limit: usize,
         progress: &mut impl FnMut(f32) -> Result<bool>,
     ) -> Result<Self> {
-        let reader = VerifiedModel::open(
+        Self::load_with_dialect_and_progress(
             path,
             PRISM_DIALECT,
+            expected_bytes,
+            expected_sha256,
+            memory_limit,
+            progress,
+        )
+    }
+
+    /// Loads an executable model under an explicit tensor dialect without progress callbacks.
+    ///
+    /// # Errors
+    /// Rejects unreadable or tampered models, dialect violations, unsupported tensors, or memory overflow.
+    pub fn load_with_dialect(
+        path: &Path,
+        dialect: &str,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        memory_limit: usize,
+    ) -> Result<Self> {
+        let mut ignore = |_| Ok(true);
+        Self::load_with_dialect_and_progress(
+            path,
+            dialect,
+            expected_bytes,
+            expected_sha256,
+            memory_limit,
+            &mut ignore,
+        )
+    }
+
+    /// Loads an executable model under an explicit tensor dialect with progress/cancellation callbacks.
+    ///
+    /// # Errors
+    /// Rejects unreadable or tampered models, dialect violations, unsupported tensors, cancellation, or memory overflow.
+    pub fn load_with_dialect_and_progress(
+        path: &Path,
+        dialect: &str,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        memory_limit: usize,
+        progress: &mut impl FnMut(f32) -> Result<bool>,
+    ) -> Result<Self> {
+        let reader = VerifiedModel::open(
+            path,
+            dialect,
             expected_bytes,
             expected_sha256,
             memory_limit,
@@ -581,6 +660,8 @@ fn payload_block_bytes(kind: u32) -> Result<usize> {
                 .ok_or_else(|| invalid("unsupported executable tensor encoding"))?;
             Ok(usize::try_from(width)?)
         }
+        26 => Ok(4),
+        44..=49 => Ok(2 * usize::try_from(kind - 43)?),
         _ => Err(invalid("unsupported executable tensor encoding")),
     }
 }
@@ -742,6 +823,19 @@ fn validate_payload(kind: u32, bytes: &[u8]) -> Result<()> {
                 if decoded.iter().any(|value| !value.is_finite()) {
                     return Err(invalid("nonfinite executable tensor payload"));
                 }
+            }
+            true
+        }
+        26 => {
+            if !bytes.len().is_multiple_of(4) {
+                return Err(invalid("invalid I32 executable tensor payload length"));
+            }
+            true
+        }
+        44..=49 => {
+            let width = 2 * usize::try_from(kind - 43)?;
+            if !bytes.len().is_multiple_of(width) {
+                return Err(invalid("invalid trellis executable tensor payload length"));
             }
             true
         }

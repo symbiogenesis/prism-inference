@@ -1,14 +1,18 @@
 //! One bounded production-session request, with value-free core attribution.
 
-use super::{AdapterSelection, Representation, evidence_backend, reject};
+use super::{
+    AdapterSelection, MultiRankAdapterSelection, Representation, evidence_backend,
+    hash_adapter_file, reject,
+};
 use bonsai_native_hash::{Hasher, hash_bytes};
 use bonsai_prism_runtime::{
     Result,
     graph::KvCachePolicy,
     kernels::{MatvecBackend, RowParallelism},
     model::lora::SWIFT_ADAPTER_SHA256,
-    runtime::{Cancellation, Completion, GenerationPhase, GenerationTimings},
-    swift_session::SwiftSession,
+    model::swift,
+    runtime::{Cancellation, Completion, GenerationPhase, GenerationTimings, PromptReuse},
+    swift_session::{BranchCheckpoints, MultiRankAdapterSpec, SwiftSession},
 };
 use serde_json::{Value, json};
 use std::{
@@ -28,6 +32,7 @@ struct Selection<'a> {
     backend: MatvecBackend,
     representation: Representation,
     adapter: Option<&'a AdapterSelection>,
+    multi_rank_adapter: Option<&'a MultiRankAdapterSelection>,
     row_workers: usize,
     output_tokens: usize,
     source_commit: &'a str,
@@ -43,6 +48,8 @@ struct Observation {
     effective_row_workers: Option<usize>,
     input_sha256: Option<String>,
     executable_sha256: Option<String>,
+    multi_rank_adapter_sha256: Option<String>,
+    multi_rank_adapter_max_rank: Option<usize>,
     load_milliseconds: Option<f64>,
     preparation_milliseconds: Option<f64>,
     session_milliseconds: Option<f64>,
@@ -155,31 +162,60 @@ fn execute(selection: &Selection<'_>, observation: &mut Observation) -> Result<(
     observation.executable_sha256 = Some(executable_hash(selection.deadline)?);
     observation.stage = "session-loading";
     check(selection.deadline)?;
+    if selection.representation.is_nariq() && selection.adapter.is_some() {
+        return Err(reject(
+            "NariQ representation does not support --rank-one-adapter",
+        ));
+    }
+    let multi_rank_identity = if let Some(multi_rank) = selection.multi_rank_adapter {
+        let (bytes, sha256) = hash_adapter_file(&multi_rank.path)?;
+        check(selection.deadline)?;
+        observation.multi_rank_adapter_sha256 = Some(sha256.clone());
+        Some((multi_rank.path.as_path(), bytes, sha256))
+    } else {
+        None
+    };
+    let multi_rank_spec =
+        multi_rank_identity
+            .as_ref()
+            .map(|(path, bytes, sha256)| MultiRankAdapterSpec {
+                path,
+                bytes: *bytes,
+                sha256,
+            });
     let parallelism = RowParallelism::new(selection.row_workers)?;
     let started = Instant::now();
     // Keep the established attribution control on its explicit FP16 baseline;
     // changing the serving default must not silently redefine this comparison.
-    let loaded = SwiftSession::load_profile_with_kv_cache(
+    let loaded = SwiftSession::load_profile_with_adapters(
         selection.model,
         selection.representation,
         selection.adapter.map(|value| value.path.as_path()),
+        multi_rank_spec,
         selection.backend,
         42,
         parallelism,
         KvCachePolicy::F16,
+        swift::CONTEXT_TOKENS,
+        None,
+        None,
+        PromptReuse::Disabled,
+        BranchCheckpoints::default(),
     );
     observation.load_milliseconds = Some(started.elapsed().as_secs_f64() * 1000.0);
     let mut session = loaded?;
     observation.model_loaded = true;
     observation.effective_row_workers = Some(session.row_workers());
+    observation.multi_rank_adapter_max_rank = session.secondary_adapter_max_rank();
     check(selection.deadline)?;
     observation.stage = "request-preparation";
     let started = Instant::now();
-    let prepared = session.prepare_with_settings(
+    let prepared = session.prepare_with_adapter_scales(
         &messages,
         selection.output_tokens,
         false,
         selection.adapter.map(|value| value.scale),
+        selection.multi_rank_adapter.map(|value| value.scale),
     );
     observation.preparation_milliseconds = Some(started.elapsed().as_secs_f64() * 1000.0);
     let prepared = prepared?;
@@ -232,6 +268,9 @@ fn identity_record(selection: &Selection<'_>, observation: &Observation) -> Valu
         "weight_representation":selection.representation.name(), "model_sha256":selection.representation.model_sha256(),
         "selected_adapter_sha256":selection.adapter.map(|_| SWIFT_ADAPTER_SHA256),
         "adapter_scale_bits":selection.adapter.map(|value| format!("{:08x}", value.scale.to_bits())),
+        "multiRankAdapterSha256":observation.multi_rank_adapter_sha256,
+        "multiRankAdapterMaxRank":observation.multi_rank_adapter_max_rank,
+        "multiRankAdapterScaleBits":selection.multi_rank_adapter.map(|value| format!("{:08x}", value.scale.to_bits())),
         "configured_row_workers":selection.row_workers, "effective_row_workers":observation.effective_row_workers,
         "backend_requested":format!("{:?}", selection.backend), "seed":42, "thinking_enabled":false,
         "sampler":"production SwiftSampler and model-declared native stops", "prompt_reuse":"disabled",
@@ -297,6 +336,7 @@ pub(super) fn run(
     arguments: &[String],
     representation: Representation,
     adapter: Option<&AdapterSelection>,
+    multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
     let started = Instant::now();
@@ -326,6 +366,7 @@ pub(super) fn run(
         backend,
         representation,
         adapter,
+        multi_rank_adapter,
         row_workers,
         output_tokens,
         source_commit,
@@ -388,6 +429,7 @@ mod tests {
             backend: MatvecBackend::Scalar,
             representation: Representation::CurrentRepackedPtq1,
             adapter: None,
+            multi_rank_adapter: None,
             row_workers: 4,
             output_tokens: 1,
             source_commit: "0000000000000000000000000000000000000000",
@@ -494,5 +536,31 @@ mod tests {
         std::fs::remove_file(final_path)?;
         std::fs::remove_dir(directory)?;
         Ok(())
+    }
+
+    #[test]
+    fn multi_rank_identity_fields_omit_paths_and_record_scale_bits() {
+        let multi_rank = MultiRankAdapterSelection {
+            path: std::path::PathBuf::from("/private-dir/private-daisyrose.gguf"),
+            scale: 0.5,
+        };
+        let mut sel = selection();
+        sel.representation = Representation::NariQ2_5Bpw;
+        sel.multi_rank_adapter = Some(&multi_rank);
+        let observation = Observation {
+            stage: "complete",
+            multi_rank_adapter_sha256: Some("a".repeat(64)),
+            multi_rank_adapter_max_rank: Some(6),
+            ..Observation::default()
+        };
+        let rec = record(&sel, &observation, true, Duration::from_millis(5));
+        assert_eq!(rec["weight_representation"], "NariQ-2.5bpw");
+        assert_eq!(rec["multiRankAdapterSha256"], "a".repeat(64));
+        assert_eq!(rec["multiRankAdapterMaxRank"], 6);
+        assert_eq!(
+            rec["multiRankAdapterScaleBits"],
+            format!("{:08x}", 0.5_f32.to_bits())
+        );
+        assert!(!rec.to_string().contains("private-"));
     }
 }

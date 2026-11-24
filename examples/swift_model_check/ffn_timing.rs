@@ -1,8 +1,8 @@
 //! Bounded layer attribution on the unmodified full-token graph path.
 
 use super::{
-    AdapterSelection, Representation, evidence_backend, load_graph, reject, request_timing,
-    valid_tokens,
+    AdapterSelection, MultiRankAdapterSelection, Representation, evidence_backend,
+    load_graph_with_adapters, reject, request_timing, valid_tokens,
 };
 use bonsai_prism_runtime::{
     Decoder, Result,
@@ -36,6 +36,8 @@ struct Observation {
     stage: &'static str,
     input_sha256: Option<String>,
     executable_sha256: Option<String>,
+    multi_rank_adapter_sha256: Option<String>,
+    multi_rank_adapter_max_rank: Option<usize>,
     graph_identity: Option<String>,
     row_workers: Option<usize>,
     load_milliseconds: Option<f64>,
@@ -48,6 +50,7 @@ struct Selection<'a> {
     arguments: &'a [String],
     representation: Representation,
     adapter: Option<&'a AdapterSelection>,
+    multi_rank_adapter: Option<&'a MultiRankAdapterSelection>,
     row_workers: usize,
     deadline_unix_milliseconds: u64,
     deadline: Instant,
@@ -69,6 +72,9 @@ fn record(
         "weightRepresentation":selection.representation.name(),
         "adapterSha256":selection.adapter.map(|_| SWIFT_ADAPTER_SHA256),
         "adapterScaleBits":format!("{:08x}",selection.adapter.map_or(0.0, |adapter| adapter.scale).to_bits()),
+        "multiRankAdapterSha256":observation.multi_rank_adapter_sha256,
+        "multiRankAdapterMaxRank":observation.multi_rank_adapter_max_rank,
+        "multiRankAdapterScaleBits":selection.multi_rank_adapter.map(|adapter| format!("{:08x}", adapter.scale.to_bits())),
         "graphIdentity":observation.graph_identity,"backendRequested":selection.arguments[1],
         "requestedRowWorkers":selection.row_workers,"effectiveRowWorkers":observation.row_workers,
         "originalDeadlineUnixMilliseconds":selection.deadline_unix_milliseconds,
@@ -99,15 +105,25 @@ fn execute(selection: &Selection<'_>, observation: &mut Observation) -> Result<(
     observation.executable_sha256 = Some(request_timing::executable_hash(selection.deadline)?);
     observation.stage = "model-loading";
     request_timing::check(selection.deadline)?;
+    if selection.representation.is_nariq() && selection.adapter.is_some() {
+        return Err(reject(
+            "NariQ representation does not support --rank-one-adapter",
+        ));
+    }
     let (_, backend) = evidence_backend(selection.arguments)?;
     let started = Instant::now();
-    let mut graph = load_graph(
+    let (mut graph, multi_meta) = load_graph_with_adapters(
         selection.model,
         backend,
         selection.representation,
         selection.adapter,
+        selection.multi_rank_adapter,
         selection.row_workers,
     )?;
+    if let Some(meta) = multi_meta {
+        observation.multi_rank_adapter_sha256 = Some(meta.sha256);
+        observation.multi_rank_adapter_max_rank = Some(meta.max_rank);
+    }
     observation.load_milliseconds = Some(started.elapsed().as_secs_f64() * 1000.0);
     observation.graph_identity = Some(graph.identity().to_owned());
     observation.row_workers = Some(graph.row_workers());
@@ -137,6 +153,7 @@ pub(super) fn run(
     arguments: &[String],
     representation: Representation,
     adapter: Option<&AdapterSelection>,
+    multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
     let started = Instant::now();
@@ -160,6 +177,7 @@ pub(super) fn run(
         arguments,
         representation,
         adapter,
+        multi_rank_adapter,
         row_workers,
         deadline_unix_milliseconds,
         deadline,
@@ -224,6 +242,7 @@ mod tests {
             arguments: &arguments,
             representation: Representation::Pq2,
             adapter: None,
+            multi_rank_adapter: None,
             row_workers: 1,
             deadline_unix_milliseconds: 1,
             deadline: Instant::now(),
@@ -252,6 +271,36 @@ mod tests {
         std::fs::remove_file(path)?;
         std::fs::remove_file(directory.join("ffn-timing-started.json"))?;
         std::fs::remove_dir(directory)?;
+
+        let multi_rank = MultiRankAdapterSelection {
+            path: std::path::PathBuf::from("/private-dir/private-mr.gguf"),
+            scale: 0.5,
+        };
+        let mr_selection = Selection {
+            model: Path::new("private-model"),
+            arguments: &arguments,
+            representation: Representation::NariQ3_0Bpw,
+            adapter: None,
+            multi_rank_adapter: Some(&multi_rank),
+            row_workers: 1,
+            deadline_unix_milliseconds: 1,
+            deadline: Instant::now(),
+        };
+        let mr_observation = Observation {
+            stage: "complete",
+            multi_rank_adapter_sha256: Some("b".repeat(64)),
+            multi_rank_adapter_max_rank: Some(4),
+            ..Observation::default()
+        };
+        let mr_record = super::record(&mr_selection, &mr_observation, Some(true), Instant::now());
+        assert_eq!(mr_record["weightRepresentation"], "NariQ-3.0bpw");
+        assert_eq!(mr_record["multiRankAdapterSha256"], "b".repeat(64));
+        assert_eq!(mr_record["multiRankAdapterMaxRank"], 4);
+        assert_eq!(
+            mr_record["multiRankAdapterScaleBits"],
+            format!("{:08x}", 0.5_f32.to_bits())
+        );
+        assert!(!mr_record.to_string().contains("private-"));
         Ok(())
     }
 }

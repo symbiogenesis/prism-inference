@@ -23,7 +23,17 @@ use bonsai_prism_runtime::token_input::read_tokens;
 use bonsai_prism_runtime::{Decoder, Result};
 use serde_json::{Value, json};
 
-const MODEL_BUDGET: usize = 8 * 1024 * 1024 * 1024;
+const DEFAULT_MODEL_BUDGET: usize = 8 * 1024 * 1024 * 1024;
+const NARIQ_MODEL_BUDGET: usize = 12 * 1024 * 1024 * 1024;
+
+const fn model_budget_for(representation: Representation) -> usize {
+    if representation.is_nariq() {
+        NARIQ_MODEL_BUDGET
+    } else {
+        DEFAULT_MODEL_BUDGET
+    }
+}
+
 const MAX_GREEDY_STEPS: usize = 16;
 const MAX_TRAJECTORY_EVIDENCE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const USAGE: &str = concat!(
@@ -33,10 +43,10 @@ const USAGE: &str = concat!(
     "       swift_model_check rollback <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check request-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-messages.json> <output-1..16> <absolute-deadline-unix-ms> <source-commit>\n",
     "       swift_model_check ffn-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-token-ids.json> <absolute-deadline-unix-ms> <source-commit>\n",
-    "Prefix any mode with --use-repacked-ptq1 to select only the verified current-weight PTQ1 export. PQ2 remains the default.\n",
+    "Prefix any mode with --use-repacked-ptq1 (verified current-weight PTQ1 export) or --nariq <2.5bpw|3.0bpw|2.0bpw> (opt-in NariQ trellis artifact; mutually exclusive with --use-repacked-ptq1 and --rank-one-adapter). PQ2 remains the default.\n",
     "For load/forward/trajectory/rollback/request-timing/ffn-timing, --row-workers <1..18> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
-    "For selected current-weight load/forward/trajectory/rollback/request-timing/ffn-timing, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
-    "For load/forward/rollback, optionally prefix --multi-rank-adapter <absolute-gguf>[:<scale-0..2>] (default scale 0.0; NpuFriendly policy) alongside or without --rank-one-adapter.\n",
+    "For selected PQ2/PTQ1 load/forward/trajectory/rollback/request-timing/ffn-timing, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
+    "For load/forward/trajectory/rollback/request-timing/ffn-timing, optionally prefix --multi-rank-adapter <absolute-gguf>[:<scale-0..2>] (default scale 0.0; NpuFriendly policy) alongside or without --rank-one-adapter (NariQ forbids --rank-one-adapter).\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
@@ -72,9 +82,25 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
-    let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    let representation = select_representation(&mut arguments);
+enum ParsedCommand {
+    Help,
+    Inspect {
+        path: PathBuf,
+        representation: Representation,
+    },
+    Mode {
+        mode: String,
+        path: PathBuf,
+        tail: Vec<String>,
+        representation: Representation,
+        adapter: Option<AdapterSelection>,
+        multi_rank_adapter: Option<MultiRankAdapterSelection>,
+        row_workers: usize,
+    },
+}
+
+fn parse_cli(mut arguments: Vec<String>) -> Result<ParsedCommand> {
+    let representation = select_representation(&mut arguments)?;
     let row_workers = select_row_workers(&mut arguments)?;
     let mut adapter = select_adapter(&mut arguments)?;
     let multi_rank_adapter = select_multi_rank_adapter(&mut arguments)?;
@@ -82,13 +108,15 @@ fn run() -> Result<()> {
         adapter = select_adapter(&mut arguments)?;
     }
     if arguments.len() == 1 && arguments[0] == "--help" {
-        std::io::stdout().lock().write_all(USAGE.as_bytes())?;
-        return Ok(());
+        return Ok(ParsedCommand::Help);
+    }
+    if representation.is_nariq() && adapter.is_some() {
+        return Err(reject("--nariq cannot be combined with --rank-one-adapter"));
     }
     if !(2..=8).contains(&arguments.len()) {
         return Err(reject(USAGE));
     }
-    let mode = &arguments[0];
+    let mode = arguments[0].clone();
     let path = PathBuf::from(&arguments[1]);
     if !path.is_absolute()
         || !matches!(
@@ -114,26 +142,78 @@ fn run() -> Result<()> {
         {
             return Err(reject("inspect takes only the model path"));
         }
-        return report(
-            "header-verified",
-            swift::inspect_representation(&path, MODEL_BUDGET, representation)?,
+        return Ok(ParsedCommand::Inspect {
+            path,
             representation,
-        );
+        });
     }
-    if !matches!(mode.as_str(), "load" | "forward" | "rollback") && multi_rank_adapter.is_some() {
-        return Err(reject(
-            "--multi-rank-adapter is supported only for load, forward, and rollback",
-        ));
-    }
-    dispatch_mode(
+    let tail: Vec<String> = arguments.drain(2..).collect();
+    validate_mode_tail(&mode, &tail)?;
+    Ok(ParsedCommand::Mode {
         mode,
-        &path,
-        &arguments[2..],
+        path,
+        tail,
         representation,
-        adapter.as_ref(),
-        multi_rank_adapter.as_ref(),
-        row_workers.unwrap_or(1),
-    )
+        adapter,
+        multi_rank_adapter,
+        row_workers: row_workers.unwrap_or(1),
+    })
+}
+
+fn validate_mode_tail(mode: &str, tail: &[String]) -> Result<()> {
+    match mode {
+        "load" if !tail.is_empty() => Err(reject("load takes only the model path")),
+        "forward" if tail.len() != 3 => Err(reject(
+            "forward requires output directory, backend and token IDs",
+        )),
+        "trajectory" if tail.len() != 4 => Err(reject(
+            "trajectory requires output directory, backend, prompt-ID file and greedy steps",
+        )),
+        "rollback" if tail.len() != 3 => Err(reject(
+            "rollback requires output directory, backend and 1..16 token IDs",
+        )),
+        "request-timing" if tail.len() != 6 => Err(reject(
+            "request-timing requires evidence, backend, messages, output bound, original deadline and source commit",
+        )),
+        "ffn-timing" if tail.len() != 5 => Err(reject(
+            "ffn-timing requires evidence, backend, absolute token input, original deadline and source commit",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn run() -> Result<()> {
+    match parse_cli(std::env::args().skip(1).collect())? {
+        ParsedCommand::Help => {
+            std::io::stdout().lock().write_all(USAGE.as_bytes())?;
+            Ok(())
+        }
+        ParsedCommand::Inspect {
+            path,
+            representation,
+        } => report(
+            "header-verified",
+            swift::inspect_representation(&path, model_budget_for(representation), representation)?,
+            representation,
+        ),
+        ParsedCommand::Mode {
+            mode,
+            path,
+            tail,
+            representation,
+            adapter,
+            multi_rank_adapter,
+            row_workers,
+        } => dispatch_mode(
+            &mode,
+            &path,
+            &tail,
+            representation,
+            adapter.as_ref(),
+            multi_rank_adapter.as_ref(),
+            row_workers,
+        ),
+    }
 }
 
 fn dispatch_mode(
@@ -170,7 +250,14 @@ fn dispatch_mode(
             multi_rank_adapter,
             row_workers,
         ),
-        "trajectory" => trajectory(path, tail, representation, adapter, row_workers),
+        "trajectory" => trajectory(
+            path,
+            tail,
+            representation,
+            adapter,
+            multi_rank_adapter,
+            row_workers,
+        ),
         "rollback" => rollback::run(
             path,
             tail,
@@ -179,8 +266,22 @@ fn dispatch_mode(
             multi_rank_adapter,
             row_workers,
         ),
-        "request-timing" => request_timing::run(path, tail, representation, adapter, row_workers),
-        "ffn-timing" => ffn_timing::run(path, tail, representation, adapter, row_workers),
+        "request-timing" => request_timing::run(
+            path,
+            tail,
+            representation,
+            adapter,
+            multi_rank_adapter,
+            row_workers,
+        ),
+        "ffn-timing" => ffn_timing::run(
+            path,
+            tail,
+            representation,
+            adapter,
+            multi_rank_adapter,
+            row_workers,
+        ),
         _ => Err(reject("unsupported evaluation mode")),
     }
 }
@@ -346,16 +447,42 @@ fn hash_adapter_file(path: &Path) -> Result<(u64, String)> {
     Ok((read_bytes, hex::encode(hasher.finish()?)))
 }
 
-fn select_representation(arguments: &mut Vec<String>) -> Representation {
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "--use-repacked-ptq1")
-    {
-        arguments.remove(0);
-        Representation::CurrentRepackedPtq1
-    } else {
-        Representation::Pq2
+fn select_representation(arguments: &mut Vec<String>) -> Result<Representation> {
+    let mut selected = None;
+    while let Some(first) = arguments.first().map(String::as_str) {
+        let next = match first {
+            "--use-repacked-ptq1" => {
+                arguments.remove(0);
+                Representation::CurrentRepackedPtq1
+            }
+            "--nariq" => {
+                let value = arguments
+                    .get(1)
+                    .map(String::as_str)
+                    .ok_or_else(|| reject("--nariq requires 2.5bpw, 3.0bpw, or 2.0bpw"))?;
+                let representation = match value {
+                    "2.5bpw" => Representation::NariQ2_5Bpw,
+                    "3.0bpw" => Representation::NariQ3_0Bpw,
+                    "2.0bpw" => Representation::NariQ2_0Bpw,
+                    _ => {
+                        return Err(reject(
+                            "unsupported --nariq variant; expected 2.5bpw, 3.0bpw, or 2.0bpw",
+                        ));
+                    }
+                };
+                arguments.drain(..2);
+                representation
+            }
+            _ => break,
+        };
+        if selected.is_some() {
+            return Err(reject(
+                "conflicting or duplicate model representation prefix",
+            ));
+        }
+        selected = Some(next);
     }
+    Ok(selected.unwrap_or(Representation::Pq2))
 }
 
 fn evidence_backend(arguments: &[String]) -> Result<(&Path, MatvecBackend)> {
@@ -379,18 +506,6 @@ fn valid_tokens(tokens: &[u32]) -> bool {
             .all(|&token| usize::try_from(token).is_ok_and(|id| id < swift::VOCAB_SIZE))
 }
 
-fn load_graph(
-    path: &Path,
-    backend: MatvecBackend,
-    representation: Representation,
-    selection: Option<&AdapterSelection>,
-    row_workers: usize,
-) -> Result<Qwen35> {
-    let (graph, _) =
-        load_graph_with_adapters(path, backend, representation, selection, None, row_workers)?;
-    Ok(graph)
-}
-
 fn load_graph_with_adapters(
     path: &Path,
     backend: MatvecBackend,
@@ -399,9 +514,15 @@ fn load_graph_with_adapters(
     multi_rank: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<(Qwen35, Option<MultiRankMetadata>)> {
-    // Reject unavailable worker counts before opening/hashing model artifacts.
+    // Reject unavailable worker counts or incompatible adapter prefixes before model I/O.
+    if representation.is_nariq() && selection.is_some() {
+        return Err(reject(
+            "NariQ representation does not support --rank-one-adapter",
+        ));
+    }
     let parallelism = RowParallelism::new(row_workers)?;
-    let (model, receipt) = swift::load_representation(path, MODEL_BUDGET, representation)?;
+    let (model, receipt) =
+        swift::load_representation(path, model_budget_for(representation), representation)?;
     report("weights-loaded", receipt, representation)?;
     let rank_one = if let Some(selection) = selection {
         let adapter =
@@ -516,11 +637,20 @@ fn forward(
     Ok(())
 }
 
+fn attach_trajectory_multi_rank(record: &mut Value, multi_metadata: Option<&MultiRankMetadata>) {
+    if let Some(meta) = multi_metadata {
+        record["multi_rank_adapter_sha256"] = json!(meta.sha256);
+        record["multi_rank_max_rank"] = json!(meta.max_rank);
+        record["multi_rank_scale_bits"] = json!(format!("{:08x}", meta.scale.to_bits()));
+    }
+}
+
 fn trajectory(
     path: &Path,
     arguments: &[String],
     representation: Representation,
     adapter: Option<&AdapterSelection>,
+    multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
     if arguments.len() != 4 {
@@ -551,7 +681,14 @@ fn trajectory(
     emit(
         &json!({"event":"trajectory-start","prompt_token_ids":prompt,"prompt_tokens":prompt.len(),"greedy_steps":steps,"context_tokens":swift::CONTEXT_TOKENS,"maximum_snapshot_payload_bytes":MAX_TRAJECTORY_EVIDENCE_BYTES,"snapshot_count":steps+1,"stop_policy":"fixed-step raw greedy; special IDs are included"}),
     )?;
-    let mut graph = load_graph(path, backend, representation, adapter, row_workers)?;
+    let (mut graph, multi_metadata) = load_graph_with_adapters(
+        path,
+        backend,
+        representation,
+        adapter,
+        multi_rank_adapter,
+        row_workers,
+    )?;
     for &token in intermediate {
         graph.ingest(token)?;
     }
@@ -566,17 +703,17 @@ fn trajectory(
         let position = prompt.len() - 1 + step;
         let output = snapshot(&graph, &logits, evidence, position, &mut remaining)?;
         let next = greedy(&logits)?;
-        emit(
-            &json!({"event":"trajectory-step","step":step,"position":position,"kind":if step==0 {"prefix"} else {"generated"},"input_token":token,"greedy_token":next,"logits":output,"logit_count":logits.len(),"checkpoint_bytes":graph.checkpoint_bytes(),"identity":graph.identity(),"backend_requested":arguments[1],"snapshot_payload_bytes_written":MAX_TRAJECTORY_EVIDENCE_BYTES-remaining,"row_workers":graph.row_workers(),"parallel_row_operations":graph.backend_statistics().parallel_row_operations,"evaluation_milliseconds":evaluation_milliseconds}),
-        )?;
+        let mut step_record = json!({"event":"trajectory-step","step":step,"position":position,"kind":if step==0 {"prefix"} else {"generated"},"input_token":token,"greedy_token":next,"logits":output,"logit_count":logits.len(),"checkpoint_bytes":graph.checkpoint_bytes(),"identity":graph.identity(),"backend_requested":arguments[1],"snapshot_payload_bytes_written":MAX_TRAJECTORY_EVIDENCE_BYTES-remaining,"row_workers":graph.row_workers(),"parallel_row_operations":graph.backend_statistics().parallel_row_operations,"evaluation_milliseconds":evaluation_milliseconds});
+        attach_trajectory_multi_rank(&mut step_record, multi_metadata.as_ref());
+        emit(&step_record)?;
         if step < steps {
             generated.push(next);
             token = next;
         }
     }
-    emit(
-        &json!({"event":"trajectory-complete","prompt_token_ids":prompt,"generated_token_ids":generated,"prompt_tokens":prompt.len(),"generated_tokens":generated.len(),"snapshot_payload_bytes_written":MAX_TRAJECTORY_EVIDENCE_BYTES-remaining}),
-    )
+    let mut complete_record = json!({"event":"trajectory-complete","prompt_token_ids":prompt,"generated_token_ids":generated,"prompt_tokens":prompt.len(),"generated_tokens":generated.len(),"snapshot_payload_bytes_written":MAX_TRAJECTORY_EVIDENCE_BYTES-remaining});
+    attach_trajectory_multi_rank(&mut complete_record, multi_metadata.as_ref());
+    emit(&complete_record)
 }
 
 fn hash_f32_le(values: &[f32]) -> Result<(usize, String)> {
@@ -653,7 +790,7 @@ fn dump_state(graph: &Qwen35, states: &Path, remaining: &mut usize) -> Result<()
 }
 
 fn report(event: &str, receipt: swift::LoadReceipt, representation: Representation) -> Result<()> {
-    let mut record = json!({"event":event,"weight_representation":representation.name(),"model_sha256":representation.model_sha256(),"model_bytes":representation.model_bytes(),"header_charge_bytes":receipt.header_charge_bytes,"tensor_payload_bytes":receipt.tensor_payload_bytes,"retained_storage_bytes":receipt.retained_storage_bytes,"largest_tensor_conversion_copy_bytes":receipt.largest_tensor_bytes,"tensor_counts_f32_bf16_packed":receipt.tensor_counts,"model_storage_budget_bytes":MODEL_BUDGET,"memory_claim":"retained storage accounting; process working set and peak commit are separate"});
+    let mut record = json!({"event":event,"weight_representation":representation.name(),"model_sha256":representation.model_sha256(),"model_bytes":representation.model_bytes(),"header_charge_bytes":receipt.header_charge_bytes,"tensor_payload_bytes":receipt.tensor_payload_bytes,"retained_storage_bytes":receipt.retained_storage_bytes,"largest_tensor_conversion_copy_bytes":receipt.largest_tensor_bytes,"tensor_counts_f32_bf16_packed":receipt.tensor_counts,"model_storage_budget_bytes":model_budget_for(representation),"memory_claim":"retained storage accounting; process working set and peak commit are separate"});
     // Retain the original PQ2 evidence key without falsely naming PTQ1 counts PQ2.
     if representation == Representation::Pq2 {
         record["tensor_counts_f32_bf16_pq2"] = json!(receipt.tensor_counts);
@@ -664,8 +801,9 @@ fn report(event: &str, receipt: swift::LoadReceipt, representation: Representati
 #[cfg(test)]
 mod tests {
     use super::{
-        Representation, Result, select_adapter, select_multi_rank_adapter, select_representation,
-        select_row_workers, write_values,
+        MultiRankMetadata, ParsedCommand, Representation, Result, attach_trajectory_multi_rank,
+        model_budget_for, parse_cli, select_adapter, select_multi_rank_adapter,
+        select_representation, select_row_workers, write_values,
     };
 
     #[test]
@@ -689,7 +827,7 @@ mod tests {
                     "forward".into(),
                 ]);
                 assert_eq!(
-                    select_representation(&mut arguments),
+                    select_representation(&mut arguments)?,
                     if repacked {
                         Representation::CurrentRepackedPtq1
                     } else {
@@ -722,10 +860,11 @@ mod tests {
     #[cfg(not(feature = "parallel-rows"))]
     #[test]
     fn row_worker_feature_rejection_precedes_model_file_access() {
-        let rejected = super::load_graph(
+        let rejected = super::load_graph_with_adapters(
             std::path::Path::new("missing-relative-model.gguf"),
             super::MatvecBackend::Auto,
             Representation::Pq2,
+            None,
             None,
             2,
         );
@@ -770,9 +909,9 @@ mod tests {
     }
 
     #[test]
-    fn ptq1_correctness_capture_requires_explicit_prefix_and_keeps_source_default() {
+    fn ptq1_correctness_capture_requires_explicit_prefix_and_keeps_source_default() -> Result<()> {
         let mut source = vec!["inspect".to_owned(), "model.gguf".to_owned()];
-        assert_eq!(select_representation(&mut source), Representation::Pq2);
+        assert_eq!(select_representation(&mut source)?, Representation::Pq2);
         assert_eq!(source, ["inspect", "model.gguf"]);
 
         let mut exported = vec![
@@ -781,14 +920,15 @@ mod tests {
             "export.gguf".to_owned(),
         ];
         assert_eq!(
-            select_representation(&mut exported),
+            select_representation(&mut exported)?,
             Representation::CurrentRepackedPtq1
         );
         assert_eq!(exported, ["forward", "export.gguf"]);
 
         let mut misplaced = vec!["inspect".to_owned(), "--use-repacked-ptq1".to_owned()];
-        assert_eq!(select_representation(&mut misplaced), Representation::Pq2);
+        assert_eq!(select_representation(&mut misplaced)?, Representation::Pq2);
         assert_eq!(misplaced, ["inspect", "--use-repacked-ptq1"]);
+        Ok(())
     }
 
     #[test]
@@ -803,7 +943,7 @@ mod tests {
                 "forward".into(),
             ];
             assert_eq!(
-                select_representation(&mut args),
+                select_representation(&mut args)?,
                 Representation::CurrentRepackedPtq1
             );
             let adapter = select_adapter(&mut args)?.ok_or("missing explicit adapter")?;
@@ -914,6 +1054,311 @@ mod tests {
             path_str,
         ];
         assert!(select_multi_rank_adapter(&mut duplicate).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn nariq_representation_parsing_and_budget_reject_ptq1_and_rank_one() -> Result<()> {
+        assert_eq!(
+            model_budget_for(Representation::Pq2),
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            model_budget_for(Representation::CurrentRepackedPtq1),
+            8 * 1024 * 1024 * 1024
+        );
+        for (flag, expected) in [
+            ("2.5bpw", Representation::NariQ2_5Bpw),
+            ("3.0bpw", Representation::NariQ3_0Bpw),
+            ("2.0bpw", Representation::NariQ2_0Bpw),
+        ] {
+            let mut args = vec!["--nariq".to_owned(), flag.to_owned(), "load".to_owned()];
+            assert_eq!(select_representation(&mut args)?, expected);
+            assert_eq!(args, ["load"]);
+            assert_eq!(model_budget_for(expected), 12 * 1024 * 1024 * 1024);
+        }
+
+        for bad in [
+            vec!["--nariq".to_owned()],
+            vec!["--nariq".to_owned(), "4.0bpw".to_owned()],
+            vec![
+                "--nariq".to_owned(),
+                "2.5bpw".to_owned(),
+                "--use-repacked-ptq1".to_owned(),
+            ],
+            vec![
+                "--use-repacked-ptq1".to_owned(),
+                "--nariq".to_owned(),
+                "3.0bpw".to_owned(),
+            ],
+            vec![
+                "--nariq".to_owned(),
+                "2.5bpw".to_owned(),
+                "--nariq".to_owned(),
+                "2.0bpw".to_owned(),
+            ],
+        ] {
+            let mut args = bad;
+            assert!(select_representation(&mut args).is_err());
+        }
+
+        let model = std::env::temp_dir()
+            .join("nariq-3.0bpw.gguf")
+            .to_string_lossy()
+            .into_owned();
+        let rank_one = std::env::temp_dir()
+            .join("orca.gguf")
+            .to_string_lossy()
+            .into_owned();
+        let multi_rank = std::env::temp_dir()
+            .join("daisyrose.gguf")
+            .to_string_lossy()
+            .into_owned();
+
+        // Reject --nariq + --rank-one-adapter (with or without --multi-rank-adapter).
+        assert!(
+            parse_cli(vec![
+                "--nariq".into(),
+                "2.5bpw".into(),
+                "--rank-one-adapter".into(),
+                rank_one.clone(),
+                "1.3".into(),
+                "load".into(),
+                model.clone(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_cli(vec![
+                "--nariq".into(),
+                "3.0bpw".into(),
+                "--multi-rank-adapter".into(),
+                format!("{multi_rank}:0.5"),
+                "--rank-one-adapter".into(),
+                rank_one,
+                "1.3".into(),
+                "load".into(),
+                model,
+            ])
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nariq_load_admits_multi_rank_adapter() -> Result<()> {
+        let model = std::env::temp_dir()
+            .join("nariq-3.0bpw.gguf")
+            .to_string_lossy()
+            .into_owned();
+        let multi_rank = std::env::temp_dir()
+            .join("daisyrose.gguf")
+            .to_string_lossy()
+            .into_owned();
+
+        let parsed = parse_cli(vec![
+            "--nariq".into(),
+            "3.0bpw".into(),
+            "--multi-rank-adapter".into(),
+            format!("{multi_rank}:0.5"),
+            "load".into(),
+            model,
+        ])?;
+        match parsed {
+            ParsedCommand::Mode {
+                mode,
+                representation,
+                adapter,
+                multi_rank_adapter,
+                ..
+            } => {
+                assert_eq!(mode, "load");
+                assert_eq!(representation, Representation::NariQ3_0Bpw);
+                assert!(adapter.is_none());
+                let mr = multi_rank_adapter.ok_or("missing multi-rank adapter")?;
+                assert_eq!(mr.scale.to_bits(), 0.5_f32.to_bits());
+            }
+            _ => return Err(super::reject("expected parsed load command")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn trajectory_and_request_timing_parse_nariq_and_multi_rank_adapter() -> Result<()> {
+        let base = std::env::temp_dir();
+        let model = base.join("model.gguf").to_string_lossy().into_owned();
+        let evidence = base.join("evidence").to_string_lossy().into_owned();
+        let input = base.join("input.json").to_string_lossy().into_owned();
+        let mr = base.join("daisyrose.gguf").to_string_lossy().into_owned();
+        let commit = "0".repeat(40);
+
+        let traj = parse_cli(vec![
+            "--nariq".into(),
+            "2.5bpw".into(),
+            "--row-workers".into(),
+            "4".into(),
+            "--multi-rank-adapter".into(),
+            format!("{mr}:0.5"),
+            "trajectory".into(),
+            model.clone(),
+            evidence.clone(),
+            "auto".into(),
+            input.clone(),
+            "4".into(),
+        ])?;
+        match traj {
+            ParsedCommand::Mode {
+                mode,
+                tail,
+                representation,
+                adapter,
+                multi_rank_adapter,
+                row_workers,
+                ..
+            } => {
+                assert_eq!(mode, "trajectory");
+                assert_eq!(tail.len(), 4);
+                assert_eq!(representation, Representation::NariQ2_5Bpw);
+                assert!(adapter.is_none());
+                assert_eq!(row_workers, 4);
+                assert_eq!(
+                    multi_rank_adapter.ok_or("missing mr")?.scale.to_bits(),
+                    0.5_f32.to_bits()
+                );
+            }
+            _ => return Err(super::reject("expected trajectory command")),
+        }
+
+        let req = parse_cli(vec![
+            "--nariq".into(),
+            "2.0bpw".into(),
+            "--multi-rank-adapter".into(),
+            mr,
+            "request-timing".into(),
+            model,
+            evidence,
+            "neon".into(),
+            input,
+            "8".into(),
+            "1700000000000".into(),
+            commit,
+        ])?;
+        match req {
+            ParsedCommand::Mode {
+                mode,
+                tail,
+                representation,
+                adapter,
+                multi_rank_adapter,
+                ..
+            } => {
+                assert_eq!(mode, "request-timing");
+                assert_eq!(tail.len(), 6);
+                assert_eq!(representation, Representation::NariQ2_0Bpw);
+                assert!(adapter.is_none());
+                assert_eq!(
+                    multi_rank_adapter.ok_or("missing mr")?.scale.to_bits(),
+                    0.0_f32.to_bits()
+                );
+            }
+            _ => return Err(super::reject("expected request-timing command")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ffn_timing_and_trajectory_receipt_support_multi_rank_adapter() -> Result<()> {
+        let base = std::env::temp_dir();
+        let model = base.join("model.gguf").to_string_lossy().into_owned();
+        let evidence = base.join("evidence").to_string_lossy().into_owned();
+        let input = base.join("input.json").to_string_lossy().into_owned();
+        let mr = base.join("daisyrose.gguf").to_string_lossy().into_owned();
+        let r1 = base.join("orca.gguf").to_string_lossy().into_owned();
+        let commit = "0".repeat(40);
+
+        let ffn = parse_cli(vec![
+            "--use-repacked-ptq1".into(),
+            "--row-workers".into(),
+            "2".into(),
+            "--rank-one-adapter".into(),
+            r1,
+            "1.3".into(),
+            "--multi-rank-adapter".into(),
+            format!("{mr}:1.0"),
+            "ffn-timing".into(),
+            model.clone(),
+            evidence.clone(),
+            "scalar".into(),
+            input,
+            "1700000000000".into(),
+            commit,
+        ])?;
+        match ffn {
+            ParsedCommand::Mode {
+                mode,
+                tail,
+                representation,
+                adapter,
+                multi_rank_adapter,
+                row_workers,
+                ..
+            } => {
+                assert_eq!(mode, "ffn-timing");
+                assert_eq!(tail.len(), 5);
+                assert_eq!(representation, Representation::CurrentRepackedPtq1);
+                assert_eq!(row_workers, 2);
+                assert_eq!(
+                    adapter.ok_or("missing r1")?.scale.to_bits(),
+                    1.3_f32.to_bits()
+                );
+                assert_eq!(
+                    multi_rank_adapter.ok_or("missing mr")?.scale.to_bits(),
+                    1.0_f32.to_bits()
+                );
+            }
+            _ => return Err(super::reject("expected ffn-timing command")),
+        }
+
+        // Verify trajectory receipt multi-rank attachment helper.
+        let mut receipt = serde_json::json!({"event": "trajectory-complete"});
+        attach_trajectory_multi_rank(
+            &mut receipt,
+            Some(&MultiRankMetadata {
+                sha256: "c".repeat(64),
+                max_rank: 6,
+                target_count: 12,
+                scale: 0.5,
+            }),
+        );
+        assert_eq!(receipt["multi_rank_adapter_sha256"], "c".repeat(64));
+        assert_eq!(receipt["multi_rank_max_rank"], 6);
+        assert_eq!(
+            receipt["multi_rank_scale_bits"],
+            format!("{:08x}", 0.5_f32.to_bits())
+        );
+
+        // Missing tail argument is rejected for timing/trajectory modes.
+        assert!(
+            parse_cli(vec![
+                "--nariq".into(),
+                "2.5bpw".into(),
+                "trajectory".into(),
+                model.clone(),
+                evidence.clone(),
+                "auto".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_cli(vec![
+                "request-timing".into(),
+                model.clone(),
+                evidence.clone(),
+                "auto".into(),
+            ])
+            .is_err()
+        );
+        assert!(parse_cli(vec!["ffn-timing".into(), model, evidence, "auto".into()]).is_err());
         Ok(())
     }
 }

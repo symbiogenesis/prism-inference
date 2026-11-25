@@ -257,6 +257,7 @@ pub struct VulkanLayerPipelines {
     attn_pv_accum_f16kv: PipelineId,
     attn_fused_f16prob: PipelineId,
     attn_fused_f16prob_f16kv: PipelineId,
+    attn_fused_gqa_prefill_f16kv: PipelineId,
     rms_norm: PipelineId,
     add_rms_norm: PipelineId,
     rope: PipelineId,
@@ -309,6 +310,7 @@ pub struct VulkanLayerPipelines {
     attn_pv_f16kv_digest: String,
     attn_fused_digest: String,
     attn_fused_f16kv_digest: String,
+    attn_fused_gqa_prefill_f16kv_digest: String,
     shader_digests_sha256: String,
 }
 
@@ -357,6 +359,12 @@ impl VulkanLayerPipelines {
         let (attn_fused_f16prob_f16kv, attn_fused_f16kv_digest) = make_pipe(
             b"attn_fused_f16prob_f16kv",
             spirv::attn_fused_f16prob_f16kv(),
+            4,
+            8,
+        )?;
+        let (attn_fused_gqa_prefill_f16kv, attn_fused_gqa_prefill_f16kv_digest) = make_pipe(
+            b"attn_fused_gqa_prefill_f16kv",
+            spirv::attn_fused_gqa_prefill_f16kv(),
             4,
             8,
         )?;
@@ -553,6 +561,7 @@ impl VulkanLayerPipelines {
             attn_pv_accum_f16kv,
             attn_fused_f16prob,
             attn_fused_f16prob_f16kv,
+            attn_fused_gqa_prefill_f16kv,
             rms_norm,
             add_rms_norm,
             rope,
@@ -605,6 +614,7 @@ impl VulkanLayerPipelines {
             attn_pv_f16kv_digest,
             attn_fused_digest,
             attn_fused_f16kv_digest,
+            attn_fused_gqa_prefill_f16kv_digest,
             shader_digests_sha256,
         })
     }
@@ -3594,8 +3604,6 @@ impl VulkanBatchedGraphExecutor {
         desc: &AttentionDescriptor,
         path: AdrenoAttentionPath,
     ) -> Result<(), Error> {
-        let num_heads_u32 = desc.num_heads;
-        let head_dim_u32 = desc.head_dim;
         let k_attn_span = BufferSpan::whole(k_cache);
         let v_attn_span = BufferSpan::whole(v_cache);
         let (fused_pipe, qk_pipe, pv_pipe) = match self.config.kv_precision {
@@ -3626,57 +3634,38 @@ impl VulkanBatchedGraphExecutor {
         let attn_push = attention_push_constants(desc);
         match path {
             AdrenoAttentionPath::Fused => {
+                let choice = select_fused_attention_dispatch(
+                    desc,
+                    self.config.kv_precision,
+                    self.device
+                        .capabilities()
+                        .compute_limits
+                        .max_compute_shared_memory_size,
+                );
+                let pipe = match choice.kind {
+                    FusedAttentionKernelKind::GqaGrouped6PrefillF16Kv => {
+                        self.pipelines.attn_fused_gqa_prefill_f16kv
+                    }
+                    FusedAttentionKernelKind::PerHead => fused_pipe,
+                };
                 self.batch_recorder.push_barrier(
-                    fused_pipe,
+                    pipe,
                     &[q_in, k_attn_span, v_attn_span, o_out],
                     &attn_push,
-                    checked_grid(&self.device, [1, num_heads_u32, desc.query_len])?,
+                    checked_grid(&self.device, choice.grid)?,
                 );
             }
             AdrenoAttentionPath::Decomposed3Stage => {
-                self.batch_recorder.push_barrier(
+                self.dispatch_decomposed_3stage_attention(
                     qk_pipe,
-                    &[
-                        q_in,
-                        k_attn_span,
-                        BufferSpan::whole(self.scratch.attn_scores),
-                    ],
-                    &attn_push,
-                    checked_grid(
-                        &self.device,
-                        [
-                            desc.total_seq.div_ceil(WORKGROUP_X),
-                            num_heads_u32,
-                            desc.query_len,
-                        ],
-                    )?,
-                );
-                self.batch_recorder.push_barrier(
-                    self.pipelines.attn_softmax_f16,
-                    &[
-                        BufferSpan::whole(self.scratch.attn_scores),
-                        BufferSpan::whole(self.scratch.attn_probs),
-                    ],
-                    &attn_push,
-                    checked_grid(&self.device, [1, num_heads_u32, desc.query_len])?,
-                );
-                self.batch_recorder.push_barrier(
                     pv_pipe,
-                    &[
-                        BufferSpan::whole(self.scratch.attn_probs),
-                        v_attn_span,
-                        o_out,
-                    ],
+                    q_in,
+                    k_attn_span,
+                    v_attn_span,
+                    o_out,
                     &attn_push,
-                    checked_grid(
-                        &self.device,
-                        [
-                            head_dim_u32.div_ceil(WORKGROUP_X),
-                            num_heads_u32,
-                            desc.query_len,
-                        ],
-                    )?,
-                );
+                    desc,
+                )?;
             }
         }
 
@@ -3691,6 +3680,69 @@ impl VulkanBatchedGraphExecutor {
                 checked_grid(&self.device, [slice_len.div_ceil(WORKGROUP_X), 1, 1])?,
             );
         }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Records the 3-stage QK^T -> FP16-rounded Softmax -> PV causal attention sequence for one query sub-chunk."
+    )]
+    fn dispatch_decomposed_3stage_attention(
+        &mut self,
+        qk_pipe: PipelineId,
+        pv_pipe: PipelineId,
+        q_in: BufferSpan,
+        k_attn_span: BufferSpan,
+        v_attn_span: BufferSpan,
+        o_out: BufferSpan,
+        attn_push: &[u32; 8],
+        desc: &AttentionDescriptor,
+    ) -> Result<(), Error> {
+        let num_heads_u32 = desc.num_heads;
+        let head_dim_u32 = desc.head_dim;
+        self.batch_recorder.push_barrier(
+            qk_pipe,
+            &[
+                q_in,
+                k_attn_span,
+                BufferSpan::whole(self.scratch.attn_scores),
+            ],
+            attn_push,
+            checked_grid(
+                &self.device,
+                [
+                    desc.total_seq.div_ceil(WORKGROUP_X),
+                    num_heads_u32,
+                    desc.query_len,
+                ],
+            )?,
+        );
+        self.batch_recorder.push_barrier(
+            self.pipelines.attn_softmax_f16,
+            &[
+                BufferSpan::whole(self.scratch.attn_scores),
+                BufferSpan::whole(self.scratch.attn_probs),
+            ],
+            attn_push,
+            checked_grid(&self.device, [1, num_heads_u32, desc.query_len])?,
+        );
+        self.batch_recorder.push_barrier(
+            pv_pipe,
+            &[
+                BufferSpan::whole(self.scratch.attn_probs),
+                v_attn_span,
+                o_out,
+            ],
+            attn_push,
+            checked_grid(
+                &self.device,
+                [
+                    head_dim_u32.div_ceil(WORKGROUP_X),
+                    num_heads_u32,
+                    desc.query_len,
+                ],
+            )?,
+        );
         Ok(())
     }
 
@@ -6323,11 +6375,53 @@ fn compute_base_provenance(
         fused_digest,
     )?;
     hash_str(&mut hasher, b"attn_sample:", &sample_key)?;
+    hash_str(
+        &mut hasher,
+        b"attn_gqa_prefill_f16kv:",
+        &pipelines.attn_fused_gqa_prefill_f16kv_digest,
+    )?;
 
     let digest = hasher
         .finish()
         .map_err(|err| Error::InvalidInput(err.to_string()))?;
     Ok(hex::encode(digest))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FusedAttentionKernelKind {
+    PerHead,
+    GqaGrouped6PrefillF16Kv,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FusedAttentionDispatchChoice {
+    kind: FusedAttentionKernelKind,
+    grid: [u32; 3],
+}
+
+const fn select_fused_attention_dispatch(
+    desc: &AttentionDescriptor,
+    kv_precision: VulkanKvPrecision,
+    max_compute_shared_memory_size: u32,
+) -> FusedAttentionDispatchChoice {
+    let gqa6_matches = desc.query_len > 1
+        && matches!(kv_precision, VulkanKvPrecision::Fp16)
+        && desc.num_kv_heads > 0
+        && desc.num_heads.is_multiple_of(desc.num_kv_heads)
+        && (desc.num_heads / desc.num_kv_heads) == spirv::ATTN_FUSED_GQA6_RATIO
+        && desc.total_seq <= spirv::ATTN_FUSED_GQA6_MAX_TOTAL_SEQ
+        && (max_compute_shared_memory_size / 2) >= spirv::ATTN_FUSED_GQA6_SHARED_MEMORY_BYTES;
+    if gqa6_matches {
+        FusedAttentionDispatchChoice {
+            kind: FusedAttentionKernelKind::GqaGrouped6PrefillF16Kv,
+            grid: [1, desc.num_kv_heads, desc.query_len],
+        }
+    } else {
+        FusedAttentionDispatchChoice {
+            kind: FusedAttentionKernelKind::PerHead,
+            grid: [1, desc.num_heads, desc.query_len],
+        }
+    }
 }
 
 fn compute_executor_identity(
@@ -6866,5 +6960,90 @@ mod tests {
         assert_eq!(plan.sizes[25], expected_lora);
         assert_eq!(plan.sizes[26], expected_lora);
         Ok(())
+    }
+
+    #[test]
+    fn fused_attention_dispatch_uses_gqa6_for_prefill_and_falls_back_cleanly() {
+        let base_desc = AttentionDescriptor {
+            query_len: 32,
+            total_seq: 128,
+            past_len: 96,
+            num_heads: 24,
+            num_kv_heads: 4,
+            head_dim: 256,
+            scale: 0.0625,
+            causal: true,
+        };
+        let shared_32k = 32_768_u32;
+
+        // Prefill with t_len > 1, 6:1 GQA, Fp16 KV, and 32 KiB shared memory routes to GQA6.
+        let gqa6 = select_fused_attention_dispatch(&base_desc, VulkanKvPrecision::Fp16, shared_32k);
+        assert_eq!(
+            gqa6,
+            FusedAttentionDispatchChoice {
+                kind: FusedAttentionKernelKind::GqaGrouped6PrefillF16Kv,
+                grid: [1, 4, 32],
+            }
+        );
+
+        // Single-token decode keeps existing per-head fused shader even for 6:1 GQA + Fp16 KV.
+        let decode_desc = AttentionDescriptor {
+            query_len: 1,
+            total_seq: 97,
+            ..base_desc
+        };
+        assert_eq!(
+            select_fused_attention_dispatch(&decode_desc, VulkanKvPrecision::Fp16, shared_32k),
+            FusedAttentionDispatchChoice {
+                kind: FusedAttentionKernelKind::PerHead,
+                grid: [1, 24, 1],
+            }
+        );
+
+        // Non-6:1 GQA ratio (4:1 and non-divisible) falls back cleanly to per-head fused shader.
+        let gqa4_desc = AttentionDescriptor {
+            num_heads: 16,
+            num_kv_heads: 4,
+            ..base_desc
+        };
+        assert_eq!(
+            select_fused_attention_dispatch(&gqa4_desc, VulkanKvPrecision::Fp16, shared_32k),
+            FusedAttentionDispatchChoice {
+                kind: FusedAttentionKernelKind::PerHead,
+                grid: [1, 16, 32],
+            }
+        );
+        let odd_desc = AttentionDescriptor {
+            num_heads: 13,
+            num_kv_heads: 2,
+            ..base_desc
+        };
+        assert_eq!(
+            select_fused_attention_dispatch(&odd_desc, VulkanKvPrecision::Fp16, shared_32k),
+            FusedAttentionDispatchChoice {
+                kind: FusedAttentionKernelKind::PerHead,
+                grid: [1, 13, 32],
+            }
+        );
+
+        // Fp32 KV precision and tight shared memory fall back cleanly to per-head fused shader.
+        assert_eq!(
+            select_fused_attention_dispatch(&base_desc, VulkanKvPrecision::Fp32, shared_32k),
+            FusedAttentionDispatchChoice {
+                kind: FusedAttentionKernelKind::PerHead,
+                grid: [1, 24, 32],
+            }
+        );
+        assert_eq!(
+            select_fused_attention_dispatch(
+                &base_desc,
+                VulkanKvPrecision::Fp16,
+                spirv::ATTN_FUSED_GQA6_SHARED_MEMORY_BYTES * 2 - 4,
+            ),
+            FusedAttentionDispatchChoice {
+                kind: FusedAttentionKernelKind::PerHead,
+                grid: [1, 24, 32],
+            }
+        );
     }
 }

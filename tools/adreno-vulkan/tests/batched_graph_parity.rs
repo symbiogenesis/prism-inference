@@ -702,6 +702,10 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "attn_fused_f16prob_f16kv",
             spirv::attn_fused_f16prob_f16kv(),
         ),
+        (
+            "attn_fused_gqa_prefill_f16kv",
+            spirv::attn_fused_gqa_prefill_f16kv(),
+        ),
         ("attn_qk_scores", spirv::attn_qk_scores()),
         ("attn_qk_scores_f16kv", spirv::attn_qk_scores_f16kv()),
         ("attn_softmax_f16", spirv::attn_softmax_f16()),

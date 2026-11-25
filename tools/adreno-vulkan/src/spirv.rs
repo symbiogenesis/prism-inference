@@ -5479,6 +5479,333 @@ fn emit_attn_fused_f16prob(f16_kv: bool) -> Vec<u32> {
     b.finish()
 }
 
+/// GQA query-to-KV head ratio handled per workgroup by [`attn_fused_gqa_prefill_f16kv`].
+pub const ATTN_FUSED_GQA6_RATIO: u32 = 6;
+
+/// Maximum `total_seq` supported by [`attn_fused_gqa_prefill_f16kv`].
+pub const ATTN_FUSED_GQA6_MAX_TOTAL_SEQ: u32 = 512;
+
+/// Workgroup shared-memory bytes reserved by [`attn_fused_gqa_prefill_f16kv`].
+///
+/// Reserves `6 * 512` `f32` score slots plus `6 * 64` `f32` reduction slots (`13_824` bytes,
+/// fitting inside the `16_384`-byte half-occupancy budget on Adreno X1/X2).
+pub const ATTN_FUSED_GQA6_SHARED_MEMORY_BYTES: u32 =
+    (ATTN_FUSED_GQA6_RATIO * ATTN_FUSED_GQA6_MAX_TOTAL_SEQ + ATTN_FUSED_GQA6_RATIO * WORKGROUP_X)
+        * 4;
+
+#[derive(Clone, Copy)]
+struct Gqa6Context {
+    q_buf: u32,
+    k_buf: u32,
+    v_buf: u32,
+    o_buf: u32,
+    wg_scores: u32,
+    wg_reduce: u32,
+    lid: u32,
+    valid_len: u32,
+    kv_stride: u32,
+    kv_head_off: u32,
+    head_dim: u32,
+    scale: u32,
+    q_bases: [u32; 6],
+    score_bases: [u32; 6],
+    reduce_bases: [u32; 6],
+    acc_vars: [u32; 6],
+}
+
+fn emit_gqa6_wg_reduce_64(
+    b: &mut ShaderBuilder,
+    wg_reduce: u32,
+    reduce_bases: &[u32; 6],
+    lid: u32,
+    is_max: bool,
+) -> [u32; 6] {
+    for stride in [32_u32, 16, 8, 4, 2, 1] {
+        let sc = b.const_u32(stride);
+        let active = b.u_lt(lid, sc);
+        b.emit_if(active, |b| {
+            let other_lane = b.uadd(lid, sc);
+            for &r_base in reduce_bases {
+                let cur_idx = b.uadd(r_base, lid);
+                let other_idx = b.uadd(r_base, other_lane);
+                let other = b.load_wg_f32(wg_reduce, other_idx);
+                let cur = b.load_wg_f32(wg_reduce, cur_idx);
+                let reduced = if is_max {
+                    b.glsl2(b.f32_t, GLSL_FMAX, cur, other)
+                } else {
+                    b.fadd_nc(cur, other)
+                };
+                b.store_wg_f32(wg_reduce, cur_idx, reduced);
+            }
+        });
+        b.workgroup_barrier();
+    }
+    reduce_bases.map(|r_base| b.load_wg_f32(wg_reduce, r_base))
+}
+
+fn emit_gqa6_qk_phase(b: &mut ShaderBuilder, ctx: &Gqa6Context) {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c64 = b.const_u32(WORKGROUP_X);
+    let c_even_mask = b.const_u32(!1_u32);
+    let f_zero = b.const_f32(0.0);
+
+    b.emit_for_range(ctx.lid, ctx.valid_len, c64, |b, k| {
+        for &acc_var in &ctx.acc_vars {
+            b.store_var(acc_var, f_zero);
+        }
+        let k_off = b.umul(k, ctx.kv_stride);
+        let k_base = b.uadd(k_off, ctx.kv_head_off);
+        let k_odd_bit = b.uand(k_base, c1);
+        let k_even_aligned = b.u_eq(k_odd_bit, c0);
+        let even_end = b.uand(ctx.head_dim, c_even_mask);
+
+        b.emit_if_else(
+            k_even_aligned,
+            |b| {
+                b.emit_for_range(c0, even_end, c2, |b, d| {
+                    let k_elem0 = b.uadd(k_base, d);
+                    let k_word = b.ushr(k_elem0, c1);
+                    let packed = b.load_sb_u32(ctx.k_buf, k_word);
+                    let (k0, k1) = b.unpack_half_pair(packed);
+                    for (&q_base, &acc_var) in ctx.q_bases.iter().zip(ctx.acc_vars.iter()) {
+                        let q_idx0 = b.uadd(q_base, d);
+                        let q_idx1 = b.uadd(q_idx0, c1);
+                        let q0 = b.load_sb_f32(ctx.q_buf, q_idx0);
+                        let q1 = b.load_sb_f32(ctx.q_buf, q_idx1);
+                        let prod0 = b.fmul_nc(q0, k0);
+                        let acc0 = b.load_var_f32(acc_var);
+                        let acc1 = b.fadd_nc(acc0, prod0);
+                        let prod1 = b.fmul_nc(q1, k1);
+                        let acc2 = b.fadd_nc(acc1, prod1);
+                        b.store_var(acc_var, acc2);
+                    }
+                });
+                let has_tail = b.u_lt(even_end, ctx.head_dim);
+                b.emit_if(has_tail, |b| {
+                    let k_elem = b.uadd(k_base, even_end);
+                    let kv = emit_load_kv_f32(b, ctx.k_buf, k_elem, true);
+                    for (&q_base, &acc_var) in ctx.q_bases.iter().zip(ctx.acc_vars.iter()) {
+                        let q_idx = b.uadd(q_base, even_end);
+                        let qv = b.load_sb_f32(ctx.q_buf, q_idx);
+                        let prod = b.fmul_nc(qv, kv);
+                        let prev = b.load_var_f32(acc_var);
+                        let next = b.fadd_nc(prev, prod);
+                        b.store_var(acc_var, next);
+                    }
+                });
+            },
+            |b| {
+                b.emit_for_range(c0, ctx.head_dim, c1, |b, d| {
+                    let k_elem = b.uadd(k_base, d);
+                    let kv = emit_load_kv_f32(b, ctx.k_buf, k_elem, true);
+                    for (&q_base, &acc_var) in ctx.q_bases.iter().zip(ctx.acc_vars.iter()) {
+                        let q_idx = b.uadd(q_base, d);
+                        let qv = b.load_sb_f32(ctx.q_buf, q_idx);
+                        let prod = b.fmul_nc(qv, kv);
+                        let prev = b.load_var_f32(acc_var);
+                        let next = b.fadd_nc(prev, prod);
+                        b.store_var(acc_var, next);
+                    }
+                });
+            },
+        );
+
+        for (&acc_var, &s_base) in ctx.acc_vars.iter().zip(ctx.score_bases.iter()) {
+            let acc_v = b.load_var_f32(acc_var);
+            let s = b.fmul_nc(ctx.scale, acc_v);
+            let ws_idx = b.uadd(s_base, k);
+            b.store_wg_f32(ctx.wg_scores, ws_idx, s);
+        }
+    });
+    b.workgroup_barrier();
+}
+
+fn emit_gqa6_softmax_phase(b: &mut ShaderBuilder, ctx: &Gqa6Context) {
+    let c64 = b.const_u32(WORKGROUP_X);
+    let f_zero = b.const_f32(0.0);
+    let f_one = b.const_f32(1.0);
+
+    for (&s_base, &acc_var) in ctx.score_bases.iter().zip(ctx.acc_vars.iter()) {
+        let s0 = b.load_wg_f32(ctx.wg_scores, s_base);
+        b.store_var(acc_var, s0);
+    }
+    b.emit_for_range(ctx.lid, ctx.valid_len, c64, |b, k| {
+        for (&s_base, &acc_var) in ctx.score_bases.iter().zip(ctx.acc_vars.iter()) {
+            let ws_idx = b.uadd(s_base, k);
+            let s = b.load_wg_f32(ctx.wg_scores, ws_idx);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.glsl2(b.f32_t, GLSL_FMAX, prev, s);
+            b.store_var(acc_var, next);
+        }
+    });
+    for (&r_base, &acc_var) in ctx.reduce_bases.iter().zip(ctx.acc_vars.iter()) {
+        let my_max = b.load_var_f32(acc_var);
+        let r_idx = b.uadd(r_base, ctx.lid);
+        b.store_wg_f32(ctx.wg_reduce, r_idx, my_max);
+    }
+    b.workgroup_barrier();
+    let row_max = emit_gqa6_wg_reduce_64(b, ctx.wg_reduce, &ctx.reduce_bases, ctx.lid, true);
+    b.workgroup_barrier();
+
+    for &acc_var in &ctx.acc_vars {
+        b.store_var(acc_var, f_zero);
+    }
+    b.emit_for_range(ctx.lid, ctx.valid_len, c64, |b, k| {
+        for ((&s_base, &acc_var), &head_max) in ctx
+            .score_bases
+            .iter()
+            .zip(ctx.acc_vars.iter())
+            .zip(row_max.iter())
+        {
+            let ws_idx = b.uadd(s_base, k);
+            let s = b.load_wg_f32(ctx.wg_scores, ws_idx);
+            let shifted = b.fsub_nc(s, head_max);
+            let e = b.glsl1(b.f32_t, GLSL_EXP, shifted);
+            b.store_wg_f32(ctx.wg_scores, ws_idx, e);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.fadd_nc(prev, e);
+            b.store_var(acc_var, next);
+        }
+    });
+    for (&r_base, &acc_var) in ctx.reduce_bases.iter().zip(ctx.acc_vars.iter()) {
+        let my_sum = b.load_var_f32(acc_var);
+        let r_idx = b.uadd(r_base, ctx.lid);
+        b.store_wg_f32(ctx.wg_reduce, r_idx, my_sum);
+    }
+    b.workgroup_barrier();
+    let denom = emit_gqa6_wg_reduce_64(b, ctx.wg_reduce, &ctx.reduce_bases, ctx.lid, false);
+    let inv_sum = denom.map(|d| b.fdiv(f_one, d));
+    b.workgroup_barrier();
+
+    b.emit_for_range(ctx.lid, ctx.valid_len, c64, |b, k| {
+        for (&s_base, &head_inv) in ctx.score_bases.iter().zip(inv_sum.iter()) {
+            let ws_idx = b.uadd(s_base, k);
+            let e = b.load_wg_f32(ctx.wg_scores, ws_idx);
+            let raw_p = b.fmul_nc(e, head_inv);
+            let rounded_p = b.round_f16(raw_p);
+            b.store_wg_f32(ctx.wg_scores, ws_idx, rounded_p);
+        }
+    });
+    b.workgroup_barrier();
+}
+
+fn emit_gqa6_pv_phase(b: &mut ShaderBuilder, ctx: &Gqa6Context) {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c64 = b.const_u32(WORKGROUP_X);
+    let f_zero = b.const_f32(0.0);
+
+    b.emit_for_range(ctx.lid, ctx.head_dim, c64, |b, d| {
+        for &acc_var in &ctx.acc_vars {
+            b.store_var(acc_var, f_zero);
+        }
+        let v_head_d = b.uadd(ctx.kv_head_off, d);
+        b.emit_for_range(c0, ctx.valid_len, c1, |b, k| {
+            let k_off = b.umul(k, ctx.kv_stride);
+            let v_idx = b.uadd(k_off, v_head_d);
+            let vv = emit_load_kv_f32(b, ctx.v_buf, v_idx, true);
+            for (&s_base, &acc_var) in ctx.score_bases.iter().zip(ctx.acc_vars.iter()) {
+                let p_idx = b.uadd(s_base, k);
+                let p = b.load_wg_f32(ctx.wg_scores, p_idx);
+                let prod = b.fmul_nc(p, vv);
+                let prev = b.load_var_f32(acc_var);
+                let next = b.fadd_nc(prev, prod);
+                b.store_var(acc_var, next);
+            }
+        });
+        for (&o_base, &acc_var) in ctx.q_bases.iter().zip(ctx.acc_vars.iter()) {
+            let out_v = b.load_var_f32(acc_var);
+            let out_idx = b.uadd(o_base, d);
+            b.store_sb_f32(ctx.o_buf, out_idx, out_v);
+        }
+    });
+}
+
+/// Emits GQA-grouped (`6:1`) fused prefill attention SPIR-V 1.6 words for packed-FP16 `K` and `V`.
+///
+/// One `[64, 1, 1]` workgroup computes all `6` query heads sharing one `(kv_head, query_token)`
+/// pair, loading each packed `K`/`V` vector once and reusing it across all 6 query heads with
+/// fused workgroup reductions (`13_824` bytes shared storage, `total_seq <= 512`, `f16` probability
+/// rounding matching [`attn_fused_f16prob_f16kv`]).
+///
+/// Bindings: `0` read-only `Q` (`f32`), `1` read-only `K` (`u32`), `2` read-only `V` (`u32`),
+/// `3` writable `out` (`f32`). Push constants (`8 x u32`): `[query_len, total_seq, past_len,
+/// num_heads, num_kv_heads, head_dim, scale_bits, causal]`.
+/// Dispatch: `(1, num_kv_heads, query_len)` with `num_heads == num_kv_heads * 6`.
+#[must_use]
+pub fn attn_fused_gqa_prefill_f16kv() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 8);
+    let push_var = push_var.unwrap_or(0);
+    let q_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let k_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let v_buf = b.storage_buffer(2, ElemType::U32, AccessMode::ReadOnly);
+    let o_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
+
+    let wg_scores = b.workgroup_f32_array(ATTN_FUSED_GQA6_RATIO * ATTN_FUSED_GQA6_MAX_TOTAL_SEQ);
+    let wg_reduce = b.workgroup_f32_array(ATTN_FUSED_GQA6_RATIO * WORKGROUP_X);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let kv_h = b.load_input_component(wid_vec, 1);
+    let qi = b.load_input_component(wid_vec, 2);
+
+    let total_seq = b.load_push(push_var, 1);
+    let past_len = b.load_push(push_var, 2);
+    let num_heads = b.load_push(push_var, 3);
+    let num_kv_heads = b.load_push(push_var, 4);
+    let head_dim = b.load_push(push_var, 5);
+    let scale_bits = b.load_push(push_var, 6);
+    let causal = b.load_push(push_var, 7);
+    let scale = b.bitcast(b.f32_t, scale_bits);
+
+    let valid_len = attn_valid_len(&mut b, qi, past_len, total_seq, causal);
+    let c6 = b.const_u32(ATTN_FUSED_GQA6_RATIO);
+    let h_group_start = b.umul(kv_h, c6);
+    let qh = b.umul(qi, num_heads);
+    let group_row_base = b.uadd(qh, h_group_start);
+
+    let q_bases = [0_u32, 1, 2, 3, 4, 5].map(|g| {
+        let g_c = b.const_u32(g);
+        let row_head = b.uadd(group_row_base, g_c);
+        b.umul(row_head, head_dim)
+    });
+    let score_bases =
+        [0_u32, 1, 2, 3, 4, 5].map(|g| b.const_u32(g * ATTN_FUSED_GQA6_MAX_TOTAL_SEQ));
+    let reduce_bases = [0_u32, 1, 2, 3, 4, 5].map(|g| b.const_u32(g * WORKGROUP_X));
+    let acc_vars = [0_u8; 6].map(|_| b.local_f32_var());
+
+    let kv_stride = b.umul(num_kv_heads, head_dim);
+    let kv_head_off = b.umul(kv_h, head_dim);
+
+    let ctx = Gqa6Context {
+        q_buf,
+        k_buf,
+        v_buf,
+        o_buf,
+        wg_scores,
+        wg_reduce,
+        lid,
+        valid_len,
+        kv_stride,
+        kv_head_off,
+        head_dim,
+        scale,
+        q_bases,
+        score_bases,
+        reduce_bases,
+        acc_vars,
+    };
+
+    emit_gqa6_qk_phase(&mut b, &ctx);
+    emit_gqa6_softmax_phase(&mut b, &ctx);
+    emit_gqa6_pv_phase(&mut b, &ctx);
+
+    b.finish()
+}
+
 fn emit_load_kv_f32(b: &mut ShaderBuilder, buf: u32, elem_idx: u32, f16_kv: bool) -> u32 {
     if !f16_kv {
         return b.load_sb_f32(buf, elem_idx);
@@ -8580,6 +8907,10 @@ mod tests {
             extract_local_size(&ptq1_q8_0_gemm_16tok_coalesced(true, false))?,
             [64, 8, 1]
         );
+        assert_eq!(
+            extract_local_size(&attn_fused_gqa_prefill_f16kv())?,
+            [64, 1, 1]
+        );
         Ok(())
     }
 
@@ -8613,6 +8944,7 @@ mod tests {
             attn_pv_accum_f16kv(),
             attn_fused_f16prob(),
             attn_fused_f16prob_f16kv(),
+            attn_fused_gqa_prefill_f16kv(),
             rms_norm_f32(),
             rms_norm_batched_f32(),
             add_rms_norm_f32(),
@@ -8654,6 +8986,35 @@ mod tests {
             assert_valid_spirv_structure(&module, Some(false));
             assert_eq!(shader_digest(&module)?.len(), 64);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn attn_fused_gqa_prefill_f16kv_structural_contract() -> Result<(), Error> {
+        let gqa6 = attn_fused_gqa_prefill_f16kv();
+        let per_head = attn_fused_f16prob_f16kv();
+        assert_valid_spirv_structure(&gqa6, Some(false));
+        assert_eq!(extract_local_size(&gqa6)?, [64, 1, 1]);
+        assert_eq!(ATTN_FUSED_GQA6_SHARED_MEMORY_BYTES, 13_824);
+        let d1 = shader_digest(&gqa6)?;
+        let d2 = shader_digest(&attn_fused_gqa_prefill_f16kv())?;
+        assert_eq!(d1, d2);
+        assert_eq!(d1.len(), 64);
+        assert_ne!(d1, shader_digest(&per_head)?);
+
+        // Count OpControlBarrier across the module body: 1 (QK) + 8 (max) + 8 (sum) + 1 (round) = 18.
+        let mut barrier_count = 0_usize;
+        let mut offset = 5_usize;
+        while offset < gqa6.len() {
+            let header = gqa6[offset];
+            let wc = usize::try_from(header >> 16).unwrap_or(0);
+            let op = u16::try_from(header & 0xFFFF).unwrap_or(0);
+            if op == OP_CONTROL_BARRIER {
+                barrier_count += 1;
+            }
+            offset += wc;
+        }
+        assert_eq!(barrier_count, 18);
         Ok(())
     }
 }

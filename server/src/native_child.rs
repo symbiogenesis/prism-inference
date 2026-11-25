@@ -111,6 +111,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut cpu_family = None;
     let mut repacked_ptq1 = false;
     let mut nariq: Option<Representation> = None;
+    let mut bonsai25: Option<Representation> = None;
     let mut adapter = None;
     let (mut daisyrose_path, mut daisyrose_bytes, mut daisyrose_sha256) = (None, None, None);
     let mut mmproj = None;
@@ -134,17 +135,28 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             broker_pipe = true;
             continue;
         }
-        if argument == "--use-repacked-ptq1" && !repacked_ptq1 && nariq.is_none() {
+        if argument == "--use-repacked-ptq1"
+            && !repacked_ptq1
+            && nariq.is_none()
+            && bonsai25.is_none()
+        {
             repacked_ptq1 = true;
             continue;
         }
         let value = arguments.next().ok_or_else(invalid)?;
         match argument.to_str() {
-            Some("--nariq") if nariq.is_none() && !repacked_ptq1 => {
+            Some("--nariq") if nariq.is_none() && bonsai25.is_none() && !repacked_ptq1 => {
                 nariq = Some(match value.to_str() {
                     Some("2.5bpw") => Representation::NariQ2_5Bpw,
                     Some("3.0bpw") => Representation::NariQ3_0Bpw,
                     Some("2.0bpw") => Representation::NariQ2_0Bpw,
+                    _ => return Err(invalid()),
+                });
+            }
+            Some("--bonsai-2-5") if bonsai25.is_none() && nariq.is_none() && !repacked_ptq1 => {
+                bonsai25 = Some(match value.to_str() {
+                    Some("pq2") => Representation::Bonsai25Pq2,
+                    Some("ptq1") => Representation::Bonsai25Ptq1,
                     _ => return Err(invalid()),
                 });
             }
@@ -335,7 +347,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
         row_workers: row_workers
             .unwrap_or_else(|| cpu_family.map_or(1, CpuFamily::default_row_workers)),
-        representation: nariq.unwrap_or(if repacked_ptq1 {
+        representation: nariq.or(bonsai25).unwrap_or(if repacked_ptq1 {
             Representation::CurrentRepackedPtq1
         } else {
             Representation::Pq2
@@ -832,7 +844,7 @@ fn required_memory_bytes(config: &Config) -> io::Result<u64> {
     let base_required_bytes = if let Some((_, memory)) = config.capacity {
         memory + 4 * 1024 * 1024 * 1024
     } else {
-        let extra = if config.representation.is_nariq() {
+        let extra = if config.representation.is_nariq() || config.representation.is_bonsai_2_5() {
             calibrated_non_context_memory_bytes(config.representation)
                 .saturating_sub(NON_CONTEXT_MEMORY_BYTES)
         } else {
@@ -1786,6 +1798,93 @@ mod tests {
             cache_dir.into_os_string(),
         ]);
         assert!(parse(with_cache).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_selects_bonsai25_with_orca_daisyrose_mmproj_and_placements() -> io::Result<()> {
+        let (directory, [model, key, adapter]) = files()?;
+        let daisy = directory.path().join("daisyrose.gguf");
+        std::fs::write(&daisy, [])?;
+        let mmproj = directory.path().join("mmproj.gguf");
+        std::fs::write(&mmproj, [])?;
+        let cache_dir = directory.path().join("cache");
+        let base = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8080".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        for (flag, expected_repr) in [
+            ("pq2", Representation::Bonsai25Pq2),
+            ("ptq1", Representation::Bonsai25Ptq1),
+        ] {
+            for (placement_opt, kv_cache, with_mmproj) in [
+                (None, "rsq4", true),
+                (Some("cpu"), "rsq4", true),
+                (Some("vulkan"), "f16", false),
+                (Some("composite"), "rsq4", true),
+            ] {
+                let mut args = base.clone();
+                args.extend([
+                    OsString::from("--bonsai-2-5"),
+                    OsString::from(flag),
+                    OsString::from("--abliterate-lora"),
+                    adapter.clone(),
+                    OsString::from("--daisyrose-lora"),
+                    daisy.clone().into_os_string(),
+                    OsString::from("--daisyrose-lora-bytes"),
+                    "128".into(),
+                    OsString::from("--daisyrose-lora-sha256"),
+                    "ab".repeat(32).into(),
+                    OsString::from("--kv-cache"),
+                    kv_cache.into(),
+                ]);
+                if with_mmproj {
+                    args.extend([OsString::from("--mmproj"), mmproj.clone().into_os_string()]);
+                }
+                if let Some(p) = placement_opt {
+                    args.extend([OsString::from("--placement"), OsString::from(p)]);
+                }
+                let cfg = parse(args)?;
+                assert_eq!(cfg.representation, expected_repr);
+                assert!(cfg.adapter.is_some());
+                assert!(cfg.daisyrose_lora.is_some());
+                assert_eq!(cfg.mmproj.is_some(), with_mmproj);
+            }
+            let mut with_cache_b25 = base.clone();
+            with_cache_b25.extend([
+                OsString::from("--bonsai-2-5"),
+                OsString::from(flag),
+                OsString::from("--hexagon-arena-cache"),
+                cache_dir.clone().into_os_string(),
+            ]);
+            assert_eq!(parse(with_cache_b25)?.representation, expected_repr);
+        }
+        let mut b25_pq2_args = base.clone();
+        b25_pq2_args.extend([OsString::from("--bonsai-2-5"), "pq2".into()]);
+        assert_eq!(
+            required_memory_bytes(&parse(b25_pq2_args)?)?,
+            crate::configuration::REQUIRED_AVAILABLE_BYTES + 47_185_920
+        );
+        for bad in [
+            vec!["--bonsai-2-5", "pq2", "--use-repacked-ptq1"],
+            vec!["--use-repacked-ptq1", "--bonsai-2-5", "ptq1"],
+            vec!["--bonsai-2-5", "pq2", "--nariq", "2.5bpw"],
+            vec!["--nariq", "2.5bpw", "--bonsai-2-5", "ptq1"],
+            vec!["--bonsai-2-5", "pq2", "--bonsai-2-5", "ptq1"],
+            vec!["--bonsai-2-5", "q4_0"],
+        ] {
+            let mut invalid_args = base.clone();
+            invalid_args.extend(bad.into_iter().map(OsString::from));
+            assert!(parse(invalid_args).is_err());
+        }
         Ok(())
     }
 

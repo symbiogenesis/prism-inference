@@ -94,6 +94,21 @@ fn same_quantizer(left: &Quantizer, right: &Quantizer) -> bool {
         && left.encoded_len() == right.encoded_len()
 }
 
+pub(super) struct PackedBatchReservation {
+    add_bytes: usize,
+    extra_pages: Vec<(Vec<u8>, usize)>,
+    trailing_tail: Option<Vec<u8>>,
+}
+
+/// Reusable scratch buffers for parallel rotated-KV tile encoding and 2D causal-balanced attention.
+#[derive(Default)]
+pub(super) struct PackedTileScratch {
+    encoded_keys: Vec<u8>,
+    encoded_values: Vec<u8>,
+    kv_major_outputs: Vec<f32>,
+    worker_scores: Vec<f32>,
+}
+
 pub(super) struct PackedCache {
     pages: Vec<Arc<Vec<u8>>>,
     tail: Vec<u8>,
@@ -172,6 +187,101 @@ impl PackedCache {
             self.pages.try_reserve_exact(1)?;
         }
         Ok(())
+    }
+
+    pub(super) fn reserve_batch(&mut self, count: usize) -> Result<PackedBatchReservation> {
+        let add_bytes = checked_product(&[count, self.row_bytes])?;
+        let next = checked_sum(self.len, add_bytes)?;
+        if next > self.maximum {
+            return Err(invalid("packed KV append exceeds context bound"));
+        }
+        if count == 0 {
+            return Ok(PackedBatchReservation {
+                add_bytes: 0,
+                extra_pages: Vec::new(),
+                trailing_tail: None,
+            });
+        }
+        let first_bytes = (self.page_bytes - self.tail.len())
+            .min(self.maximum - self.len)
+            .min(add_bytes);
+        let first_required = checked_sum(self.tail.len(), first_bytes)?;
+        let first_remaining = self.maximum - (self.len - self.tail.len());
+        let first_limit = self.page_bytes.min(first_remaining);
+        let first_tail_reserve = if first_required > self.tail.capacity() {
+            let target = self
+                .tail
+                .capacity()
+                .saturating_mul(2)
+                .min(first_limit)
+                .max(first_required);
+            target - self.tail.len()
+        } else {
+            0
+        };
+        let mut simulated_len = self.len + first_bytes;
+        let mut sealed_pages = usize::from(
+            self.tail.len() + first_bytes == self.page_bytes || simulated_len == self.maximum,
+        );
+        let mut extra_pages = Vec::new();
+        let mut trailing_tail = None;
+        while simulated_len < next {
+            let chunk = self
+                .page_bytes
+                .min(self.maximum - simulated_len)
+                .min(next - simulated_len);
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(chunk)?;
+            simulated_len += chunk;
+            if chunk == self.page_bytes || simulated_len == self.maximum {
+                sealed_pages += 1;
+                extra_pages.push((buf, chunk));
+            } else {
+                trailing_tail = Some(buf);
+            }
+        }
+        self.pages.try_reserve_exact(sealed_pages)?;
+        if first_tail_reserve > 0 {
+            self.tail.try_reserve_exact(first_tail_reserve)?;
+        }
+        Ok(PackedBatchReservation {
+            add_bytes,
+            extra_pages,
+            trailing_tail,
+        })
+    }
+
+    pub(super) fn commit_batch(
+        &mut self,
+        encoded: &[u8],
+        reservation: PackedBatchReservation,
+    ) {
+        debug_assert_eq!(encoded.len(), reservation.add_bytes);
+        if encoded.is_empty() {
+            return;
+        }
+        let first_bytes = (self.page_bytes - self.tail.len())
+            .min(self.maximum - self.len)
+            .min(encoded.len());
+        let (first_slice, mut rest) = encoded.split_at(first_bytes);
+        self.tail.extend_from_slice(first_slice);
+        self.len += first_bytes;
+        self.prepared_ready = false;
+        if self.tail.len() == self.page_bytes || self.len == self.maximum {
+            self.pages.push(Arc::new(std::mem::take(&mut self.tail)));
+        }
+        for (mut buf, chunk_len) in reservation.extra_pages {
+            let (chunk, next_rest) = rest.split_at(chunk_len);
+            rest = next_rest;
+            buf.extend_from_slice(chunk);
+            self.len += chunk.len();
+            self.pages.push(Arc::new(buf));
+        }
+        if let Some(mut buf) = reservation.trailing_tail {
+            buf.extend_from_slice(rest);
+            self.len += rest.len();
+            self.tail = buf;
+        }
     }
 
     pub(super) fn commit(&mut self) {
@@ -526,6 +636,7 @@ const fn grouped_head_unit(heads_per_kv: usize, heads: usize) -> usize {
     }
 }
 
+#[cfg(test)]
 const fn grouped_unit_with_capacity(heads_per_kv: usize, heads: usize, max_rows: usize) -> usize {
     if max_rows >= 6 && heads_per_kv.is_multiple_of(6) && heads.is_multiple_of(6) {
         6
@@ -709,6 +820,210 @@ pub(super) fn prepare_tile_append(
     prepare_current(key_cache, value_cache, current_key, current_value)?;
     key_cache.reserve()?;
     value_cache.reserve()
+}
+
+struct EncodeRowTask<'a> {
+    quantizer: &'a Quantizer,
+    src: &'a [f32],
+    dst: &'a mut [u8],
+}
+
+/// Encode and commit a tile of rotated K/V rows in parallel across `parallelism`
+/// while preserving exact token-order pages and deterministic failure priority.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Wired from prefill tile execution during integration and exercised in tests."
+    )
+)]
+pub(super) fn prepare_tile_append_parallel(
+    keys: &mut KvCache,
+    values: &mut KvCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    let mut scratch = PackedTileScratch::default();
+    prepare_tile_append_parallel_with_scratch(
+        keys,
+        values,
+        current_keys,
+        current_values,
+        &mut scratch,
+        parallelism,
+    )
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Reusable scratch entry point wired during prefill tile integration."
+    )
+)]
+pub(super) fn prepare_tile_append_parallel_with_scratch(
+    keys: &mut KvCache,
+    values: &mut KvCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    scratch: &mut PackedTileScratch,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    let key_cache = keys
+        .packed
+        .as_mut()
+        .ok_or_else(|| invalid("missing packed tile keys"))?;
+    let value_cache = values
+        .packed
+        .as_mut()
+        .ok_or_else(|| invalid("missing packed tile values"))?;
+    key_cache.prepared_ready = false;
+    value_cache.prepared_ready = false;
+    let count = current_keys.len();
+    if count == 0
+        || count > crate::MAX_PREFILL_BLOCK_TOKENS
+        || current_values.len() != count
+        || key_cache.heads == 0
+        || key_cache.heads != value_cache.heads
+        || keys.width != key_cache.heads * HEAD_DIM
+        || values.width != value_cache.heads * HEAD_DIM
+        || keys.len != values.len
+        || !keys.len.is_multiple_of(keys.width)
+        || !key_cache.len.is_multiple_of(key_cache.row_bytes)
+        || !value_cache.len.is_multiple_of(value_cache.row_bytes)
+        || key_cache.len / key_cache.row_bytes != value_cache.len / value_cache.row_bytes
+        || key_cache.len / key_cache.row_bytes != keys.len / keys.width
+        || current_keys.iter().any(|row| row.len() != keys.width)
+        || current_values.iter().any(|row| row.len() != values.width)
+    {
+        return Err(invalid("invalid packed tile append geometry"));
+    }
+    let add_width = checked_product(&[count, keys.width])?;
+    if checked_sum(keys.len, add_width)? > keys.maximum
+        || checked_sum(values.len, add_width)? > values.maximum
+    {
+        return Err(invalid("packed KV append exceeds context bound"));
+    }
+    let key_res = key_cache.reserve_batch(count)?;
+    let val_res = value_cache.reserve_batch(count)?;
+    let total_key_bytes = checked_product(&[count, key_cache.row_bytes])?;
+    let total_val_bytes = checked_product(&[count, value_cache.row_bytes])?;
+    resize_bytes(total_key_bytes, &mut scratch.encoded_keys)?;
+    resize_bytes(total_val_bytes, &mut scratch.encoded_values)?;
+
+    encode_packed_kv_rows_parallel(
+        key_cache,
+        value_cache,
+        current_keys,
+        current_values,
+        &mut scratch.encoded_keys[..total_key_bytes],
+        &mut scratch.encoded_values[..total_val_bytes],
+        parallelism,
+    )?;
+
+    key_cache.commit_batch(&scratch.encoded_keys[..total_key_bytes], key_res);
+    value_cache.commit_batch(&scratch.encoded_values[..total_val_bytes], val_res);
+    keys.len += add_width;
+    values.len += add_width;
+    Ok(())
+}
+
+fn encode_packed_kv_rows_parallel(
+    key_cache: &PackedCache,
+    value_cache: &PackedCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    encoded_keys: &mut [u8],
+    encoded_values: &mut [u8],
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    let count = current_keys.len();
+    let kv_heads = key_cache.heads;
+    let key_enc = key_cache.quantizer.encoded_len();
+    let val_enc = value_cache.quantizer.encoded_len();
+    let total_pairs = checked_product(&[count, kv_heads])?;
+    let workers = parallelism.workers().max(1);
+    let key_quantizer = &key_cache.quantizer;
+    let val_quantizer = &value_cache.quantizer;
+
+    if workers <= 1 {
+        for (token, (k_row, v_row)) in current_keys.iter().zip(current_values).enumerate() {
+            let k_base = token * key_cache.row_bytes;
+            let v_base = token * value_cache.row_bytes;
+            for ((k_src, k_dst), (v_src, v_dst)) in k_row
+                .as_chunks::<HEAD_DIM>()
+                .0
+                .iter()
+                .zip(encoded_keys[k_base..k_base + key_cache.row_bytes].chunks_exact_mut(key_enc))
+                .zip(
+                    v_row.as_chunks::<HEAD_DIM>().0.iter().zip(
+                        encoded_values[v_base..v_base + value_cache.row_bytes]
+                            .chunks_exact_mut(val_enc),
+                    ),
+                )
+            {
+                key_quantizer.encode(k_src, k_dst)?;
+                val_quantizer.encode(v_src, v_dst)?;
+            }
+        }
+        return Ok(());
+    }
+    if total_pairs >= workers {
+        return parallelism.update_paired_chunks(
+            encoded_keys,
+            key_enc,
+            encoded_values,
+            val_enc,
+            |base_unit, k_chunk, v_chunk| {
+                for (local, (k_dst, v_dst)) in k_chunk
+                    .chunks_exact_mut(key_enc)
+                    .zip(v_chunk.chunks_exact_mut(val_enc))
+                    .enumerate()
+                {
+                    let unit = base_unit + local;
+                    let token = unit / kv_heads;
+                    let head = unit % kv_heads;
+                    let src_range = head * HEAD_DIM..(head + 1) * HEAD_DIM;
+                    key_quantizer.encode(&current_keys[token][src_range.clone()], k_dst)?;
+                    val_quantizer.encode(&current_values[token][src_range], v_dst)?;
+                }
+                Ok(())
+            },
+        );
+    }
+    let total_tasks = 2 * total_pairs;
+    let mut slots: [Option<EncodeRowTask<'_>>; 2 * MAX_ROW_WORKERS] =
+        std::array::from_fn(|_| None);
+    let mut k_rem = encoded_keys;
+    let mut v_rem = encoded_values;
+    let mut slot_idx = 0;
+    for (k_row, v_row) in current_keys.iter().zip(current_values) {
+        for head in 0..kv_heads {
+            let src_range = head * HEAD_DIM..(head + 1) * HEAD_DIM;
+            let (k_dst, k_tail) = std::mem::take(&mut k_rem).split_at_mut(key_enc);
+            k_rem = k_tail;
+            let (v_dst, v_tail) = std::mem::take(&mut v_rem).split_at_mut(val_enc);
+            v_rem = v_tail;
+            slots[slot_idx] = Some(EncodeRowTask {
+                quantizer: key_quantizer,
+                src: &k_row[src_range.clone()],
+                dst: k_dst,
+            });
+            slots[slot_idx + 1] = Some(EncodeRowTask {
+                quantizer: val_quantizer,
+                src: &v_row[src_range],
+                dst: v_dst,
+            });
+            slot_idx += 2;
+        }
+    }
+    parallelism.update_chunks(&mut slots[..total_tasks], 1, |_, chunk| {
+        for task in chunk.iter_mut().flatten() {
+            task.quantizer.encode(task.src, task.dst)?;
+        }
+        Ok(())
+    })
 }
 
 /// Stream packed history directly: query rotation once, one score row per task,
@@ -951,7 +1266,6 @@ struct TileContext<'a> {
     queries: &'a [Vec<f32>],
     projected: &'a [Vec<f32>],
     base: usize,
-    heads: usize,
     heads_per_kv: usize,
     scale: f32,
     arithmetic: super::Arithmetic,
@@ -974,76 +1288,173 @@ impl<'a> TileContext<'a> {
         })
     }
 
-    fn run_single(&self, token: usize, output: &mut [f32], scratch: &mut [f32]) -> Result<()> {
-        let input = self.make_input(token)?;
-        let stride = input.history_tokens + 1;
-        let max_rows = (scratch.len() / stride).saturating_add(STACK_GROUP_SCORES_LEN / stride);
-        let unit = grouped_unit_with_capacity(self.heads_per_kv, self.heads, max_rows);
-        input.attend_chunk_tile_scores(0, output, scratch, stride, unit)
-    }
-
-    fn run_chunk(
+    fn run_single_kv<const G: usize>(
         &self,
-        base_token: usize,
-        output_chunk: &mut [Vec<f32>],
-        scores_chunk: &mut [f32],
-    ) -> Result<()> {
-        let mut offset = 0;
-        while offset < output_chunk.len() {
-            let token0 = base_token + offset;
-            let pos0 = self.base + token0;
-            let stride0 = pos0 + 1;
-            let single_unit0 = grouped_unit_with_capacity(
-                self.heads_per_kv,
-                self.heads,
-                (scores_chunk.len() / stride0).saturating_add(STACK_GROUP_SCORES_LEN / stride0),
-            );
-            if offset + 1 < output_chunk.len() {
-                let token1 = token0 + 1;
-                let stride1 = pos0 + 2;
-                let pair_rows_cap = scores_chunk.len() / (stride0 + stride1);
-                let pair_unit =
-                    grouped_unit_with_capacity(self.heads_per_kv, self.heads, pair_rows_cap);
-                if pair_rows_cap >= 1 && 2 * pair_unit > single_unit0 {
-                    let [out0, out1] = &mut output_chunk[offset..offset + 2] else {
-                        return Err(invalid("invalid packed attention tile pair slice"));
-                    };
-                    let pair_result = (|| -> Result<()> {
-                        let input0 = self.make_input(token0)?;
-                        let input1 = self.make_input(token1)?;
-                        attend_pair_tokens(
-                            [&input0, &input1],
-                            [out0.as_mut_slice(), out1.as_mut_slice()],
-                            scores_chunk,
-                            pair_unit,
-                        )
-                    })();
-                    if pair_result.is_ok() {
-                        offset += 2;
-                        continue;
-                    }
-                    self.run_single(token0, out0, scores_chunk)?;
-                    self.run_single(token1, out1, scores_chunk)?;
-                    return pair_result;
-                }
+        token: usize,
+        kv_head: usize,
+        output: &mut [f32],
+        score_scratch: &mut [f32],
+    ) -> std::result::Result<(), (usize, usize, crate::Error)> {
+        let input = self.make_input(token).map_err(|err| (token, kv_head, err))?;
+        let stride = input.history_tokens + 1;
+        let base_kv_head = kv_head * self.heads_per_kv;
+        let group_elems = G * HEAD_DIM;
+        for (group_idx, out_group) in output.chunks_exact_mut(group_elems).enumerate() {
+            let group_head = base_kv_head + group_idx * G;
+            let res = if G == 1 {
+                input.attend_head(group_head, out_group, &mut score_scratch[..stride])
+            } else {
+                input.attend_chunk_fixed_scores::<G>(
+                    group_head,
+                    out_group,
+                    &mut score_scratch[..G * stride],
+                    stride,
+                )
+            };
+            if let Err(err) = res {
+                return Err((token, kv_head, err));
             }
-            self.run_single(token0, &mut output_chunk[offset], scores_chunk)?;
-            offset += 1;
         }
         Ok(())
     }
+
+    fn run_pair_kv<const G: usize>(
+        &self,
+        token0: usize,
+        kv_head: usize,
+        output: &mut [f32],
+        score_scratch: &mut [f32],
+    ) -> std::result::Result<(), (usize, usize, crate::Error)> {
+        let token1 = token0 + 1;
+        let kv_out_len = self.heads_per_kv * HEAD_DIM;
+        let (out0, out1) = output.split_at_mut(kv_out_len);
+        let pair_res = (|| -> Result<()> {
+            let input0 = self.make_input(token0)?;
+            let input1 = self.make_input(token1)?;
+            let stride0 = input0.history_tokens + 1;
+            let stride1 = input1.history_tokens + 1;
+            let needed0 = checked_product(&[G, stride0])?;
+            let needed1 = checked_product(&[G, stride1])?;
+            if score_scratch.len() < checked_sum(needed0, needed1)? {
+                return Err(invalid("grouped attention slice length underflow"));
+            }
+            let (scores0_flat, tail) = score_scratch.split_at_mut(needed0);
+            let scores1_flat = &mut tail[..needed1];
+            let mut score_rows0 = split_mut_slices::<G>(scores0_flat, stride0)?;
+            let mut score_rows1 = split_mut_slices::<G>(scores1_flat, stride1)?;
+            let base_kv_head = kv_head * self.heads_per_kv;
+            let group_elems = G * HEAD_DIM;
+            for (group_idx, (out0_group, out1_group)) in out0
+                .chunks_exact_mut(group_elems)
+                .zip(out1.chunks_exact_mut(group_elems))
+                .enumerate()
+            {
+                let mut head_outputs0 = split_mut_slices::<G>(out0_group, HEAD_DIM)?;
+                let mut head_outputs1 = split_mut_slices::<G>(out1_group, HEAD_DIM)?;
+                attend_group_pair::<G>(
+                    [&input0, &input1],
+                    base_kv_head + group_idx * G,
+                    [&mut head_outputs0, &mut head_outputs1],
+                    [&mut score_rows0, &mut score_rows1],
+                )?;
+            }
+            Ok(())
+        })();
+        match pair_res {
+            Ok(()) => Ok(()),
+            Err(pair_err) => {
+                // Re-run tokens singly so an earlier failure in token0 cannot be
+                // shadowed by a later-token failure within the shared pair.
+                self.run_single_kv::<G>(token0, kv_head, out0, score_scratch)?;
+                self.run_single_kv::<G>(token1, kv_head, out1, score_scratch)?;
+                Err((token0, kv_head, pair_err))
+            }
+        }
+    }
+
+    fn run_item_fixed<const G: usize>(
+        &self,
+        item: &mut TileWorkItem<'_>,
+        score_scratch: &mut [f32],
+    ) -> std::result::Result<(), (usize, usize, crate::Error)> {
+        if item.token_len == 2 {
+            self.run_pair_kv::<G>(item.token_start, item.kv_head, item.output, score_scratch)
+        } else {
+            self.run_single_kv::<G>(item.token_start, item.kv_head, item.output, score_scratch)
+        }
+    }
+
+    fn run_item(
+        &self,
+        item: &mut TileWorkItem<'_>,
+        score_scratch: &mut [f32],
+        unit: usize,
+    ) -> std::result::Result<(), (usize, usize, crate::Error)> {
+        match unit {
+            6 => self.run_item_fixed::<6>(item, score_scratch),
+            4 => self.run_item_fixed::<4>(item, score_scratch),
+            3 => self.run_item_fixed::<3>(item, score_scratch),
+            2 => self.run_item_fixed::<2>(item, score_scratch),
+            _ => self.run_item_fixed::<1>(item, score_scratch),
+        }
+    }
 }
 
-struct TileTask<'a> {
-    base_token: usize,
-    attended: &'a mut [Vec<f32>],
+struct TileWorkItem<'a> {
+    token_start: usize,
+    token_len: usize,
+    kv_head: usize,
+    output: &'a mut [f32],
+}
+
+struct TileWorkerTask<'a> {
+    items: &'a mut [Option<TileWorkItem<'a>>],
     scores: &'a mut [f32],
+    error: Option<(usize, usize, crate::Error)>,
 }
 
-/// Attend already encoded tile rows against their own causal prefixes. Each
-/// token owns one probability row and keeps the ordinary serial head order;
-/// the existing pool partitions tokens without nested head-worker submissions.
-/// Future rows remain immutable and are never consumed by an earlier token.
+fn assign_causal_balanced_items(
+    costs: &[usize],
+    token_starts: &[usize],
+    kv_heads_idx: &[usize],
+    workers: usize,
+    assigned: &mut [usize],
+    counts: &mut [usize; MAX_ROW_WORKERS],
+) -> Result<(usize, [usize; MAX_ROW_WORKERS])> {
+    let active_workers = costs.len().min(workers.max(1)).min(MAX_ROW_WORKERS);
+    counts.fill(0);
+    let mut loads = [0_usize; MAX_ROW_WORKERS];
+    if active_workers == 0 {
+        return Ok((0, loads));
+    }
+    let mut order = Vec::new();
+    order.try_reserve_exact(costs.len())?;
+    order.extend(0..costs.len());
+    order.sort_by(|&lhs, &rhs| {
+        costs[rhs]
+            .cmp(&costs[lhs])
+            .then_with(|| token_starts[lhs].cmp(&token_starts[rhs]))
+            .then_with(|| kv_heads_idx[lhs].cmp(&kv_heads_idx[rhs]))
+    });
+    for idx in order {
+        let mut best_worker = 0_usize;
+        let mut best_load = loads[0];
+        for (worker, &load) in loads[..active_workers].iter().enumerate().skip(1) {
+            if load < best_load {
+                best_load = load;
+                best_worker = worker;
+            }
+        }
+        loads[best_worker] = loads[best_worker].saturating_add(costs[idx]);
+        counts[best_worker] += 1;
+        assigned[idx] = best_worker;
+    }
+    Ok((active_workers, loads))
+}
+
+/// Attend already encoded tile rows against their own causal prefixes using
+/// 2D `(token_pair, kv_head)` causal-cost-balanced partitioning and per-worker
+/// `2 * unit`-row score scratch.
 #[expect(
     clippy::too_many_arguments,
     reason = "Keep causal history, immutable prepared inputs and bounded tile scratch explicit."
@@ -1061,6 +1472,49 @@ pub(super) fn attend_tile(
     arithmetic: super::Arithmetic,
     parallelism: &RowParallelism,
 ) -> Result<()> {
+    let mut scratch = PackedTileScratch::default();
+    attend_tile_with_scratch(
+        keys,
+        values,
+        queries,
+        projected,
+        attended,
+        scores,
+        base,
+        heads,
+        scale,
+        arithmetic,
+        &mut scratch,
+        parallelism,
+    )
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Reusable scratch entry point for prefill tile loops."
+    )
+)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Coordinates validation, 2D causal-balanced scheduling, worker execution, and scatter."
+)]
+pub(super) fn attend_tile_with_scratch(
+    keys: &KvCache,
+    values: &KvCache,
+    queries: &[Vec<f32>],
+    projected: &[Vec<f32>],
+    attended: &mut [Vec<f32>],
+    scores: &mut [f32],
+    base: usize,
+    heads: usize,
+    scale: f32,
+    arithmetic: super::Arithmetic,
+    tile_scratch: &mut PackedTileScratch,
+    parallelism: &RowParallelism,
+) -> Result<()> {
     let result = (|| {
         let keys = keys
             .packed
@@ -1075,7 +1529,7 @@ pub(super) fn attend_tile(
         let width = checked_product(&[heads, HEAD_DIM])?;
         let projected_width = checked_product(&[2, width])?;
         if count == 0
-            || count > crate::kernels::prefill::MAX_TILE_TOKENS
+            || count > crate::MAX_PREFILL_BLOCK_TOKENS
             || heads == 0
             || !heads.is_multiple_of(keys.heads)
             || keys.heads != values.heads
@@ -1090,46 +1544,220 @@ pub(super) fn attend_tile(
         {
             return Err(invalid("invalid packed attention tile geometry"));
         }
+        let kv_heads = keys.heads;
+        let heads_per_kv = heads / kv_heads;
+        let unit = grouped_head_unit(heads_per_kv, heads_per_kv);
         let ctx = TileContext {
             keys,
             values,
             queries,
             projected,
             base,
-            heads,
-            heads_per_kv: heads / keys.heads,
+            heads_per_kv,
             scale,
             arithmetic,
         };
-        let task_count = count.min(parallelism.workers().max(1)).min(MAX_ROW_WORKERS);
-        if task_count == 1 {
-            return ctx.run_chunk(0, attended, scores);
-        }
-        let base_tokens = count / task_count;
-        let rem_tokens = count % task_count;
-        let mut tasks: [Option<TileTask<'_>>; MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
-        let mut rem_attended = &mut *attended;
-        let mut rem_scores = scores;
-        let mut token_cursor = 0;
-        for (index, task) in tasks[..task_count].iter_mut().enumerate() {
-            let chunk_tokens = base_tokens + usize::from(index < rem_tokens);
-            let (att_chunk, att_tail) = rem_attended.split_at_mut(chunk_tokens);
-            rem_attended = att_tail;
-            let (score_chunk, score_tail) = rem_scores.split_at_mut(chunk_tokens * end);
-            rem_scores = score_tail;
-            *task = Some(TileTask {
-                base_token: token_cursor,
-                attended: att_chunk,
-                scores: score_chunk,
-            });
-            token_cursor += chunk_tokens;
-        }
-        parallelism.update_chunks(&mut tasks[..task_count], 1, |_, tasks| {
-            for task in tasks.iter_mut().flatten() {
-                ctx.run_chunk(task.base_token, task.attended, task.scores)?;
+        let num_token_units = count.div_ceil(2);
+        let total_items = checked_product(&[num_token_units, kv_heads])?;
+        let kv_out_len = checked_product(&[heads_per_kv, HEAD_DIM])?;
+        let total_out_elems = checked_product(&[count, width])?;
+        resize_f32s(total_out_elems, &mut tile_scratch.kv_major_outputs)?;
+
+        let active_workers = total_items
+            .min(parallelism.workers().max(1))
+            .min(MAX_ROW_WORKERS);
+        let score_rows_per_worker = if count >= 2 {
+            checked_product(&[2, unit])?
+        } else {
+            unit
+        };
+        let worker_score_len = checked_product(&[score_rows_per_worker, end])?;
+        let reuse_caller_scores = scores.len() >= worker_score_len;
+        let scratch_workers = if reuse_caller_scores {
+            active_workers - 1
+        } else {
+            active_workers
+        };
+        resize_f32s(
+            checked_product(&[scratch_workers, worker_score_len])?,
+            &mut tile_scratch.worker_scores,
+        )?;
+
+        if active_workers == 1 {
+            let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
+            let worker_scores = if reuse_caller_scores {
+                &mut scores[..worker_score_len]
+            } else {
+                &mut tile_scratch.worker_scores[..worker_score_len]
+            };
+            let mut earliest: Option<(usize, usize, crate::Error)> = None;
+            for u in 0..num_token_units {
+                let token_start = u * 2;
+                let token_len = (count - token_start).min(2);
+                let chunk_len = token_len * kv_out_len;
+                for kv_head in 0..kv_heads {
+                    let (out_slice, tail) = std::mem::take(&mut rem_out).split_at_mut(chunk_len);
+                    rem_out = tail;
+                    let mut item = TileWorkItem {
+                        token_start,
+                        token_len,
+                        kv_head,
+                        output: out_slice,
+                    };
+                    if let Err(err) = ctx.run_item(&mut item, worker_scores, unit) {
+                        let key = (err.0, err.1);
+                        if earliest
+                            .as_ref()
+                            .is_none_or(|(tok, kh, _)| key < (*tok, *kh))
+                        {
+                            earliest = Some(err);
+                        }
+                    }
+                }
             }
-            Ok(())
-        })
+            if let Some((_, _, err)) = earliest {
+                return Err(err);
+            }
+        } else {
+            let mut items = Vec::new();
+            items.try_reserve_exact(total_items)?;
+            let mut costs = Vec::new();
+            costs.try_reserve_exact(total_items)?;
+            let mut token_starts = Vec::new();
+            token_starts.try_reserve_exact(total_items)?;
+            let mut kv_heads_idx = Vec::new();
+            kv_heads_idx.try_reserve_exact(total_items)?;
+
+            let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
+            for u in 0..num_token_units {
+                let token_start = u * 2;
+                let token_len = (count - token_start).min(2);
+                let causal_cost = if token_len == 2 {
+                    2_usize
+                        .saturating_mul(base + token_start)
+                        .saturating_add(3)
+                } else {
+                    (base + token_start).saturating_add(1)
+                };
+                let chunk_len = token_len * kv_out_len;
+                for kv_head in 0..kv_heads {
+                    let (out_slice, tail) = std::mem::take(&mut rem_out).split_at_mut(chunk_len);
+                    rem_out = tail;
+                    costs.push(causal_cost);
+                    token_starts.push(token_start);
+                    kv_heads_idx.push(kv_head);
+                    items.push(TileWorkItem {
+                        token_start,
+                        token_len,
+                        kv_head,
+                        output: out_slice,
+                    });
+                }
+            }
+            let mut assigned = Vec::new();
+            assigned.try_reserve_exact(total_items)?;
+            assigned.resize(total_items, 0);
+            let mut counts = [0_usize; MAX_ROW_WORKERS];
+            let (used_workers, _) = assign_causal_balanced_items(
+                &costs,
+                &token_starts,
+                &kv_heads_idx,
+                active_workers,
+                &mut assigned,
+                &mut counts,
+            )?;
+
+            let mut cursor = [0_usize; MAX_ROW_WORKERS];
+            let mut running = 0_usize;
+            for (c_off, &cnt) in cursor[..used_workers].iter_mut().zip(&counts[..used_workers]) {
+                *c_off = running;
+                running += cnt;
+            }
+            let mut ordered: Vec<Option<TileWorkItem<'_>>> = Vec::new();
+            ordered.try_reserve_exact(total_items)?;
+            ordered.resize_with(total_items, || None);
+            for (item, worker) in items.into_iter().zip(assigned) {
+                let slot = cursor[worker];
+                cursor[worker] += 1;
+                ordered[slot] = Some(item);
+            }
+
+            let mut tasks: [Option<TileWorkerTask<'_>>; MAX_ROW_WORKERS] =
+                std::array::from_fn(|_| None);
+            let mut rem_ordered = ordered.as_mut_slice();
+            let scratch_slice_workers = if reuse_caller_scores {
+                used_workers - 1
+            } else {
+                used_workers
+            };
+            let mut rem_scores =
+                &mut tile_scratch.worker_scores[..scratch_slice_workers * worker_score_len];
+            let mut caller_scores_opt =
+                reuse_caller_scores.then(|| &mut scores[..worker_score_len]);
+            for (worker, task) in tasks[..used_workers].iter_mut().enumerate() {
+                let (item_chunk, item_tail) =
+                    std::mem::take(&mut rem_ordered).split_at_mut(counts[worker]);
+                rem_ordered = item_tail;
+                let score_chunk = caller_scores_opt.take().map_or_else(
+                    || {
+                        let (chunk, score_tail) =
+                            std::mem::take(&mut rem_scores).split_at_mut(worker_score_len);
+                        rem_scores = score_tail;
+                        chunk
+                    },
+                    |caller_chunk| caller_chunk,
+                );
+                *task = Some(TileWorkerTask {
+                    items: item_chunk,
+                    scores: score_chunk,
+                    error: None,
+                });
+            }
+
+            parallelism.update_chunks(&mut tasks[..used_workers], 1, |_, worker_slice| {
+                for task in worker_slice.iter_mut().flatten() {
+                    for item in task.items.iter_mut().flatten() {
+                        if let Err(err) = ctx.run_item(item, task.scores, unit) {
+                            let key = (err.0, err.1);
+                            if task
+                                .error
+                                .as_ref()
+                                .is_none_or(|(tok, kh, _)| key < (*tok, *kh))
+                            {
+                                task.error = Some(err);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+
+            let earliest = tasks[..used_workers]
+                .iter_mut()
+                .filter_map(|task| task.as_mut().and_then(|t| t.error.take()))
+                .min_by_key(|(tok, kh, _)| (*tok, *kh));
+            if let Some((_, _, err)) = earliest {
+                return Err(err);
+            }
+        }
+
+        let mut rem_out = &tile_scratch.kv_major_outputs[..total_out_elems];
+        for u in 0..num_token_units {
+            let token_start = u * 2;
+            let token_len = (count - token_start).min(2);
+            let chunk_len = token_len * kv_out_len;
+            for kv_head in 0..kv_heads {
+                let (kv_block, tail) = rem_out.split_at(chunk_len);
+                rem_out = tail;
+                let dst_offset = kv_head * kv_out_len;
+                for local_tok in 0..token_len {
+                    let src = &kv_block[local_tok * kv_out_len..(local_tok + 1) * kv_out_len];
+                    attended[token_start + local_tok][dst_offset..dst_offset + kv_out_len]
+                        .copy_from_slice(src);
+                }
+            }
+        }
+        Ok(())
     })();
     if result.is_err() {
         for row in attended {
@@ -1194,76 +1822,6 @@ impl PackedAttention<'_> {
                 Ok(())
             }
         }
-    }
-
-    fn attend_chunk_tile_scores(
-        &self,
-        base_head: usize,
-        attended: &mut [f32],
-        scores_scratch: &mut [f32],
-        stride: usize,
-        unit: usize,
-    ) -> Result<()> {
-        match unit {
-            6 => self.attend_chunk_tile_fixed::<6>(base_head, attended, scores_scratch, stride),
-            4 => self.attend_chunk_tile_fixed::<4>(base_head, attended, scores_scratch, stride),
-            3 => self.attend_chunk_tile_fixed::<3>(base_head, attended, scores_scratch, stride),
-            2 => self.attend_chunk_tile_fixed::<2>(base_head, attended, scores_scratch, stride),
-            _ => {
-                let first_row = scores_scratch
-                    .get_mut(..stride)
-                    .ok_or_else(|| invalid("grouped attention slice length underflow"))?;
-                for (offset, result) in attended
-                    .as_chunks_mut::<HEAD_DIM>()
-                    .0
-                    .iter_mut()
-                    .enumerate()
-                {
-                    self.attend_head(base_head + offset, result, first_row)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn attend_chunk_tile_fixed<const G: usize>(
-        &self,
-        base_head: usize,
-        attended: &mut [f32],
-        scores_scratch: &mut [f32],
-        stride: usize,
-    ) -> Result<()> {
-        if scores_scratch.len() >= G * stride {
-            return self.attend_chunk_fixed_scores::<G>(
-                base_head,
-                attended,
-                &mut scores_scratch[..G * stride],
-                stride,
-            );
-        }
-        let heap_rows = (scores_scratch.len() / stride).min(G);
-        if heap_rows == 0 {
-            return Err(invalid("grouped attention slice length underflow"));
-        }
-        let stack_rows = G - heap_rows;
-        if stack_rows * stride > STACK_GROUP_SCORES_LEN {
-            return Err(invalid("grouped attention slice length underflow"));
-        }
-        let mut stack_buf = [0.0_f32; STACK_GROUP_SCORES_LEN];
-        let mut score_rows: [&mut [f32]; G] = std::array::from_fn(|_| &mut [][..]);
-        let mut rest_heap = &mut scores_scratch[..heap_rows * stride];
-        for slot in &mut score_rows[..heap_rows] {
-            let (head, tail) = std::mem::take(&mut rest_heap).split_at_mut(stride);
-            *slot = head;
-            rest_heap = tail;
-        }
-        let mut rest_stack = &mut stack_buf[..stack_rows * stride];
-        for slot in &mut score_rows[heap_rows..] {
-            let (head, tail) = std::mem::take(&mut rest_stack).split_at_mut(stride);
-            *slot = head;
-            rest_stack = tail;
-        }
-        self.attend_chunk_with_score_rows::<G>(base_head, attended, &mut score_rows)
     }
 
     fn attend_chunk_fixed_scores<const G: usize>(
@@ -1496,84 +2054,6 @@ impl PackedAttention<'_> {
     }
 }
 
-fn attend_pair_tokens(
-    pair: [&PackedAttention<'_>; 2],
-    results: [&mut [f32]; 2],
-    scores_chunk: &mut [f32],
-    unit: usize,
-) -> Result<()> {
-    match unit {
-        6 => attend_pair_fixed::<6>(pair, results, scores_chunk),
-        4 => attend_pair_fixed::<4>(pair, results, scores_chunk),
-        3 => attend_pair_fixed::<3>(pair, results, scores_chunk),
-        2 => attend_pair_fixed::<2>(pair, results, scores_chunk),
-        _ => attend_pair_fixed::<1>(pair, results, scores_chunk),
-    }
-}
-
-fn attend_pair_fixed<const G: usize>(
-    pair: [&PackedAttention<'_>; 2],
-    results: [&mut [f32]; 2],
-    scores_chunk: &mut [f32],
-) -> Result<()> {
-    let stride0 = pair[0].history_tokens + 1;
-    let stride1 = pair[1].history_tokens + 1;
-    if stride1 != stride0 + 1
-        || results[0].len() != results[1].len()
-        || !results[0].len().is_multiple_of(HEAD_DIM)
-    {
-        return Err(invalid("invalid packed attention pair geometry"));
-    }
-    let needed0 = checked_product(&[G, stride0])?;
-    let needed1 = checked_product(&[G, stride1])?;
-    let total_needed = checked_sum(needed0, needed1)?;
-    if scores_chunk.len() < total_needed {
-        return Err(invalid("grouped attention slice length underflow"));
-    }
-    let (scores0_flat, tail) = scores_chunk.split_at_mut(needed0);
-    let scores1_flat = &mut tail[..needed1];
-    let mut score_rows0 = split_mut_slices::<G>(scores0_flat, stride0)?;
-    let mut score_rows1 = split_mut_slices::<G>(scores1_flat, stride1)?;
-
-    let [out0, out1] = results;
-    let group_elems = (out0.len() / (G * HEAD_DIM)) * G * HEAD_DIM;
-    let (groups0, rem0) = out0.split_at_mut(group_elems);
-    let (groups1, rem1) = out1.split_at_mut(group_elems);
-    let heads_per_kv = pair[0].heads_per_kv;
-    for (group_index, (chunk0, chunk1)) in groups0
-        .chunks_exact_mut(G * HEAD_DIM)
-        .zip(groups1.chunks_exact_mut(G * HEAD_DIM))
-        .enumerate()
-    {
-        let group_base = group_index * G;
-        if group_base / heads_per_kv == (group_base + G - 1) / heads_per_kv {
-            let mut head_outputs0 = split_mut_slices::<G>(chunk0, HEAD_DIM)?;
-            let mut head_outputs1 = split_mut_slices::<G>(chunk1, HEAD_DIM)?;
-            attend_group_pair::<G>(
-                pair,
-                group_base,
-                [&mut head_outputs0, &mut head_outputs1],
-                [&mut score_rows0, &mut score_rows1],
-            )?;
-        } else {
-            for (offset, res) in chunk0.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
-                pair[0].attend_head(group_base + offset, res, score_rows0[0])?;
-            }
-            for (offset, res) in chunk1.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
-                pair[1].attend_head(group_base + offset, res, score_rows1[0])?;
-            }
-        }
-    }
-    let rem_base = groups0.len() / HEAD_DIM;
-    for (offset, res) in rem0.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
-        pair[0].attend_head(rem_base + offset, res, score_rows0[0])?;
-    }
-    for (offset, res) in rem1.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
-        pair[1].attend_head(rem_base + offset, res, score_rows1[0])?;
-    }
-    Ok(())
-}
-
 fn score_pair_group<const G: usize>(
     pair: [&PackedAttention<'_>; 2],
     base_head: usize,
@@ -1712,5 +2192,13 @@ fn resize_bytes(count: usize, output: &mut Vec<u8>) -> Result<()> {
         output.try_reserve_exact(count - output.len())?;
     }
     output.resize(count, 0);
+    Ok(())
+}
+
+fn resize_f32s(count: usize, output: &mut Vec<f32>) -> Result<()> {
+    if count > output.len() {
+        output.try_reserve_exact(count - output.len())?;
+    }
+    output.resize(count, 0.0);
     Ok(())
 }

@@ -4,7 +4,8 @@ use bonsai_ternary::half_to_float;
 
 use super::super::{Geometry, KvCache};
 use super::{
-    attend_group, attend_prefix, attend_tile_chunk, attend_tile_kv_group, pinned_attention,
+    SixHeadTileScratch, attend_group, attend_prefix, attend_tile_balanced,
+    attend_tile_balanced_with_scratch, attend_tile_chunk, attend_tile_kv_group, pinned_attention,
 };
 use crate::kernels::RowParallelism;
 
@@ -779,6 +780,132 @@ fn six_head_prefill_24_head_gqa_2d_counts_match_oracle_across_workers() -> crate
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn six_head_attend_tile_balanced_matches_oracle_0_ulp_across_tokens_and_workers()
+-> crate::Result<()> {
+    #[cfg(feature = "parallel-rows")]
+    let worker_counts: Vec<usize> = (1..=12).collect();
+    #[cfg(not(feature = "parallel-rows"))]
+    let worker_counts = vec![1_usize];
+    let pools: Vec<(usize, RowParallelism)> = worker_counts
+        .into_iter()
+        .map(|workers| Ok((workers, RowParallelism::new(workers)?)))
+        .collect::<crate::Result<_>>()?;
+    let width_base = [0_usize, 63, 255];
+    let counts = [1_usize, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 64];
+    let mut scratch = SixHeadTileScratch::default();
+
+    for base in width_base {
+        for count in counts {
+            let fixture = fixture_with_geometry(24, 4, base + count + 4, base, count)?;
+            let q_width = fixture.geometry.heads * fixture.geometry.head;
+            let expected: Vec<_> = (0..count)
+                .map(|token| reference(&fixture, base + token, token))
+                .collect::<crate::Result<_>>()?;
+            for (workers, pool) in &pools {
+                let mut attended = vec![vec![19.0_f32; q_width]; count];
+                if *workers == 1 && count == 64 {
+                    attend_tile_balanced(
+                        &fixture.geometry,
+                        base,
+                        &fixture.queries,
+                        &fixture.projected,
+                        &fixture.keys,
+                        &fixture.values,
+                        &fixture.current_keys,
+                        &fixture.current_values,
+                        &mut attended,
+                        0.125,
+                        pool,
+                    )?;
+                } else {
+                    attend_tile_balanced_with_scratch(
+                        &fixture.geometry,
+                        base,
+                        &fixture.queries,
+                        &fixture.projected,
+                        &fixture.keys,
+                        &fixture.values,
+                        &fixture.current_keys,
+                        &fixture.current_values,
+                        &mut attended,
+                        0.125,
+                        &mut scratch,
+                        pool,
+                    )?;
+                }
+                for (token, (got, want)) in attended.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "six-head balanced 0 ULP mismatch base={base}, count={count}, workers={workers}, token={token}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn six_head_attend_tile_balanced_preserves_earliest_error_across_workers() -> crate::Result<()> {
+    #[cfg(feature = "parallel-rows")]
+    let worker_counts = [1_usize, 2, 4, 8, 12];
+    #[cfg(not(feature = "parallel-rows"))]
+    let worker_counts = [1_usize];
+    let base = 4;
+    let count = 6;
+    let mut fixture = fixture_with_geometry(24, 4, base + count + 4, base, count)?;
+    let width = fixture.geometry.head;
+    let q_width = fixture.geometry.heads * width;
+    // Place nonfinite inputs in an earlier pair's first token (token 1, kv_head 2)
+    // and in a later pair (token 4, kv_head 0) as well as token 0 later kv_head (token 0, kv_head 3).
+    // Earliest causal item is (token=0, kv_head=3).
+    fixture.queries[4][0] = f32::NAN;
+    fixture.queries[1][2 * 6 * width] = f32::NAN;
+    fixture.queries[0][3 * 6 * width] = f32::NAN;
+
+    let mut serial_out = vec![vec![1.0_f32; q_width]; count];
+    let serial_err = attend_tile_balanced(
+        &fixture.geometry,
+        base,
+        &fixture.queries,
+        &fixture.projected,
+        &fixture.keys,
+        &fixture.values,
+        &fixture.current_keys,
+        &fixture.current_values,
+        &mut serial_out,
+        0.125,
+        &RowParallelism::new(1)?,
+    )
+    .err()
+    .ok_or_else(|| crate::invalid("expected serial error"))?;
+    assert!(serial_out.iter().flatten().all(|&v| v == 0.0));
+
+    for workers in worker_counts {
+        let mut out = vec![vec![2.0_f32; q_width]; count];
+        let err = attend_tile_balanced(
+            &fixture.geometry,
+            base,
+            &fixture.queries,
+            &fixture.projected,
+            &fixture.keys,
+            &fixture.values,
+            &fixture.current_keys,
+            &fixture.current_values,
+            &mut out,
+            0.125,
+            &RowParallelism::new(workers)?,
+        )
+        .err()
+        .ok_or_else(|| crate::invalid("expected parallel error"))?;
+        assert_eq!(err.to_string(), serial_err.to_string());
+        assert!(out.iter().flatten().all(|&v| v == 0.0));
     }
     Ok(())
 }

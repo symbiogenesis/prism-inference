@@ -2081,3 +2081,367 @@ fn fitted_kv_optimizes_both_keys_and_values_preserving_restore_and_improving_sof
     assert!((sum_v1 - 1.0).abs() < 1e-3 && (sum_v3 - 1.0).abs() < 1e-3);
     Ok(())
 }
+
+fn seeded_kv_pair(
+    policy: KvCachePolicy,
+    kv_heads: usize,
+    history: usize,
+    capacity_tokens: usize,
+) -> Result<(KvCache, KvCache)> {
+    let width = kv_heads * HEAD_DIM;
+    let mut keys = KvCache::with_policy(width, capacity_tokens, policy, true, false)?;
+    let mut values = KvCache::with_policy(width, capacity_tokens, policy, false, false)?;
+    for token in 0..history {
+        let k_row = input(width, u16::try_from(token * 13 + 5)?)?;
+        let v_row = input(width, u16::try_from(token * 17 + 29)?)?;
+        keys.prepare_append(&k_row)?;
+        keys.append(&k_row);
+        values.prepare_append(&v_row)?;
+        values.append(&v_row);
+    }
+    Ok((keys, values))
+}
+
+fn clone_packed_kv(src: &KvCache, truncate_tokens: Option<usize>) -> Result<KvCache> {
+    let mut dst = src.copy()?;
+    if let Some(tokens) = truncate_tokens {
+        let packed = dst
+            .packed
+            .as_mut()
+            .ok_or_else(|| invalid("dst packed"))?;
+        packed.truncate_to(tokens)?;
+        dst.len = tokens * src.width;
+    }
+    Ok(dst)
+}
+
+#[test]
+fn prepare_tile_append_parallel_matches_serial_bytes_across_policies_tokens_and_workers()
+-> Result<()> {
+    #[cfg(feature = "parallel-rows")]
+    let worker_counts: Vec<usize> = (1..=12).collect();
+    #[cfg(not(feature = "parallel-rows"))]
+    let worker_counts = vec![1_usize];
+    let pools: Vec<(usize, RowParallelism)> = worker_counts
+        .into_iter()
+        .map(|workers| Ok((workers, RowParallelism::new(workers)?)))
+        .collect::<Result<_>>()?;
+
+    let kv_heads = 4;
+    let width = kv_heads * HEAD_DIM;
+    let initial_history = 60;
+    let policies = [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedKv,
+        KvCachePolicy::Rotated4Keys3Values,
+    ];
+
+    let max_tokens = 32;
+    let tile_keys: Vec<Vec<f32>> = (0..max_tokens)
+        .map(|tok| input(width, u16::try_from(tok * 7 + 3)?))
+        .collect::<Result<_>>()?;
+    let tile_values: Vec<Vec<f32>> = (0..max_tokens)
+        .map(|tok| input(width, u16::try_from(tok * 11 + 19)?))
+        .collect::<Result<_>>()?;
+
+    for policy in policies {
+        let (base_k, base_v) =
+            seeded_kv_pair(policy, kv_heads, initial_history, initial_history + max_tokens)?;
+        let mut scratch = PackedTileScratch::default();
+        for count in 1..=max_tokens {
+            let mut ser_k = clone_packed_kv(&base_k, None)?;
+            let mut ser_v = clone_packed_kv(&base_v, None)?;
+            for (k_row, v_row) in tile_keys[..count].iter().zip(&tile_values[..count]) {
+                prepare_tile_append(&mut ser_k, &mut ser_v, k_row, v_row)?;
+                ser_k.append(k_row);
+                ser_v.append(v_row);
+            }
+            let expected_k_bytes = packed_bytes(&ser_k);
+            let expected_v_bytes = packed_bytes(&ser_v);
+            let expected_k_pages = ser_k
+                .packed
+                .as_ref()
+                .ok_or_else(|| invalid("ser_k"))?
+                .pages
+                .len();
+            let expected_v_pages = ser_v
+                .packed
+                .as_ref()
+                .ok_or_else(|| invalid("ser_v"))?
+                .pages
+                .len();
+
+            for (workers, pool) in &pools {
+                let mut par_k = clone_packed_kv(&base_k, None)?;
+                let mut par_v = clone_packed_kv(&base_v, None)?;
+
+                if *workers == 1 && count == max_tokens {
+                    prepare_tile_append_parallel(
+                        &mut par_k,
+                        &mut par_v,
+                        &tile_keys[..count],
+                        &tile_values[..count],
+                        pool,
+                    )?;
+                } else {
+                    prepare_tile_append_parallel_with_scratch(
+                        &mut par_k,
+                        &mut par_v,
+                        &tile_keys[..count],
+                        &tile_values[..count],
+                        &mut scratch,
+                        pool,
+                    )?;
+                }
+                assert_eq!(
+                    par_k.len, ser_k.len,
+                    "parallel key len mismatch for {policy:?}, count={count}, workers={workers}"
+                );
+                assert_eq!(
+                    par_v.len, ser_v.len,
+                    "parallel value len mismatch for {policy:?}, count={count}, workers={workers}"
+                );
+                assert_eq!(
+                    par_k.packed.as_ref().map(|p| p.pages.len()),
+                    Some(expected_k_pages),
+                    "page count mismatch for {policy:?}, count={count}, workers={workers}"
+                );
+                assert_eq!(
+                    par_v.packed.as_ref().map(|p| p.pages.len()),
+                    Some(expected_v_pages),
+                    "value page count mismatch for {policy:?}, count={count}, workers={workers}"
+                );
+                assert_eq!(
+                    packed_bytes(&par_k),
+                    expected_k_bytes,
+                    "parallel key bytes mismatch for {policy:?}, count={count}, workers={workers}"
+                );
+                assert_eq!(
+                    packed_bytes(&par_v),
+                    expected_v_bytes,
+                    "parallel value bytes mismatch for {policy:?}, count={count}, workers={workers}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn prepare_tile_append_parallel_preserves_cache_on_error() -> Result<()> {
+    #[cfg(feature = "parallel-rows")]
+    let worker_counts = [1_usize, 2, 4, 8, 12];
+    #[cfg(not(feature = "parallel-rows"))]
+    let worker_counts = [1_usize];
+    let kv_heads = 4;
+    let width = kv_heads * HEAD_DIM;
+    let initial_history = 5;
+    let count = 6;
+    let (base_k, base_v) = seeded_kv_pair(
+        KvCachePolicy::Rotated4FittedKv,
+        kv_heads,
+        initial_history,
+        initial_history + count,
+    )?;
+    let expected_k_bytes = packed_bytes(&base_k);
+    let expected_v_bytes = packed_bytes(&base_v);
+    let mut keys_in: Vec<Vec<f32>> = (0..count)
+        .map(|tok| input(width, u16::try_from(tok * 5 + 1)?))
+        .collect::<Result<_>>()?;
+    let mut vals_in: Vec<Vec<f32>> = (0..count)
+        .map(|tok| input(width, u16::try_from(tok * 9 + 7)?))
+        .collect::<Result<_>>()?;
+    // Corrupt later token value and earlier token key.
+    vals_in[4][3 * HEAD_DIM] = f32::NAN;
+    keys_in[1][2 * HEAD_DIM] = f32::NAN;
+
+    for workers in worker_counts {
+        let pool = RowParallelism::new(workers)?;
+        let mut k = clone_packed_kv(&base_k, None)?;
+        let mut v = clone_packed_kv(&base_v, None)?;
+
+        assert!(prepare_tile_append_parallel(&mut k, &mut v, &keys_in, &vals_in, &pool).is_err());
+        assert_eq!(k.len, base_k.len);
+        assert_eq!(v.len, base_v.len);
+        assert_eq!(packed_bytes(&k), expected_k_bytes);
+        assert_eq!(packed_bytes(&v), expected_v_bytes);
+    }
+    Ok(())
+}
+
+#[test]
+fn attend_tile_2d_causal_balanced_matches_serial_0_ulp_across_policies_tokens_and_workers()
+-> Result<()> {
+    #[cfg(feature = "parallel-rows")]
+    let worker_counts: Vec<usize> = (1..=12).collect();
+    #[cfg(not(feature = "parallel-rows"))]
+    let worker_counts = vec![1_usize];
+    let pools: Vec<(usize, RowParallelism)> = worker_counts
+        .into_iter()
+        .map(|workers| Ok((workers, RowParallelism::new(workers)?)))
+        .collect::<Result<_>>()?;
+
+    let heads = 24;
+    let kv_heads = 4;
+    let kv_width = kv_heads * HEAD_DIM;
+    let q_width = heads * HEAD_DIM;
+    let base = 62;
+    let scale = 0.0625;
+    let policies = [
+        KvCachePolicy::Rotated4,
+        KvCachePolicy::Rotated4FittedKv,
+        KvCachePolicy::Rotated4Keys3Values,
+    ];
+
+    let max_tokens = 32;
+    let queries: Vec<Vec<f32>> = (0..max_tokens)
+        .map(|tok| input(q_width, u16::try_from(tok * 3 + 5)?))
+        .collect::<Result<_>>()?;
+    let projected: Vec<Vec<f32>> = (0..max_tokens)
+        .map(|tok| input(2 * q_width, u16::try_from(tok * 13 + 9)?))
+        .collect::<Result<_>>()?;
+    let tile_keys: Vec<Vec<f32>> = (0..max_tokens)
+        .map(|tok| input(kv_width, u16::try_from(tok * 7 + 11)?))
+        .collect::<Result<_>>()?;
+    let tile_values: Vec<Vec<f32>> = (0..max_tokens)
+        .map(|tok| input(kv_width, u16::try_from(tok * 17 + 21)?))
+        .collect::<Result<_>>()?;
+
+    for policy in policies {
+        let (mut keys, mut values) = seeded_kv_pair(policy, kv_heads, base, base + max_tokens)?;
+        prepare_tile_append_parallel(
+            &mut keys,
+            &mut values,
+            &tile_keys,
+            &tile_values,
+            &pools[0].1,
+        )?;
+        let mut scratch = PackedTileScratch::default();
+
+        for count in 1..=max_tokens {
+            let end = base + count;
+            let prefix_keys = clone_packed_kv(&keys, Some(end))?;
+            let prefix_values = clone_packed_kv(&values, Some(end))?;
+
+            let mut serial_scores = vec![0.0_f32; count * end];
+            let mut serial_out = vec![vec![0.0_f32; q_width]; count];
+            attend_tile(
+                &prefix_keys,
+                &prefix_values,
+                &queries[..count],
+                &projected[..count],
+                &mut serial_out,
+                &mut serial_scores,
+                base,
+                heads,
+                scale,
+                super::super::Arithmetic::PinnedSwift,
+                &pools[0].1,
+            )?;
+
+            if matches!(count, 1 | 2 | 7 | 16 | 31 | 32) {
+                let mut decode_k = clone_packed_kv(&keys, Some(end - 1))?;
+                let mut decode_v = clone_packed_kv(&values, Some(end - 1))?;
+                let mut oracle_scores = vec![0.0_f32; end];
+                let mut oracle_out = vec![0.0_f32; q_width];
+                attend(
+                    &mut decode_k,
+                    &mut decode_v,
+                    &queries[count - 1],
+                    &projected[count - 1],
+                    &tile_keys[count - 1],
+                    &tile_values[count - 1],
+                    &mut oracle_out,
+                    &mut oracle_scores,
+                    heads,
+                    scale,
+                    super::super::Arithmetic::PinnedSwift,
+                    &pools[0].1,
+                )?;
+                assert_eq!(
+                    serial_out[count - 1]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    oracle_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "serial attend_tile mismatch vs decode for {policy:?}, count={count}"
+                );
+            }
+
+            for (workers, pool) in pools.iter().skip(1) {
+                let mut par_scores = vec![0.0_f32; count * end];
+                let mut par_out = vec![vec![0.0_f32; q_width]; count];
+                attend_tile_with_scratch(
+                    &prefix_keys,
+                    &prefix_values,
+                    &queries[..count],
+                    &projected[..count],
+                    &mut par_out,
+                    &mut par_scores,
+                    base,
+                    heads,
+                    scale,
+                    super::super::Arithmetic::PinnedSwift,
+                    &mut scratch,
+                    pool,
+                )?;
+                for token in 0..count {
+                    assert_eq!(
+                        par_out[token]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        serial_out[token]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        "0 ULP mismatch for {policy:?}, count={count}, workers={workers}, token={token}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn assign_causal_balanced_items_balances_work_across_workers() -> Result<()> {
+    let base = 0_usize;
+    let count = 32_usize;
+    let kv_heads = 4_usize;
+    let num_units = count.div_ceil(2);
+    let total_items = num_units * kv_heads;
+    let mut costs = Vec::with_capacity(total_items);
+    let mut token_starts = Vec::with_capacity(total_items);
+    let mut kv_heads_idx = Vec::with_capacity(total_items);
+    for u in 0..num_units {
+        let token_start = u * 2;
+        let cost = 2 * (base + token_start) + 3;
+        for kv_head in 0..kv_heads {
+            costs.push(cost);
+            token_starts.push(token_start);
+            kv_heads_idx.push(kv_head);
+        }
+    }
+    let mut assigned = vec![0_usize; total_items];
+    let mut counts = [0_usize; MAX_ROW_WORKERS];
+    for workers in [4_usize, 8, 12] {
+        let (used, loads) = assign_causal_balanced_items(
+            &costs,
+            &token_starts,
+            &kv_heads_idx,
+            workers,
+            &mut assigned,
+            &mut counts,
+        )?;
+        assert_eq!(used, workers);
+        let min_load = loads[..used].iter().copied().min().unwrap_or(0);
+        let max_load = loads[..used].iter().copied().max().unwrap_or(0);
+        let max_item = costs.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_load - min_load <= max_item,
+            "LPT imbalance exceeded single largest item for workers={workers}: {min_load}..={max_load}"
+        );
+    }
+    Ok(())
+}

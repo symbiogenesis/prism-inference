@@ -1,8 +1,9 @@
 //! Complete six-head decode and causal-prefill groups without tail cache rereads.
 
-use super::{Geometry, KvCache, attention_gate};
+use super::{Geometry, KvCache, attention_gate, checked_product, checked_sum};
 use crate::kernels::pinned_attention::{self, six};
-use crate::{Result, invalid};
+use crate::kernels::{MAX_ROW_WORKERS, RowParallelism};
+use crate::{Error, Result, invalid};
 
 fn rows<T>(values: &mut [T], width: usize) -> Result<[&mut [T]; 6]> {
     rows_group::<T, 6>(values, width)
@@ -761,6 +762,544 @@ pub(super) fn attend_tile_kv_group(
         )?;
     }
     Ok(())
+}
+
+/// Reusable scratch storage for causal-cost-balanced 2D `(token_pair, kv_head)`
+/// six-head FP16 prefill tile attention.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Wired into tiled FP16 prefill during integration and tested across worker counts."
+    )
+)]
+#[derive(Default)]
+pub(super) struct SixHeadTileScratch {
+    kv_major_outputs: Vec<f32>,
+    worker_scores: Vec<f32>,
+    packed_scratch: Vec<[Vec<[u16; 6]>; 2]>,
+}
+
+struct BalancedTileContext<'a> {
+    geometry: &'a Geometry,
+    first_position: usize,
+    queries: &'a [Vec<f32>],
+    projected: &'a [Vec<f32>],
+    keys: &'a KvCache,
+    values: &'a KvCache,
+    current_keys: &'a [Vec<f32>],
+    current_values: &'a [Vec<f32>],
+    scale: f32,
+}
+
+impl BalancedTileContext<'_> {
+    fn run_single(
+        &self,
+        token: usize,
+        kv_head: usize,
+        output: &mut [f32],
+        scores: &mut [f32],
+        packed_scratch: &mut Vec<[u16; 6]>,
+    ) -> std::result::Result<(), (usize, usize, Error)> {
+        let head = kv_head * 6;
+        let position = self.first_position + token;
+        let needed_scores = 6 * (position + 1);
+        attend_prefix_with_scratch(
+            self.geometry,
+            head,
+            &self.queries[token],
+            &self.projected[token],
+            self.keys,
+            self.values,
+            position,
+            &self.current_keys[token],
+            &self.current_values[token],
+            output,
+            &mut scores[..needed_scores],
+            self.scale,
+            packed_scratch,
+        )
+        .map_err(|err| (token, kv_head, err))
+    }
+
+    fn run_pair(
+        &self,
+        token0: usize,
+        kv_head: usize,
+        output: &mut [f32],
+        scores: &mut [f32],
+        score_stride: usize,
+        packed_scratch: &mut [Vec<[u16; 6]>; 2],
+    ) -> std::result::Result<(), (usize, usize, Error)> {
+        let token1 = token0 + 1;
+        let head = kv_head * 6;
+        let position = self.first_position + token0;
+        let group_stride = 6 * self.geometry.head;
+        let (out0, out1) = output.split_at_mut(group_stride);
+        let (first_scores, second_scores) = scores.split_at_mut(score_stride);
+        if let Err(pair_err) = attend_group_pair(
+            self.geometry,
+            head,
+            position,
+            [&self.queries[token0], &self.queries[token1]],
+            [&self.projected[token0], &self.projected[token1]],
+            self.keys,
+            self.values,
+            [&self.current_keys[token0], &self.current_keys[token1]],
+            [&self.current_values[token0], &self.current_values[token1]],
+            [out0, out1],
+            first_scores,
+            second_scores,
+            self.scale,
+            packed_scratch,
+        ) {
+            // Preserve token-0 error precedence even when a shared pair fails.
+            self.run_single(token0, kv_head, out0, first_scores, &mut packed_scratch[0])?;
+            self.run_single(token1, kv_head, out1, second_scores, &mut packed_scratch[1])?;
+            return Err((token0, kv_head, pair_err));
+        }
+        Ok(())
+    }
+
+    fn run_item(
+        &self,
+        item: &mut BalancedWorkItem<'_>,
+        scores: &mut [f32],
+        score_stride: usize,
+        packed_scratch: &mut [Vec<[u16; 6]>; 2],
+    ) -> std::result::Result<(), (usize, usize, Error)> {
+        if item.token_len == 2 {
+            self.run_pair(
+                item.token_start,
+                item.kv_head,
+                item.output,
+                scores,
+                score_stride,
+                packed_scratch,
+            )
+        } else {
+            self.run_single(
+                item.token_start,
+                item.kv_head,
+                item.output,
+                scores,
+                &mut packed_scratch[0],
+            )
+        }
+    }
+}
+
+struct BalancedWorkItem<'a> {
+    token_start: usize,
+    token_len: usize,
+    kv_head: usize,
+    output: &'a mut [f32],
+}
+
+struct BalancedWorkerTask<'a> {
+    items: &'a mut [Option<BalancedWorkItem<'a>>],
+    scores: &'a mut [f32],
+    packed: &'a mut [Vec<[u16; 6]>; 2],
+    error: Option<(usize, usize, Error)>,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Validate full six-head prefill tile invariants before causal-balanced dispatch."
+)]
+fn validate_balanced_tile_inputs(
+    geometry: &Geometry,
+    first_position: usize,
+    queries: &[Vec<f32>],
+    projected: &[Vec<f32>],
+    keys: &KvCache,
+    values: &KvCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    attended: &[Vec<f32>],
+) -> Result<()> {
+    let count = queries.len();
+    let last_position = count
+        .checked_sub(1)
+        .and_then(|last| first_position.checked_add(last))
+        .ok_or_else(|| invalid("invalid six-head attention tile geometry"))?;
+    let width = geometry.head;
+    if count == 0
+        || count > crate::MAX_PREFILL_BLOCK_TOKENS
+        || width == 0
+        || geometry.kv_heads == 0
+        || !geometry.heads.is_multiple_of(6)
+        || geometry.heads / geometry.kv_heads != 6
+        || projected.len() != count
+        || current_keys.len() != count
+        || current_values.len() != count
+        || attended.len() != count
+        || keys.width != checked_product(&[geometry.kv_heads, width])?
+        || values.width != keys.width
+        || last_position > keys.len / keys.width
+        || last_position > values.len / values.width
+        || queries
+            .iter()
+            .any(|row| row.len() != geometry.heads * width)
+        || projected
+            .iter()
+            .any(|row| row.len() != 2 * geometry.heads * width)
+        || attended
+            .iter()
+            .any(|row| row.len() != geometry.heads * width)
+        || current_keys.iter().any(|row| row.len() != keys.width)
+        || current_values.iter().any(|row| row.len() != values.width)
+    {
+        return Err(invalid("invalid six-head attention balanced tile geometry"));
+    }
+    Ok(())
+}
+
+fn assign_causal_balanced_items(
+    costs: &[usize],
+    token_starts: &[usize],
+    kv_heads_idx: &[usize],
+    workers: usize,
+    assigned: &mut [usize],
+    counts: &mut [usize; MAX_ROW_WORKERS],
+) -> Result<(usize, [usize; MAX_ROW_WORKERS])> {
+    let active_workers = costs.len().min(workers.max(1)).min(MAX_ROW_WORKERS);
+    counts.fill(0);
+    let mut loads = [0_usize; MAX_ROW_WORKERS];
+    if active_workers == 0 {
+        return Ok((0, loads));
+    }
+    let mut order = Vec::new();
+    order.try_reserve_exact(costs.len())?;
+    order.extend(0..costs.len());
+    order.sort_by(|&lhs, &rhs| {
+        costs[rhs]
+            .cmp(&costs[lhs])
+            .then_with(|| token_starts[lhs].cmp(&token_starts[rhs]))
+            .then_with(|| kv_heads_idx[lhs].cmp(&kv_heads_idx[rhs]))
+    });
+    for idx in order {
+        let mut best_worker = 0_usize;
+        let mut best_load = loads[0];
+        for (worker, &load) in loads[..active_workers].iter().enumerate().skip(1) {
+            if load < best_load {
+                best_load = load;
+                best_worker = worker;
+            }
+        }
+        loads[best_worker] = loads[best_worker].saturating_add(costs[idx]);
+        counts[best_worker] += 1;
+        assigned[idx] = best_worker;
+    }
+    Ok((active_workers, loads))
+}
+
+fn resize_balanced_f32s(count: usize, output: &mut Vec<f32>) -> Result<()> {
+    if count > output.len() {
+        output.try_reserve_exact(count - output.len())?;
+    }
+    output.resize(count, 0.0);
+    Ok(())
+}
+
+/// Evaluates all six-head KV groups across a prefill tile using causal-cost-balanced
+/// 2D `(token_pair, kv_head)` scheduling with 0 ULP parity against serial decoding.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Wired into tiled FP16 prefill during integration and tested across worker counts."
+    )
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Matches caller-owned projections, KV history caches, outputs, and row worker pool."
+)]
+pub(super) fn attend_tile_balanced(
+    geometry: &Geometry,
+    first_position: usize,
+    queries: &[Vec<f32>],
+    projected: &[Vec<f32>],
+    keys: &KvCache,
+    values: &KvCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    attended: &mut [Vec<f32>],
+    scale: f32,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    let mut scratch = SixHeadTileScratch::default();
+    attend_tile_balanced_with_scratch(
+        geometry,
+        first_position,
+        queries,
+        projected,
+        keys,
+        values,
+        current_keys,
+        current_values,
+        attended,
+        scale,
+        &mut scratch,
+        parallelism,
+    )
+}
+
+/// Evaluates all six-head KV groups across a prefill tile with reusable scratch storage
+/// and causal-cost-balanced 2D `(token_pair, kv_head)` worker scheduling.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Reusable scratch entry point for causal-balanced FP16 tiled prefill."
+    )
+)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Coordinates validation, 2D LPT scheduling, parallel execution, and scatter."
+)]
+pub(super) fn attend_tile_balanced_with_scratch(
+    geometry: &Geometry,
+    first_position: usize,
+    queries: &[Vec<f32>],
+    projected: &[Vec<f32>],
+    keys: &KvCache,
+    values: &KvCache,
+    current_keys: &[Vec<f32>],
+    current_values: &[Vec<f32>],
+    attended: &mut [Vec<f32>],
+    scale: f32,
+    tile_scratch: &mut SixHeadTileScratch,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    let result = (|| {
+        validate_balanced_tile_inputs(
+            geometry,
+            first_position,
+            queries,
+            projected,
+            keys,
+            values,
+            current_keys,
+            current_values,
+            attended,
+        )?;
+        let count = queries.len();
+        let end = checked_sum(first_position, count)?;
+        let width = geometry.head;
+        let kv_heads = geometry.kv_heads;
+        let group_stride = checked_product(&[6, width])?;
+        let total_out_elems = checked_product(&[count, kv_heads, group_stride])?;
+        resize_balanced_f32s(total_out_elems, &mut tile_scratch.kv_major_outputs)?;
+
+        let num_token_units = count.div_ceil(2);
+        let total_items = checked_product(&[num_token_units, kv_heads])?;
+        let active_workers = total_items
+            .min(parallelism.workers().max(1))
+            .min(MAX_ROW_WORKERS);
+        let score_stride = checked_product(&[6, end])?;
+        let worker_score_len = if count >= 2 {
+            checked_product(&[2, score_stride])?
+        } else {
+            score_stride
+        };
+        resize_balanced_f32s(
+            checked_product(&[active_workers, worker_score_len])?,
+            &mut tile_scratch.worker_scores,
+        )?;
+        if tile_scratch.packed_scratch.len() < active_workers {
+            tile_scratch
+                .packed_scratch
+                .try_reserve_exact(active_workers - tile_scratch.packed_scratch.len())?;
+            tile_scratch
+                .packed_scratch
+                .resize_with(active_workers, || [Vec::new(), Vec::new()]);
+        }
+
+        let ctx = BalancedTileContext {
+            geometry,
+            first_position,
+            queries,
+            projected,
+            keys,
+            values,
+            current_keys,
+            current_values,
+            scale,
+        };
+
+        if active_workers == 1 {
+            let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
+            let worker_scores = &mut tile_scratch.worker_scores[..worker_score_len];
+            let packed = &mut tile_scratch.packed_scratch[0];
+            let mut earliest: Option<(usize, usize, Error)> = None;
+            for u in 0..num_token_units {
+                let token_start = u * 2;
+                let token_len = (count - token_start).min(2);
+                let chunk_len = token_len * group_stride;
+                for kv_head in 0..kv_heads {
+                    let (out_slice, tail) = std::mem::take(&mut rem_out).split_at_mut(chunk_len);
+                    rem_out = tail;
+                    let mut item = BalancedWorkItem {
+                        token_start,
+                        token_len,
+                        kv_head,
+                        output: out_slice,
+                    };
+                    if let Err(err) = ctx.run_item(&mut item, worker_scores, score_stride, packed) {
+                        let key = (err.0, err.1);
+                        if earliest
+                            .as_ref()
+                            .is_none_or(|(tok, kh, _)| key < (*tok, *kh))
+                        {
+                            earliest = Some(err);
+                        }
+                    }
+                }
+            }
+            if let Some((_, _, err)) = earliest {
+                return Err(err);
+            }
+        } else {
+            let mut items = Vec::new();
+            items.try_reserve_exact(total_items)?;
+            let mut costs = Vec::new();
+            costs.try_reserve_exact(total_items)?;
+            let mut token_starts = Vec::new();
+            token_starts.try_reserve_exact(total_items)?;
+            let mut kv_heads_idx = Vec::new();
+            kv_heads_idx.try_reserve_exact(total_items)?;
+
+            let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
+            for u in 0..num_token_units {
+                let token_start = u * 2;
+                let token_len = (count - token_start).min(2);
+                let causal_cost = if token_len == 2 {
+                    2_usize
+                        .saturating_mul(first_position + token_start)
+                        .saturating_add(3)
+                } else {
+                    (first_position + token_start).saturating_add(1)
+                };
+                let chunk_len = token_len * group_stride;
+                for kv_head in 0..kv_heads {
+                    let (out_slice, tail) = std::mem::take(&mut rem_out).split_at_mut(chunk_len);
+                    rem_out = tail;
+                    costs.push(causal_cost);
+                    token_starts.push(token_start);
+                    kv_heads_idx.push(kv_head);
+                    items.push(BalancedWorkItem {
+                        token_start,
+                        token_len,
+                        kv_head,
+                        output: out_slice,
+                    });
+                }
+            }
+            let mut assigned = Vec::new();
+            assigned.try_reserve_exact(total_items)?;
+            assigned.resize(total_items, 0);
+            let mut counts = [0_usize; MAX_ROW_WORKERS];
+            let (used_workers, _) = assign_causal_balanced_items(
+                &costs,
+                &token_starts,
+                &kv_heads_idx,
+                active_workers,
+                &mut assigned,
+                &mut counts,
+            )?;
+
+            let mut cursor = [0_usize; MAX_ROW_WORKERS];
+            let mut running = 0_usize;
+            for (c_off, &cnt) in cursor[..used_workers].iter_mut().zip(&counts[..used_workers]) {
+                *c_off = running;
+                running += cnt;
+            }
+            let mut ordered: Vec<Option<BalancedWorkItem<'_>>> = Vec::new();
+            ordered.try_reserve_exact(total_items)?;
+            ordered.resize_with(total_items, || None);
+            for (item, worker) in items.into_iter().zip(assigned) {
+                let slot = cursor[worker];
+                cursor[worker] += 1;
+                ordered[slot] = Some(item);
+            }
+
+            let mut tasks: [Option<BalancedWorkerTask<'_>>; MAX_ROW_WORKERS] =
+                std::array::from_fn(|_| None);
+            let mut rem_ordered = ordered.as_mut_slice();
+            let mut rem_scores = &mut tile_scratch.worker_scores[..used_workers * worker_score_len];
+            let mut rem_packed = &mut tile_scratch.packed_scratch[..used_workers];
+            for (worker, task) in tasks[..used_workers].iter_mut().enumerate() {
+                let (item_chunk, item_tail) =
+                    std::mem::take(&mut rem_ordered).split_at_mut(counts[worker]);
+                rem_ordered = item_tail;
+                let (score_chunk, score_tail) =
+                    std::mem::take(&mut rem_scores).split_at_mut(worker_score_len);
+                rem_scores = score_tail;
+                let (packed_pair, packed_tail) =
+                    std::mem::take(&mut rem_packed).split_at_mut(1);
+                rem_packed = packed_tail;
+                *task = Some(BalancedWorkerTask {
+                    items: item_chunk,
+                    scores: score_chunk,
+                    packed: &mut packed_pair[0],
+                    error: None,
+                });
+            }
+
+            parallelism.update_chunks(&mut tasks[..used_workers], 1, |_, worker_slice| {
+                for task in worker_slice.iter_mut().flatten() {
+                    for item in task.items.iter_mut().flatten() {
+                        if let Err(err) = ctx.run_item(item, task.scores, score_stride, task.packed)
+                        {
+                            let key = (err.0, err.1);
+                            if task
+                                .error
+                                .as_ref()
+                                .is_none_or(|(tok, kh, _)| key < (*tok, *kh))
+                            {
+                                task.error = Some(err);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+
+            let earliest = tasks[..used_workers]
+                .iter_mut()
+                .filter_map(|task| task.as_mut().and_then(|t| t.error.take()))
+                .min_by_key(|(tok, kh, _)| (*tok, *kh));
+            if let Some((_, _, err)) = earliest {
+                return Err(err);
+            }
+        }
+
+        let mut rem_out = &tile_scratch.kv_major_outputs[..total_out_elems];
+        for u in 0..num_token_units {
+            let token_start = u * 2;
+            let token_len = (count - token_start).min(2);
+            let chunk_len = token_len * group_stride;
+            for kv_head in 0..kv_heads {
+                let (kv_block, tail) = rem_out.split_at(chunk_len);
+                rem_out = tail;
+                let dst_offset = kv_head * group_stride;
+                for local_tok in 0..token_len {
+                    let src = &kv_block[local_tok * group_stride..(local_tok + 1) * group_stride];
+                    attended[token_start + local_tok][dst_offset..dst_offset + group_stride]
+                        .copy_from_slice(src);
+                }
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for row in attended {
+            row.fill(0.0);
+        }
+    }
+    result
 }
 
 #[cfg(test)]

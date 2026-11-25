@@ -43,7 +43,7 @@ const USAGE: &str = concat!(
     "       swift_model_check rollback <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check request-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-messages.json> <output-1..16> <absolute-deadline-unix-ms> <source-commit>\n",
     "       swift_model_check ffn-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-token-ids.json> <absolute-deadline-unix-ms> <source-commit>\n",
-    "Prefix any mode with --use-repacked-ptq1 (verified current-weight PTQ1 export) or --nariq <2.5bpw|3.0bpw|2.0bpw> (opt-in NariQ trellis artifact; mutually exclusive with --use-repacked-ptq1 and --rank-one-adapter). PQ2 remains the default.\n",
+    "Prefix any mode with --use-repacked-ptq1 (verified current-weight PTQ1 export), --bonsai-2-5 <pq2|ptq1> (opt-in Ternary Bonsai 2.5 27B), or --nariq <2.5bpw|3.0bpw|2.0bpw> (opt-in NariQ trellis artifact; mutually exclusive prefixes; --nariq excludes --rank-one-adapter). Swift PQ2 remains the default.\n",
     "For load/forward/trajectory/rollback/request-timing/ffn-timing, --row-workers <1..18> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
     "For selected PQ2/PTQ1 load/forward/trajectory/rollback/request-timing/ffn-timing, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
     "For load/forward/trajectory/rollback/request-timing/ffn-timing, optionally prefix --multi-rank-adapter <absolute-gguf>[:<scale-0..2>] (default scale 0.0; NpuFriendly policy) alongside or without --rank-one-adapter (NariQ forbids --rank-one-adapter).\n",
@@ -467,6 +467,23 @@ fn select_representation(arguments: &mut Vec<String>) -> Result<Representation> 
                     _ => {
                         return Err(reject(
                             "unsupported --nariq variant; expected 2.5bpw, 3.0bpw, or 2.0bpw",
+                        ));
+                    }
+                };
+                arguments.drain(..2);
+                representation
+            }
+            "--bonsai-2-5" => {
+                let value = arguments
+                    .get(1)
+                    .map(String::as_str)
+                    .ok_or_else(|| reject("--bonsai-2-5 requires pq2 or ptq1"))?;
+                let representation = match value {
+                    "pq2" => Representation::Bonsai25Pq2,
+                    "ptq1" => Representation::Bonsai25Ptq1,
+                    _ => {
+                        return Err(reject(
+                            "unsupported --bonsai-2-5 variant; expected pq2 or ptq1",
                         ));
                     }
                 };
@@ -1359,6 +1376,84 @@ mod tests {
             .is_err()
         );
         assert!(parse_cli(vec!["ffn-timing".into(), model, evidence, "auto".into()]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bonsai25_cli_supports_orca_multi_rank_and_rejects_conflicts() -> Result<()> {
+        for (flag, expected_repr) in [
+            ("pq2", Representation::Bonsai25Pq2),
+            ("ptq1", Representation::Bonsai25Ptq1),
+        ] {
+            let mut args = vec![
+                "--bonsai-2-5".to_owned(),
+                flag.to_owned(),
+                "load".to_owned(),
+            ];
+            assert_eq!(select_representation(&mut args)?, expected_repr);
+            assert_eq!(args, ["load"]);
+            assert_eq!(model_budget_for(expected_repr), 8 * 1024 * 1024 * 1024);
+
+            let r1_path = std::env::temp_dir()
+                .join("orca.gguf")
+                .to_string_lossy()
+                .into_owned();
+            let mr_path = std::env::temp_dir()
+                .join("daisyrose.gguf")
+                .to_string_lossy()
+                .into_owned();
+            let parsed = parse_cli(vec![
+                "--bonsai-2-5".into(),
+                flag.into(),
+                "--rank-one-adapter".into(),
+                r1_path,
+                "1.3".into(),
+                "--multi-rank-adapter".into(),
+                format!("{mr_path}:0.5"),
+                "load".into(),
+                std::env::temp_dir()
+                    .join("bonsai25.gguf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ])?;
+            match parsed {
+                ParsedCommand::Mode {
+                    representation,
+                    adapter,
+                    multi_rank_adapter,
+                    ..
+                } => {
+                    assert_eq!(representation, expected_repr);
+                    assert!(adapter.is_some());
+                    assert!(multi_rank_adapter.is_some());
+                }
+                _ => return Err(super::reject("expected Bonsai 2.5 parsed load command")),
+            }
+        }
+        for bad in [
+            vec!["--bonsai-2-5".to_owned()],
+            vec!["--bonsai-2-5".to_owned(), "q4_0".to_owned()],
+            vec![
+                "--bonsai-2-5".to_owned(),
+                "pq2".to_owned(),
+                "--use-repacked-ptq1".to_owned(),
+            ],
+            vec![
+                "--bonsai-2-5".to_owned(),
+                "pq2".to_owned(),
+                "--nariq".to_owned(),
+                "2.5bpw".to_owned(),
+            ],
+            vec![
+                "--bonsai-2-5".to_owned(),
+                "pq2".to_owned(),
+                "--bonsai-2-5".to_owned(),
+                "ptq1".to_owned(),
+            ],
+        ] {
+            let mut args = bad;
+            assert!(select_representation(&mut args).is_err());
+        }
         Ok(())
     }
 }

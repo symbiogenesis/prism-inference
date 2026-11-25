@@ -398,6 +398,8 @@ fn validate(request: &Request) -> Result<Representation> {
     let representation = match request.weight_representation.as_str() {
         "PQ2_0" => Representation::Pq2,
         "current-repacked-PTQ1_0" => Representation::CurrentRepackedPtq1,
+        "Bonsai-2.5-PQ2_0" => Representation::Bonsai25Pq2,
+        "Bonsai-2.5-PTQ1_0" => Representation::Bonsai25Ptq1,
         _ => return Err(reject("unsupported current-weight representation")),
     };
     let mut tokens = 0_usize;

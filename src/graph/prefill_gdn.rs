@@ -40,7 +40,87 @@ fn head(
     head_into(arithmetic, previous, inputs, None, matrix, output)
 }
 
-const KEY_DOT_STRIDE: usize = 2 * 32 * 32;
+const WY_CHUNK_TOKENS: usize = 32;
+const KEY_DOT_STRIDE: usize = 2 * WY_CHUNK_TOKENS * WY_CHUNK_TOKENS;
+const GDN_INPUT_CAPACITY: usize = if crate::kernels::prefill::MAX_TILE_TOKENS > 64 {
+    crate::kernels::prefill::MAX_TILE_TOKENS
+} else {
+    64
+};
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Sub-chunk GDN tiles larger than 32 tokens into <=32-token WY chunks with one ping-pong carry buffer."
+)]
+fn chunkwise_subchunks_into(
+    arithmetic: Arithmetic,
+    previous: &[f32],
+    inputs: &[Input<'_>],
+    key_dots: Option<&[f32]>,
+    width: usize,
+    carry_state: &mut Vec<f32>,
+    matrix: &mut [f32],
+    output: &mut [f32],
+) -> Result<()> {
+    let count = inputs.len();
+    if count <= WY_CHUNK_TOKENS {
+        return head_into(arithmetic, previous, inputs, key_dots, matrix, output);
+    }
+    let state_len = matrix.len();
+    resize_into(state_len, carry_state)?;
+    let num_chunks = count.div_ceil(WY_CHUNK_TOKENS);
+    let mut prev_in_matrix = false;
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * WY_CHUNK_TOKENS;
+        let end = (start + WY_CHUNK_TOKENS).min(count);
+        let chunk_inputs = &inputs[start..end];
+        let chunk_out = &mut output[start * width..end * width];
+        let chunk_dots = key_dots
+            .map(|dots| &dots[chunk_idx * KEY_DOT_STRIDE..(chunk_idx + 1) * KEY_DOT_STRIDE]);
+        let write_to_matrix = (num_chunks - 1 - chunk_idx).is_multiple_of(2);
+        if chunk_idx == 0 {
+            if write_to_matrix {
+                head_into(
+                    arithmetic,
+                    previous,
+                    chunk_inputs,
+                    chunk_dots,
+                    matrix,
+                    chunk_out,
+                )?;
+            } else {
+                head_into(
+                    arithmetic,
+                    previous,
+                    chunk_inputs,
+                    chunk_dots,
+                    carry_state,
+                    chunk_out,
+                )?;
+            }
+        } else if prev_in_matrix {
+            head_into(
+                arithmetic,
+                matrix,
+                chunk_inputs,
+                chunk_dots,
+                carry_state,
+                chunk_out,
+            )?;
+        } else {
+            head_into(
+                arithmetic,
+                carry_state,
+                chunk_inputs,
+                chunk_dots,
+                matrix,
+                chunk_out,
+            )?;
+        }
+        prev_in_matrix = write_to_matrix;
+    }
+    Ok(())
+}
 
 fn fill_key_head_dots(
     arithmetic: Arithmetic,
@@ -1267,6 +1347,9 @@ fn recurrent_tile_with_tape<'a>(
     else {
         return Err(invalid("chunkwise GDN requires recurrent state"));
     };
+    if count > GDN_INPUT_CAPACITY {
+        return Err(invalid("GDN tile count exceeds static input capacity"));
+    }
     check()?;
     let previous_weight = project_tile_pair(
         transforms,
@@ -1517,27 +1600,18 @@ fn recurrent_tile_with_tape<'a>(
                 },
             )?;
         }
-        tile.projector.row_parallelism().update_paired_chunks(
-            &mut tile.alpha[..count],
-            1,
-            &mut tile.beta[..count],
-            1,
-            |_, alpha_chunk, beta_chunk| {
-                for (alpha, beta) in alpha_chunk.iter_mut().zip(beta_chunk.iter_mut()) {
-                    for head in 0..geometry.ssm_values {
-                        let activation = alpha[head] + layer.time_bias[head];
-                        let softplus = if activation > 20.0 {
-                            activation
-                        } else {
-                            (1.0 + activation.exp()).ln()
-                        };
-                        alpha[head] = (softplus * layer.decay[head]).exp();
-                        beta[head] = sigmoid(beta[head]);
-                    }
-                }
-                Ok(())
-            },
-        )?;
+        for (alpha, beta) in tile.alpha[..count].iter_mut().zip(&mut tile.beta[..count]) {
+            for head in 0..geometry.ssm_values {
+                let activation = alpha[head] + layer.time_bias[head];
+                let softplus = if activation > 20.0 {
+                    activation
+                } else {
+                    (1.0 + activation.exp()).ln()
+                };
+                alpha[head] = (softplus * layer.decay[head]).exp();
+                beta[head] = sigmoid(beta[head]);
+            }
+        }
     }
     if let Some(layer_tape) = folded.as_deref_mut() {
         layer_tape.capture_gdn_inputs(
@@ -1550,41 +1624,56 @@ fn recurrent_tile_with_tape<'a>(
         )?;
     }
     let chunkwise = tile.chunkwise_gdn && folded.is_none();
+    let wy_chunks = if chunkwise {
+        count.div_ceil(WY_CHUNK_TOKENS)
+    } else {
+        1
+    };
+    let head_dot_stride = wy_chunks * KEY_DOT_STRIDE;
     let use_shared_key_dots = chunkwise
-        && count <= 32
         && width > 0
         && geometry.ssm_values > geometry.ssm_keys
         && geometry.ssm_keys > 0;
     if use_shared_key_dots {
-        resize_into(geometry.ssm_keys * KEY_DOT_STRIDE, &mut tile.gdn_key_dots)?;
+        resize_into(geometry.ssm_keys * head_dot_stride, &mut tile.gdn_key_dots)?;
         let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
         let conv_ref: &[f32] = &tile.gdn_conv_outputs;
         let key_width = geometry.key_width();
         let head_out_len = count * width;
         tile.projector.row_parallelism().update_chunks(
             &mut tile.gdn_key_dots,
-            KEY_DOT_STRIDE,
+            head_dot_stride,
             |base_key, chunk| {
-                for (offset, dots) in chunk
-                    .as_chunks_mut::<KEY_DOT_STRIDE>()
-                    .0
-                    .iter_mut()
-                    .enumerate()
-                {
+                for (offset, head_dots_all) in chunk.chunks_exact_mut(head_dot_stride).enumerate() {
                     let key_head = base_key + offset;
-                    if conv_head_major {
-                        let q_head =
-                            &conv_ref[key_head * head_out_len..(key_head + 1) * head_out_len];
-                        let k_head_idx = geometry.ssm_keys + key_head;
-                        let k_head =
-                            &conv_ref[k_head_idx * head_out_len..(k_head_idx + 1) * head_out_len];
-                        fill_key_head_dots_head_major(
-                            arithmetic, q_head, k_head, count, width, dots,
-                        )?;
-                    } else {
-                        fill_key_head_dots(
-                            arithmetic, mixed_ref, key_width, width, key_head, dots,
-                        )?;
+                    for (chunk_idx, dots) in head_dots_all
+                        .as_chunks_mut::<KEY_DOT_STRIDE>()
+                        .0
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        let c_start = chunk_idx * WY_CHUNK_TOKENS;
+                        let c_end = (c_start + WY_CHUNK_TOKENS).min(count);
+                        let c_len = c_end - c_start;
+                        if conv_head_major {
+                            let q_head = &conv_ref[key_head * head_out_len + c_start * width
+                                ..key_head * head_out_len + c_end * width];
+                            let k_head_idx = geometry.ssm_keys + key_head;
+                            let k_head = &conv_ref[k_head_idx * head_out_len + c_start * width
+                                ..k_head_idx * head_out_len + c_end * width];
+                            fill_key_head_dots_head_major(
+                                arithmetic, q_head, k_head, c_len, width, dots,
+                            )?;
+                        } else {
+                            fill_key_head_dots(
+                                arithmetic,
+                                &mixed_ref[c_start..c_end],
+                                key_width,
+                                width,
+                                key_head,
+                                dots,
+                            )?;
+                        }
                     }
                 }
                 Ok(())
@@ -1618,13 +1707,14 @@ fn recurrent_tile_with_tape<'a>(
             &mut tile.gdn_head_outputs,
             head_out_len,
             |base_head, matrix_chunk, out_chunk| {
-                let mut inputs: [Input<'_>; 32] = std::array::from_fn(|_| Input {
+                let mut inputs: [Input<'_>; GDN_INPUT_CAPACITY] = std::array::from_fn(|_| Input {
                     query: &[],
                     key: &[],
                     value: &[],
                     decay: 0.0,
                     beta: 0.0,
                 });
+                let mut carry_state = Vec::new();
                 for (offset, (head_matrix, head_out)) in matrix_chunk
                     .chunks_exact_mut(head_state_len)
                     .zip(out_chunk.chunks_exact_mut(head_out_len))
@@ -1669,13 +1759,15 @@ fn recurrent_tile_with_tape<'a>(
                     if chunkwise {
                         let head_dots = use_shared_key_dots.then(|| {
                             &key_dots_ref
-                                [key_head * KEY_DOT_STRIDE..(key_head + 1) * KEY_DOT_STRIDE]
+                                [key_head * head_dot_stride..(key_head + 1) * head_dot_stride]
                         });
-                        head_into(
+                        chunkwise_subchunks_into(
                             arithmetic,
                             prev_head,
                             &inputs[..count],
                             head_dots,
+                            width,
+                            &mut carry_state,
                             head_matrix,
                             head_out,
                         )?;
@@ -1771,7 +1863,7 @@ fn recurrent_tile_with_tape<'a>(
                 .saturating_add(u64::try_from(geometry.ssm_values)?);
         }
     } else {
-        let mut inputs: [Input<'_>; 32] = std::array::from_fn(|_| Input {
+        let mut inputs: [Input<'_>; GDN_INPUT_CAPACITY] = std::array::from_fn(|_| Input {
             query: &[],
             key: &[],
             value: &[],
@@ -1780,6 +1872,7 @@ fn recurrent_tile_with_tape<'a>(
         });
         let head_out_len = count * width;
         resize_into(head_out_len, &mut tile.gdn_head_outputs)?;
+        let mut carry_state = Vec::new();
         for head_index in 0..geometry.ssm_values {
             if chunkwise {
                 check()?;
@@ -1818,13 +1911,16 @@ fn recurrent_tile_with_tape<'a>(
             let range = head_index * width * width..(head_index + 1) * width * width;
             if chunkwise {
                 let head_dots = use_shared_key_dots.then(|| {
-                    &tile.gdn_key_dots[key_head * KEY_DOT_STRIDE..(key_head + 1) * KEY_DOT_STRIDE]
+                    &tile.gdn_key_dots
+                        [key_head * head_dot_stride..(key_head + 1) * head_dot_stride]
                 });
-                head_into(
+                chunkwise_subchunks_into(
                     arithmetic,
                     &previous[range.clone()],
                     &inputs[..count],
                     head_dots,
+                    width,
+                    &mut carry_state,
                     &mut matrix[range],
                     &mut tile.gdn_head_outputs,
                 )?;
@@ -2379,6 +2475,92 @@ mod tests {
         for width in [32_usize, 64, 128, 131] {
             for kept in 1..=crate::speculative::MAX_SPECULATIVE_DRAFT_TOKENS {
                 check_folded_carry_flush_case(width, kept)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_chunkwise_subchunks_case(count: usize, arithmetic: Arithmetic) -> Result<()> {
+        let width = 16_usize;
+        let state_len = width * width;
+        let is_pinned = matches!(arithmetic, Arithmetic::PinnedSwift);
+        let prev: Vec<f32> = (0..state_len)
+            .map(|i| (f32::from(i8::try_from(i % 17).unwrap_or(0)) - 8.0) * 0.015_625)
+            .collect();
+        let make_rows = |a: usize, b: usize, m: usize, bias: f32| -> Vec<Vec<f32>> {
+            (0..count)
+                .map(|t| {
+                    (0..width)
+                        .map(|c| {
+                            (f32::from(i8::try_from((t * a + c * b) % m).unwrap_or(0)) - bias)
+                                * 0.03125
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let q = make_rows(5, 3, 15, 0.0);
+        let mut k = make_rows(7, 11, 13, 6.0);
+        for row in &mut k {
+            l2_norm(row, 1e-6);
+        }
+        let v = make_rows(13, 5, 19, 0.0);
+        let inputs: Vec<Input<'_>> = (0..count)
+            .map(|t| Input {
+                query: &q[t],
+                key: &k[t],
+                value: &v[t],
+                decay: [0.9_f32, 0.875, 0.85, 0.825, 0.8][t % 5],
+                beta: [0.125_f32, 0.156_25, 0.1875, 0.218_75, 0.25][t % 5],
+            })
+            .collect();
+        let chunks = count.div_ceil(WY_CHUNK_TOKENS);
+        let mut dots_all = vec![0.0_f32; chunks * KEY_DOT_STRIDE];
+        let q_flat: Vec<f32> = q.iter().flat_map(|row| row.iter().copied()).collect();
+        let k_flat: Vec<f32> = k.iter().flat_map(|row| row.iter().copied()).collect();
+        for (chunk_idx, dots) in dots_all.as_chunks_mut::<KEY_DOT_STRIDE>().0.iter_mut().enumerate() {
+            let c_start = chunk_idx * WY_CHUNK_TOKENS;
+            let c_end = (c_start + WY_CHUNK_TOKENS).min(count);
+            fill_key_head_dots_head_major(
+                arithmetic, &q_flat[c_start * width..c_end * width],
+                &k_flat[c_start * width..c_end * width], c_end - c_start, width, dots,
+            )?;
+        }
+        let (mut ref_a, mut ref_b, mut ref_out) =
+            (vec![0.0_f32; state_len], vec![0.0_f32; state_len], vec![0.0_f32; count * width]);
+        head_into(
+            arithmetic, &prev, &inputs[..WY_CHUNK_TOKENS], Some(&dots_all[..KEY_DOT_STRIDE]),
+            &mut ref_a, &mut ref_out[..WY_CHUNK_TOKENS * width],
+        )?;
+        head_into(
+            arithmetic, &ref_a, &inputs[WY_CHUNK_TOKENS..],
+            Some(&dots_all[KEY_DOT_STRIDE..2 * KEY_DOT_STRIDE]), &mut ref_b,
+            &mut ref_out[WY_CHUNK_TOKENS * width..],
+        )?;
+        let (mut carry_state, mut actual_state, mut actual_out) =
+            (Vec::new(), vec![0.0_f32; state_len], vec![0.0_f32; count * width]);
+        chunkwise_subchunks_into(
+            arithmetic, &prev, &inputs, Some(&dots_all), width,
+            &mut carry_state, &mut actual_state, &mut actual_out,
+        )?;
+        assert_eq!(
+            actual_state.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            ref_b.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "state mismatch count={count} pinned={is_pinned}"
+        );
+        assert_eq!(
+            actual_out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            ref_out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "output mismatch count={count} pinned={is_pinned}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chunkwise_subchunks_64_matches_32_token_chunks_zero_ulp() -> Result<()> {
+        for count in [33_usize, 40, 64] {
+            for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+                check_chunkwise_subchunks_case(count, arithmetic)?;
             }
         }
         Ok(())

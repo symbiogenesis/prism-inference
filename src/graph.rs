@@ -16,10 +16,9 @@ use crate::kernels::pinned_activations::{silu_in_place, swiglu_in_place};
 use crate::kernels::{
     MatvecBackend, MatvecDiagnostics, MatvecScratch, MatvecStatistics, RmsNormWeights,
     RowParallelism, add_rms_norm_into, add_rms_norm_pinned_into, add_scaled_slice_in_place,
-    add_slice_in_place, add_slice_in_place_all_finite, append_half_bits, f16_dot, float_dot,
-    is_finite_slice, l2_norm_in_place, mul_sigmoid_in_place, mul_slice_in_place, mul_slice_into,
-    rms_norm_into, rms_norm_pinned_into, round_f16_slice, row, row_into, scale_slice_into, silu,
-    softmax_round_f16,
+    add_slice_in_place_all_finite, append_half_bits, f16_dot, float_dot, is_finite_slice,
+    l2_norm_in_place, mul_sigmoid_in_place, mul_slice_in_place, mul_slice_into, rms_norm_into,
+    rms_norm_pinned_into, round_f16_slice, row, row_into, scale_slice_into, silu, softmax_round_f16,
 };
 use crate::model::lora::{MultiRankAdapter, RankOneAdapter, Scratch as AdapterScratch};
 use crate::model::{Model, Tensor};
@@ -7343,10 +7342,6 @@ fn recurrent_decay(alpha: f32, time_bias: f32, decay_weight: f32) -> Result<f32>
         (1.0 + linear.exp()).ln()
     };
     Ok((softplus * decay_weight).exp())
-}
-
-fn add(target: &mut [f32], other: &[f32]) {
-    add_slice_in_place(target, other);
 }
 
 fn add_finite(target: &mut [f32], other: &[f32], operation: &str) -> Result<()> {

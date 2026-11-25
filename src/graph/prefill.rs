@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use super::{
     ActiveAdapters, Arithmetic, Attention, Evaluation, FullAttention, Geometry, KvCache, Layer,
-    LayerDelta, LayerState, Qwen35, RecurrentAttention, Transforms, add, add_finite,
+    LayerDelta, LayerState, Qwen35, RecurrentAttention, Transforms, add_finite,
     attention_gate, checked_product, finite, l2_norm, recurrent_decay, resize_attention_scores,
     resize_into, rope_frequencies, sigmoid, small_float,
 };
@@ -274,10 +274,15 @@ impl Qwen35 {
     /// and floating fallback high-water storage are charged simultaneously.
     ///
     /// # Errors
-    /// Rejects tile sizes other than 8, 16 or 32 and size overflow.
+    /// Rejects unsupported tile token counts (outside 8, 16, 32, or 64 when
+    /// enabled by [`crate::kernels::prefill::MAX_TILE_TOKENS`]) and size overflow.
     pub fn tiled_prefill_scratch_bytes(&self, tokens: usize) -> Result<usize> {
-        if !matches!(tokens, 8 | 16 | 32) {
-            return Err(invalid("CPU prefill tiles must contain 8, 16 or 32 tokens"));
+        if !matches!(tokens, 8 | 16 | 32 | 64)
+            || tokens > crate::kernels::prefill::MAX_TILE_TOKENS
+        {
+            return Err(invalid(
+                "CPU prefill tiles must contain 8, 16, 32 or supported 64 tokens",
+            ));
         }
         let width = self
             .geometry
@@ -306,7 +311,7 @@ impl Qwen35 {
             // temporary vectors exist even for an eight-token, narrow graph.
             .and_then(|bytes| bytes.checked_add(64 * 1024))
             // Fixed task slice/error descriptors stay bounded at 16 workers
-            // and 32 token outputs, including later worker-policy changes.
+            // and MAX_TILE_TOKENS token outputs, including later worker-policy changes.
             .and_then(|bytes| bytes.checked_add(ROW_TASK_SCRATCH_BYTES))
             .ok_or_else(|| invalid("CPU prefill scratch reservation overflow"))
     }
@@ -1167,6 +1172,73 @@ impl Qwen35 {
         adapter_scratch: &mut AdapterScratch,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        let count = tokens.len();
+        if count > 1 && tile.projector.row_parallelism().workers() > 1 {
+            let single_worker = RowParallelism::default();
+            let transforms = &self.transforms;
+            let inverse = transforms.inverse_embedding;
+            match &self.embedding {
+                super::EmbeddingSource::Plain(tensor) => {
+                    for _ in tokens {
+                        check()?;
+                    }
+                    tile.projector.row_parallelism().update_chunks(
+                        &mut tile.hidden[..count],
+                        1,
+                        |base_tok, hidden_chunk| {
+                            for (offset, hidden) in hidden_chunk.iter_mut().enumerate() {
+                                super::row_into(
+                                    tensor,
+                                    usize::try_from(tokens[base_tok + offset])?,
+                                    hidden,
+                                )?;
+                                if inverse {
+                                    transforms
+                                        .rotate_with_parallelism(hidden, &single_worker)?;
+                                    transforms.sign(hidden);
+                                }
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+                super::EmbeddingSource::Trellis(_) | super::EmbeddingSource::TrellisBanded(_) => {
+                    for (token, hidden) in tokens.iter().zip(&mut tile.hidden[..count]) {
+                        check()?;
+                        self.embedding.row_into(
+                            usize::try_from(*token)?,
+                            hidden,
+                            &mut tile.projector.trellis.tmp,
+                        )?;
+                    }
+                    if inverse {
+                        tile.projector.row_parallelism().update_chunks(
+                            &mut tile.hidden[..count],
+                            1,
+                            |_, hidden_chunk| {
+                                for hidden in hidden_chunk {
+                                    transforms
+                                        .rotate_with_parallelism(hidden, &single_worker)?;
+                                    transforms.sign(hidden);
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                }
+            }
+            if let Some(adapter) = &self.adapter {
+                for (token, hidden) in tokens.iter().zip(&mut tile.hidden[..count]) {
+                    adapter.embedding(
+                        usize::try_from(*token)?,
+                        self.adapter_scale,
+                        hidden,
+                        adapter_scratch,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
         for (token, hidden) in tokens.iter().zip(&mut tile.hidden) {
             check()?;
             self.embedding.row_into(
@@ -1193,7 +1265,7 @@ impl Qwen35 {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "Keep causal FFN range execution, compaction compensation and residual update explicit."
+        reason = "Keep causal FFN range execution, compaction compensation and deferred residual flag explicit."
     )]
     fn run_tile_ffn_range(
         transforms: &Transforms,
@@ -1209,7 +1281,7 @@ impl Qwen35 {
         end: usize,
         mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
         check: &dyn Fn() -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let post_norm_reuse = add_normalize_for_tile_into(
             transforms,
             geometry,
@@ -1239,7 +1311,7 @@ impl Qwen35 {
                 std::mem::swap(hidden, output);
                 finite(hidden, "CPU tiled decoder layer output")?;
             }
-            return Ok(());
+            return Ok(false);
         }
         let ffn_reuse = project_tile_ffn_swiglu(
             transforms, geometry, arithmetic, adapters, adapter_scratch, projection_scratch,
@@ -1248,15 +1320,9 @@ impl Qwen35 {
             &mut tile.transformed[start..end], &mut tile.projector, executor.as_deref_mut(), check,
         )?;
         check()?;
-        let use_attention_scratch = ffn_compensation.is_some();
-        let branch_outputs = if use_attention_scratch {
-            &mut tile.attention[start..end]
-        } else {
-            &mut tile.normalized[start..end]
-        };
         let _ = project_tile(
             transforms, geometry, arithmetic, adapters, adapter_scratch, projection_scratch,
-            ffn_reuse, &layer.down, &tile.up[start..end], branch_outputs,
+            ffn_reuse, &layer.down, &tile.up[start..end], &mut tile.attention[start..end],
             &mut tile.transformed[start..end], &mut tile.projector, executor, check,
         )?;
         if let Some(compensation) = ffn_compensation {
@@ -1264,15 +1330,7 @@ impl Qwen35 {
                 compensation.apply(norm_in, branch)?;
             }
         }
-        let branch_outputs = if use_attention_scratch {
-            &tile.attention[start..end]
-        } else {
-            &tile.normalized[start..end]
-        };
-        for (hidden, output) in tile.hidden[start..end].iter_mut().zip(branch_outputs) {
-            add_finite(hidden, output, "CPU tiled decoder layer output")?;
-        }
-        Ok(())
+        Ok(true)
     }
 
     #[expect(
@@ -1294,6 +1352,7 @@ impl Qwen35 {
         mrope_base: usize,
         count: usize,
         frequencies_ready: &mut bool,
+        pending_residual: &mut bool,
         tile: &mut TiledPrefill,
         folded_tape: Option<&mut gdn::FoldedRecurrentLayerTape>,
         mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
@@ -1303,11 +1362,13 @@ impl Qwen35 {
             Attention::Recurrent(weights) => &weights.qkv,
             Attention::Full(weights) => &weights.query,
         };
-        let norm_reuse = normalize_for_tile_into(
+        let norm_reuse = normalize_or_add_tile_into(
+            *pending_residual,
             transforms, geometry, arithmetic, &layer.norm, first_attn_target,
-            &tile.hidden[..count], &mut tile.normalized[..count],
+            &mut tile.hidden[..count], &tile.attention[..count], &mut tile.normalized[..count],
             &mut tile.transformed[..count], tile.projector.row_parallelism(),
         )?;
+        *pending_residual = false;
         match (&layer.attention, state) {
             (Attention::Recurrent(weights), state @ LayerState::Recurrent { .. }) => {
                 if let Some(layer_tape) = folded_tape {
@@ -1377,6 +1438,7 @@ impl Qwen35 {
         mrope_base: usize,
         count: usize,
         frequencies_ready: &mut bool,
+        pending_residual: &mut bool,
         tile: &mut TiledPrefill,
         folded_tape: Option<&mut gdn::FoldedRecurrentLayerTape>,
         mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
@@ -1385,12 +1447,12 @@ impl Qwen35 {
         Self::run_full_tile_attention(
             geometry, arithmetic, transforms, adapters, projection, adapter_scratch,
             attention_scratch, layer, state, delta, base, mrope_base, count,
-            frequencies_ready, tile, folded_tape, executor.as_deref_mut(), check,
+            frequencies_ready, pending_residual, tile, folded_tape, executor.as_deref_mut(), check,
         )?;
         for _ in 0..count {
             check()?;
         }
-        Self::run_tile_ffn_range(
+        *pending_residual = Self::run_tile_ffn_range(
             transforms, geometry, arithmetic, adapters, adapter_scratch, &mut projection.matvec,
             layer_idx, layer, tile, 0, count, executor, check,
         )?;
@@ -1411,6 +1473,7 @@ impl Qwen35 {
         adapters: ActiveAdapters<'_>,
         adapter_scratch: &mut AdapterScratch,
         projection_scratch: &mut crate::kernels::MatvecScratch,
+        pending_residual: bool,
         tile: &mut TiledPrefill,
         start: usize,
         end: usize,
@@ -1419,10 +1482,12 @@ impl Qwen35 {
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         if let super::OutputHead::Plain(output_tensor) = output_head {
-            let reuse = normalize_for_tile_into(
+            let reuse = normalize_or_add_tile_into(
+                pending_residual,
                 transforms, geometry, arithmetic, output_norm, output_tensor,
-                &tile.hidden[start..end], &mut tile.normalized[start..end],
-                &mut tile.transformed[start..end], tile.projector.row_parallelism(),
+                &mut tile.hidden[start..end], &tile.attention[start..end],
+                &mut tile.normalized[start..end], &mut tile.transformed[start..end],
+                tile.projector.row_parallelism(),
             )?;
             check()?;
             let _ = project_tile(
@@ -1431,6 +1496,13 @@ impl Qwen35 {
                 &mut tile.transformed[start..end], &mut tile.projector, executor, check,
             )?;
         } else {
+            if pending_residual {
+                for (hidden, branch) in
+                    tile.hidden[start..end].iter_mut().zip(&tile.attention[start..end])
+                {
+                    add_finite(hidden, branch, "CPU tiled decoder layer output")?;
+                }
+            }
             super::normalize_tile_plain_into(
                 geometry, arithmetic, output_norm, &tile.hidden[start..end],
                 &mut tile.normalized[start..end], tile.projector.row_parallelism(),
@@ -1489,6 +1561,7 @@ impl Qwen35 {
         mrope_base: usize,
         count: usize,
         frequencies_ready: &mut bool,
+        pending_residual: &mut bool,
         tile: &mut TiledPrefill,
         mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
         use_executor_on_tiles: bool,
@@ -1499,17 +1572,20 @@ impl Qwen35 {
             Attention::Full(weights) => &weights.key,
             Attention::Recurrent(weights) => &weights.qkv,
         };
-        let norm_reuse = normalize_for_tile_into(
+        let norm_reuse = normalize_or_add_tile_into(
+            *pending_residual,
             transforms,
             geometry,
             arithmetic,
             &layer.norm,
             first_attn_target,
-            &tile.hidden[..count],
+            &mut tile.hidden[..count],
+            &tile.attention[..count],
             &mut tile.normalized[..count],
             &mut tile.transformed[..count],
             tile.projector.row_parallelism(),
         )?;
+        *pending_residual = false;
         match (&layer.attention, state) {
             (Attention::Full(weights), LayerState::Full { keys, values }) => {
                 keys.invalidate_prepared();
@@ -1728,19 +1804,25 @@ impl Qwen35 {
                         return Err(invalid("CPU tiled prefill layer/cache mismatch"));
                     };
                     resize_into(history.len(), convolution)?;
-                    convolution.copy_from_slice(history);
                     resize_into(previous.len(), matrix)?;
-                    step_recurrent_state_only_conv(
+                    let conv_head_major = step_recurrent_state_only_conv(
                         weights,
                         geometry,
                         arithmetic,
+                        history,
                         convolution,
                         tile,
                         last_tok,
                         check,
                     )?;
                     step_recurrent_state_only_matrix(
-                        geometry, arithmetic, tile, last_tok, previous, matrix,
+                        geometry,
+                        arithmetic,
+                        tile,
+                        last_tok,
+                        conv_head_major,
+                        previous,
+                        matrix,
                     )?;
                     check()?;
                     std::mem::swap(history, convolution);
@@ -1806,7 +1888,7 @@ impl Qwen35 {
             _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
         }
         check()?;
-        Self::run_tile_ffn_range(
+        *pending_residual = Self::run_tile_ffn_range(
             transforms,
             geometry,
             arithmetic,
@@ -1841,6 +1923,7 @@ impl Qwen35 {
         mrope_base: usize,
         count: usize,
         frequencies_ready: &mut bool,
+        pending_residual: &mut bool,
         tile: &mut TiledPrefill,
         executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
         check: &dyn Fn() -> Result<()>,
@@ -1849,11 +1932,13 @@ impl Qwen35 {
             Attention::Recurrent(weights) => &weights.qkv,
             Attention::Full(weights) => &weights.key,
         };
-        let norm_reuse = normalize_for_tile_into(
+        let norm_reuse = normalize_or_add_tile_into(
+            *pending_residual,
             transforms, geometry, arithmetic, &layer.norm, first_attn_target,
-            &tile.hidden[..count], &mut tile.normalized[..count],
+            &mut tile.hidden[..count], &tile.attention[..count], &mut tile.normalized[..count],
             &mut tile.transformed[..count], tile.projector.row_parallelism(),
         )?;
+        *pending_residual = false;
         match (&layer.attention, state) {
             (Attention::Recurrent(weights), state @ LayerState::Recurrent { .. }) => {
                 recurrent_state_only_tile(
@@ -1915,6 +2000,7 @@ impl Qwen35 {
         };
         self.state_consistent = false;
         let mut frequencies_ready = false;
+        let mut pending_residual = false;
         for (layer_idx, ((layer, state), delta)) in leading_layers
             .iter()
             .zip(leading_states.iter_mut())
@@ -1930,21 +2016,22 @@ impl Qwen35 {
                 &self.geometry, self.arithmetic, &self.transforms, adapters,
                 &mut self.workspace.projection, &mut self.workspace.adapter,
                 &mut self.workspace.attention_scratch, layer_idx, layer, state, delta,
-                base, mrope_base, count, &mut frequencies_ready, tile, None, tile_executor, check,
+                base, mrope_base, count, &mut frequencies_ready, &mut pending_residual, tile,
+                None, tile_executor, check,
             )?;
         }
         Self::run_last_layer_and_evaluate_last(
             &self.geometry, self.arithmetic, &self.transforms, adapters,
             &mut self.workspace.projection, &mut self.workspace.adapter,
             &mut self.workspace.attention_scratch, last_idx, last_layer, last_state,
-            last_delta, base, mrope_base, count, &mut frequencies_ready, tile,
-            executor.as_deref_mut(), use_executor_on_tiles, check,
+            last_delta, base, mrope_base, count, &mut frequencies_ready, &mut pending_residual,
+            tile, executor.as_deref_mut(), use_executor_on_tiles, check,
         )?;
         let last_tok = count - 1;
         Self::evaluate_tile_output_head_range(
             &self.output, &self.output_norm, self.vocabulary, &self.transforms,
             &self.geometry, self.arithmetic, adapters, &mut self.workspace.adapter,
-            &mut self.workspace.projection.matvec, tile, last_tok, count,
+            &mut self.workspace.projection.matvec, pending_residual, tile, last_tok, count,
             std::slice::from_mut(output), executor, check,
         )?;
         self.position = base + count;
@@ -1980,6 +2067,7 @@ impl Qwen35 {
         };
         self.state_consistent = false;
         let mut frequencies_ready = false;
+        let mut pending_residual = false;
         let total_layers = self.layers.len();
         let narrow_final = logits.is_none() && self.narrow_last_layer;
         let mut recurrent_layer_idx = 0_usize;
@@ -1995,7 +2083,7 @@ impl Qwen35 {
                     &self.geometry, self.arithmetic, &self.transforms, adapters,
                     &mut self.workspace.adapter, &mut self.workspace.projection.matvec,
                     layer, state, delta, mrope_base, count, &mut frequencies_ready,
-                    tile, executor.as_deref_mut(), check,
+                    &mut pending_residual, tile, executor.as_deref_mut(), check,
                 )?;
                 continue;
             }
@@ -2015,16 +2103,21 @@ impl Qwen35 {
                 &self.geometry, self.arithmetic, &self.transforms, adapters,
                 &mut self.workspace.projection, &mut self.workspace.adapter,
                 &mut self.workspace.attention_scratch, layer_idx, layer, state, delta,
-                base, mrope_base, count, &mut frequencies_ready, tile, folded_tape,
-                executor.as_deref_mut(), check,
+                base, mrope_base, count, &mut frequencies_ready, &mut pending_residual, tile,
+                folded_tape, executor.as_deref_mut(), check,
             )?;
         }
         if let Some(logits) = logits {
             Self::evaluate_tile_output_head_range(
                 &self.output, &self.output_norm, self.vocabulary, &self.transforms,
                 &self.geometry, self.arithmetic, adapters, &mut self.workspace.adapter,
-                &mut self.workspace.projection.matvec, tile, 0, count, logits, executor, check,
+                &mut self.workspace.projection.matvec, pending_residual, tile, 0, count, logits,
+                executor, check,
             )?;
+        } else if pending_residual {
+            for (hidden, branch) in tile.hidden[..count].iter_mut().zip(&tile.attention[..count]) {
+                add_finite(hidden, branch, "CPU tiled decoder layer output")?;
+            }
         }
         self.position = base + count;
         self.mrope_position = mrope_base + count;
@@ -2037,18 +2130,230 @@ impl Qwen35 {
 #[path = "prefill_folded_tests.rs"]
 mod folded_tests;
 
-fn step_recurrent_state_only_conv(
+fn apply_state_only_gates(
+    layer: &RecurrentAttention,
+    tile: &mut TiledPrefill,
+    count: usize,
+) -> Result<()> {
+    for (alpha, beta) in tile.alpha[..count].iter_mut().zip(&mut tile.beta[..count]) {
+        for (((alpha_out, beta_out), &time_bias), &decay_weight) in alpha
+            .iter_mut()
+            .zip(beta.iter_mut())
+            .zip(&layer.time_bias)
+            .zip(&layer.decay)
+        {
+            *alpha_out = recurrent_decay(*alpha_out, time_bias, decay_weight)?;
+            *beta_out = sigmoid(*beta_out);
+        }
+    }
+    Ok(())
+}
+
+fn step_recurrent_state_only_conv_head_major(
+    layer: &RecurrentAttention,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    history: &[f32],
+    convolution: &mut [f32],
+    tile: &mut TiledPrefill,
+    count: usize,
+) -> Result<()> {
+    let width = geometry.ssm_head;
+    let hist_width = geometry.convolution - 1;
+    let key_width = geometry.key_width();
+    let head_hist = width * hist_width;
+    let head_coeff = width * geometry.convolution;
+    let head_out_len = count * width;
+    let num_conv_heads = geometry.convolution_width() / width;
+    let q_heads = key_width / width;
+    let k_heads_end = 2 * q_heads;
+    if !matches!(arithmetic, Arithmetic::PinnedSwift) {
+        convolution.copy_from_slice(history);
+    }
+    resize_into(num_conv_heads * head_out_len, &mut tile.gdn_conv_outputs)?;
+    let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
+    tile.projector.row_parallelism().update_paired_chunks(
+        convolution,
+        head_hist,
+        &mut tile.gdn_conv_outputs,
+        head_out_len,
+        |base_head, conv_chunk, out_chunk| {
+            for (offset, (head_conv, head_out)) in conv_chunk
+                .chunks_exact_mut(head_hist)
+                .zip(out_chunk.chunks_exact_mut(head_out_len))
+                .enumerate()
+            {
+                let head = base_head + offset;
+                let c_slice = layer
+                    .convolution
+                    .range(head * head_coeff..(head + 1) * head_coeff);
+                if matches!(arithmetic, Arithmetic::PinnedSwift) {
+                    if head >= q_heads && head < k_heads_end {
+                        crate::kernels::pinned_convolution::step_silu_clamped_l2_token_rows_from_coefficients(
+                            &history[head * head_hist..(head + 1) * head_hist],
+                            head_conv,
+                            mixed_ref,
+                            &(head * width..(head + 1) * width),
+                            c_slice,
+                            geometry.convolution,
+                            geometry.epsilon,
+                            head_out,
+                        )?;
+                    } else {
+                        crate::kernels::pinned_convolution::step_silu_token_rows_from_coefficients(
+                            &history[head * head_hist..(head + 1) * head_hist],
+                            head_conv,
+                            mixed_ref,
+                            &(head * width..(head + 1) * width),
+                            c_slice,
+                            geometry.convolution,
+                            head_out,
+                        )?;
+                    }
+                } else {
+                    for (token, token_mixed) in mixed_ref.iter().enumerate() {
+                        head_out[token * width..(token + 1) * width]
+                            .copy_from_slice(&token_mixed[head * width..(head + 1) * width]);
+                    }
+                    for head_mixed in head_out.chunks_exact_mut(width) {
+                        for (channel, value) in head_mixed.iter_mut().enumerate() {
+                            let projected = *value;
+                            let start = channel * hist_width;
+                            let coefficients = &c_slice.source()[channel * geometry.convolution
+                                ..(channel + 1) * geometry.convolution];
+                            *value = arithmetic.convolution_row(
+                                &head_conv[start..start + hist_width],
+                                projected,
+                                coefficients,
+                            )?;
+                            head_conv[start..start + hist_width].rotate_left(1);
+                            head_conv[start + hist_width - 1] = projected;
+                        }
+                        arithmetic.silu(head_mixed);
+                    }
+                    if head >= q_heads && head < k_heads_end {
+                        for head_mixed in head_out.chunks_exact_mut(width) {
+                            l2_norm(head_mixed, geometry.epsilon);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        },
+    )?;
+    apply_state_only_gates(layer, tile, count)?;
+    finite(convolution, "convolution state")
+}
+
+fn step_recurrent_state_only_conv_single_parallel(
     layer: &RecurrentAttention,
     geometry: &Geometry,
     arithmetic: Arithmetic,
     convolution: &mut [f32],
     tile: &mut TiledPrefill,
-    count: usize,
-    check: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
     let width = geometry.ssm_head;
     let hist_width = geometry.convolution - 1;
+    let head_hist = width * hist_width;
+    let head_coeff = width * geometry.convolution;
+    let q_heads = geometry.key_width() / width;
+    let k_heads_end = 2 * q_heads;
+    let mixed = &mut tile.mixed[0];
+    tile.projector.row_parallelism().update_paired_chunks(
+        mixed,
+        width,
+        convolution,
+        head_hist,
+        |base_head, mixed_chunk, conv_chunk| {
+            for (offset, (head_mixed, head_conv)) in mixed_chunk
+                .chunks_exact_mut(width)
+                .zip(conv_chunk.chunks_exact_mut(head_hist))
+                .enumerate()
+            {
+                let head = base_head + offset;
+                let c_slice = layer
+                    .convolution
+                    .range(head * head_coeff..(head + 1) * head_coeff);
+                if matches!(arithmetic, Arithmetic::PinnedSwift) {
+                    crate::kernels::pinned_convolution::step_silu_in_place_coefficients(
+                        head_conv,
+                        head_mixed,
+                        c_slice,
+                        geometry.convolution,
+                    )?;
+                } else {
+                    for (channel, value) in head_mixed.iter_mut().enumerate() {
+                        let projected = *value;
+                        let start = channel * hist_width;
+                        let coefficients = &c_slice.source()
+                            [channel * geometry.convolution..(channel + 1) * geometry.convolution];
+                        *value = arithmetic.convolution_row(
+                            &head_conv[start..start + hist_width],
+                            projected,
+                            coefficients,
+                        )?;
+                        head_conv[start..start + hist_width].rotate_left(1);
+                        head_conv[start + hist_width - 1] = projected;
+                    }
+                    arithmetic.silu(head_mixed);
+                }
+                if head >= q_heads && head < k_heads_end {
+                    l2_norm(head_mixed, geometry.epsilon);
+                }
+            }
+            Ok(())
+        },
+    )?;
+    apply_state_only_gates(layer, tile, 1)?;
+    finite(convolution, "convolution state")
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep causal state-only convolution and head-major dispatch explicit."
+)]
+fn step_recurrent_state_only_conv(
+    layer: &RecurrentAttention,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    history: &[f32],
+    convolution: &mut [f32],
+    tile: &mut TiledPrefill,
+    count: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<bool> {
+    let width = geometry.ssm_head;
+    let hist_width = geometry.convolution - 1;
     let key_width = geometry.key_width();
+    let conv_aligned =
+        hist_width > 0 && geometry.convolution_width().is_multiple_of(width) && width.is_multiple_of(4);
+    if conv_aligned && count > 1 {
+        for _ in 0..count {
+            check()?;
+        }
+        step_recurrent_state_only_conv_head_major(
+            layer,
+            geometry,
+            arithmetic,
+            history,
+            convolution,
+            tile,
+            count,
+        )?;
+        return Ok(true);
+    }
+    convolution.copy_from_slice(history);
+    if conv_aligned && count == 1 && tile.projector.row_parallelism().workers() > 1 {
+        check()?;
+        step_recurrent_state_only_conv_single_parallel(
+            layer,
+            geometry,
+            arithmetic,
+            convolution,
+            tile,
+        )?;
+        return Ok(false);
+    }
     for ((mixed, alpha), beta) in tile.mixed[..count]
         .iter_mut()
         .zip(&mut tile.alpha[..count])
@@ -2094,7 +2399,8 @@ fn step_recurrent_state_only_conv(
             *beta_out = sigmoid(*beta_out);
         }
     }
-    finite(convolution, "convolution state")
+    finite(convolution, "convolution state")?;
+    Ok(false)
 }
 
 fn step_recurrent_state_only_rows_single(
@@ -2166,13 +2472,17 @@ fn step_recurrent_state_only_matrix(
     arithmetic: Arithmetic,
     tile: &TiledPrefill,
     count: usize,
+    conv_head_major: bool,
     previous: &[f32],
     matrix: &mut [f32],
 ) -> Result<()> {
     let width = geometry.ssm_head;
     let key_width = geometry.key_width();
     let head_state_len = width * width;
+    let head_out_len = count * width;
+    let q_heads = key_width / width;
     let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
+    let conv_ref: &[f32] = &tile.gdn_conv_outputs;
     let alpha_ref: &[Vec<f32>] = &tile.alpha[..count];
     let beta_ref: &[Vec<f32>] = &tile.beta[..count];
     let use_pinned_four_row =
@@ -2187,15 +2497,32 @@ fn step_recurrent_state_only_matrix(
                 let prev_head = &previous[head * head_state_len..(head + 1) * head_state_len];
                 let key_head = head % geometry.ssm_keys;
                 step_inputs.clear();
-                for ((mixed, alpha), beta) in mixed_ref.iter().zip(alpha_ref).zip(beta_ref) {
-                    step_inputs.push(StateStepInput {
-                        key: &mixed
-                            [key_width + key_head * width..key_width + (key_head + 1) * width],
-                        value: &mixed
-                            [2 * key_width + head * width..2 * key_width + (head + 1) * width],
-                        decay: alpha[head],
-                        beta: beta[head],
-                    });
+                if conv_head_major {
+                    let k_head_idx = q_heads + key_head;
+                    let k_head =
+                        &conv_ref[k_head_idx * head_out_len..(k_head_idx + 1) * head_out_len];
+                    let v_head_idx = 2 * q_heads + head;
+                    let v_head =
+                        &conv_ref[v_head_idx * head_out_len..(v_head_idx + 1) * head_out_len];
+                    for (token, (alpha, beta)) in alpha_ref.iter().zip(beta_ref).enumerate() {
+                        step_inputs.push(StateStepInput {
+                            key: &k_head[token * width..(token + 1) * width],
+                            value: &v_head[token * width..(token + 1) * width],
+                            decay: alpha[head],
+                            beta: beta[head],
+                        });
+                    }
+                } else {
+                    for ((mixed, alpha), beta) in mixed_ref.iter().zip(alpha_ref).zip(beta_ref) {
+                        step_inputs.push(StateStepInput {
+                            key: &mixed
+                                [key_width + key_head * width..key_width + (key_head + 1) * width],
+                            value: &mixed
+                                [2 * key_width + head * width..2 * key_width + (head + 1) * width],
+                            decay: alpha[head],
+                            beta: beta[head],
+                        });
+                    }
                 }
                 if use_pinned_four_row {
                     step_recurrent_state_only_head_pinned(
@@ -2290,10 +2617,26 @@ fn recurrent_state_only_tile<'a>(
         check,
     )?;
     resize_into(history.len(), convolution)?;
-    convolution.copy_from_slice(history);
     resize_into(previous.len(), matrix)?;
-    step_recurrent_state_only_conv(layer, geometry, arithmetic, convolution, tile, count, check)?;
-    step_recurrent_state_only_matrix(geometry, arithmetic, tile, count, previous, matrix)?;
+    let conv_head_major = step_recurrent_state_only_conv(
+        layer,
+        geometry,
+        arithmetic,
+        history,
+        convolution,
+        tile,
+        count,
+        check,
+    )?;
+    step_recurrent_state_only_matrix(
+        geometry,
+        arithmetic,
+        tile,
+        count,
+        conv_head_major,
+        previous,
+        matrix,
+    )?;
     check()?;
     std::mem::swap(history, convolution);
     std::mem::swap(previous, matrix);
@@ -3528,7 +3871,84 @@ fn normalize_for_tile_into<'a>(
 
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
+    reason = "Keep fused tile residual-add, RMSNorm and Hadamard rotation explicit."
+)]
+fn add_normalize_hadamard_tile_into<'a>(
+    transforms: &Transforms,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    weight: &[f32],
+    first_target: &'a Tensor,
+    hidden: &mut [Vec<f32>],
+    delta: &[Vec<f32>],
+    normalized: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    parallelism: &RowParallelism,
+) -> Result<TileReuse<'a>> {
+    let count = hidden.len();
+    let len = hidden.first().map_or(0, Vec::len);
+    let signs = transforms.signs_for(first_target, len);
+    let block = transforms.block;
+    let epsilon = geometry.epsilon;
+    if count > 1 && parallelism.workers() > 1 {
+        let single_worker = RowParallelism::default();
+        parallelism.update_triple_chunks(
+            hidden,
+            1,
+            normalized,
+            1,
+            transformed,
+            1,
+            |base_tok, hidden_chunk, norm_chunk, trans_chunk| {
+                for (offset, ((h, norm_out), rot_out)) in hidden_chunk
+                    .iter_mut()
+                    .zip(norm_chunk.iter_mut())
+                    .zip(trans_chunk.iter_mut())
+                    .enumerate()
+                {
+                    arithmetic.add_normalize_hadamard_into(
+                        h,
+                        &delta[base_tok + offset],
+                        weight,
+                        epsilon,
+                        block,
+                        signs,
+                        &single_worker,
+                        norm_out,
+                        rot_out,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        for (((h, d), norm_out), rot_out) in hidden
+            .iter_mut()
+            .zip(delta.iter())
+            .zip(normalized.iter_mut())
+            .zip(transformed.iter_mut())
+        {
+            arithmetic.add_normalize_hadamard_into(
+                h,
+                d,
+                weight,
+                epsilon,
+                block,
+                signs,
+                parallelism,
+                norm_out,
+                rot_out,
+            )?;
+        }
+    }
+    Ok(TileReuse {
+        basis: Some(first_target),
+        prepared: None,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "Keep fused tile residual-add, RMSNorm, Hadamard rotation and bounded tile scratch explicit."
 )]
 fn add_normalize_for_tile_into<'a>(
@@ -3551,96 +3971,18 @@ fn add_normalize_for_tile_into<'a>(
         && transforms.can_block_hadamard_for(first_target, len)
         && first_target.dimensions.first().copied() == Some(len);
     if can_hadamard {
-        let signs = transforms.signs_for(first_target, len);
-        let block = transforms.block;
-        let epsilon = geometry.epsilon;
-        let fused_ok = if count > 1 && parallelism.workers() > 1 {
-            let single_worker = RowParallelism::default();
-            parallelism
-                .update_triple_chunks(
-                    hidden,
-                    1,
-                    normalized,
-                    1,
-                    transformed,
-                    1,
-                    |base_tok, hidden_chunk, norm_chunk, trans_chunk| {
-                        let mut chunk_err = None;
-                        for (offset, ((h, norm_out), rot_out)) in hidden_chunk
-                            .iter_mut()
-                            .zip(norm_chunk.iter_mut())
-                            .zip(trans_chunk.iter_mut())
-                            .enumerate()
-                        {
-                            if chunk_err.is_some() {
-                                add(h, &delta[base_tok + offset]);
-                            } else if let Err(err) = arithmetic.add_normalize_hadamard_into(
-                                h,
-                                &delta[base_tok + offset],
-                                weight,
-                                epsilon,
-                                block,
-                                signs,
-                                &single_worker,
-                                norm_out,
-                                rot_out,
-                            ) {
-                                chunk_err = Some(err);
-                            }
-                        }
-                        chunk_err.map_or(Ok(()), Err)
-                    },
-                )
-                .is_ok()
-        } else {
-            let mut ok = true;
-            for (((h, d), norm_out), rot_out) in hidden
-                .iter_mut()
-                .zip(delta.iter())
-                .zip(normalized.iter_mut())
-                .zip(transformed.iter_mut())
-            {
-                if !ok {
-                    add(h, d);
-                } else if arithmetic
-                    .add_normalize_hadamard_into(
-                        h,
-                        d,
-                        weight,
-                        epsilon,
-                        block,
-                        signs,
-                        parallelism,
-                        norm_out,
-                        rot_out,
-                    )
-                    .is_err()
-                {
-                    ok = false;
-                }
-            }
-            ok
-        };
-        if fused_ok {
-            return Ok(TileReuse {
-                basis: Some(first_target),
-                prepared: None,
-            });
-        }
-        if count > 1 && parallelism.workers() > 1 {
-            let epsilon = geometry.epsilon;
-            parallelism.update_chunks(normalized, 1, |base_tok, chunk| {
-                for (offset, norm_out) in chunk.iter_mut().enumerate() {
-                    arithmetic.normalize(&hidden[base_tok + offset], weight, epsilon, norm_out)?;
-                }
-                Ok(())
-            })?;
-        } else {
-            for (h, norm_out) in hidden.iter().zip(normalized.iter_mut()) {
-                arithmetic.normalize(h, weight, geometry.epsilon, norm_out)?;
-            }
-        }
-        return Ok(TileReuse::default());
+        return add_normalize_hadamard_tile_into(
+            transforms,
+            geometry,
+            arithmetic,
+            weight,
+            first_target,
+            hidden,
+            delta,
+            normalized,
+            transformed,
+            parallelism,
+        );
     }
     if count > 1 && parallelism.workers() > 1 {
         let epsilon = geometry.epsilon;
@@ -3676,6 +4018,51 @@ fn add_normalize_for_tile_into<'a>(
         }
     }
     Ok(TileReuse::default())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Dispatch fused residual-add RMSNorm when previous FFN delta is still pending."
+)]
+fn normalize_or_add_tile_into<'a>(
+    pending_residual: bool,
+    transforms: &Transforms,
+    geometry: &Geometry,
+    arithmetic: Arithmetic,
+    weight: &[f32],
+    first_target: &'a Tensor,
+    hidden: &mut [Vec<f32>],
+    delta: &[Vec<f32>],
+    normalized: &mut [Vec<f32>],
+    transformed: &mut [Vec<f32>],
+    parallelism: &RowParallelism,
+) -> Result<TileReuse<'a>> {
+    if pending_residual {
+        add_normalize_for_tile_into(
+            transforms,
+            geometry,
+            arithmetic,
+            weight,
+            first_target,
+            hidden,
+            delta,
+            normalized,
+            transformed,
+            parallelism,
+        )
+    } else {
+        normalize_for_tile_into(
+            transforms,
+            geometry,
+            arithmetic,
+            weight,
+            first_target,
+            hidden,
+            normalized,
+            transformed,
+            parallelism,
+        )
+    }
 }
 
 fn transform_tile_inputs<'a>(
@@ -5780,14 +6167,15 @@ mod attention_2d_tests {
 #[cfg(test)]
 mod fused_last_token_tests {
     use std::cell::Cell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bonsai_gguf::MetadataValue;
 
-    use super::super::{KvCachePolicy, MAX_STATE_BYTES, Qwen35};
-    use crate::kernels::{MatvecBackend, Pq2ProjectionExecutor, Q8KBlock};
+    use super::super::{Arithmetic, Geometry, KvCachePolicy, MAX_STATE_BYTES, Qwen35, Transforms};
+    use super::add_normalize_for_tile_into;
+    use crate::kernels::{MatvecBackend, Pq2ProjectionExecutor, Q8KBlock, RowParallelism};
     use crate::model::{Model, Tensor};
     use crate::{Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
 
@@ -6265,6 +6653,151 @@ mod fused_last_token_tests {
             actual_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             expected_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn add_normalize_for_tile_rejects_nonfinite_delta_without_hadamard_fallback() -> Result<()> {
+        let len = 32_usize;
+        let block = 32_usize;
+        let ones_mat = vec![1.0_f32; len * len];
+        let tensor = f32_tensor("blk.0.ffn_gate.weight", &[len, len], &ones_mat);
+        let mut weights = BTreeSet::new();
+        weights.insert("blk.0.ffn_gate.weight".to_owned());
+        let transforms = Transforms {
+            block,
+            weights,
+            inverse_embedding: false,
+            grouped_values: false,
+            signs: BTreeMap::new(),
+            tensor_signs: BTreeMap::new(),
+            compacted_ffn: super::super::weight_patch::CompactedFfnRuntime::default(),
+            trellis: None,
+        };
+        let geometry = Geometry {
+            embedding: len,
+            feed_forward: len,
+            heads: 1,
+            kv_heads: 1,
+            head: len,
+            rope: 4,
+            rope_sections: [2, 0, 0, 0],
+            rope_base: 10_000.0,
+            epsilon: 1e-6,
+            ssm_head: len,
+            ssm_keys: 1,
+            ssm_values: 1,
+            convolution: 2,
+        };
+        let norm_weight = vec![1.0_f32; len];
+        let parallelism = RowParallelism::new(4)?;
+        let mut hidden = vec![vec![1.0_f32; len]; 2];
+        let mut delta = vec![vec![0.5_f32; len]; 2];
+        delta[0][3] = f32::NAN;
+        let mut normalized = vec![Vec::new(); 2];
+        let mut transformed = vec![Vec::new(); 2];
+        for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
+            let err = add_normalize_for_tile_into(
+                &transforms,
+                &geometry,
+                arithmetic,
+                &norm_weight,
+                &tensor,
+                &mut hidden,
+                &delta,
+                &mut normalized,
+                &mut transformed,
+                &parallelism,
+            );
+            assert!(err.is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_prefill_fusions_match_decode_with_hadamard_inverse_embedding_and_workers() -> Result<()>
+    {
+        let mut model = hybrid_two_layer_fixture(false);
+        insert_layer_tensors(&mut model.tensors, 2, false, 64, 128, 64, 256);
+        insert_layer_tensors(&mut model.tensors, 3, true, 64, 128, 64, 256);
+        model
+            .metadata
+            .insert("qwen35.block_count".into(), MetadataValue::from(4_u32));
+        model.metadata.insert(
+            "qwen35.attention.recurrent_layers".into(),
+            MetadataValue::from(vec![true, false, false, true]),
+        );
+        for (key, value) in [
+            ("prism.hadamard.version", MetadataValue::from(1_u32)),
+            ("prism.hadamard.block_size", MetadataValue::from(16_u32)),
+            (
+                "prism.hadamard.transform",
+                MetadataValue::from("normalized-sylvester-walsh-hadamard"),
+            ),
+            (
+                "prism.hadamard.axis",
+                MetadataValue::from("input-last-dimension"),
+            ),
+            (
+                "prism.hadamard.weight_names",
+                MetadataValue::from(vec![
+                    "blk.0.attn_qkv.weight",
+                    "blk.0.ffn_gate.weight",
+                    "blk.0.ffn_up.weight",
+                    "blk.1.attn_q.weight",
+                    "blk.1.attn_k.weight",
+                    "blk.1.attn_v.weight",
+                    "blk.1.ffn_gate.weight",
+                    "blk.1.ffn_up.weight",
+                    "blk.2.attn_q.weight",
+                    "blk.2.attn_k.weight",
+                    "blk.2.attn_v.weight",
+                    "blk.2.ffn_gate.weight",
+                    "blk.2.ffn_up.weight",
+                    "blk.3.attn_qkv.weight",
+                    "blk.3.ffn_gate.weight",
+                    "blk.3.ffn_up.weight",
+                    "output.weight",
+                ]),
+            ),
+            (
+                "prism.hadamard.inverse_weight_names",
+                MetadataValue::from(vec!["token_embd.weight"]),
+            ),
+            ("prism.hadamard.sign_mode", MetadataValue::from("identity")),
+        ] {
+            model.metadata.insert(key.into(), value);
+        }
+        let cloned = Model {
+            metadata: model.metadata.clone(),
+            tensors: model.tensors.clone(),
+            identity: model.identity.clone(),
+        };
+        let mut sequential = Qwen35::new(cloned, 32)?;
+        sequential.set_row_parallelism(RowParallelism::new(4)?);
+        for &token in &[0_u32, 1, 2, 3, 2, 0, 1, 2, 3] {
+            sequential.ingest(token)?;
+        }
+        let expected_logits = sequential.evaluate(1)?;
+
+        let mut tiled = Qwen35::new(model, 32)?;
+        let scratch = tiled.tiled_prefill_scratch_bytes(8)?;
+        tiled = tiled.with_tiled_prefill(8, scratch)?;
+        tiled.set_row_parallelism(RowParallelism::new(4)?);
+        let mut actual_logits = Vec::new();
+        // Two tiles: leading 8-token tile runs narrow_last_layer (parallel state-only conv/matrix);
+        // final 2-token tile exercises fused residual add + last-layer evaluation.
+        tiled.ingest_block(&[0_u32, 1, 2, 3, 2, 0, 1, 2], &|| Ok(()))?;
+        tiled.ingest_block_and_evaluate_last_into(&[3_u32, 1], &mut actual_logits, &|| Ok(()))?;
+        assert_eq!(
+            actual_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(state_bits(&tiled)?, state_bits(&sequential)?);
+
+        // Verify 64-token reservation mirrors MAX_TILE_TOKENS cleanly.
+        let r64 = tiled.tiled_prefill_scratch_bytes(64);
+        assert_eq!(r64.is_ok(), 64 <= crate::kernels::prefill::MAX_TILE_TOKENS);
         Ok(())
     }
 }

@@ -1686,6 +1686,7 @@ pub struct MatvecScratch {
     statistics: MatvecStatistics,
     pinned_accumulation: bool,
     row_parallelism: RowParallelism,
+    prefill_row_parallelism: Option<RowParallelism>,
     row_errors: Vec<Option<crate::Error>>,
     #[cfg(test)]
     preparations: usize,
@@ -1931,6 +1932,7 @@ impl Default for MatvecScratch {
             statistics: MatvecStatistics::default(),
             pinned_accumulation: false,
             row_parallelism: RowParallelism::default(),
+            prefill_row_parallelism: None,
             row_errors: Vec::new(),
             #[cfg(test)]
             preparations: 0,
@@ -1939,17 +1941,30 @@ impl Default for MatvecScratch {
 }
 
 impl MatvecScratch {
-    /// Changes only row scheduling, preserving prepared arithmetic and storage.
+    /// Changes only decode row scheduling, preserving prepared arithmetic and storage.
     /// Existing callers remain serial until explicitly configured.
     pub fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
         self.row_errors.clear();
         self.row_parallelism = parallelism;
     }
 
-    /// Explicit persistent row-worker budget; small/floating operations stay serial.
+    /// Configures dedicated row scheduling used during batched prefill, falling
+    /// back to `set_row_parallelism` when unset.
+    pub fn set_prefill_row_parallelism(&mut self, parallelism: RowParallelism) {
+        self.row_errors.clear();
+        self.prefill_row_parallelism = Some(parallelism);
+    }
+
+    /// Explicit persistent decode row-worker budget; small/floating operations stay serial.
     #[must_use]
     pub const fn row_workers(&self) -> usize {
         self.row_parallelism.workers()
+    }
+
+    /// Persistent row-worker budget applied during batched prefill (defaults to decode workers).
+    #[must_use]
+    pub const fn prefill_row_workers(&self) -> usize {
+        self.prefill_row_parallelism().workers()
     }
 
     /// Share the existing private pool with another scoped projection consumer.
@@ -1957,8 +1972,27 @@ impl MatvecScratch {
         self.row_parallelism.clone()
     }
 
+    /// Share the prefill private pool with another scoped prefill projection consumer.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "Wired into Qwen35 prefill scratch during P1/P2/P3 integration."
+        )
+    )]
+    pub(crate) fn clone_prefill_row_parallelism(&self) -> RowParallelism {
+        self.prefill_row_parallelism().clone()
+    }
+
     pub(crate) const fn row_parallelism(&self) -> &RowParallelism {
         &self.row_parallelism
+    }
+
+    pub(crate) const fn prefill_row_parallelism(&self) -> &RowParallelism {
+        match &self.prefill_row_parallelism {
+            Some(parallelism) => parallelism,
+            None => &self.row_parallelism,
+        }
     }
 
     /// Prepares one exact activation vector for compatible sibling projections.

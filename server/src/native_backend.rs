@@ -50,6 +50,13 @@ pub(crate) struct WorkerOptions {
     pub(crate) hexagon_arena_cache: Option<PathBuf>,
 }
 
+pub(crate) fn set_swift_prefill_row_parallelism(
+    session: &mut SwiftSession,
+    parallelism: bonsai_prism_runtime::kernels::RowParallelism,
+) {
+    worker::Engine::set_prefill_row_parallelism(session, parallelism);
+}
+
 /// Immutable projection placement requested by the trusted private child owner.
 ///
 /// This selects execution only; it does not reduce memory admission or qualify
@@ -151,27 +158,65 @@ pub async fn serve_with_placement(
 
 pub(crate) async fn serve_with_options(
     listener: TcpListener,
+    session: SwiftSession,
+    key: String,
+    placement: Placement,
+    options: WorkerOptions,
+) -> Result<(), NativeBackendError> {
+    Box::pin(serve_with_prefill_workers(
+        listener,
+        session,
+        key,
+        placement,
+        options,
+        None,
+    ))
+    .await
+}
+
+pub(crate) async fn serve_with_prefill_workers(
+    listener: TcpListener,
     mut session: SwiftSession,
     key: String,
     placement: Placement,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> Result<(), NativeBackendError> {
     if placement == Placement::Cpu {
         session.set_projection_executor(None);
     }
     let seed = session.seed();
-    serve_engine_with_options(listener, session, seed, key, placement, options).await
+    serve_engine_with_options(
+        listener,
+        session,
+        seed,
+        key,
+        placement,
+        options,
+        prefill_row_workers,
+    )
+    .await
 }
 
 #[cfg(windows)]
-pub(crate) async fn serve_vulkan_with_options(
+pub(crate) async fn serve_vulkan_with_prefill_workers(
     listener: TcpListener,
     session: VulkanSwiftSession,
     key: String,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> Result<(), NativeBackendError> {
     let seed = session.seed();
-    serve_engine_with_options(listener, session, seed, key, Placement::Vulkan, options).await
+    serve_engine_with_options(
+        listener,
+        session,
+        seed,
+        key,
+        Placement::Vulkan,
+        options,
+        prefill_row_workers,
+    )
+    .await
 }
 
 async fn serve_engine_with_options<E: worker::Engine>(
@@ -181,6 +226,7 @@ async fn serve_engine_with_options<E: worker::Engine>(
     key: String,
     placement: Placement,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> Result<(), NativeBackendError> {
     let address = listener
         .local_addr()
@@ -191,7 +237,8 @@ async fn serve_engine_with_options<E: worker::Engine>(
     }
     let base_policy =
         RequestPolicy::new(address.port(), &key).map_err(|_| NativeBackendError::Configuration)?;
-    let mut worker = Worker::with_options(engine, seed, placement, &options)?;
+    let mut worker =
+        Worker::with_prefill_options(engine, seed, placement, &options, prefill_row_workers)?;
     let policy = base_policy.with_vision(worker.profile.vision);
     loop {
         let (client, peer) = listener
@@ -210,30 +257,49 @@ async fn serve_engine_with_options<E: worker::Engine>(
     }
 }
 
-pub(crate) async fn serve_broker_pipe_with_options(
+pub(crate) async fn serve_broker_pipe_with_prefill_workers(
     endpoint: crate::broker_pipe::ServerEndpoint,
     mut session: SwiftSession,
     key: &str,
     placement: Placement,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> Result<(), NativeBackendError> {
     if placement == Placement::Cpu {
         session.set_projection_executor(None);
     }
     let seed = session.seed();
-    serve_broker_pipe_engine_with_options(endpoint, session, seed, key, placement, options).await
+    serve_broker_pipe_engine_with_options(
+        endpoint,
+        session,
+        seed,
+        key,
+        placement,
+        options,
+        prefill_row_workers,
+    )
+    .await
 }
 
 #[cfg(windows)]
-pub(crate) async fn serve_broker_pipe_vulkan_with_options(
+pub(crate) async fn serve_broker_pipe_vulkan_with_prefill_workers(
     endpoint: crate::broker_pipe::ServerEndpoint,
     session: VulkanSwiftSession,
     key: &str,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> Result<(), NativeBackendError> {
     let seed = session.seed();
-    serve_broker_pipe_engine_with_options(endpoint, session, seed, key, Placement::Vulkan, options)
-        .await
+    serve_broker_pipe_engine_with_options(
+        endpoint,
+        session,
+        seed,
+        key,
+        Placement::Vulkan,
+        options,
+        prefill_row_workers,
+    )
+    .await
 }
 
 async fn serve_broker_pipe_engine_with_options<E: worker::Engine>(
@@ -243,10 +309,12 @@ async fn serve_broker_pipe_engine_with_options<E: worker::Engine>(
     key: &str,
     placement: Placement,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> Result<(), NativeBackendError> {
     let base_policy = RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, key)
         .map_err(|_| NativeBackendError::Configuration)?;
-    let worker = Worker::with_options(engine, seed, placement, &options)?;
+    let worker =
+        Worker::with_prefill_options(engine, seed, placement, &options, prefill_row_workers)?;
     let policy = base_policy.with_vision(worker.profile.vision);
     serve_broker_pipe_with_worker(endpoint, &policy, worker).await
 }
@@ -283,11 +351,13 @@ fn write_request_failure(
     writeln!(writer, "private-inference-request-failed error={error:?}")
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Route {
     Health,
     Models,
     Count,
     Generate,
+    Warm,
     Reset,
 }
 struct Received {
@@ -338,19 +408,24 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
             return write_json(&mut client, 200, &json!({"status":"ok"}), deadline).await;
         }
         Route::Models => {
-            return write_json(
+            return write_json(&mut client, 200, &worker.readiness(), deadline).await;
+        }
+        Route::Warm if !worker.is_idle() => {
+            write_json(
                 &mut client,
-                200,
-                &worker.profile.readiness(worker.seed),
+                409,
+                &json!({"error":"worker busy"}),
                 deadline,
             )
-            .await;
+            .await?;
+            return Err(NativeBackendError::Engine);
         }
         _ => {}
     }
     let input = match received.route {
         Route::Count => Input::Count(received.pending.ok_or(NativeBackendError::Schema)?),
         Route::Generate => Input::Generate(received.pending.ok_or(NativeBackendError::Schema)?),
+        Route::Warm => Input::Warm(received.pending.ok_or(NativeBackendError::Schema)?),
         Route::Reset => Input::Reset,
         Route::Health | Route::Models => return Err(NativeBackendError::Configuration),
     };
@@ -485,6 +560,17 @@ async fn deliver<W: AsyncWrite + Unpin>(
                     .map_err(NativeBackendError::Response)?;
                 delivered.store(true, Ordering::Release);
             }
+            Output::Warmed { prompt } => {
+                write_terminal_json(
+                    writer.as_mut().ok_or(NativeBackendError::Engine)?,
+                    200,
+                    &json!({"status":"ok","warmed_tokens":prompt,"object":"chat.warm"}),
+                    deadline,
+                    Some(terminal_written),
+                )
+                .await?;
+                delivered.store(true, Ordering::Release);
+            }
             Output::Done(result) => {
                 if result.is_err()
                     && !delivered.load(Ordering::Acquire)
@@ -568,7 +654,7 @@ async fn receive<C: AsyncRead + Unpin>(
         }
         &bytes[..]
     };
-    let pending = if matches!(route, Route::Count | Route::Generate) {
+    let pending = if matches!(route, Route::Count | Route::Generate | Route::Warm) {
         Some(canonical_for_profile(body, profile)?)
     } else {
         None
@@ -592,6 +678,7 @@ fn parse_head(bytes: &[u8], policy: &RequestPolicy) -> Result<(Route, usize), Na
         (Some("GET"), Some("/v1/models" | "/props")) => Route::Models,
         (Some("POST"), Some("/v1/chat/completions/input_tokens")) => Route::Count,
         (Some("POST"), Some("/v1/chat/completions")) => Route::Generate,
+        (Some("POST"), Some("/v1/chat/warm")) => Route::Warm,
         (Some("POST"), Some("/reset")) => Route::Reset,
         _ => return Err(NativeBackendError::Configuration),
     };
@@ -828,6 +915,8 @@ async fn write_terminal_json<W: AsyncWrite + Unpin>(
         "OK"
     } else if status == 401 {
         "Unauthorized"
+    } else if status == 409 {
+        "Conflict"
     } else if status == 413 {
         "Content Too Large"
     } else {
@@ -868,3 +957,248 @@ fn ensure_time(deadline: impl Into<Option<Instant>>) -> Result<(), NativeBackend
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    use crate::{MAX_MULTIMODAL_BODY_BYTES, native_backend::worker::Engine};
+    use bonsai_prism_runtime::{
+        runtime::{Completion, Finish},
+        swift_session::TextEvent,
+    };
+    use std::{
+        sync::{Arc, atomic::AtomicUsize},
+        task::Poll,
+        time::Duration,
+    };
+    use tokio::io::duplex;
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    struct WarmableEngine {
+        warmable: bool,
+        hold_until_cancel: bool,
+        warm_calls: Arc<AtomicUsize>,
+        complete_calls: Arc<AtomicUsize>,
+        row_workers: usize,
+    }
+
+    impl Engine for WarmableEngine {
+        type Prepared = PendingChat;
+
+        fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
+            Ok(ModelProfile {
+                row_workers: self.row_workers,
+                ..ModelProfile::default()
+            })
+        }
+
+        fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
+            Ok(pending)
+        }
+
+        fn properties(prepared: &Self::Prepared) -> (usize, bool, bool, &[u8]) {
+            (42, false, false, &prepared.body)
+        }
+
+        fn supports_warm(&self) -> bool {
+            self.warmable
+        }
+
+        fn warm_prefix(
+            &mut self,
+            _prepared: &Self::Prepared,
+            cancel: &Cancellation,
+            _deadline: Option<std::time::Instant>,
+        ) -> Result<usize, NativeBackendError> {
+            self.warm_calls.fetch_add(1, Ordering::Relaxed);
+            if self.hold_until_cancel {
+                while !cancel.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                return Err(NativeBackendError::ClientAbandoned);
+            }
+            Ok(42)
+        }
+
+        fn complete(
+            &mut self,
+            _prepared: &Self::Prepared,
+            _cancel: &Cancellation,
+            _deadline: Option<std::time::Instant>,
+            _emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+        ) -> bonsai_prism_runtime::Result<Completion> {
+            self.complete_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Completion {
+                prompt_tokens: 42,
+                reused_tokens: 42,
+                generated_tokens: 0,
+                finish: Finish::Length,
+            })
+        }
+
+        fn reset(&mut self) -> bonsai_prism_runtime::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn http_post(path: &str, body: &[u8], authenticated: bool, length_override: Option<usize>) -> Vec<u8> {
+        let mut head = format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n");
+        if authenticated {
+            head.push_str("Authorization: Bearer ");
+            head.push_str(KEY);
+            head.push_str("\r\n");
+        }
+        head.push_str("Content-Type: application/json\r\nContent-Length: ");
+        head.push_str(&length_override.unwrap_or(body.len()).to_string());
+        head.push_str("\r\n\r\n");
+        let mut raw = head.into_bytes();
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    async fn exchange_once(
+        worker: &mut Worker,
+        raw_request: Vec<u8>,
+    ) -> Result<(Result<(), NativeBackendError>, Vec<u8>), std::io::Error> {
+        let policy = RequestPolicy::new(8080, KEY).map_err(|_| std::io::Error::other("policy"))?;
+        let (server, mut client) = duplex(16 * 1024);
+        let mut serve_fut = pin!(serve_connection(server, &policy, worker, None));
+        let mut client_fut = pin!(async {
+            client.write_all(&raw_request).await?;
+            client.flush().await?;
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).await?;
+            Ok::<_, std::io::Error>(reply)
+        });
+        let mut a = None;
+        let mut b = None;
+        poll_fn(|cx| {
+            if a.is_none()
+                && let Poll::Ready(res) = serve_fut.as_mut().poll(cx)
+            {
+                a = Some(res);
+            }
+            if b.is_none()
+                && let Poll::Ready(res) = client_fut.as_mut().poll(cx)
+            {
+                b = Some(res);
+            }
+            match (a, b.is_some()) {
+                (Some(res), true) => {
+                    let reply = b.take().unwrap_or_else(|| Ok(Vec::new()))?;
+                    Poll::Ready(Ok((res, reply)))
+                }
+                _ => Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    #[test]
+    fn post_warm_enforces_auth_bounds_idle_warm_success_and_cancellation() -> TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let warm_calls = Arc::new(AtomicUsize::new(0));
+            let complete_calls = Arc::new(AtomicUsize::new(0));
+            let raw_req = serde_json::to_vec(&json!({
+                "messages": [{"role": "user", "content": "Hello warm cache"}],
+                "max_completion_tokens": 16,
+                "stream": false
+            }))?;
+            let valid_body = crate::AuthorizedHead {
+                length: raw_req.len(),
+                vision: false,
+            }
+            .prepare(&raw_req)
+            .map_err(|e| format!("{e:?}"))?
+            .body;
+
+            let mut worker = Worker::with_prefill_options(
+                WarmableEngine {
+                    warmable: true,
+                    hold_until_cancel: false,
+                    warm_calls: warm_calls.clone(),
+                    complete_calls: complete_calls.clone(),
+                    row_workers: 4,
+                },
+                42,
+                Placement::Cpu,
+                &WorkerOptions::default(),
+                Some(12),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+
+            let (res, reply) = exchange_once(
+                &mut worker,
+                http_post("/v1/chat/warm", &valid_body, false, None),
+            )
+            .await?;
+            assert_eq!(res, Err(NativeBackendError::Unauthorized));
+            assert!(reply.starts_with(b"HTTP/1.1 401 "));
+            assert_eq!(warm_calls.load(Ordering::Relaxed), 0);
+
+            let (res, reply) = exchange_once(
+                &mut worker,
+                http_post(
+                    "/v1/chat/warm",
+                    &valid_body,
+                    true,
+                    Some(MAX_MULTIMODAL_BODY_BYTES + 1),
+                ),
+            )
+            .await?;
+            assert_eq!(res, Err(NativeBackendError::Configuration));
+            assert!(reply.starts_with(b"HTTP/1.1 400 "));
+            assert_eq!(warm_calls.load(Ordering::Relaxed), 0);
+
+            let (res, reply) = exchange_once(
+                &mut worker,
+                http_post("/v1/chat/warm", &valid_body, true, None),
+            )
+            .await?;
+            assert_eq!(res, Ok(()));
+            assert!(reply.starts_with(b"HTTP/1.1 200 "));
+            let end = reply
+                .array_windows()
+                .position(|w| w == b"\r\n\r\n")
+                .ok_or("missing response headers")?
+                + 4;
+            let body: Value = serde_json::from_slice(&reply[end..])?;
+            assert_eq!(
+                body,
+                json!({"status": "ok", "warmed_tokens": 42, "object": "chat.warm"})
+            );
+            assert_eq!(warm_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(complete_calls.load(Ordering::Relaxed), 0);
+
+            let mut worker_cancel = Worker::with_options(
+                WarmableEngine {
+                    warmable: true,
+                    hold_until_cancel: true,
+                    warm_calls,
+                    complete_calls,
+                    row_workers: 1,
+                },
+                42,
+                Placement::Cpu,
+                &WorkerOptions::default(),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            let policy = RequestPolicy::new(8080, KEY).map_err(|_| std::io::Error::other("policy"))?;
+            let (server, mut client) = duplex(16 * 1024);
+            client
+                .write_all(&http_post("/v1/chat/warm", &valid_body, true, None))
+                .await?;
+            client.flush().await?;
+            drop(client);
+            let res = serve_connection(server, &policy, &mut worker_cancel, None).await;
+            assert!(res.is_err());
+            assert!(worker_cancel.settled_within(Duration::from_secs(2)).await);
+            Ok(())
+        })
+    }
+}

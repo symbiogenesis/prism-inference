@@ -85,6 +85,25 @@ pub(super) trait Engine: Send + 'static {
     ) -> Result<ProjectionStartup, NativeBackendError> {
         self.initialize_worker_thread_for_placement(placement)
     }
+    fn set_prefill_row_parallelism(
+        &mut self,
+        _parallelism: bonsai_prism_runtime::kernels::RowParallelism,
+    ) {
+    }
+    fn prefill_row_workers(&self) -> Option<usize> {
+        None
+    }
+    fn supports_warm(&self) -> bool {
+        false
+    }
+    fn warm_prefix(
+        &mut self,
+        _prepared: &Self::Prepared,
+        _cancel: &Cancellation,
+        _deadline: Option<Instant>,
+    ) -> Result<usize, NativeBackendError> {
+        Err(NativeBackendError::Configuration)
+    }
 }
 
 fn initialize_with_options(
@@ -1411,6 +1430,7 @@ fn install_composite_executor(
 pub(super) enum Input {
     Count(PendingChat),
     Generate(PendingChat),
+    Warm(PendingChat),
     Reset,
 }
 
@@ -1426,6 +1446,9 @@ pub(super) enum Output {
         confidence: Option<TokenLogprobInfo>,
     },
     Complete(Completion),
+    Warmed {
+        prompt: usize,
+    },
     Reset,
     Done(Result<(), NativeBackendError>),
 }
@@ -1449,6 +1472,7 @@ struct CommandContext {
 pub(super) struct Worker {
     pub(super) seed: u32,
     pub(super) profile: ModelProfile,
+    pub(super) prefill_row_workers: usize,
     commands: Option<mpsc::SyncSender<Command>>,
     thread: Option<JoinHandle<()>>,
     busy: Arc<AtomicBool>,
@@ -1551,11 +1575,22 @@ impl Worker {
         Self::with_options(engine, seed, placement, &WorkerOptions::default())
     }
 
+    #[cfg(test)]
     pub(super) fn with_options(
         engine: impl Engine,
         seed: u32,
         placement: Placement,
         options: &WorkerOptions,
+    ) -> Result<Self, NativeBackendError> {
+        Self::with_prefill_options(engine, seed, placement, options, None)
+    }
+
+    pub(super) fn with_prefill_options(
+        engine: impl Engine,
+        seed: u32,
+        placement: Placement,
+        options: &WorkerOptions,
+        prefill_row_workers: Option<usize>,
     ) -> Result<Self, NativeBackendError> {
         let mut profile = engine.profile()?;
         profile.placement = placement;
@@ -1564,7 +1599,12 @@ impl Worker {
         ) else {
             return Err(NativeBackendError::Configuration);
         };
+        let resolved_prefill_workers = prefill_row_workers
+            .or_else(|| engine.prefill_row_workers())
+            .unwrap_or(profile.row_workers);
         if !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS).contains(&profile.row_workers)
+            || !(1..=bonsai_prism_runtime::kernels::MAX_ROW_WORKERS)
+                .contains(&resolved_prefill_workers)
             || bonsai_prism_runtime::swift_session::validate_execution_capacity_with_reuse(
                 profile.context_tokens,
                 u64::MAX,
@@ -1639,6 +1679,7 @@ impl Worker {
         Ok(Self {
             seed,
             profile,
+            prefill_row_workers: resolved_prefill_workers,
             commands: Some(commands),
             thread: Some(thread),
             busy,
@@ -1678,6 +1719,15 @@ impl Worker {
             return Err(NativeBackendError::Engine);
         }
         Ok(receiver)
+    }
+
+    pub(super) fn is_idle(&self) -> bool {
+        !self.busy.load(Ordering::Acquire)
+    }
+
+    pub(super) fn readiness(&self) -> serde_json::Value {
+        self.profile
+            .readiness_with_prefill_row_workers(self.seed, self.prefill_row_workers)
     }
 
     pub(super) async fn settled(&mut self) {
@@ -1742,7 +1792,39 @@ impl<E: Engine> State<E> {
             Input::Count(_) if self.faulted => Err(NativeBackendError::Engine),
             Input::Count(pending) => self.count(context, pending),
             Input::Generate(pending) => self.generate(context, &pending),
+            Input::Warm(pending) => self.warm(context, pending),
         }
+    }
+
+    fn warm(
+        &mut self,
+        context: &CommandContext,
+        pending: PendingChat,
+    ) -> Result<(), NativeBackendError> {
+        if self.faulted {
+            return Err(NativeBackendError::Engine);
+        }
+        check(context)?;
+        if !self.engine.supports_warm() {
+            return Err(NativeBackendError::Configuration);
+        }
+        let prepared = self
+            .engine
+            .prepare_until(pending, &context.cancel, context.deadline)?;
+        check(context)?;
+        self.faulted = true;
+        let warmed_tokens =
+            self.engine
+                .warm_prefix(&prepared, &context.cancel, context.deadline)?;
+        check(context)?;
+        acknowledge(
+            context,
+            Output::Warmed {
+                prompt: warmed_tokens,
+            },
+        )?;
+        self.faulted = false;
+        Ok(())
     }
 
     fn count(
@@ -1997,6 +2079,207 @@ mod tests {
 
             release.store(true, Ordering::Release);
             assert!(worker.settled_within(Duration::from_secs(2)).await);
+            Ok(())
+        })
+    }
+
+    struct WarmEngine {
+        warmable: bool,
+        prefill_workers: Option<usize>,
+        warmed_calls: Arc<std::sync::atomic::AtomicUsize>,
+        hold_until_cancel: bool,
+    }
+
+    impl Engine for WarmEngine {
+        type Prepared = PendingChat;
+
+        fn profile(&self) -> Result<super::super::profile::ModelProfile, NativeBackendError> {
+            Ok(super::super::profile::ModelProfile {
+                row_workers: 4,
+                ..Default::default()
+            })
+        }
+
+        fn prefill_row_workers(&self) -> Option<usize> {
+            self.prefill_workers
+        }
+
+        fn prepare(&self, pending: PendingChat) -> Result<Self::Prepared, NativeBackendError> {
+            Ok(pending)
+        }
+
+        fn properties(prepared: &Self::Prepared) -> (usize, bool, bool, &[u8]) {
+            (7, false, false, &prepared.body)
+        }
+
+        fn supports_warm(&self) -> bool {
+            self.warmable
+        }
+
+        fn warm_prefix(
+            &mut self,
+            _prepared: &Self::Prepared,
+            cancel: &Cancellation,
+            _deadline: Option<Instant>,
+        ) -> Result<usize, NativeBackendError> {
+            self.warmed_calls.fetch_add(1, Ordering::Relaxed);
+            if self.hold_until_cancel {
+                while !cancel.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                return Err(NativeBackendError::ClientAbandoned);
+            }
+            Ok(7)
+        }
+
+        fn complete(
+            &mut self,
+            _prepared: &Self::Prepared,
+            _cancel: &Cancellation,
+            _deadline: Option<Instant>,
+            _emit: impl FnMut(TextEvent<'_>) -> bonsai_prism_runtime::Result<()>,
+        ) -> bonsai_prism_runtime::Result<Completion> {
+            Ok(Completion {
+                prompt_tokens: 7,
+                reused_tokens: 7,
+                generated_tokens: 0,
+                finish: Finish::Length,
+            })
+        }
+
+        fn reset(&mut self) -> bonsai_prism_runtime::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn worker_prefill_row_workers_validation_and_readiness() -> TestResult {
+        use super::super::WorkerOptions;
+        use super::Placement;
+        use bonsai_prism_runtime::kernels::MAX_ROW_WORKERS;
+        use std::sync::atomic::AtomicUsize;
+
+        let defaulted = Worker::with_options(
+            WarmEngine {
+                warmable: false,
+                prefill_workers: None,
+                warmed_calls: Arc::new(AtomicUsize::new(0)),
+                hold_until_cancel: false,
+            },
+            42,
+            Placement::Cpu,
+            &WorkerOptions::default(),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(defaulted.profile.row_workers, 4);
+        assert_eq!(defaulted.prefill_row_workers, 4);
+        assert_eq!(defaulted.readiness()["data"][0]["prefill_row_workers"], 4);
+
+        let configured = Worker::with_prefill_options(
+            WarmEngine {
+                warmable: false,
+                prefill_workers: Some(12),
+                warmed_calls: Arc::new(AtomicUsize::new(0)),
+                hold_until_cancel: false,
+            },
+            42,
+            Placement::Cpu,
+            &WorkerOptions::default(),
+            Some(16),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(configured.prefill_row_workers, 16);
+        assert_eq!(configured.readiness()["data"][0]["prefill_row_workers"], 16);
+
+        for invalid_count in [0, MAX_ROW_WORKERS + 1] {
+            let err = Worker::with_prefill_options(
+                WarmEngine {
+                    warmable: false,
+                    prefill_workers: None,
+                    warmed_calls: Arc::new(AtomicUsize::new(0)),
+                    hold_until_cancel: false,
+                },
+                42,
+                Placement::Cpu,
+                &WorkerOptions::default(),
+                Some(invalid_count),
+            );
+            assert!(matches!(err, Err(NativeBackendError::Configuration)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn worker_warm_rejects_unsupported_and_honors_cancellation() -> TestResult {
+        use super::super::WorkerOptions;
+        use super::{Output, Placement};
+        use std::sync::atomic::AtomicUsize;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut unsupported = Worker::with_options(
+                WarmEngine {
+                    warmable: false,
+                    prefill_workers: None,
+                    warmed_calls: calls.clone(),
+                    hold_until_cancel: false,
+                },
+                42,
+                Placement::Cpu,
+                &WorkerOptions::default(),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            let mut events = unsupported
+                .start(Input::Warm(sample_pending()?), Cancellation::default(), None)
+                .map_err(|error| format!("{error:?}"))?;
+            let event = events.recv().await.ok_or("missing Done")?;
+            assert!(matches!(
+                event.output,
+                Output::Done(Err(NativeBackendError::Configuration))
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert!(unsupported.settled_within(Duration::from_secs(1)).await);
+
+            // Unsupported warm must not fault subsequent Count.
+            let mut count_events = unsupported
+                .start(
+                    Input::Count(sample_pending()?),
+                    Cancellation::default(),
+                    None,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            let counted = count_events.recv().await.ok_or("missing Count")?;
+            assert!(matches!(counted.output, Output::Count(7)));
+            drop(counted.ack);
+            let _ = count_events.recv().await;
+            assert!(unsupported.settled_within(Duration::from_secs(1)).await);
+
+            let mut cancellable = Worker::with_options(
+                WarmEngine {
+                    warmable: true,
+                    prefill_workers: None,
+                    warmed_calls: calls,
+                    hold_until_cancel: true,
+                },
+                42,
+                Placement::Cpu,
+                &WorkerOptions::default(),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            let cancel = Cancellation::default();
+            let mut warm_events = cancellable
+                .start(Input::Warm(sample_pending()?), cancel.clone(), None)
+                .map_err(|error| format!("{error:?}"))?;
+            cancel.cancel();
+            let done = warm_events.recv().await.ok_or("missing cancel Done")?;
+            assert!(matches!(
+                done.output,
+                Output::Done(Err(NativeBackendError::ClientAbandoned))
+            ));
+            assert!(cancellable.settled_within(Duration::from_secs(1)).await);
             Ok(())
         })
     }

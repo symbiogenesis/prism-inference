@@ -333,4 +333,36 @@ impl ModelProfile {
         }
         json!({"data": [model]})
     }
+
+    /// Renders `/v1/models` readiness metadata with an explicit prefill worker count.
+    pub(super) fn readiness_with_prefill_row_workers(
+        &self,
+        seed: u32,
+        prefill_row_workers: usize,
+    ) -> Value {
+        let mut payload = self.readiness(seed);
+        if let Some(model) = payload["data"].get_mut(0) {
+            model["prefill_row_workers"] = json!(prefill_row_workers);
+        }
+        payload
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelProfile;
+
+    #[test]
+    fn readiness_reports_explicit_prefill_row_workers() {
+        let profile = ModelProfile {
+            row_workers: 8,
+            ..ModelProfile::default()
+        };
+        let legacy = profile.readiness(42);
+        assert!(legacy["data"][0].get("prefill_row_workers").is_none());
+
+        let ready = profile.readiness_with_prefill_row_workers(42, 16);
+        assert_eq!(ready["data"][0]["row_workers"], 8);
+        assert_eq!(ready["data"][0]["prefill_row_workers"], 16);
+    }
 }

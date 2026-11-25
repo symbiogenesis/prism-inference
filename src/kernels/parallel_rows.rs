@@ -215,6 +215,84 @@ impl RowParallelism {
         self.workers
     }
 
+    /// Maximum worker capacity of the backing private pool, or `1` when serial.
+    #[cfg(feature = "parallel-rows")]
+    #[must_use]
+    pub fn pool_workers(&self) -> usize {
+        if let Some(pool) = &self.pool {
+            return pool.worker_count();
+        }
+        self.workers
+    }
+
+    /// Maximum worker capacity of the backing private pool, or `1` when serial.
+    #[cfg(not(feature = "parallel-rows"))]
+    #[must_use]
+    pub const fn pool_workers(&self) -> usize {
+        self.workers
+    }
+
+    /// Returns true when `self` and `other` share the same underlying worker pool instance.
+    #[cfg(test)]
+    pub(crate) fn shares_pool_with(&self, other: &Self) -> bool {
+        #[cfg(feature = "parallel-rows")]
+        match (&self.pool, &other.pool) {
+            (Some(lhs), Some(rhs)) => Arc::ptr_eq(lhs, rhs),
+            (None, None) => true,
+            _ => false,
+        }
+        #[cfg(not(feature = "parallel-rows"))]
+        {
+            self.workers == 1 && other.workers == 1
+        }
+    }
+
+    /// Derives a worker policy sharing this instance's underlying [`NativeRowPool`]
+    /// with active concurrency capped to `1..=self.pool_workers()`.
+    ///
+    /// Selecting `1` retains serial execution without dispatching background threads.
+    ///
+    /// # Errors
+    /// Rejects zero workers, counts exceeding the pool's spawned thread budget, or
+    /// multi-worker counts when `parallel-rows` is disabled.
+    pub fn with_active_workers(&self, workers: usize) -> Result<Self> {
+        let cap = self.pool_workers();
+        if workers == 0 || workers > cap {
+            return Err(invalid(
+                "active row worker count must be from 1 through pool capacity",
+            ));
+        }
+        if workers == 1 {
+            return Ok(Self::default());
+        }
+        #[cfg(feature = "parallel-rows")]
+        if let Some(pool) = &self.pool {
+            return Ok(Self {
+                workers,
+                pool: Some(Arc::clone(pool)),
+            });
+        }
+        Err(invalid("multiple row workers require parallel-rows"))
+    }
+
+    /// Creates a `(decode, prefill)` pair of policies sharing one [`NativeRowPool`]
+    /// sized to `max(decode_workers, prefill_workers)` (`<= MAX_ROW_WORKERS`).
+    ///
+    /// # Errors
+    /// Rejects zero workers, counts above [`MAX_ROW_WORKERS`], unavailable
+    /// `parallel-rows` support when either budget exceeds `1`, or thread creation failure.
+    pub fn new_pair(decode_workers: usize, prefill_workers: usize) -> Result<(Self, Self)> {
+        if !(1..=MAX_ROW_WORKERS).contains(&decode_workers)
+            || !(1..=MAX_ROW_WORKERS).contains(&prefill_workers)
+        {
+            return Err(invalid("row worker count must be from 1 through 18"));
+        }
+        let pool_policy = Self::new(decode_workers.max(prefill_workers))?;
+        let decode = pool_policy.with_active_workers(decode_workers)?;
+        let prefill = pool_policy.with_active_workers(prefill_workers)?;
+        Ok((decode, prefill))
+    }
+
     /// Updates contiguous row chunks of `target` in place across the private pool.
     ///
     /// Serial execution (`workers == 1` or `target.len() <= 1`) runs directly on
@@ -680,6 +758,65 @@ pub(super) fn fill_batched_chunk(
         *value = dot(row)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::super::MatvecScratch;
+    use super::{MAX_ROW_WORKERS, RowParallelism};
+    use crate::Result;
+
+    #[test]
+    fn row_parallelism_pair_and_matvec_scratch_prefill_defaults() -> Result<()> {
+        let (serial_decode, serial_prefill) = RowParallelism::new_pair(1, 1)?;
+        assert_eq!(serial_decode.workers(), 1);
+        assert_eq!(serial_prefill.workers(), 1);
+        assert!(serial_decode.shares_pool_with(&serial_prefill));
+        assert!(RowParallelism::new_pair(0, 1).is_err());
+        assert!(RowParallelism::new_pair(1, MAX_ROW_WORKERS + 1).is_err());
+        assert!(serial_decode.with_active_workers(0).is_err());
+        assert!(serial_decode.with_active_workers(2).is_err());
+
+        let mut scratch = MatvecScratch::default();
+        assert_eq!(scratch.row_workers(), 1);
+        assert_eq!(scratch.prefill_row_workers(), 1);
+        assert_eq!(scratch.prefill_row_parallelism().workers(), 1);
+
+        #[cfg(feature = "parallel-rows")]
+        {
+            let (decode, prefill) = RowParallelism::new_pair(8, 16)?;
+            assert_eq!(decode.workers(), 8);
+            assert_eq!(decode.pool_workers(), 16);
+            assert_eq!(prefill.workers(), 16);
+            assert_eq!(prefill.pool_workers(), 16);
+            assert!(decode.shares_pool_with(&prefill));
+            assert!(decode.with_active_workers(17).is_err());
+
+            let sub = decode.with_active_workers(12)?;
+            assert_eq!(sub.workers(), 12);
+            assert!(sub.shares_pool_with(&prefill));
+            assert_eq!(decode.with_active_workers(1)?.workers(), 1);
+
+            let (serial_dec, shared_pref) = RowParallelism::new_pair(1, 4)?;
+            assert_eq!(serial_dec.workers(), 1);
+            assert_eq!(shared_pref.workers(), 4);
+
+            scratch.set_row_parallelism(decode.clone());
+            assert_eq!(scratch.row_workers(), 8);
+            assert_eq!(scratch.prefill_row_workers(), 8);
+            assert_eq!(scratch.prefill_row_parallelism().workers(), 8);
+
+            scratch.set_prefill_row_parallelism(prefill.clone());
+            assert_eq!(scratch.row_workers(), 8);
+            assert_eq!(scratch.prefill_row_workers(), 16);
+            assert!(
+                scratch
+                    .clone_prefill_row_parallelism()
+                    .shares_pool_with(&prefill)
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(

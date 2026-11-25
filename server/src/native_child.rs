@@ -54,6 +54,7 @@ struct Config {
     admission_policy: AdmissionPolicy,
     seed: u32,
     row_workers: usize,
+    prefill_row_workers: usize,
     representation: Representation,
     adapter: Option<PathBuf>,
     daisyrose_lora: Option<DaisyRoseConfig>,
@@ -63,6 +64,7 @@ struct Config {
     branch_checkpoints: BranchCheckpoints,
     kv_cache: KvCachePolicy,
     cpu_prefill: Option<CpuPrefill>,
+    requested_prefill_tokens: Option<usize>,
     cpu_speculation: Option<CpuSpeculation>,
     capacity: Option<(usize, u64)>,
     hexagon_arena_cache: Option<PathBuf>,
@@ -108,6 +110,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut admission_policy = None;
     let (mut model, mut key, mut port, mut seed) = (None, None, None, None);
     let mut row_workers = None;
+    let mut prefill_row_workers = None;
     let mut cpu_family = None;
     let mut repacked_ptq1 = false;
     let mut nariq: Option<Representation> = None;
@@ -229,6 +232,15 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                         .map_err(|_| invalid())?,
                 );
             }
+            Some("--prefill-row-workers") if prefill_row_workers.is_none() => {
+                prefill_row_workers = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(invalid)?
+                        .parse::<usize>()
+                        .map_err(|_| invalid())?,
+                );
+            }
             Some("--prompt-reuse") if prompt_reuse.is_none() => {
                 prompt_reuse = Some(match value.to_str() {
                     Some("disabled") => PromptReuse::Disabled,
@@ -338,6 +350,11 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let resolved_policy = admission_policy.unwrap_or_default();
     let daisyrose_lora =
         resolve_daisyrose_config(daisyrose_path, daisyrose_bytes, daisyrose_sha256)?;
+    let resolved_row_workers =
+        row_workers.unwrap_or_else(|| cpu_family.map_or(1, CpuFamily::default_row_workers));
+    let resolved_prefill_row_workers = prefill_row_workers.unwrap_or(resolved_row_workers);
+    let (cpu_prefill, requested_prefill_tokens) =
+        parse_prefill(prefill_tokens, prefill_scratch, prefill_gdn)?;
     let config = Config {
         placement: resolved_placement,
         model: model.ok_or_else(invalid)?,
@@ -345,8 +362,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         verified_sections,
         admission_policy: resolved_policy,
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
-        row_workers: row_workers
-            .unwrap_or_else(|| cpu_family.map_or(1, CpuFamily::default_row_workers)),
+        row_workers: resolved_row_workers,
+        prefill_row_workers: resolved_prefill_row_workers,
         representation: nariq.or(bonsai25).unwrap_or(if repacked_ptq1 {
             Representation::CurrentRepackedPtq1
         } else {
@@ -359,7 +376,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         prompt_reuse: prompt_reuse.unwrap_or_default(),
         branch_checkpoints: parse_branch_checkpoints(reuse_checkpoints, reuse_checkpoint_bytes)?,
         kv_cache: resolved_kv_cache,
-        cpu_prefill: parse_prefill(prefill_tokens, prefill_scratch, prefill_gdn)?,
+        cpu_prefill,
+        requested_prefill_tokens,
         cpu_speculation: resolve_speculation(
             spec_type,
             draft_max,
@@ -445,7 +463,9 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         }
     }
     if !(1..=MAX_ROW_WORKERS).contains(&config.row_workers)
-        || (config.row_workers > 1 && !cfg!(feature = "parallel-rows"))
+        || !(1..=MAX_ROW_WORKERS).contains(&config.prefill_row_workers)
+        || ((config.row_workers > 1 || config.prefill_row_workers > 1)
+            && !cfg!(feature = "parallel-rows"))
     {
         return Err(invalid());
     }
@@ -546,13 +566,13 @@ fn parse_prefill(
     tokens: Option<OsString>,
     scratch: Option<OsString>,
     chunkwise_gdn: Option<bool>,
-) -> io::Result<Option<CpuPrefill>> {
+) -> io::Result<(Option<CpuPrefill>, Option<usize>)> {
     match (tokens, scratch) {
         (None, None) => {
             if chunkwise_gdn.is_some() {
                 return Err(invalid());
             }
-            Ok(None)
+            Ok((None, None))
         }
         (Some(tokens), Some(scratch)) => {
             let tokens = tokens
@@ -565,12 +585,21 @@ fn parse_prefill(
                 .ok_or_else(invalid)?
                 .parse::<usize>()
                 .map_err(|_| invalid())?;
-            let prefill = CpuPrefill::new(tokens, scratch).map_err(|_| invalid())?;
-            Ok(Some(if chunkwise_gdn == Some(true) {
+            let prefill = match CpuPrefill::new(tokens, scratch) {
+                Ok(prefill) => prefill,
+                Err(_) if tokens == 64 => {
+                    // Validate paired scratch admission for 64-token tiles cleanly
+                    // until P1/P2 integration raises `CpuPrefill::new`'s ceiling to 64.
+                    CpuPrefill::new(32, scratch).map_err(|_| invalid())?
+                }
+                Err(_) => return Err(invalid()),
+            };
+            let prefill = if chunkwise_gdn == Some(true) {
                 prefill.with_chunkwise_gdn()
             } else {
                 prefill
-            }))
+            };
+            Ok((Some(prefill), Some(tokens)))
         }
         _ => Err(invalid()),
     }
@@ -893,6 +922,7 @@ async fn serve_prepared(
     session: SwiftSession,
     placement: Placement,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> io::Result<()> {
     serve_prepared_backend(
         prepared_transport,
@@ -901,6 +931,7 @@ async fn serve_prepared(
             placement,
         },
         options,
+        prefill_row_workers,
     )
     .await
 }
@@ -909,11 +940,13 @@ async fn serve_prepared_vulkan(
     prepared_transport: PreparedTransport,
     session: crate::native_backend::VulkanSwiftSession,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> io::Result<()> {
     serve_prepared_backend(
         prepared_transport,
         PreparedBackend::Vulkan(Box::new(session)),
         options,
+        prefill_row_workers,
     )
     .await
 }
@@ -922,6 +955,7 @@ async fn serve_prepared_backend(
     prepared_transport: PreparedTransport,
     backend: PreparedBackend,
     options: WorkerOptions,
+    prefill_row_workers: Option<usize>,
 ) -> io::Result<()> {
     let served = match prepared_transport {
         PreparedTransport::Loopback { port, guard, key } => {
@@ -930,14 +964,23 @@ async fn serve_prepared_backend(
                 .map_err(|error| startup::at(Stage::Listener, &error))?;
             let result = match backend {
                 PreparedBackend::Cpu { session, placement } => {
-                    Box::pin(crate::native_backend::serve_with_options(
-                        listener, *session, key, placement, options,
+                    Box::pin(crate::native_backend::serve_with_prefill_workers(
+                        listener,
+                        *session,
+                        key,
+                        placement,
+                        options,
+                        prefill_row_workers,
                     ))
                     .await
                 }
                 PreparedBackend::Vulkan(session) => {
-                    Box::pin(crate::native_backend::serve_vulkan_with_options(
-                        listener, *session, key, options,
+                    Box::pin(crate::native_backend::serve_vulkan_with_prefill_workers(
+                        listener,
+                        *session,
+                        key,
+                        options,
+                        prefill_row_workers,
                     ))
                     .await
                 }
@@ -947,22 +990,26 @@ async fn serve_prepared_backend(
         }
         PreparedTransport::BrokerPipe { endpoint, key } => match backend {
             PreparedBackend::Cpu { session, placement } => {
-                Box::pin(crate::native_backend::serve_broker_pipe_with_options(
-                    endpoint,
-                    *session,
-                    key.as_str(),
-                    placement,
-                    options,
-                ))
+                Box::pin(
+                    crate::native_backend::serve_broker_pipe_with_prefill_workers(
+                        endpoint,
+                        *session,
+                        key.as_str(),
+                        placement,
+                        options,
+                        prefill_row_workers,
+                    ),
+                )
                 .await
             }
             PreparedBackend::Vulkan(session) => {
                 Box::pin(
-                    crate::native_backend::serve_broker_pipe_vulkan_with_options(
+                    crate::native_backend::serve_broker_pipe_vulkan_with_prefill_workers(
                         endpoint,
                         *session,
                         key.as_str(),
                         options,
+                        prefill_row_workers,
                     ),
                 )
                 .await
@@ -978,8 +1025,18 @@ async fn serve_prepared_backend(
 }
 
 fn load_prepared_backend(config: &Config) -> io::Result<PreparedBackend> {
-    let parallelism = RowParallelism::new(config.row_workers)
-        .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
+    if config
+        .requested_prefill_tokens
+        .is_some_and(|requested| config.cpu_prefill.map(CpuPrefill::tokens) != Some(requested))
+    {
+        return Err(startup::at(
+            Stage::Arguments,
+            &io::Error::new(
+                io::ErrorKind::Unsupported,
+                "requested CPU prefill tile size requires runtime support",
+            ),
+        ));
+    }
     let context_tokens = config.capacity.map_or(
         bonsai_prism_runtime::model::swift::CONTEXT_TOKENS,
         |(tokens, _)| tokens,
@@ -993,7 +1050,6 @@ fn load_prepared_backend(config: &Config) -> io::Result<PreparedBackend> {
             sha256: &item.sha256,
         });
     if config.placement == Placement::Vulkan {
-        let _ = parallelism;
         let session = crate::native_backend::VulkanSwiftSession::load_profile_with_adapters(
             &config.model,
             config.representation,
@@ -1008,6 +1064,9 @@ fn load_prepared_backend(config: &Config) -> io::Result<PreparedBackend> {
         .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
         return Ok(PreparedBackend::Vulkan(Box::new(session)));
     }
+    let (parallelism, prefill_parallelism) =
+        RowParallelism::new_pair(config.row_workers, config.prefill_row_workers)
+            .map_err(|error| startup::at(Stage::Arguments, error.as_ref()))?;
     let mut session = SwiftSession::load_profile_with_adapters(
         &config.model,
         config.representation,
@@ -1024,6 +1083,7 @@ fn load_prepared_backend(config: &Config) -> io::Result<PreparedBackend> {
         config.branch_checkpoints,
     )
     .map_err(|error| startup::at(Stage::Model, error.as_ref()))?;
+    crate::native_backend::set_swift_prefill_row_parallelism(&mut session, prefill_parallelism);
     if let Some(ref mmproj) = config.mmproj {
         session
             .load_vision(mmproj, config.image_max_tokens)
@@ -1087,15 +1147,20 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
     let options = WorkerOptions {
         hexagon_arena_cache: config.hexagon_arena_cache,
     };
+    let prefill_row_workers = Some(config.prefill_row_workers);
     match backend {
-        PreparedBackend::Vulkan(session) => {
-            runtime.block_on(serve_prepared_vulkan(prepared_transport, *session, options))
-        }
+        PreparedBackend::Vulkan(session) => runtime.block_on(serve_prepared_vulkan(
+            prepared_transport,
+            *session,
+            options,
+            prefill_row_workers,
+        )),
         PreparedBackend::Cpu { session, placement } => runtime.block_on(serve_prepared(
             prepared_transport,
             *session,
             placement,
             options,
+            prefill_row_workers,
         )),
     }
 }
@@ -2770,6 +2835,99 @@ mod tests {
         let mut vk_vision = base("vulkan");
         vk_vision.extend(["--mmproj".into(), mmproj.into_os_string()]);
         assert!(parse(vk_vision).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_child_prefill_row_workers_and_64_tile_tokens_cli_admission() -> io::Result<()> {
+        use bonsai_prism_runtime::swift_session::{
+            CONTEXT_TOKEN_MEMORY_BYTES, NON_CONTEXT_MEMORY_BYTES,
+        };
+        let (_directory, [model, key, _adapter]) = files()?;
+        let base: Vec<OsString> = vec![
+            "--native-engine-child".into(),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8080".into(),
+            "--seed".into(),
+            "42".into(),
+        ];
+
+        let default_cfg = parse(base.clone())?;
+        assert_eq!(default_cfg.row_workers, 1);
+        assert_eq!(default_cfg.prefill_row_workers, 1);
+
+        let mut single_override = base.clone();
+        single_override.extend(["--prefill-row-workers", "1"].map(OsString::from));
+        let single_cfg = parse(single_override.clone())?;
+        assert_eq!(single_cfg.row_workers, 1);
+        assert_eq!(single_cfg.prefill_row_workers, 1);
+
+        let mut duplicate = single_override;
+        duplicate.extend(["--prefill-row-workers", "1"].map(OsString::from));
+        assert!(parse(duplicate).is_err());
+
+        let mut x1_args = base.clone();
+        x1_args.extend(["--cpu-family", "x1"].map(OsString::from));
+        #[cfg(feature = "parallel-rows")]
+        {
+            let x1_cfg = parse(x1_args.clone())?;
+            assert_eq!(x1_cfg.row_workers, 8);
+            assert_eq!(x1_cfg.prefill_row_workers, 8);
+
+            let mut override_args = x1_args;
+            override_args.extend(["--prefill-row-workers", "16"].map(OsString::from));
+            let override_cfg = parse(override_args.clone())?;
+            assert_eq!(override_cfg.row_workers, 8);
+            assert_eq!(override_cfg.prefill_row_workers, 16);
+
+            let mut dup_multi = override_args;
+            dup_multi.extend(["--prefill-row-workers", "12"].map(OsString::from));
+            assert!(parse(dup_multi).is_err());
+        }
+        #[cfg(not(feature = "parallel-rows"))]
+        {
+            assert!(parse(x1_args).is_err());
+            let mut multi_prefill = base.clone();
+            multi_prefill.extend(["--prefill-row-workers", "16"].map(OsString::from));
+            assert!(parse(multi_prefill).is_err());
+        }
+        for bad in ["0", &(MAX_ROW_WORKERS + 1).to_string()] {
+            let mut bad_args = base.clone();
+            bad_args.extend(["--prefill-row-workers", bad].map(OsString::from));
+            assert!(parse(bad_args).is_err());
+        }
+
+        // `--cpu-prefill-tokens 64` parses cleanly alongside paired KV/context/memory admission.
+        let reserve = 64 * 1024 * 1024;
+        let memory = NON_CONTEXT_MEMORY_BYTES + 8_192 * CONTEXT_TOKEN_MEMORY_BYTES + reserve;
+        let mut tile64 = base;
+        tile64.extend(
+            [
+                "--kv-cache",
+                "rsq4",
+                "--context-tokens",
+                "8192",
+                "--memory-limit-bytes",
+                &memory.to_string(),
+                "--cpu-prefill-tokens",
+                "64",
+                "--cpu-prefill-scratch-bytes",
+                &reserve.to_string(),
+            ]
+            .map(OsString::from),
+        );
+        let tile64_cfg = parse(tile64.clone())?;
+        assert_eq!(tile64_cfg.requested_prefill_tokens, Some(64));
+        assert!(tile64_cfg.cpu_prefill.is_some());
+
+        // Zero scratch still fails even with `--cpu-prefill-tokens 64`.
+        let last = tile64.len() - 1;
+        tile64[last] = "0".into();
+        assert!(parse(tile64).is_err());
         Ok(())
     }
 }

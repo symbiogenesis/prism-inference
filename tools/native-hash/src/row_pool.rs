@@ -15,6 +15,9 @@ use std::time::Duration;
 const WORKER_STACK_BYTES: usize = 512 * 1024;
 const SPIN_ITERATIONS: u32 = 32_768;
 const CHECK_WAIT_INTERVAL: Duration = Duration::from_millis(1);
+const SLOT_BITS: u32 = 16;
+const SLOT_MASK: u64 = (1_u64 << SLOT_BITS) - 1;
+const GEN_MASK: u64 = (1_u64 << (64 - SLOT_BITS)) - 1;
 
 #[repr(align(64))]
 struct CachePadded<T>(T);
@@ -66,7 +69,7 @@ struct Shared {
     wake_workers: Condvar,
     done_lock: Mutex<()>,
     done_cv: Condvar,
-    generation: CachePadded<AtomicU64>,
+    dispatch_state: CachePadded<AtomicU64>,
     next_task: CachePadded<AtomicUsize>,
     pending_workers: CachePadded<AtomicUsize>,
     sleeping_workers: CachePadded<AtomicUsize>,
@@ -224,13 +227,19 @@ impl NativeRowPool {
                 "Row worker pool requires at least one thread.",
             ));
         }
+        if worker_count - 1 > usize::from(u16::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Row worker pool exceeds supported background worker limit.",
+            ));
+        }
         let shared = Arc::new(Shared {
             dispatch_lock: Mutex::new(()),
             state_lock: Mutex::new(()),
             wake_workers: Condvar::new(),
             done_lock: Mutex::new(()),
             done_cv: Condvar::new(),
-            generation: CachePadded::new(AtomicU64::new(0)),
+            dispatch_state: CachePadded::new(AtomicU64::new(0)),
             next_task: CachePadded::new(AtomicUsize::new(0)),
             pending_workers: CachePadded::new(AtomicUsize::new(0)),
             sleeping_workers: CachePadded::new(AtomicUsize::new(0)),
@@ -292,7 +301,8 @@ impl NativeRowPool {
         }
 
         let bg_workers = self.workers.len();
-        if bg_workers == 0 {
+        let needed_bg = bg_workers.min(task_count.saturating_sub(1));
+        if needed_bg == 0 {
             on_wait();
             for index in 0..task_count {
                 task(index);
@@ -316,20 +326,36 @@ impl NativeRowPool {
             };
             // SAFETY: `dispatch_lock` guarantees the previous generation exited
             // completely (`pending_workers == 0`), so no worker reads `job` until
-            // `generation` advances below with `SeqCst` release semantics.
+            // `dispatch_state` advances below with `SeqCst` release semantics.
             unsafe { *self.shared.job.0.0.get() = Some(job) };
             self.shared.next_task.store(0, Ordering::Release);
             self.shared
                 .pending_workers
-                .store(bg_workers, Ordering::Release);
-            self.shared.generation.fetch_add(1, Ordering::SeqCst);
+                .store(needed_bg, Ordering::Release);
+            let prev_state = self.shared.dispatch_state.load(Ordering::Relaxed);
+            let next_gen = ((prev_state >> SLOT_BITS).wrapping_add(1)) & GEN_MASK;
+            let slots = u64::try_from(needed_bg).unwrap_or(SLOT_MASK);
+            self.shared
+                .dispatch_state
+                .store((next_gen << SLOT_BITS) | slots, Ordering::SeqCst);
             if self.shared.sleeping_workers.load(Ordering::SeqCst) != 0 {
                 let _state_guard = self
                     .shared
                     .state_lock
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                self.shared.wake_workers.notify_all();
+                let remaining = usize::try_from(
+                    self.shared.dispatch_state.load(Ordering::SeqCst) & SLOT_MASK,
+                )
+                .unwrap_or(needed_bg);
+                let sleeping = self.shared.sleeping_workers.load(Ordering::SeqCst);
+                if remaining >= sleeping {
+                    self.shared.wake_workers.notify_all();
+                } else {
+                    for _ in 0..remaining {
+                        self.shared.wake_workers.notify_one();
+                    }
+                }
             }
         }
 
@@ -424,17 +450,42 @@ fn shutdown_workers(shared: &Shared, workers: &mut Vec<JoinHandle<()>>) {
     }
 }
 
+fn try_claim_slot(dispatch_state: &AtomicU64, seen_generation: &mut u64) -> bool {
+    loop {
+        let current = dispatch_state.load(Ordering::Acquire);
+        let generation = current >> SLOT_BITS;
+        if generation == *seen_generation {
+            return false;
+        }
+        let slots = current & SLOT_MASK;
+        if slots == 0 {
+            *seen_generation = generation;
+            return false;
+        }
+        let next = (generation << SLOT_BITS) | (slots - 1);
+        if dispatch_state
+            .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            *seen_generation = generation;
+            return true;
+        }
+    }
+}
+
 fn worker_loop(shared: &Shared) {
     let mut seen_generation = 0_u64;
     loop {
         let mut spins = 0_u32;
-        let next_generation = loop {
+        loop {
             if shared.shutdown.load(Ordering::Acquire) {
                 return;
             }
-            let current = shared.generation.load(Ordering::Acquire);
-            if current != seen_generation {
-                break current;
+            let current = shared.dispatch_state.load(Ordering::Acquire);
+            if (current >> SLOT_BITS) != seen_generation
+                && try_claim_slot(&shared.dispatch_state, &mut seen_generation)
+            {
+                break;
             }
             if spins < SPIN_ITERATIONS {
                 std::hint::spin_loop();
@@ -446,26 +497,27 @@ fn worker_loop(shared: &Shared) {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             shared.sleeping_workers.fetch_add(1, Ordering::SeqCst);
-            let current = loop {
+            loop {
                 if shared.shutdown.load(Ordering::SeqCst) {
                     shared.sleeping_workers.fetch_sub(1, Ordering::Release);
                     drop(guard);
                     return;
                 }
-                let current = shared.generation.load(Ordering::SeqCst);
-                if current != seen_generation {
-                    break current;
+                let current = shared.dispatch_state.load(Ordering::SeqCst);
+                if (current >> SLOT_BITS) != seen_generation
+                    && try_claim_slot(&shared.dispatch_state, &mut seen_generation)
+                {
+                    break;
                 }
                 guard = shared
                     .wake_workers
                     .wait(guard)
                     .unwrap_or_else(PoisonError::into_inner);
-            };
+            }
             shared.sleeping_workers.fetch_sub(1, Ordering::Release);
             drop(guard);
-            break current;
-        };
-        seen_generation = next_generation;
+            break;
+        }
 
         let _done = WorkerDoneGuard { shared };
         // SAFETY: Caller published `job` under `dispatch_lock` before advancing
@@ -785,6 +837,53 @@ mod tests {
                     assert_eq!(val, round.wrapping_mul(100).wrapping_add(idx));
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn small_dispatch_keeps_excess_prefill_workers_parked() -> io::Result<()> {
+        let pool = NativeRowPool::new(16)?;
+        let bg_workers = 15;
+        let mut waited_ms = 0_u32;
+        while pool.shared.sleeping_workers.load(Ordering::Acquire) < bg_workers && waited_ms < 500
+        {
+            thread::sleep(Duration::from_millis(1));
+            waited_ms += 1;
+        }
+        assert_eq!(pool.shared.sleeping_workers.load(Ordering::Acquire), 15);
+
+        // Single-task dispatch executes directly on caller without waking any parked worker.
+        let mut single = [0_usize; 1];
+        pool.dispatch_mut(&mut single, |idx, slot| {
+            *slot = idx + 99;
+        });
+        assert_eq!(single, [99]);
+        assert_eq!(pool.shared.sleeping_workers.load(Ordering::Acquire), 15);
+
+        // An 8-task dispatch wakes only 7 background workers (+ caller), leaving >= 8 parked.
+        let barrier = std::sync::Barrier::new(8);
+        let min_sleeping = AtomicUsize::new(usize::MAX);
+        let mut decode_slots = [0_usize; 8];
+        pool.dispatch_mut(&mut decode_slots, |idx, slot| {
+            barrier.wait();
+            let sleeping = pool.shared.sleeping_workers.load(Ordering::Acquire);
+            min_sleeping.fetch_min(sleeping, Ordering::Relaxed);
+            barrier.wait();
+            *slot = idx + 1;
+        });
+        assert_eq!(decode_slots, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(min_sleeping.load(Ordering::Relaxed) >= 8);
+
+        // Subsequent 16-task prefill dispatch still engages all 16 threads cleanly.
+        let mut prefill_slots = [0_usize; 16];
+        let prefill_barrier = std::sync::Barrier::new(16);
+        pool.dispatch_mut(&mut prefill_slots, |idx, slot| {
+            prefill_barrier.wait();
+            *slot = idx + 10;
+        });
+        for (idx, &val) in prefill_slots.iter().enumerate() {
+            assert_eq!(val, idx + 10);
         }
         Ok(())
     }

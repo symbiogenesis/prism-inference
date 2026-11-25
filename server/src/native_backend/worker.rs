@@ -9,8 +9,10 @@ use bonsai_prism_runtime::{
     runtime::{Cancellation, Completion, GenerationTimings},
     swift_session::{RichTextEvent, SwiftSession, TextEvent, TokenLogprobInfo},
 };
+#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+use std::path::PathBuf;
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -1211,7 +1213,7 @@ fn open_hexagon_native_q2_executor(
         not(test),
         not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))
     ),
-    expect(
+    allow(
         dead_code,
         reason = "Host-weight retention check is called on Windows ARM64 worker setup and unit tests."
     )

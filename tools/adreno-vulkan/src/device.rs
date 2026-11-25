@@ -24,7 +24,8 @@ static QGLC_PIPELINE_COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
 const FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 const QUALCOMM_VENDOR_ID: u32 = 0x5143;
-const MAX_STAGE_BINDINGS: usize = 12;
+/// Maximum storage buffer bindings supported per inline compute stage.
+pub const MAX_STAGE_BINDINGS: usize = 12;
 const MAX_PUSH_BYTES: usize = 128;
 const MAX_STAGE_PUSH_U32S: usize = MAX_PUSH_BYTES / 4;
 const PIPELINED_CB_COUNT: usize = 8;

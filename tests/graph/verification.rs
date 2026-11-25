@@ -24,6 +24,29 @@ impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for RefusingExecutor {
     }
 }
 
+struct ReleasedWeightRefusingExecutor;
+
+impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for ReleasedWeightRefusingExecutor {
+    fn identity(&self) -> &'static str {
+        "verification-released-weight-refused-executor"
+    }
+    fn supports(&self, _: &Tensor) -> bool {
+        false
+    }
+    fn project(
+        &mut self,
+        _: &Tensor,
+        _: &[bonsai_ternary::Q8KBlock],
+        _: bool,
+        _: &mut Vec<f32>,
+    ) -> Result<()> {
+        Err("verification must not invoke an external executor".into())
+    }
+    fn has_released_host_weight(&self, _: &Tensor) -> bool {
+        true
+    }
+}
+
 fn verified(model: Model) -> Result<Qwen35> {
     let graph = Qwen35::new(model, 192)?;
     let tile_bytes = graph.tiled_prefill_scratch_bytes(8)?;
@@ -195,10 +218,17 @@ fn tiled_verification_rejects_unadmitted_modes_and_clears_failed_output() -> Res
     let tile_bytes = graph.tiled_prefill_scratch_bytes(8)?;
     graph = graph.with_tiled_prefill(8, tile_bytes)?;
     graph.set_projection_executor(Some(Box::new(RefusingExecutor)));
+    let mut mixed_phase = graph.with_tiled_verification(logits_bytes)?;
+    mixed_phase.evaluate_batch_into(&[0, 1], &mut rows, &|| Ok(()))?;
+    assert_eq!(rows.len(), 2);
+    let mut graph = Qwen35::new(paged_hybrid_fixture(), 192)?;
+    let tile_bytes = graph.tiled_prefill_scratch_bytes(8)?;
+    graph = graph.with_tiled_prefill(8, tile_bytes)?;
+    graph.set_projection_executor(Some(Box::new(ReleasedWeightRefusingExecutor)));
     assert!(graph.with_tiled_verification(usize::MAX).is_err());
     let mut actual = verified(paged_hybrid_fixture())?;
     let initial = graph_bits(&actual)?;
-    actual.set_projection_executor(Some(Box::new(RefusingExecutor)));
+    actual.set_projection_executor(Some(Box::new(ReleasedWeightRefusingExecutor)));
     assert!(
         actual
             .evaluate_batch_into(&[0, 1], &mut rows, &|| Ok(()))

@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "aho-corasick",
  "base64ct",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "bonsai-adreno-vulkan",
  "bonsai-hexagon-native",

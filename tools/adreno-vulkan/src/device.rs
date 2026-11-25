@@ -28,7 +28,7 @@ const QUALCOMM_VENDOR_ID: u32 = 0x5143;
 pub const MAX_STAGE_BINDINGS: usize = 12;
 const MAX_PUSH_BYTES: usize = 128;
 const MAX_STAGE_PUSH_U32S: usize = MAX_PUSH_BYTES / 4;
-const PIPELINED_CB_COUNT: usize = 8;
+const PIPELINED_CB_COUNT: usize = 16;
 const PERSISTENT_MAX_SETS: u32 = 8192;
 const PERSISTENT_MAX_DESCRIPTORS: u32 = 32_768;
 /// Maximum descriptor sets allocated inside one synchronous Vulkan command buffer submission.
@@ -971,7 +971,7 @@ impl AdrenoVulkanDevice {
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(u32::try_from(PIPELINED_CB_COUNT).unwrap_or(8));
+            .command_buffer_count(u32::try_from(PIPELINED_CB_COUNT).unwrap_or(16));
         // SAFETY: Allocating `PIPELINED_CB_COUNT` primary command buffers from `command_pool`.
         let cmd_bufs = unsafe { device.allocate_command_buffers(&cmd_alloc) }
             .map_err(|err| format!("allocate_command_buffers: {err:?}"))?;
@@ -1970,7 +1970,7 @@ impl AdrenoVulkanDevice {
 
     /// Records and executes a [`CommandBatchRecorder`] split into chunks of at most
     /// `max_stages_per_submit` dispatches (bounded by device descriptor limits), pipelining up to
-    /// `8` command buffers back-to-back on the compute queue and waiting once on the final chunk
+    /// `16` command buffers back-to-back on the compute queue and waiting once on the final chunk
     /// (or at pipeline window boundaries), returning the number of Vulkan queue submits executed.
     ///
     /// Validates every stage before submitting the first chunk.
@@ -1991,6 +1991,10 @@ impl AdrenoVulkanDevice {
             self.abort_pipelined_session();
         }
         res
+    }
+
+    pub(crate) const fn has_unwaited_slots(&self) -> bool {
+        self.unwaited_slots > 0
     }
 
     pub(crate) fn ensure_pipelined_idle(&self) -> Result<(), Error> {

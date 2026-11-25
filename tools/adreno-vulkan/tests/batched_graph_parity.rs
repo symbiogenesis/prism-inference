@@ -899,7 +899,7 @@ fn synthetic_hybrid_model_builds_and_config_defaults_are_well_formed() -> TestRe
     let cfg = VulkanBatchedConfig::default();
     assert_eq!(cfg.kv_precision, VulkanKvPrecision::Fp16);
     assert_eq!(cfg.tdr_policy.layers_per_submit, 8);
-    assert_eq!(cfg.prefill_tile_tokens, 16);
+    assert_eq!(cfg.prefill_tile_tokens, 32);
     assert_eq!(cfg.kv_precision.name(), "fp16");
     assert_eq!(VulkanKvPrecision::Fp32.name(), "fp32");
 
@@ -2703,6 +2703,60 @@ fn live_prefill_16tok_fused_h1024_and_decode_gdn_hybrid_parity() -> TestResult {
                 5e-3,
                 5e-3,
                 &format!("bat vs cpu h1024 hybrid T={len}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_fused_block_and_evaluate_last_tile32_parity() -> TestResult {
+    let prompt_all: [u32; 37] = [
+        0, 3, 6, 9, 12, 2, 5, 8, 11, 14, 1, 4, 7, 10, 13, 15, 2, 7, 11, 1, 4, 9, 13, 6, 10, 14, 3,
+        8, 12, 5, 0, 15, 2, 9, 4, 11, 6,
+    ];
+    let base_model = synthetic_hadamard1024_hybrid_model("h1024-fused-eval-last-32")?;
+    let q8_model = clone_with_q8_0_weights(&base_model, 41);
+
+    for model in [&base_model, &q8_model] {
+        let mut seq_exec = VulkanBatchedGraphExecutor::open(model, VulkanBatchedConfig::default())?;
+        let mut fused_exec =
+            VulkanBatchedGraphExecutor::open(model, VulkanBatchedConfig::default())?;
+
+        for &len in &[1_usize, 5, 16, 32, 37] {
+            let prompt = &prompt_all[..len];
+            seq_exec.reset()?;
+            fused_exec.reset()?;
+
+            for &tok in &prompt[..len - 1] {
+                seq_exec.ingest_token(tok)?;
+            }
+            let seq_logits = seq_exec.evaluate_token(prompt[len - 1])?;
+
+            let mut fused_logits = Vec::new();
+            fused_exec.ingest_block_and_evaluate_last_into(prompt, &mut fused_logits)?;
+
+            assert_close(
+                &fused_logits,
+                &seq_logits,
+                1e-4,
+                &format!("fused block+last vs seq T={len}"),
+            );
+            assert_eq!(
+                fused_exec.checkpoint()?.identity_sha256()?,
+                seq_exec.checkpoint()?.identity_sha256()?,
+                "fused block+last checkpoint mismatch T={len}"
+            );
+
+            // Continue one sequential decode step to confirm post-fused-prefill KV/GDN state.
+            let next_seq = seq_exec.evaluate_token(7)?;
+            let next_fused = fused_exec.evaluate_token(7)?;
+            assert_close(
+                &next_fused,
+                &next_seq,
+                1e-4,
+                &format!("post fused block+last decode T={len}"),
             );
         }
     }

@@ -209,6 +209,40 @@ mod platform {
         }
     }
 
+    impl VulkanBatchedDecoder {
+        #[expect(
+            dead_code,
+            reason = "Staged fused block-prefill + final-token logits helper ready to hook into Decoder integration."
+        )]
+        pub(super) fn ingest_block_and_evaluate_last_into(
+            &self,
+            tokens: &[u32],
+            output: &mut Vec<f32>,
+            check: &dyn Fn() -> RuntimeResult<()>,
+        ) -> RuntimeResult<()> {
+            let mut inner = self
+                .shared
+                .try_borrow_mut()
+                .map_err(|_| runtime_invalid("Vulkan batched executor borrow conflict"))?;
+            let mut pending_check_err: Option<bonsai_prism_runtime::Error> = None;
+            let mut wrapped_check = || -> Result<(), bonsai_adreno_vulkan::Error> {
+                if let Err(err) = check() {
+                    pending_check_err = Some(err);
+                    return Err(bonsai_adreno_vulkan::Error::Cancelled);
+                }
+                Ok(())
+            };
+            inner
+                .executor
+                .ingest_block_and_evaluate_last_with_check_into(tokens, output, &mut wrapped_check)
+                .map_err(|err| {
+                    pending_check_err
+                        .take()
+                        .unwrap_or_else(|| err.into_runtime_error())
+                })
+        }
+    }
+
     struct PendingVulkanUpload {
         model: Model,
         rank_one_model: Option<Model>,
@@ -391,6 +425,38 @@ mod platform {
             self.seed
         }
 
+        /// Ingests `tokens` through the worker-thread Vulkan executor and writes final-token
+        /// logits into `output`, clearing `output` on error.
+        ///
+        /// Staged helper ready to hook into [`Decoder`] batched prefill integration.
+        #[expect(
+            dead_code,
+            reason = "Staged fused block-prefill + final-token logits helper ready to hook into Decoder integration."
+        )]
+        pub(crate) fn ingest_block_and_evaluate_last_into(
+            &self,
+            tokens: &[u32],
+            output: &mut Vec<f32>,
+            check: &dyn Fn() -> RuntimeResult<()>,
+        ) -> RuntimeResult<()> {
+            output.clear();
+            if self.is_faulted() {
+                return Err(runtime_invalid("Vulkan Swift session requires reset"));
+            }
+            check()?;
+            WORKER_VULKAN_RUNTIME.with_borrow(|slot| {
+                let runtime = slot.as_ref().ok_or_else(|| {
+                    runtime_invalid("Vulkan batched runtime is not initialized on worker thread")
+                })?;
+                if runtime.is_faulted() {
+                    return Err(runtime_invalid("Vulkan batched runtime requires reset"));
+                }
+                runtime
+                    .decoder()
+                    .ingest_block_and_evaluate_last_into(tokens, output, check)
+            })
+        }
+
         #[must_use]
         pub(super) fn is_faulted(&self) -> bool {
             self.delivery_fault
@@ -553,7 +619,7 @@ mod platform {
                 runtime.generate_sampled_until_with_timings(
                     &prepared.tokens,
                     &options,
-                    Prefill { block_tokens: 16 },
+                    Prefill { block_tokens: 32 },
                     cancellation,
                     deadline,
                     &mut self.sampler,
@@ -1085,6 +1151,7 @@ mod platform {
         MultiRankAdapterSpec, NativeBackendError, Path, PendingChat, Placement, ProjectionStartup,
         PromptReuse, Representation, TextEvent, WorkerOptions,
     };
+    use bonsai_prism_runtime::Result as RuntimeResult;
 
     pub(in super::super) struct VulkanPreparedChat {
         admitted: AdmittedChat,
@@ -1123,6 +1190,25 @@ mod platform {
         #[must_use]
         pub(crate) const fn seed(&self) -> u32 {
             0
+        }
+
+        #[expect(
+            dead_code,
+            clippy::missing_const_for_fn,
+            reason = "Non-Windows stub matches the Windows VulkanSwiftSession helper signature."
+        )]
+        pub(crate) fn ingest_block_and_evaluate_last_into(
+            &self,
+            _tokens: &[u32],
+            output: &mut Vec<f32>,
+            _check: &dyn Fn() -> RuntimeResult<()>,
+        ) -> RuntimeResult<()> {
+            output.clear();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Adreno Vulkan batched session requires Windows",
+            )
+            .into())
         }
     }
 

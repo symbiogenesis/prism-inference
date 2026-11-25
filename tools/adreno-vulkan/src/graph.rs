@@ -218,7 +218,7 @@ pub struct VulkanBatchedConfig {
     /// Optional explicit override for Prism `PinnedSwift` vs `Source` integer rounding/FMA contract.
     /// When `None`, auto-detects from verified Swift model SHA-256 identities.
     pub pinned_arithmetic: Option<bool>,
-    /// Maximum prompt tokens evaluated together per batched GPU prefill tile (`1..=256`, default `16`).
+    /// Maximum prompt tokens evaluated together per batched GPU prefill tile (`1..=256`, default `32`).
     ///
     /// Setting `1` forces single-token evaluation inside [`Decoder::ingest_block`]. Larger values
     /// amortize weight reads across tokens while remaining bounded by `scratch_budget_bytes` and
@@ -237,7 +237,7 @@ impl Default for VulkanBatchedConfig {
             max_layer_count: None,
             scratch_budget_bytes: 256 * 1024 * 1024,
             pinned_arithmetic: None,
-            prefill_tile_tokens: 16,
+            prefill_tile_tokens: 32,
         }
     }
 }
@@ -882,6 +882,7 @@ struct GpuLayer {
 
 struct GpuGraphScratch {
     hidden: BufferId,
+    hidden_staging: [BufferId; 2],
     norm: BufferId,
     delta: BufferId,
     transformed: BufferId,
@@ -897,7 +898,9 @@ struct GpuGraphScratch {
     gdn_k: BufferId,
     gdn_v: BufferId,
     rope_freqs: BufferId,
+    rope_freqs_staging: [BufferId; 2],
     lora_ranks: BufferId,
+    lora_ranks_staging: [BufferId; 2],
     attn_scores: BufferId,
     attn_probs: BufferId,
     attn_score_bytes: u64,
@@ -988,6 +991,8 @@ pub struct VulkanBatchedGraphExecutor {
     host_embed_tile_scratch: Vec<f32>,
     host_rope_freqs: Vec<f32>,
     host_lora_ranks: Vec<f32>,
+    staging_bank_in_flight: [bool; 2],
+    next_staging_bank: usize,
     rank_one_embed: Option<GpuRankOneEmbed>,
     rank_one_scale: Option<f32>,
     multi_rank_scale: Option<f32>,
@@ -1292,6 +1297,8 @@ impl VulkanBatchedGraphExecutor {
             host_embed_tile_scratch,
             host_rope_freqs,
             host_lora_ranks,
+            staging_bank_in_flight: [false; 2],
+            next_staging_bank: 0,
             rank_one_embed: uploaded_adapters.rank_one_embed,
             rank_one_scale: uploaded_adapters.rank_one_scale,
             multi_rank_scale: uploaded_adapters.multi_rank_scale,
@@ -1343,8 +1350,9 @@ impl VulkanBatchedGraphExecutor {
     /// reading logits.
     ///
     /// Tiles up to [`VulkanBatchedConfig::prefill_tile_tokens`] (bounded by scratch budget and
-    /// device limits) evaluate together in a single GPU sweep over layer weights, using 4-token
-    /// coalesced GEMM kernels for quantized/F32 projections and `#40` multi-query causal attention.
+    /// device limits) evaluate together in a single GPU sweep over layer weights, using 16-token /
+    /// 4-token coalesced GEMM kernels for quantized/F32 projections and `#40` multi-query causal
+    /// attention, overlapping double-buffered host staging across consecutive mid-prefill tiles.
     ///
     /// # Errors
     /// Returns [`Error::InvalidInput`] if `tokens` is empty, contains an out-of-vocabulary token,
@@ -1352,6 +1360,49 @@ impl VulkanBatchedGraphExecutor {
     /// on GPU failure.
     pub fn ingest_tokens_batched(&mut self, tokens: &[u32]) -> Result<(), Error> {
         self.ingest_tokens_batched_with_check(tokens, &mut || Ok(()))
+    }
+
+    /// Advances model recurrent/KV state on GPU across `tokens` in batched GPU tiles and writes
+    /// `[vocabulary]` logits for the final token `tokens[tokens.len() - 1]` into `logits`.
+    ///
+    /// Mid-prefill tiles evaluate without reading logits and overlap host-upload staging without
+    /// draining between tiles. On the final tile, layers `0..last_layer` run batched across all
+    /// `t_len` tokens while `last_layer` updates recurrent/KV state for `0..t_len` and computes
+    /// attention output, FFN, `output_norm`, and `lm_head` only for slice `t_len - 1`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if `tokens` is empty, contains an out-of-vocabulary token,
+    /// or exceeds `context_limit`, or [`Error::ResourceLimit`]/[`Error::DeviceFault`]/[`Error::Vulkan`]
+    /// on GPU failure. Clears `logits` on error.
+    pub fn ingest_block_and_evaluate_last_into(
+        &mut self,
+        tokens: &[u32],
+        logits: &mut Vec<f32>,
+    ) -> Result<(), Error> {
+        self.ingest_block_and_evaluate_last_with_check_into(tokens, logits, &mut || Ok(()))
+    }
+
+    /// Advances model recurrent/KV state on GPU across `tokens` in batched GPU tiles with
+    /// cooperative cancellation/deadline checks between tiles and TDR chunks, writing
+    /// `[vocabulary]` logits for the final token into `logits`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Cancelled`] when `check` rejects, [`Error::InvalidInput`] if `tokens` is
+    /// empty, contains an out-of-vocabulary token, or exceeds `context_limit`, or
+    /// [`Error::ResourceLimit`]/[`Error::DeviceFault`]/[`Error::Vulkan`] on GPU failure. Clears
+    /// `logits` on error.
+    pub fn ingest_block_and_evaluate_last_with_check_into(
+        &mut self,
+        tokens: &[u32],
+        logits: &mut Vec<f32>,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        logits.clear();
+        let res = self.ingest_tokens_and_maybe_eval_last_with_check(tokens, Some(logits), check);
+        if res.is_err() {
+            logits.clear();
+        }
+        res
     }
 
     /// Resets all GPU recurrent GDN/conv state and position counters cleanly back to position `0`.
@@ -1364,6 +1415,9 @@ impl VulkanBatchedGraphExecutor {
                 "Vulkan batched executor faulted and cannot reset".to_owned(),
             ));
         }
+        self.device.ensure_pipelined_idle()?;
+        self.staging_bank_in_flight = [false; 2];
+        self.next_staging_bank = 0;
         for layer in &self.layers {
             match &layer.attention {
                 GpuLayerAttention::Recurrent {
@@ -1590,6 +1644,7 @@ impl VulkanBatchedGraphExecutor {
                 "cannot checkpoint faulted or inconsistent Vulkan graph executor".to_owned(),
             ));
         }
+        self.device.ensure_pipelined_idle()?;
         let kv_width = self.geometry.kv_width();
         let reuse = target.layers.len() == self.layers.len();
         if !reuse {
@@ -1734,6 +1789,9 @@ impl VulkanBatchedGraphExecutor {
                 "Vulkan batched executor faulted and cannot restore".to_owned(),
             ));
         }
+        self.device.ensure_pipelined_idle()?;
+        self.staging_bank_in_flight = [false; 2];
+        self.next_staging_bank = 0;
         #[expect(
             clippy::suspicious_operation_groupings,
             reason = "Checkpoint stores the target executor digest in `executor_identity_sha256` while executor holds `identity_sha256`."
@@ -1912,7 +1970,7 @@ impl VulkanBatchedGraphExecutor {
         logits_out: Option<&mut Vec<f32>>,
     ) -> Result<(), Error> {
         self.validate_execution_ready(&[token])?;
-        self.step_tile_impl(&[token], logits_out, &mut || Ok(()))
+        self.step_tile_pipelined_impl(&[token], logits_out, true, &mut || Ok(()))
     }
 
     fn validate_execution_ready(&self, tokens: &[u32]) -> Result<(), Error> {
@@ -1957,27 +2015,60 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
+    fn drain_pipelined_session(&mut self) -> Result<(), Error> {
+        if !self.device.has_unwaited_slots() {
+            self.staging_bank_in_flight = [false; 2];
+            return Ok(());
+        }
+        let res = self.device.finish_pipelined_session();
+        self.staging_bank_in_flight = [false; 2];
+        if res.is_err() {
+            self.device.abort_pipelined_session();
+            self.state_consistent = false;
+        }
+        res
+    }
+
     fn ingest_tokens_batched_with_check(
         &mut self,
         tokens: &[u32],
         check: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
-        self.validate_execution_ready(tokens)?;
-        let tile_cap = self.scratch.allocated_tile_tokens.max(1);
-        for tile in tokens.chunks(tile_cap) {
-            check()?;
-            self.step_tile_impl(tile, None, check)?;
-            check()?;
-        }
-        Ok(())
+        self.ingest_tokens_and_maybe_eval_last_with_check(tokens, None, check)
     }
 
-    fn prepare_tile_host_inputs(
+    fn ingest_tokens_and_maybe_eval_last_with_check(
         &mut self,
         tokens: &[u32],
-    ) -> Result<Option<(BufferSpan, f32)>, Error> {
-        let t_len = tokens.len();
-        if t_len == 1 {
+        mut logits_out: Option<&mut Vec<f32>>,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.validate_execution_ready(tokens)?;
+        let tile_cap = self.scratch.allocated_tile_tokens.max(1);
+        let total_tiles = tokens.len().div_ceil(tile_cap);
+        for (tile_idx, tile) in tokens.chunks(tile_cap).enumerate() {
+            if let Err(err) = check() {
+                self.drain_pipelined_session()?;
+                return Err(err);
+            }
+            let is_last_tile = tile_idx + 1 == total_tiles;
+            let tile_logits = if is_last_tile {
+                logits_out.take()
+            } else {
+                None
+            };
+            let drain_at_tile_end = is_last_tile || tile_logits.is_some();
+            self.step_tile_pipelined_impl(tile, tile_logits, drain_at_tile_end, check)?;
+            if let Err(err) = check() {
+                self.drain_pipelined_session()?;
+                return Err(err);
+            }
+        }
+        self.drain_pipelined_session()
+    }
+
+    fn write_tile_embeddings(&mut self, tokens: &[u32], hidden_dst: BufferId) -> Result<(), Error> {
+        if tokens.len() == 1 {
             let token_idx = usize::try_from(tokens[0])
                 .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
             row_into(&self.embedding, token_idx, &mut self.host_embed_scratch)
@@ -1987,7 +2078,7 @@ impl VulkanBatchedGraphExecutor {
                 "token embedding contains non-finite value",
             )?;
             self.device
-                .write_buffer_f32(self.scratch.hidden, &self.host_embed_scratch)?;
+                .write_buffer_f32(hidden_dst, &self.host_embed_scratch)
         } else {
             self.host_embed_tile_scratch.clear();
             for &token in tokens {
@@ -2003,39 +2094,84 @@ impl VulkanBatchedGraphExecutor {
                     .extend_from_slice(&self.host_embed_scratch);
             }
             self.device
-                .write_buffer_f32(self.scratch.hidden, &self.host_embed_tile_scratch)?;
+                .write_buffer_f32(hidden_dst, &self.host_embed_tile_scratch)
         }
+    }
 
-        let active_embed_lora = if let (Some(embed_lora), Some(scale)) =
-            (&self.rank_one_embed, self.rank_one_scale)
-            && scale != 0.0
-        {
-            let effective_scale = scale * embed_lora.alpha;
-            if !effective_scale.is_finite() {
+    fn write_tile_embed_lora(
+        &mut self,
+        tokens: &[u32],
+        lora_dst: BufferId,
+    ) -> Result<Option<(BufferSpan, f32)>, Error> {
+        let Some((embed_lora, scale)) = self
+            .rank_one_embed
+            .as_ref()
+            .zip(self.rank_one_scale)
+            .filter(|&(_, s)| s != 0.0)
+        else {
+            return Ok(None);
+        };
+        let effective_scale = scale * embed_lora.alpha;
+        if !effective_scale.is_finite() {
+            return Err(Error::InvalidInput(
+                "embedding LoRA scalar or scale is non-finite".to_owned(),
+            ));
+        }
+        self.host_lora_ranks.clear();
+        for &token in tokens {
+            let token_idx = usize::try_from(token)
+                .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
+            let a_val = embed_lora.a_values.get(token_idx).copied().ok_or_else(|| {
+                Error::InvalidInput("embedding LoRA token out of bounds".to_owned())
+            })?;
+            if !a_val.is_finite() {
                 return Err(Error::InvalidInput(
                     "embedding LoRA scalar or scale is non-finite".to_owned(),
                 ));
             }
-            self.host_lora_ranks.clear();
-            for &token in tokens {
-                let token_idx = usize::try_from(token)
-                    .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
-                let a_val = embed_lora.a_values.get(token_idx).copied().ok_or_else(|| {
-                    Error::InvalidInput("embedding LoRA token out of bounds".to_owned())
-                })?;
-                if !a_val.is_finite() {
-                    return Err(Error::InvalidInput(
-                        "embedding LoRA scalar or scale is non-finite".to_owned(),
-                    ));
-                }
-                self.host_lora_ranks.push(a_val);
+            self.host_lora_ranks.push(a_val);
+        }
+        self.device
+            .write_buffer_f32(lora_dst, &self.host_lora_ranks)?;
+        Ok(Some((embed_lora.b_span, effective_scale)))
+    }
+
+    fn prepare_tile_host_inputs(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<PreparedTileUpload, Error> {
+        if !self.device.has_unwaited_slots() {
+            self.staging_bank_in_flight = [false; 2];
+        }
+        let staged_bank = if self.device.has_unwaited_slots() {
+            let bank = self.next_staging_bank;
+            self.next_staging_bank ^= 1;
+            if self.staging_bank_in_flight[bank] {
+                self.drain_pipelined_session()?;
+                None
+            } else {
+                Some(bank)
             }
-            self.device
-                .write_buffer_f32(self.scratch.lora_ranks, &self.host_lora_ranks)?;
-            Some((embed_lora.b_span, effective_scale))
         } else {
             None
         };
+
+        let (hidden_dst, lora_dst, rope_dst) = if let Some(bank) = staged_bank {
+            (
+                self.scratch.hidden_staging[bank],
+                self.scratch.lora_ranks_staging[bank],
+                self.scratch.rope_freqs_staging[bank],
+            )
+        } else {
+            (
+                self.scratch.hidden,
+                self.scratch.lora_ranks,
+                self.scratch.rope_freqs,
+            )
+        };
+
+        self.write_tile_embeddings(tokens, hidden_dst)?;
+        let active_embed_lora = self.write_tile_embed_lora(tokens, lora_dst)?;
 
         let has_full_layers = self
             .layers
@@ -2043,7 +2179,7 @@ impl VulkanBatchedGraphExecutor {
             .any(|layer| matches!(layer.attention, GpuLayerAttention::Full { .. }));
         if has_full_layers {
             let rope = self.geometry.rope;
-            let rope_end = t_len * rope;
+            let rope_end = tokens.len() * rope;
             for (t, dst_slice) in self.host_rope_freqs[..rope_end]
                 .chunks_exact_mut(rope)
                 .enumerate()
@@ -2057,21 +2193,26 @@ impl VulkanBatchedGraphExecutor {
                 fill_rope_frequencies(&self.geometry, tok_mrope, dst_slice)?;
             }
             self.device
-                .write_buffer_f32(self.scratch.rope_freqs, &self.host_rope_freqs[..rope_end])?;
+                .write_buffer_f32(rope_dst, &self.host_rope_freqs[..rope_end])?;
         }
 
-        Ok(active_embed_lora)
+        Ok(PreparedTileUpload {
+            active_embed_lora,
+            staged_bank,
+            has_full_layers,
+        })
     }
 
-    fn step_tile_impl(
+    fn step_tile_pipelined_impl(
         &mut self,
         tokens: &[u32],
         logits_out: Option<&mut Vec<f32>>,
+        drain_at_tile_end: bool,
         check: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
         let t_len = tokens.len();
         if let Some(dst) = logits_out {
-            self.run_tile_gpu_into(tokens, Some(dst), check)?;
+            self.run_tile_gpu_pipelined_into(tokens, Some(dst), drain_at_tile_end, check)?;
             if let Err(err) = ensure_finite_f32(dst, "GPU batched graph produced non-finite logits")
             {
                 dst.clear();
@@ -2079,7 +2220,7 @@ impl VulkanBatchedGraphExecutor {
                 return Err(err);
             }
         } else {
-            self.run_tile_gpu_into(tokens, None, check)?;
+            self.run_tile_gpu_pipelined_into(tokens, None, drain_at_tile_end, check)?;
         }
         self.commit_tile_position(t_len);
         Ok(())
@@ -2098,15 +2239,25 @@ impl VulkanBatchedGraphExecutor {
         logits_out: Option<&mut Vec<f32>>,
         check: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.run_tile_gpu_pipelined_into(tokens, logits_out, true, check)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Coordinates host-staged tile upload, layered TDR command chunks, fused final-token logits, and optional queue drain."
+    )]
+    fn run_tile_gpu_pipelined_into(
+        &mut self,
+        tokens: &[u32],
+        logits_out: Option<&mut Vec<f32>>,
+        drain_at_tile_end: bool,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let t_len = tokens.len();
-        if logits_out.is_some() && t_len != 1 {
-            return Err(Error::InvalidInput(
-                "logit readout requires a single token".to_owned(),
-            ));
-        }
         let t_u32 = u32::try_from(t_len)
             .map_err(|_| Error::ResourceLimit("tile token count exceeds u32".to_owned()))?;
-        let active_embed_lora = self.prepare_tile_host_inputs(tokens)?;
+        let prepared = self.prepare_tile_host_inputs(tokens)?;
+        let active_embed_lora = prepared.active_embed_lora;
 
         let chunks = self
             .config
@@ -2117,72 +2268,148 @@ impl VulkanBatchedGraphExecutor {
         let min_align = usize::try_from(self.device.min_storage_buffer_offset_alignment().max(1))
             .unwrap_or(256);
 
+        let had_unwaited_before = self.device.has_unwaited_slots();
         let mut mutated_gpu = false;
         let run_result = (|| -> Result<(), Error> {
-            self.device.ensure_pipelined_idle()?;
-            for (chunk_idx, range) in chunks.iter().enumerate() {
-                if chunk_idx > 0 {
-                    check()?;
-                }
-                self.batch_recorder.clear();
-                if chunk_idx == 0 {
-                    if self.transforms.inverse_embedding {
-                        self.record_inverse_embedding_transform_tokens(t_len)?;
+            let record_tile_prologue = |this: &mut Self| -> Result<(), Error> {
+                if let Some(bank) = prepared.staged_bank {
+                    let total_embed_u32 = u32::try_from(t_len * this.geometry.embedding)
+                        .map_err(|_| Error::ResourceLimit("staged embedding exceeds u32".to_owned()))?;
+                    this.record_copy_slice(
+                        this.scratch.hidden_staging[bank],
+                        0,
+                        this.scratch.hidden,
+                        total_embed_u32,
+                        true,
+                    )?;
+                    if active_embed_lora.is_some() {
+                        this.record_copy_slice(
+                            this.scratch.lora_ranks_staging[bank],
+                            0,
+                            this.scratch.lora_ranks,
+                            t_u32,
+                            false,
+                        )?;
                     }
-                    if let Some((b_span, eff_scale)) = active_embed_lora {
-                        let embed_u32 = u32::try_from(self.geometry.embedding).map_err(|_| {
-                            Error::ResourceLimit("embedding exceeds u32".to_owned())
-                        })?;
-                        if t_len == 1 {
-                            self.batch_recorder.push_barrier(
-                                self.pipelines.lora_b_accum,
-                                &[
-                                    b_span,
-                                    BufferSpan::whole(self.scratch.lora_ranks),
-                                    BufferSpan::whole(self.scratch.hidden),
-                                ],
-                                &[embed_u32, 1, eff_scale.to_bits()],
-                                checked_grid(
-                                    &self.device,
-                                    [embed_u32.div_ceil(WORKGROUP_X), 1, 1],
-                                )?,
-                            );
-                        } else {
-                            self.batch_recorder.push_barrier(
-                                self.pipelines.lora_b_accum_batched,
-                                &[
-                                    b_span,
-                                    BufferSpan::whole(self.scratch.lora_ranks),
-                                    BufferSpan::whole(self.scratch.hidden),
-                                ],
-                                &[embed_u32, 1, t_u32, eff_scale.to_bits()],
-                                checked_grid(
-                                    &self.device,
-                                    [embed_u32.div_ceil(WORKGROUP_X), t_u32.div_ceil(4), 1],
-                                )?,
-                            );
+                    if prepared.has_full_layers {
+                        let total_rope_u32 = u32::try_from(t_len * this.geometry.rope)
+                            .map_err(|_| Error::ResourceLimit("staged rope exceeds u32".to_owned()))?;
+                        this.record_copy_slice(
+                            this.scratch.rope_freqs_staging[bank],
+                            0,
+                            this.scratch.rope_freqs,
+                            total_rope_u32,
+                            false,
+                        )?;
+                    }
+                    this.staging_bank_in_flight[bank] = true;
+                }
+                if this.transforms.inverse_embedding {
+                    this.record_inverse_embedding_transform_tokens(t_len)?;
+                }
+                if let Some((b_span, eff_scale)) = active_embed_lora {
+                    let embed_u32 = u32::try_from(this.geometry.embedding).map_err(|_| {
+                        Error::ResourceLimit("embedding exceeds u32".to_owned())
+                    })?;
+                    if t_len == 1 {
+                        this.batch_recorder.push_barrier(
+                            this.pipelines.lora_b_accum,
+                            &[
+                                b_span,
+                                BufferSpan::whole(this.scratch.lora_ranks),
+                                BufferSpan::whole(this.scratch.hidden),
+                            ],
+                            &[embed_u32, 1, eff_scale.to_bits()],
+                            checked_grid(
+                                &this.device,
+                                [embed_u32.div_ceil(WORKGROUP_X), 1, 1],
+                            )?,
+                        );
+                    } else {
+                        this.batch_recorder.push_barrier(
+                            this.pipelines.lora_b_accum_batched,
+                            &[
+                                b_span,
+                                BufferSpan::whole(this.scratch.lora_ranks),
+                                BufferSpan::whole(this.scratch.hidden),
+                            ],
+                            &[embed_u32, 1, t_u32, eff_scale.to_bits()],
+                            checked_grid(
+                                &this.device,
+                                [embed_u32.div_ceil(WORKGROUP_X), t_u32.div_ceil(4), 1],
+                            )?,
+                        );
+                    }
+                }
+                Ok(())
+            };
+
+            if chunks.is_empty() {
+                if need_logits || prepared.staged_bank.is_some() {
+                    self.batch_recorder.clear();
+                    record_tile_prologue(self)?;
+                    if need_logits {
+                        self.record_final_logits(t_len)?;
+                    }
+                    if !self.batch_recorder.is_empty() {
+                        mutated_gpu = true;
+                        let submits = self.device.submit_pipelined_batches_with_max_stages(
+                            &self.batch_recorder,
+                            self.config.tdr_policy.max_stages_per_submit,
+                            drain_at_tile_end,
+                        )?;
+                        self.submits_completed = self.submits_completed.saturating_add(submits);
+                        if !self.device.has_unwaited_slots() {
+                            self.staging_bank_in_flight = [false; 2];
                         }
                     }
                 }
-                for layer_idx in range.clone() {
-                    let narrow_final = !need_logits && layer_idx + 1 == total_layers;
-                    self.record_layer_tokens(layer_idx, t_len, narrow_final, min_align)?;
-                }
-                let is_final_chunk = chunk_idx + 1 == chunks.len();
-                if is_final_chunk && need_logits {
-                    self.record_final_logits()?;
-                }
-                if !self.batch_recorder.is_empty() {
-                    mutated_gpu = true;
-                    let submits = self.device.submit_pipelined_batches_with_max_stages(
-                        &self.batch_recorder,
-                        self.config.tdr_policy.max_stages_per_submit,
-                        is_final_chunk,
-                    )?;
-                    self.submits_completed = self.submits_completed.saturating_add(submits);
+            } else {
+                for (chunk_idx, range) in chunks.iter().enumerate() {
+                    if chunk_idx > 0 {
+                        check()?;
+                    }
+                    self.batch_recorder.clear();
+                    if chunk_idx == 0 {
+                        record_tile_prologue(self)?;
+                    }
+                    for layer_idx in range.clone() {
+                        let mode = if layer_idx + 1 == total_layers {
+                            if !need_logits {
+                                FinalLayerMode::IngestOnly
+                            } else if t_len > 1 {
+                                FinalLayerMode::LastTokenLogits
+                            } else {
+                                FinalLayerMode::FullAllTokens
+                            }
+                        } else {
+                            FinalLayerMode::FullAllTokens
+                        };
+                        self.record_layer_tokens(layer_idx, t_len, mode, min_align)?;
+                    }
+                    let is_final_chunk = chunk_idx + 1 == chunks.len();
+                    if is_final_chunk && need_logits {
+                        self.record_final_logits(t_len)?;
+                    }
+                    if !self.batch_recorder.is_empty() {
+                        mutated_gpu = true;
+                        let fence_this_chunk = drain_at_tile_end && is_final_chunk;
+                        let submits = self.device.submit_pipelined_batches_with_max_stages(
+                            &self.batch_recorder,
+                            self.config.tdr_policy.max_stages_per_submit,
+                            fence_this_chunk,
+                        )?;
+                        self.submits_completed = self.submits_completed.saturating_add(submits);
+                        if !self.device.has_unwaited_slots() {
+                            self.staging_bank_in_flight = [false; 2];
+                        }
+                    }
                 }
             }
-            self.device.finish_pipelined_session()?;
+            if drain_at_tile_end || need_logits {
+                self.device.finish_pipelined_session()?;
+                self.staging_bank_in_flight = [false; 2];
+            }
 
             if let Some(dst) = logits_out {
                 dst.resize(self.geometry.vocabulary, 0.0_f32);
@@ -2193,7 +2420,8 @@ impl VulkanBatchedGraphExecutor {
 
         if run_result.is_err() {
             self.device.abort_pipelined_session();
-            if mutated_gpu {
+            self.staging_bank_in_flight = [false; 2];
+            if mutated_gpu || had_unwaited_before {
                 self.state_consistent = false;
             }
             return run_result;
@@ -2319,11 +2547,136 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
+    fn record_copy_slice(
+        &mut self,
+        src: BufferId,
+        src_offset: u32,
+        dst: BufferId,
+        len: u32,
+        barrier: bool,
+    ) -> Result<(), Error> {
+        let grid = checked_grid(&self.device, [len.div_ceil(WORKGROUP_X), 1, 1])?;
+        self.batch_recorder.push(
+            self.pipelines.copy_slice,
+            &[BufferSpan::whole(src), BufferSpan::whole(dst)],
+            &[src_offset, len],
+            grid,
+            barrier,
+        );
+        Ok(())
+    }
+
+    fn record_last_token_recurrent_slice(
+        &mut self,
+        tokens: usize,
+        gdn_out_buf: BufferId,
+        val_width: usize,
+    ) -> Result<(), Error> {
+        let embed = self.geometry.embedding;
+        let last = tokens - 1;
+        let last_embed_off = u32::try_from(last * embed).map_err(|_| {
+            Error::ResourceLimit("last token embedding offset exceeds u32".to_owned())
+        })?;
+        let embed_u32 = u32::try_from(embed)
+            .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
+        let last_val_off = u32::try_from(last * val_width)
+            .map_err(|_| Error::ResourceLimit("last token value offset exceeds u32".to_owned()))?;
+        let val_u32 = u32::try_from(val_width)
+            .map_err(|_| Error::ResourceLimit("val_width exceeds u32".to_owned()))?;
+
+        // `proj_a`, `proj_c`, `proj_d` are unused after GDN scan and disjoint from `gdn_out_buf` (`proj_e`).
+        self.record_copy_slice(
+            self.scratch.norm,
+            last_embed_off,
+            self.scratch.proj_a,
+            embed_u32,
+            true,
+        )?;
+        self.record_copy_slice(
+            self.scratch.hidden,
+            last_embed_off,
+            self.scratch.proj_c,
+            embed_u32,
+            false,
+        )?;
+        self.record_copy_slice(
+            gdn_out_buf,
+            last_val_off,
+            self.scratch.proj_d,
+            val_u32,
+            false,
+        )?;
+
+        self.record_copy_slice(self.scratch.proj_a, 0, self.scratch.norm, embed_u32, true)?;
+        self.record_copy_slice(
+            self.scratch.proj_c,
+            0,
+            self.scratch.hidden,
+            embed_u32,
+            false,
+        )?;
+        self.record_copy_slice(self.scratch.proj_d, 0, gdn_out_buf, val_u32, false)
+    }
+
+    fn record_last_token_full_slice(&mut self, tokens: usize) -> Result<(), Error> {
+        let embed = self.geometry.embedding;
+        let rope = self.geometry.rope;
+        let last = tokens - 1;
+        let last_embed_off = u32::try_from(last * embed).map_err(|_| {
+            Error::ResourceLimit("last token embedding offset exceeds u32".to_owned())
+        })?;
+        let embed_u32 = u32::try_from(embed)
+            .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
+        let last_rope_off = u32::try_from(last * rope)
+            .map_err(|_| Error::ResourceLimit("last token rope offset exceeds u32".to_owned()))?;
+        let rope_u32 = u32::try_from(rope)
+            .map_err(|_| Error::ResourceLimit("rope exceeds u32".to_owned()))?;
+
+        // `proj_b`, `proj_c`, `proj_e` are dead after K/V append and before Q-only evaluation.
+        self.record_copy_slice(
+            self.scratch.norm,
+            last_embed_off,
+            self.scratch.proj_b,
+            embed_u32,
+            true,
+        )?;
+        self.record_copy_slice(
+            self.scratch.hidden,
+            last_embed_off,
+            self.scratch.proj_c,
+            embed_u32,
+            false,
+        )?;
+        self.record_copy_slice(
+            self.scratch.rope_freqs,
+            last_rope_off,
+            self.scratch.proj_e,
+            rope_u32,
+            false,
+        )?;
+
+        self.record_copy_slice(self.scratch.proj_b, 0, self.scratch.norm, embed_u32, true)?;
+        self.record_copy_slice(
+            self.scratch.proj_c,
+            0,
+            self.scratch.hidden,
+            embed_u32,
+            false,
+        )?;
+        self.record_copy_slice(
+            self.scratch.proj_e,
+            0,
+            self.scratch.rope_freqs,
+            rope_u32,
+            false,
+        )
+    }
+
     fn record_layer_tokens(
         &mut self,
         layer_idx: usize,
         tokens: usize,
-        narrow_final: bool,
+        mode: FinalLayerMode,
         min_align: usize,
     ) -> Result<(), Error> {
         let embed_u32 = u32::try_from(self.geometry.embedding)
@@ -2364,15 +2717,22 @@ impl VulkanBatchedGraphExecutor {
             GpuLayerAttention::Recurrent { .. }
         );
         if is_recurrent {
-            self.record_recurrent_attention_tokens(layer_idx, tokens, narrow_final, min_align)?;
+            self.record_recurrent_attention_tokens(layer_idx, tokens, mode, min_align)?;
         } else {
-            self.record_full_attention_tokens(layer_idx, tokens, narrow_final, min_align)?;
+            self.record_full_attention_tokens(layer_idx, tokens, mode, min_align)?;
         }
 
-        if narrow_final {
+        if mode == FinalLayerMode::IngestOnly {
             return Ok(());
         }
 
+        let post_tokens = if mode == FinalLayerMode::LastTokenLogits {
+            1
+        } else {
+            tokens
+        };
+        let post_tokens_u32 = u32::try_from(post_tokens)
+            .map_err(|_| Error::ResourceLimit("post_tokens exceed u32".to_owned()))?;
         self.batch_recorder.push_barrier(
             self.pipelines.add_rms_norm,
             &[
@@ -2382,21 +2742,21 @@ impl VulkanBatchedGraphExecutor {
                 BufferSpan::whole(self.scratch.norm),
             ],
             &[embed_u32, eps_bits],
-            checked_grid(&self.device, [1, tokens_u32, 1])?,
+            checked_grid(&self.device, [1, post_tokens_u32, 1])?,
         );
 
-        self.record_ffn_tokens(layer_idx, tokens)
+        self.record_ffn_tokens(layer_idx, post_tokens)
     }
 
     #[expect(
         clippy::too_many_lines,
-        reason = "Encodes GPU-resident GDN recurrent layer stages preserving exact Qwen35 conv1d+SiLU, ClampedL2, decay/beta, delta-rule, and gated norm sequence for single and batched prefill tokens."
+        reason = "Encodes GPU-resident GDN recurrent layer stages preserving exact Qwen35 conv1d+SiLU, ClampedL2, decay/beta, delta-rule, and gated norm sequence for single, batched, and final-token-logits tiles."
     )]
     fn record_recurrent_attention_tokens(
         &mut self,
         layer_idx: usize,
         tokens: usize,
-        narrow_final: bool,
+        mode: FinalLayerMode,
         min_align: usize,
     ) -> Result<(), Error> {
         let (
@@ -2451,11 +2811,12 @@ impl VulkanBatchedGraphExecutor {
         let proj_beta_buf = self.scratch.proj_c;
         let proj_alpha_buf = self.scratch.proj_d;
 
-        if narrow_final {
+        if mode == FinalLayerMode::FullAllTokens {
             self.record_projection_group_tokens(
                 self.scratch.norm,
                 &[
                     (qkv, proj_qkv_buf),
+                    (gate, proj_gate_buf),
                     (beta, proj_beta_buf),
                     (alpha, proj_alpha_buf),
                 ],
@@ -2466,7 +2827,6 @@ impl VulkanBatchedGraphExecutor {
                 self.scratch.norm,
                 &[
                     (qkv, proj_qkv_buf),
-                    (gate, proj_gate_buf),
                     (beta, proj_beta_buf),
                     (alpha, proj_alpha_buf),
                 ],
@@ -2682,11 +3042,23 @@ impl VulkanBatchedGraphExecutor {
             (batched_out_buf, self.scratch.perm_tmp)
         };
 
-        if narrow_final {
+        if mode == FinalLayerMode::IngestOnly {
             return Ok(());
         }
 
-        let norm_rows = u32::try_from(tokens * self.geometry.ssm_values)
+        let out_tokens = if mode == FinalLayerMode::LastTokenLogits && tokens > 1 {
+            self.record_last_token_recurrent_slice(tokens, gdn_out_buf, val_width)?;
+            self.record_projection_group_tokens(
+                self.scratch.norm,
+                &[(gate, proj_gate_buf)],
+                1,
+            )?;
+            1
+        } else {
+            tokens
+        };
+
+        let norm_rows = u32::try_from(out_tokens * self.geometry.ssm_values)
             .map_err(|_| Error::ResourceLimit("GDN norm rows exceed u32".to_owned()))?;
         self.batch_recorder.push_barrier(
             self.pipelines.rms_norm,
@@ -2699,7 +3071,7 @@ impl VulkanBatchedGraphExecutor {
             checked_grid(&self.device, [1, norm_rows, 1])?,
         );
 
-        let total_val_u32 = u32::try_from(tokens * val_width)
+        let total_val_u32 = u32::try_from(out_tokens * val_width)
             .map_err(|_| Error::ResourceLimit("batched value_width exceeds u32".to_owned()))?;
         let gated_buf = gdn_out_buf;
         let swiglu_pipe = if self.resolved_pinned_arithmetic {
@@ -2718,7 +3090,11 @@ impl VulkanBatchedGraphExecutor {
             checked_grid(&self.device, [total_val_u32.div_ceil(WORKGROUP_X), 1, 1])?,
         );
 
-        self.record_projection_group_tokens(gated_buf, &[(output_w, self.scratch.delta)], tokens)
+        self.record_projection_group_tokens(
+            gated_buf,
+            &[(output_w, self.scratch.delta)],
+            out_tokens,
+        )
     }
 
     fn resolve_gdn_qkv_spans(
@@ -2788,7 +3164,7 @@ impl VulkanBatchedGraphExecutor {
         &mut self,
         layer_idx: usize,
         tokens: usize,
-        narrow_final: bool,
+        mode: FinalLayerMode,
         min_align: usize,
     ) -> Result<(), Error> {
         let (query_w, key_w, value_w, output_w, query_norm_w, key_norm_w, k_cache, v_cache) =
@@ -2843,8 +3219,53 @@ impl VulkanBatchedGraphExecutor {
         let pos_u32 = u32::try_from(self.position)
             .map_err(|_| Error::ResourceLimit("position exceeds u32".to_owned()))?;
         let eps_bits = self.geometry.epsilon.to_bits();
+        let q_width = self.geometry.q_width();
+        let q_width_u32 = u32::try_from(q_width)
+            .map_err(|_| Error::ResourceLimit("q_width exceeds u32".to_owned()))?;
 
-        if narrow_final {
+        let (q_tokens, q_past_offset) = if mode == FinalLayerMode::FullAllTokens {
+            self.record_projection_group_tokens(
+                self.scratch.norm,
+                &[(query_w, q_gate_buf), (key_w, key_buf), (value_w, val_buf)],
+                tokens,
+            )?;
+            self.batch_recorder.push_barrier(
+                self.pipelines.rms_norm,
+                &[
+                    BufferSpan::whole(key_buf),
+                    BufferSpan::whole(key_norm_w),
+                    BufferSpan::whole(key_buf),
+                ],
+                &[head_dim_u32, eps_bits],
+                checked_grid(&self.device, [1, tokens_u32 * kv_heads_u32, 1])?,
+            );
+            if self.config.kv_precision == VulkanKvPrecision::Fp32 {
+                self.batch_recorder.push_concurrent(
+                    self.pipelines.round_f16,
+                    &[BufferSpan::whole(val_buf)],
+                    &[total_kv_u32],
+                    checked_grid(&self.device, [total_kv_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                );
+            }
+            self.record_rope_tokens(
+                key_buf,
+                kv_heads_u32,
+                head_dim_u32,
+                rope_u32,
+                tokens_u32,
+                true,
+            )?;
+            self.record_kv_append_tokens(
+                key_buf,
+                val_buf,
+                k_cache,
+                v_cache,
+                kv_width_u32,
+                pos_u32,
+                tokens_u32,
+            )?;
+            (tokens, 0)
+        } else {
             self.record_projection_group_tokens(
                 self.scratch.norm,
                 &[(key_w, key_buf), (value_w, val_buf)],
@@ -2885,19 +3306,21 @@ impl VulkanBatchedGraphExecutor {
                 pos_u32,
                 tokens_u32,
             )?;
-            return Ok(());
-        }
+            if mode == FinalLayerMode::IngestOnly {
+                return Ok(());
+            }
+            self.record_last_token_full_slice(tokens)?;
+            self.record_projection_group_tokens(
+                self.scratch.norm,
+                &[(query_w, q_gate_buf)],
+                1,
+            )?;
+            (1, tokens - 1)
+        };
 
-        self.record_projection_group_tokens(
-            self.scratch.norm,
-            &[(query_w, q_gate_buf), (key_w, key_buf), (value_w, val_buf)],
-            tokens,
-        )?;
-
-        let q_width = self.geometry.q_width();
-        let q_width_u32 = u32::try_from(q_width)
-            .map_err(|_| Error::ResourceLimit("q_width exceeds u32".to_owned()))?;
-        if tokens == 1 {
+        let q_tokens_u32 = u32::try_from(q_tokens)
+            .map_err(|_| Error::ResourceLimit("q_tokens exceed u32".to_owned()))?;
+        if q_tokens == 1 {
             self.batch_recorder.push_barrier(
                 self.pipelines.deinterleave_q_gate,
                 &[
@@ -2916,10 +3339,10 @@ impl VulkanBatchedGraphExecutor {
                     BufferSpan::whole(query_buf),
                     BufferSpan::whole(gate_buf),
                 ],
-                &[num_heads_u32, head_dim_u32, tokens_u32],
+                &[num_heads_u32, head_dim_u32, q_tokens_u32],
                 checked_grid(
                     &self.device,
-                    [q_width_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
+                    [q_width_u32.div_ceil(WORKGROUP_X), q_tokens_u32, 1],
                 )?,
             );
         }
@@ -2932,52 +3355,16 @@ impl VulkanBatchedGraphExecutor {
                 BufferSpan::whole(query_buf),
             ],
             &[head_dim_u32, eps_bits],
-            checked_grid(&self.device, [1, tokens_u32 * num_heads_u32, 1])?,
+            checked_grid(&self.device, [1, q_tokens_u32 * num_heads_u32, 1])?,
         );
-        self.batch_recorder.push_concurrent(
-            self.pipelines.rms_norm,
-            &[
-                BufferSpan::whole(key_buf),
-                BufferSpan::whole(key_norm_w),
-                BufferSpan::whole(key_buf),
-            ],
-            &[head_dim_u32, eps_bits],
-            checked_grid(&self.device, [1, tokens_u32 * kv_heads_u32, 1])?,
-        );
-        if self.config.kv_precision == VulkanKvPrecision::Fp32 {
-            self.batch_recorder.push_concurrent(
-                self.pipelines.round_f16,
-                &[BufferSpan::whole(val_buf)],
-                &[total_kv_u32],
-                checked_grid(&self.device, [total_kv_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-            );
-        }
 
         self.record_rope_tokens(
             query_buf,
             num_heads_u32,
             head_dim_u32,
             rope_u32,
-            tokens_u32,
+            q_tokens_u32,
             true,
-        )?;
-        self.record_rope_tokens(
-            key_buf,
-            kv_heads_u32,
-            head_dim_u32,
-            rope_u32,
-            tokens_u32,
-            false,
-        )?;
-
-        self.record_kv_append_tokens(
-            key_buf,
-            val_buf,
-            k_cache,
-            v_cache,
-            kv_width_u32,
-            pos_u32,
-            tokens_u32,
         )?;
 
         let attended_buf = q_gate_buf;
@@ -2986,12 +3373,13 @@ impl VulkanBatchedGraphExecutor {
             k_cache,
             v_cache,
             attended_buf,
-            tokens,
+            q_tokens,
+            q_past_offset,
             q_width,
             min_align,
         )?;
 
-        let total_q_u32 = u32::try_from(tokens * q_width)
+        let total_q_u32 = u32::try_from(q_tokens * q_width)
             .map_err(|_| Error::ResourceLimit("batched q_width exceeds u32".to_owned()))?;
         self.batch_recorder.push_barrier(
             self.pipelines.mul_sigmoid,
@@ -3000,7 +3388,11 @@ impl VulkanBatchedGraphExecutor {
             checked_grid(&self.device, [total_q_u32.div_ceil(WORKGROUP_X), 1, 1])?,
         );
 
-        self.record_projection_group_tokens(attended_buf, &[(output_w, self.scratch.delta)], tokens)
+        self.record_projection_group_tokens(
+            attended_buf,
+            &[(output_w, self.scratch.delta)],
+            q_tokens,
+        )
     }
 
     fn record_rope_tokens(
@@ -3055,13 +3447,14 @@ impl VulkanBatchedGraphExecutor {
         v_cache: BufferId,
         attended_buf: BufferId,
         tokens: usize,
+        past_token_offset: usize,
         q_width: usize,
         min_align: usize,
     ) -> Result<(), Error> {
         let mut q_start = 0_usize;
         while q_start < tokens {
             let (chosen_sub_q, desc, plan) =
-                self.select_attention_sub_chunk(q_start, tokens - q_start)?;
+                self.select_attention_sub_chunk(past_token_offset + q_start, tokens - q_start)?;
             self.dispatch_attention_sub_chunk(
                 query_buf,
                 k_cache,
@@ -3423,14 +3816,28 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
-    fn record_final_logits(&mut self) -> Result<(), Error> {
+    fn record_final_logits(&mut self, tile_tokens: usize) -> Result<(), Error> {
         let embed_u32 = u32::try_from(self.geometry.embedding)
             .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
         if self.layers.is_empty() {
+            let hidden_src = if tile_tokens > 1 {
+                let last_off = u32::try_from((tile_tokens - 1) * self.geometry.embedding)
+                    .map_err(|_| Error::ResourceLimit("last hidden offset exceeds u32".to_owned()))?;
+                self.record_copy_slice(
+                    self.scratch.hidden,
+                    last_off,
+                    self.scratch.proj_a,
+                    embed_u32,
+                    true,
+                )?;
+                self.scratch.proj_a
+            } else {
+                self.scratch.hidden
+            };
             self.batch_recorder.push_barrier(
                 self.pipelines.rms_norm,
                 &[
-                    BufferSpan::whole(self.scratch.hidden),
+                    BufferSpan::whole(hidden_src),
                     BufferSpan::whole(self.output_norm_w),
                     BufferSpan::whole(self.scratch.norm),
                 ],
@@ -5526,6 +5933,19 @@ fn upload_full_attention(
     })
 }
 
+struct PreparedTileUpload {
+    active_embed_lora: Option<(BufferSpan, f32)>,
+    staged_bank: Option<usize>,
+    has_full_layers: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FinalLayerMode {
+    FullAllTokens,
+    IngestOnly,
+    LastTokenLogits,
+}
+
 struct AttentionChunkSpans {
     q_in: BufferSpan,
     o_out: BufferSpan,
@@ -5535,7 +5955,7 @@ struct AttentionChunkSpans {
 struct TileScratchPlan {
     allocated_tile_tokens: usize,
     score_bytes: u64,
-    sizes: [u64; 21],
+    sizes: [u64; 27],
 }
 
 fn compute_max_wg_tile_tokens(
@@ -5622,6 +6042,12 @@ fn build_tile_scratch_plan(
         score_bytes,
         inputs.logits_bytes,
         MIN_NORM_OR_BIAS_BYTES,
+        hidden_bytes,
+        hidden_bytes,
+        rope_bytes,
+        rope_bytes,
+        lora_ranks_bytes,
+        lora_ranks_bytes,
     ];
     Ok(TileScratchPlan {
         allocated_tile_tokens: tile_tokens,
@@ -5748,6 +6174,10 @@ fn allocate_scratch(
 
     Ok(GpuGraphScratch {
         hidden: guard.alloc_storage(sizes[0])?,
+        hidden_staging: [
+            guard.alloc_storage(sizes[21])?,
+            guard.alloc_storage(sizes[22])?,
+        ],
         norm: guard.alloc_storage(sizes[1])?,
         delta: guard.alloc_storage(sizes[2])?,
         transformed: guard.alloc_storage(sizes[3])?,
@@ -5763,7 +6193,15 @@ fn allocate_scratch(
         gdn_k: guard.alloc_storage(sizes[13])?,
         gdn_v: guard.alloc_storage(sizes[14])?,
         rope_freqs: guard.alloc_storage(sizes[15])?,
+        rope_freqs_staging: [
+            guard.alloc_storage(sizes[23])?,
+            guard.alloc_storage(sizes[24])?,
+        ],
         lora_ranks: guard.alloc_storage(sizes[16])?,
+        lora_ranks_staging: [
+            guard.alloc_storage(sizes[25])?,
+            guard.alloc_storage(sizes[26])?,
+        ],
         attn_scores: guard.alloc_storage(sizes[17])?,
         attn_probs: guard.alloc_storage(sizes[18])?,
         attn_score_bytes: plan.score_bytes,
@@ -6383,6 +6821,50 @@ mod tests {
             [65_535, 65_535, 65_535],
         )?;
         assert_eq!(plan_alt.sizes[16], (256 * 4 * 4).max(MIN_SCRATCH_BYTES));
+        Ok(())
+    }
+
+    #[test]
+    fn default_prefill_tile32_and_double_buffered_staging_plan() -> Result<(), Error> {
+        let cfg = VulkanBatchedConfig::default();
+        assert_eq!(cfg.prefill_tile_tokens, 32);
+
+        let geometry = GraphGeometry {
+            embedding: 512,
+            feed_forward: 1024,
+            vocabulary: 4096,
+            heads: 16,
+            kv_heads: 4,
+            head: 64,
+            rope: 64,
+            rope_sections: [8, 8, 8, 0],
+            rope_base: 10_000.0,
+            epsilon: 1e-6,
+            ssm_head: 64,
+            ssm_keys: 4,
+            ssm_values: 8,
+            convolution: 4,
+            context_limit: 2048,
+        };
+        let plan = plan_tile_scratch(
+            &geometry,
+            8,
+            cfg.prefill_tile_tokens,
+            64 * 1024 * 1024,
+            u32::MAX,
+            [65_535, 65_535, 65_535],
+        )?;
+        assert_eq!(plan.allocated_tile_tokens, 32);
+        let expected_hidden = (32_u64 * 512 * 4).max(MIN_SCRATCH_BYTES);
+        let expected_rope = (32_u64 * 64 * 4).max(MIN_SCRATCH_BYTES);
+        let expected_lora = (32_u64 * 8 * 4).max(MIN_SCRATCH_BYTES);
+        assert_eq!(plan.sizes[0], expected_hidden);
+        assert_eq!(plan.sizes[21], expected_hidden);
+        assert_eq!(plan.sizes[22], expected_hidden);
+        assert_eq!(plan.sizes[23], expected_rope);
+        assert_eq!(plan.sizes[24], expected_rope);
+        assert_eq!(plan.sizes[25], expected_lora);
+        assert_eq!(plan.sizes[26], expected_lora);
         Ok(())
     }
 }

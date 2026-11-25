@@ -1085,7 +1085,10 @@ impl VulkanBatchedGraphExecutor {
         let resolved_context_limit = geometry.context_limit;
         let resolved_pinned_arithmetic = config.pinned_arithmetic.unwrap_or(matches!(
             model.identity.as_str(),
-            MODEL_SHA256 | REPACKED_PTQ1_SHA256
+            MODEL_SHA256
+                | REPACKED_PTQ1_SHA256
+                | bonsai_prism_runtime::model::swift::BONSAI_2_5_PQ2_SHA256
+                | bonsai_prism_runtime::model::swift::BONSAI_2_5_PTQ1_SHA256
         ));
 
         let embedding = lookup_tensor(model, "token_embd.weight", &[geometry.embedding, 0])?;

@@ -632,6 +632,89 @@ impl VulkanLayerPipelines {
     }
 }
 
+const KV_PREFIX_HISTORY_LIMIT: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KvPrefixTracker {
+    current_gen: u64,
+    high_water: usize,
+    valid_prefixes: Vec<(u64, usize)>,
+}
+
+impl KvPrefixTracker {
+    const fn new() -> Self {
+        Self {
+            current_gen: 1,
+            high_water: 0,
+            valid_prefixes: Vec::new(),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.current_gen = self.current_gen.wrapping_add(1).max(1);
+        self.high_water = 0;
+        self.valid_prefixes.clear();
+    }
+
+    fn on_reset(&mut self) {
+        self.invalidate();
+    }
+
+    fn on_full_kv_restore(&mut self, restored_position: usize) {
+        self.current_gen = self.current_gen.wrapping_add(1).max(1);
+        self.high_water = restored_position;
+        self.valid_prefixes.clear();
+    }
+
+    fn begin_write(&mut self, write_start: usize, token_count: usize) {
+        let write_end = write_start.saturating_add(token_count);
+        if write_start < self.high_water {
+            for (_, intact_limit) in &mut self.valid_prefixes {
+                *intact_limit = (*intact_limit).min(write_start);
+            }
+            self.valid_prefixes.retain(|&(_, limit)| limit > 0);
+            if write_start > 0 {
+                if self.valid_prefixes.len() >= KV_PREFIX_HISTORY_LIMIT {
+                    self.valid_prefixes.remove(0);
+                }
+                self.valid_prefixes.push((self.current_gen, write_start));
+            }
+            self.current_gen = self.current_gen.wrapping_add(1).max(1);
+            self.high_water = write_end;
+        } else {
+            self.high_water = self.high_water.max(write_end);
+        }
+    }
+
+    fn intact_prefix_for(&self, target_gen: u64, watermark: usize) -> usize {
+        if target_gen == 0 {
+            return 0;
+        }
+        if target_gen == self.current_gen {
+            return self.high_water.min(watermark);
+        }
+        self.valid_prefixes
+            .iter()
+            .rev()
+            .find(|&&(entry_gen, _)| entry_gen == target_gen)
+            .map_or(0, |&(_, limit)| limit.min(watermark))
+    }
+
+    fn can_skip_kv_restore(
+        &self,
+        state_consistent: bool,
+        checkpoint_gen: u64,
+        checkpoint_watermark: usize,
+        checkpoint_position: usize,
+    ) -> bool {
+        if checkpoint_position == 0 {
+            return state_consistent;
+        }
+        state_consistent
+            && self.intact_prefix_for(checkpoint_gen, checkpoint_watermark) >= checkpoint_position
+    }
+}
+
 /// Checkpoint snapshot of GPU-resident recurrent GDN/conv state and attention KV cache.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VulkanBatchedCheckpoint {
@@ -639,6 +722,8 @@ pub struct VulkanBatchedCheckpoint {
     provenance_nonce: u64,
     position: usize,
     mrope_positions: [usize; 4],
+    kv_generation: u64,
+    kv_prefix_watermark: usize,
     layers: Vec<LayerStateCheckpoint>,
 }
 
@@ -661,6 +746,18 @@ impl VulkanBatchedCheckpoint {
     #[must_use]
     pub const fn position(&self) -> usize {
         self.position
+    }
+
+    /// Returns the executor KV cache lineage generation active when this checkpoint was taken.
+    #[must_use]
+    pub const fn kv_generation(&self) -> u64 {
+        self.kv_generation
+    }
+
+    /// Returns the contiguous intact KV prefix watermark (in tokens) recorded by this checkpoint.
+    #[must_use]
+    pub const fn kv_prefix_watermark(&self) -> usize {
+        self.kv_prefix_watermark
     }
 
     /// Returns the number of transformer layers captured in this checkpoint.
@@ -1008,6 +1105,9 @@ pub struct VulkanBatchedGraphExecutor {
     multi_rank_scale: Option<f32>,
     base_provenance_sha256: String,
     provenance_nonce: u64,
+    kv_tracker: KvPrefixTracker,
+    kv_fast_restores: u64,
+    kv_full_restores: u64,
     position: usize,
     mrope_positions: [usize; 4],
     submits_completed: u64,
@@ -1314,6 +1414,9 @@ impl VulkanBatchedGraphExecutor {
             multi_rank_scale: uploaded_adapters.multi_rank_scale,
             base_provenance_sha256,
             provenance_nonce: 0,
+            kv_tracker: KvPrefixTracker::new(),
+            kv_fast_restores: 0,
+            kv_full_restores: 0,
             position: 0,
             mrope_positions: [0; 4],
             submits_completed: 0,
@@ -1458,6 +1561,7 @@ impl VulkanBatchedGraphExecutor {
         }
         self.position = 0;
         self.mrope_positions = [0; 4];
+        self.kv_tracker.on_reset();
         self.state_consistent = true;
         Ok(())
     }
@@ -1633,6 +1737,8 @@ impl VulkanBatchedGraphExecutor {
             provenance_nonce: 0,
             position: 0,
             mrope_positions: [0; 4],
+            kv_generation: 0,
+            kv_prefix_watermark: 0,
             layers: Vec::new(),
         };
         self.checkpoint_into(&mut snapshot)?;
@@ -1644,10 +1750,6 @@ impl VulkanBatchedGraphExecutor {
     ///
     /// # Errors
     /// Returns [`Error::DeviceFault`], [`Error::InvalidInput`], or [`Error::Vulkan`].
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Reads recurrent conv/matrix buffers and KV slices into existing or freshly sized checkpoint vectors."
-    )]
     pub fn checkpoint_into(&self, target: &mut VulkanBatchedCheckpoint) -> Result<(), Error> {
         if self.device.is_faulted() || !self.state_consistent {
             return Err(Error::DeviceFault(
@@ -1657,6 +1759,17 @@ impl VulkanBatchedGraphExecutor {
         self.device.ensure_pipelined_idle()?;
         let kv_width = self.geometry.kv_width();
         let reuse = target.layers.len() == self.layers.len();
+        let same_lineage = reuse
+            && target.executor_identity_sha256 == self.identity_sha256
+            && target.provenance_nonce == self.provenance_nonce;
+        let reusable_tokens = if same_lineage {
+            self.kv_tracker
+                .intact_prefix_for(target.kv_generation, target.kv_prefix_watermark)
+                .min(target.position)
+                .min(self.position)
+        } else {
+            0
+        };
         if !reuse {
             target.layers.clear();
             target.layers.reserve(self.layers.len());
@@ -1714,62 +1827,15 @@ impl VulkanBatchedGraphExecutor {
                 GpuLayerAttention::Full {
                     k_cache, v_cache, ..
                 } => {
-                    let words_per_tok = match self.config.kv_precision {
-                        VulkanKvPrecision::Fp16 => kv_width / 2,
-                        VulkanKvPrecision::Fp32 => kv_width,
-                    };
-                    let total_words = self.position.saturating_mul(words_per_tok);
-                    let total_bytes =
-                        usize::try_from(u32_slice_bytes(total_words)?).map_err(|_| {
-                            Error::ResourceLimit("KV checkpoint byte length overflow".to_owned())
-                        })?;
-                    let mut raw_k = Vec::new();
-                    let mut raw_v = Vec::new();
-                    if total_bytes > 0 {
-                        raw_k.resize(total_bytes, 0_u8);
-                        raw_v.resize(total_bytes, 0_u8);
-                        self.device.read_buffer_bytes_at(*k_cache, 0, &mut raw_k)?;
-                        self.device.read_buffer_bytes_at(*v_cache, 0, &mut raw_v)?;
-                    }
-                    if reuse
-                        && let Some(LayerStateCheckpoint::Full {
-                            precision,
-                            width,
-                            keys_words,
-                            values_words,
-                        }) = target.layers.get_mut(layer_idx)
-                    {
-                        *precision = self.config.kv_precision;
-                        *width = kv_width;
-                        keys_words.resize(total_words, 0_u32);
-                        values_words.resize(total_words, 0_u32);
-                        for (dst, chunk) in keys_words.iter_mut().zip(raw_k.as_chunks::<4>().0) {
-                            *dst = u32::from_le_bytes(*chunk);
-                        }
-                        for (dst, chunk) in values_words.iter_mut().zip(raw_v.as_chunks::<4>().0) {
-                            *dst = u32::from_le_bytes(*chunk);
-                        }
-                    } else {
-                        let mut keys_words = vec![0_u32; total_words];
-                        let mut values_words = vec![0_u32; total_words];
-                        for (dst, chunk) in keys_words.iter_mut().zip(raw_k.as_chunks::<4>().0) {
-                            *dst = u32::from_le_bytes(*chunk);
-                        }
-                        for (dst, chunk) in values_words.iter_mut().zip(raw_v.as_chunks::<4>().0) {
-                            *dst = u32::from_le_bytes(*chunk);
-                        }
-                        let snap = LayerStateCheckpoint::Full {
-                            precision: self.config.kv_precision,
-                            width: kv_width,
-                            keys_words,
-                            values_words,
-                        };
-                        if reuse {
-                            target.layers[layer_idx] = snap;
-                        } else {
-                            target.layers.push(snap);
-                        }
-                    }
+                    self.read_full_kv_checkpoint_layer(
+                        *k_cache,
+                        *v_cache,
+                        layer_idx,
+                        kv_width,
+                        reusable_tokens,
+                        reuse,
+                        target,
+                    )?;
                 }
             }
         }
@@ -1781,27 +1847,115 @@ impl VulkanBatchedGraphExecutor {
         target.provenance_nonce = self.provenance_nonce;
         target.position = self.position;
         target.mrope_positions = self.mrope_positions;
+        target.kv_generation = self.kv_tracker.current_gen;
+        target.kv_prefix_watermark = self.position;
         Ok(())
     }
 
-    /// Restores GPU recurrent and KV-cache state from a checkpoint produced by this executor.
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidInput`], [`Error::DeviceFault`], or [`Error::Vulkan`] if the
-    /// checkpoint belongs to a different model/executor configuration or fails validation.
     #[expect(
-        clippy::too_many_lines,
-        reason = "Validates checkpoint provenance/shapes before overwriting recurrent or KV GPU state."
+        clippy::too_many_arguments,
+        reason = "Incrementally downloads only uncaptured `[reusable_tokens..position)` KV cache slices when lineage is intact."
     )]
-    pub fn restore(&mut self, checkpoint: &VulkanBatchedCheckpoint) -> Result<(), Error> {
-        if self.device.is_faulted() {
-            return Err(Error::DeviceFault(
-                "Vulkan batched executor faulted and cannot restore".to_owned(),
-            ));
+    fn read_full_kv_checkpoint_layer(
+        &self,
+        k_cache: BufferId,
+        v_cache: BufferId,
+        layer_idx: usize,
+        kv_width: usize,
+        reusable_tokens: usize,
+        reuse: bool,
+        target: &mut VulkanBatchedCheckpoint,
+    ) -> Result<(), Error> {
+        let words_per_tok = match self.config.kv_precision {
+            VulkanKvPrecision::Fp16 => kv_width / 2,
+            VulkanKvPrecision::Fp32 => kv_width,
+        };
+        let total_words = self.position.saturating_mul(words_per_tok);
+        let expected_prev_words = target.position.saturating_mul(words_per_tok);
+        let reuse_layer = reuse
+            && matches!(
+                target.layers.get(layer_idx),
+                Some(LayerStateCheckpoint::Full {
+                    precision,
+                    width,
+                    keys_words,
+                    values_words,
+                }) if *precision == self.config.kv_precision
+                    && *width == kv_width
+                    && keys_words.len() == expected_prev_words
+                    && values_words.len() == expected_prev_words
+            );
+        let start_tokens = if reuse_layer {
+            reusable_tokens.min(self.position)
+        } else {
+            0
+        };
+        let start_words = start_tokens.saturating_mul(words_per_tok);
+        let delta_words = total_words.saturating_sub(start_words);
+        let start_bytes = u32_slice_bytes(start_words)?;
+        let delta_bytes = usize::try_from(u32_slice_bytes(delta_words)?)
+            .map_err(|_| Error::ResourceLimit("KV checkpoint byte length overflow".to_owned()))?;
+
+        let mut raw_k = Vec::new();
+        let mut raw_v = Vec::new();
+        if delta_bytes > 0 {
+            raw_k.resize(delta_bytes, 0_u8);
+            raw_v.resize(delta_bytes, 0_u8);
+            self.device
+                .read_buffer_bytes_at(k_cache, start_bytes, &mut raw_k)?;
+            self.device
+                .read_buffer_bytes_at(v_cache, start_bytes, &mut raw_v)?;
         }
-        self.device.ensure_pipelined_idle()?;
-        self.staging_bank_in_flight = [false; 2];
-        self.next_staging_bank = 0;
+
+        if reuse
+            && let Some(LayerStateCheckpoint::Full {
+                precision,
+                width,
+                keys_words,
+                values_words,
+            }) = target.layers.get_mut(layer_idx)
+        {
+            *precision = self.config.kv_precision;
+            *width = kv_width;
+            keys_words.resize(total_words, 0_u32);
+            values_words.resize(total_words, 0_u32);
+            for (dst, chunk) in keys_words[start_words..]
+                .iter_mut()
+                .zip(raw_k.as_chunks::<4>().0)
+            {
+                *dst = u32::from_le_bytes(*chunk);
+            }
+            for (dst, chunk) in values_words[start_words..]
+                .iter_mut()
+                .zip(raw_v.as_chunks::<4>().0)
+            {
+                *dst = u32::from_le_bytes(*chunk);
+            }
+        } else {
+            let mut keys_words = vec![0_u32; total_words];
+            let mut values_words = vec![0_u32; total_words];
+            for (dst, chunk) in keys_words.iter_mut().zip(raw_k.as_chunks::<4>().0) {
+                *dst = u32::from_le_bytes(*chunk);
+            }
+            for (dst, chunk) in values_words.iter_mut().zip(raw_v.as_chunks::<4>().0) {
+                *dst = u32::from_le_bytes(*chunk);
+            }
+            let snap = LayerStateCheckpoint::Full {
+                precision: self.config.kv_precision,
+                width: kv_width,
+                keys_words,
+                values_words,
+            };
+            if reuse {
+                target.layers[layer_idx] = snap;
+            } else {
+                target.layers.push(snap);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_checkpoint_for_restore(&self, checkpoint: &VulkanBatchedCheckpoint) -> Result<(), Error> {
         #[expect(
             clippy::suspicious_operation_groupings,
             reason = "Checkpoint stores the target executor digest in `executor_identity_sha256` while executor holds `identity_sha256`."
@@ -1825,15 +1979,12 @@ impl VulkanBatchedGraphExecutor {
                 "checkpoint layer count mismatch".to_owned(),
             ));
         }
-
         let kv_width = self.geometry.kv_width();
         for (layer, snap) in self.layers.iter().zip(&checkpoint.layers) {
             match (&layer.attention, snap) {
                 (
                     GpuLayerAttention::Recurrent {
-                        conv_state,
                         conv_state_elems,
-                        matrix_state,
                         matrix_state_elems,
                         ..
                     },
@@ -1853,17 +2004,9 @@ impl VulkanBatchedGraphExecutor {
                         "checkpoint conv state contains non-finite value",
                     )?;
                     ensure_finite_f32(matrix, "checkpoint matrix state contains non-finite value")?;
-                    if *conv_state_elems > 0 {
-                        self.device.write_buffer_f32(*conv_state, convolution)?;
-                    }
-                    if *matrix_state_elems > 0 {
-                        self.device.write_buffer_f32(*matrix_state, matrix)?;
-                    }
                 }
                 (
-                    GpuLayerAttention::Full {
-                        k_cache, v_cache, ..
-                    },
+                    GpuLayerAttention::Full { .. },
                     LayerStateCheckpoint::Full {
                         precision,
                         width,
@@ -1886,6 +2029,78 @@ impl VulkanBatchedGraphExecutor {
                             "checkpoint KV word count mismatch for position".to_owned(),
                         ));
                     }
+                }
+                _ => {
+                    return Err(Error::InvalidInput(
+                        "checkpoint layer kind mismatch".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Restores GPU state from a checkpoint produced by this executor.
+    ///
+    /// When the executor's live device KV cache prefix up to `checkpoint.position` has not been
+    /// overwritten since the checkpoint's KV lineage generation, this performs an append-only
+    /// cursor rollback that uploads only recurrent GDN/conv states and preserves GPU KV caches
+    /// without host->GPU KV copying. Whenever earlier KV positions have been overwritten by a
+    /// diverging branch (or the state is inconsistent), it falls back to full KV cache restoration.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`], [`Error::DeviceFault`], or [`Error::Vulkan`] if the
+    /// checkpoint belongs to a different model/executor configuration or fails validation.
+    pub fn restore(&mut self, checkpoint: &VulkanBatchedCheckpoint) -> Result<(), Error> {
+        if self.device.is_faulted() {
+            return Err(Error::DeviceFault(
+                "Vulkan batched executor faulted and cannot restore".to_owned(),
+            ));
+        }
+        self.device.ensure_pipelined_idle()?;
+        self.staging_bank_in_flight = [false; 2];
+        self.next_staging_bank = 0;
+        self.validate_checkpoint_for_restore(checkpoint)?;
+
+        let can_skip_kv = self.kv_tracker.can_skip_kv_restore(
+            self.state_consistent,
+            checkpoint.kv_generation,
+            checkpoint.kv_prefix_watermark,
+            checkpoint.position,
+        );
+
+        for (layer, snap) in self.layers.iter().zip(&checkpoint.layers) {
+            match (&layer.attention, snap) {
+                (
+                    GpuLayerAttention::Recurrent {
+                        conv_state,
+                        conv_state_elems,
+                        matrix_state,
+                        matrix_state_elems,
+                        ..
+                    },
+                    LayerStateCheckpoint::Recurrent {
+                        convolution,
+                        matrix,
+                    },
+                ) => {
+                    if *conv_state_elems > 0 {
+                        self.device.write_buffer_f32(*conv_state, convolution)?;
+                    }
+                    if *matrix_state_elems > 0 {
+                        self.device.write_buffer_f32(*matrix_state, matrix)?;
+                    }
+                }
+                (
+                    GpuLayerAttention::Full {
+                        k_cache, v_cache, ..
+                    },
+                    LayerStateCheckpoint::Full {
+                        keys_words,
+                        values_words,
+                        ..
+                    },
+                ) if !can_skip_kv => {
                     let k_bytes = self.device.buffer_size_bytes(*k_cache)?;
                     let v_bytes = self.device.buffer_size_bytes(*v_cache)?;
                     self.device.fill_buffer_zero(*k_cache, 0, k_bytes)?;
@@ -1895,17 +2110,45 @@ impl VulkanBatchedGraphExecutor {
                         self.device.write_buffer_u32_at(*v_cache, 0, values_words)?;
                     }
                 }
-                _ => {
-                    return Err(Error::InvalidInput(
-                        "checkpoint layer kind mismatch".to_owned(),
-                    ));
-                }
+                _ => {}
             }
+        }
+        if can_skip_kv {
+            // Live `[0..checkpoint.position)` KV slots remain intact on GPU; keep `high_water`
+            // intact so any later write below `high_water` narrows `valid_prefixes` accurately.
+            self.kv_fast_restores = self.kv_fast_restores.saturating_add(1);
+        } else {
+            self.kv_tracker.on_full_kv_restore(checkpoint.position);
+            self.kv_full_restores = self.kv_full_restores.saturating_add(1);
         }
         self.position = checkpoint.position;
         self.mrope_positions = checkpoint.mrope_positions;
         self.state_consistent = true;
         Ok(())
+    }
+
+    /// Returns the active GPU KV cache lineage generation counter.
+    #[must_use]
+    pub const fn kv_generation(&self) -> u64 {
+        self.kv_tracker.current_gen
+    }
+
+    /// Returns the contiguous intact token watermark recorded for the current GPU KV lineage.
+    #[must_use]
+    pub const fn kv_prefix_watermark(&self) -> usize {
+        self.kv_tracker.high_water
+    }
+
+    /// Returns how many `restore` calls reused the live GPU KV prefix without copying KV buffers.
+    #[must_use]
+    pub const fn kv_fast_restores(&self) -> u64 {
+        self.kv_fast_restores
+    }
+
+    /// Returns how many `restore` calls fell back to full GPU KV buffer upload.
+    #[must_use]
+    pub const fn kv_full_restores(&self) -> u64 {
+        self.kv_full_restores
     }
 
     /// Returns the total number of Vulkan queue submissions executed across this executor's life.
@@ -2035,6 +2278,7 @@ impl VulkanBatchedGraphExecutor {
         if res.is_err() {
             self.device.abort_pipelined_session();
             self.state_consistent = false;
+            self.kv_tracker.invalidate();
         }
         res
     }
@@ -2227,6 +2471,7 @@ impl VulkanBatchedGraphExecutor {
             {
                 dst.clear();
                 self.state_consistent = false;
+                self.kv_tracker.invalidate();
                 return Err(err);
             }
         } else {
@@ -2402,7 +2647,10 @@ impl VulkanBatchedGraphExecutor {
                         self.record_final_logits(t_len)?;
                     }
                     if !self.batch_recorder.is_empty() {
-                        mutated_gpu = true;
+                        if !mutated_gpu {
+                            self.kv_tracker.begin_write(self.position, t_len);
+                            mutated_gpu = true;
+                        }
                         let fence_this_chunk = drain_at_tile_end && is_final_chunk;
                         let submits = self.device.submit_pipelined_batches_with_max_stages(
                             &self.batch_recorder,
@@ -2433,6 +2681,7 @@ impl VulkanBatchedGraphExecutor {
             self.staging_bank_in_flight = [false; 2];
             if mutated_gpu || had_unwaited_before {
                 self.state_consistent = false;
+                self.kv_tracker.invalidate();
             }
             return run_result;
         }
@@ -4677,6 +4926,7 @@ impl Decoder for VulkanBatchedGraphExecutor {
         {
             output.clear();
             self.state_consistent = false;
+            self.kv_tracker.invalidate();
             return Err(Error::InvalidInput(
                 "GPU returned invalid logit vocabulary extent".to_owned(),
             )
@@ -4684,7 +4934,13 @@ impl Decoder for VulkanBatchedGraphExecutor {
         }
         let prev_consistent = self.state_consistent;
         self.state_consistent = false;
-        let finite = FiniteLogits::new(output.as_slice())?;
+        let finite = match FiniteLogits::new(output.as_slice()) {
+            Ok(finite) => finite,
+            Err(err) => {
+                self.kv_tracker.invalidate();
+                return Err(err);
+            }
+        };
         self.state_consistent = prev_consistent;
         self.commit_tile_position(1);
         Ok(finite)
@@ -6560,11 +6816,13 @@ mod tests {
 
     #[test]
     fn batched_checkpoint_identity_is_deterministic_and_sensitive_to_state() -> Result<(), Error> {
-        let make = |pos: usize, val: f32, nonce: u64| VulkanBatchedCheckpoint {
+        let make = |pos: usize, val: f32, nonce: u64, kv_gen: u64| VulkanBatchedCheckpoint {
             executor_identity_sha256: "exec-abc".to_owned(),
             provenance_nonce: nonce,
             position: pos,
             mrope_positions: [pos, pos, pos, 0],
+            kv_generation: kv_gen,
+            kv_prefix_watermark: pos,
             layers: vec![
                 LayerStateCheckpoint::Recurrent {
                     convolution: vec![val, -val],
@@ -6578,12 +6836,14 @@ mod tests {
                 },
             ],
         };
-        let snap_base = make(1, 0.25, 0);
-        let snap_repeat = make(1, 0.25, 0);
-        let snap_pos2 = make(2, 0.25, 0);
-        let snap_val_half = make(1, 0.50, 0);
-        let snap_layer_one = make(1, 0.25, 1);
+        let snap_base = make(1, 0.25, 0, 1);
+        let snap_repeat = make(1, 0.25, 0, 9);
+        let snap_pos2 = make(2, 0.25, 0, 1);
+        let snap_val_half = make(1, 0.50, 0, 1);
+        let snap_layer_one = make(1, 0.25, 1, 1);
         assert_eq!(snap_base.identity_sha256()?, snap_repeat.identity_sha256()?);
+        assert_eq!(snap_repeat.kv_generation(), 9);
+        assert_eq!(snap_repeat.kv_prefix_watermark(), 1);
         assert_ne!(snap_base.identity_sha256()?, snap_pos2.identity_sha256()?);
         assert_ne!(
             snap_base.identity_sha256()?,
@@ -6594,6 +6854,63 @@ mod tests {
             snap_layer_one.identity_sha256()?
         );
         Ok(())
+    }
+
+    #[test]
+    fn kv_prefix_tracker_handles_append_rollback_and_branch_overwrites() {
+        let mut tracker = KvPrefixTracker::new();
+        assert_eq!(tracker.current_gen, 1);
+        assert_eq!(tracker.high_water, 0);
+
+        // Prompt prefill [0..100) + checkpoint C100.
+        tracker.begin_write(0, 100);
+        let c100_gen = tracker.current_gen;
+        let c100_wm = tracker.high_water;
+        assert_eq!((c100_gen, c100_wm), (1, 100));
+
+        // Branch A generates [100..150) + mid checkpoint.
+        tracker.begin_write(100, 20);
+        let branch_a_gen = tracker.current_gen;
+        let branch_a_wm = tracker.high_water;
+        tracker.begin_write(120, 30);
+        assert_eq!(tracker.current_gen, 1);
+        assert_eq!(tracker.high_water, 150);
+        assert!(tracker.can_skip_kv_restore(true, c100_gen, c100_wm, 100));
+        assert!(tracker.can_skip_kv_restore(true, branch_a_gen, branch_a_wm, 120));
+
+        // Append-only rollback to C100 leaves C100 prefix intact without full KV copy.
+        assert!(tracker.can_skip_kv_restore(true, c100_gen, c100_wm, 100));
+
+        // Branch B writes at [100..140): C100 [0..100) remains intact across turns,
+        // while Branch A [0..120) had [100..120) overwritten and MUST fall back to full KV restore!
+        tracker.begin_write(100, 40);
+        assert_eq!(tracker.current_gen, 2);
+        assert_eq!(tracker.high_water, 140);
+        assert!(tracker.can_skip_kv_restore(true, c100_gen, c100_wm, 100));
+        assert!(!tracker.can_skip_kv_restore(true, branch_a_gen, branch_a_wm, 120));
+        assert_eq!(tracker.intact_prefix_for(branch_a_gen, branch_a_wm), 100);
+
+        // Turn 3 overwrites [100..130) again from C100: C100 STILL fast-restores!
+        let next_gen = tracker.current_gen;
+        let next_wm = 130_usize;
+        assert!(tracker.can_skip_kv_restore(true, next_gen, next_wm, 130));
+        tracker.begin_write(100, 30);
+        assert!(tracker.can_skip_kv_restore(true, c100_gen, c100_wm, 100));
+        assert!(!tracker.can_skip_kv_restore(true, next_gen, next_wm, 130));
+
+        // Deep rollback writing at [50..80) invalidates C100 [50..100) cleanly.
+        tracker.begin_write(50, 30);
+        assert!(!tracker.can_skip_kv_restore(true, c100_gen, c100_wm, 100));
+        assert_eq!(tracker.intact_prefix_for(c100_gen, c100_wm), 50);
+
+        // Full KV restore & inconsistent state force full fallback for stale checkpoints.
+        assert!(!tracker.can_skip_kv_restore(false, tracker.current_gen, tracker.high_water, 80));
+        assert!(!tracker.can_skip_kv_restore(false, c100_gen, 0, 0));
+        tracker.on_full_kv_restore(120);
+        assert!(!tracker.can_skip_kv_restore(true, c100_gen, c100_wm, 50));
+        tracker.on_reset();
+        assert_eq!(tracker.high_water, 0);
+        assert_eq!(tracker.intact_prefix_for(c100_gen, c100_wm), 0);
     }
 
     #[test]

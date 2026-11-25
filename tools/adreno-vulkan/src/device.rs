@@ -24,6 +24,11 @@ static QGLC_PIPELINE_COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
 const FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 const QUALCOMM_VENDOR_ID: u32 = 0x5143;
+const PIPELINE_CACHE_ENVELOPE_MAGIC: &[u8; 8] = b"BSVKPC01";
+const PIPELINE_CACHE_HASH_DOMAIN: &[u8] = b"bonsai-vk-pipeline-cache-envelope-v1:";
+const PIPELINE_CACHE_DIGEST_BYTES: usize = 32;
+const MAX_SHADER_BUNDLE_DIGEST_BYTES: usize = 256;
+const MAX_PIPELINE_CACHE_BLOB_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum storage buffer bindings supported per inline compute stage.
 pub const MAX_STAGE_BINDINGS: usize = 12;
 const MAX_PUSH_BYTES: usize = 128;
@@ -726,6 +731,7 @@ pub struct AdrenoVulkanDevice {
     command_slots: Vec<CommandSlot>,
     next_slot_idx: usize,
     unwaited_slots: usize,
+    pipeline_cache_uuid: [u8; vk::UUID_SIZE],
     pipeline_cache: vk::PipelineCache,
     persistent_descriptor_pool: vk::DescriptorPool,
     command_pool: vk::CommandPool,
@@ -736,6 +742,182 @@ pub struct AdrenoVulkanDevice {
     _entry: ash::Entry,
     #[cfg(windows)]
     _library: win_loader::VulkanLibrary,
+}
+
+/// Hardware, driver, and SPIR-V shader bundle identity bound to a serialized `VkPipelineCache`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PipelineCacheBinding<'a> {
+    /// PCI vendor ID (`VkPhysicalDeviceProperties::vendorID`).
+    pub vendor_id: u32,
+    /// PCI/adapter device ID (`VkPhysicalDeviceProperties::deviceID`).
+    pub device_id: u32,
+    /// Vulkan driver version (`VkPhysicalDeviceProperties::driverVersion`).
+    pub driver_version: u32,
+    /// Driver pipeline cache compatibility UUID (`VkPhysicalDeviceProperties::pipelineCacheUUID`).
+    pub pipeline_cache_uuid: [u8; vk::UUID_SIZE],
+    /// Deterministic SHA-256 hex digest (or unique identifier) of the SPIR-V shader bundle.
+    pub shader_bundle_sha256: &'a str,
+}
+
+fn validate_shader_bundle_digest(shader_bundle_sha256: &str) -> Result<(), Error> {
+    if shader_bundle_sha256.is_empty()
+        || shader_bundle_sha256.len() > MAX_SHADER_BUNDLE_DIGEST_BYTES
+        || shader_bundle_sha256.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidInput(
+            "invalid shader bundle digest for pipeline cache binding".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn compute_pipeline_cache_envelope_digest(body: &[u8]) -> Result<[u8; PIPELINE_CACHE_DIGEST_BYTES], Error> {
+    let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
+    hash_bytes(&mut hasher, PIPELINE_CACHE_HASH_DOMAIN)?;
+    hash_bytes(&mut hasher, body)?;
+    hasher
+        .finish()
+        .map_err(|err| Error::InvalidInput(err.to_string()))
+}
+
+/// Serializes `raw_vulkan_cache` into a digest-checked binary envelope bound to `binding`.
+///
+/// # Errors
+/// Returns [`Error::InvalidInput`] if `binding.shader_bundle_sha256` is invalid or `raw_vulkan_cache`
+/// exceeds the bounded 64 MiB limit, or [`Error::InvalidInput`] if hashing fails.
+pub fn encode_pipeline_cache_envelope(
+    binding: &PipelineCacheBinding<'_>,
+    raw_vulkan_cache: &[u8],
+) -> Result<Vec<u8>, Error> {
+    validate_shader_bundle_digest(binding.shader_bundle_sha256)?;
+    if raw_vulkan_cache.len() > MAX_PIPELINE_CACHE_BLOB_BYTES {
+        return Err(Error::InvalidInput(
+            "raw Vulkan pipeline cache exceeds 64 MiB limit".to_owned(),
+        ));
+    }
+    let shader_bytes = binding.shader_bundle_sha256.as_bytes();
+    let shader_len_u32 = u32::try_from(shader_bytes.len())
+        .map_err(|_| Error::InvalidInput("shader bundle digest length exceeds u32".to_owned()))?;
+    let payload_len_u64 = u64::try_from(raw_vulkan_cache.len())
+        .map_err(|_| Error::InvalidInput("pipeline cache length exceeds u64".to_owned()))?;
+
+    let header_len = 8 + 4 + 4 + 4 + vk::UUID_SIZE + 4 + shader_bytes.len() + 8;
+    let total_len = header_len + raw_vulkan_cache.len() + PIPELINE_CACHE_DIGEST_BYTES;
+    let mut out = Vec::with_capacity(total_len);
+    out.extend_from_slice(PIPELINE_CACHE_ENVELOPE_MAGIC);
+    out.extend_from_slice(&binding.vendor_id.to_le_bytes());
+    out.extend_from_slice(&binding.device_id.to_le_bytes());
+    out.extend_from_slice(&binding.driver_version.to_le_bytes());
+    out.extend_from_slice(&binding.pipeline_cache_uuid);
+    out.extend_from_slice(&shader_len_u32.to_le_bytes());
+    out.extend_from_slice(shader_bytes);
+    out.extend_from_slice(&payload_len_u64.to_le_bytes());
+    out.extend_from_slice(raw_vulkan_cache);
+    let digest = compute_pipeline_cache_envelope_digest(&out)?;
+    out.extend_from_slice(&digest);
+    Ok(out)
+}
+
+/// Verifies `envelope` integrity and binding compatibility against `expected`, returning the
+/// borrowed raw `VkPipelineCache` payload bytes on success.
+///
+/// # Errors
+/// Returns [`Error::InvalidInput`] on magic mismatch, digest tamper, truncation, trailing data,
+/// oversize payload, or any mismatch across `(vendor_id, device_id, driver_version,
+/// pipeline_cache_uuid, shader_bundle_sha256)`.
+pub fn decode_pipeline_cache_envelope<'a>(
+    envelope: &'a [u8],
+    expected: &PipelineCacheBinding<'_>,
+) -> Result<&'a [u8], Error> {
+    validate_shader_bundle_digest(expected.shader_bundle_sha256)?;
+    let min_envelope_bytes = 8 + 4 + 4 + 4 + vk::UUID_SIZE + 4 + 8 + PIPELINE_CACHE_DIGEST_BYTES;
+    if envelope.len() < min_envelope_bytes {
+        return Err(Error::InvalidInput(
+            "serialized Vulkan pipeline cache envelope is truncated".to_owned(),
+        ));
+    }
+    let body_len = envelope.len() - PIPELINE_CACHE_DIGEST_BYTES;
+    let (body, trailing_digest) = envelope.split_at(body_len);
+    if body.get(..8) != Some(PIPELINE_CACHE_ENVELOPE_MAGIC.as_slice()) {
+        return Err(Error::InvalidInput(
+            "serialized Vulkan pipeline cache envelope magic mismatch".to_owned(),
+        ));
+    }
+    let actual_digest = compute_pipeline_cache_envelope_digest(body)?;
+    if trailing_digest != actual_digest.as_slice() {
+        return Err(Error::InvalidInput(
+            "serialized Vulkan pipeline cache envelope SHA-256 digest mismatch".to_owned(),
+        ));
+    }
+
+    let mut pos = 8_usize;
+    let take = |pos: &mut usize, n: usize| -> Result<&'a [u8], Error> {
+        let end = pos
+            .checked_add(n)
+            .ok_or_else(|| Error::InvalidInput("pipeline cache envelope offset overflow".to_owned()))?;
+        let slice = body
+            .get(*pos..end)
+            .ok_or_else(|| Error::InvalidInput("pipeline cache envelope truncated".to_owned()))?;
+        *pos = end;
+        Ok(slice)
+    };
+    let read_u32 = |bytes: &[u8]| -> Result<u32, Error> {
+        let arr: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| Error::InvalidInput("pipeline cache header u32 truncated".to_owned()))?;
+        Ok(u32::from_le_bytes(arr))
+    };
+
+    let vendor_id = read_u32(take(&mut pos, 4)?)?;
+    let device_id = read_u32(take(&mut pos, 4)?)?;
+    let driver_version = read_u32(take(&mut pos, 4)?)?;
+    let uuid_slice = take(&mut pos, vk::UUID_SIZE)?;
+    let pipeline_cache_uuid: [u8; vk::UUID_SIZE] = uuid_slice
+        .try_into()
+        .map_err(|_| Error::InvalidInput("pipeline cache UUID truncated".to_owned()))?;
+
+    let shader_len_u32 = read_u32(take(&mut pos, 4)?)?;
+    let shader_len = usize::try_from(shader_len_u32)
+        .map_err(|_| Error::InvalidInput("shader bundle digest length overflow".to_owned()))?;
+    if shader_len == 0 || shader_len > MAX_SHADER_BUNDLE_DIGEST_BYTES {
+        return Err(Error::InvalidInput(
+            "serialized shader bundle digest length out of bounds".to_owned(),
+        ));
+    }
+    let shader_bytes = take(&mut pos, shader_len)?;
+    let shader_str = std::str::from_utf8(shader_bytes)
+        .map_err(|_| Error::InvalidInput("serialized shader bundle digest is non-UTF8".to_owned()))?;
+
+    let payload_len_bytes = take(&mut pos, 8)?;
+    let payload_len_arr: [u8; 8] = payload_len_bytes
+        .try_into()
+        .map_err(|_| Error::InvalidInput("pipeline cache payload length truncated".to_owned()))?;
+    let payload_len_u64 = u64::from_le_bytes(payload_len_arr);
+    let payload_len = usize::try_from(payload_len_u64)
+        .map_err(|_| Error::InvalidInput("pipeline cache payload length overflow".to_owned()))?;
+    if payload_len > MAX_PIPELINE_CACHE_BLOB_BYTES {
+        return Err(Error::InvalidInput(
+            "serialized pipeline cache payload exceeds 64 MiB limit".to_owned(),
+        ));
+    }
+    let payload = take(&mut pos, payload_len)?;
+    if pos != body.len() {
+        return Err(Error::InvalidInput(
+            "serialized Vulkan pipeline cache envelope contains unexpected trailing bytes".to_owned(),
+        ));
+    }
+
+    if vendor_id != expected.vendor_id
+        || device_id != expected.device_id
+        || driver_version != expected.driver_version
+        || pipeline_cache_uuid != expected.pipeline_cache_uuid
+        || shader_str != expected.shader_bundle_sha256
+    {
+        return Err(Error::InvalidInput(
+            "serialized Vulkan pipeline cache hardware/driver/shader binding mismatch".to_owned(),
+        ));
+    }
+    Ok(payload)
 }
 
 impl AdrenoVulkanDevice {
@@ -749,16 +931,92 @@ impl AdrenoVulkanDevice {
     /// [`Error::Vulkan`] if Vulkan device/pool creation fails.
     pub fn open() -> Result<Self, Error> {
         check_forbidden_env()?;
-        Self::open_internal()
+        Self::open_internal(None, None)
+    }
+
+    /// Opens the native Qualcomm Adreno Vulkan device, optionally seeding its `VkPipelineCache`
+    /// from a previously exported digest-checked envelope bound to this exact adapter, driver,
+    /// and `shader_bundle_sha256`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if forbidden `VK_*` environment overrides are set,
+    /// `shader_bundle_sha256` is invalid, or `cache_blob` fails envelope/binding validation;
+    /// [`Error::Unsupported`] if no native Adreno Vulkan compute adapter exists; or
+    /// [`Error::Vulkan`] if Vulkan initialization fails.
+    pub fn open_with_pipeline_cache_data(
+        cache_blob: Option<&[u8]>,
+        shader_bundle_sha256: &str,
+    ) -> Result<Self, Error> {
+        check_forbidden_env()?;
+        validate_shader_bundle_digest(shader_bundle_sha256)?;
+        Self::open_internal(cache_blob, Some(shader_bundle_sha256))
+    }
+
+    /// Returns the `VkPhysicalDeviceProperties::pipelineCacheUUID` reported by the active GPU driver.
+    #[must_use]
+    pub const fn pipeline_cache_uuid(&self) -> [u8; vk::UUID_SIZE] {
+        self.pipeline_cache_uuid
+    }
+
+    /// Constructs the [`PipelineCacheBinding`] representing this device and `shader_bundle_sha256`.
+    #[must_use]
+    pub const fn pipeline_cache_binding<'a>(
+        &self,
+        shader_bundle_sha256: &'a str,
+    ) -> PipelineCacheBinding<'a> {
+        PipelineCacheBinding {
+            vendor_id: self.capabilities.vendor_id,
+            device_id: self.capabilities.device_id,
+            driver_version: self.capabilities.driver_version,
+            pipeline_cache_uuid: self.pipeline_cache_uuid,
+            shader_bundle_sha256,
+        }
+    }
+
+    /// Exports the live `VkPipelineCache` serialized bytes wrapped in a digest-checked envelope
+    /// bound to `(vendor_id, device_id, driver_version, pipeline_cache_uuid, shader_bundle_sha256)`.
+    ///
+    /// # Errors
+    /// Returns [`Error::DeviceFault`] if the device is faulted, [`Error::InvalidInput`] if
+    /// `shader_bundle_sha256` is invalid or serialization overflows, [`Error::Unsupported`] on
+    /// non-Windows targets, or [`Error::Vulkan`] if `vkGetPipelineCacheData` fails.
+    pub fn export_pipeline_cache_data(&self, shader_bundle_sha256: &str) -> Result<Vec<u8>, Error> {
+        if self.faulted {
+            return Err(Error::DeviceFault(
+                "Adreno Vulkan device faulted and cannot export pipeline cache".to_owned(),
+            ));
+        }
+        validate_shader_bundle_digest(shader_bundle_sha256)?;
+        #[cfg(not(windows))]
+        {
+            Err(Error::Unsupported)
+        }
+        #[cfg(windows)]
+        {
+            let _compile_guard = QGLC_PIPELINE_COMPILE_LOCK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // SAFETY: `self.pipeline_cache` is live on `self.device` and serialized under `QGLC_PIPELINE_COMPILE_LOCK`.
+            let raw = unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) }
+                .map_err(|err| Error::Vulkan(format!("get_pipeline_cache_data: {err:?}")))?;
+            let binding = self.pipeline_cache_binding(shader_bundle_sha256);
+            encode_pipeline_cache_envelope(&binding, &raw)
+        }
     }
 
     #[cfg(not(windows))]
-    fn open_internal() -> Result<Self, Error> {
+    fn open_internal(
+        _cache_blob: Option<&[u8]>,
+        _shader_bundle_sha256: Option<&str>,
+    ) -> Result<Self, Error> {
         Err(Error::Unsupported)
     }
 
     #[cfg(windows)]
-    fn open_internal() -> Result<Self, Error> {
+    fn open_internal(
+        cache_blob: Option<&[u8]>,
+        shader_bundle_sha256: Option<&str>,
+    ) -> Result<Self, Error> {
         let library = win_loader::VulkanLibrary::load_system32()?;
         let proc_raw = library.symbol(c"vkGetInstanceProcAddr")?;
         // SAFETY: `vkGetInstanceProcAddr` matches `vk::PFN_vkGetInstanceProcAddr` ABI.
@@ -795,7 +1053,7 @@ impl AdrenoVulkanDevice {
         let instance =
             unsafe { entry.create_instance(&create_info, None) }.map_err(|_| Error::Unsupported)?;
 
-        Self::init_from_instance(entry, instance, library)
+        Self::init_from_instance(entry, instance, library, cache_blob, shader_bundle_sha256)
     }
 
     #[cfg(windows)]
@@ -803,6 +1061,8 @@ impl AdrenoVulkanDevice {
         entry: ash::Entry,
         instance: ash::Instance,
         library: win_loader::VulkanLibrary,
+        cache_blob: Option<&[u8]>,
+        shader_bundle_sha256: Option<&str>,
     ) -> Result<Self, Error> {
         // SAFETY: `instance` is valid; enumerates physical devices.
         let physical_devices = match unsafe { instance.enumerate_physical_devices() } {
@@ -817,12 +1077,47 @@ impl AdrenoVulkanDevice {
         };
 
         // SAFETY: Querying initial adapter selection handles.
-        let Some((phys, queue_family, caps, _ext_set, mem_properties, min_offset_align)) =
-            select_native_adreno(&entry, &instance, &physical_devices)
+        let Some((
+            phys,
+            queue_family,
+            caps,
+            pipeline_cache_uuid,
+            _ext_set,
+            mem_properties,
+            min_offset_align,
+        )) = select_native_adreno(&entry, &instance, &physical_devices)
         else {
             // SAFETY: No suitable Adreno adapter found; clean up instance.
             unsafe { instance.destroy_instance(None) };
             return Err(Error::Unsupported);
+        };
+
+        let initial_pipeline_cache = match (cache_blob, shader_bundle_sha256) {
+            (Some(blob), Some(shader_sha)) => {
+                let binding = PipelineCacheBinding {
+                    vendor_id: caps.vendor_id,
+                    device_id: caps.device_id,
+                    driver_version: caps.driver_version,
+                    pipeline_cache_uuid,
+                    shader_bundle_sha256: shader_sha,
+                };
+                match decode_pipeline_cache_envelope(blob, &binding) {
+                    Ok(raw) => Some(raw),
+                    Err(err) => {
+                        // SAFETY: Destroying instance before creating device after cache rejection.
+                        unsafe { instance.destroy_instance(None) };
+                        return Err(err);
+                    }
+                }
+            }
+            (Some(_), None) => {
+                // SAFETY: Destroying instance when cache blob supplied without shader digest.
+                unsafe { instance.destroy_instance(None) };
+                return Err(Error::InvalidInput(
+                    "pipeline cache data requires shader bundle SHA-256".to_owned(),
+                ));
+            }
+            (None, _) => None,
         };
 
         let (device, sdot_enabled) =
@@ -842,6 +1137,8 @@ impl AdrenoVulkanDevice {
             library,
             queue_family,
             caps,
+            pipeline_cache_uuid,
+            initial_pipeline_cache,
             sdot_enabled,
             &mem_properties,
             min_offset_align,
@@ -860,6 +1157,8 @@ impl AdrenoVulkanDevice {
         library: win_loader::VulkanLibrary,
         queue_family: u32,
         capabilities: VulkanDeviceCapabilities,
+        pipeline_cache_uuid: [u8; vk::UUID_SIZE],
+        initial_pipeline_cache: Option<&[u8]>,
         sdot_enabled: bool,
         mem_properties: &vk::PhysicalDeviceMemoryProperties,
         min_storage_buffer_offset_alignment: u64,
@@ -886,7 +1185,10 @@ impl AdrenoVulkanDevice {
                 }
             };
 
-        let cache_info = vk::PipelineCacheCreateInfo::default();
+        let cache_info = initial_pipeline_cache.map_or_else(
+            vk::PipelineCacheCreateInfo::default,
+            |initial_data| vk::PipelineCacheCreateInfo::default().initial_data(initial_data),
+        );
         // SAFETY: Creating pipeline cache on live device.
         let pipeline_cache = match unsafe { device.create_pipeline_cache(&cache_info, None) } {
             Ok(cache) => cache,
@@ -951,6 +1253,7 @@ impl AdrenoVulkanDevice {
             command_slots,
             next_slot_idx: 0,
             unwaited_slots: 0,
+            pipeline_cache_uuid,
             pipeline_cache,
             persistent_descriptor_pool,
             command_pool,
@@ -2750,6 +3053,7 @@ type SelectedAdapter = (
     vk::PhysicalDevice,
     u32,
     VulkanDeviceCapabilities,
+    [u8; vk::UUID_SIZE],
     BTreeSet<String>,
     vk::PhysicalDeviceMemoryProperties,
     u64,
@@ -2862,6 +3166,7 @@ fn inspect_adreno_candidate(
         phys,
         compute_family,
         caps,
+        props.pipeline_cache_uuid,
         ext_set,
         mem_properties,
         props.limits.min_storage_buffer_offset_alignment.max(1),
@@ -3100,6 +3405,90 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_cache_envelope_roundtrip_header_and_mismatch_rejection() -> Result<(), Error> {
+        let uuid_a: [u8; vk::UUID_SIZE] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let binding = PipelineCacheBinding {
+            vendor_id: QUALCOMM_VENDOR_ID,
+            device_id: 0x0630_0001,
+            driver_version: 512_345,
+            pipeline_cache_uuid: uuid_a,
+            shader_bundle_sha256:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        };
+        let raw_cache = vec![0x20_u8, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd];
+        let encoded = encode_pipeline_cache_envelope(&binding, &raw_cache)?;
+        let decoded = decode_pipeline_cache_envelope(&encoded, &binding)?;
+        assert_eq!(decoded, raw_cache.as_slice());
+
+        // Magic mismatch rejected even before hash match/decode.
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 0xFF;
+        assert!(matches!(
+            decode_pipeline_cache_envelope(&bad_magic, &binding),
+            Err(Error::InvalidInput(_))
+        ));
+
+        // Truncated envelope rejected.
+        assert!(matches!(
+            decode_pipeline_cache_envelope(&encoded[..encoded.len() - 1], &binding),
+            Err(Error::InvalidInput(_))
+        ));
+
+        // Trailing bytes invalidate trailer digest split & payload length check.
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_pipeline_cache_envelope(&trailing, &binding),
+            Err(Error::InvalidInput(_))
+        ));
+
+        // Single bit flip in payload or digest fails SHA-256 verification.
+        let mut flipped_payload = encoded.clone();
+        let mid = flipped_payload.len() - PIPELINE_CACHE_DIGEST_BYTES - 2;
+        flipped_payload[mid] ^= 0x01;
+        assert!(matches!(
+            decode_pipeline_cache_envelope(&flipped_payload, &binding),
+            Err(Error::InvalidInput(_))
+        ));
+        let mut flipped_digest = encoded.clone();
+        let last = flipped_digest.len() - 1;
+        flipped_digest[last] ^= 0x01;
+        assert!(matches!(
+            decode_pipeline_cache_envelope(&flipped_digest, &binding),
+            Err(Error::InvalidInput(_))
+        ));
+
+        // Re-signed valid envelopes for any differing binding field must be rejected.
+        let mut wrong_vendor = binding;
+        wrong_vendor.vendor_id = 0x10DE;
+        assert!(decode_pipeline_cache_envelope(&encoded, &wrong_vendor).is_err());
+
+        let mut wrong_device = binding;
+        wrong_device.device_id = 0x0700_0002;
+        assert!(decode_pipeline_cache_envelope(&encoded, &wrong_device).is_err());
+
+        let mut wrong_driver = binding;
+        wrong_driver.driver_version = 512_346;
+        assert!(decode_pipeline_cache_envelope(&encoded, &wrong_driver).is_err());
+
+        let mut wrong_uuid = binding;
+        wrong_uuid.pipeline_cache_uuid[0] ^= 0x01;
+        assert!(decode_pipeline_cache_envelope(&encoded, &wrong_uuid).is_err());
+
+        let mut wrong_shader = binding;
+        wrong_shader.shader_bundle_sha256 =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        assert!(decode_pipeline_cache_envelope(&encoded, &wrong_shader).is_err());
+
+        // Invalid digest strings rejected cleanly.
+        let mut empty_shader = binding;
+        empty_shader.shader_bundle_sha256 = "";
+        assert!(encode_pipeline_cache_envelope(&empty_shader, &raw_cache).is_err());
+        assert!(decode_pipeline_cache_envelope(&encoded, &empty_shader).is_err());
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
     fn opens_native_qualcomm_adreno_and_queries_capabilities() -> Result<(), Error> {
         let device = AdrenoVulkanDevice::open()?;
@@ -3108,6 +3497,11 @@ mod tests {
         assert_eq!(caps.identity_sha256.len(), 64);
         assert!(!caps.device_name.contains("Direct3D12"));
         assert!(caps.compute_limits.max_compute_shared_memory_size >= 16_384);
+        let shader_sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let blob = device.export_pipeline_cache_data(shader_sha)?;
+        drop(device);
+        let reopened = AdrenoVulkanDevice::open_with_pipeline_cache_data(Some(&blob), shader_sha)?;
+        assert_eq!(reopened.capabilities().vendor_id, QUALCOMM_VENDOR_ID);
         Ok(())
     }
 }

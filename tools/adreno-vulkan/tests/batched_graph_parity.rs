@@ -2766,3 +2766,60 @@ fn live_fused_block_and_evaluate_last_tile32_parity() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_incremental_checkpoint_append_rollback_and_branch_fallback_parity() -> TestResult {
+    let model = synthetic_hadamard1024_hybrid_model("h1024-incr-ckpt")?;
+    let mut exec = VulkanBatchedGraphExecutor::open(&model, VulkanBatchedConfig::default())?;
+    let mut ref_exec = VulkanBatchedGraphExecutor::open(&model, VulkanBatchedConfig::default())?;
+
+    let prefix: [u32; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
+    exec.ingest_tokens_batched(&prefix)?;
+    ref_exec.ingest_tokens_batched(&prefix)?;
+    let ckpt_prefix = exec.checkpoint()?;
+    assert_eq!(ckpt_prefix.kv_prefix_watermark(), 8);
+
+    // Branch A extends [8..12) and saves mid-branch checkpoint, then extends [12..14).
+    exec.ingest_tokens_batched(&[2, 4, 6, 8])?;
+    let mut recycled = ckpt_prefix.clone();
+    exec.checkpoint_into(&mut recycled)?;
+    assert_eq!(recycled.position(), 12);
+    assert_eq!(
+        recycled.identity_sha256()?,
+        exec.checkpoint()?.identity_sha256()?
+    );
+    exec.ingest_tokens_batched(&[10, 12])?;
+
+    // Append-only rollback to prefix (pos=8) skips KV copy cleanly and diverges onto Branch B.
+    exec.restore(&ckpt_prefix)?;
+    assert_eq!(exec.kv_fast_restores(), 1);
+    assert_eq!(exec.kv_full_restores(), 0);
+    exec.ingest_tokens_batched(&[0, 2, 4, 6])?;
+    ref_exec.ingest_tokens_batched(&[0, 2, 4, 6])?;
+    assert_close(
+        &exec.evaluate_token(14)?,
+        &ref_exec.evaluate_token(14)?,
+        1e-4,
+        "append-only rollback branch B parity",
+    );
+
+    // Roll back to prefix a second time (Turn 3) -> still fast-restores prefix [0..8).
+    exec.restore(&ckpt_prefix)?;
+    assert_eq!(exec.kv_fast_restores(), 2);
+
+    // Roll back to mid-Branch-A checkpoint `recycled` whose [8..12) was overwritten by Branch B:
+    // must automatically take full KV restore fallback and stay bit-identical to fresh Branch A!
+    exec.restore(&recycled)?;
+    assert_eq!(exec.kv_full_restores(), 1);
+    let mut branch_a_ref =
+        VulkanBatchedGraphExecutor::open(&model, VulkanBatchedConfig::default())?;
+    branch_a_ref.ingest_tokens_batched(&[1, 3, 5, 7, 9, 11, 13, 15, 2, 4, 6, 8])?;
+    assert_close(
+        &exec.evaluate_token(10)?,
+        &branch_a_ref.evaluate_token(10)?,
+        1e-4,
+        "branch divergence full KV restore fallback parity",
+    );
+    Ok(())
+}

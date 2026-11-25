@@ -337,7 +337,8 @@ impl Pq2Dotprod {
     }
 
     /// Consumes complete PQ2 rows across `1..=4` eight-token chunks (`8..=32` tokens)
-    /// inside a single full-K invocation, preserving bit-exact `0 ULP` parity.
+    /// Consumes complete PQ2 rows across `1..=4` aligned eight-token activation
+    /// chunks (`8..=32` tokens) inside a single full-K invocation, preserving bit-exact `0 ULP` parity.
     ///
     /// Returns `None` for unsupported chunk/output geometry or nonfinite scales/outputs.
     #[inline]
@@ -359,6 +360,41 @@ impl Pq2Dotprod {
         {
             let _ = self;
             scaled::portable_scaled_8x8_chunks::<FUSED>(rows, chunks, outputs)
+        }
+    }
+
+    /// Consumes complete PQ2 rows across `1..=8` aligned eight-token activation
+    /// chunks (`8..=64` tokens) inside a single full-K invocation, preserving bit-exact `0 ULP` parity.
+    ///
+    /// Returns `None` for unsupported chunk/output geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks_up_to_8<const FUSED: bool>(
+        self,
+        rows: [&[u8]; 8],
+        chunks: &[[&[Pq2Activation]; 8]],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        let first_blocks = chunks.first().map(|chunk| chunk[0].len())?;
+        if chunks.len() > 8
+            || outputs.len() != chunks.len()
+            || !chunks.chunks(4).zip(outputs.chunks(4)).all(|(c, o)| {
+                c[0][0].len() == first_blocks && scaled::valid_scaled_8x8_chunks(rows, c, o.len())
+            })
+        {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_scaled_8x8_chunks::<FUSED>(self, rows, chunks, outputs)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            for (c, o) in chunks.chunks(4).zip(outputs.chunks_mut(4)) {
+                scaled::portable_scaled_8x8_chunks::<FUSED>(rows, c, o)?;
+            }
+            Some(())
         }
     }
 
@@ -527,6 +563,42 @@ impl Ptq1Dotprod {
             scaled::portable_ptq1_8x8_chunks_validated::<PINNED, A>(rows, chunks, outputs)
         }
     }
+
+    /// Consumes complete `PTQ1_0` rows across `1..=8` aligned eight-token
+    /// chunks (`8..=64` tokens) inside a single full-K invocation over any
+    /// [`Q8ActivationView`] slices, preserving exact `0 ULP` parity.
+    ///
+    /// Returns `None` for unsupported chunk/output geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks_up_to_8<const PINNED: bool, A: Q8ActivationView>(
+        self,
+        rows: [&[u8]; 8],
+        chunks: &[[&[A]; 8]],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        let first_blocks = chunks.first().map(|chunk| chunk[0].len())?;
+        if chunks.len() > 8
+            || outputs.len() != chunks.len()
+            || !chunks.chunks(4).zip(outputs.chunks(4)).all(|(c, o)| {
+                c[0][0].len() == first_blocks && scaled::valid_ptq1_8x8_chunks(rows, c, o.len())
+            })
+        {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::ptq1_detected_dot_scaled_8x8_chunks::<PINNED, A>(self, rows, chunks, outputs)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            for (c, o) in chunks.chunks(4).zip(outputs.chunks_mut(4)) {
+                scaled::portable_ptq1_8x8_chunks_validated::<PINNED, A>(rows, c, o)?;
+            }
+            Some(())
+        }
+    }
 }
 
 /// Detected `Q8_0` SIMD capability (`dotprod` and/or `i8mm`) reusable across full-K calls.
@@ -677,6 +749,42 @@ impl Q8Dotprod {
         {
             let _ = self;
             scaled::portable_q8_0_8x8_chunks_validated::<A>(rows, chunks, outputs)
+        }
+    }
+
+    /// Consumes complete `Q8_0` rows across `1..=8` aligned eight-token
+    /// chunks (`8..=64` tokens) inside a single full-K invocation over any
+    /// [`Q8ActivationView`] slices, preserving exact `0 ULP` non-FMA parity.
+    ///
+    /// Returns `None` for unsupported chunk/output geometry or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks_up_to_8<A: Q8ActivationView>(
+        self,
+        rows: [&[u8]; 8],
+        chunks: &[[&[A]; 8]],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        let first_blocks = chunks.first().map(|chunk| chunk[0].len())?;
+        if chunks.len() > 8
+            || outputs.len() != chunks.len()
+            || !chunks.chunks(4).zip(outputs.chunks(4)).all(|(c, o)| {
+                c[0][0].len() == first_blocks && scaled::valid_q8_0_8x8_chunks(rows, c, o.len())
+            })
+        {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::q8_0_detected_dot_scaled_8x8_chunks::<A>(self, rows, chunks, outputs)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            for (c, o) in chunks.chunks(4).zip(outputs.chunks_mut(4)) {
+                scaled::portable_q8_0_8x8_chunks_validated::<A>(rows, c, o)?;
+            }
+            Some(())
         }
     }
 }
@@ -2116,6 +2224,173 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    fn assert_64_token_chunk_bits(expected: &[[[f32; 8]; 8]], actual: &[[[f32; 8]; 8]]) {
+        assert_eq!(expected.len(), actual.len());
+        for (exp_chunk, act_chunk) in expected.iter().zip(actual.iter()) {
+            for r in 0..8 {
+                for t in 0..8 {
+                    assert_eq!(act_chunk[r][t].to_bits(), exp_chunk[r][t].to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pq2_64_token_chunks_match_single_chunk_bits() {
+        const BLOCKS: usize = 3;
+        let pq2_rows: [[u8; 34 * BLOCKS]; 8] = std::array::from_fn(|r| {
+            let mut row = [0_u8; 34 * BLOCKS];
+            for b in 0..BLOCKS {
+                let off = b * 34;
+                let idx_f = f32::from(u8::try_from(r + b + 1).unwrap_or(1));
+                let scale = idx_f.mul_add(0.0125, 0.025);
+                row[off..off + 2].copy_from_slice(&float_to_half(scale).to_le_bytes());
+                for (j, byte) in row[off + 2..off + 34].iter_mut().enumerate() {
+                    *byte = u8::try_from((r * 19 + b * 37 + j * 11 + 5) & 0xff).unwrap_or(0);
+                }
+            }
+            row
+        });
+        let pq2_row_refs: [&[u8]; 8] = std::array::from_fn(|r| pq2_rows[r].as_slice());
+        let pq2_acts: Vec<Vec<Pq2Activation>> = (0..72)
+            .map(|t| {
+                (0..BLOCKS)
+                    .map(|b| {
+                        let values: [i8; 128] = std::array::from_fn(|i| {
+                            let v = i32::try_from((t * 17 + b * 29 + i * 7) % 19).unwrap_or(0) - 9;
+                            i8::try_from(v).unwrap_or(0)
+                        });
+                        let sum = values.iter().map(|&v| i32::from(v)).sum();
+                        let scale_idx = f32::from(u8::try_from((t + b) % 13 + 1).unwrap_or(1));
+                        let scale = scale_idx.mul_add(0.004, 0.03);
+                        Pq2Activation { scale, values, sum }
+                    })
+                    .collect()
+            })
+            .collect();
+        let pq2_chunks_9: [[&[Pq2Activation]; 8]; 9] =
+            std::array::from_fn(|c| std::array::from_fn(|t| pq2_acts[c * 8 + t].as_slice()));
+        let Some(pq2) = Pq2Dotprod::detect() else {
+            return;
+        };
+        let mut single = [[[0.0_f32; 8]; 8]; 8];
+        for (c, slot) in single.iter_mut().enumerate() {
+            assert!(pq2
+                .dot_scaled_8x8_chunks::<true>(
+                    pq2_row_refs,
+                    &pq2_chunks_9[c..=c],
+                    std::slice::from_mut(slot),
+                )
+                .is_some());
+        }
+        for count in 1..=8 {
+            let mut wide = [[[0.0_f32; 8]; 8]; 8];
+            assert!(pq2
+                .dot_scaled_8x8_chunks_up_to_8::<true>(
+                    pq2_row_refs,
+                    &pq2_chunks_9[..count],
+                    &mut wide[..count],
+                )
+                .is_some());
+            assert_64_token_chunk_bits(&single[..count], &wide[..count]);
+        }
+        let mut too_many = [[[0.0_f32; 8]; 8]; 9];
+        assert!(pq2
+            .dot_scaled_8x8_chunks_up_to_8::<true>(pq2_row_refs, &pq2_chunks_9, &mut too_many)
+            .is_none());
+    }
+
+    #[test]
+    fn ptq1_and_q8_64_token_chunks_match_single_chunk_bits() {
+        const BLOCKS: usize = 3;
+        let ptq1_rows: [[u8; 28 * BLOCKS]; 8] = std::array::from_fn(|r| {
+            let mut row = [0_u8; 28 * BLOCKS];
+            for b in 0..BLOCKS {
+                let off = b * 28;
+                let idx_f = f32::from(u8::try_from(r + b + 1).unwrap_or(1));
+                let scale = idx_f.mul_add(0.015, 0.04);
+                for (j, byte) in row[off..off + 26].iter_mut().enumerate() {
+                    *byte = u8::try_from((r * 23 + b * 41 + j * 13 + 9) & 0xff).unwrap_or(0);
+                }
+                row[off + 26..off + 28].copy_from_slice(&float_to_half(scale).to_le_bytes());
+            }
+            row
+        });
+        let q8_rows: [[u8; 34 * BLOCKS]; 8] = std::array::from_fn(|r| {
+            let mut row = [0_u8; 34 * BLOCKS];
+            for b in 0..BLOCKS {
+                let off = b * 34;
+                let idx_f = f32::from(u8::try_from(r + b + 2).unwrap_or(2));
+                let scale = idx_f.mul_add(0.01, 0.02);
+                row[off..off + 2].copy_from_slice(&float_to_half(scale).to_le_bytes());
+                for (j, byte) in row[off + 2..off + 34].iter_mut().enumerate() {
+                    *byte = u8::try_from((r * 17 + b * 31 + j * 7 + 3) & 0xff).unwrap_or(0);
+                }
+            }
+            row
+        });
+        let ptq1_row_refs: [&[u8]; 8] = std::array::from_fn(|r| ptq1_rows[r].as_slice());
+        let q8_row_refs: [&[u8]; 8] = std::array::from_fn(|r| q8_rows[r].as_slice());
+        let q8_acts: Vec<Vec<Q8ActivationBlock>> = (0..72)
+            .map(|t| {
+                (0..BLOCKS * 4)
+                    .map(|b| {
+                        let scale_idx = f32::from(u8::try_from((t + b) % 11 + 1).unwrap_or(1));
+                        Q8ActivationBlock {
+                            scale: scale_idx.mul_add(0.005, 0.02),
+                            values: std::array::from_fn(|i| {
+                                let v = i32::try_from((t * 13 + b * 17 + i * 5) % 21).unwrap_or(0) - 10;
+                                i8::try_from(v).unwrap_or(0)
+                            }),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let ptq1_chunks_9: [[&[Q8ActivationBlock]; 8]; 9] =
+            std::array::from_fn(|c| std::array::from_fn(|t| q8_acts[c * 8 + t].as_slice()));
+        if let Some(ptq1) = Ptq1Dotprod::detect() {
+            for pinned in [false, true] {
+                let mut single = [[[0.0_f32; 8]; 8]; 8];
+                for (c, slot) in single.iter_mut().enumerate() {
+                    let ok = if pinned {
+                        ptq1.dot_scaled_8x8_chunks::<true, _>(ptq1_row_refs, &ptq1_chunks_9[c..=c], std::slice::from_mut(slot))
+                    } else {
+                        ptq1.dot_scaled_8x8_chunks::<false, _>(ptq1_row_refs, &ptq1_chunks_9[c..=c], std::slice::from_mut(slot))
+                    };
+                    assert!(ok.is_some());
+                }
+                for count in 5..=8 {
+                    let mut wide = [[[0.0_f32; 8]; 8]; 8];
+                    let ok = if pinned {
+                        ptq1.dot_scaled_8x8_chunks_up_to_8::<true, _>(ptq1_row_refs, &ptq1_chunks_9[..count], &mut wide[..count])
+                    } else {
+                        ptq1.dot_scaled_8x8_chunks_up_to_8::<false, _>(ptq1_row_refs, &ptq1_chunks_9[..count], &mut wide[..count])
+                    };
+                    assert!(ok.is_some());
+                    assert_64_token_chunk_bits(&single[..count], &wide[..count]);
+                }
+            }
+            let mut too_many = [[[0.0_f32; 8]; 8]; 9];
+            assert!(ptq1.dot_scaled_8x8_chunks_up_to_8::<true, _>(ptq1_row_refs, &ptq1_chunks_9, &mut too_many).is_none());
+        }
+        let q8_chunks_9: [[&[Q8ActivationBlock]; 8]; 9] =
+            std::array::from_fn(|c| std::array::from_fn(|t| &q8_acts[c * 8 + t][..BLOCKS]));
+        if let Some(q8) = Q8Dotprod::detect() {
+            let mut single = [[[0.0_f32; 8]; 8]; 8];
+            for (c, slot) in single.iter_mut().enumerate() {
+                assert!(q8.dot_scaled_8x8_chunks(q8_row_refs, &q8_chunks_9[c..=c], std::slice::from_mut(slot)).is_some());
+            }
+            for count in 5..=8 {
+                let mut wide = [[[0.0_f32; 8]; 8]; 8];
+                assert!(q8.dot_scaled_8x8_chunks_up_to_8(q8_row_refs, &q8_chunks_9[..count], &mut wide[..count]).is_some());
+                assert_64_token_chunk_bits(&single[..count], &wide[..count]);
+            }
+            let mut too_many = [[[0.0_f32; 8]; 8]; 9];
+            assert!(q8.dot_scaled_8x8_chunks_up_to_8(q8_row_refs, &q8_chunks_9, &mut too_many).is_none());
         }
     }
 }

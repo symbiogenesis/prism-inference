@@ -50,7 +50,7 @@ impl RowParallelism {
             })?;
             let task_rows = total_rows.div_ceil(self.workers());
             // ceil(a/t) + ceil(b/t) + ceil(c/t) <= workers + 2.
-            // Twenty token-slice task owners remain within the existing 16 KiB
+            // Token-slice task owners remain within the bounded 32 KiB
             // caller/task reserve; there is no heap task vector or weight copy.
             let mut tasks: [SiblingTask<'_, TOKENS>; MAX_ROW_WORKERS + 2] =
                 std::array::from_fn(|_| SiblingTask {

@@ -23,8 +23,8 @@ use crate::{Result, invalid, model::Tensor};
 #[path = "prefill_dot.rs"]
 mod dot;
 
-pub(crate) const MAX_TILE_TOKENS: usize = 32;
-pub(crate) const ROW_TASK_SCRATCH_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_TILE_TOKENS: usize = 64;
+pub(crate) const ROW_TASK_SCRATCH_BYTES: usize = 32 * 1024;
 
 const fn supports_tiled_rows(kind: u32) -> bool {
     matches!(
@@ -960,7 +960,7 @@ mod tests {
             data: Arc::<[u8]>::from([0_u8; 68]).into(),
         };
         let mut scratch = ProjectionTile::default();
-        for count in [0, 8, 33] {
+        for count in [0, 8, MAX_TILE_TOKENS + 1] {
             let mut inputs = vec![vec![0.0; 128]; count];
             if count == 8 {
                 inputs[7][127] = f32::NAN;
@@ -1913,6 +1913,132 @@ mod tests {
                     );
                     assert!(sib_a.iter().chain(&sib_b).all(Vec::is_empty));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verify 64-token tiled projections across BF16 float64x2, F32, PQ2, PTQ1, and Q8_0 against scalar reference."
+    )]
+    #[test]
+    fn tiled_64_token_gemm_and_bf16_match_scalar_zero_ulp() -> Result<()> {
+        let scalar_bits_ref =
+            |tensor: &Tensor, inputs: &[Vec<f32>], pinned: bool| -> Result<Vec<Vec<u32>>> {
+                inputs
+                    .iter()
+                    .map(|input| {
+                        let mut s = if pinned {
+                            MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                        } else {
+                            MatvecScratch::with_backend(MatvecBackend::Scalar)
+                        };
+                        let mut out = Vec::new();
+                        matvec_into(tensor, input, &mut out, &mut s)?;
+                        Ok(out.into_iter().map(f32::to_bits).collect())
+                    })
+                    .collect()
+            };
+
+        for &(columns, rows) in &[(20_usize, 13_usize), (67, 17)] {
+            let mut bf16_data = Vec::with_capacity(columns * rows * 2);
+            for row in 0..rows {
+                for col in 0..columns {
+                    let bits = u16::try_from(0x3c00_usize + ((row * 7 + col * 5) % 64) * 4)?;
+                    bf16_data.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+            let bf16_tensor = Tensor {
+                name: "tile-bf16-64".into(),
+                dimensions: vec![columns, rows],
+                kind: BF16,
+                data: Arc::<[u8]>::from(bf16_data).into(),
+            };
+            for count in [1_usize, 5, 17, 48, MAX_TILE_TOKENS] {
+                let inputs: Vec<Vec<f32>> = (0..count)
+                    .map(|tok| {
+                        (0..columns)
+                            .map(|idx| [1.25, -3.5, 0.0, -0.0, 7.125, -0.375][(idx + tok * 3) % 6])
+                            .collect()
+                    })
+                    .collect();
+                let expected = scalar_bits_ref(&bf16_tensor, &inputs, true)?;
+                for backend in [MatvecBackend::Scalar, MatvecBackend::ExperimentalNeon] {
+                    let mut tile = ProjectionTile::with_backend(backend);
+                    #[cfg(feature = "parallel-rows")]
+                    tile.set_row_parallelism(RowParallelism::new(4)?);
+                    let mut actual = vec![Vec::new(); count];
+                    tile.project(&bf16_tensor, &inputs, &mut actual, true, &|| Ok(()))?;
+                    let actual_bits: Vec<Vec<u32>> = actual
+                        .iter()
+                        .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                        .collect();
+                    assert_eq!(actual_bits, expected, "bf16 count={count} cols={columns}");
+                }
+            }
+        }
+
+        let columns = 256_usize;
+        let rows = 9_usize;
+        let f32_tensor = make_f32_tensor("f32-64", columns, rows, 31);
+        let f32_inputs = make_f32_inputs(MAX_TILE_TOKENS, columns, 19);
+        for pinned in [false, true] {
+            let expected = scalar_bits_ref(&f32_tensor, &f32_inputs, pinned)?;
+            let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
+            #[cfg(feature = "parallel-rows")]
+            tile.set_row_parallelism(RowParallelism::new(4)?);
+            let mut actual = vec![Vec::new(); MAX_TILE_TOKENS];
+            tile.project(&f32_tensor, &f32_inputs, &mut actual, pinned, &|| Ok(()))?;
+            let actual_bits: Vec<Vec<u32>> = actual
+                .iter()
+                .map(|r| r.iter().copied().map(f32::to_bits).collect())
+                .collect();
+            assert_eq!(actual_bits, expected, "f32 64-tok pinned={pinned}");
+        }
+
+        for kind in [PQ2, PTQ1, Q8_0] {
+            let block_width = if kind == Q8_0 { 32 } else { 128 };
+            let blocks_per_row = columns / block_width;
+            let mut data = Vec::new();
+            for row in 0..rows {
+                for blk in 0..blocks_per_row {
+                    let mut raw = [0_u8; 34];
+                    let scale = u16::try_from(0x3400_usize + ((row * 3 + blk) % 16) * 0x10)?;
+                    raw[..2].copy_from_slice(&scale.to_le_bytes());
+                    for (idx, slot) in raw[2..].iter_mut().enumerate() {
+                        *slot = if kind == PTQ1 {
+                            [0x00, 0x55, 0x66, 0x99, 0xaa][(row + blk + idx) % 5]
+                        } else {
+                            u8::try_from((row * 29 + blk * 13 + idx * 7) & 0xff)?
+                        };
+                    }
+                    if kind == PTQ1 {
+                        data.extend_from_slice(&bonsai_ternary::pack_ptq(&raw)?);
+                    } else {
+                        data.extend_from_slice(&raw);
+                    }
+                }
+            }
+            let tensor = Tensor {
+                name: format!("tile-64-kind-{kind}"),
+                dimensions: vec![columns, rows],
+                kind,
+                data: Arc::<[u8]>::from(data).into(),
+            };
+            let inputs = make_f32_inputs(MAX_TILE_TOKENS, columns, 23);
+            for pinned in [false, true] {
+                let expected = scalar_bits_ref(&tensor, &inputs, pinned)?;
+                let mut tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
+                #[cfg(feature = "parallel-rows")]
+                tile.set_row_parallelism(RowParallelism::new(4)?);
+                let mut actual = vec![Vec::new(); MAX_TILE_TOKENS];
+                tile.project(&tensor, &inputs, &mut actual, pinned, &|| Ok(()))?;
+                let actual_bits: Vec<Vec<u32>> = actual
+                    .iter()
+                    .map(|r| r.iter().copied().map(f32::to_bits).collect())
+                    .collect();
+                assert_eq!(actual_bits, expected, "kind={kind} 64-tok pinned={pinned}");
             }
         }
         Ok(())

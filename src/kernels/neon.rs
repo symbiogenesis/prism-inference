@@ -1476,7 +1476,153 @@ pub(super) fn lora_multi_a_f32(
     Some(true)
 }
 
-pub(super) fn lora_multi_a_tokens_f16(
+#[inline]
+fn dot_f16_f32_pair_tokens<const TOK: usize>(
+    neon: Neon,
+    w_rows: [&[u16]; 2],
+    inputs: [&[f32]; TOK],
+) -> [[f32; TOK]; 2] {
+    let mut acc0 = [[f32x4::splat(neon, 0.0); TOK]; 2];
+    let mut acc1 = [[f32x4::splat(neon, 0.0); TOK]; 2];
+    let (w0_chunks8, w0_rem8) = w_rows[0].as_chunks::<8>();
+    let (w1_chunks8, w1_rem8) = w_rows[1].as_chunks::<8>();
+    let x_chunks8: [&[[f32; 8]]; TOK] = std::array::from_fn(|t| inputs[t].as_chunks::<8>().0);
+    let x_rem8: [&[f32]; TOK] = std::array::from_fn(|t| inputs[t].as_chunks::<8>().1);
+
+    for (idx, (w0_8, w1_8)) in w0_chunks8.iter().zip(w1_chunks8).enumerate() {
+        let (w0_lo, w0_hi) = f16_bits_to_f32_x8(neon, w0_8);
+        let (w1_lo, w1_hi) = f16_bits_to_f32_x8(neon, w1_8);
+        for t in 0..TOK {
+            let x8 = &x_chunks8[t][idx];
+            let x_lo = f32x4::from_slice(neon, &x8[..4]);
+            let x_hi = f32x4::from_slice(neon, &x8[4..]);
+            acc0[0][t] = w0_lo.mul_add_precise(x_lo, acc0[0][t]);
+            acc1[0][t] = w0_hi.mul_add_precise(x_hi, acc1[0][t]);
+            acc0[1][t] = w1_lo.mul_add_precise(x_lo, acc0[1][t]);
+            acc1[1][t] = w1_hi.mul_add_precise(x_hi, acc1[1][t]);
+        }
+    }
+
+    let (w0_chunks4, w0_tail) = w0_rem8.as_chunks::<4>();
+    let (w1_chunks4, w1_tail) = w1_rem8.as_chunks::<4>();
+    let x_chunks4: [&[[f32; 4]]; TOK] = std::array::from_fn(|t| x_rem8[t].as_chunks::<4>().0);
+    let x_tails: [&[f32]; TOK] = std::array::from_fn(|t| x_rem8[t].as_chunks::<4>().1);
+    if let (Some(w0_4), Some(w1_4)) = (w0_chunks4.first(), w1_chunks4.first()) {
+        let w0 = f16_bits_to_f32_x4(neon, *w0_4);
+        let w1 = f16_bits_to_f32_x4(neon, *w1_4);
+        for t in 0..TOK {
+            let x = f32x4::from_slice(neon, &x_chunks4[t][0]);
+            acc0[0][t] = w0.mul_add_precise(x, acc0[0][t]);
+            acc0[1][t] = w1.mul_add_precise(x, acc0[1][t]);
+        }
+    }
+
+    let mut sums = [[0.0_f32; TOK]; 2];
+    for r in 0..2 {
+        for t in 0..TOK {
+            let mut lanes = [0.0_f32; 4];
+            (acc0[r][t] + acc1[r][t]).store_slice(&mut lanes);
+            sums[r][t] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        }
+    }
+    for (i, (&w0_bits, &w1_bits)) in w0_tail.iter().zip(w1_tail).enumerate() {
+        let w0 = bonsai_ternary::half_to_float(w0_bits);
+        let w1 = bonsai_ternary::half_to_float(w1_bits);
+        for t in 0..TOK {
+            let x = x_tails[t][i];
+            sums[0][t] = w0.mul_add(x, sums[0][t]);
+            sums[1][t] = w1.mul_add(x, sums[1][t]);
+        }
+    }
+    sums
+}
+
+#[inline]
+fn dot_f32_f32_pair_tokens<const TOK: usize>(
+    neon: Neon,
+    w_rows: [&[f32]; 2],
+    inputs: [&[f32]; TOK],
+) -> [[f32; TOK]; 2] {
+    let mut acc0 = [[f32x4::splat(neon, 0.0); TOK]; 2];
+    let mut acc1 = [[f32x4::splat(neon, 0.0); TOK]; 2];
+    let (w0_chunks8, w0_rem8) = w_rows[0].as_chunks::<8>();
+    let (w1_chunks8, w1_rem8) = w_rows[1].as_chunks::<8>();
+    let x_chunks8: [&[[f32; 8]]; TOK] = std::array::from_fn(|t| inputs[t].as_chunks::<8>().0);
+    let x_rem8: [&[f32]; TOK] = std::array::from_fn(|t| inputs[t].as_chunks::<8>().1);
+
+    for (idx, (w0_8, w1_8)) in w0_chunks8.iter().zip(w1_chunks8).enumerate() {
+        let w0_lo = f32x4::from_slice(neon, &w0_8[..4]);
+        let w0_hi = f32x4::from_slice(neon, &w0_8[4..]);
+        let w1_lo = f32x4::from_slice(neon, &w1_8[..4]);
+        let w1_hi = f32x4::from_slice(neon, &w1_8[4..]);
+        for t in 0..TOK {
+            let x8 = &x_chunks8[t][idx];
+            let x_lo = f32x4::from_slice(neon, &x8[..4]);
+            let x_hi = f32x4::from_slice(neon, &x8[4..]);
+            acc0[0][t] = w0_lo.mul_add_precise(x_lo, acc0[0][t]);
+            acc1[0][t] = w0_hi.mul_add_precise(x_hi, acc1[0][t]);
+            acc0[1][t] = w1_lo.mul_add_precise(x_lo, acc0[1][t]);
+            acc1[1][t] = w1_hi.mul_add_precise(x_hi, acc1[1][t]);
+        }
+    }
+
+    let (w0_chunks4, w0_tail) = w0_rem8.as_chunks::<4>();
+    let (w1_chunks4, w1_tail) = w1_rem8.as_chunks::<4>();
+    let x_chunks4: [&[[f32; 4]]; TOK] = std::array::from_fn(|t| x_rem8[t].as_chunks::<4>().0);
+    let x_tails: [&[f32]; TOK] = std::array::from_fn(|t| x_rem8[t].as_chunks::<4>().1);
+    if let (Some(w0_4), Some(w1_4)) = (w0_chunks4.first(), w1_chunks4.first()) {
+        let w0 = f32x4::from_slice(neon, w0_4);
+        let w1 = f32x4::from_slice(neon, w1_4);
+        for t in 0..TOK {
+            let x = f32x4::from_slice(neon, &x_chunks4[t][0]);
+            acc0[0][t] = w0.mul_add_precise(x, acc0[0][t]);
+            acc0[1][t] = w1.mul_add_precise(x, acc0[1][t]);
+        }
+    }
+
+    let mut sums = [[0.0_f32; TOK]; 2];
+    for r in 0..2 {
+        for t in 0..TOK {
+            let mut lanes = [0.0_f32; 4];
+            (acc0[r][t] + acc1[r][t]).store_slice(&mut lanes);
+            sums[r][t] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        }
+    }
+    for (i, (&w0, &w1)) in w0_tail.iter().zip(w1_tail).enumerate() {
+        for t in 0..TOK {
+            let x = x_tails[t][i];
+            sums[0][t] = w0.mul_add(x, sums[0][t]);
+            sums[1][t] = w1.mul_add(x, sums[1][t]);
+        }
+    }
+    sums
+}
+
+#[inline]
+fn write_lora_a_dots<const RANK_MAJOR: bool, const TOK: usize>(
+    ranks_out: &mut [f32],
+    rank: usize,
+    n_tokens: usize,
+    row_base: usize,
+    tok_base: usize,
+    dots: &[f32; TOK],
+) -> bool {
+    if !dots.iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    for (offset, &dot) in dots.iter().enumerate() {
+        let t = tok_base + offset;
+        let idx = if RANK_MAJOR {
+            row_base * n_tokens + t
+        } else {
+            t * rank + row_base
+        };
+        ranks_out[idx] = dot;
+    }
+    true
+}
+
+fn lora_multi_a_tokens_f16_layout<const RANK_MAJOR: bool>(
     a_weights: &[u16],
     in_features: usize,
     rank: usize,
@@ -1484,36 +1630,206 @@ pub(super) fn lora_multi_a_tokens_f16(
     ranks_out: &mut [f32],
 ) -> Option<bool> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
+    let n_tokens = inputs.len();
     if in_features == 0
         || rank == 0
         || a_weights.len() != rank.saturating_mul(in_features)
-        || ranks_out.len() != inputs.len().saturating_mul(rank)
+        || ranks_out.len() != n_tokens.saturating_mul(rank)
         || inputs.iter().any(|input| input.len() != in_features)
     {
         return Some(false);
     }
+    let pair_len = (rank / 2) * 2 * in_features;
+    let (w_pairs, w_rem) = a_weights.split_at(pair_len);
     let (tok_quads, tok_tail) = inputs.as_chunks::<4>();
     let tail_base = tok_quads.len() * 4;
-    for (r, a_row) in a_weights.chunks_exact(in_features).enumerate() {
-        for (q_idx, tok4) in tok_quads.iter().enumerate() {
-            let dots = dot_f16_f32_row_4tokens(neon, a_row, *tok4);
-            if !dots.iter().all(|v| v.is_finite()) {
+
+    for (pair_idx, pair_weights) in w_pairs.chunks_exact(2 * in_features).enumerate() {
+        let r_base = pair_idx * 2;
+        let (r0, r1) = pair_weights.split_at(in_features);
+        for (q_idx, &tok4) in tok_quads.iter().enumerate() {
+            let dots = dot_f16_f32_pair_tokens::<4>(neon, [r0, r1], tok4);
+            let base_t = q_idx * 4;
+            if !write_lora_a_dots::<RANK_MAJOR, 4>(ranks_out, rank, n_tokens, r_base, base_t, &dots[0])
+                || !write_lora_a_dots::<RANK_MAJOR, 4>(
+                    ranks_out,
+                    rank,
+                    n_tokens,
+                    r_base + 1,
+                    base_t,
+                    &dots[1],
+                )
+            {
                 return Some(false);
             }
-            let base_t = q_idx * 4;
-            for (offset, &dot) in dots.iter().enumerate() {
-                ranks_out[(base_t + offset) * rank + r] = dot;
+        }
+        match tok_tail {
+            [t0] => {
+                let dots = dot_f16_f32_pair_tokens::<1>(neon, [r0, r1], [*t0]);
+                if !write_lora_a_dots::<RANK_MAJOR, 1>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
+                    || !write_lora_a_dots::<RANK_MAJOR, 1>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
+                {
+                    return Some(false);
+                }
+            }
+            [t0, t1] => {
+                let dots = dot_f16_f32_pair_tokens::<2>(neon, [r0, r1], [*t0, *t1]);
+                if !write_lora_a_dots::<RANK_MAJOR, 2>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
+                    || !write_lora_a_dots::<RANK_MAJOR, 2>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
+                {
+                    return Some(false);
+                }
+            }
+            [t0, t1, t2] => {
+                let dots = dot_f16_f32_pair_tokens::<3>(neon, [r0, r1], [*t0, *t1, *t2]);
+                if !write_lora_a_dots::<RANK_MAJOR, 3>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
+                    || !write_lora_a_dots::<RANK_MAJOR, 3>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
+                {
+                    return Some(false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !w_rem.is_empty() {
+        let r = (rank / 2) * 2;
+        for (q_idx, &tok4) in tok_quads.iter().enumerate() {
+            let dots = dot_f16_f32_row_4tokens(neon, w_rem, tok4);
+            if !write_lora_a_dots::<RANK_MAJOR, 4>(ranks_out, rank, n_tokens, r, q_idx * 4, &dots) {
+                return Some(false);
             }
         }
         for (offset, &input) in tok_tail.iter().enumerate() {
-            let dot = dot_f16_f32_row(neon, a_row, input);
-            if !dot.is_finite() {
+            let dot = dot_f16_f32_row(neon, w_rem, input);
+            if !write_lora_a_dots::<RANK_MAJOR, 1>(
+                ranks_out,
+                rank,
+                n_tokens,
+                r,
+                tail_base + offset,
+                &[dot],
+            ) {
                 return Some(false);
             }
-            ranks_out[(tail_base + offset) * rank + r] = dot;
         }
     }
     Some(true)
+}
+
+fn lora_multi_a_tokens_f32_layout<const RANK_MAJOR: bool>(
+    a_weights: &[f32],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+) -> Option<bool> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    let n_tokens = inputs.len();
+    if in_features == 0
+        || rank == 0
+        || a_weights.len() != rank.saturating_mul(in_features)
+        || ranks_out.len() != n_tokens.saturating_mul(rank)
+        || inputs.iter().any(|input| input.len() != in_features)
+    {
+        return Some(false);
+    }
+    let pair_len = (rank / 2) * 2 * in_features;
+    let (w_pairs, w_rem) = a_weights.split_at(pair_len);
+    let (tok_quads, tok_tail) = inputs.as_chunks::<4>();
+    let tail_base = tok_quads.len() * 4;
+
+    for (pair_idx, pair_weights) in w_pairs.chunks_exact(2 * in_features).enumerate() {
+        let r_base = pair_idx * 2;
+        let (r0, r1) = pair_weights.split_at(in_features);
+        for (q_idx, &tok4) in tok_quads.iter().enumerate() {
+            let dots = dot_f32_f32_pair_tokens::<4>(neon, [r0, r1], tok4);
+            let base_t = q_idx * 4;
+            if !write_lora_a_dots::<RANK_MAJOR, 4>(ranks_out, rank, n_tokens, r_base, base_t, &dots[0])
+                || !write_lora_a_dots::<RANK_MAJOR, 4>(
+                    ranks_out,
+                    rank,
+                    n_tokens,
+                    r_base + 1,
+                    base_t,
+                    &dots[1],
+                )
+            {
+                return Some(false);
+            }
+        }
+        match tok_tail {
+            [t0] => {
+                let dots = dot_f32_f32_pair_tokens::<1>(neon, [r0, r1], [*t0]);
+                if !write_lora_a_dots::<RANK_MAJOR, 1>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
+                    || !write_lora_a_dots::<RANK_MAJOR, 1>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
+                {
+                    return Some(false);
+                }
+            }
+            [t0, t1] => {
+                let dots = dot_f32_f32_pair_tokens::<2>(neon, [r0, r1], [*t0, *t1]);
+                if !write_lora_a_dots::<RANK_MAJOR, 2>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
+                    || !write_lora_a_dots::<RANK_MAJOR, 2>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
+                {
+                    return Some(false);
+                }
+            }
+            [t0, t1, t2] => {
+                let dots = dot_f32_f32_pair_tokens::<3>(neon, [r0, r1], [*t0, *t1, *t2]);
+                if !write_lora_a_dots::<RANK_MAJOR, 3>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
+                    || !write_lora_a_dots::<RANK_MAJOR, 3>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
+                {
+                    return Some(false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !w_rem.is_empty() {
+        let r = (rank / 2) * 2;
+        for (q_idx, &tok4) in tok_quads.iter().enumerate() {
+            let dots = dot_f32_f32_row_4tokens(neon, w_rem, tok4);
+            if !write_lora_a_dots::<RANK_MAJOR, 4>(ranks_out, rank, n_tokens, r, q_idx * 4, &dots) {
+                return Some(false);
+            }
+        }
+        for (offset, &input) in tok_tail.iter().enumerate() {
+            let dot = dot_f32_f32_row(neon, w_rem, input);
+            if !write_lora_a_dots::<RANK_MAJOR, 1>(
+                ranks_out,
+                rank,
+                n_tokens,
+                r,
+                tail_base + offset,
+                &[dot],
+            ) {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
+}
+
+pub(super) fn lora_multi_a_tokens_f16(
+    a_weights: &[u16],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+) -> Option<bool> {
+    lora_multi_a_tokens_f16_layout::<false>(a_weights, in_features, rank, inputs, ranks_out)
+}
+
+pub(super) fn lora_multi_a_tokens_rank_major_f16(
+    a_weights: &[u16],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+) -> Option<bool> {
+    lora_multi_a_tokens_f16_layout::<true>(a_weights, in_features, rank, inputs, ranks_out)
 }
 
 pub(super) fn lora_multi_a_tokens_f32(
@@ -1523,37 +1839,17 @@ pub(super) fn lora_multi_a_tokens_f32(
     inputs: &[&[f32]],
     ranks_out: &mut [f32],
 ) -> Option<bool> {
-    let neon = fearless_simd::Level::baseline().as_neon()?;
-    if in_features == 0
-        || rank == 0
-        || a_weights.len() != rank.saturating_mul(in_features)
-        || ranks_out.len() != inputs.len().saturating_mul(rank)
-        || inputs.iter().any(|input| input.len() != in_features)
-    {
-        return Some(false);
-    }
-    let (tok_quads, tok_tail) = inputs.as_chunks::<4>();
-    let tail_base = tok_quads.len() * 4;
-    for (r, a_row) in a_weights.chunks_exact(in_features).enumerate() {
-        for (q_idx, tok4) in tok_quads.iter().enumerate() {
-            let dots = dot_f32_f32_row_4tokens(neon, a_row, *tok4);
-            if !dots.iter().all(|v| v.is_finite()) {
-                return Some(false);
-            }
-            let base_t = q_idx * 4;
-            for (offset, &dot) in dots.iter().enumerate() {
-                ranks_out[(base_t + offset) * rank + r] = dot;
-            }
-        }
-        for (offset, &input) in tok_tail.iter().enumerate() {
-            let dot = dot_f32_f32_row(neon, a_row, input);
-            if !dot.is_finite() {
-                return Some(false);
-            }
-            ranks_out[(tail_base + offset) * rank + r] = dot;
-        }
-    }
-    Some(true)
+    lora_multi_a_tokens_f32_layout::<false>(a_weights, in_features, rank, inputs, ranks_out)
+}
+
+pub(super) fn lora_multi_a_tokens_rank_major_f32(
+    a_weights: &[f32],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+) -> Option<bool> {
+    lora_multi_a_tokens_f32_layout::<true>(a_weights, in_features, rank, inputs, ranks_out)
 }
 
 pub(super) fn lora_multi_b_scale_and_finish_f16(

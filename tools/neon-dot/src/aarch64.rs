@@ -144,6 +144,17 @@ fn prefetch_row_blocks<const ROWS: usize, const BYTES: usize>(
 }
 
 #[inline]
+fn prefetch_pq2_tokens_block(tokens: &[&[super::Pq2Activation]], block_idx: usize, block_count: usize) {
+    if block_idx + 1 < block_count {
+        for tok in tokens {
+            let ptr = tok[block_idx + 1].values.as_ptr().cast::<u8>();
+            prefetch_l1(ptr);
+            prefetch_l1(ptr.wrapping_add(64));
+        }
+    }
+}
+
+#[inline]
 #[target_feature(enable = "neon")]
 fn load_u8x16(bytes: &[u8; 16]) -> uint8x16_t {
     // SAFETY: `bytes` is a valid 16-byte array reference and `vld1q_u8` requires no alignment.
@@ -2712,6 +2723,9 @@ fn dot_scaled_8x8_chunks_i8mm<const FUSED: bool>(
             let w_h0 = unpack_pq2_paired_half([r0_h0, r1_h0, r2_h0, r3_h0], mask);
             let w_h1 = unpack_pq2_paired_half([r0_h1, r1_h1, r2_h1, r3_h1], mask);
             for (chunk, out_chunk) in chunks.iter().zip(outputs.iter_mut()) {
+                if row_half == 0 {
+                    prefetch_pq2_tokens_block(chunk, block_idx, block_count);
+                }
                 let a = [
                     &chunk[0][block_idx],
                     &chunk[1][block_idx],
@@ -2799,6 +2813,9 @@ fn dot_scaled_8x8_chunks_dotprod<const FUSED: bool>(
             let (r3_h0, r3_h1) = load_pq2_block_halves(blocks[rbase + 3]);
             let raw_halves = [[r0_h0, r1_h0, r2_h0, r3_h0], [r0_h1, r1_h1, r2_h1, r3_h1]];
             for (chunk, out_chunk) in chunks.iter().zip(outputs.iter_mut()) {
+                if row_half == 0 {
+                    prefetch_pq2_tokens_block(chunk, block_idx, block_count);
+                }
                 let a = [
                     &chunk[0][block_idx],
                     &chunk[1][block_idx],
@@ -3002,6 +3019,8 @@ fn dot_scaled_8x_pairs_reg_i8mm<const FUSED: bool, const PAIRS: usize, const HAS
     let mut odd_acc = [vdupq_n_f32(0.0); 2];
 
     for block_idx in 0..block_count {
+        prefetch_row_blocks(&row_chunks, block_idx, block_count);
+        prefetch_pq2_tokens_block(tokens, block_idx, block_count);
         let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
         let row_scales = widen_row_scales_f16(&blocks)?;
         for (row_half, half_scales_arr) in row_scales.iter().enumerate() {
@@ -3083,6 +3102,8 @@ fn dot_scaled_8x_pairs_stack_i8mm<const FUSED: bool, const PAIRS: usize, const H
     let mut odd_buf = [[0.0_f32; 4]; 2];
 
     for block_idx in 0..block_count {
+        prefetch_row_blocks(&row_chunks, block_idx, block_count);
+        prefetch_pq2_tokens_block(tokens, block_idx, block_count);
         let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
         let row_scales = widen_row_scales_f16(&blocks)?;
         for (row_half, half_scales_arr) in row_scales.iter().enumerate() {
@@ -3290,6 +3311,8 @@ fn dot_scaled_8x_quad_dotprod<const FUSED: bool, const N_TOK: usize>(
     let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
     let mut f_acc = [[vdupq_n_f32(0.0); 4]; 2];
     for block_idx in 0..block_count {
+        prefetch_row_blocks(&row_chunks, block_idx, block_count);
+        prefetch_pq2_tokens_block(tokens, block_idx, block_count);
         let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
         let row_scales = widen_row_scales_f16(&blocks)?;
         let act_scales_arr: [f32; 4] = std::array::from_fn(|t| {
@@ -3340,6 +3363,8 @@ fn dot_scaled_8x_oct_dotprod<const FUSED: bool, const TAIL_TOK: usize>(
     let mask = vdupq_n_u8(3);
     let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
     for block_idx in 0..block_count {
+        prefetch_row_blocks(&row_chunks, block_idx, block_count);
+        prefetch_pq2_tokens_block(tokens, block_idx, block_count);
         let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
         let row_scales = widen_row_scales_f16(&blocks)?;
         let act_lo_arr: [f32; 4] = std::array::from_fn(|t| tokens[t][block_idx].scale);
@@ -4861,6 +4886,58 @@ pub(super) fn ptq1_detected_dot_scaled_8x_tokens<const PINNED: bool, A: super::Q
 }
 
 #[inline]
+fn prefetch_q8_quad_window<A: super::Q8ActivationView>(tok_quad: [&[A]; 4], act_idx: usize) {
+    if act_idx < tok_quad[0].len() {
+        for tok in tok_quad {
+            prefetch_l1(tok[act_idx].values().as_ptr().cast::<u8>());
+        }
+    }
+    if act_idx + 2 < tok_quad[0].len() {
+        for tok in tok_quad {
+            prefetch_l1(tok[act_idx + 2].values().as_ptr().cast::<u8>());
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn ptq1_pinned_quad_block<A: super::Q8ActivationView>(
+    block_trits: &[[int8x16_t; 8]; 4],
+    rs: &[f32; 4],
+    tok_quad: [&[A]; 4],
+    act_base: usize,
+    acc: &mut [[core::arch::aarch64::float32x4_t; 4]; 4],
+) {
+    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32};
+
+    for group in 0..4 {
+        let act_idx = act_base + group;
+        let a_scales = [
+            tok_quad[0][act_idx].scale(),
+            tok_quad[1][act_idx].scale(),
+            tok_quad[2][act_idx].scale(),
+            tok_quad[3][act_idx].scale(),
+        ];
+        let a_pairs: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|t| {
+            let ah = tok_quad[t][act_idx].values().as_chunks::<16>().0;
+            (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
+        });
+        for (acc_row, (&row_rs, row_trits)) in acc.iter_mut().zip(rs.iter().zip(block_trits.iter())) {
+            let w0 = row_trits[group * 2];
+            let w1 = row_trits[group * 2 + 1];
+            for t in 0..4 {
+                let sdot = sdot32_vec(w0, w1, a_pairs[t].0, a_pairs[t].1);
+                acc_row[t] = vfmaq_f32(
+                    acc_row[t],
+                    vcvtq_f32_s32(sdot),
+                    vdupq_n_f32(row_rs * a_scales[t]),
+                );
+            }
+        }
+    }
+}
+
+#[inline]
 #[target_feature(enable = "neon,dotprod")]
 fn ptq1_pinned_quad_k_tile<A: super::Q8ActivationView>(
     half_trits: &[[[int8x16_t; 8]; 4]],
@@ -4869,35 +4946,29 @@ fn ptq1_pinned_quad_k_tile<A: super::Q8ActivationView>(
     k_base: usize,
     mut acc: [[core::arch::aarch64::float32x4_t; 4]; 4],
 ) -> [[core::arch::aarch64::float32x4_t; 4]; 4] {
-    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32};
+    prefetch_q8_quad_window(tok_quad, k_base * 4);
+    let (trit_pairs, trit_rem) = half_trits.as_chunks::<2>();
+    let (scale_pairs, scale_rem) = half_scales.as_chunks::<2>();
 
-    for (k_off, (block_trits, rs)) in half_trits.iter().zip(half_scales).enumerate() {
-        let act_base = (k_base + k_off) * 4;
-        for group in 0..4 {
-            let act_idx = act_base + group;
-            let a_scales = [
-                tok_quad[0][act_idx].scale(),
-                tok_quad[1][act_idx].scale(),
-                tok_quad[2][act_idx].scale(),
-                tok_quad[3][act_idx].scale(),
-            ];
-            let a_pairs: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|t| {
-                let ah = tok_quad[t][act_idx].values().as_chunks::<16>().0;
-                (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
-            });
-            for (r, (&row_rs, row_trits)) in rs.iter().zip(block_trits.iter()).enumerate() {
-                let w0 = row_trits[group * 2];
-                let w1 = row_trits[group * 2 + 1];
-                for t in 0..4 {
-                    let sdot = sdot32_vec(w0, w1, a_pairs[t].0, a_pairs[t].1);
-                    acc[r][t] = vfmaq_f32(
-                        acc[r][t],
-                        vcvtq_f32_s32(sdot),
-                        vdupq_n_f32(row_rs * a_scales[t]),
-                    );
-                }
-            }
-        }
+    for (pair_idx, (trit_pair, scale_pair)) in trit_pairs.iter().zip(scale_pairs).enumerate() {
+        let act_base = (k_base + pair_idx * 2) * 4;
+        prefetch_q8_quad_window(tok_quad, act_base + 4);
+        prefetch_q8_quad_window(tok_quad, act_base + 8);
+        ptq1_pinned_quad_block(&trit_pair[0], &scale_pair[0], tok_quad, act_base, &mut acc);
+        ptq1_pinned_quad_block(
+            &trit_pair[1],
+            &scale_pair[1],
+            tok_quad,
+            act_base + 4,
+            &mut acc,
+        );
+    }
+
+    let rem_base = (k_base + trit_pairs.len() * 2) * 4;
+    for (rem_off, (block_trits, rs)) in trit_rem.iter().zip(scale_rem).enumerate() {
+        let act_base = rem_base + rem_off * 4;
+        prefetch_q8_quad_window(tok_quad, act_base + 4);
+        ptq1_pinned_quad_block(block_trits, rs, tok_quad, act_base, &mut acc);
     }
     acc
 }
@@ -5195,6 +5266,14 @@ pub(super) fn ptq1_detected_dot_scaled_8x8_chunks<
             3 => unsafe { ptq1_scaled_8x8_chunks_pinned_dotprod::<3, A>(rows, chunks, outputs) },
             // SAFETY: see arm `1` above.
             4 => unsafe { ptq1_scaled_8x8_chunks_pinned_dotprod::<4, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            5 => unsafe { ptq1_scaled_8x8_chunks_pinned_dotprod::<5, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            6 => unsafe { ptq1_scaled_8x8_chunks_pinned_dotprod::<6, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            7 => unsafe { ptq1_scaled_8x8_chunks_pinned_dotprod::<7, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            8 => unsafe { ptq1_scaled_8x8_chunks_pinned_dotprod::<8, A>(rows, chunks, outputs) },
             _ => None,
         }
     } else if detected.i8mm {
@@ -5208,6 +5287,14 @@ pub(super) fn ptq1_detected_dot_scaled_8x8_chunks<
             3 => unsafe { ptq1_scaled_8x8_chunks_source_i8mm::<3, A>(rows, chunks, outputs) },
             // SAFETY: see arm `1` above.
             4 => unsafe { ptq1_scaled_8x8_chunks_source_i8mm::<4, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            5 => unsafe { ptq1_scaled_8x8_chunks_source_i8mm::<5, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            6 => unsafe { ptq1_scaled_8x8_chunks_source_i8mm::<6, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            7 => unsafe { ptq1_scaled_8x8_chunks_source_i8mm::<7, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            8 => unsafe { ptq1_scaled_8x8_chunks_source_i8mm::<8, A>(rows, chunks, outputs) },
             _ => None,
         }
     } else {
@@ -5221,6 +5308,14 @@ pub(super) fn ptq1_detected_dot_scaled_8x8_chunks<
             3 => unsafe { ptq1_scaled_8x8_chunks_source_dotprod::<3, A>(rows, chunks, outputs) },
             // SAFETY: see arm `1` above.
             4 => unsafe { ptq1_scaled_8x8_chunks_source_dotprod::<4, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            5 => unsafe { ptq1_scaled_8x8_chunks_source_dotprod::<5, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            6 => unsafe { ptq1_scaled_8x8_chunks_source_dotprod::<6, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            7 => unsafe { ptq1_scaled_8x8_chunks_source_dotprod::<7, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            8 => unsafe { ptq1_scaled_8x8_chunks_source_dotprod::<8, A>(rows, chunks, outputs) },
             _ => None,
         }
     }
@@ -6076,6 +6171,14 @@ pub(super) fn q8_0_detected_dot_scaled_8x8_chunks<A: super::Q8ActivationView>(
             3 => unsafe { q8_0_scaled_8x8_chunks_i8mm::<3, A>(rows, chunks, outputs) },
             // SAFETY: see arm `1` above.
             4 => unsafe { q8_0_scaled_8x8_chunks_i8mm::<4, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            5 => unsafe { q8_0_scaled_8x8_chunks_i8mm::<5, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            6 => unsafe { q8_0_scaled_8x8_chunks_i8mm::<6, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            7 => unsafe { q8_0_scaled_8x8_chunks_i8mm::<7, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            8 => unsafe { q8_0_scaled_8x8_chunks_i8mm::<8, A>(rows, chunks, outputs) },
             _ => None,
         }
     } else if detected.dotprod {
@@ -6089,6 +6192,14 @@ pub(super) fn q8_0_detected_dot_scaled_8x8_chunks<A: super::Q8ActivationView>(
             3 => unsafe { q8_0_scaled_8x8_chunks_dotprod::<3, A>(rows, chunks, outputs) },
             // SAFETY: see arm `1` above.
             4 => unsafe { q8_0_scaled_8x8_chunks_dotprod::<4, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            5 => unsafe { q8_0_scaled_8x8_chunks_dotprod::<5, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            6 => unsafe { q8_0_scaled_8x8_chunks_dotprod::<6, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            7 => unsafe { q8_0_scaled_8x8_chunks_dotprod::<7, A>(rows, chunks, outputs) },
+            // SAFETY: see arm `1` above.
+            8 => unsafe { q8_0_scaled_8x8_chunks_dotprod::<8, A>(rows, chunks, outputs) },
             _ => None,
         }
     } else {

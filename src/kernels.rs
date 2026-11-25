@@ -4567,6 +4567,16 @@ trait MultiLoraScalarWeight: Copy + Sync {
         None
     }
 
+    fn neon_multi_a_tokens_rank_major(
+        _a_weights: &[Self],
+        _in_features: usize,
+        _rank: usize,
+        _inputs: &[&[f32]],
+        _ranks_out_rank_major: &mut [f32],
+    ) -> Option<bool> {
+        None
+    }
+
     fn neon_multi_b(
         _b_weights: &[Self],
         _ranks: &[f32],
@@ -4627,6 +4637,29 @@ impl MultiLoraScalarWeight for u16 {
         ranks_out: &mut [f32],
     ) -> Option<bool> {
         neon::lora_multi_a_tokens_f16(a_weights, in_features, rank, inputs, ranks_out)
+    }
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    fn neon_multi_a_tokens_rank_major(
+        a_weights: &[Self],
+        in_features: usize,
+        rank: usize,
+        inputs: &[&[f32]],
+        ranks_out_rank_major: &mut [f32],
+    ) -> Option<bool> {
+        neon::lora_multi_a_tokens_rank_major_f16(
+            a_weights,
+            in_features,
+            rank,
+            inputs,
+            ranks_out_rank_major,
+        )
     }
 
     #[cfg(all(
@@ -4711,6 +4744,29 @@ impl MultiLoraScalarWeight for f32 {
         ranks_out: &mut [f32],
     ) -> Option<bool> {
         neon::lora_multi_a_tokens_f32(a_weights, in_features, rank, inputs, ranks_out)
+    }
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    fn neon_multi_a_tokens_rank_major(
+        a_weights: &[Self],
+        in_features: usize,
+        rank: usize,
+        inputs: &[&[f32]],
+        ranks_out_rank_major: &mut [f32],
+    ) -> Option<bool> {
+        neon::lora_multi_a_tokens_rank_major_f32(
+            a_weights,
+            in_features,
+            rank,
+            inputs,
+            ranks_out_rank_major,
+        )
     }
 
     #[cfg(all(
@@ -4883,6 +4939,65 @@ fn lora_multi_a_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
     result
 }
 
+fn lora_multi_a_tokens_rank_parallel<W: MultiLoraScalarWeight, const USE_NEON: bool>(
+    a_weights: &[W],
+    in_features: usize,
+    rank: usize,
+    inputs: &[&[f32]],
+    ranks_out: &mut [f32],
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    const STACK_RANK_MAJOR_CAP: usize = 2048;
+    let n_tokens = inputs.len();
+    let needed = n_tokens * rank;
+    let run_rank_chunk = |start_row: usize, rank_major_chunk: &mut [f32]| -> Result<()> {
+        let chunk_rank = rank_major_chunk.len() / n_tokens;
+        let weight_start = start_row * in_features;
+        let weight_end = weight_start + chunk_rank * in_features;
+        let a_chunk = &a_weights[weight_start..weight_end];
+        if USE_NEON
+            && let Some(finite) = W::neon_multi_a_tokens_rank_major(
+                a_chunk,
+                in_features,
+                chunk_rank,
+                inputs,
+                rank_major_chunk,
+            )
+        {
+            return if finite {
+                Ok(())
+            } else {
+                Err(invalid("non-finite multi-rank LoRA A activation"))
+            };
+        }
+        for (r, a_row) in a_chunk.chunks_exact(in_features).enumerate() {
+            for (t, &input) in inputs.iter().enumerate() {
+                let dot = dot_multi_scalar(a_row, input);
+                if !dot.is_finite() {
+                    return Err(invalid("non-finite multi-rank LoRA A activation"));
+                }
+                rank_major_chunk[r * n_tokens + t] = dot;
+            }
+        }
+        Ok(())
+    };
+    let mut stack_buf = [0.0_f32; STACK_RANK_MAJOR_CAP];
+    let mut heap_buf = Vec::new();
+    let rank_major = if needed <= STACK_RANK_MAJOR_CAP {
+        &mut stack_buf[..needed]
+    } else {
+        reserve_f32_scratch(&mut heap_buf, needed)?;
+        &mut heap_buf[..needed]
+    };
+    parallelism.update_chunks(rank_major, n_tokens, run_rank_chunk)?;
+    for (t, tok_out) in ranks_out[..needed].chunks_exact_mut(rank).enumerate() {
+        for (r, dst) in tok_out.iter_mut().enumerate() {
+            *dst = rank_major[r * n_tokens + t];
+        }
+    }
+    Ok(())
+}
+
 fn lora_multi_a_tokens_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
     a_weights: &[W],
     in_features: usize,
@@ -4902,8 +5017,8 @@ fn lora_multi_a_tokens_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
     {
         return Err(invalid("multi-rank LoRA A batch dimension mismatch"));
     }
-    let needed = inputs
-        .len()
+    let n_tokens = inputs.len();
+    let needed = n_tokens
         .checked_mul(rank)
         .ok_or_else(|| invalid("multi-rank LoRA rank buffer overflow"))?;
     reserve_f32_scratch(ranks_out, needed)?;
@@ -4931,8 +5046,20 @@ fn lora_multi_a_tokens_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
         }
         Ok(())
     };
-    let work = a_weights.len().saturating_mul(inputs.len());
-    let result = if inputs.len() >= 4
+    let work = a_weights.len().saturating_mul(n_tokens);
+    let result = if work >= MULTI_A_PARALLEL_ELEM_THRESHOLD
+        && parallelism.workers() > 1
+        && (rank >= 8 || (n_tokens < 4 && rank > 1))
+    {
+        lora_multi_a_tokens_rank_parallel::<W, USE_NEON>(
+            a_weights,
+            in_features,
+            rank,
+            inputs,
+            &mut ranks_out[..needed],
+            parallelism,
+        )
+    } else if n_tokens >= 4
         && work >= MULTI_A_PARALLEL_ELEM_THRESHOLD
         && parallelism.workers() > 1
     {
@@ -6948,6 +7075,107 @@ mod tests {
             let mut par_out = vec![123.0_f32; 31];
             assert!(matvec_into(&tensor, &input, &mut par_out, &mut par_scratch).is_err());
             assert_eq!(par_out, empty);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lora_multi_a_rank16_parallel_matches_scalar_zero_ulp() -> crate::Result<()> {
+        #[cfg(feature = "parallel-rows")]
+        let worker_counts = [1_usize, 4];
+        #[cfg(not(feature = "parallel-rows"))]
+        let worker_counts = [1_usize];
+        let in_features = 2051_usize;
+
+        for (rank, token_counts) in [
+            (16_usize, [2_usize, 3, 8, 17, 64].as_slice()),
+            (33_usize, [2_usize, 64].as_slice()),
+        ] {
+            let a_f16: Vec<u16> = (0..rank * in_features)
+                .map(|idx| {
+                    let v = i16::try_from((idx * 7) % 13).unwrap_or(0) - 6;
+                    super::half_bits(f32::from(v) * 0.0625)
+                })
+                .collect();
+            let a_f32: Vec<f32> = a_f16.iter().map(|&b| super::half_to_float(b)).collect();
+
+            for &token_count in token_counts {
+                let owned_inputs: Vec<Vec<f32>> = (0..token_count)
+                    .map(|t| {
+                        (0..in_features)
+                            .map(|c| {
+                                let num = i16::try_from((c * 11 + t * 17) % 19).unwrap_or(0) - 9;
+                                f32::from(num) * 0.125
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let input_refs: Vec<&[f32]> = owned_inputs.iter().map(Vec::as_slice).collect();
+                let serial = super::RowParallelism::new(1)?;
+                let mut expected_bits = Vec::new();
+                super::lora_multi_a_tokens_impl::<_, false>(
+                    &a_f16,
+                    in_features,
+                    rank,
+                    &input_refs,
+                    &mut expected_bits,
+                    &serial,
+                )?;
+                let expected: Vec<u32> = expected_bits.into_iter().map(f32::to_bits).collect();
+
+                for workers in worker_counts {
+                    let parallelism = super::RowParallelism::new(workers)?;
+                    let mut out_f16 = Vec::new();
+                    let mut out_f32 = Vec::new();
+                    super::lora_multi_a_tokens_f16(
+                        &a_f16,
+                        in_features,
+                        rank,
+                        &input_refs,
+                        &mut out_f16,
+                        &parallelism,
+                    )?;
+                    super::lora_multi_a_tokens_f32(
+                        &a_f32,
+                        in_features,
+                        rank,
+                        &input_refs,
+                        &mut out_f32,
+                        &parallelism,
+                    )?;
+                    assert_eq!(
+                        out_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        expected,
+                        "f16 rank={rank} tokens={token_count} workers={workers}"
+                    );
+                    assert_eq!(
+                        out_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        expected,
+                        "f32 rank={rank} tokens={token_count} workers={workers}"
+                    );
+                }
+            }
+
+            // Failure atomicity across rank-major parallel workers.
+            #[cfg(feature = "parallel-rows")]
+            {
+                let mut bad_a = a_f32;
+                bad_a[rank / 2 * in_features + in_features - 1] = f32::NAN;
+                let bad_inputs = vec![vec![0.0_f32; in_features]; 2];
+                let bad_refs: Vec<&[f32]> = bad_inputs.iter().map(Vec::as_slice).collect();
+                let parallel = super::RowParallelism::new(4)?;
+                let mut ranks_out = vec![9.0_f32; 2 * rank];
+                assert!(super::lora_multi_a_tokens_f32(
+                    &bad_a,
+                    in_features,
+                    rank,
+                    &bad_refs,
+                    &mut ranks_out,
+                    &parallel,
+                )
+                .is_err());
+                assert!(ranks_out.is_empty());
+            }
         }
         Ok(())
     }

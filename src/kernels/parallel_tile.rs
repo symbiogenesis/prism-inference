@@ -179,7 +179,7 @@ impl RowParallelism {
 
             let task_rows = rows.div_ceil(self.workers());
             let task_count = rows.div_ceil(task_rows);
-            // At most 16 * 32 mutable slice descriptors and one error/count per
+            // At most 16 * 64 mutable slice descriptors and one error/count per
             // worker, all stack-scoped. Existing output capacities were reserved
             // fallibly by the caller; no second matrix or result transpose exists.
             let mut tasks: [Task<'_, TOKENS>; MAX_ROW_WORKERS] = std::array::from_fn(|_| Task {
@@ -427,7 +427,8 @@ mod tests {
     #[test]
     fn tiled_parallel_rows_borrow_outputs_and_keep_callback_on_caller() -> Result<()> {
         assert!(
-            size_of::<[Task<'_, 32>; MAX_ROW_WORKERS]>() + 1024
+            size_of::<[Task<'_, { crate::kernels::prefill::MAX_TILE_TOKENS }>; MAX_ROW_WORKERS]>()
+                + 1024
                 <= crate::kernels::prefill::ROW_TASK_SCRATCH_BYTES
         );
         let policy = RowParallelism::new(4)?;

@@ -11,7 +11,8 @@ use crate::{Result, invalid};
 )]
 fn x1_sibling_tile_workers_preserve_borrows_order_and_cancellation() -> Result<()> {
     assert!(
-        size_of::<[SiblingTask<'_, 32>; MAX_ROW_WORKERS + 2]>() + 1024
+        size_of::<[SiblingTask<'_, { crate::kernels::prefill::MAX_TILE_TOKENS }>; MAX_ROW_WORKERS + 2]>()
+            + 1024
             <= crate::kernels::prefill::ROW_TASK_SCRATCH_BYTES
     );
     let parallelism = RowParallelism::new(4)?;

@@ -811,22 +811,22 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
         && let Some(dotprod) = dotprod
     {
         if !chunks8.is_empty() {
-            let mut out_buf = [[[0.0_f32; 8]; 8]; 4];
-            for (batch_idx, batch) in chunks8.chunks(4).enumerate() {
-                let mut arg_chunks: [[&[bonsai_neon_dot::Pq2Activation]; 8]; 4] = [[&[]; 8]; 4];
+            let mut out_buf = [[[0.0_f32; 8]; 8]; 8];
+            for (batch_idx, batch) in chunks8.chunks(8).enumerate() {
+                let mut arg_chunks: [[&[bonsai_neon_dot::Pq2Activation]; 8]; 8] = [[&[]; 8]; 8];
                 for (c, chunk) in batch.iter().enumerate() {
                     arg_chunks[c] =
                         std::array::from_fn(|t| &chunk[t].pq2_consumption[..block_count]);
                 }
                 let out_slice = &mut out_buf[..batch.len()];
                 let result = if pinned {
-                    dotprod.dot_scaled_8x8_chunks::<true>(
+                    dotprod.dot_scaled_8x8_chunks_up_to_8::<true>(
                         rows,
                         &arg_chunks[..batch.len()],
                         out_slice,
                     )
                 } else {
-                    dotprod.dot_scaled_8x8_chunks::<false>(
+                    dotprod.dot_scaled_8x8_chunks_up_to_8::<false>(
                         rows,
                         &arg_chunks[..batch.len()],
                         out_slice,
@@ -836,7 +836,7 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                     return Some(Err(crate::invalid("nonfinite tensor or activation value")));
                 };
                 for (c, chunk_out) in out_slice.iter().enumerate() {
-                    let base = (batch_idx * 4 + c) * 8;
+                    let base = (batch_idx * 8 + c) * 8;
                     for row in 0..8 {
                         sums[row][base..base + 8].copy_from_slice(&chunk_out[row]);
                     }
@@ -1814,21 +1814,21 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
         let q8_len = block_count * 4;
         let (chunks8, rem8) = preparations.as_chunks::<8>();
         if !chunks8.is_empty() {
-            let mut out_buf = [[[0.0_f32; 8]; 8]; 4];
-            for (batch_idx, batch) in chunks8.chunks(4).enumerate() {
-                let mut arg_chunks: [[&[crate::kernels::Q8Block]; 8]; 4] = [[&[]; 8]; 4];
+            let mut out_buf = [[[0.0_f32; 8]; 8]; 8];
+            for (batch_idx, batch) in chunks8.chunks(8).enumerate() {
+                let mut arg_chunks: [[&[crate::kernels::Q8Block]; 8]; 8] = [[&[]; 8]; 8];
                 for (c, chunk) in batch.iter().enumerate() {
                     arg_chunks[c] = std::array::from_fn(|t| &chunk[t].q8[..q8_len]);
                 }
                 let out_slice = &mut out_buf[..batch.len()];
                 let result = if pinned {
-                    dotprod.dot_scaled_8x8_chunks::<true, _>(
+                    dotprod.dot_scaled_8x8_chunks_up_to_8::<true, _>(
                         rows,
                         &arg_chunks[..batch.len()],
                         out_slice,
                     )
                 } else {
-                    dotprod.dot_scaled_8x8_chunks::<false, _>(
+                    dotprod.dot_scaled_8x8_chunks_up_to_8::<false, _>(
                         rows,
                         &arg_chunks[..batch.len()],
                         out_slice,
@@ -1838,7 +1838,7 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
                     return Some(Err(crate::invalid("nonfinite tensor or activation value")));
                 };
                 for (c, chunk_out) in out_slice.iter().enumerate() {
-                    let base = (batch_idx * 4 + c) * 8;
+                    let base = (batch_idx * 8 + c) * 8;
                     for row in 0..8 {
                         sums[row][base..base + 8].copy_from_slice(&chunk_out[row]);
                     }
@@ -2311,81 +2311,193 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
     Some(Ok(sums))
 }
 
+#[inline]
+fn decode_bf16_pair(
+    neon: Neon,
+    zero: u16x8<Neon>,
+    bytes: &[u8; 16],
+) -> (f32x4<Neon>, f32x4<Neon>) {
+    let raw = u8x16::from_slice(neon, bytes).bitcast::<u16x8<Neon>>();
+    (
+        zero.zip_low(raw).bitcast::<f32x4<Neon>>(),
+        zero.zip_high(raw).bitcast::<f32x4<Neon>>(),
+    )
+}
+
+#[inline]
+fn decode_bf16_tail_weights(rem: &[u8]) -> crate::Result<([f32; 7], usize)> {
+    let mut weights = [0.0_f32; 7];
+    let chunks = rem.as_chunks::<2>().0;
+    if chunks.len() > weights.len() {
+        return Err(crate::invalid("invalid BF16 tail extent"));
+    }
+    for (dst, bytes) in weights.iter_mut().zip(chunks) {
+        *dst = crate::kernels::finite(f32::from_bits(u32::from(u16::from_le_bytes(*bytes)) << 16))?;
+    }
+    Ok((weights, chunks.len()))
+}
+
 #[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::needless_range_loop,
-    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+    clippy::too_many_lines,
+    reason = "Vectorize paired BF16 rows with float64x2 accumulation while preserving exact scalar 0 ULP sum order."
 )]
+fn dot_bf16_row_pairs<const PAIRS: usize, const ROWS: usize, const TOKENS: usize>(
+    neon: Neon,
+    rows: [&[u8]; ROWS],
+    preparations: &[crate::kernels::MatvecScratch],
+) -> crate::Result<[[f32; TOKENS]; ROWS]> {
+    const K_TILE: usize = 32;
+    let token_count = preparations.len();
+    if token_count == 0
+        || token_count > TOKENS
+        || !rows[0].len().is_multiple_of(2)
+        || rows.iter().any(|row| row.len() != rows[0].len())
+        || preparations
+            .iter()
+            .any(|prep| prep.activations.len() * 2 != rows[0].len())
+    {
+        return Err(crate::invalid("invalid BF16 tile geometry"));
+    }
+
+    let zero = u16x8::splat(neon, 0);
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let b_chunks = rows.map(|row| row.as_chunks::<16>().0);
+    let b_rems = rows.map(|row| row.as_chunks::<16>().1);
+    let chunk_count = b_chunks[0].len();
+    let mut sums = [[f64x2::splat(neon, -0.0); TOKENS]; PAIRS];
+    let (tok_quads, tok_rem) = preparations.as_chunks::<4>();
+
+    for k_base in (0..chunk_count).step_by(K_TILE) {
+        let k_end = (k_base + K_TILE).min(chunk_count);
+        for (quad_idx, quad) in tok_quads.iter().enumerate() {
+            let base_t = quad_idx * 4;
+            let mut acc: [[f64x2<Neon>; 4]; PAIRS] = std::array::from_fn(|p| {
+                [
+                    sums[p][base_t],
+                    sums[p][base_t + 1],
+                    sums[p][base_t + 2],
+                    sums[p][base_t + 3],
+                ]
+            });
+            for idx in k_base..k_end {
+                let col = idx * 8;
+                let a_lo: [f32x4<Neon>; 4] = std::array::from_fn(|t| {
+                    f32x4::from_slice(neon, &quad[t].activations[col..col + 4])
+                });
+                let a_hi: [f32x4<Neon>; 4] = std::array::from_fn(|t| {
+                    f32x4::from_slice(neon, &quad[t].activations[col + 4..col + 8])
+                });
+                for (p, acc_pair) in acc.iter_mut().enumerate() {
+                    let (we0, we1) = decode_bf16_pair(neon, zero, &b_chunks[p * 2][idx]);
+                    let (wo0, wo1) = decode_bf16_pair(neon, zero, &b_chunks[p * 2 + 1][idx]);
+                    if quad_idx == 0 {
+                        finite_mask = finite_mask
+                            & we0.is_finite()
+                            & we1.is_finite()
+                            & wo0.is_finite()
+                            & wo1.is_finite();
+                    }
+                    for t in 0..4 {
+                        let s = add_f32_columns(acc_pair[t], we0 * a_lo[t], wo0 * a_lo[t]);
+                        acc_pair[t] = add_f32_columns(s, we1 * a_hi[t], wo1 * a_hi[t]);
+                    }
+                }
+            }
+            for (p, acc_pair) in acc.iter().enumerate() {
+                sums[p][base_t..base_t + 4].copy_from_slice(acc_pair);
+            }
+        }
+        if !tok_rem.is_empty() {
+            let rem_base = tok_quads.len() * 4;
+            let check_weights = tok_quads.is_empty();
+            let mut acc = [[f64x2::splat(neon, -0.0); 3]; PAIRS];
+            for (p, acc_pair) in acc.iter_mut().enumerate() {
+                acc_pair[..tok_rem.len()]
+                    .copy_from_slice(&sums[p][rem_base..rem_base + tok_rem.len()]);
+            }
+            for idx in k_base..k_end {
+                let col = idx * 8;
+                let mut acts = [(f32x4::splat(neon, 0.0), f32x4::splat(neon, 0.0)); 3];
+                for (t_off, scratch) in tok_rem.iter().enumerate() {
+                    acts[t_off] = (
+                        f32x4::from_slice(neon, &scratch.activations[col..col + 4]),
+                        f32x4::from_slice(neon, &scratch.activations[col + 4..col + 8]),
+                    );
+                }
+                for (p, acc_pair) in acc.iter_mut().enumerate() {
+                    let (we0, we1) = decode_bf16_pair(neon, zero, &b_chunks[p * 2][idx]);
+                    let (wo0, wo1) = decode_bf16_pair(neon, zero, &b_chunks[p * 2 + 1][idx]);
+                    if check_weights {
+                        finite_mask = finite_mask
+                            & we0.is_finite()
+                            & we1.is_finite()
+                            & wo0.is_finite()
+                            & wo1.is_finite();
+                    }
+                    for (acc_tok, &(a_lo, a_hi)) in acc_pair[..tok_rem.len()].iter_mut().zip(&acts) {
+                        let s = add_f32_columns(*acc_tok, we0 * a_lo, wo0 * a_lo);
+                        *acc_tok = add_f32_columns(s, we1 * a_hi, wo1 * a_hi);
+                    }
+                }
+            }
+            for (p, acc_pair) in acc.iter().enumerate() {
+                sums[p][rem_base..rem_base + tok_rem.len()]
+                    .copy_from_slice(&acc_pair[..tok_rem.len()]);
+            }
+        }
+    }
+
+    if !finite_mask.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    let rem_base = chunk_count * 8;
+    let mut out = [[0.0_f32; TOKENS]; ROWS];
+    for (p, pair_sums) in sums.iter().enumerate() {
+        let r0 = p * 2;
+        let r1 = r0 + 1;
+        let (tail_w0, tail_len) = decode_bf16_tail_weights(b_rems[r0])?;
+        let (tail_w1, tail_len1) = decode_bf16_tail_weights(b_rems[r1])?;
+        if tail_len != tail_len1 {
+            return Err(crate::invalid("invalid BF16 tail geometry"));
+        }
+        for (tok, (prep, pair_sum)) in preparations.iter().zip(pair_sums).enumerate() {
+            let [mut s0, mut s1] = pair_sum.to_array();
+            for (idx, (&w0, &w1)) in tail_w0[..tail_len]
+                .iter()
+                .zip(&tail_w1[..tail_len])
+                .enumerate()
+            {
+                let act = prep.activations[rem_base + idx];
+                s0 += f64::from(w0 * act);
+                s1 += f64::from(w1 * act);
+            }
+            out[r0][tok] = crate::kernels::finite(s0 as f32)?;
+            out[r1][tok] = crate::kernels::finite(s1 as f32)?;
+        }
+    }
+    Ok(out)
+}
+
 pub(in crate::kernels::prefill) fn dot_bf16_rows<const ROWS: usize, const TOKENS: usize>(
     rows: [&[u8]; ROWS],
     preparations: &[crate::kernels::MatvecScratch],
 ) -> Option<crate::Result<[[f32; TOKENS]; ROWS]>> {
     let neon = fearless_simd::Level::baseline().as_neon()?;
-    let zero = u16x8::splat(neon, 0);
-    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
-    let b_chunks = rows.map(|row| row.as_chunks::<16>().0);
-    let b_rems = rows.map(|row| row.as_chunks::<16>().1);
-    let token_count = preparations.len();
-    let mut sums = [[-0.0_f64; TOKENS]; ROWS];
-    let chunk_count = b_chunks[0].len();
-    for idx in 0..chunk_count {
-        let mut w_pairs = [(f32x4::splat(neon, 0.0), f32x4::splat(neon, 0.0)); ROWS];
-        for r in 0..ROWS {
-            let raw = u8x16::from_slice(neon, &b_chunks[r][idx]).bitcast::<u16x8<Neon>>();
-            let w0 = zero.zip_low(raw).bitcast::<f32x4<Neon>>();
-            let w1 = zero.zip_high(raw).bitcast::<f32x4<Neon>>();
-            finite_mask = finite_mask & w0.is_finite() & w1.is_finite();
-            w_pairs[r] = (w0, w1);
-        }
-        let col_base = idx * 8;
-        for (tok, prep) in preparations.iter().enumerate() {
-            let in_chunk = &prep.activations[col_base..col_base + 8];
-            let a0 = f32x4::from_slice(neon, &in_chunk[..4]);
-            let a1 = f32x4::from_slice(neon, &in_chunk[4..]);
-            for r in 0..ROWS {
-                let (w0, w1) = w_pairs[r];
-                let prod0 = (w0 * a0).to_array();
-                let prod1 = (w1 * a1).to_array();
-                sums[r][tok] += f64::from(prod0[0]);
-                sums[r][tok] += f64::from(prod0[1]);
-                sums[r][tok] += f64::from(prod0[2]);
-                sums[r][tok] += f64::from(prod0[3]);
-                sums[r][tok] += f64::from(prod1[0]);
-                sums[r][tok] += f64::from(prod1[1]);
-                sums[r][tok] += f64::from(prod1[2]);
-                sums[r][tok] += f64::from(prod1[3]);
-            }
-        }
+    match ROWS {
+        4 => Some(dot_bf16_row_pairs::<2, ROWS, TOKENS>(
+            neon,
+            rows,
+            preparations,
+        )),
+        8 => Some(dot_bf16_row_pairs::<4, ROWS, TOKENS>(
+            neon,
+            rows,
+            preparations,
+        )),
+        _ => None,
     }
-    if !finite_mask.all_true() {
-        return Some(Err(crate::invalid("nonfinite tensor or activation value")));
-    }
-    let rem_base = chunk_count * 8;
-    for r in 0..ROWS {
-        for (rem_idx, b) in b_rems[r].as_chunks::<2>().0.iter().enumerate() {
-            let w = match crate::kernels::finite(f32::from_bits(
-                u32::from(u16::from_le_bytes(*b)) << 16,
-            )) {
-                Ok(val) => val,
-                Err(err) => return Some(Err(err)),
-            };
-            let col = rem_base + rem_idx;
-            for (tok, prep) in preparations.iter().enumerate() {
-                sums[r][tok] += f64::from(w * prep.activations[col]);
-            }
-        }
-    }
-    let mut out = [[0.0_f32; TOKENS]; ROWS];
-    for r in 0..ROWS {
-        for tok in 0..token_count {
-            match crate::kernels::finite(sums[r][tok] as f32) {
-                Ok(val) => out[r][tok] = val,
-                Err(err) => return Some(Err(err)),
-            }
-        }
-    }
-    Some(Ok(out))
 }
 
 #[inline]
@@ -2998,7 +3110,7 @@ mod tests {
         let columns = 512_usize;
         let block_count = columns / 128;
         let row_bytes = block_count * 34;
-        let max_tokens = 32_usize;
+        let max_tokens = MAX_TILE_TOKENS;
         let (tensor, inputs) = build_pq2_test_fixture(columns, max_tokens)?;
         let row_refs: [&[u8]; 8] =
             std::array::from_fn(|r| &tensor.data[r * row_bytes..(r + 1) * row_bytes]);
@@ -3025,7 +3137,7 @@ mod tests {
                 preps.push(neon_scratch);
             }
 
-            for count in [1_usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17, 24, 32] {
+            for count in [1_usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17, 24, 32, 48, 64] {
                 let mut decoded = 0_u64;
                 let actual = super::dot_pq2_eight_rows::<MAX_TILE_TOKENS>(
                     row_refs,
@@ -3160,7 +3272,7 @@ mod tests {
             preps.push(neon_scratch);
         }
 
-        for count in [1_usize, 2, 3, 4, 5, 7, 8, 9, 16, 24, 32] {
+        for count in [1_usize, 2, 3, 4, 5, 7, 8, 9, 16, 24, 32, 48, 64] {
             let mut decoded = 0_u64;
             let actual = super::dot_q8_eight_rows::<MAX_TILE_TOKENS>(
                 row_refs,
@@ -3189,7 +3301,7 @@ mod tests {
         let columns = 384_usize;
         let block_count = columns / 128;
         let row_bytes = block_count * 28;
-        let (tensor, inputs) = sample_ptq1_eight_row_tensor(columns, 32)?;
+        let (tensor, inputs) = sample_ptq1_eight_row_tensor(columns, MAX_TILE_TOKENS)?;
         let row_refs: [&[u8]; 8] =
             std::array::from_fn(|r| &tensor.data[r * row_bytes..(r + 1) * row_bytes]);
         for pinned in [false, true] {

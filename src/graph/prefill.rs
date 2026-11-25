@@ -980,12 +980,7 @@ impl Qwen35 {
         result
     }
 
-    pub(super) fn ingest_prefill_block_with_executor(
-        &mut self,
-        tokens: &[u32],
-        check: &dyn Fn() -> Result<()>,
-        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
-    ) -> Result<()> {
+    fn validate_prefill_block_bounds(&self, tokens: &[u32]) -> Result<()> {
         if self.has_pending_folded_verification() {
             return Err(invalid(
                 "folded verification state must be committed or flushed before prefill",
@@ -1012,6 +1007,127 @@ impl Qwen35 {
         {
             return Err(invalid("CPU prefill block exceeds remaining context"));
         }
+        Ok(())
+    }
+
+    pub(super) fn ingest_prefill_block_and_evaluate_last_into(
+        &mut self,
+        tokens: &[u32],
+        output: &mut Vec<f32>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let mut executor = self.projection_executor.take();
+        let use_executor_on_tiles = executor
+            .as_deref()
+            .is_some_and(crate::kernels::Pq2ProjectionExecutor::supports_tile_tokens);
+        let result = self.ingest_prefill_block_and_evaluate_last_with_executor(
+            tokens,
+            output,
+            check,
+            executor.as_mut().map(Self::coerce_executor),
+            use_executor_on_tiles,
+        );
+        self.projection_executor = executor;
+        result
+    }
+
+    pub(super) fn ingest_prefill_block_and_evaluate_last_with_executor(
+        &mut self,
+        tokens: &[u32],
+        output: &mut Vec<f32>,
+        check: &dyn Fn() -> Result<()>,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        use_executor_on_tiles: bool,
+    ) -> Result<()> {
+        if let Err(error) = self.validate_prefill_block_bounds(tokens) {
+            output.clear();
+            return Err(error);
+        }
+        let Some(mut tile) = self.tiled_prefill.take() else {
+            let Some((&last, prefix)) = tokens.split_last() else {
+                output.clear();
+                return Err(invalid("invalid native prefill block bounds or tokens"));
+            };
+            let result = (|| {
+                for &token in prefix {
+                    check()?;
+                    self.evaluate_token_with_executor(token, None, executor.as_deref_mut(), None)?;
+                    check()?;
+                }
+                check()?;
+                self.evaluate_token_with_executor(last, Some(output), executor, None)?;
+                check()
+            })();
+            if result.is_err() {
+                output.clear();
+            }
+            return result;
+        };
+        let result = (|| {
+            let mut chunks = tokens.chunks(tile.tokens).peekable();
+            while let Some(chunk) = chunks.next() {
+                let is_last_chunk = chunks.peek().is_none();
+                check()?;
+                if !is_last_chunk {
+                    let tile_executor = if use_executor_on_tiles {
+                        executor.as_deref_mut()
+                    } else {
+                        None
+                    };
+                    self.ingest_cpu_tile_with_folded(
+                        chunk,
+                        check,
+                        &mut tile,
+                        None,
+                        tile_executor,
+                        None,
+                    )?;
+                    tile.statistics.completed_tiles =
+                        tile.statistics.completed_tiles.saturating_add(1);
+                    tile.statistics.completed_tokens = tile
+                        .statistics
+                        .completed_tokens
+                        .saturating_add(u64::try_from(chunk.len())?);
+                } else if chunk.len() == 1 {
+                    self.evaluate_token_with_executor(chunk[0], Some(output), executor, None)?;
+                    check()?;
+                    break;
+                } else {
+                    self.ingest_cpu_tile_and_evaluate_last(
+                        chunk,
+                        check,
+                        &mut tile,
+                        executor,
+                        use_executor_on_tiles,
+                        output,
+                    )?;
+                    tile.statistics.completed_tiles =
+                        tile.statistics.completed_tiles.saturating_add(1);
+                    tile.statistics.completed_tokens = tile
+                        .statistics
+                        .completed_tokens
+                        .saturating_add(u64::try_from(chunk.len())?);
+                    check()?;
+                    break;
+                }
+                check()?;
+            }
+            Ok(())
+        })();
+        self.tiled_prefill = Some(tile);
+        if result.is_err() {
+            output.clear();
+        }
+        result
+    }
+
+    pub(super) fn ingest_prefill_block_with_executor(
+        &mut self,
+        tokens: &[u32],
+        check: &dyn Fn() -> Result<()>,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+    ) -> Result<()> {
+        self.validate_prefill_block_bounds(tokens)?;
         let Some(mut tile) = self.tiled_prefill.take() else {
             for &token in tokens {
                 check()?;
@@ -1044,22 +1160,13 @@ impl Qwen35 {
         result
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep causal attention commits, FFN tile consumption and cancellation visibly ordered."
-    )]
-    fn ingest_cpu_tile_with_folded(
-        &mut self,
+    fn embed_tile_tokens(
+        &self,
         tokens: &[u32],
-        check: &dyn Fn() -> Result<()>,
         tile: &mut TiledPrefill,
-        mut folded: Option<&mut FoldedVerificationState>,
-        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
-        logits: Option<&mut [Vec<f32>]>,
+        adapter_scratch: &mut AdapterScratch,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        let count = tokens.len();
-        let base = self.position;
-        let mrope_base = self.mrope_position;
         for (token, hidden) in tokens.iter().zip(&mut tile.hidden) {
             check()?;
             self.embedding.row_into(
@@ -1077,10 +1184,791 @@ impl Qwen35 {
                     usize::try_from(*token)?,
                     self.adapter_scale,
                     hidden,
-                    &mut self.workspace.adapter,
+                    adapter_scratch,
                 )?;
             }
         }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep causal FFN range execution, compaction compensation and residual update explicit."
+    )]
+    fn run_tile_ffn_range(
+        transforms: &Transforms,
+        geometry: &Geometry,
+        arithmetic: Arithmetic,
+        adapters: ActiveAdapters<'_>,
+        adapter_scratch: &mut AdapterScratch,
+        projection_scratch: &mut crate::kernels::MatvecScratch,
+        layer_idx: usize,
+        layer: &Layer,
+        tile: &mut TiledPrefill,
+        start: usize,
+        end: usize,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let post_norm_reuse = add_normalize_for_tile_into(
+            transforms,
+            geometry,
+            arithmetic,
+            &layer.post_norm,
+            &layer.gate,
+            &mut tile.hidden[start..end],
+            &tile.attention[start..end],
+            &mut tile.normalized[start..end],
+            &mut tile.transformed[start..end],
+            tile.projector.row_parallelism(),
+        )?;
+        check()?;
+        let compacted_layer = transforms.is_compacted_layer(layer_idx);
+        let ffn_compensation = transforms.compaction_compensation(layer_idx);
+        let chain_ran = !compacted_layer
+            && ffn_compensation.is_none()
+            && try_project_tile_ffn_chain(
+                transforms, geometry, arithmetic, adapters, post_norm_reuse,
+                [&layer.gate, &layer.up, &layer.down], &tile.normalized[start..end],
+                Some(&tile.hidden[start..end]), &mut tile.attention[start..end],
+                &mut tile.transformed[start..end], &tile.projector,
+                executor.as_deref_mut(), check,
+            )?;
+        if chain_ran {
+            for (hidden, output) in tile.hidden[start..end].iter_mut().zip(&mut tile.attention[start..end]) {
+                std::mem::swap(hidden, output);
+                finite(hidden, "CPU tiled decoder layer output")?;
+            }
+            return Ok(());
+        }
+        let ffn_reuse = project_tile_ffn_swiglu(
+            transforms, geometry, arithmetic, adapters, adapter_scratch, projection_scratch,
+            post_norm_reuse, &layer.gate, &layer.up, &layer.down,
+            &tile.normalized[start..end], &mut tile.gate[start..end], &mut tile.up[start..end],
+            &mut tile.transformed[start..end], &mut tile.projector, executor.as_deref_mut(), check,
+        )?;
+        check()?;
+        let use_attention_scratch = ffn_compensation.is_some();
+        let branch_outputs = if use_attention_scratch {
+            &mut tile.attention[start..end]
+        } else {
+            &mut tile.normalized[start..end]
+        };
+        let _ = project_tile(
+            transforms, geometry, arithmetic, adapters, adapter_scratch, projection_scratch,
+            ffn_reuse, &layer.down, &tile.up[start..end], branch_outputs,
+            &mut tile.transformed[start..end], &mut tile.projector, executor, check,
+        )?;
+        if let Some(compensation) = ffn_compensation {
+            for (norm_in, branch) in tile.normalized[start..end].iter().zip(&mut tile.attention[start..end]) {
+                compensation.apply(norm_in, branch)?;
+            }
+        }
+        let branch_outputs = if use_attention_scratch {
+            &tile.attention[start..end]
+        } else {
+            &tile.normalized[start..end]
+        };
+        for (hidden, output) in tile.hidden[start..end].iter_mut().zip(branch_outputs) {
+            add_finite(hidden, output, "CPU tiled decoder layer output")?;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep full causal layer attention execution explicit across leading and final tiles."
+    )]
+    fn run_full_tile_attention(
+        geometry: &Geometry,
+        arithmetic: Arithmetic,
+        transforms: &Transforms,
+        adapters: ActiveAdapters<'_>,
+        projection: &mut super::ProjectionScratch,
+        adapter_scratch: &mut AdapterScratch,
+        attention_scratch: &mut super::AttentionScratch,
+        layer: &Layer,
+        state: &mut LayerState,
+        delta: &mut LayerDelta,
+        base: usize,
+        mrope_base: usize,
+        count: usize,
+        frequencies_ready: &mut bool,
+        tile: &mut TiledPrefill,
+        folded_tape: Option<&mut gdn::FoldedRecurrentLayerTape>,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let first_attn_target = match &layer.attention {
+            Attention::Recurrent(weights) => &weights.qkv,
+            Attention::Full(weights) => &weights.query,
+        };
+        let norm_reuse = normalize_for_tile_into(
+            transforms, geometry, arithmetic, &layer.norm, first_attn_target,
+            &tile.hidden[..count], &mut tile.normalized[..count],
+            &mut tile.transformed[..count], tile.projector.row_parallelism(),
+        )?;
+        match (&layer.attention, state) {
+            (Attention::Recurrent(weights), state @ LayerState::Recurrent { .. }) => {
+                if let Some(layer_tape) = folded_tape {
+                    gdn::flush_recurrent_carry_layer(
+                        layer_tape, state, delta, geometry, arithmetic,
+                        &tile.projector, &mut tile.gdn_head_outputs,
+                    )?;
+                    gdn::recurrent_tile_folded(
+                        weights, state, delta, geometry, arithmetic, transforms, adapters,
+                        adapter_scratch, &mut projection.matvec, norm_reuse, count, check,
+                        tile, executor, layer_tape,
+                    )?;
+                } else {
+                    gdn::recurrent_tile(
+                        weights, state, delta, geometry, arithmetic, transforms, adapters,
+                        adapter_scratch, &mut projection.matvec, norm_reuse, count, check,
+                        tile, executor,
+                    )?;
+                }
+            }
+            (Attention::Full(weights), LayerState::Full { keys, values }) => {
+                check()?;
+                let _ = project_tile_triple(
+                    transforms, geometry, arithmetic, adapters, adapter_scratch,
+                    &mut projection.matvec, norm_reuse,
+                    [&weights.query, &weights.key, &weights.value],
+                    &tile.normalized[..count], &mut tile.mixed[..count],
+                    &mut tile.recurrent_gate[..count], &mut tile.beta[..count],
+                    &mut tile.transformed[..count], &mut tile.projector,
+                    executor.as_deref_mut(), check,
+                )?;
+                full_attention_tile(
+                    weights, geometry, arithmetic, transforms, base, mrope_base, count,
+                    frequencies_ready, keys, values, projection, adapters, adapter_scratch,
+                    attention_scratch, tile, check,
+                )?;
+                check()?;
+                let _ = project_tile(
+                    transforms, geometry, arithmetic, adapters, adapter_scratch,
+                    &mut projection.matvec, TileReuse::default(), &weights.output,
+                    &tile.attended[..count], &mut tile.attention[..count],
+                    &mut tile.transformed[..count], &mut tile.projector, executor, check,
+                )?;
+            }
+            _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep full causal layer attention + FFN execution explicit across leading and final tiles."
+    )]
+    fn run_full_tile_layer(
+        geometry: &Geometry,
+        arithmetic: Arithmetic,
+        transforms: &Transforms,
+        adapters: ActiveAdapters<'_>,
+        projection: &mut super::ProjectionScratch,
+        adapter_scratch: &mut AdapterScratch,
+        attention_scratch: &mut super::AttentionScratch,
+        layer_idx: usize,
+        layer: &Layer,
+        state: &mut LayerState,
+        delta: &mut LayerDelta,
+        base: usize,
+        mrope_base: usize,
+        count: usize,
+        frequencies_ready: &mut bool,
+        tile: &mut TiledPrefill,
+        folded_tape: Option<&mut gdn::FoldedRecurrentLayerTape>,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        Self::run_full_tile_attention(
+            geometry, arithmetic, transforms, adapters, projection, adapter_scratch,
+            attention_scratch, layer, state, delta, base, mrope_base, count,
+            frequencies_ready, tile, folded_tape, executor.as_deref_mut(), check,
+        )?;
+        for _ in 0..count {
+            check()?;
+        }
+        Self::run_tile_ffn_range(
+            transforms, geometry, arithmetic, adapters, adapter_scratch, &mut projection.matvec,
+            layer_idx, layer, tile, 0, count, executor, check,
+        )?;
+        check()
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep causal output-head normalization, projection and finite verification explicit."
+    )]
+    fn evaluate_tile_output_head_range(
+        output_head: &super::OutputHead,
+        output_norm: &[f32],
+        vocabulary: usize,
+        transforms: &Transforms,
+        geometry: &Geometry,
+        arithmetic: Arithmetic,
+        adapters: ActiveAdapters<'_>,
+        adapter_scratch: &mut AdapterScratch,
+        projection_scratch: &mut crate::kernels::MatvecScratch,
+        tile: &mut TiledPrefill,
+        start: usize,
+        end: usize,
+        logits: &mut [Vec<f32>],
+        executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if let super::OutputHead::Plain(output_tensor) = output_head {
+            let reuse = normalize_for_tile_into(
+                transforms, geometry, arithmetic, output_norm, output_tensor,
+                &tile.hidden[start..end], &mut tile.normalized[start..end],
+                &mut tile.transformed[start..end], tile.projector.row_parallelism(),
+            )?;
+            check()?;
+            let _ = project_tile(
+                transforms, geometry, arithmetic, adapters, adapter_scratch, projection_scratch,
+                reuse, output_tensor, &tile.normalized[start..end], logits,
+                &mut tile.transformed[start..end], &mut tile.projector, executor, check,
+            )?;
+        } else {
+            super::normalize_tile_plain_into(
+                geometry, arithmetic, output_norm, &tile.hidden[start..end],
+                &mut tile.normalized[start..end], tile.projector.row_parallelism(),
+            )?;
+            check()?;
+            let backend = tile.projector.requested_backend();
+            let (row_parallelism, trellis) = tile.projector.row_parallelism_and_trellis();
+            match output_head {
+                super::OutputHead::Trellis(weight) if logits.len() == 1 => {
+                    crate::kernels::trellis::trellis_matvec_into(
+                        weight, &tile.normalized[start], &mut logits[0], backend, row_parallelism, trellis,
+                    )?;
+                }
+                super::OutputHead::Trellis(weight) => {
+                    crate::kernels::trellis::trellis_matmul_tokens_into(
+                        weight, &tile.normalized[start..end], logits, backend, row_parallelism, trellis,
+                    )?;
+                }
+                super::OutputHead::TrellisBanded(head) if logits.len() == 1 => {
+                    head.matvec_into(&tile.normalized[start], &mut logits[0], backend, row_parallelism, trellis)?;
+                }
+                super::OutputHead::TrellisBanded(head) => {
+                    head.matmul_tokens_into(&tile.normalized[start..end], logits, backend, row_parallelism, trellis)?;
+                }
+                super::OutputHead::Plain(_) => {}
+            }
+        }
+        for row in logits {
+            if row.len() != vocabulary {
+                return Err(invalid("invalid tiled verification vocabulary extent"));
+            }
+            finite(row, "tiled verification output logits")?;
+            check()?;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "Keep last-layer narrow 0..T-1 KV/GDN update and full T-1 evaluation ordered."
+    )]
+    fn run_last_layer_and_evaluate_last(
+        geometry: &Geometry,
+        arithmetic: Arithmetic,
+        transforms: &Transforms,
+        adapters: ActiveAdapters<'_>,
+        projection: &mut super::ProjectionScratch,
+        adapter_scratch: &mut AdapterScratch,
+        attention_scratch: &mut super::AttentionScratch,
+        last_idx: usize,
+        layer: &Layer,
+        state: &mut LayerState,
+        delta: &mut LayerDelta,
+        base: usize,
+        mrope_base: usize,
+        count: usize,
+        frequencies_ready: &mut bool,
+        tile: &mut TiledPrefill,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        use_executor_on_tiles: bool,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let last_tok = count - 1;
+        let first_attn_target = match &layer.attention {
+            Attention::Full(weights) => &weights.key,
+            Attention::Recurrent(weights) => &weights.qkv,
+        };
+        let norm_reuse = normalize_for_tile_into(
+            transforms,
+            geometry,
+            arithmetic,
+            &layer.norm,
+            first_attn_target,
+            &tile.hidden[..count],
+            &mut tile.normalized[..count],
+            &mut tile.transformed[..count],
+            tile.projector.row_parallelism(),
+        )?;
+        match (&layer.attention, state) {
+            (Attention::Full(weights), LayerState::Full { keys, values }) => {
+                keys.invalidate_prepared();
+                values.invalidate_prepared();
+                check()?;
+                let kv_reuse = project_tile_pair(
+                    transforms,
+                    geometry,
+                    arithmetic,
+                    adapters,
+                    adapter_scratch,
+                    &mut projection.matvec,
+                    norm_reuse,
+                    [&weights.key, &weights.value],
+                    &tile.normalized[..count],
+                    &mut tile.recurrent_gate[..count],
+                    &mut tile.beta[..count],
+                    &mut tile.transformed[..count],
+                    &mut tile.projector,
+                    if use_executor_on_tiles {
+                        executor.as_deref_mut()
+                    } else {
+                        None
+                    },
+                    check,
+                )?;
+                check()?;
+                let query_reuse = if use_executor_on_tiles || executor.is_none() {
+                    kv_reuse
+                } else {
+                    TileReuse {
+                        basis: kv_reuse.basis,
+                        prepared: None,
+                    }
+                };
+                let _ = project_tile(
+                    transforms,
+                    geometry,
+                    arithmetic,
+                    adapters,
+                    adapter_scratch,
+                    &mut projection.matvec,
+                    query_reuse,
+                    &weights.query,
+                    &tile.normalized[last_tok..count],
+                    &mut tile.mixed[last_tok..count],
+                    &mut tile.transformed[last_tok..count],
+                    &mut tile.projector,
+                    executor.as_deref_mut(),
+                    check,
+                )?;
+                check()?;
+                if !*frequencies_ready {
+                    for (index, frequencies) in tile.frequencies.iter_mut().enumerate().take(count) {
+                        rope_frequencies(geometry, mrope_base + index, frequencies)?;
+                    }
+                    *frequencies_ready = true;
+                }
+                full_attention_kv_only_tile(
+                    weights,
+                    geometry,
+                    arithmetic,
+                    mrope_base,
+                    last_tok,
+                    frequencies_ready,
+                    keys,
+                    values,
+                    tile,
+                    check,
+                )?;
+                std::mem::swap(
+                    &mut attention_scratch.frequencies,
+                    &mut tile.frequencies[last_tok],
+                );
+                let step_result = {
+                    let mut evaluation = Evaluation {
+                        geometry,
+                        arithmetic,
+                        transforms,
+                        position: base + last_tok,
+                        mrope_positions: [
+                            mrope_base + last_tok,
+                            mrope_base + last_tok,
+                            mrope_base + last_tok,
+                            0,
+                        ],
+                        frequencies_ready: true,
+                        projection,
+                        adapters,
+                        adapter_scratch,
+                        executor: None,
+                    };
+                    evaluation.full_attention_state(
+                        weights,
+                        &tile.mixed[last_tok],
+                        &mut tile.recurrent_gate[last_tok],
+                        &mut tile.beta[last_tok],
+                        keys,
+                        values,
+                        &mut attention_scratch.query,
+                        &mut attention_scratch.scores,
+                        &mut attention_scratch.packed_probs,
+                        &mut attention_scratch.frequencies,
+                        &mut tile.attended[last_tok],
+                    )
+                };
+                std::mem::swap(
+                    &mut attention_scratch.frequencies,
+                    &mut tile.frequencies[last_tok],
+                );
+                step_result?;
+                keys.prepare_staged_append(&tile.recurrent_gate[last_tok])?;
+                values.prepare_staged_append(&tile.beta[last_tok])?;
+                keys.append(&tile.recurrent_gate[last_tok]);
+                values.append(&tile.beta[last_tok]);
+                check()?;
+                let _ = project_tile(
+                    transforms,
+                    geometry,
+                    arithmetic,
+                    adapters,
+                    adapter_scratch,
+                    &mut projection.matvec,
+                    TileReuse::default(),
+                    &weights.output,
+                    &tile.attended[last_tok..count],
+                    &mut tile.attention[last_tok..count],
+                    &mut tile.transformed[last_tok..count],
+                    &mut tile.projector,
+                    executor.as_deref_mut(),
+                    check,
+                )?;
+            }
+            (
+                Attention::Recurrent(weights),
+                LayerState::Recurrent {
+                    convolution: history,
+                    matrix: previous,
+                },
+            ) => {
+                check()?;
+                let qkv_reuse = project_tile(
+                    transforms,
+                    geometry,
+                    arithmetic,
+                    adapters,
+                    adapter_scratch,
+                    &mut projection.matvec,
+                    norm_reuse,
+                    &weights.qkv,
+                    &tile.normalized[..count],
+                    &mut tile.mixed[..count],
+                    &mut tile.transformed[..count],
+                    &mut tile.projector,
+                    if use_executor_on_tiles {
+                        executor.as_deref_mut()
+                    } else {
+                        None
+                    },
+                    check,
+                )?;
+                check()?;
+                let ba_reuse = project_tile_pair(
+                    transforms,
+                    geometry,
+                    arithmetic,
+                    adapters,
+                    adapter_scratch,
+                    &mut projection.matvec,
+                    qkv_reuse,
+                    [&weights.beta, &weights.alpha],
+                    &tile.normalized[..count],
+                    &mut tile.beta[..count],
+                    &mut tile.alpha[..count],
+                    &mut tile.transformed[..count],
+                    &mut tile.projector,
+                    if use_executor_on_tiles {
+                        executor.as_deref_mut()
+                    } else {
+                        None
+                    },
+                    check,
+                )?;
+                check()?;
+                let gate_reuse = if use_executor_on_tiles || executor.is_none() {
+                    ba_reuse
+                } else {
+                    TileReuse {
+                        basis: ba_reuse.basis,
+                        prepared: None,
+                    }
+                };
+                let _ = project_tile(
+                    transforms,
+                    geometry,
+                    arithmetic,
+                    adapters,
+                    adapter_scratch,
+                    &mut projection.matvec,
+                    gate_reuse,
+                    &weights.gate,
+                    &tile.normalized[last_tok..count],
+                    &mut tile.recurrent_gate[last_tok..count],
+                    &mut tile.transformed[last_tok..count],
+                    &mut tile.projector,
+                    executor.as_deref_mut(),
+                    check,
+                )?;
+                check()?;
+                {
+                    let LayerDelta::Recurrent {
+                        convolution,
+                        matrix,
+                    } = delta
+                    else {
+                        return Err(invalid("CPU tiled prefill layer/cache mismatch"));
+                    };
+                    resize_into(history.len(), convolution)?;
+                    convolution.copy_from_slice(history);
+                    resize_into(previous.len(), matrix)?;
+                    step_recurrent_state_only_conv(
+                        weights,
+                        geometry,
+                        arithmetic,
+                        convolution,
+                        tile,
+                        last_tok,
+                        check,
+                    )?;
+                    step_recurrent_state_only_matrix(
+                        geometry, arithmetic, tile, last_tok, previous, matrix,
+                    )?;
+                    check()?;
+                    std::mem::swap(history, convolution);
+                    std::mem::swap(previous, matrix);
+                }
+                {
+                    let evaluation = Evaluation {
+                        geometry,
+                        arithmetic,
+                        transforms,
+                        position: base + last_tok,
+                        mrope_positions: [
+                            mrope_base + last_tok,
+                            mrope_base + last_tok,
+                            mrope_base + last_tok,
+                            0,
+                        ],
+                        frequencies_ready: *frequencies_ready,
+                        projection,
+                        adapters,
+                        adapter_scratch,
+                        executor: None,
+                    };
+                    evaluation.recurrent_attention_state(
+                        weights,
+                        &mut tile.mixed[last_tok],
+                        Some(&tile.recurrent_gate[last_tok]),
+                        &tile.beta[last_tok],
+                        &tile.alpha[last_tok],
+                        history,
+                        previous,
+                        delta,
+                        Some(&mut tile.attended[last_tok]),
+                    )?;
+                    let LayerDelta::Recurrent {
+                        convolution,
+                        matrix,
+                    } = delta
+                    else {
+                        return Err(invalid("CPU tiled prefill layer/cache mismatch"));
+                    };
+                    std::mem::swap(history, convolution);
+                    std::mem::swap(previous, matrix);
+                }
+                check()?;
+                let _ = project_tile(
+                    transforms,
+                    geometry,
+                    arithmetic,
+                    adapters,
+                    adapter_scratch,
+                    &mut projection.matvec,
+                    TileReuse::default(),
+                    &weights.output,
+                    &tile.attended[last_tok..count],
+                    &mut tile.attention[last_tok..count],
+                    &mut tile.transformed[last_tok..count],
+                    &mut tile.projector,
+                    executor.as_deref_mut(),
+                    check,
+                )?;
+            }
+            _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
+        }
+        check()?;
+        Self::run_tile_ffn_range(
+            transforms,
+            geometry,
+            arithmetic,
+            adapters,
+            adapter_scratch,
+            &mut projection.matvec,
+            last_idx,
+            layer,
+            tile,
+            last_tok,
+            count,
+            executor,
+            check,
+        )?;
+        check()
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep narrow last-layer KV/GDN state update explicit across leading tiles."
+    )]
+    fn run_narrow_last_layer_tile(
+        geometry: &Geometry,
+        arithmetic: Arithmetic,
+        transforms: &Transforms,
+        adapters: ActiveAdapters<'_>,
+        adapter_scratch: &mut AdapterScratch,
+        projection_scratch: &mut crate::kernels::MatvecScratch,
+        layer: &Layer,
+        state: &mut LayerState,
+        delta: &mut LayerDelta,
+        mrope_base: usize,
+        count: usize,
+        frequencies_ready: &mut bool,
+        tile: &mut TiledPrefill,
+        executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let first_attn_target = match &layer.attention {
+            Attention::Recurrent(weights) => &weights.qkv,
+            Attention::Full(weights) => &weights.key,
+        };
+        let norm_reuse = normalize_for_tile_into(
+            transforms, geometry, arithmetic, &layer.norm, first_attn_target,
+            &tile.hidden[..count], &mut tile.normalized[..count],
+            &mut tile.transformed[..count], tile.projector.row_parallelism(),
+        )?;
+        match (&layer.attention, state) {
+            (Attention::Recurrent(weights), state @ LayerState::Recurrent { .. }) => {
+                recurrent_state_only_tile(
+                    weights, state, delta, geometry, arithmetic, transforms, adapters,
+                    adapter_scratch, projection_scratch, norm_reuse, count, check, tile, executor,
+                )?;
+            }
+            (Attention::Full(weights), LayerState::Full { keys, values }) => {
+                check()?;
+                let _ = project_tile_pair(
+                    transforms, geometry, arithmetic, adapters, adapter_scratch,
+                    projection_scratch, norm_reuse, [&weights.key, &weights.value],
+                    &tile.normalized[..count], &mut tile.recurrent_gate[..count],
+                    &mut tile.beta[..count], &mut tile.transformed[..count],
+                    &mut tile.projector, executor, check,
+                )?;
+                full_attention_kv_only_tile(
+                    weights, geometry, arithmetic, mrope_base, count,
+                    frequencies_ready, keys, values, tile, check,
+                )?;
+            }
+            _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
+        }
+        check()
+    }
+
+    fn ingest_cpu_tile_and_evaluate_last(
+        &mut self,
+        tokens: &[u32],
+        check: &dyn Fn() -> Result<()>,
+        tile: &mut TiledPrefill,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        use_executor_on_tiles: bool,
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        let count = tokens.len();
+        let base = self.position;
+        let mrope_base = self.mrope_position;
+        let mut adapter_scratch = std::mem::take(&mut self.workspace.adapter);
+        let embed_result = self.embed_tile_tokens(tokens, tile, &mut adapter_scratch, check);
+        self.workspace.adapter = adapter_scratch;
+        embed_result?;
+        let adapters = ActiveAdapters {
+            rank_one: self.adapter.as_ref(),
+            rank_one_scale: self.adapter_scale,
+            multi_rank: self.multi_rank_adapter.as_ref(),
+            multi_rank_scale: self.multi_rank_adapter_scale,
+        };
+        let Some((last_layer, leading_layers)) = self.layers.split_last() else {
+            return Err(invalid("CPU tiled prefill requires at least one layer"));
+        };
+        let last_idx = self.layers.len() - 1;
+        let (leading_states, last_states) = self.state.split_at_mut(last_idx);
+        let (leading_deltas, last_deltas) = self.workspace.deltas.split_at_mut(last_idx);
+        let (Some(last_state), Some(last_delta)) =
+            (last_states.first_mut(), last_deltas.first_mut())
+        else {
+            return Err(invalid("CPU tiled prefill layer/state count mismatch"));
+        };
+        self.state_consistent = false;
+        let mut frequencies_ready = false;
+        for (layer_idx, ((layer, state), delta)) in leading_layers
+            .iter()
+            .zip(leading_states.iter_mut())
+            .zip(leading_deltas.iter_mut())
+            .enumerate()
+        {
+            let tile_executor = if use_executor_on_tiles {
+                executor.as_deref_mut()
+            } else {
+                None
+            };
+            Self::run_full_tile_layer(
+                &self.geometry, self.arithmetic, &self.transforms, adapters,
+                &mut self.workspace.projection, &mut self.workspace.adapter,
+                &mut self.workspace.attention_scratch, layer_idx, layer, state, delta,
+                base, mrope_base, count, &mut frequencies_ready, tile, None, tile_executor, check,
+            )?;
+        }
+        Self::run_last_layer_and_evaluate_last(
+            &self.geometry, self.arithmetic, &self.transforms, adapters,
+            &mut self.workspace.projection, &mut self.workspace.adapter,
+            &mut self.workspace.attention_scratch, last_idx, last_layer, last_state,
+            last_delta, base, mrope_base, count, &mut frequencies_ready, tile,
+            executor.as_deref_mut(), use_executor_on_tiles, check,
+        )?;
+        let last_tok = count - 1;
+        Self::evaluate_tile_output_head_range(
+            &self.output, &self.output_norm, self.vocabulary, &self.transforms,
+            &self.geometry, self.arithmetic, adapters, &mut self.workspace.adapter,
+            &mut self.workspace.projection.matvec, tile, last_tok, count,
+            std::slice::from_mut(output), executor, check,
+        )?;
+        self.position = base + count;
+        self.mrope_position = mrope_base + count;
+        self.state_consistent = true;
+        Ok(())
+    }
+
+    fn ingest_cpu_tile_with_folded(
+        &mut self,
+        tokens: &[u32],
+        check: &dyn Fn() -> Result<()>,
+        tile: &mut TiledPrefill,
+        mut folded: Option<&mut FoldedVerificationState>,
+        mut executor: Option<&mut (dyn crate::kernels::Pq2ProjectionExecutor + '_)>,
+        logits: Option<&mut [Vec<f32>]>,
+    ) -> Result<()> {
+        let count = tokens.len();
+        let base = self.position;
+        let mrope_base = self.mrope_position;
+        let mut adapter_scratch = std::mem::take(&mut self.workspace.adapter);
+        let embed_result = self.embed_tile_tokens(tokens, tile, &mut adapter_scratch, check);
+        self.workspace.adapter = adapter_scratch;
+        embed_result?;
         // Mark live state inconsistent before any layer-major mutation so any
         // mid-tile error or cancellation leaves state unavailable until explicit
         // reset or restore, and keep `position` at the last committed prefix.
@@ -1102,380 +1990,41 @@ impl Qwen35 {
             .zip(&mut self.workspace.deltas)
             .enumerate()
         {
-            let first_attn_target = match &layer.attention {
-                Attention::Recurrent(weights) => &weights.qkv,
-                Attention::Full(weights) if narrow_final && layer_idx + 1 == total_layers => {
-                    &weights.key
-                }
-                Attention::Full(weights) => &weights.query,
-            };
-            let norm_reuse = normalize_for_tile_into(
-                &self.transforms,
-                &self.geometry,
-                self.arithmetic,
-                &layer.norm,
-                first_attn_target,
-                &tile.hidden[..count],
-                &mut tile.normalized[..count],
-                &mut tile.transformed[..count],
-                tile.projector.row_parallelism(),
-            )?;
             if narrow_final && layer_idx + 1 == total_layers {
-                match (&layer.attention, &mut *state) {
-                    (Attention::Recurrent(weights), _) => {
-                        recurrent_state_only_tile(
-                            weights,
-                            state,
-                            delta,
-                            &self.geometry,
-                            self.arithmetic,
-                            &self.transforms,
-                            adapters,
-                            &mut self.workspace.adapter,
-                            &mut self.workspace.projection.matvec,
-                            norm_reuse,
-                            count,
-                            check,
-                            tile,
-                            executor.as_deref_mut(),
-                        )?;
-                    }
-                    (Attention::Full(weights), LayerState::Full { keys, values }) => {
-                        check()?;
-                        let _ = project_tile_pair(
-                            &self.transforms,
-                            &self.geometry,
-                            self.arithmetic,
-                            adapters,
-                            &mut self.workspace.adapter,
-                            &mut self.workspace.projection.matvec,
-                            norm_reuse,
-                            [&weights.key, &weights.value],
-                            &tile.normalized[..count],
-                            &mut tile.recurrent_gate[..count],
-                            &mut tile.beta[..count],
-                            &mut tile.transformed[..count],
-                            &mut tile.projector,
-                            executor.as_deref_mut(),
-                            check,
-                        )?;
-                        full_attention_kv_only_tile(
-                            weights,
-                            &self.geometry,
-                            self.arithmetic,
-                            mrope_base,
-                            count,
-                            &mut frequencies_ready,
-                            keys,
-                            values,
-                            tile,
-                            check,
-                        )?;
-                    }
-                    _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
-                }
-                check()?;
+                Self::run_narrow_last_layer_tile(
+                    &self.geometry, self.arithmetic, &self.transforms, adapters,
+                    &mut self.workspace.adapter, &mut self.workspace.projection.matvec,
+                    layer, state, delta, mrope_base, count, &mut frequencies_ready,
+                    tile, executor.as_deref_mut(), check,
+                )?;
                 continue;
             }
-            match (&layer.attention, &mut *state) {
-                (Attention::Recurrent(weights), _) => {
-                    if let Some(folded_state) = folded.as_deref_mut() {
-                        let layer_tape = folded_state
-                            .layers
-                            .get_mut(recurrent_layer_idx)
-                            .ok_or_else(|| invalid("folded verification layer tape missing"))?;
-                        recurrent_layer_idx += 1;
-                        gdn::flush_recurrent_carry_layer(
-                            layer_tape,
-                            state,
-                            delta,
-                            &self.geometry,
-                            self.arithmetic,
-                            &tile.projector,
-                            &mut tile.gdn_head_outputs,
-                        )?;
-                        gdn::recurrent_tile_folded(
-                            weights,
-                            state,
-                            delta,
-                            &self.geometry,
-                            self.arithmetic,
-                            &self.transforms,
-                            adapters,
-                            &mut self.workspace.adapter,
-                            &mut self.workspace.projection.matvec,
-                            norm_reuse,
-                            count,
-                            check,
-                            tile,
-                            executor.as_deref_mut(),
-                            layer_tape,
-                        )?;
-                    } else {
-                        gdn::recurrent_tile(
-                            weights,
-                            state,
-                            delta,
-                            &self.geometry,
-                            self.arithmetic,
-                            &self.transforms,
-                            adapters,
-                            &mut self.workspace.adapter,
-                            &mut self.workspace.projection.matvec,
-                            norm_reuse,
-                            count,
-                            check,
-                            tile,
-                            executor.as_deref_mut(),
-                        )?;
-                    }
-                }
-                (Attention::Full(weights), LayerState::Full { keys, values }) => {
-                    check()?;
-                    let _ = project_tile_triple(
-                        &self.transforms,
-                        &self.geometry,
-                        self.arithmetic,
-                        adapters,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.projection.matvec,
-                        norm_reuse,
-                        [&weights.query, &weights.key, &weights.value],
-                        &tile.normalized[..count],
-                        &mut tile.mixed[..count],
-                        &mut tile.recurrent_gate[..count],
-                        &mut tile.beta[..count],
-                        &mut tile.transformed[..count],
-                        &mut tile.projector,
-                        executor.as_deref_mut(),
-                        check,
-                    )?;
-                    full_attention_tile(
-                        weights,
-                        &self.geometry,
-                        self.arithmetic,
-                        &self.transforms,
-                        base,
-                        mrope_base,
-                        count,
-                        &mut frequencies_ready,
-                        keys,
-                        values,
-                        &mut self.workspace.projection,
-                        adapters,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.attention_scratch,
-                        tile,
-                        check,
-                    )?;
-                    check()?;
-                    let _ = project_tile(
-                        &self.transforms,
-                        &self.geometry,
-                        self.arithmetic,
-                        adapters,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.projection.matvec,
-                        TileReuse::default(),
-                        &weights.output,
-                        &tile.attended[..count],
-                        &mut tile.attention[..count],
-                        &mut tile.transformed[..count],
-                        &mut tile.projector,
-                        executor.as_deref_mut(),
-                        check,
-                    )?;
-                }
-                _ => return Err(invalid("CPU tiled prefill layer/cache mismatch")),
-            }
-            for _ in 0..count {
-                check()?;
-            }
-            let post_norm_reuse = add_normalize_for_tile_into(
-                &self.transforms,
-                &self.geometry,
-                self.arithmetic,
-                &layer.post_norm,
-                &layer.gate,
-                &mut tile.hidden[..count],
-                &tile.attention[..count],
-                &mut tile.normalized[..count],
-                &mut tile.transformed[..count],
-                tile.projector.row_parallelism(),
-            )?;
-            check()?;
-            let compacted_layer = self.transforms.is_compacted_layer(layer_idx);
-            let ffn_compensation = self.transforms.compaction_compensation(layer_idx);
-            if !compacted_layer
-                && ffn_compensation.is_none()
-                && try_project_tile_ffn_chain(
-                    &self.transforms,
-                    &self.geometry,
-                    self.arithmetic,
-                    adapters,
-                    post_norm_reuse,
-                    [&layer.gate, &layer.up, &layer.down],
-                    &tile.normalized[..count],
-                    Some(&tile.hidden[..count]),
-                    &mut tile.attention[..count],
-                    &mut tile.transformed[..count],
-                    &tile.projector,
-                    executor.as_deref_mut(),
-                    check,
-                )?
+            let folded_tape = if let Some(folded_state) = folded.as_deref_mut()
+                && matches!(layer.attention, Attention::Recurrent(_))
             {
-                for (hidden, output) in tile.hidden[..count]
-                    .iter_mut()
-                    .zip(&mut tile.attention[..count])
-                {
-                    std::mem::swap(hidden, output);
-                    finite(hidden, "CPU tiled decoder layer output")?;
-                }
+                let layer_tape = folded_state
+                    .layers
+                    .get_mut(recurrent_layer_idx)
+                    .ok_or_else(|| invalid("folded verification layer tape missing"))?;
+                recurrent_layer_idx += 1;
+                Some(layer_tape)
             } else {
-                let ffn_reuse = project_tile_ffn_swiglu(
-                    &self.transforms,
-                    &self.geometry,
-                    self.arithmetic,
-                    adapters,
-                    &mut self.workspace.adapter,
-                    &mut self.workspace.projection.matvec,
-                    post_norm_reuse,
-                    &layer.gate,
-                    &layer.up,
-                    &layer.down,
-                    &tile.normalized[..count],
-                    &mut tile.gate[..count],
-                    &mut tile.up[..count],
-                    &mut tile.transformed[..count],
-                    &mut tile.projector,
-                    executor.as_deref_mut(),
-                    check,
-                )?;
-                check()?;
-                let use_attention_scratch = ffn_compensation.is_some();
-                {
-                    let branch_outputs = if use_attention_scratch {
-                        &mut tile.attention[..count]
-                    } else {
-                        &mut tile.normalized[..count]
-                    };
-                    let _ = project_tile(
-                        &self.transforms,
-                        &self.geometry,
-                        self.arithmetic,
-                        adapters,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.projection.matvec,
-                        ffn_reuse,
-                        &layer.down,
-                        &tile.up[..count],
-                        branch_outputs,
-                        &mut tile.transformed[..count],
-                        &mut tile.projector,
-                        executor.as_deref_mut(),
-                        check,
-                    )?;
-                }
-                if let Some(compensation) = ffn_compensation {
-                    for (norm_in, branch) in tile.normalized[..count]
-                        .iter()
-                        .zip(&mut tile.attention[..count])
-                    {
-                        compensation.apply(norm_in, branch)?;
-                    }
-                }
-                let branch_outputs = if use_attention_scratch {
-                    &tile.attention[..count]
-                } else {
-                    &tile.normalized[..count]
-                };
-                for (hidden, output) in tile.hidden[..count].iter_mut().zip(branch_outputs) {
-                    add_finite(hidden, output, "CPU tiled decoder layer output")?;
-                }
-            }
-            check()?;
+                None
+            };
+            Self::run_full_tile_layer(
+                &self.geometry, self.arithmetic, &self.transforms, adapters,
+                &mut self.workspace.projection, &mut self.workspace.adapter,
+                &mut self.workspace.attention_scratch, layer_idx, layer, state, delta,
+                base, mrope_base, count, &mut frequencies_ready, tile, folded_tape,
+                executor.as_deref_mut(), check,
+            )?;
         }
         if let Some(logits) = logits {
-            match &self.output {
-                super::OutputHead::Plain(output_tensor) => {
-                    let reuse = normalize_for_tile_into(
-                        &self.transforms,
-                        &self.geometry,
-                        self.arithmetic,
-                        &self.output_norm,
-                        output_tensor,
-                        &tile.hidden[..count],
-                        &mut tile.normalized[..count],
-                        &mut tile.transformed[..count],
-                        tile.projector.row_parallelism(),
-                    )?;
-                    check()?;
-                    let _ = project_tile(
-                        &self.transforms,
-                        &self.geometry,
-                        self.arithmetic,
-                        adapters,
-                        &mut self.workspace.adapter,
-                        &mut self.workspace.projection.matvec,
-                        reuse,
-                        output_tensor,
-                        &tile.normalized[..count],
-                        logits,
-                        &mut tile.transformed[..count],
-                        &mut tile.projector,
-                        executor,
-                        check,
-                    )?;
-                }
-                super::OutputHead::Trellis(weight) => {
-                    super::normalize_tile_plain_into(
-                        &self.geometry,
-                        self.arithmetic,
-                        &self.output_norm,
-                        &tile.hidden[..count],
-                        &mut tile.normalized[..count],
-                        tile.projector.row_parallelism(),
-                    )?;
-                    check()?;
-                    let backend = tile.projector.requested_backend();
-                    let (row_parallelism, trellis) = tile.projector.row_parallelism_and_trellis();
-                    crate::kernels::trellis::trellis_matmul_tokens_into(
-                        weight,
-                        &tile.normalized[..count],
-                        logits,
-                        backend,
-                        row_parallelism,
-                        trellis,
-                    )?;
-                }
-                super::OutputHead::TrellisBanded(head) => {
-                    super::normalize_tile_plain_into(
-                        &self.geometry,
-                        self.arithmetic,
-                        &self.output_norm,
-                        &tile.hidden[..count],
-                        &mut tile.normalized[..count],
-                        tile.projector.row_parallelism(),
-                    )?;
-                    check()?;
-                    let backend = tile.projector.requested_backend();
-                    let (row_parallelism, trellis) = tile.projector.row_parallelism_and_trellis();
-                    head.matmul_tokens_into(
-                        &tile.normalized[..count],
-                        logits,
-                        backend,
-                        row_parallelism,
-                        trellis,
-                    )?;
-                }
-            }
-            for row in logits {
-                if row.len() != self.vocabulary {
-                    return Err(invalid("invalid tiled verification vocabulary extent"));
-                }
-                finite(row, "tiled verification output logits")?;
-                check()?;
-            }
+            Self::evaluate_tile_output_head_range(
+                &self.output, &self.output_norm, self.vocabulary, &self.transforms,
+                &self.geometry, self.arithmetic, adapters, &mut self.workspace.adapter,
+                &mut self.workspace.projection.matvec, tile, 0, count, logits, executor, check,
+            )?;
         }
         self.position = base + count;
         self.mrope_position = mrope_base + count;
@@ -5224,6 +5773,498 @@ mod attention_2d_tests {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fused_last_token_tests {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bonsai_gguf::MetadataValue;
+
+    use super::super::{KvCachePolicy, MAX_STATE_BYTES, Qwen35};
+    use crate::kernels::{MatvecBackend, Pq2ProjectionExecutor, Q8KBlock};
+    use crate::model::{Model, Tensor};
+    use crate::{Decoder, MAX_PREFILL_BLOCK_TOKENS, Result, invalid};
+
+    fn f32_tensor(name: &str, dims: &[usize], values: &[f32]) -> Tensor {
+        Tensor {
+            name: name.to_owned(),
+            dimensions: dims.to_vec(),
+            kind: 0,
+            data: Arc::<[u8]>::from(
+                values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        }
+    }
+
+    fn pat(len: usize, seed: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| [0.0625_f32, -0.03125, 0.015_625, -0.0625, 0.03125][(i + seed) % 5])
+            .collect()
+    }
+
+    fn insert_layer_tensors(
+        tensors: &mut BTreeMap<String, Tensor>,
+        layer: usize,
+        is_rec: bool,
+        emb: usize,
+        ffn: usize,
+        ssm_head: usize,
+        full_head: usize,
+    ) {
+        let ones = |len: usize| vec![1.0_f32; len];
+        let p = format!("blk.{layer}.");
+        for (suffix, dims, vals) in [
+            ("attn_norm.weight", vec![emb], ones(emb)),
+            ("post_attention_norm.weight", vec![emb], ones(emb)),
+            ("ffn_up.weight", vec![emb, ffn], pat(emb * ffn, 13 + layer)),
+            ("ffn_gate.weight", vec![emb, ffn], pat(emb * ffn, 15 + layer)),
+            ("ffn_down.weight", vec![ffn, emb], pat(ffn * emb, 17 + layer)),
+        ] {
+            let name = format!("{p}{suffix}");
+            tensors.insert(name.clone(), f32_tensor(&name, &dims, &vals));
+        }
+        let attn_specs: Vec<(&str, Vec<usize>, Vec<f32>)> = if is_rec {
+            vec![
+                ("attn_qkv.weight", vec![emb, 3 * ssm_head], pat(emb * 3 * ssm_head, 3 + layer)),
+                ("attn_gate.weight", vec![emb, ssm_head], pat(emb * ssm_head, 4 + layer)),
+                ("ssm_alpha.weight", vec![emb, 1], pat(emb, 5)),
+                ("ssm_beta.weight", vec![emb, 1], pat(emb, 6)),
+                ("ssm_conv1d.weight", vec![2, 3 * ssm_head], pat(2 * 3 * ssm_head, 7)),
+                ("ssm_dt.bias", vec![1], vec![0.125]),
+                ("ssm_a", vec![1], vec![-0.25]),
+                ("ssm_norm.weight", vec![ssm_head], ones(ssm_head)),
+                ("ssm_out.weight", vec![ssm_head, emb], pat(ssm_head * emb, 8)),
+            ]
+        } else {
+            vec![
+                ("attn_q.weight", vec![emb, 2 * full_head], pat(emb * 2 * full_head, 9 + layer)),
+                ("attn_k.weight", vec![emb, full_head], pat(emb * full_head, 10 + layer)),
+                ("attn_v.weight", vec![emb, full_head], pat(emb * full_head, 11 + layer)),
+                ("attn_output.weight", vec![full_head, emb], pat(full_head * emb, 12 + layer)),
+                ("attn_q_norm.weight", vec![full_head], ones(full_head)),
+                ("attn_k_norm.weight", vec![full_head], ones(full_head)),
+            ]
+        };
+        for (suffix, dims, vals) in attn_specs {
+            let name = format!("{p}{suffix}");
+            tensors.insert(name.clone(), f32_tensor(&name, &dims, &vals));
+        }
+    }
+
+    fn hybrid_two_layer_fixture(last_recurrent: bool) -> Model {
+        let emb = 64_usize;
+        let ffn = 128_usize;
+        let ssm_head = 64_usize;
+        let full_head = 256_usize;
+        let vocab = 6_usize;
+        let ones = |len: usize| vec![1.0_f32; len];
+        let recurrent_flags = if last_recurrent {
+            vec![false, true]
+        } else {
+            vec![true, false]
+        };
+        let metadata = BTreeMap::from([
+            ("general.architecture".into(), MetadataValue::from("qwen35")),
+            ("qwen35.block_count".into(), MetadataValue::from(2_u32)),
+            ("qwen35.context_length".into(), MetadataValue::from(64_u32)),
+            ("qwen35.embedding_length".into(), MetadataValue::from(64_u32)),
+            ("qwen35.feed_forward_length".into(), MetadataValue::from(128_u32)),
+            ("qwen35.attention.head_count".into(), MetadataValue::from(1_u32)),
+            ("qwen35.attention.head_count_kv".into(), MetadataValue::from(1_u32)),
+            ("qwen35.attention.key_length".into(), MetadataValue::from(256_u32)),
+            ("qwen35.attention.value_length".into(), MetadataValue::from(256_u32)),
+            ("qwen35.rope.dimension_count".into(), MetadataValue::from(64_u32)),
+            ("qwen35.rope.freq_base".into(), MetadataValue::from(10_000.0_f32)),
+            ("qwen35.attention.layer_norm_rms_epsilon".into(), MetadataValue::from(1e-6_f32)),
+            ("qwen35.full_attention_interval".into(), MetadataValue::from(2_u32)),
+            ("qwen35.ssm.state_size".into(), MetadataValue::from(64_u32)),
+            ("qwen35.ssm.group_count".into(), MetadataValue::from(1_u32)),
+            ("qwen35.ssm.time_step_rank".into(), MetadataValue::from(1_u32)),
+            ("qwen35.ssm.inner_size".into(), MetadataValue::from(64_u32)),
+            ("qwen35.ssm.conv_kernel".into(), MetadataValue::from(2_u32)),
+            (
+                "qwen35.rope.dimension_sections".into(),
+                MetadataValue::from(vec![16_u32, 16, 0, 0]),
+            ),
+            (
+                "qwen35.attention.recurrent_layers".into(),
+                MetadataValue::from(recurrent_flags.clone()),
+            ),
+        ]);
+        let mut tensors = BTreeMap::from([
+            (
+                "token_embd.weight".into(),
+                f32_tensor("token_embd.weight", &[emb, vocab], &pat(emb * vocab, 1)),
+            ),
+            (
+                "output.weight".into(),
+                f32_tensor("output.weight", &[emb, vocab], &pat(emb * vocab, 2)),
+            ),
+            (
+                "output_norm.weight".into(),
+                f32_tensor("output_norm.weight", &[emb], &ones(emb)),
+            ),
+        ]);
+        for (layer, &is_rec) in recurrent_flags.iter().enumerate() {
+            insert_layer_tensors(&mut tensors, layer, is_rec, emb, ffn, ssm_head, full_head);
+        }
+        Model {
+            metadata,
+            tensors,
+            identity: format!("fused-last-token-fixture-{last_recurrent}"),
+        }
+    }
+
+    fn state_bits(graph: &Qwen35) -> Result<Vec<u32>> {
+        let mut bits = Vec::new();
+        graph.visit_state(&mut |_, _, values| {
+            bits.extend(values.iter().map(|v| v.to_bits()));
+            Ok(())
+        })?;
+        Ok(bits)
+    }
+
+    fn state_values(graph: &Qwen35) -> Result<Vec<f32>> {
+        let mut out = Vec::new();
+        graph.visit_state(&mut |_, _, values| {
+            out.extend_from_slice(values);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn build_tiled(
+        last_recurrent: bool,
+        policy: KvCachePolicy,
+        tile_tokens: usize,
+        chunkwise: bool,
+        narrow_last: bool,
+    ) -> Result<Qwen35> {
+        let mut graph = Qwen35::with_adapters_and_kv(
+            hybrid_two_layer_fixture(last_recurrent),
+            32,
+            MAX_STATE_BYTES,
+            MatvecBackend::Scalar,
+            None,
+            None,
+            policy,
+        )?;
+        graph.set_last_layer_prefill_narrowing(narrow_last);
+        let scratch = graph.tiled_prefill_scratch_bytes(tile_tokens)?;
+        let graph = graph.with_tiled_prefill(tile_tokens, scratch)?;
+        if chunkwise {
+            graph.with_chunkwise_gdn_prefill()
+        } else {
+            Ok(graph)
+        }
+    }
+
+    #[test]
+    fn fused_last_token_matches_ingest_plus_evaluate_across_kv_policies_and_last_layer_kinds()
+    -> Result<()> {
+        for last_recurrent in [false, true] {
+            for policy in [
+                KvCachePolicy::F16,
+                KvCachePolicy::Rotated4,
+                KvCachePolicy::Rotated4FittedValues,
+                KvCachePolicy::Rotated4Keys3Values,
+            ] {
+                for narrow_last in [false, true] {
+                    for length in [1_usize, 2, 5, 8, 9, 11] {
+                        let prompt: Vec<u32> =
+                            (0..length).map(|i| u32::try_from(i % 6).unwrap_or(0)).collect();
+                        let mut expected =
+                            build_tiled(last_recurrent, policy, 8, false, narrow_last)?;
+                        let mut expected_logits = Vec::new();
+                        let Some((&last, prefix)) = prompt.split_last() else {
+                            return Err(invalid("empty test prompt"));
+                        };
+                        if !prefix.is_empty() {
+                            expected.ingest_block(prefix, &|| Ok(()))?;
+                        }
+                        expected.evaluate_into(last, &mut expected_logits)?;
+
+                        let mut actual =
+                            build_tiled(last_recurrent, policy, 8, false, narrow_last)?;
+                        let mut actual_logits = Vec::new();
+                        actual.ingest_block_and_evaluate_last_into(
+                            &prompt,
+                            &mut actual_logits,
+                            &|| Ok(()),
+                        )?;
+
+                        assert_eq!(
+                            actual_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            expected_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "logits mismatch last_recurrent={last_recurrent} policy={policy:?} narrow={narrow_last} len={length}"
+                        );
+                        assert_eq!(state_bits(&actual)?, state_bits(&expected)?);
+                        assert_eq!(actual.evaluate(3)?, expected.evaluate(3)?);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "Retain declared separately rounded chunkwise tolerance check."
+    )]
+    fn fused_last_token_chunkwise_gdn_stays_within_declared_tolerance() -> Result<()> {
+        for last_recurrent in [false, true] {
+            let prompt: Vec<u32> = (0..11).map(|i| u32::try_from(i % 6).unwrap_or(0)).collect();
+            let mut expected =
+                build_tiled(last_recurrent, KvCachePolicy::F16, 8, true, true)?;
+            let mut expected_logits = Vec::new();
+            let Some((&last, prefix)) = prompt.split_last() else {
+                return Err(invalid("empty test prompt"));
+            };
+            expected.ingest_block(prefix, &|| Ok(()))?;
+            expected.evaluate_into(last, &mut expected_logits)?;
+
+            let mut actual = build_tiled(last_recurrent, KvCachePolicy::F16, 8, true, true)?;
+            let mut actual_logits = Vec::new();
+            actual.ingest_block_and_evaluate_last_into(
+                &prompt,
+                &mut actual_logits,
+                &|| Ok(()),
+            )?;
+            for (&a, &e) in actual_logits.iter().zip(&expected_logits) {
+                let tol = 1e-3 + 1e-3 * e.abs();
+                assert!((a - e).abs() <= tol, "|{a} - {e}| > {tol}");
+            }
+            for (&a, &e) in state_values(&actual)?.iter().zip(&state_values(&expected)?) {
+                let tol = 1e-3 + 1e-3 * e.abs();
+                assert!((a - e).abs() <= tol, "state |{a} - {e}| > {tol}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_last_token_preserves_bounds_cancellation_and_rollback_safety() -> Result<()> {
+        let mut graph = build_tiled(false, KvCachePolicy::F16, 8, false, true)?;
+        let initial = graph.checkpoint()?;
+        let initial_state = state_bits(&graph)?;
+        let mut output = vec![1.0_f32; 4];
+
+        for bad_block in [
+            vec![],
+            vec![0; MAX_PREFILL_BLOCK_TOKENS + 1],
+            vec![0, 99],
+            vec![0; 33],
+        ] {
+            output.push(2.0);
+            assert!(
+                graph
+                    .ingest_block_and_evaluate_last_into(&bad_block, &mut output, &|| Ok(()))
+                    .is_err()
+            );
+            assert_eq!(output, Vec::<f32>::new());
+            assert_eq!(state_bits(&graph)?, initial_state);
+        }
+
+        // Mid-tile cancellation marks state inconsistent until restore, and clears output.
+        let checks = Cell::new(0_usize);
+        output = vec![1.0_f32; 3];
+        let cancelled = graph.ingest_block_and_evaluate_last_into(&[0, 1, 2, 3], &mut output, &|| {
+            checks.set(checks.get() + 1);
+            if checks.get() == 8 {
+                Err(invalid("mid-tile cancel"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(output, Vec::<f32>::new());
+        assert!(graph.evaluate(0).is_err());
+        assert!(graph.checkpoint().is_err());
+
+        graph.restore(&initial)?;
+        assert_eq!(
+            graph.ingest_block_and_evaluate_last_into(&[0, 1, 2, 3], &mut output, &|| Ok(()))?,
+            ()
+        );
+        assert_eq!(output.len(), 6);
+
+        // Post-evaluation cancellation must still clear output.
+        let after_restore = graph.checkpoint()?;
+        let total_checks = Cell::new(0_usize);
+        graph.ingest_block_and_evaluate_last_into(&[1, 2], &mut output, &|| {
+            total_checks.set(total_checks.get() + 1);
+            Ok(())
+        })?;
+        let target_check = total_checks.get();
+        graph.restore(&after_restore)?;
+        let post_cancel = Cell::new(0_usize);
+        assert!(
+            graph
+                .ingest_block_and_evaluate_last_into(&[1, 2], &mut output, &|| {
+                    post_cancel.set(post_cancel.get() + 1);
+                    if post_cancel.get() == target_check {
+                        Err(invalid("post-eval cancel"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(output, Vec::<f32>::new());
+        Ok(())
+    }
+
+    struct DecodeGateExecutor {
+        supports_tiles: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Pq2ProjectionExecutor for DecodeGateExecutor {
+        fn identity(&self) -> &'static str {
+            "fused-last-decode-gate-test"
+        }
+
+        fn supports(&self, _tensor: &Tensor) -> bool {
+            false
+        }
+
+        fn supports_f32(&self, tensor: &Tensor) -> bool {
+            tensor.kind == 142
+        }
+
+        fn supports_tile_tokens(&self) -> bool {
+            self.supports_tiles
+        }
+
+        fn project(
+            &mut self,
+            _tensor: &Tensor,
+            _activation: &[Q8KBlock],
+            _fused: bool,
+            _output: &mut Vec<f32>,
+        ) -> Result<()> {
+            Err(invalid("unexpected Q8_K call"))
+        }
+
+        fn project_f32(
+            &mut self,
+            tensor: &Tensor,
+            activation: &[f32],
+            pinned: bool,
+            output: &mut Vec<f32>,
+        ) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut scratch = if pinned {
+                crate::kernels::MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+            } else {
+                crate::kernels::MatvecScratch::with_backend(MatvecBackend::Scalar)
+            };
+            scratch
+                .prepare(tensor, activation)?
+                .matvec_into(tensor, output)
+        }
+    }
+
+    #[test]
+    fn fused_last_token_decode_executor_skips_multi_token_tiles_and_runs_last_token() -> Result<()>
+    {
+        let mut model = hybrid_two_layer_fixture(false);
+        model.tensors.clear();
+        let pq2_rect = |cols: usize, rows: usize, seed: u8| -> Tensor {
+            let mut block = [0_u8; 34];
+            block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            for (idx, byte) in block[2..].iter_mut().enumerate() {
+                *byte = u8::try_from((idx * 13 + usize::from(seed)) % 256).unwrap_or(0);
+            }
+            Tensor {
+                name: String::new(),
+                dimensions: vec![cols, rows],
+                kind: 142,
+                data: Arc::<[u8]>::from(block.repeat((cols / 128) * rows)).into(),
+            }
+        };
+        for (key, value) in [
+            ("qwen35.block_count", MetadataValue::from(1_u32)),
+            ("qwen35.embedding_length", MetadataValue::from(128_u32)),
+            ("qwen35.feed_forward_length", MetadataValue::from(128_u32)),
+            ("qwen35.attention.key_length", MetadataValue::from(128_u32)),
+            ("qwen35.attention.value_length", MetadataValue::from(128_u32)),
+            (
+                "qwen35.rope.dimension_sections",
+                MetadataValue::from(vec![32_u32, 0, 0, 0]),
+            ),
+            ("qwen35.attention.recurrent_layers", MetadataValue::from(vec![false])),
+        ] {
+            model.metadata.insert(key.into(), value);
+        }
+        let ones128 = vec![1.0_f32; 128];
+        for (name, dims, data) in [
+            ("token_embd.weight", &[128, 6][..], pat(128 * 6, 1)),
+            ("output.weight", &[128, 6][..], pat(128 * 6, 2)),
+            ("output_norm.weight", &[128][..], ones128.clone()),
+            ("blk.0.attn_norm.weight", &[128][..], ones128.clone()),
+            ("blk.0.post_attention_norm.weight", &[128][..], ones128.clone()),
+            ("blk.0.attn_q_norm.weight", &[128][..], ones128.clone()),
+            ("blk.0.attn_k_norm.weight", &[128][..], ones128),
+        ] {
+            model.tensors.insert(name.into(), f32_tensor(name, dims, &data));
+        }
+        for (name, cols, rows, seed) in [
+            ("blk.0.attn_q.weight", 128, 256, 1_u8),
+            ("blk.0.attn_k.weight", 128, 128, 2),
+            ("blk.0.attn_v.weight", 128, 128, 3),
+            ("blk.0.attn_output.weight", 128, 128, 4),
+            ("blk.0.ffn_up.weight", 128, 128, 5),
+            ("blk.0.ffn_gate.weight", 128, 128, 6),
+            ("blk.0.ffn_down.weight", 128, 128, 7),
+        ] {
+            let mut tensor = pq2_rect(cols, rows, seed);
+            tensor.name = name.to_owned();
+            model.tensors.insert(name.to_owned(), tensor);
+        }
+
+        let cloned_model = Model {
+            metadata: model.metadata.clone(),
+            tensors: model.tensors.clone(),
+            identity: model.identity.clone(),
+        };
+        let mut cpu_ref = Qwen35::new(cloned_model, 32)?;
+        let cpu_scratch = cpu_ref.tiled_prefill_scratch_bytes(8)?;
+        cpu_ref = cpu_ref.with_tiled_prefill(8, cpu_scratch)?;
+        let mut expected_logits = Vec::new();
+        cpu_ref.ingest_block_and_evaluate_last_into(&[0, 1, 2, 3], &mut expected_logits, &|| Ok(()))?;
+
+        let mut decode_gated = Qwen35::new(model, 32)?;
+        let gated_scratch = decode_gated.tiled_prefill_scratch_bytes(8)?;
+        decode_gated = decode_gated.with_tiled_prefill(8, gated_scratch)?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        decode_gated.set_projection_executor(Some(Box::new(DecodeGateExecutor {
+            supports_tiles: false,
+            calls: Arc::clone(&calls),
+        })));
+        let mut actual_logits = Vec::new();
+        decode_gated.ingest_block_and_evaluate_last_into(
+            &[0, 1, 2, 3],
+            &mut actual_logits,
+            &|| Ok(()),
+        )?;
+        // Only the 5 single-token projections on token T-1 (query, output, up, gate, down) hit executor.
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            actual_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
         Ok(())
     }
 }

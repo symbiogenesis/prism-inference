@@ -6096,6 +6096,25 @@ impl Decoder for Qwen35 {
     fn ingest_block(&mut self, tokens: &[u32], check: &dyn Fn() -> Result<()>) -> Result<()> {
         self.ingest_prefill_block(tokens, check)
     }
+    fn ingest_block_and_evaluate_last_into(
+        &mut self,
+        tokens: &[u32],
+        output: &mut Vec<f32>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.ingest_prefill_block_and_evaluate_last_into(tokens, output, check)
+    }
+    fn ingest_block_and_evaluate_last_finite_into<'a>(
+        &mut self,
+        tokens: &[u32],
+        output: &'a mut Vec<f32>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<crate::sampling::FiniteLogits<'a>> {
+        self.ingest_block_and_evaluate_last_into(tokens, output, check)?;
+        // ingest_prefill_block_and_evaluate_last_into validates complete finite
+        // output before committing state, or clears `output` on any error.
+        crate::sampling::FiniteLogits::from_validated(output)
+    }
     fn batched_evaluation_capacity(&self) -> usize {
         self.verification_capacity()
     }

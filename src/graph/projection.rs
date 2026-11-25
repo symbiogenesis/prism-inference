@@ -427,6 +427,46 @@ impl Decoder for ProjectedQwen35<'_> {
         self.faulted = result.is_err();
         result
     }
+    fn ingest_block_and_evaluate_last_into(
+        &mut self,
+        tokens: &[u32],
+        output: &mut Vec<f32>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if let Err(error) = self.available() {
+            output.clear();
+            return Err(error);
+        }
+        if tokens.is_empty() || tokens.len() > crate::MAX_PREFILL_BLOCK_TOKENS {
+            output.clear();
+            return Err(invalid("invalid native prefill block bounds or tokens"));
+        }
+        if let Err(error) = self.admit_work(tokens.len() - 1, 1) {
+            output.clear();
+            return Err(error);
+        }
+        let result = self.decoder.ingest_prefill_block_and_evaluate_last_with_executor(
+            tokens,
+            output,
+            check,
+            Some(self.executor),
+            true,
+        );
+        if result.is_err() {
+            output.clear();
+        }
+        self.faulted = result.is_err();
+        result
+    }
+    fn ingest_block_and_evaluate_last_finite_into<'a>(
+        &mut self,
+        tokens: &[u32],
+        output: &'a mut Vec<f32>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<crate::sampling::FiniteLogits<'a>> {
+        self.ingest_block_and_evaluate_last_into(tokens, output, check)?;
+        crate::sampling::FiniteLogits::from_validated(output)
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +835,42 @@ mod tests {
         let proj_off = decoder_off.with_projection_executor(&mut exec_off)?;
         assert_eq!(proj_off.work.map(|w| (w.hidden, w.output)), Some((0, 0)));
         assert_ne!(digest_on, proj_off.plan_digest);
+        Ok(())
+    }
+
+    #[test]
+    fn projected_qwen35_forwards_ingest_block_and_evaluate_last_and_enforces_budget() -> Result<()>
+    {
+        let provenance = Arc::new(());
+        let decoder = tiny_decoder(provenance)?;
+        let scratch = decoder.tiled_prefill_scratch_bytes(8)?;
+        let decoder = decoder.with_tiled_prefill(8, scratch)?;
+        let mut exec = PlanTestExecutor {
+            id: "projected-fused-last",
+            supports_f32: true,
+            supports_ffn_fusion: false,
+            bounded: true,
+        };
+        let mut projected = decoder.with_projection_executor(&mut exec)?;
+        // Empty block is rejected pre-execution without faulting the scope.
+        let mut output = vec![1.0_f32];
+        assert!(
+            projected
+                .ingest_block_and_evaluate_last_into(&[], &mut output, &|| Ok(()))
+                .is_err()
+        );
+        assert_eq!(output, Vec::<f32>::new());
+        assert!(!projected.is_faulted());
+
+        // Budget refusal must clear output without faulting the scope.
+        output = vec![1.0_f32];
+        assert!(
+            projected
+                .ingest_block_and_evaluate_last_into(&[0; 200], &mut output, &|| Ok(()))
+                .is_err()
+        );
+        assert_eq!(output, Vec::<f32>::new());
+        assert!(!projected.is_faulted());
         Ok(())
     }
 }

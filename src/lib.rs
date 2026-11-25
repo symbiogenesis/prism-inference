@@ -242,6 +242,89 @@ pub trait Decoder {
         }
         Ok(())
     }
+    /// Include a bounded, nonempty causal prompt block and compute finite
+    /// next-token logits only for its final token in reusable storage.
+    ///
+    /// The reference implementation splits the block into an optional leading
+    /// prefix passed to [`Self::ingest_block`] followed by [`Self::evaluate_into`]
+    /// on the last token, honoring `check` around both stages and clearing
+    /// `output` on any error. Overrides must preserve complete state/position
+    /// equivalence to [`Self::ingest_block`] plus [`Self::evaluate_into`].
+    ///
+    /// # Errors
+    /// Rejects empty or oversized blocks beyond [`MAX_PREFILL_BLOCK_TOKENS`],
+    /// invalid tokens, cancellation/deadline checks, and underlying evaluation
+    /// errors. On error `output` is empty and state may require restoration.
+    fn ingest_block_and_evaluate_last_into(
+        &mut self,
+        tokens: &[u32],
+        output: &mut Vec<f32>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if tokens.is_empty()
+            || tokens.len() > MAX_PREFILL_BLOCK_TOKENS
+            || tokens
+                .iter()
+                .any(|&token| !usize::try_from(token).is_ok_and(|value| value < self.vocab_size()))
+        {
+            output.clear();
+            return Err(invalid("invalid native prefill block bounds or tokens"));
+        }
+        let Some((&last, prefix)) = tokens.split_last() else {
+            output.clear();
+            return Err(invalid("invalid native prefill block bounds or tokens"));
+        };
+        if !prefix.is_empty()
+            && let Err(error) = self.ingest_block(prefix, check)
+        {
+            output.clear();
+            return Err(error);
+        }
+        if let Err(error) = check() {
+            output.clear();
+            return Err(error);
+        }
+        if let Err(error) = self.evaluate_into(last, output) {
+            output.clear();
+            return Err(error);
+        }
+        if let Err(error) = check() {
+            output.clear();
+            return Err(error);
+        }
+        Ok(())
+    }
+    /// Include a bounded, nonempty causal prompt block and borrow checked
+    /// finite logits for its final token from reusable storage.
+    ///
+    /// The default validates the complete output produced by
+    /// [`Self::ingest_block_and_evaluate_last_into`], clearing `output` on any
+    /// error.
+    ///
+    /// # Errors
+    /// Returns ingestion/evaluation errors or rejects wrong-size, empty,
+    /// oversized or nonfinite output. On error `output` is empty and state may
+    /// require restoration.
+    fn ingest_block_and_evaluate_last_finite_into<'a>(
+        &mut self,
+        tokens: &[u32],
+        output: &'a mut Vec<f32>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<sampling::FiniteLogits<'a>> {
+        if let Err(error) = self.ingest_block_and_evaluate_last_into(tokens, output, check) {
+            output.clear();
+            return Err(error);
+        }
+        if output.len() != self.vocab_size()
+            || output.is_empty()
+            || output.len() > 1_048_576
+            || !kernels::is_finite_slice(output)
+        {
+            output.clear();
+            return Err(invalid("native decoder returned invalid logits"));
+        }
+        sampling::FiniteLogits::from_validated(output)
+    }
     /// Maximum token count supported by an explicitly selected, weight-sharing
     /// evaluation path, or zero when that path is unavailable.
     ///

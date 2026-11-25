@@ -1784,12 +1784,20 @@ impl<D: Decoder> Runtime<D> {
         Ok(self.tokens.len())
     }
 
-    fn evaluate(&mut self, token: u32, check: &impl Fn() -> Result<()>) -> Result<()> {
+    fn write_logits_with<F>(
+        &mut self,
+        reserve_tokens: usize,
+        check: &impl Fn() -> Result<()>,
+        eval: F,
+    ) -> Result<()>
+    where
+        F: for<'a> FnOnce(&'a mut D, &'a mut Vec<f32>) -> Result<FiniteLogits<'a>>,
+    {
         check()?;
         // Reserve before mutating decoder state; rollback is still available if
         // a decoder allocation or arithmetic operation subsequently fails.
         let tokens_cap_before = self.tokens.capacity();
-        self.tokens.try_reserve(1)?;
+        self.tokens.try_reserve(reserve_tokens)?;
         if self.tokens.capacity() > tokens_cap_before {
             self.reallocation_witness.growth_reallocations = self
                 .reallocation_witness
@@ -1803,17 +1811,13 @@ impl<D: Decoder> Runtime<D> {
         let output_cap_before = output.capacity();
         output.clear();
         check()?;
-        let result = self
-            .decoder
-            .evaluate_finite_into(token, output)
+        let vocab_size = self.decoder.vocab_size();
+        let result = eval(&mut self.decoder, output)
             .map(|logits| (logits.as_slice().as_ptr(), logits.as_slice().len()))
             .and_then(|(pointer, length)| {
                 // A public custom decoder can return a checked view of other
                 // storage. Admit only a proof covering this complete output.
-                if length != self.decoder.vocab_size()
-                    || length != output.len()
-                    || !std::ptr::eq(pointer, output.as_ptr())
-                {
+                if length != vocab_size || length != output.len() || !std::ptr::eq(pointer, output.as_ptr()) {
                     return Err(invalid("native decoder returned invalid logits"));
                 }
                 check()
@@ -1840,7 +1844,26 @@ impl<D: Decoder> Runtime<D> {
             output.clear();
             return Err(error);
         }
+        Ok(())
+    }
+
+    fn evaluate(&mut self, token: u32, check: &impl Fn() -> Result<()>) -> Result<()> {
+        self.write_logits_with(1, check, |decoder, output| {
+            decoder.evaluate_finite_into(token, output)
+        })?;
         self.tokens.push(token);
+        Ok(())
+    }
+
+    fn ingest_block_and_evaluate_last(
+        &mut self,
+        tokens: &[u32],
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.write_logits_with(tokens.len(), check, |decoder, output| {
+            decoder.ingest_block_and_evaluate_last_finite_into(tokens, output, check)
+        })?;
+        self.tokens.extend_from_slice(tokens);
         Ok(())
     }
 
@@ -1986,8 +2009,11 @@ impl<D: Decoder> Runtime<D> {
             })?;
             cursor = chunk_end;
         }
-        if let Some((&last, prefix)) = prompt[cursor..].split_last() {
-            for block in prefix.chunks(prefill.block_tokens) {
+        let tail = &prompt[cursor..];
+        if !tail.is_empty() {
+            let last_len = ((tail.len() - 1) % prefill.block_tokens) + 1;
+            let leading_end = tail.len() - last_len;
+            for block in tail[..leading_end].chunks(prefill.block_tokens) {
                 measure(
                     timings,
                     GenerationPhase::PrefillIngestion,
@@ -1995,9 +2021,30 @@ impl<D: Decoder> Runtime<D> {
                     || self.ingest_block(block, check),
                 )?;
             }
-            measure(timings, GenerationPhase::PrefillEvaluation, 1, || {
-                self.evaluate(last, check)
-            })?;
+            let final_block = &tail[leading_end..];
+            if final_block.len() == 1 {
+                measure(timings, GenerationPhase::PrefillEvaluation, 1, || {
+                    self.evaluate(final_block[0], check)
+                })?;
+            } else {
+                let result = measure(timings, GenerationPhase::PrefillEvaluation, 1, || {
+                    self.ingest_block_and_evaluate_last(final_block, check)
+                });
+                let ingest_tokens = final_block.len() - 1;
+                let _ = measure(
+                    timings,
+                    GenerationPhase::PrefillIngestion,
+                    ingest_tokens,
+                    || {
+                        if result.is_ok() {
+                            Ok(())
+                        } else {
+                            Err(invalid("fused prefill ingestion failed"))
+                        }
+                    },
+                );
+                result?;
+            }
         }
         Ok(())
     }
@@ -4776,6 +4823,172 @@ mod ptq1_host_release_tests {
         );
         assert_eq!(runtime.release_executor_resident_host_weights()?, 0);
         drop(runtime);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fused_prefill_eval_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct FusedTrackingDecoder {
+        tokens: Vec<u32>,
+        fused_blocks: Vec<Vec<u32>>,
+        ingest_blocks: Vec<Vec<u32>>,
+        evals: Vec<u32>,
+        fail_fused: Cell<bool>,
+    }
+
+    impl FusedTrackingDecoder {
+        fn new() -> Self {
+            Self {
+                tokens: Vec::new(),
+                fused_blocks: Vec::new(),
+                ingest_blocks: Vec::new(),
+                evals: Vec::new(),
+                fail_fused: Cell::new(false),
+            }
+        }
+    }
+
+    impl Decoder for FusedTrackingDecoder {
+        type Checkpoint = Vec<u32>;
+
+        fn identity(&self) -> &'static str {
+            "fused-tracking-decoder/v1"
+        }
+
+        fn vocab_size(&self) -> usize {
+            16
+        }
+
+        fn checkpoint_bytes(&self) -> usize {
+            self.tokens.len() * size_of::<u32>()
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.tokens.clear();
+            Ok(())
+        }
+
+        fn evaluate(&mut self, token: u32) -> Result<Vec<f32>> {
+            let mut out = Vec::new();
+            self.evaluate_into(token, &mut out)?;
+            Ok(out)
+        }
+
+        fn evaluate_into(&mut self, token: u32, output: &mut Vec<f32>) -> Result<()> {
+            self.tokens.push(token);
+            self.evals.push(token);
+            output.clear();
+            output.resize(16, -1.0);
+            let next = usize::try_from((self.tokens.iter().sum::<u32>() + 1) % 16)?;
+            output[next] = 1.0;
+            Ok(())
+        }
+
+        fn ingest_block(&mut self, tokens: &[u32], check: &dyn Fn() -> Result<()>) -> Result<()> {
+            check()?;
+            self.ingest_blocks.push(tokens.to_vec());
+            self.tokens.extend_from_slice(tokens);
+            check()
+        }
+
+        fn ingest_block_and_evaluate_last_into(
+            &mut self,
+            tokens: &[u32],
+            output: &mut Vec<f32>,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            check()?;
+            self.fused_blocks.push(tokens.to_vec());
+            if self.fail_fused.get() {
+                output.clear();
+                return Err(invalid("injected fused prefill failure"));
+            }
+            let Some((&last, prefix)) = tokens.split_last() else {
+                output.clear();
+                return Err(invalid("empty fused block"));
+            };
+            self.tokens.extend_from_slice(prefix);
+            self.evaluate_into(last, output)?;
+            check()
+        }
+
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            Ok(self.tokens.clone())
+        }
+
+        fn restore(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+            self.tokens.clone_from(checkpoint);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fused_final_prompt_block_preserves_prompt_end_checkpoint_and_rollback() -> Result<()> {
+        let mut runtime = Runtime::new(
+            FusedTrackingDecoder::new(),
+            Limits {
+                context_tokens: 64,
+                checkpoints: 1,
+                checkpoint_bytes: 64 * 1_024,
+            },
+        )?;
+        runtime.set_retain_prompt_end(true);
+        let cancel = Cancellation::default();
+        let options = Generation {
+            max_tokens: 2,
+            stop_tokens: Vec::new(),
+        };
+        let prompt = [1_u32, 2, 3, 4, 5, 6];
+        let mut generated = Vec::new();
+        runtime.generate_with_prefill(
+            &prompt,
+            &options,
+            Prefill { block_tokens: 4 },
+            &cancel,
+            |tok| {
+                generated.push(tok);
+                Ok(())
+            },
+        )?;
+        assert_eq!(generated.len(), 2);
+        assert_eq!(runtime.decoder().ingest_blocks, vec![vec![1, 2, 3, 4]]);
+        assert_eq!(runtime.decoder().fused_blocks, vec![vec![5, 6]]);
+        assert!(runtime.has_prompt_end_checkpoint());
+        let committed_tokens = runtime.tokens().to_vec();
+
+        // Injected failure inside fused prefill must roll back completely without faulting.
+        runtime.decoder.fail_fused.set(true);
+        assert!(
+            runtime
+                .generate_with_prefill(
+                    &[9, 10, 11],
+                    &options,
+                    Prefill { block_tokens: 4 },
+                    &cancel,
+                    |_| Ok(()),
+                )
+                .is_err()
+        );
+        assert!(!runtime.is_faulted());
+        assert_eq!(runtime.tokens(), committed_tokens);
+        assert_eq!(runtime.decoder().tokens, committed_tokens);
+
+        // Regenerating after assistant decode hits the prompt-end checkpoint at `prompt.len()`.
+        runtime.decoder.fail_fused.set(false);
+        let mut edited = prompt.to_vec();
+        edited.push(7);
+        let regen = runtime.generate_with_prefill(
+            &edited,
+            &options,
+            Prefill { block_tokens: 4 },
+            &cancel,
+            |_| Ok(()),
+        )?;
+        assert_eq!(regen.reused_tokens, prompt.len());
         Ok(())
     }
 }

@@ -24,12 +24,15 @@ const MAX_REUSABLE_CHECKPOINTS: usize = 8;
 const MAX_RECYCLED_CHECKPOINTS: usize = 2;
 const MAX_RECYCLED_BATCH_LOGITS: usize = MAX_SPECULATIVE_DRAFT_TOKENS;
 const MARCONI_UTILITY_SCALE: u128 = 1_000_000;
+const AUTO_PREFIX_BOUNDARY_MIN_TOKENS: usize = 32;
+const AUTO_PREFIX_BOUNDARY_TOLERANCE_TOKENS: usize = 16;
 
 struct GenerationEffects<'a, S, E> {
     sampler: &'a mut S,
     emit: E,
     timings: Option<&'a mut GenerationTimings>,
     terminal_state_only: bool,
+    prefix_boundary: Option<usize>,
 }
 
 /// Cancellation shared with the request owner; checked between decoder steps.
@@ -170,6 +173,13 @@ struct Snapshot<S> {
 
 struct PromptEndCapture<'a, S> {
     reserved: usize,
+    slot: &'a mut Option<Snapshot<S>>,
+}
+
+struct BoundaryCapture<'a, S> {
+    reserved: usize,
+    boundary: Option<usize>,
+    hits: u64,
     slot: &'a mut Option<Snapshot<S>>,
 }
 
@@ -336,6 +346,7 @@ pub struct Runtime<D: Decoder> {
     prefix_cache_stats: PrefixCacheStats,
     prompt_end_checkpoint: Option<Snapshot<D::Checkpoint>>,
     retain_prompt_end: bool,
+    prefix_boundary_hint: Option<usize>,
     recycled_checkpoints: Vec<D::Checkpoint>,
     batch_logits: Vec<Vec<f32>>,
     suffix_tree: SuffixTree,
@@ -503,6 +514,7 @@ impl Runtime<crate::graph::Qwen35> {
         self.cache_epoch = 0;
         self.cache_aging_floor = 0;
         self.prompt_end_checkpoint = None;
+        self.prefix_boundary_hint = None;
         self.recycled_checkpoints.clear();
         self.suffix_tree.clear();
         self.tokens.clear();
@@ -554,6 +566,7 @@ impl<D: Decoder> Runtime<D> {
             prefix_cache_stats: PrefixCacheStats::default(),
             prompt_end_checkpoint: None,
             retain_prompt_end: false,
+            prefix_boundary_hint: None,
             recycled_checkpoints,
             batch_logits,
             suffix_tree: SuffixTree::new(),
@@ -631,6 +644,22 @@ impl<D: Decoder> Runtime<D> {
         self.prompt_end_checkpoint.is_some()
     }
 
+    /// Set or clear an explicit prefix-boundary token length hint for generation.
+    ///
+    /// When [`Limits::checkpoints`] is at least 2 and a request prefills across
+    /// `boundary` tokens without an existing snapshot at that position, the
+    /// runtime captures a reusable checkpoint at `boundary` before evaluating the
+    /// remaining suffix.
+    pub const fn set_prefix_boundary_hint(&mut self, boundary: Option<usize>) {
+        self.prefix_boundary_hint = boundary;
+    }
+
+    /// Configured explicit prefix-boundary token length hint, if any.
+    #[must_use]
+    pub const fn prefix_boundary_hint(&self) -> Option<usize> {
+        self.prefix_boundary_hint
+    }
+
     /// Compute the maximal reusable prefix boundary across live state and saved checkpoints.
     ///
     /// Inspects active conversation tokens (when current logits are valid), saved prefix
@@ -702,6 +731,7 @@ impl<D: Decoder> Runtime<D> {
         if let Some(snapshot) = self.prompt_end_checkpoint.take() {
             self.recycle_snapshot(snapshot);
         }
+        self.prefix_boundary_hint = None;
         self.suffix_tree.clear();
         self.tokens.clear();
         self.media_spans.clear();
@@ -748,6 +778,135 @@ impl<D: Decoder> Runtime<D> {
         emit: impl FnMut(u32) -> Result<()>,
     ) -> Result<Completion> {
         self.generate_checked(prompt, options, prefill, &|| cancellation.check(), emit)
+    }
+
+    /// Generate with an explicit prefix-boundary checkpoint index inside `prompt`.
+    ///
+    /// When [`Limits::checkpoints`] is at least 2 and `prefix_boundary` lies
+    /// uncached inside `(reused..prompt.len())`, prefills through `prefix_boundary`
+    /// first, captures a reusable boundary checkpoint without running `output_norm`
+    /// or `lm_head`, and continues evaluating the remaining suffix.
+    ///
+    /// # Errors
+    /// Rejects zero or out-of-range `prefix_boundary`, or any [`Self::generate_with_prefill`]
+    /// failure.
+    pub fn generate_with_prefix_boundary(
+        &mut self,
+        prompt: &[u32],
+        prefix_boundary: usize,
+        options: &Generation,
+        prefill: Prefill,
+        cancellation: &Cancellation,
+        emit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<Completion> {
+        if prefix_boundary == 0 || prefix_boundary >= prompt.len() {
+            return Err(invalid(
+                "explicit prefix boundary must lie strictly inside prompt",
+            ));
+        }
+        let mut emit = emit;
+        self.generate_sampled_observed(
+            prompt,
+            &[],
+            options,
+            prefill,
+            &|| cancellation.check(),
+            GenerationEffects {
+                sampler: &mut Greedy,
+                emit: move |token, _| emit(token),
+                timings: None,
+                terminal_state_only: false,
+                prefix_boundary: Some(prefix_boundary),
+            },
+        )
+    }
+
+    /// Pre-ingest a reusable prefix (such as a shared system prompt) and save a
+    /// checkpoint at `prefix.len()` without evaluating terminal logits.
+    ///
+    /// Returns the number of tokens reused from prior live state or checkpoints.
+    /// Subsequent prompts extending `prefix` reuse the entire prefilled state
+    /// without re-evaluating tokens `0..prefix.len()`.
+    ///
+    /// # Errors
+    /// Rejects faulted admission, invalid prefix or prefill bounds, `checkpoints == 0`,
+    /// cancellation, decoder errors, or transient rollback-budget exhaustion.
+    pub fn prefill_with_prefix_boundary(
+        &mut self,
+        prefix: &[u32],
+        prefill: Prefill,
+        cancellation: &Cancellation,
+    ) -> Result<usize> {
+        if self.faulted {
+            return Err(invalid(
+                "native runtime requires reset after failed restoration",
+            ));
+        }
+        let check = || cancellation.check();
+        check()?;
+        if prefix.is_empty()
+            || prefix.len() > self.limits.context_tokens
+            || prefill.block_tokens == 0
+            || prefill.block_tokens > MAX_PREFILL_BLOCK_TOKENS
+            || self.limits.checkpoints == 0
+            || prefix.iter().any(|&token| {
+                !usize::try_from(token).is_ok_and(|value| value < self.decoder.vocab_size())
+            })
+        {
+            return Err(invalid(
+                "invalid prefix-boundary bounds, token IDs, or checkpoint policy",
+            ));
+        }
+        let rollback = self.capture_transient(0, &check)?;
+        let result = (|| -> Result<(usize, Option<Snapshot<D::Checkpoint>>)> {
+            let (reused, _) =
+                self.prepare_with_spans_for_boundary(prefix, &[], false, None, &check)?;
+            let remaining = prefix.len() - reused;
+            self.decoder.admit_work(remaining, 0)?;
+            check()?;
+            let mut no_boundary = None;
+            let mut boundary_capture = BoundaryCapture {
+                reserved: rollback.bytes,
+                boundary: None,
+                hits: 0,
+                slot: &mut no_boundary,
+            };
+            self.prefill_remaining_with_boundary(
+                prefix,
+                reused,
+                false,
+                &[],
+                prefill,
+                &mut None,
+                &mut boundary_capture,
+                &check,
+            )?;
+            check()?;
+            let already_cached = self
+                .checkpoints
+                .iter()
+                .any(|saved| saved.tokens == prefix && saved.media_spans.is_empty());
+            let snapshot = if already_cached {
+                None
+            } else {
+                let captured = self.capture_reusable(rollback.bytes, &check).ok();
+                check()?;
+                captured
+            };
+            Ok((reused, snapshot))
+        })();
+        match result {
+            Ok((reused, snapshot)) => {
+                self.commit_reusable_snapshot_with_hits(snapshot, 1);
+                self.recycle_snapshot(rollback);
+                Ok(reused)
+            }
+            Err(error) => {
+                self.faulted = true;
+                self.restore_rollback_snapshot(rollback)?;
+                Err(error)
+            }
+        }
     }
 
     /// Generate synchronously before an absolute monotonic request deadline.
@@ -916,6 +1075,7 @@ impl<D: Decoder> Runtime<D> {
                 emit: move |token, _| emit(token),
                 timings: Some(timings),
                 terminal_state_only: false,
+                prefix_boundary: None,
             },
         )
     }
@@ -957,6 +1117,7 @@ impl<D: Decoder> Runtime<D> {
                 emit,
                 timings,
                 terminal_state_only,
+                prefix_boundary: None,
             },
         )
     }
@@ -997,6 +1158,7 @@ impl<D: Decoder> Runtime<D> {
                 emit: move |token, _| emit(token),
                 timings: None,
                 terminal_state_only: false,
+                prefix_boundary: None,
             },
         )
     }
@@ -1034,6 +1196,7 @@ impl<D: Decoder> Runtime<D> {
                 emit: move |token, _| emit(token),
                 timings: Some(timings),
                 terminal_state_only: false,
+                prefix_boundary: None,
             },
         )
     }
@@ -1074,6 +1237,7 @@ impl<D: Decoder> Runtime<D> {
                 emit: move |token, _| emit(token),
                 timings,
                 terminal_state_only: true,
+                prefix_boundary: None,
             },
         )
     }
@@ -1118,6 +1282,7 @@ impl<D: Decoder> Runtime<D> {
                 emit: move |token, _| emit(token),
                 timings,
                 terminal_state_only: true,
+                prefix_boundary: None,
             },
         )
     }
@@ -1154,6 +1319,7 @@ impl<D: Decoder> Runtime<D> {
                 emit: move |token, _| emit(token),
                 timings: None,
                 terminal_state_only: false,
+                prefix_boundary: None,
             },
         )
     }
@@ -1203,6 +1369,27 @@ impl<D: Decoder> Runtime<D> {
         result
     }
 
+    fn restore_rollback_snapshot(&mut self, rollback: Snapshot<D::Checkpoint>) -> Result<()> {
+        let Snapshot {
+            state,
+            tokens,
+            media_spans,
+            logits,
+            ..
+        } = rollback;
+        let restored = self.decoder.restore(&state);
+        // History describes the committed request even if backend
+        // recovery fails and admission remains closed.
+        self.tokens = tokens;
+        self.media_spans = media_spans;
+        let previous_logits = std::mem::replace(&mut self.logits, logits);
+        restored?;
+        self.faulted = false;
+        self.recycle_checkpoint(state);
+        self.recycle_logits(previous_logits);
+        Ok(())
+    }
+
     fn generate_transaction(
         &mut self,
         prompt: &[u32],
@@ -1232,11 +1419,19 @@ impl<D: Decoder> Runtime<D> {
             || self.capture_transient(0, check),
         )?;
         let mut prompt_end = None;
+        let mut boundary_snapshot = None;
+        let mut boundary_hits = 1_u64;
         let result = (|| {
             check()?;
             let mut prompt_end_capture = PromptEndCapture {
                 reserved: rollback.bytes,
                 slot: &mut prompt_end,
+            };
+            let mut boundary_capture = BoundaryCapture {
+                reserved: rollback.bytes,
+                boundary: None,
+                hits: 1,
+                slot: &mut boundary_snapshot,
             };
             let completion = self.generate_inner(
                 prompt,
@@ -1246,7 +1441,9 @@ impl<D: Decoder> Runtime<D> {
                 check,
                 effects,
                 &mut prompt_end_capture,
+                &mut boundary_capture,
             )?;
+            boundary_hits = boundary_capture.hits;
             check()?;
             // A failed optional capture still permits success, but deadline
             // expiry during capture must roll back the completed generation.
@@ -1255,7 +1452,8 @@ impl<D: Decoder> Runtime<D> {
             } else {
                 let snapshot_reserved = rollback
                     .bytes
-                    .saturating_add(prompt_end.as_ref().map_or(0, |s| s.bytes));
+                    .saturating_add(prompt_end.as_ref().map_or(0, |s| s.bytes))
+                    .saturating_add(boundary_snapshot.as_ref().map_or(0, |s| s.bytes));
                 let snapshot = measure(
                     &mut effects.timings,
                     GenerationPhase::CompletionSnapshot,
@@ -1273,38 +1471,21 @@ impl<D: Decoder> Runtime<D> {
                 // Snapshots are an optional reuse optimization. A budget miss
                 // does not invalidate an otherwise completed generation.
                 self.commit_prompt_end(prompt_end);
+                self.commit_reusable_snapshot_with_hits(boundary_snapshot, boundary_hits);
                 self.commit_reusable_snapshot(snapshot);
                 self.recycle_snapshot(rollback);
                 Ok(completion)
             }
             Err(error) => {
                 self.faulted = true;
+                self.recycle_optional_snapshot(prompt_end);
+                self.recycle_optional_snapshot(boundary_snapshot);
                 measure(
                     &mut effects.timings,
                     GenerationPhase::RollbackRestore,
                     0,
-                    || {
-                        let Snapshot {
-                            state,
-                            tokens,
-                            media_spans,
-                            logits,
-                            ..
-                        } = rollback;
-                        let restored = self.decoder.restore(&state);
-                        // History describes the committed request even if backend
-                        // recovery fails and admission remains closed.
-                        self.tokens = tokens;
-                        self.media_spans = media_spans;
-                        let previous_logits = std::mem::replace(&mut self.logits, logits);
-                        restored?;
-                        self.recycle_checkpoint(state);
-                        self.recycle_logits(previous_logits);
-                        Ok(())
-                    },
+                    || self.restore_rollback_snapshot(rollback),
                 )?;
-                self.recycle_optional_snapshot(prompt_end);
-                self.faulted = false;
                 Err(error)
             }
         }
@@ -1555,6 +1736,14 @@ impl<D: Decoder> Runtime<D> {
     }
 
     fn commit_reusable_snapshot(&mut self, snapshot: Option<Snapshot<D::Checkpoint>>) {
+        self.commit_reusable_snapshot_with_hits(snapshot, 0);
+    }
+
+    fn commit_reusable_snapshot_with_hits(
+        &mut self,
+        snapshot: Option<Snapshot<D::Checkpoint>>,
+        initial_hits: u64,
+    ) {
         if let Some(snapshot) = snapshot {
             // Count pressure alone must not discard a usable prefix
             // when its optional replacement could not be captured.
@@ -1569,13 +1758,13 @@ impl<D: Decoder> Runtime<D> {
                 .saturating_add(Self::marconi_base_utility(
                     snapshot.tokens.len(),
                     snapshot.bytes,
-                    0,
+                    initial_hits,
                 ));
             self.checkpoints.push(snapshot);
             if slot < MAX_REUSABLE_CHECKPOINTS {
                 self.checkpoint_meta[slot] = CheckpointUtility {
                     last_used_epoch: epoch,
-                    reuse_hits: 0,
+                    reuse_hits: initial_hits,
                     priority,
                 };
             }
@@ -1646,7 +1835,8 @@ impl<D: Decoder> Runtime<D> {
     }
 
     fn prepare(&mut self, prompt: &[u32], check: &impl Fn() -> Result<()>) -> Result<usize> {
-        self.prepare_with_spans(prompt, &[], check)
+        let (reused, _) = self.prepare_with_spans_for_boundary(prompt, &[], true, None, check)?;
+        Ok(reused)
     }
 
     fn record_checkpoint_hit(&mut self, index: usize) {
@@ -1713,15 +1903,107 @@ impl<D: Decoder> Runtime<D> {
         Ok(())
     }
 
-    fn prepare_with_spans(
+    fn longest_shared_prefix_with_media(
+        &self,
+        prompt: &[u32],
+        incoming_spans: &[MediaSpan],
+    ) -> usize {
+        let mut best = if self.tokens.is_empty() {
+            0
+        } else {
+            common_prefix_len_with_media(prompt, incoming_spans, &self.tokens, &self.media_spans)
+        };
+        for snapshot in self.checkpoints.iter().chain(&self.prompt_end_checkpoint) {
+            best = best.max(common_prefix_len_with_media(
+                prompt,
+                incoming_spans,
+                &snapshot.tokens,
+                &snapshot.media_spans,
+            ));
+        }
+        best
+    }
+
+    fn has_checkpoint_near_prefix_boundary(
+        &self,
+        prompt: &[u32],
+        incoming_spans: &[MediaSpan],
+        boundary: usize,
+        tolerance: usize,
+    ) -> bool {
+        self.checkpoints
+            .iter()
+            .chain(&self.prompt_end_checkpoint)
+            .any(|snapshot| {
+                snapshot.tokens.len() <= boundary
+                    && boundary - snapshot.tokens.len() < tolerance
+                    && (!snapshot.logits.is_empty() || snapshot.tokens.len() < prompt.len())
+                    && prefix_matches_media(
+                        prompt,
+                        incoming_spans,
+                        &snapshot.tokens,
+                        &snapshot.media_spans,
+                    )
+            })
+    }
+
+    fn select_prefix_boundary(
+        &self,
+        prompt: &[u32],
+        incoming_spans: &[MediaSpan],
+        reused: usize,
+        best_common: usize,
+        requested_boundary: Option<usize>,
+    ) -> Option<usize> {
+        if self.limits.checkpoints < 2 {
+            return None;
+        }
+        if let Some(boundary) = requested_boundary.or(self.prefix_boundary_hint) {
+            if boundary > reused
+                && boundary < prompt.len()
+                && !splits_media_span(incoming_spans, boundary)
+                && !self.has_checkpoint_near_prefix_boundary(prompt, incoming_spans, boundary, 1)
+            {
+                return Some(boundary);
+            }
+            return None;
+        }
+        if best_common >= AUTO_PREFIX_BOUNDARY_MIN_TOKENS
+            && best_common > reused
+            && best_common < prompt.len()
+            && !splits_media_span(incoming_spans, best_common)
+            && !self.has_checkpoint_near_prefix_boundary(
+                prompt,
+                incoming_spans,
+                best_common,
+                AUTO_PREFIX_BOUNDARY_TOLERANCE_TOKENS,
+            )
+        {
+            Some(best_common)
+        } else {
+            None
+        }
+    }
+
+    fn prepare_with_spans_for_boundary(
         &mut self,
         prompt: &[u32],
         incoming_spans: &[MediaSpan],
+        require_logits: bool,
+        requested_boundary: Option<usize>,
         check: &impl Fn() -> Result<()>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Option<usize>)> {
+        let best_common = if self.limits.checkpoints >= 2 && requested_boundary.is_none() {
+            self.longest_shared_prefix_with_media(prompt, incoming_spans)
+        } else {
+            0
+        };
+        let live_logits_usable = !require_logits
+            || !self.logits.is_empty()
+            || (self.limits.checkpoints > 0 && self.tokens.len() < prompt.len());
         if !self.tokens.is_empty()
+            && live_logits_usable
             && prefix_matches_media(prompt, incoming_spans, &self.tokens, &self.media_spans)
-            && !self.logits.is_empty()
         {
             if let Some(index) = self.checkpoints.iter().position(|snapshot| {
                 snapshot.tokens == self.tokens && snapshot.media_spans == self.media_spans
@@ -1733,29 +2015,35 @@ impl<D: Decoder> Runtime<D> {
                 .prefix_cache_stats
                 .reused_tokens
                 .saturating_add(u64::try_from(self.tokens.len()).unwrap_or(u64::MAX));
-            return Ok(self.tokens.len());
+            let reused = self.tokens.len();
+            let boundary = self.select_prefix_boundary(
+                prompt,
+                incoming_spans,
+                reused,
+                best_common,
+                requested_boundary,
+            );
+            return Ok((reused, boundary));
         }
-        let best_cached = self
-            .checkpoints
-            .iter()
-            .enumerate()
-            .filter(|(_, snapshot)| {
-                prefix_matches_media(
+        let snapshot_usable = |snapshot: &Snapshot<D::Checkpoint>| -> bool {
+            (!require_logits || !snapshot.logits.is_empty() || snapshot.tokens.len() < prompt.len())
+                && prefix_matches_media(
                     prompt,
                     incoming_spans,
                     &snapshot.tokens,
                     &snapshot.media_spans,
                 )
-            })
+        };
+        let best_cached = self
+            .checkpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, snapshot)| snapshot_usable(snapshot))
             .max_by_key(|(_, snapshot)| snapshot.tokens.len());
-        let best_prompt_end = self.prompt_end_checkpoint.as_ref().filter(|snapshot| {
-            prefix_matches_media(
-                prompt,
-                incoming_spans,
-                &snapshot.tokens,
-                &snapshot.media_spans,
-            )
-        });
+        let best_prompt_end = self
+            .prompt_end_checkpoint
+            .as_ref()
+            .filter(|snapshot| snapshot_usable(snapshot));
         let (snapshot_idx, from_prompt_end) = match (best_cached, best_prompt_end) {
             (Some((index, cached)), Some(end)) => {
                 if cached.tokens.len() >= end.tokens.len() {
@@ -1781,7 +2069,15 @@ impl<D: Decoder> Runtime<D> {
                 self.prefix_cache_stats.misses = self.prefix_cache_stats.misses.saturating_add(1);
             }
         }
-        Ok(self.tokens.len())
+        let reused = self.tokens.len();
+        let boundary = self.select_prefix_boundary(
+            prompt,
+            incoming_spans,
+            reused,
+            best_common,
+            requested_boundary,
+        );
+        Ok((reused, boundary))
     }
 
     fn write_logits_with<F>(
@@ -1973,17 +2269,26 @@ impl<D: Decoder> Runtime<D> {
         Ok(())
     }
 
-    fn prefill_remaining(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep causal prefix slice ingestion and optional final-token evaluation ordered."
+    )]
+    fn prefill_slice(
         &mut self,
         prompt: &[u32],
-        reused: usize,
+        start: usize,
+        end: usize,
+        evaluate_final: bool,
         chunks: &[MultimodalChunk<'_>],
         prefill: Prefill,
         timings: &mut Option<&mut GenerationTimings>,
         check: &impl Fn() -> Result<()>,
     ) -> Result<()> {
-        let mut cursor = reused;
-        for chunk in chunks.iter().filter(|chunk| chunk.span.offset >= reused) {
+        let mut cursor = start;
+        for chunk in chunks
+            .iter()
+            .filter(|chunk| chunk.span.offset >= start && chunk.span.offset + chunk.span.len <= end)
+        {
             for block in prompt[cursor..chunk.span.offset].chunks(prefill.block_tokens) {
                 measure(
                     timings,
@@ -1993,7 +2298,7 @@ impl<D: Decoder> Runtime<D> {
                 )?;
             }
             let chunk_end = chunk.span.offset + chunk.span.len;
-            let want_logits = chunk_end == prompt.len();
+            let want_logits = evaluate_final && chunk_end == end;
             let phase = if want_logits {
                 GenerationPhase::PrefillEvaluation
             } else {
@@ -2009,8 +2314,19 @@ impl<D: Decoder> Runtime<D> {
             })?;
             cursor = chunk_end;
         }
-        let tail = &prompt[cursor..];
+        let tail = &prompt[cursor..end];
         if !tail.is_empty() {
+            if !evaluate_final {
+                for block in tail.chunks(prefill.block_tokens) {
+                    measure(
+                        timings,
+                        GenerationPhase::PrefillIngestion,
+                        block.len(),
+                        || self.ingest_block(block, check),
+                    )?;
+                }
+                return Ok(());
+            }
             let last_len = ((tail.len() - 1) % prefill.block_tokens) + 1;
             let leading_end = tail.len() - last_len;
             for block in tail[..leading_end].chunks(prefill.block_tokens) {
@@ -2051,6 +2367,53 @@ impl<D: Decoder> Runtime<D> {
 
     #[expect(
         clippy::too_many_arguments,
+        reason = "Keep mid-prefill boundary snapshot capture transactional before suffix ingestion."
+    )]
+    fn prefill_remaining_with_boundary(
+        &mut self,
+        prompt: &[u32],
+        reused: usize,
+        evaluate_final: bool,
+        chunks: &[MultimodalChunk<'_>],
+        prefill: Prefill,
+        timings: &mut Option<&mut GenerationTimings>,
+        boundary_capture: &mut BoundaryCapture<'_, D::Checkpoint>,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        if let Some(boundary) = boundary_capture.boundary
+            && boundary > reused
+            && boundary < prompt.len()
+        {
+            self.prefill_slice(prompt, reused, boundary, false, chunks, prefill, timings, check)?;
+            let captured = self.capture_transient(boundary_capture.reserved, check).ok();
+            check()?;
+            *boundary_capture.slot = captured;
+            self.prefill_slice(
+                prompt,
+                boundary,
+                prompt.len(),
+                evaluate_final,
+                chunks,
+                prefill,
+                timings,
+                check,
+            )
+        } else {
+            self.prefill_slice(
+                prompt,
+                reused,
+                prompt.len(),
+                evaluate_final,
+                chunks,
+                prefill,
+                timings,
+                check,
+            )
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
         reason = "Text and multimodal execution share one guarded transaction sequence."
     )]
     fn generate_inner(
@@ -2066,14 +2429,24 @@ impl<D: Decoder> Runtime<D> {
             impl FnMut(u32, Option<TokenConfidence>) -> Result<()>,
         >,
         prompt_end: &mut PromptEndCapture<'_, D::Checkpoint>,
+        boundary_capture: &mut BoundaryCapture<'_, D::Checkpoint>,
     ) -> Result<Completion> {
         check()?;
         let incoming_spans: Vec<MediaSpan> = chunks.iter().map(|chunk| chunk.span).collect();
-        let reused = measure(
+        let requested_boundary = effects.prefix_boundary;
+        let (reused, auto_boundary) = measure(
             &mut effects.timings,
             GenerationPhase::PrefixPreparation,
             0,
-            || self.prepare_with_spans(prompt, &incoming_spans, check),
+            || {
+                self.prepare_with_spans_for_boundary(
+                    prompt,
+                    &incoming_spans,
+                    true,
+                    requested_boundary,
+                    check,
+                )
+            },
         )?;
         if let Some(timings) = effects.timings.as_deref_mut() {
             timings.reused_tokens = Some(reused);
@@ -2087,8 +2460,30 @@ impl<D: Decoder> Runtime<D> {
         self.decoder
             .admit_work(remaining.saturating_sub(1), evaluations)?;
         check()?;
-        self.prefill_remaining(prompt, reused, chunks, prefill, &mut effects.timings, check)?;
-        self.maybe_capture_prompt_end_with_spans(prompt, &incoming_spans, prompt_end, check)?;
+        boundary_capture.boundary = auto_boundary;
+        self.prefill_remaining_with_boundary(
+            prompt,
+            reused,
+            true,
+            chunks,
+            prefill,
+            &mut effects.timings,
+            boundary_capture,
+            check,
+        )?;
+        let prompt_end_reserved = prompt_end
+            .reserved
+            .saturating_add(boundary_capture.slot.as_ref().map_or(0, |s| s.bytes));
+        let mut adjusted_prompt_end = PromptEndCapture {
+            reserved: prompt_end_reserved,
+            slot: prompt_end.slot,
+        };
+        self.maybe_capture_prompt_end_with_spans(
+            prompt,
+            &incoming_spans,
+            &mut adjusted_prompt_end,
+            check,
+        )?;
         let mut completion = Completion {
             prompt_tokens: prompt.len(),
             reused_tokens: reused,
@@ -2426,11 +2821,19 @@ impl<D: Decoder> Runtime<D> {
         check()?;
         let rollback = self.capture_transient(0, check)?;
         let mut prompt_end = None;
+        let mut boundary_snapshot = None;
+        let mut boundary_hits = 1_u64;
         let result = (|| {
             check()?;
             let mut prompt_end_capture = PromptEndCapture {
                 reserved: rollback.bytes,
                 slot: &mut prompt_end,
+            };
+            let mut boundary_capture = BoundaryCapture {
+                reserved: rollback.bytes,
+                boundary: None,
+                hits: 1,
+                slot: &mut boundary_snapshot,
             };
             let (completion, stats) = self.generate_speculative_inner(
                 prompt,
@@ -2440,14 +2843,17 @@ impl<D: Decoder> Runtime<D> {
                 check,
                 &mut emit,
                 &mut prompt_end_capture,
+                &mut boundary_capture,
             )?;
+            boundary_hits = boundary_capture.hits;
             check()?;
             let snapshot = if self.limits.checkpoints == 0 {
                 None
             } else {
                 let snapshot_reserved = rollback
                     .bytes
-                    .saturating_add(prompt_end.as_ref().map_or(0, |s| s.bytes));
+                    .saturating_add(prompt_end.as_ref().map_or(0, |s| s.bytes))
+                    .saturating_add(boundary_snapshot.as_ref().map_or(0, |s| s.bytes));
                 let snapshot = self.capture_reusable(snapshot_reserved, check).ok();
                 check()?;
                 snapshot
@@ -2457,28 +2863,16 @@ impl<D: Decoder> Runtime<D> {
         match result {
             Ok((completion, stats, snapshot)) => {
                 self.commit_prompt_end(prompt_end);
+                self.commit_reusable_snapshot_with_hits(boundary_snapshot, boundary_hits);
                 self.commit_reusable_snapshot(snapshot);
                 self.recycle_snapshot(rollback);
                 Ok((completion, stats))
             }
             Err(error) => {
                 self.faulted = true;
-                let Snapshot {
-                    state,
-                    tokens,
-                    media_spans,
-                    logits,
-                    ..
-                } = rollback;
-                let restored = self.decoder.restore(&state);
-                self.tokens = tokens;
-                self.media_spans = media_spans;
-                let previous_logits = std::mem::replace(&mut self.logits, logits);
-                restored?;
-                self.faulted = false;
-                self.recycle_checkpoint(state);
-                self.recycle_logits(previous_logits);
                 self.recycle_optional_snapshot(prompt_end);
+                self.recycle_optional_snapshot(boundary_snapshot);
+                self.restore_rollback_snapshot(rollback)?;
                 Err(error)
             }
         }
@@ -2497,9 +2891,11 @@ impl<D: Decoder> Runtime<D> {
         check: &impl Fn() -> Result<()>,
         emit: &mut impl FnMut(u32) -> Result<()>,
         prompt_end: &mut PromptEndCapture<'_, D::Checkpoint>,
+        boundary_capture: &mut BoundaryCapture<'_, D::Checkpoint>,
     ) -> Result<(Completion, SpeculativeStats)> {
         check()?;
-        let reused = self.prepare(prompt, check)?;
+        let (reused, boundary) =
+            self.prepare_with_spans_for_boundary(prompt, &[], true, None, check)?;
         check()?;
         let remaining = prompt.len() - reused;
         let evaluations = options
@@ -2509,13 +2905,35 @@ impl<D: Decoder> Runtime<D> {
         self.decoder
             .admit_work(remaining.saturating_sub(1), evaluations)?;
         check()?;
-        if let Some((&last, prefix)) = prompt[reused..].split_last() {
+        boundary_capture.boundary = boundary;
+        let eval_start = if let Some(b) = boundary
+            && b > reused
+            && b < prompt.len()
+        {
+            for block in prompt[reused..b].chunks(prefill.block_tokens) {
+                self.ingest_block(block, check)?;
+            }
+            let captured = self.capture_transient(boundary_capture.reserved, check).ok();
+            check()?;
+            *boundary_capture.slot = captured;
+            b
+        } else {
+            reused
+        };
+        if let Some((&last, prefix)) = prompt[eval_start..].split_last() {
             for block in prefix.chunks(prefill.block_tokens) {
                 self.ingest_block(block, check)?;
             }
             self.evaluate(last, check)?;
         }
-        self.maybe_capture_prompt_end(prompt, prompt_end, check)?;
+        let prompt_end_reserved = prompt_end
+            .reserved
+            .saturating_add(boundary_capture.slot.as_ref().map_or(0, |s| s.bytes));
+        let mut adjusted_prompt_end = PromptEndCapture {
+            reserved: prompt_end_reserved,
+            slot: prompt_end.slot,
+        };
+        self.maybe_capture_prompt_end(prompt, &mut adjusted_prompt_end, check)?;
         let mut completion = Completion {
             prompt_tokens: prompt.len(),
             reused_tokens: reused,
@@ -2664,6 +3082,43 @@ fn prefix_matches_media(
             .take_while(|span| span.offset < prefix_tokens.len())
             .copied()
             .eq(prefix_media.iter().copied())
+}
+
+fn splits_media_span(spans: &[MediaSpan], boundary: usize) -> bool {
+    spans
+        .iter()
+        .any(|span| span.offset < boundary && boundary < span.offset + span.len)
+}
+
+fn common_prefix_len_with_media(
+    prompt: &[u32],
+    incoming_spans: &[MediaSpan],
+    prior_tokens: &[u32],
+    prior_spans: &[MediaSpan],
+) -> usize {
+    let mut len = prompt
+        .iter()
+        .zip(prior_tokens)
+        .take_while(|(lhs, rhs)| lhs == rhs)
+        .count();
+    let mut incoming_iter = incoming_spans.iter().take_while(|span| span.offset < len);
+    let mut prior_iter = prior_spans.iter().take_while(|span| span.offset < len);
+    loop {
+        match (incoming_iter.next(), prior_iter.next()) {
+            (Some(lhs), Some(rhs)) => {
+                if lhs != rhs || lhs.offset + lhs.len > len {
+                    len = len.min(lhs.offset).min(rhs.offset);
+                    break;
+                }
+            }
+            (Some(span), None) | (None, Some(span)) => {
+                len = len.min(span.offset);
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    len
 }
 
 fn validate_multimodal_chunks(prompt: &[u32], chunks: &[MultimodalChunk<'_>]) -> Result<()> {
@@ -4832,16 +5287,16 @@ mod fused_prefill_eval_tests {
     use super::*;
     use std::cell::Cell;
 
-    struct FusedTrackingDecoder {
-        tokens: Vec<u32>,
-        fused_blocks: Vec<Vec<u32>>,
-        ingest_blocks: Vec<Vec<u32>>,
-        evals: Vec<u32>,
-        fail_fused: Cell<bool>,
+    pub(super) struct FusedTrackingDecoder {
+        pub(super) tokens: Vec<u32>,
+        pub(super) fused_blocks: Vec<Vec<u32>>,
+        pub(super) ingest_blocks: Vec<Vec<u32>>,
+        pub(super) evals: Vec<u32>,
+        pub(super) fail_fused: Cell<bool>,
     }
 
     impl FusedTrackingDecoder {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 tokens: Vec::new(),
                 fused_blocks: Vec::new(),
@@ -4989,6 +5444,171 @@ mod fused_prefill_eval_tests {
             |_| Ok(()),
         )?;
         assert_eq!(regen.reused_tokens, prompt.len());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prefix_boundary_tests {
+    use super::fused_prefill_eval_tests::FusedTrackingDecoder;
+    use super::*;
+
+    fn make_runtime(checkpoints: usize, checkpoint_bytes: usize) -> Result<Runtime<FusedTrackingDecoder>> {
+        Runtime::new(
+            FusedTrackingDecoder::new(),
+            Limits {
+                context_tokens: 256,
+                checkpoints,
+                checkpoint_bytes,
+            },
+        )
+    }
+
+    fn total_prompt_work(decoder: &FusedTrackingDecoder) -> usize {
+        let ingest: usize = decoder.ingest_blocks.iter().map(Vec::len).sum();
+        let fused: usize = decoder.fused_blocks.iter().map(Vec::len).sum();
+        ingest + fused
+    }
+
+    fn system_prompt(len: usize) -> Vec<u32> {
+        (0..len).map(|i| u32::try_from((i % 7) + 1).unwrap_or(1)).collect()
+    }
+
+    fn opts(max_tokens: usize) -> Generation {
+        Generation {
+            max_tokens,
+            stop_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_prefill_with_prefix_boundary_and_hint_reuse_without_reprefill() -> Result<()> {
+        let sys = system_prompt(40);
+        let cancel = Cancellation::default();
+        let prefill = Prefill { block_tokens: 16 };
+
+        // 1) Explicit `prefill_with_prefix_boundary` pre-ingests system prompt once and saves boundary.
+        let mut rt = make_runtime(2, 64 * 1_024)?;
+        let reused_pre = rt.prefill_with_prefix_boundary(&sys, prefill, &cancel)?;
+        assert_eq!(reused_pre, 0);
+        assert_eq!(rt.checkpoint_count(), 1);
+        assert!(rt.logits.is_empty());
+        assert_eq!(rt.decoder().evals.len(), 0);
+
+        let mut p1 = sys.clone();
+        p1.extend_from_slice(&[8, 9, 10, 11]);
+        let before1 = total_prompt_work(rt.decoder());
+        let c1 = rt.generate_with_prefill(&p1, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(c1.reused_tokens, 40);
+        assert_eq!(total_prompt_work(rt.decoder()) - before1, 4);
+
+        // New conversation with same system prompt hits the 40-token checkpoint directly.
+        let mut p2 = sys.clone();
+        p2.extend_from_slice(&[12, 13, 14, 15]);
+        let before2 = total_prompt_work(rt.decoder());
+        let c2 = rt.generate_with_prefill(&p2, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(c2.reused_tokens, 40);
+        assert_eq!(total_prompt_work(rt.decoder()) - before2, 4);
+
+        // Exact-length prompt equal to empty-logits boundary checkpoint must still evaluate token 39.
+        let exact = rt.generate_with_prefill(&sys, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(exact.reused_tokens, 0);
+        assert!(!rt.logits.is_empty());
+
+        // 2) `generate_with_prefix_boundary` captures boundary inline during Turn 1 prefill.
+        let mut rt2 = make_runtime(2, 64 * 1_024)?;
+        rt2.generate_with_prefix_boundary(&p1, 40, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(rt2.checkpoint_count(), 2);
+        let c2_inline = rt2.generate_with_prefill(&p2, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(c2_inline.reused_tokens, 40);
+
+        // 3) Rollback safety on `prefill_with_prefix_boundary` failure.
+        let prev_tokens = rt2.tokens().to_vec();
+        let cancelled = Cancellation::default();
+        cancelled.cancel();
+        assert!(rt2.prefill_with_prefix_boundary(&sys, prefill, &cancelled).is_err());
+        assert!(!rt2.is_faulted());
+        assert_eq!(rt2.tokens(), prev_tokens);
+        Ok(())
+    }
+
+    #[test]
+    fn auto_prefix_boundary_captures_turn1_edit_and_new_conversation_shared_prefix() -> Result<()> {
+        let sys = system_prompt(48);
+        let cancel = Cancellation::default();
+        let prefill = Prefill { block_tokens: 16 };
+        let mut rt = make_runtime(2, 64 * 1_024)?;
+
+        let mut turn1 = sys.clone();
+        turn1.extend_from_slice(&[8, 9, 10, 11, 12, 13, 14, 15]);
+        let c1 = rt.generate_with_prefill(&turn1, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(c1.reused_tokens, 0);
+        assert_eq!(rt.checkpoint_count(), 1);
+
+        // Editing Turn 1 (or starting a new conversation with same 48-token system prompt)
+        // diverges after >= 32 tokens and captures a boundary checkpoint at token 48.
+        let mut edit1 = sys.clone();
+        edit1.extend_from_slice(&[15, 14, 13, 12, 11, 10, 9, 8]);
+        let c_edit1 = rt.generate_with_prefill(&edit1, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(c_edit1.reused_tokens, 0);
+        assert_eq!(rt.checkpoint_count(), 2);
+
+        // Subsequent edit / new conversation hits the 48-token boundary instead of token 0.
+        let mut edit2 = sys;
+        edit2.extend_from_slice(&[9, 9, 10, 10, 11, 11, 12, 12]);
+        let before = total_prompt_work(rt.decoder());
+        let c_edit2 = rt.generate_with_prefill(&edit2, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(c_edit2.reused_tokens, 48);
+        assert_eq!(total_prompt_work(rt.decoder()) - before, 8);
+
+        // Divergence after < 32 shared tokens must NOT capture a boundary checkpoint.
+        let mut rt_short = make_runtime(3, 64 * 1_024)?;
+        let short_a: Vec<u32> = (0..24).map(|i| u32::try_from((i % 5) + 1).unwrap_or(1)).collect();
+        let mut short_p1 = short_a.clone();
+        short_p1.extend_from_slice(&[8, 9]);
+        let mut short_p2 = short_a;
+        short_p2.extend_from_slice(&[10, 11]);
+        rt_short.generate_with_prefill(&short_p1, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        rt_short.generate_with_prefill(&short_p2, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(rt_short.checkpoint_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_boundary_respects_near_tolerance_byte_budget_and_marconi_eviction() -> Result<()> {
+        let sys = system_prompt(40);
+        let cancel = Cancellation::default();
+        let prefill = Prefill { block_tokens: 16 };
+
+        // 1) Near-boundary checkpoint within 16 tokens suppresses redundant boundary capture.
+        let mut rt_near = make_runtime(3, 64 * 1_024)?;
+        rt_near.prefill_with_prefix_boundary(&sys[..36], prefill, &cancel)?;
+        let mut turn_b = sys.clone();
+        turn_b.extend_from_slice(&[8, 9, 10, 11]);
+        let c_b = rt_near.generate_with_prefill(&turn_b, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(c_b.reused_tokens, 36);
+        let mut turn_c = sys.clone();
+        turn_c.extend_from_slice(&[12, 13, 14, 15]);
+        let c_c = rt_near.generate_with_prefill(&turn_c, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert_eq!(c_c.reused_tokens, 36);
+        assert_eq!(rt_near.checkpoint_count(), 3);
+        assert!(!rt_near.checkpoints.iter().any(|snap| snap.tokens.len() == 40));
+
+        // 2) Tight byte budget: only fits rollback + 1 saved checkpoint -> boundary omitted cleanly.
+        let mut probe = make_runtime(2, 64 * 1_024)?;
+        probe.generate_with_prefill(&turn_b, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        let one_snap_bytes = probe.retained_reusable_bytes()?;
+        let mut rt_tight = make_runtime(2, one_snap_bytes * 2 + 128)?;
+        rt_tight.generate_with_prefill(&turn_b, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        rt_tight.generate_with_prefill(&turn_c, &opts(1), prefill, &cancel, |_| Ok(()))?;
+        assert!(rt_tight.retained_reusable_bytes()? <= one_snap_bytes * 2 + 128);
+        assert!(rt_tight.checkpoint_count() <= 2);
+
+        // 3) `set_prefix_boundary_hint` works cleanly and resets on `Runtime::reset`.
+        rt_near.set_prefix_boundary_hint(Some(40));
+        assert_eq!(rt_near.prefix_boundary_hint(), Some(40));
+        rt_near.reset()?;
+        assert_eq!(rt_near.prefix_boundary_hint(), None);
         Ok(())
     }
 }

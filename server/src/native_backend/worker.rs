@@ -2261,7 +2261,11 @@ mod tests {
             )
             .map_err(|error| format!("{error:?}"))?;
             let mut events = unsupported
-                .start(Input::Warm(sample_pending()?), Cancellation::default(), None)
+                .start(
+                    Input::Warm(sample_pending()?),
+                    Cancellation::default(),
+                    None,
+                )
                 .map_err(|error| format!("{error:?}"))?;
             let event = events.recv().await.ok_or("missing Done")?;
             assert!(matches!(

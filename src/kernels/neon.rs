@@ -1650,41 +1650,62 @@ fn lora_multi_a_tokens_f16_layout<const RANK_MAJOR: bool>(
         for (q_idx, &tok4) in tok_quads.iter().enumerate() {
             let dots = dot_f16_f32_pair_tokens::<4>(neon, [r0, r1], tok4);
             let base_t = q_idx * 4;
-            if !write_lora_a_dots::<RANK_MAJOR, 4>(ranks_out, rank, n_tokens, r_base, base_t, &dots[0])
-                || !write_lora_a_dots::<RANK_MAJOR, 4>(
-                    ranks_out,
-                    rank,
-                    n_tokens,
-                    r_base + 1,
-                    base_t,
-                    &dots[1],
-                )
-            {
+            if !write_lora_a_dots::<RANK_MAJOR, 4>(
+                ranks_out, rank, n_tokens, r_base, base_t, &dots[0],
+            ) || !write_lora_a_dots::<RANK_MAJOR, 4>(
+                ranks_out,
+                rank,
+                n_tokens,
+                r_base + 1,
+                base_t,
+                &dots[1],
+            ) {
                 return Some(false);
             }
         }
         match tok_tail {
             [t0] => {
                 let dots = dot_f16_f32_pair_tokens::<1>(neon, [r0, r1], [*t0]);
-                if !write_lora_a_dots::<RANK_MAJOR, 1>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
-                    || !write_lora_a_dots::<RANK_MAJOR, 1>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
-                {
+                if !write_lora_a_dots::<RANK_MAJOR, 1>(
+                    ranks_out, rank, n_tokens, r_base, tail_base, &dots[0],
+                ) || !write_lora_a_dots::<RANK_MAJOR, 1>(
+                    ranks_out,
+                    rank,
+                    n_tokens,
+                    r_base + 1,
+                    tail_base,
+                    &dots[1],
+                ) {
                     return Some(false);
                 }
             }
             [t0, t1] => {
                 let dots = dot_f16_f32_pair_tokens::<2>(neon, [r0, r1], [*t0, *t1]);
-                if !write_lora_a_dots::<RANK_MAJOR, 2>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
-                    || !write_lora_a_dots::<RANK_MAJOR, 2>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
-                {
+                if !write_lora_a_dots::<RANK_MAJOR, 2>(
+                    ranks_out, rank, n_tokens, r_base, tail_base, &dots[0],
+                ) || !write_lora_a_dots::<RANK_MAJOR, 2>(
+                    ranks_out,
+                    rank,
+                    n_tokens,
+                    r_base + 1,
+                    tail_base,
+                    &dots[1],
+                ) {
                     return Some(false);
                 }
             }
             [t0, t1, t2] => {
                 let dots = dot_f16_f32_pair_tokens::<3>(neon, [r0, r1], [*t0, *t1, *t2]);
-                if !write_lora_a_dots::<RANK_MAJOR, 3>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
-                    || !write_lora_a_dots::<RANK_MAJOR, 3>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
-                {
+                if !write_lora_a_dots::<RANK_MAJOR, 3>(
+                    ranks_out, rank, n_tokens, r_base, tail_base, &dots[0],
+                ) || !write_lora_a_dots::<RANK_MAJOR, 3>(
+                    ranks_out,
+                    rank,
+                    n_tokens,
+                    r_base + 1,
+                    tail_base,
+                    &dots[1],
+                ) {
                     return Some(false);
                 }
             }
@@ -1745,41 +1766,62 @@ fn lora_multi_a_tokens_f32_layout<const RANK_MAJOR: bool>(
         for (q_idx, &tok4) in tok_quads.iter().enumerate() {
             let dots = dot_f32_f32_pair_tokens::<4>(neon, [r0, r1], tok4);
             let base_t = q_idx * 4;
-            if !write_lora_a_dots::<RANK_MAJOR, 4>(ranks_out, rank, n_tokens, r_base, base_t, &dots[0])
-                || !write_lora_a_dots::<RANK_MAJOR, 4>(
-                    ranks_out,
-                    rank,
-                    n_tokens,
-                    r_base + 1,
-                    base_t,
-                    &dots[1],
-                )
-            {
+            if !write_lora_a_dots::<RANK_MAJOR, 4>(
+                ranks_out, rank, n_tokens, r_base, base_t, &dots[0],
+            ) || !write_lora_a_dots::<RANK_MAJOR, 4>(
+                ranks_out,
+                rank,
+                n_tokens,
+                r_base + 1,
+                base_t,
+                &dots[1],
+            ) {
                 return Some(false);
             }
         }
         match tok_tail {
             [t0] => {
                 let dots = dot_f32_f32_pair_tokens::<1>(neon, [r0, r1], [*t0]);
-                if !write_lora_a_dots::<RANK_MAJOR, 1>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
-                    || !write_lora_a_dots::<RANK_MAJOR, 1>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
-                {
+                if !write_lora_a_dots::<RANK_MAJOR, 1>(
+                    ranks_out, rank, n_tokens, r_base, tail_base, &dots[0],
+                ) || !write_lora_a_dots::<RANK_MAJOR, 1>(
+                    ranks_out,
+                    rank,
+                    n_tokens,
+                    r_base + 1,
+                    tail_base,
+                    &dots[1],
+                ) {
                     return Some(false);
                 }
             }
             [t0, t1] => {
                 let dots = dot_f32_f32_pair_tokens::<2>(neon, [r0, r1], [*t0, *t1]);
-                if !write_lora_a_dots::<RANK_MAJOR, 2>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
-                    || !write_lora_a_dots::<RANK_MAJOR, 2>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
-                {
+                if !write_lora_a_dots::<RANK_MAJOR, 2>(
+                    ranks_out, rank, n_tokens, r_base, tail_base, &dots[0],
+                ) || !write_lora_a_dots::<RANK_MAJOR, 2>(
+                    ranks_out,
+                    rank,
+                    n_tokens,
+                    r_base + 1,
+                    tail_base,
+                    &dots[1],
+                ) {
                     return Some(false);
                 }
             }
             [t0, t1, t2] => {
                 let dots = dot_f32_f32_pair_tokens::<3>(neon, [r0, r1], [*t0, *t1, *t2]);
-                if !write_lora_a_dots::<RANK_MAJOR, 3>(ranks_out, rank, n_tokens, r_base, tail_base, &dots[0])
-                    || !write_lora_a_dots::<RANK_MAJOR, 3>(ranks_out, rank, n_tokens, r_base + 1, tail_base, &dots[1])
-                {
+                if !write_lora_a_dots::<RANK_MAJOR, 3>(
+                    ranks_out, rank, n_tokens, r_base, tail_base, &dots[0],
+                ) || !write_lora_a_dots::<RANK_MAJOR, 3>(
+                    ranks_out,
+                    rank,
+                    n_tokens,
+                    r_base + 1,
+                    tail_base,
+                    &dots[1],
+                ) {
                     return Some(false);
                 }
             }

@@ -771,7 +771,9 @@ fn validate_shader_bundle_digest(shader_bundle_sha256: &str) -> Result<(), Error
     Ok(())
 }
 
-fn compute_pipeline_cache_envelope_digest(body: &[u8]) -> Result<[u8; PIPELINE_CACHE_DIGEST_BYTES], Error> {
+fn compute_pipeline_cache_envelope_digest(
+    body: &[u8],
+) -> Result<[u8; PIPELINE_CACHE_DIGEST_BYTES], Error> {
     let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
     hash_bytes(&mut hasher, PIPELINE_CACHE_HASH_DOMAIN)?;
     hash_bytes(&mut hasher, body)?;
@@ -852,9 +854,9 @@ pub fn decode_pipeline_cache_envelope<'a>(
 
     let mut pos = 8_usize;
     let take = |pos: &mut usize, n: usize| -> Result<&'a [u8], Error> {
-        let end = pos
-            .checked_add(n)
-            .ok_or_else(|| Error::InvalidInput("pipeline cache envelope offset overflow".to_owned()))?;
+        let end = pos.checked_add(n).ok_or_else(|| {
+            Error::InvalidInput("pipeline cache envelope offset overflow".to_owned())
+        })?;
         let slice = body
             .get(*pos..end)
             .ok_or_else(|| Error::InvalidInput("pipeline cache envelope truncated".to_owned()))?;
@@ -885,8 +887,9 @@ pub fn decode_pipeline_cache_envelope<'a>(
         ));
     }
     let shader_bytes = take(&mut pos, shader_len)?;
-    let shader_str = std::str::from_utf8(shader_bytes)
-        .map_err(|_| Error::InvalidInput("serialized shader bundle digest is non-UTF8".to_owned()))?;
+    let shader_str = std::str::from_utf8(shader_bytes).map_err(|_| {
+        Error::InvalidInput("serialized shader bundle digest is non-UTF8".to_owned())
+    })?;
 
     let payload_len_bytes = take(&mut pos, 8)?;
     let payload_len_arr: [u8; 8] = payload_len_bytes
@@ -903,7 +906,8 @@ pub fn decode_pipeline_cache_envelope<'a>(
     let payload = take(&mut pos, payload_len)?;
     if pos != body.len() {
         return Err(Error::InvalidInput(
-            "serialized Vulkan pipeline cache envelope contains unexpected trailing bytes".to_owned(),
+            "serialized Vulkan pipeline cache envelope contains unexpected trailing bytes"
+                .to_owned(),
         ));
     }
 
@@ -1185,10 +1189,10 @@ impl AdrenoVulkanDevice {
                 }
             };
 
-        let cache_info = initial_pipeline_cache.map_or_else(
-            vk::PipelineCacheCreateInfo::default,
-            |initial_data| vk::PipelineCacheCreateInfo::default().initial_data(initial_data),
-        );
+        let cache_info = initial_pipeline_cache
+            .map_or_else(vk::PipelineCacheCreateInfo::default, |initial_data| {
+                vk::PipelineCacheCreateInfo::default().initial_data(initial_data)
+            });
         // SAFETY: Creating pipeline cache on live device.
         let pipeline_cache = match unsafe { device.create_pipeline_cache(&cache_info, None) } {
             Ok(cache) => cache,
@@ -3412,8 +3416,7 @@ mod tests {
             device_id: 0x0630_0001,
             driver_version: 512_345,
             pipeline_cache_uuid: uuid_a,
-            shader_bundle_sha256:
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            shader_bundle_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         };
         let raw_cache = vec![0x20_u8, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd];
         let encoded = encode_pipeline_cache_envelope(&binding, &raw_cache)?;

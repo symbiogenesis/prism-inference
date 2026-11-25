@@ -5093,9 +5093,7 @@ fn lora_multi_a_tokens_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
             &mut ranks_out[..needed],
             parallelism,
         )
-    } else if n_tokens >= 4
-        && work >= MULTI_A_PARALLEL_ELEM_THRESHOLD
-        && parallelism.workers() > 1
+    } else if n_tokens >= 4 && work >= MULTI_A_PARALLEL_ELEM_THRESHOLD && parallelism.workers() > 1
     {
         parallelism.update_chunks(&mut ranks_out[..needed], rank, run_token_chunk)
     } else {
@@ -7178,12 +7176,20 @@ mod tests {
                         &parallelism,
                     )?;
                     assert_eq!(
-                        out_f16.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        out_f16
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
                         expected,
                         "f16 rank={rank} tokens={token_count} workers={workers}"
                     );
                     assert_eq!(
-                        out_f32.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        out_f32
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
                         expected,
                         "f32 rank={rank} tokens={token_count} workers={workers}"
                     );
@@ -7199,15 +7205,17 @@ mod tests {
                 let bad_refs: Vec<&[f32]> = bad_inputs.iter().map(Vec::as_slice).collect();
                 let parallel = super::RowParallelism::new(4)?;
                 let mut ranks_out = vec![9.0_f32; 2 * rank];
-                assert!(super::lora_multi_a_tokens_f32(
-                    &bad_a,
-                    in_features,
-                    rank,
-                    &bad_refs,
-                    &mut ranks_out,
-                    &parallel,
-                )
-                .is_err());
+                assert!(
+                    super::lora_multi_a_tokens_f32(
+                        &bad_a,
+                        in_features,
+                        rank,
+                        &bad_refs,
+                        &mut ranks_out,
+                        &parallel,
+                    )
+                    .is_err()
+                );
                 assert!(ranks_out.is_empty());
             }
         }

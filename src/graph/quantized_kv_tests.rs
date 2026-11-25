@@ -2105,10 +2105,7 @@ fn seeded_kv_pair(
 fn clone_packed_kv(src: &KvCache, truncate_tokens: Option<usize>) -> Result<KvCache> {
     let mut dst = src.copy()?;
     if let Some(tokens) = truncate_tokens {
-        let packed = dst
-            .packed
-            .as_mut()
-            .ok_or_else(|| invalid("dst packed"))?;
+        let packed = dst.packed.as_mut().ok_or_else(|| invalid("dst packed"))?;
         packed.truncate_to(tokens)?;
         dst.len = tokens * src.width;
     }
@@ -2145,8 +2142,12 @@ fn prepare_tile_append_parallel_matches_serial_bytes_across_policies_tokens_and_
         .collect::<Result<_>>()?;
 
     for policy in policies {
-        let (base_k, base_v) =
-            seeded_kv_pair(policy, kv_heads, initial_history, initial_history + max_tokens)?;
+        let (base_k, base_v) = seeded_kv_pair(
+            policy,
+            kv_heads,
+            initial_history,
+            initial_history + max_tokens,
+        )?;
         let mut scratch = PackedTileScratch::default();
         for count in 1..=max_tokens {
             let mut ser_k = clone_packed_kv(&base_k, None)?;

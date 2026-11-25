@@ -1630,10 +1630,8 @@ fn recurrent_tile_with_tape<'a>(
         1
     };
     let head_dot_stride = wy_chunks * KEY_DOT_STRIDE;
-    let use_shared_key_dots = chunkwise
-        && width > 0
-        && geometry.ssm_values > geometry.ssm_keys
-        && geometry.ssm_keys > 0;
+    let use_shared_key_dots =
+        chunkwise && width > 0 && geometry.ssm_values > geometry.ssm_keys && geometry.ssm_keys > 0;
     if use_shared_key_dots {
         resize_into(geometry.ssm_keys * head_dot_stride, &mut tile.gdn_key_dots)?;
         let mixed_ref: &[Vec<f32>] = &tile.mixed[..count];
@@ -1911,8 +1909,7 @@ fn recurrent_tile_with_tape<'a>(
             let range = head_index * width * width..(head_index + 1) * width * width;
             if chunkwise {
                 let head_dots = use_shared_key_dots.then(|| {
-                    &tile.gdn_key_dots
-                        [key_head * head_dot_stride..(key_head + 1) * head_dot_stride]
+                    &tile.gdn_key_dots[key_head * head_dot_stride..(key_head + 1) * head_dot_stride]
                 });
                 chunkwise_subchunks_into(
                     arithmetic,
@@ -2518,30 +2515,58 @@ mod tests {
         let mut dots_all = vec![0.0_f32; chunks * KEY_DOT_STRIDE];
         let q_flat: Vec<f32> = q.iter().flat_map(|row| row.iter().copied()).collect();
         let k_flat: Vec<f32> = k.iter().flat_map(|row| row.iter().copied()).collect();
-        for (chunk_idx, dots) in dots_all.as_chunks_mut::<KEY_DOT_STRIDE>().0.iter_mut().enumerate() {
+        for (chunk_idx, dots) in dots_all
+            .as_chunks_mut::<KEY_DOT_STRIDE>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
             let c_start = chunk_idx * WY_CHUNK_TOKENS;
             let c_end = (c_start + WY_CHUNK_TOKENS).min(count);
             fill_key_head_dots_head_major(
-                arithmetic, &q_flat[c_start * width..c_end * width],
-                &k_flat[c_start * width..c_end * width], c_end - c_start, width, dots,
+                arithmetic,
+                &q_flat[c_start * width..c_end * width],
+                &k_flat[c_start * width..c_end * width],
+                c_end - c_start,
+                width,
+                dots,
             )?;
         }
-        let (mut ref_a, mut ref_b, mut ref_out) =
-            (vec![0.0_f32; state_len], vec![0.0_f32; state_len], vec![0.0_f32; count * width]);
+        let (mut ref_a, mut ref_b, mut ref_out) = (
+            vec![0.0_f32; state_len],
+            vec![0.0_f32; state_len],
+            vec![0.0_f32; count * width],
+        );
         head_into(
-            arithmetic, &prev, &inputs[..WY_CHUNK_TOKENS], Some(&dots_all[..KEY_DOT_STRIDE]),
-            &mut ref_a, &mut ref_out[..WY_CHUNK_TOKENS * width],
+            arithmetic,
+            &prev,
+            &inputs[..WY_CHUNK_TOKENS],
+            Some(&dots_all[..KEY_DOT_STRIDE]),
+            &mut ref_a,
+            &mut ref_out[..WY_CHUNK_TOKENS * width],
         )?;
         head_into(
-            arithmetic, &ref_a, &inputs[WY_CHUNK_TOKENS..],
-            Some(&dots_all[KEY_DOT_STRIDE..2 * KEY_DOT_STRIDE]), &mut ref_b,
+            arithmetic,
+            &ref_a,
+            &inputs[WY_CHUNK_TOKENS..],
+            Some(&dots_all[KEY_DOT_STRIDE..2 * KEY_DOT_STRIDE]),
+            &mut ref_b,
             &mut ref_out[WY_CHUNK_TOKENS * width..],
         )?;
-        let (mut carry_state, mut actual_state, mut actual_out) =
-            (Vec::new(), vec![0.0_f32; state_len], vec![0.0_f32; count * width]);
+        let (mut carry_state, mut actual_state, mut actual_out) = (
+            Vec::new(),
+            vec![0.0_f32; state_len],
+            vec![0.0_f32; count * width],
+        );
         chunkwise_subchunks_into(
-            arithmetic, &prev, &inputs, Some(&dots_all), width,
-            &mut carry_state, &mut actual_state, &mut actual_out,
+            arithmetic,
+            &prev,
+            &inputs,
+            Some(&dots_all),
+            width,
+            &mut carry_state,
+            &mut actual_state,
+            &mut actual_out,
         )?;
         assert_eq!(
             actual_state.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),

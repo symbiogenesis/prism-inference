@@ -144,7 +144,11 @@ fn prefetch_row_blocks<const ROWS: usize, const BYTES: usize>(
 }
 
 #[inline]
-fn prefetch_pq2_tokens_block(tokens: &[&[super::Pq2Activation]], block_idx: usize, block_count: usize) {
+fn prefetch_pq2_tokens_block(
+    tokens: &[&[super::Pq2Activation]],
+    block_idx: usize,
+    block_count: usize,
+) {
     if block_idx + 1 < block_count {
         for tok in tokens {
             let ptr = tok[block_idx + 1].values.as_ptr().cast::<u8>();
@@ -4922,7 +4926,8 @@ fn ptq1_pinned_quad_block<A: super::Q8ActivationView>(
             let ah = tok_quad[t][act_idx].values().as_chunks::<16>().0;
             (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
         });
-        for (acc_row, (&row_rs, row_trits)) in acc.iter_mut().zip(rs.iter().zip(block_trits.iter())) {
+        for (acc_row, (&row_rs, row_trits)) in acc.iter_mut().zip(rs.iter().zip(block_trits.iter()))
+        {
             let w0 = row_trits[group * 2];
             let w1 = row_trits[group * 2 + 1];
             for t in 0..4 {

@@ -2145,7 +2145,10 @@ impl<D: Decoder> Runtime<D> {
             .and_then(|(pointer, length)| {
                 // A public custom decoder can return a checked view of other
                 // storage. Admit only a proof covering this complete output.
-                if length != vocab_size || length != output.len() || !std::ptr::eq(pointer, output.as_ptr()) {
+                if length != vocab_size
+                    || length != output.len()
+                    || !std::ptr::eq(pointer, output.as_ptr())
+                {
                     return Err(invalid("native decoder returned invalid logits"));
                 }
                 check()
@@ -2416,8 +2419,12 @@ impl<D: Decoder> Runtime<D> {
             && boundary > reused
             && boundary < prompt.len()
         {
-            self.prefill_slice(prompt, reused, boundary, false, chunks, prefill, timings, check)?;
-            let captured = self.capture_transient(boundary_capture.reserved, check).ok();
+            self.prefill_slice(
+                prompt, reused, boundary, false, chunks, prefill, timings, check,
+            )?;
+            let captured = self
+                .capture_transient(boundary_capture.reserved, check)
+                .ok();
             check()?;
             *boundary_capture.slot = captured;
             self.prefill_slice(
@@ -2945,7 +2952,9 @@ impl<D: Decoder> Runtime<D> {
             for block in prompt[reused..b].chunks(prefill.block_tokens) {
                 self.ingest_block(block, check)?;
             }
-            let captured = self.capture_transient(boundary_capture.reserved, check).ok();
+            let captured = self
+                .capture_transient(boundary_capture.reserved, check)
+                .ok();
             check()?;
             *boundary_capture.slot = captured;
             b
@@ -5485,7 +5494,10 @@ mod prefix_boundary_tests {
     use super::fused_prefill_eval_tests::FusedTrackingDecoder;
     use super::*;
 
-    fn make_runtime(checkpoints: usize, checkpoint_bytes: usize) -> Result<Runtime<FusedTrackingDecoder>> {
+    fn make_runtime(
+        checkpoints: usize,
+        checkpoint_bytes: usize,
+    ) -> Result<Runtime<FusedTrackingDecoder>> {
         Runtime::new(
             FusedTrackingDecoder::new(),
             Limits {
@@ -5503,7 +5515,9 @@ mod prefix_boundary_tests {
     }
 
     fn system_prompt(len: usize) -> Vec<u32> {
-        (0..len).map(|i| u32::try_from((i % 7) + 1).unwrap_or(1)).collect()
+        (0..len)
+            .map(|i| u32::try_from((i % 7) + 1).unwrap_or(1))
+            .collect()
     }
 
     fn opts(max_tokens: usize) -> Generation {
@@ -5558,7 +5572,10 @@ mod prefix_boundary_tests {
         let prev_tokens = rt2.tokens().to_vec();
         let cancelled = Cancellation::default();
         cancelled.cancel();
-        assert!(rt2.prefill_with_prefix_boundary(&sys, prefill, &cancelled).is_err());
+        assert!(
+            rt2.prefill_with_prefix_boundary(&sys, prefill, &cancelled)
+                .is_err()
+        );
         assert!(!rt2.is_faulted());
         assert_eq!(rt2.tokens(), prev_tokens);
         Ok(())
@@ -5595,7 +5612,9 @@ mod prefix_boundary_tests {
 
         // Divergence after < 32 shared tokens must NOT capture a boundary checkpoint.
         let mut rt_short = make_runtime(3, 64 * 1_024)?;
-        let short_a: Vec<u32> = (0..24).map(|i| u32::try_from((i % 5) + 1).unwrap_or(1)).collect();
+        let short_a: Vec<u32> = (0..24)
+            .map(|i| u32::try_from((i % 5) + 1).unwrap_or(1))
+            .collect();
         let mut short_p1 = short_a.clone();
         short_p1.extend_from_slice(&[8, 9]);
         let mut short_p2 = short_a;
@@ -5624,7 +5643,12 @@ mod prefix_boundary_tests {
         let c_c = rt_near.generate_with_prefill(&turn_c, &opts(1), prefill, &cancel, |_| Ok(()))?;
         assert_eq!(c_c.reused_tokens, 36);
         assert_eq!(rt_near.checkpoint_count(), 3);
-        assert!(!rt_near.checkpoints.iter().any(|snap| snap.tokens.len() == 40));
+        assert!(
+            !rt_near
+                .checkpoints
+                .iter()
+                .any(|snap| snap.tokens.len() == 40)
+        );
 
         // 2) Tight byte budget: only fits rollback + 1 saved checkpoint -> boundary omitted cleanly.
         let mut probe = make_runtime(2, 64 * 1_024)?;

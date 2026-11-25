@@ -2312,11 +2312,7 @@ pub(in crate::kernels::prefill) fn dot_q8_eight_rows<const TOKENS: usize>(
 }
 
 #[inline]
-fn decode_bf16_pair(
-    neon: Neon,
-    zero: u16x8<Neon>,
-    bytes: &[u8; 16],
-) -> (f32x4<Neon>, f32x4<Neon>) {
+fn decode_bf16_pair(neon: Neon, zero: u16x8<Neon>, bytes: &[u8; 16]) -> (f32x4<Neon>, f32x4<Neon>) {
     let raw = u8x16::from_slice(neon, bytes).bitcast::<u16x8<Neon>>();
     (
         zero.zip_low(raw).bitcast::<f32x4<Neon>>(),
@@ -2436,7 +2432,8 @@ fn dot_bf16_row_pairs<const PAIRS: usize, const ROWS: usize, const TOKENS: usize
                             & wo0.is_finite()
                             & wo1.is_finite();
                     }
-                    for (acc_tok, &(a_lo, a_hi)) in acc_pair[..tok_rem.len()].iter_mut().zip(&acts) {
+                    for (acc_tok, &(a_lo, a_hi)) in acc_pair[..tok_rem.len()].iter_mut().zip(&acts)
+                    {
                         let s = add_f32_columns(*acc_tok, we0 * a_lo, wo0 * a_lo);
                         *acc_tok = add_f32_columns(s, we1 * a_hi, wo1 * a_hi);
                     }
@@ -2557,8 +2554,10 @@ fn dot_f32_row_pinned<const TOKENS: usize>(
                 }
                 for (scratch, acc_tok) in quad.iter().zip(acc.iter_mut()) {
                     let act = &scratch.activations[col..col + 16];
-                    acc_tok[0] = w0.mul_add_precise(f32x4::from_slice(neon, &act[0..4]), acc_tok[0]);
-                    acc_tok[1] = w1.mul_add_precise(f32x4::from_slice(neon, &act[4..8]), acc_tok[1]);
+                    acc_tok[0] =
+                        w0.mul_add_precise(f32x4::from_slice(neon, &act[0..4]), acc_tok[0]);
+                    acc_tok[1] =
+                        w1.mul_add_precise(f32x4::from_slice(neon, &act[4..8]), acc_tok[1]);
                     acc_tok[2] =
                         w2.mul_add_precise(f32x4::from_slice(neon, &act[8..12]), acc_tok[2]);
                     acc_tok[3] =
@@ -2655,8 +2654,8 @@ fn dot_f32_row_f64<const TOKENS: usize>(
                 if check_weights {
                     finite_mask &= w.is_finite();
                 }
-                let p = (w * f32x4::from_slice(neon, &odd_prep.activations[col..col + 4]))
-                    .to_array();
+                let p =
+                    (w * f32x4::from_slice(neon, &odd_prep.activations[col..col + 4])).to_array();
                 odd_sum += f64::from(p[0]);
                 odd_sum += f64::from(p[1]);
                 odd_sum += f64::from(p[2]);
@@ -2887,7 +2886,8 @@ fn dot_f32_rows_f64<const PAIRS: usize, const ROWS: usize, const TOKENS: usize>(
                 let a2 = f32x4::from_slice(neon, &quad[2].activations[col..col + 4]);
                 let a3 = f32x4::from_slice(neon, &quad[3].activations[col..col + 4]);
                 for (p, acc_pair) in acc.iter_mut().enumerate() {
-                    let we = u8x16::from_slice(neon, &r_chunks[p * 2][idx]).bitcast::<f32x4<Neon>>();
+                    let we =
+                        u8x16::from_slice(neon, &r_chunks[p * 2][idx]).bitcast::<f32x4<Neon>>();
                     let wo =
                         u8x16::from_slice(neon, &r_chunks[p * 2 + 1][idx]).bitcast::<f32x4<Neon>>();
                     if quad_idx == 0 {
@@ -2918,7 +2918,8 @@ fn dot_f32_rows_f64<const PAIRS: usize, const ROWS: usize, const TOKENS: usize>(
                     acts[t_off] = f32x4::from_slice(neon, &scratch.activations[col..col + 4]);
                 }
                 for (p, acc_pair) in acc.iter_mut().enumerate() {
-                    let we = u8x16::from_slice(neon, &r_chunks[p * 2][idx]).bitcast::<f32x4<Neon>>();
+                    let we =
+                        u8x16::from_slice(neon, &r_chunks[p * 2][idx]).bitcast::<f32x4<Neon>>();
                     let wo =
                         u8x16::from_slice(neon, &r_chunks[p * 2 + 1][idx]).bitcast::<f32x4<Neon>>();
                     if check_weights {
@@ -2979,7 +2980,9 @@ fn validate_f32_tile_inputs<const ROWS: usize, const TOKENS: usize>(
     }
     let row_bytes = columns.checked_mul(4)?;
     if rows.iter().any(|row| row.len() != row_bytes)
-        || preparations.iter().any(|prep| prep.activations.len() != columns)
+        || preparations
+            .iter()
+            .any(|prep| prep.activations.len() != columns)
     {
         return None;
     }

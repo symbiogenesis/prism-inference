@@ -445,13 +445,15 @@ impl Decoder for ProjectedQwen35<'_> {
             output.clear();
             return Err(error);
         }
-        let result = self.decoder.ingest_prefill_block_and_evaluate_last_with_executor(
-            tokens,
-            output,
-            check,
-            Some(self.executor),
-            true,
-        );
+        let result = self
+            .decoder
+            .ingest_prefill_block_and_evaluate_last_with_executor(
+                tokens,
+                output,
+                check,
+                Some(self.executor),
+                true,
+            );
         if result.is_err() {
             output.clear();
         }

@@ -14,9 +14,9 @@
 use std::sync::Arc;
 
 use super::{
-    ActivationContract, BF16, F32, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0,
-    Q5_1, Q8_0, RowParallelism, bf16_dot, dimensions, dot_additional, dot_legacy, finite,
-    integer_float, kquants, matvec_into, scale,
+    ActivationContract, BF16, F32, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0, Q5_1,
+    Q8_0, RowParallelism, bf16_dot, dimensions, dot_additional, dot_legacy, finite, integer_float,
+    kquants, matvec_into, scale,
 };
 use crate::{Result, invalid, model::Tensor};
 
@@ -1796,7 +1796,12 @@ mod tests {
                     MatvecScratch::with_backend(MatvecBackend::Scalar)
                 };
                 let mut expected = Vec::new();
-                matvec_into(&neg_tensor, &pos_inputs[0], &mut expected, &mut scalar_scratch)?;
+                matvec_into(
+                    &neg_tensor,
+                    &pos_inputs[0],
+                    &mut expected,
+                    &mut scalar_scratch,
+                )?;
                 let expected_bits: Vec<u32> = expected.into_iter().map(f32::to_bits).collect();
                 for backend in [MatvecBackend::Scalar, MatvecBackend::ExperimentalNeon] {
                     let mut tile = ProjectionTile::with_backend(backend);
@@ -1845,8 +1850,16 @@ mod tests {
                 )?;
                 for r in 0..8 {
                     assert_eq!(
-                        neon8[r][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                        scalar8[r][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        neon8[r][..9]
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        scalar8[r][..9]
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
                     );
                 }
                 let neon4 = dot::dot_f32_four_rows::<MAX_TILE_TOKENS>(
@@ -1865,13 +1878,29 @@ mod tests {
                 )?;
                 for r in 0..4 {
                     assert_eq!(
-                        neon4[r][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                        scalar8[r][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                        neon4[r][..9]
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        scalar8[r][..9]
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
                     );
                 }
                 assert_eq!(
-                    neon1[..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                    scalar8[7][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                    neon1[..9]
+                        .iter()
+                        .copied()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>(),
+                    scalar8[7][..9]
+                        .iter()
+                        .copied()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>()
                 );
             }
 

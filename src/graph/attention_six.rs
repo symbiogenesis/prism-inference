@@ -1221,7 +1221,10 @@ pub(super) fn attend_tile_balanced_with_scratch(
 
             let mut cursor = [0_usize; MAX_ROW_WORKERS];
             let mut running = 0_usize;
-            for (c_off, &cnt) in cursor[..used_workers].iter_mut().zip(&counts[..used_workers]) {
+            for (c_off, &cnt) in cursor[..used_workers]
+                .iter_mut()
+                .zip(&counts[..used_workers])
+            {
                 *c_off = running;
                 running += cnt;
             }
@@ -1259,8 +1262,7 @@ pub(super) fn attend_tile_balanced_with_scratch(
                     rem_scores = score_tail;
                     chunk
                 };
-                let (packed_pair, packed_tail) =
-                    std::mem::take(&mut rem_packed).split_at_mut(1);
+                let (packed_pair, packed_tail) = std::mem::take(&mut rem_packed).split_at_mut(1);
                 rem_packed = packed_tail;
                 *task = Some(BalancedWorkerTask {
                     items: item_chunk,

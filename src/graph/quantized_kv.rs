@@ -251,11 +251,7 @@ impl PackedCache {
         })
     }
 
-    pub(super) fn commit_batch(
-        &mut self,
-        encoded: &[u8],
-        reservation: PackedBatchReservation,
-    ) {
+    pub(super) fn commit_batch(&mut self, encoded: &[u8], reservation: PackedBatchReservation) {
         debug_assert_eq!(encoded.len(), reservation.add_bytes);
         if encoded.is_empty() {
             return;
@@ -993,8 +989,7 @@ fn encode_packed_kv_rows_parallel(
         );
     }
     let total_tasks = 2 * total_pairs;
-    let mut slots: [Option<EncodeRowTask<'_>>; 2 * MAX_ROW_WORKERS] =
-        std::array::from_fn(|_| None);
+    let mut slots: [Option<EncodeRowTask<'_>>; 2 * MAX_ROW_WORKERS] = std::array::from_fn(|_| None);
     let mut k_rem = encoded_keys;
     let mut v_rem = encoded_values;
     let mut slot_idx = 0;
@@ -1295,7 +1290,9 @@ impl<'a> TileContext<'a> {
         output: &mut [f32],
         score_scratch: &mut [f32],
     ) -> std::result::Result<(), (usize, usize, crate::Error)> {
-        let input = self.make_input(token).map_err(|err| (token, kv_head, err))?;
+        let input = self
+            .make_input(token)
+            .map_err(|err| (token, kv_head, err))?;
         let stride = input.history_tokens + 1;
         let base_kv_head = kv_head * self.heads_per_kv;
         let group_elems = G * HEAD_DIM;
@@ -1637,9 +1634,7 @@ pub(super) fn attend_tile_with_scratch(
                 let token_start = u * 2;
                 let token_len = (count - token_start).min(2);
                 let causal_cost = if token_len == 2 {
-                    2_usize
-                        .saturating_mul(base + token_start)
-                        .saturating_add(3)
+                    2_usize.saturating_mul(base + token_start).saturating_add(3)
                 } else {
                     (base + token_start).saturating_add(1)
                 };
@@ -1673,7 +1668,10 @@ pub(super) fn attend_tile_with_scratch(
 
             let mut cursor = [0_usize; MAX_ROW_WORKERS];
             let mut running = 0_usize;
-            for (c_off, &cnt) in cursor[..used_workers].iter_mut().zip(&counts[..used_workers]) {
+            for (c_off, &cnt) in cursor[..used_workers]
+                .iter_mut()
+                .zip(&counts[..used_workers])
+            {
                 *c_off = running;
                 running += cnt;
             }

@@ -2278,29 +2278,32 @@ mod tests {
         };
         let mut single = [[[0.0_f32; 8]; 8]; 8];
         for (c, slot) in single.iter_mut().enumerate() {
-            assert!(pq2
-                .dot_scaled_8x8_chunks::<true>(
+            assert!(
+                pq2.dot_scaled_8x8_chunks::<true>(
                     pq2_row_refs,
                     &pq2_chunks_9[c..=c],
                     std::slice::from_mut(slot),
                 )
-                .is_some());
+                .is_some()
+            );
         }
         for count in 1..=8 {
             let mut wide = [[[0.0_f32; 8]; 8]; 8];
-            assert!(pq2
-                .dot_scaled_8x8_chunks_up_to_8::<true>(
+            assert!(
+                pq2.dot_scaled_8x8_chunks_up_to_8::<true>(
                     pq2_row_refs,
                     &pq2_chunks_9[..count],
                     &mut wide[..count],
                 )
-                .is_some());
+                .is_some()
+            );
             assert_64_token_chunk_bits(&single[..count], &wide[..count]);
         }
         let mut too_many = [[[0.0_f32; 8]; 8]; 9];
-        assert!(pq2
-            .dot_scaled_8x8_chunks_up_to_8::<true>(pq2_row_refs, &pq2_chunks_9, &mut too_many)
-            .is_none());
+        assert!(
+            pq2.dot_scaled_8x8_chunks_up_to_8::<true>(pq2_row_refs, &pq2_chunks_9, &mut too_many)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2342,7 +2345,8 @@ mod tests {
                         Q8ActivationBlock {
                             scale: scale_idx.mul_add(0.005, 0.02),
                             values: std::array::from_fn(|i| {
-                                let v = i32::try_from((t * 13 + b * 17 + i * 5) % 21).unwrap_or(0) - 10;
+                                let v =
+                                    i32::try_from((t * 13 + b * 17 + i * 5) % 21).unwrap_or(0) - 10;
                                 i8::try_from(v).unwrap_or(0)
                             }),
                         }
@@ -2357,40 +2361,80 @@ mod tests {
                 let mut single = [[[0.0_f32; 8]; 8]; 8];
                 for (c, slot) in single.iter_mut().enumerate() {
                     let ok = if pinned {
-                        ptq1.dot_scaled_8x8_chunks::<true, _>(ptq1_row_refs, &ptq1_chunks_9[c..=c], std::slice::from_mut(slot))
+                        ptq1.dot_scaled_8x8_chunks::<true, _>(
+                            ptq1_row_refs,
+                            &ptq1_chunks_9[c..=c],
+                            std::slice::from_mut(slot),
+                        )
                     } else {
-                        ptq1.dot_scaled_8x8_chunks::<false, _>(ptq1_row_refs, &ptq1_chunks_9[c..=c], std::slice::from_mut(slot))
+                        ptq1.dot_scaled_8x8_chunks::<false, _>(
+                            ptq1_row_refs,
+                            &ptq1_chunks_9[c..=c],
+                            std::slice::from_mut(slot),
+                        )
                     };
                     assert!(ok.is_some());
                 }
                 for count in 5..=8 {
                     let mut wide = [[[0.0_f32; 8]; 8]; 8];
                     let ok = if pinned {
-                        ptq1.dot_scaled_8x8_chunks_up_to_8::<true, _>(ptq1_row_refs, &ptq1_chunks_9[..count], &mut wide[..count])
+                        ptq1.dot_scaled_8x8_chunks_up_to_8::<true, _>(
+                            ptq1_row_refs,
+                            &ptq1_chunks_9[..count],
+                            &mut wide[..count],
+                        )
                     } else {
-                        ptq1.dot_scaled_8x8_chunks_up_to_8::<false, _>(ptq1_row_refs, &ptq1_chunks_9[..count], &mut wide[..count])
+                        ptq1.dot_scaled_8x8_chunks_up_to_8::<false, _>(
+                            ptq1_row_refs,
+                            &ptq1_chunks_9[..count],
+                            &mut wide[..count],
+                        )
                     };
                     assert!(ok.is_some());
                     assert_64_token_chunk_bits(&single[..count], &wide[..count]);
                 }
             }
             let mut too_many = [[[0.0_f32; 8]; 8]; 9];
-            assert!(ptq1.dot_scaled_8x8_chunks_up_to_8::<true, _>(ptq1_row_refs, &ptq1_chunks_9, &mut too_many).is_none());
+            assert!(
+                ptq1.dot_scaled_8x8_chunks_up_to_8::<true, _>(
+                    ptq1_row_refs,
+                    &ptq1_chunks_9,
+                    &mut too_many
+                )
+                .is_none()
+            );
         }
         let q8_chunks_9: [[&[Q8ActivationBlock]; 8]; 9] =
             std::array::from_fn(|c| std::array::from_fn(|t| &q8_acts[c * 8 + t][..BLOCKS]));
         if let Some(q8) = Q8Dotprod::detect() {
             let mut single = [[[0.0_f32; 8]; 8]; 8];
             for (c, slot) in single.iter_mut().enumerate() {
-                assert!(q8.dot_scaled_8x8_chunks(q8_row_refs, &q8_chunks_9[c..=c], std::slice::from_mut(slot)).is_some());
+                assert!(
+                    q8.dot_scaled_8x8_chunks(
+                        q8_row_refs,
+                        &q8_chunks_9[c..=c],
+                        std::slice::from_mut(slot)
+                    )
+                    .is_some()
+                );
             }
             for count in 5..=8 {
                 let mut wide = [[[0.0_f32; 8]; 8]; 8];
-                assert!(q8.dot_scaled_8x8_chunks_up_to_8(q8_row_refs, &q8_chunks_9[..count], &mut wide[..count]).is_some());
+                assert!(
+                    q8.dot_scaled_8x8_chunks_up_to_8(
+                        q8_row_refs,
+                        &q8_chunks_9[..count],
+                        &mut wide[..count]
+                    )
+                    .is_some()
+                );
                 assert_64_token_chunk_bits(&single[..count], &wide[..count]);
             }
             let mut too_many = [[[0.0_f32; 8]; 8]; 9];
-            assert!(q8.dot_scaled_8x8_chunks_up_to_8(q8_row_refs, &q8_chunks_9, &mut too_many).is_none());
+            assert!(
+                q8.dot_scaled_8x8_chunks_up_to_8(q8_row_refs, &q8_chunks_9, &mut too_many)
+                    .is_none()
+            );
         }
     }
 }

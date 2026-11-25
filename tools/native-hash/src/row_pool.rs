@@ -344,10 +344,9 @@ impl NativeRowPool {
                     .state_lock
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let remaining = usize::try_from(
-                    self.shared.dispatch_state.load(Ordering::SeqCst) & SLOT_MASK,
-                )
-                .unwrap_or(needed_bg);
+                let remaining =
+                    usize::try_from(self.shared.dispatch_state.load(Ordering::SeqCst) & SLOT_MASK)
+                        .unwrap_or(needed_bg);
                 let sleeping = self.shared.sleeping_workers.load(Ordering::SeqCst);
                 if remaining >= sleeping {
                     self.shared.wake_workers.notify_all();
@@ -846,8 +845,7 @@ mod tests {
         let pool = NativeRowPool::new(16)?;
         let bg_workers = 15;
         let mut waited_ms = 0_u32;
-        while pool.shared.sleeping_workers.load(Ordering::Acquire) < bg_workers && waited_ms < 500
-        {
+        while pool.shared.sleeping_workers.load(Ordering::Acquire) < bg_workers && waited_ms < 500 {
             thread::sleep(Duration::from_millis(1));
             waited_ms += 1;
         }

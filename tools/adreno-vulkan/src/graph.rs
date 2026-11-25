@@ -1955,7 +1955,10 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
-    fn validate_checkpoint_for_restore(&self, checkpoint: &VulkanBatchedCheckpoint) -> Result<(), Error> {
+    fn validate_checkpoint_for_restore(
+        &self,
+        checkpoint: &VulkanBatchedCheckpoint,
+    ) -> Result<(), Error> {
         #[expect(
             clippy::suspicious_operation_groupings,
             reason = "Checkpoint stores the target executor digest in `executor_identity_sha256` while executor holds `identity_sha256`."
@@ -2390,10 +2393,7 @@ impl VulkanBatchedGraphExecutor {
         Ok(Some((embed_lora.b_span, effective_scale)))
     }
 
-    fn prepare_tile_host_inputs(
-        &mut self,
-        tokens: &[u32],
-    ) -> Result<PreparedTileUpload, Error> {
+    fn prepare_tile_host_inputs(&mut self, tokens: &[u32]) -> Result<PreparedTileUpload, Error> {
         if !self.device.has_unwaited_slots() {
             self.staging_bank_in_flight = [false; 2];
         }
@@ -2528,8 +2528,10 @@ impl VulkanBatchedGraphExecutor {
         let run_result = (|| -> Result<(), Error> {
             let record_tile_prologue = |this: &mut Self| -> Result<(), Error> {
                 if let Some(bank) = prepared.staged_bank {
-                    let total_embed_u32 = u32::try_from(t_len * this.geometry.embedding)
-                        .map_err(|_| Error::ResourceLimit("staged embedding exceeds u32".to_owned()))?;
+                    let total_embed_u32 =
+                        u32::try_from(t_len * this.geometry.embedding).map_err(|_| {
+                            Error::ResourceLimit("staged embedding exceeds u32".to_owned())
+                        })?;
                     this.record_copy_slice(
                         this.scratch.hidden_staging[bank],
                         0,
@@ -2547,8 +2549,10 @@ impl VulkanBatchedGraphExecutor {
                         )?;
                     }
                     if prepared.has_full_layers {
-                        let total_rope_u32 = u32::try_from(t_len * this.geometry.rope)
-                            .map_err(|_| Error::ResourceLimit("staged rope exceeds u32".to_owned()))?;
+                        let total_rope_u32 =
+                            u32::try_from(t_len * this.geometry.rope).map_err(|_| {
+                                Error::ResourceLimit("staged rope exceeds u32".to_owned())
+                            })?;
                         this.record_copy_slice(
                             this.scratch.rope_freqs_staging[bank],
                             0,
@@ -2563,9 +2567,8 @@ impl VulkanBatchedGraphExecutor {
                     this.record_inverse_embedding_transform_tokens(t_len)?;
                 }
                 if let Some((b_span, eff_scale)) = active_embed_lora {
-                    let embed_u32 = u32::try_from(this.geometry.embedding).map_err(|_| {
-                        Error::ResourceLimit("embedding exceeds u32".to_owned())
-                    })?;
+                    let embed_u32 = u32::try_from(this.geometry.embedding)
+                        .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
                     if t_len == 1 {
                         this.batch_recorder.push_barrier(
                             this.pipelines.lora_b_accum,
@@ -2575,10 +2578,7 @@ impl VulkanBatchedGraphExecutor {
                                 BufferSpan::whole(this.scratch.hidden),
                             ],
                             &[embed_u32, 1, eff_scale.to_bits()],
-                            checked_grid(
-                                &this.device,
-                                [embed_u32.div_ceil(WORKGROUP_X), 1, 1],
-                            )?,
+                            checked_grid(&this.device, [embed_u32.div_ceil(WORKGROUP_X), 1, 1])?,
                         );
                     } else {
                         this.batch_recorder.push_barrier(
@@ -2888,8 +2888,8 @@ impl VulkanBatchedGraphExecutor {
             .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
         let last_rope_off = u32::try_from(last * rope)
             .map_err(|_| Error::ResourceLimit("last token rope offset exceeds u32".to_owned()))?;
-        let rope_u32 = u32::try_from(rope)
-            .map_err(|_| Error::ResourceLimit("rope exceeds u32".to_owned()))?;
+        let rope_u32 =
+            u32::try_from(rope).map_err(|_| Error::ResourceLimit("rope exceeds u32".to_owned()))?;
 
         // `proj_b`, `proj_c`, `proj_e` are dead after K/V append and before Q-only evaluation.
         self.record_copy_slice(
@@ -3307,11 +3307,7 @@ impl VulkanBatchedGraphExecutor {
 
         let out_tokens = if mode == FinalLayerMode::LastTokenLogits && tokens > 1 {
             self.record_last_token_recurrent_slice(tokens, gdn_out_buf, val_width)?;
-            self.record_projection_group_tokens(
-                self.scratch.norm,
-                &[(gate, proj_gate_buf)],
-                1,
-            )?;
+            self.record_projection_group_tokens(self.scratch.norm, &[(gate, proj_gate_buf)], 1)?;
             1
         } else {
             tokens
@@ -3569,11 +3565,7 @@ impl VulkanBatchedGraphExecutor {
                 return Ok(());
             }
             self.record_last_token_full_slice(tokens)?;
-            self.record_projection_group_tokens(
-                self.scratch.norm,
-                &[(query_w, q_gate_buf)],
-                1,
-            )?;
+            self.record_projection_group_tokens(self.scratch.norm, &[(query_w, q_gate_buf)], 1)?;
             (1, tokens - 1)
         };
 
@@ -4122,8 +4114,10 @@ impl VulkanBatchedGraphExecutor {
             .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
         if self.layers.is_empty() {
             let hidden_src = if tile_tokens > 1 {
-                let last_off = u32::try_from((tile_tokens - 1) * self.geometry.embedding)
-                    .map_err(|_| Error::ResourceLimit("last hidden offset exceeds u32".to_owned()))?;
+                let last_off =
+                    u32::try_from((tile_tokens - 1) * self.geometry.embedding).map_err(|_| {
+                        Error::ResourceLimit("last hidden offset exceeds u32".to_owned())
+                    })?;
                 self.record_copy_slice(
                     self.scratch.hidden,
                     last_off,

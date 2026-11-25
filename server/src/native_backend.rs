@@ -164,12 +164,7 @@ pub(crate) async fn serve_with_options(
     options: WorkerOptions,
 ) -> Result<(), NativeBackendError> {
     Box::pin(serve_with_prefill_workers(
-        listener,
-        session,
-        key,
-        placement,
-        options,
-        None,
+        listener, session, key, placement, options, None,
     ))
     .await
 }
@@ -411,13 +406,7 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
             return write_json(&mut client, 200, &worker.readiness(), deadline).await;
         }
         Route::Warm if !worker.is_idle() => {
-            write_json(
-                &mut client,
-                409,
-                &json!({"error":"worker busy"}),
-                deadline,
-            )
-            .await?;
+            write_json(&mut client, 409, &json!({"error":"worker busy"}), deadline).await?;
             return Err(NativeBackendError::Engine);
         }
         _ => {}
@@ -1043,8 +1032,14 @@ mod warm_tests {
         }
     }
 
-    fn http_post(path: &str, body: &[u8], authenticated: bool, length_override: Option<usize>) -> Vec<u8> {
-        let mut head = format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n");
+    fn http_post(
+        path: &str,
+        body: &[u8],
+        authenticated: bool,
+        length_override: Option<usize>,
+    ) -> Vec<u8> {
+        let mut head =
+            format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n");
         if authenticated {
             head.push_str("Authorization: Bearer ");
             head.push_str(KEY);
@@ -1188,7 +1183,8 @@ mod warm_tests {
                 &WorkerOptions::default(),
             )
             .map_err(|e| format!("{e:?}"))?;
-            let policy = RequestPolicy::new(8080, KEY).map_err(|_| std::io::Error::other("policy"))?;
+            let policy =
+                RequestPolicy::new(8080, KEY).map_err(|_| std::io::Error::other("policy"))?;
             let (server, mut client) = duplex(16 * 1024);
             client
                 .write_all(&http_post("/v1/chat/warm", &valid_body, true, None))

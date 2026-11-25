@@ -1,6 +1,6 @@
 //! Baseline NEON over one predecoded PQ2/PTQ1 block, reused across token dots.
 
-use fearless_simd::{Neon, f32x4, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8};
+use fearless_simd::{Neon, f32x4, f64x2, i8x16, i16x8, i32x4, prelude::*, u8x16, u16x8};
 
 #[inline]
 fn reduce4_i32x4_vec(
@@ -2386,6 +2386,543 @@ pub(in crate::kernels::prefill) fn dot_bf16_rows<const ROWS: usize, const TOKENS
         }
     }
     Some(Ok(out))
+}
+
+#[inline]
+fn add_f32_columns(sum: f64x2<Neon>, first: f32x4<Neon>, second: f32x4<Neon>) -> f64x2<Neon> {
+    let (l0, l1) = first.zip_low(second).widen();
+    let (h0, h1) = first.zip_high(second).widen();
+    (((sum + l0) + l1) + h0) + h1
+}
+
+#[inline]
+fn decode_f32_tail_weights(rem: &[u8]) -> crate::Result<([f32; 3], usize)> {
+    let mut weights = [0.0_f32; 3];
+    let chunks = rem.as_chunks::<4>().0;
+    if chunks.len() > weights.len() {
+        return Err(crate::invalid("invalid F32 tail extent"));
+    }
+    for (dst, bytes) in weights.iter_mut().zip(chunks) {
+        *dst = crate::kernels::finite(f32::from_le_bytes(*bytes))?;
+    }
+    Ok((weights, chunks.len()))
+}
+
+fn dot_f32_row_pinned<const TOKENS: usize>(
+    neon: Neon,
+    row: &[u8],
+    preparations: &[crate::kernels::MatvecScratch],
+) -> crate::Result<[f32; TOKENS]> {
+    const K_TILE: usize = 16;
+    let chunks16 = row.as_chunks::<64>().0;
+    let mut lanes = [[f32x4::splat(neon, 0.0); 4]; TOKENS];
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (tok_quads, tok_rem) = preparations.as_chunks::<4>();
+
+    for k_base in (0..chunks16.len()).step_by(K_TILE) {
+        let k_end = (k_base + K_TILE).min(chunks16.len());
+        for (quad_idx, quad) in tok_quads.iter().enumerate() {
+            let base_t = quad_idx * 4;
+            let mut acc = [
+                lanes[base_t],
+                lanes[base_t + 1],
+                lanes[base_t + 2],
+                lanes[base_t + 3],
+            ];
+            for (blk_off, blk) in chunks16[k_base..k_end].iter().enumerate() {
+                let col = (k_base + blk_off) * 16;
+                let b4 = blk.as_chunks::<16>().0;
+                let w0 = u8x16::from_slice(neon, &b4[0]).bitcast::<f32x4<Neon>>();
+                let w1 = u8x16::from_slice(neon, &b4[1]).bitcast::<f32x4<Neon>>();
+                let w2 = u8x16::from_slice(neon, &b4[2]).bitcast::<f32x4<Neon>>();
+                let w3 = u8x16::from_slice(neon, &b4[3]).bitcast::<f32x4<Neon>>();
+                if quad_idx == 0 {
+                    finite_mask = finite_mask
+                        & w0.is_finite()
+                        & w1.is_finite()
+                        & w2.is_finite()
+                        & w3.is_finite();
+                }
+                for (scratch, acc_tok) in quad.iter().zip(acc.iter_mut()) {
+                    let act = &scratch.activations[col..col + 16];
+                    acc_tok[0] = w0.mul_add_precise(f32x4::from_slice(neon, &act[0..4]), acc_tok[0]);
+                    acc_tok[1] = w1.mul_add_precise(f32x4::from_slice(neon, &act[4..8]), acc_tok[1]);
+                    acc_tok[2] =
+                        w2.mul_add_precise(f32x4::from_slice(neon, &act[8..12]), acc_tok[2]);
+                    acc_tok[3] =
+                        w3.mul_add_precise(f32x4::from_slice(neon, &act[12..16]), acc_tok[3]);
+                }
+            }
+            lanes[base_t..base_t + 4].copy_from_slice(&acc);
+        }
+        if !tok_rem.is_empty() {
+            let rem_base = tok_quads.len() * 4;
+            let check_weights = tok_quads.is_empty();
+            for (t_off, scratch) in tok_rem.iter().enumerate() {
+                let mut acc = lanes[rem_base + t_off];
+                for (blk_off, blk) in chunks16[k_base..k_end].iter().enumerate() {
+                    let col = (k_base + blk_off) * 16;
+                    let b4 = blk.as_chunks::<16>().0;
+                    let w0 = u8x16::from_slice(neon, &b4[0]).bitcast::<f32x4<Neon>>();
+                    let w1 = u8x16::from_slice(neon, &b4[1]).bitcast::<f32x4<Neon>>();
+                    let w2 = u8x16::from_slice(neon, &b4[2]).bitcast::<f32x4<Neon>>();
+                    let w3 = u8x16::from_slice(neon, &b4[3]).bitcast::<f32x4<Neon>>();
+                    if check_weights && t_off == 0 {
+                        finite_mask = finite_mask
+                            & w0.is_finite()
+                            & w1.is_finite()
+                            & w2.is_finite()
+                            & w3.is_finite();
+                    }
+                    let act = &scratch.activations[col..col + 16];
+                    acc[0] = w0.mul_add_precise(f32x4::from_slice(neon, &act[0..4]), acc[0]);
+                    acc[1] = w1.mul_add_precise(f32x4::from_slice(neon, &act[4..8]), acc[1]);
+                    acc[2] = w2.mul_add_precise(f32x4::from_slice(neon, &act[8..12]), acc[2]);
+                    acc[3] = w3.mul_add_precise(f32x4::from_slice(neon, &act[12..16]), acc[3]);
+                }
+                lanes[rem_base + t_off] = acc;
+            }
+        }
+    }
+
+    if !finite_mask.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    let mut out = [0.0_f32; TOKENS];
+    for (dst, [s0, s1, s2, s3]) in out.iter_mut().zip(lanes).take(preparations.len()) {
+        let sum = ((s0 + s2) + (s1 + s3)).reduce_sum();
+        *dst = crate::kernels::finite(sum)?;
+    }
+    Ok(out)
+}
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+fn dot_f32_row_f64<const TOKENS: usize>(
+    neon: Neon,
+    row: &[u8],
+    preparations: &[crate::kernels::MatvecScratch],
+) -> crate::Result<[f32; TOKENS]> {
+    const K_TILE: usize = 64;
+    let (chunks4, rem_bytes) = row.as_chunks::<16>();
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (tok_pairs, tok_rem) = preparations.as_chunks::<2>();
+    let mut pair_sums = [f64x2::splat(neon, -0.0); TOKENS];
+    let mut odd_sum = -0.0_f64;
+
+    for k_base in (0..chunks4.len()).step_by(K_TILE) {
+        let k_end = (k_base + K_TILE).min(chunks4.len());
+        for (batch_idx, pair_batch) in tok_pairs.chunks(4).enumerate() {
+            let pair_base = batch_idx * 4;
+            let mut acc = [f64x2::splat(neon, -0.0); 4];
+            acc[..pair_batch.len()]
+                .copy_from_slice(&pair_sums[pair_base..pair_base + pair_batch.len()]);
+            for (off, w_bytes) in chunks4[k_base..k_end].iter().enumerate() {
+                let col = (k_base + off) * 4;
+                let w = u8x16::from_slice(neon, w_bytes).bitcast::<f32x4<Neon>>();
+                if batch_idx == 0 {
+                    finite_mask &= w.is_finite();
+                }
+                for ([prep0, prep1], acc_pair) in pair_batch.iter().zip(acc.iter_mut()) {
+                    let a0 = f32x4::from_slice(neon, &prep0.activations[col..col + 4]);
+                    let a1 = f32x4::from_slice(neon, &prep1.activations[col..col + 4]);
+                    *acc_pair = add_f32_columns(*acc_pair, w * a0, w * a1);
+                }
+            }
+            pair_sums[pair_base..pair_base + pair_batch.len()]
+                .copy_from_slice(&acc[..pair_batch.len()]);
+        }
+        if let [odd_prep] = tok_rem {
+            let check_weights = tok_pairs.is_empty();
+            for (off, w_bytes) in chunks4[k_base..k_end].iter().enumerate() {
+                let col = (k_base + off) * 4;
+                let w = u8x16::from_slice(neon, w_bytes).bitcast::<f32x4<Neon>>();
+                if check_weights {
+                    finite_mask &= w.is_finite();
+                }
+                let p = (w * f32x4::from_slice(neon, &odd_prep.activations[col..col + 4]))
+                    .to_array();
+                odd_sum += f64::from(p[0]);
+                odd_sum += f64::from(p[1]);
+                odd_sum += f64::from(p[2]);
+                odd_sum += f64::from(p[3]);
+            }
+        }
+    }
+
+    if !finite_mask.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    let (tail_w, tail_len) = decode_f32_tail_weights(rem_bytes)?;
+    let rem_base = chunks4.len() * 4;
+    let mut out = [0.0_f32; TOKENS];
+    for (pair_idx, [prep0, prep1]) in tok_pairs.iter().enumerate() {
+        let [mut s0, mut s1] = pair_sums[pair_idx].to_array();
+        for (idx, &w) in tail_w[..tail_len].iter().enumerate() {
+            let col = rem_base + idx;
+            s0 += f64::from(w * prep0.activations[col]);
+            s1 += f64::from(w * prep1.activations[col]);
+        }
+        let base_t = pair_idx * 2;
+        out[base_t] = crate::kernels::finite(s0 as f32)?;
+        out[base_t + 1] = crate::kernels::finite(s1 as f32)?;
+    }
+    if let [odd_prep] = tok_rem {
+        for (idx, &w) in tail_w[..tail_len].iter().enumerate() {
+            odd_sum += f64::from(w * odd_prep.activations[rem_base + idx]);
+        }
+        out[tok_pairs.len() * 2] = crate::kernels::finite(odd_sum as f32)?;
+    }
+    Ok(out)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep 2x2 F32 pinned FMA register-blocked tile and weight validation together."
+)]
+fn dot_f32_rows_pinned<const PAIRS: usize, const ROWS: usize, const TOKENS: usize>(
+    neon: Neon,
+    rows: [&[u8]; ROWS],
+    preparations: &[crate::kernels::MatvecScratch],
+) -> crate::Result<[[f32; TOKENS]; ROWS]> {
+    const K_TILE: usize = 8;
+    let r_chunks = rows.map(|row| row.as_chunks::<64>().0);
+    let block_count = r_chunks[0].len();
+    let mut lanes = [[[f32x4::splat(neon, 0.0); 4]; TOKENS]; ROWS];
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (tok_pairs, tok_rem) = preparations.as_chunks::<2>();
+
+    for k_base in (0..block_count).step_by(K_TILE) {
+        let k_end = (k_base + K_TILE).min(block_count);
+        for (pair_idx, [prep0, prep1]) in tok_pairs.iter().enumerate() {
+            let t0 = pair_idx * 2;
+            let t1 = t0 + 1;
+            for row_pair in 0..PAIRS {
+                let r0 = row_pair * 2;
+                let r1 = r0 + 1;
+                let mut acc00 = lanes[r0][t0];
+                let mut acc01 = lanes[r0][t1];
+                let mut acc10 = lanes[r1][t0];
+                let mut acc11 = lanes[r1][t1];
+                for blk_idx in k_base..k_end {
+                    let col = blk_idx * 16;
+                    let act0 = &prep0.activations[col..col + 16];
+                    let act1 = &prep1.activations[col..col + 16];
+                    let a00 = f32x4::from_slice(neon, &act0[0..4]);
+                    let a01 = f32x4::from_slice(neon, &act0[4..8]);
+                    let a02 = f32x4::from_slice(neon, &act0[8..12]);
+                    let a03 = f32x4::from_slice(neon, &act0[12..16]);
+                    let a10 = f32x4::from_slice(neon, &act1[0..4]);
+                    let a11 = f32x4::from_slice(neon, &act1[4..8]);
+                    let a12 = f32x4::from_slice(neon, &act1[8..12]);
+                    let a13 = f32x4::from_slice(neon, &act1[12..16]);
+
+                    let b0 = r_chunks[r0][blk_idx].as_chunks::<16>().0;
+                    let w00 = u8x16::from_slice(neon, &b0[0]).bitcast::<f32x4<Neon>>();
+                    let w01 = u8x16::from_slice(neon, &b0[1]).bitcast::<f32x4<Neon>>();
+                    let w02 = u8x16::from_slice(neon, &b0[2]).bitcast::<f32x4<Neon>>();
+                    let w03 = u8x16::from_slice(neon, &b0[3]).bitcast::<f32x4<Neon>>();
+                    if pair_idx == 0 {
+                        finite_mask = finite_mask
+                            & w00.is_finite()
+                            & w01.is_finite()
+                            & w02.is_finite()
+                            & w03.is_finite();
+                    }
+                    acc00[0] = w00.mul_add_precise(a00, acc00[0]);
+                    acc01[0] = w00.mul_add_precise(a10, acc01[0]);
+                    acc00[1] = w01.mul_add_precise(a01, acc00[1]);
+                    acc01[1] = w01.mul_add_precise(a11, acc01[1]);
+                    acc00[2] = w02.mul_add_precise(a02, acc00[2]);
+                    acc01[2] = w02.mul_add_precise(a12, acc01[2]);
+                    acc00[3] = w03.mul_add_precise(a03, acc00[3]);
+                    acc01[3] = w03.mul_add_precise(a13, acc01[3]);
+
+                    let b1 = r_chunks[r1][blk_idx].as_chunks::<16>().0;
+                    let w10 = u8x16::from_slice(neon, &b1[0]).bitcast::<f32x4<Neon>>();
+                    let w11 = u8x16::from_slice(neon, &b1[1]).bitcast::<f32x4<Neon>>();
+                    let w12 = u8x16::from_slice(neon, &b1[2]).bitcast::<f32x4<Neon>>();
+                    let w13 = u8x16::from_slice(neon, &b1[3]).bitcast::<f32x4<Neon>>();
+                    if pair_idx == 0 {
+                        finite_mask = finite_mask
+                            & w10.is_finite()
+                            & w11.is_finite()
+                            & w12.is_finite()
+                            & w13.is_finite();
+                    }
+                    acc10[0] = w10.mul_add_precise(a00, acc10[0]);
+                    acc11[0] = w10.mul_add_precise(a10, acc11[0]);
+                    acc10[1] = w11.mul_add_precise(a01, acc10[1]);
+                    acc11[1] = w11.mul_add_precise(a11, acc11[1]);
+                    acc10[2] = w12.mul_add_precise(a02, acc10[2]);
+                    acc11[2] = w12.mul_add_precise(a12, acc11[2]);
+                    acc10[3] = w13.mul_add_precise(a03, acc10[3]);
+                    acc11[3] = w13.mul_add_precise(a13, acc11[3]);
+                }
+                lanes[r0][t0] = acc00;
+                lanes[r0][t1] = acc01;
+                lanes[r1][t0] = acc10;
+                lanes[r1][t1] = acc11;
+            }
+        }
+        if let [odd_prep] = tok_rem {
+            let t_last = tok_pairs.len() * 2;
+            let check_weights = tok_pairs.is_empty();
+            for row_pair in 0..PAIRS {
+                let r0 = row_pair * 2;
+                let r1 = r0 + 1;
+                let mut acc0 = lanes[r0][t_last];
+                let mut acc1 = lanes[r1][t_last];
+                for blk_idx in k_base..k_end {
+                    let col = blk_idx * 16;
+                    let act = &odd_prep.activations[col..col + 16];
+                    let a0 = f32x4::from_slice(neon, &act[0..4]);
+                    let a1 = f32x4::from_slice(neon, &act[4..8]);
+                    let a2 = f32x4::from_slice(neon, &act[8..12]);
+                    let a3 = f32x4::from_slice(neon, &act[12..16]);
+
+                    let b0 = r_chunks[r0][blk_idx].as_chunks::<16>().0;
+                    let w00 = u8x16::from_slice(neon, &b0[0]).bitcast::<f32x4<Neon>>();
+                    let w01 = u8x16::from_slice(neon, &b0[1]).bitcast::<f32x4<Neon>>();
+                    let w02 = u8x16::from_slice(neon, &b0[2]).bitcast::<f32x4<Neon>>();
+                    let w03 = u8x16::from_slice(neon, &b0[3]).bitcast::<f32x4<Neon>>();
+                    if check_weights {
+                        finite_mask = finite_mask
+                            & w00.is_finite()
+                            & w01.is_finite()
+                            & w02.is_finite()
+                            & w03.is_finite();
+                    }
+                    acc0[0] = w00.mul_add_precise(a0, acc0[0]);
+                    acc0[1] = w01.mul_add_precise(a1, acc0[1]);
+                    acc0[2] = w02.mul_add_precise(a2, acc0[2]);
+                    acc0[3] = w03.mul_add_precise(a3, acc0[3]);
+
+                    let b1 = r_chunks[r1][blk_idx].as_chunks::<16>().0;
+                    let w10 = u8x16::from_slice(neon, &b1[0]).bitcast::<f32x4<Neon>>();
+                    let w11 = u8x16::from_slice(neon, &b1[1]).bitcast::<f32x4<Neon>>();
+                    let w12 = u8x16::from_slice(neon, &b1[2]).bitcast::<f32x4<Neon>>();
+                    let w13 = u8x16::from_slice(neon, &b1[3]).bitcast::<f32x4<Neon>>();
+                    if check_weights {
+                        finite_mask = finite_mask
+                            & w10.is_finite()
+                            & w11.is_finite()
+                            & w12.is_finite()
+                            & w13.is_finite();
+                    }
+                    acc1[0] = w10.mul_add_precise(a0, acc1[0]);
+                    acc1[1] = w11.mul_add_precise(a1, acc1[1]);
+                    acc1[2] = w12.mul_add_precise(a2, acc1[2]);
+                    acc1[3] = w13.mul_add_precise(a3, acc1[3]);
+                }
+                lanes[r0][t_last] = acc0;
+                lanes[r1][t_last] = acc1;
+            }
+        }
+    }
+
+    if !finite_mask.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    let mut out = [[0.0_f32; TOKENS]; ROWS];
+    for (out_row, row_lanes) in out.iter_mut().zip(lanes) {
+        for (dst, [s0, s1, s2, s3]) in out_row.iter_mut().zip(row_lanes).take(preparations.len()) {
+            let sum = ((s0 + s2) + (s1 + s3)).reduce_sum();
+            *dst = crate::kernels::finite(sum)?;
+        }
+    }
+    Ok(out)
+}
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    reason = "Retain exact scalar binary64 reduction order across paired F32 rows and register-blocked token quads."
+)]
+fn dot_f32_rows_f64<const PAIRS: usize, const ROWS: usize, const TOKENS: usize>(
+    neon: Neon,
+    rows: [&[u8]; ROWS],
+    preparations: &[crate::kernels::MatvecScratch],
+) -> crate::Result<[[f32; TOKENS]; ROWS]> {
+    const K_TILE: usize = 32;
+    let r_chunks = rows.map(|row| row.as_chunks::<16>().0);
+    let r_rems = rows.map(|row| row.as_chunks::<16>().1);
+    let chunk_count = r_chunks[0].len();
+    let mut sums = [[f64x2::splat(neon, -0.0); TOKENS]; PAIRS];
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (tok_quads, tok_rem) = preparations.as_chunks::<4>();
+
+    for k_base in (0..chunk_count).step_by(K_TILE) {
+        let k_end = (k_base + K_TILE).min(chunk_count);
+        for (quad_idx, quad) in tok_quads.iter().enumerate() {
+            let base_t = quad_idx * 4;
+            let mut acc: [[f64x2<Neon>; 4]; PAIRS] = std::array::from_fn(|p| {
+                [
+                    sums[p][base_t],
+                    sums[p][base_t + 1],
+                    sums[p][base_t + 2],
+                    sums[p][base_t + 3],
+                ]
+            });
+            for idx in k_base..k_end {
+                let col = idx * 4;
+                let a0 = f32x4::from_slice(neon, &quad[0].activations[col..col + 4]);
+                let a1 = f32x4::from_slice(neon, &quad[1].activations[col..col + 4]);
+                let a2 = f32x4::from_slice(neon, &quad[2].activations[col..col + 4]);
+                let a3 = f32x4::from_slice(neon, &quad[3].activations[col..col + 4]);
+                for (p, acc_pair) in acc.iter_mut().enumerate() {
+                    let we = u8x16::from_slice(neon, &r_chunks[p * 2][idx]).bitcast::<f32x4<Neon>>();
+                    let wo =
+                        u8x16::from_slice(neon, &r_chunks[p * 2 + 1][idx]).bitcast::<f32x4<Neon>>();
+                    if quad_idx == 0 {
+                        finite_mask = finite_mask & we.is_finite() & wo.is_finite();
+                    }
+                    acc_pair[0] = add_f32_columns(acc_pair[0], we * a0, wo * a0);
+                    acc_pair[1] = add_f32_columns(acc_pair[1], we * a1, wo * a1);
+                    acc_pair[2] = add_f32_columns(acc_pair[2], we * a2, wo * a2);
+                    acc_pair[3] = add_f32_columns(acc_pair[3], we * a3, wo * a3);
+                }
+            }
+            for (p, acc_pair) in acc.iter().enumerate() {
+                sums[p][base_t..base_t + 4].copy_from_slice(acc_pair);
+            }
+        }
+        if !tok_rem.is_empty() {
+            let rem_base = tok_quads.len() * 4;
+            let check_weights = tok_quads.is_empty();
+            let mut acc = [[f64x2::splat(neon, -0.0); 3]; PAIRS];
+            for (p, acc_pair) in acc.iter_mut().enumerate() {
+                acc_pair[..tok_rem.len()]
+                    .copy_from_slice(&sums[p][rem_base..rem_base + tok_rem.len()]);
+            }
+            for idx in k_base..k_end {
+                let col = idx * 4;
+                let mut acts = [f32x4::splat(neon, 0.0); 3];
+                for (t_off, scratch) in tok_rem.iter().enumerate() {
+                    acts[t_off] = f32x4::from_slice(neon, &scratch.activations[col..col + 4]);
+                }
+                for (p, acc_pair) in acc.iter_mut().enumerate() {
+                    let we = u8x16::from_slice(neon, &r_chunks[p * 2][idx]).bitcast::<f32x4<Neon>>();
+                    let wo =
+                        u8x16::from_slice(neon, &r_chunks[p * 2 + 1][idx]).bitcast::<f32x4<Neon>>();
+                    if check_weights {
+                        finite_mask = finite_mask & we.is_finite() & wo.is_finite();
+                    }
+                    for (acc_tok, &act) in acc_pair[..tok_rem.len()].iter_mut().zip(&acts) {
+                        *acc_tok = add_f32_columns(*acc_tok, we * act, wo * act);
+                    }
+                }
+            }
+            for (p, acc_pair) in acc.iter().enumerate() {
+                sums[p][rem_base..rem_base + tok_rem.len()]
+                    .copy_from_slice(&acc_pair[..tok_rem.len()]);
+            }
+        }
+    }
+
+    if !finite_mask.all_true() {
+        return Err(crate::invalid("nonfinite tensor or activation value"));
+    }
+    let rem_base = chunk_count * 4;
+    let mut out = [[0.0_f32; TOKENS]; ROWS];
+    for (p, pair_sums) in sums.iter().enumerate() {
+        let r0 = p * 2;
+        let r1 = r0 + 1;
+        let (tail_w0, tail_len) = decode_f32_tail_weights(r_rems[r0])?;
+        let (tail_w1, tail_len1) = decode_f32_tail_weights(r_rems[r1])?;
+        if tail_len != tail_len1 {
+            return Err(crate::invalid("invalid F32 tail geometry"));
+        }
+        for (tok, (prep, pair_sum)) in preparations.iter().zip(pair_sums).enumerate() {
+            let [mut s0, mut s1] = pair_sum.to_array();
+            for (idx, (&w0, &w1)) in tail_w0[..tail_len]
+                .iter()
+                .zip(&tail_w1[..tail_len])
+                .enumerate()
+            {
+                let act = prep.activations[rem_base + idx];
+                s0 += f64::from(w0 * act);
+                s1 += f64::from(w1 * act);
+            }
+            out[r0][tok] = crate::kernels::finite(s0 as f32)?;
+            out[r1][tok] = crate::kernels::finite(s1 as f32)?;
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
+fn validate_f32_tile_inputs<const ROWS: usize, const TOKENS: usize>(
+    rows: [&[u8]; ROWS],
+    preparations: &[crate::kernels::MatvecScratch],
+    columns: usize,
+) -> Option<()> {
+    let token_count = preparations.len();
+    if token_count == 0 || token_count > TOKENS || columns == 0 {
+        return None;
+    }
+    let row_bytes = columns.checked_mul(4)?;
+    if rows.iter().any(|row| row.len() != row_bytes)
+        || preparations.iter().any(|prep| prep.activations.len() != columns)
+    {
+        return None;
+    }
+    Some(())
+}
+
+pub(in crate::kernels::prefill) fn dot_f32_row<const TOKENS: usize>(
+    row: &[u8],
+    preparations: &[crate::kernels::MatvecScratch],
+    columns: usize,
+    pinned: bool,
+) -> Option<crate::Result<[f32; TOKENS]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if validate_f32_tile_inputs::<1, TOKENS>([row], preparations, columns).is_none() {
+        return Some(Err(crate::invalid("invalid F32 tile geometry")));
+    }
+    Some(if pinned && columns.is_multiple_of(16) {
+        dot_f32_row_pinned(neon, row, preparations)
+    } else {
+        dot_f32_row_f64(neon, row, preparations)
+    })
+}
+
+pub(in crate::kernels::prefill) fn dot_f32_four_rows<const TOKENS: usize>(
+    rows: [&[u8]; 4],
+    preparations: &[crate::kernels::MatvecScratch],
+    columns: usize,
+    pinned: bool,
+) -> Option<crate::Result<[[f32; TOKENS]; 4]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if validate_f32_tile_inputs::<4, TOKENS>(rows, preparations, columns).is_none() {
+        return Some(Err(crate::invalid("invalid F32 tile geometry")));
+    }
+    Some(if pinned && columns.is_multiple_of(16) {
+        dot_f32_rows_pinned::<2, 4, TOKENS>(neon, rows, preparations)
+    } else {
+        dot_f32_rows_f64::<2, 4, TOKENS>(neon, rows, preparations)
+    })
+}
+
+pub(in crate::kernels::prefill) fn dot_f32_eight_rows<const TOKENS: usize>(
+    rows: [&[u8]; 8],
+    preparations: &[crate::kernels::MatvecScratch],
+    columns: usize,
+    pinned: bool,
+) -> Option<crate::Result<[[f32; TOKENS]; 8]>> {
+    let neon = fearless_simd::Level::baseline().as_neon()?;
+    if validate_f32_tile_inputs::<8, TOKENS>(rows, preparations, columns).is_none() {
+        return Some(Err(crate::invalid("invalid F32 tile geometry")));
+    }
+    Some(if pinned && columns.is_multiple_of(16) {
+        dot_f32_rows_pinned::<4, 8, TOKENS>(neon, rows, preparations)
+    } else {
+        dot_f32_rows_f64::<4, 8, TOKENS>(neon, rows, preparations)
+    })
 }
 
 #[cfg(test)]

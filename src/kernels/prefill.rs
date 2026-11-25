@@ -14,9 +14,9 @@
 use std::sync::Arc;
 
 use super::{
-    ActivationContract, BF16, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0, Q5_1,
-    Q8_0, RowParallelism, bf16_dot, dimensions, dot_additional, dot_legacy, finite, integer_float,
-    kquants, matvec_into, scale,
+    ActivationContract, BF16, F32, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0,
+    Q5_1, Q8_0, RowParallelism, bf16_dot, dimensions, dot_additional, dot_legacy, finite,
+    integer_float, kquants, matvec_into, scale,
 };
 use crate::{Result, invalid, model::Tensor};
 
@@ -30,6 +30,7 @@ const fn supports_tiled_rows(kind: u32) -> bool {
     matches!(
         kind,
         PQ2 | PTQ1
+            | F32
             | BF16
             | Q4_0
             | Q4_1
@@ -174,7 +175,7 @@ impl ProjectionTile {
             // The joined scheduler retains the existing per-format row
             // kernels, including Q8_0 for odd PQ2 and PTQ1. Row tails use the
             // same one-row kernel; joining does not require a four-row head.
-            && matches!(first.kind, BF16 | PQ2 | PTQ1)
+            && matches!(first.kind, F32 | BF16 | PQ2 | PTQ1)
             && tensors.iter().all(|tensor| {
                 tensor.kind == first.kind
                     && dimensions(tensor).is_ok_and(|(cols, rows, bytes)| {
@@ -353,6 +354,58 @@ impl ProjectionTile {
                         scratch.prepare_pq2_consumption()?;
                     }
                 }
+            }
+            if tensor.kind == F32 {
+                let backend = self.backend;
+                let preparations = &self.preparations[..inputs.len()];
+                let mut unused_blocks = 0_u64;
+                let dot_f32_one = |row: &[u8], _: &mut u64| -> Result<[f32; MAX_TILE_TOKENS]> {
+                    dot::dot_f32_row::<MAX_TILE_TOKENS>(row, preparations, columns, pinned, backend)
+                };
+                let dot_eight = |rows8: [&[u8]; 8], _: &mut u64| {
+                    dot::dot_f32_eight_rows::<MAX_TILE_TOKENS>(
+                        rows8,
+                        preparations,
+                        columns,
+                        pinned,
+                        backend,
+                    )
+                };
+                let dot_four = |rows4: [&[u8]; 4], _: &mut u64| {
+                    dot::dot_f32_four_rows::<MAX_TILE_TOKENS>(
+                        rows4,
+                        preparations,
+                        columns,
+                        pinned,
+                        backend,
+                    )
+                };
+                if tensors.len() == 1 {
+                    return self.row_parallelism.fill_tile_four_rows(
+                        &tensor.data,
+                        block_bytes,
+                        all_outputs[0],
+                        &mut unused_blocks,
+                        check,
+                        dot_eight,
+                        dot_four,
+                        dot_f32_one,
+                    );
+                }
+                let mut data = [&[][..]; 3];
+                for (slot, tensor) in data.iter_mut().zip(tensors) {
+                    *slot = &tensor.data;
+                }
+                return self.row_parallelism.fill_tile_siblings_four_rows(
+                    &data[..tensors.len()],
+                    block_bytes,
+                    all_outputs,
+                    &mut unused_blocks,
+                    check,
+                    dot_eight,
+                    dot_four,
+                    dot_f32_one,
+                );
             }
             if tensor.kind == BF16 {
                 let backend = self.backend;
@@ -1520,6 +1573,347 @@ mod tests {
             }
 
             assert_tiled_16_32_rejects_nonfinite(kind, columns, &mut tensor, &max_inputs);
+        }
+        Ok(())
+    }
+
+    fn make_f32_tensor(name: &str, columns: usize, rows: usize, seed: usize) -> Tensor {
+        let mut data = Vec::with_capacity(columns * rows * 4);
+        for row in 0..rows {
+            for col in 0..columns {
+                let value = [
+                    0.0_f32,
+                    -0.0,
+                    f32::from_bits(1),
+                    -f32::from_bits(1),
+                    1.25,
+                    -3.5,
+                    7.125,
+                    -0.375,
+                    0.0625,
+                ][(row * 7 + col * 5 + seed) % 9];
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: vec![columns, rows],
+            kind: F32,
+            data: Arc::<[u8]>::from(data).into(),
+        }
+    }
+
+    fn make_f32_inputs(count: usize, columns: usize, seed: usize) -> Vec<Vec<f32>> {
+        (0..count)
+            .map(|token| {
+                (0..columns)
+                    .map(|col| {
+                        [1.5_f32, -128.0, 0.0, -0.0, 63.5, -3.25, 0.125, -0.5]
+                            [(col + token * 3 + seed) % 8]
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verify 0 ULP F32 parity across all 1..=32 token counts, shapes, backends, pinned modes, serial/parallel rows, and sibling pairs."
+    )]
+    fn tiled_f32_single_and_siblings_match_scalar_zero_ulp_across_tokens_and_workers() -> Result<()>
+    {
+        #[cfg(feature = "parallel-rows")]
+        let worker_counts = [1_usize, 4];
+        #[cfg(not(feature = "parallel-rows"))]
+        let worker_counts = [1_usize];
+
+        for (columns, rows_a, rows_b) in [
+            (1_usize, 9_usize, 5_usize),
+            (3, 13, 4),
+            (5, 8, 1),
+            (16, 17, 9),
+            (17, 13, 5),
+            (32, 21, 12),
+            (35, 9, 4),
+        ] {
+            let tensor_a = make_f32_tensor("f32-a", columns, rows_a, 1);
+            let tensor_b = make_f32_tensor("f32-b", columns, rows_b, 2);
+            let max_inputs = make_f32_inputs(32, columns, 0);
+
+            for pinned in [false, true] {
+                let expected_a: Vec<Vec<u32>> = max_inputs
+                    .iter()
+                    .map(|input| {
+                        let mut scratch = if pinned {
+                            MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                        } else {
+                            MatvecScratch::with_backend(MatvecBackend::Scalar)
+                        };
+                        let mut out = Vec::new();
+                        matvec_into(&tensor_a, input, &mut out, &mut scratch)?;
+                        Ok(out.into_iter().map(f32::to_bits).collect())
+                    })
+                    .collect::<Result<_>>()?;
+                let expected_b: Vec<Vec<u32>> = max_inputs
+                    .iter()
+                    .map(|input| {
+                        let mut scratch = if pinned {
+                            MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                        } else {
+                            MatvecScratch::with_backend(MatvecBackend::Scalar)
+                        };
+                        let mut out = Vec::new();
+                        matvec_into(&tensor_b, input, &mut out, &mut scratch)?;
+                        Ok(out.into_iter().map(f32::to_bits).collect())
+                    })
+                    .collect::<Result<_>>()?;
+
+                let counts: &[usize] = if columns == 16 || columns == 17 {
+                    &[
+                        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                        22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                    ]
+                } else {
+                    &[1, 2, 3, 4, 7, 8, 9, 16, 17, 24, 31, 32]
+                };
+
+                for &count in counts {
+                    let inputs = &max_inputs[..count];
+                    for &workers in &worker_counts {
+                        let parallelism = RowParallelism::new(workers)?;
+                        for backend in [
+                            MatvecBackend::Scalar,
+                            MatvecBackend::Auto,
+                            MatvecBackend::ExperimentalNeon,
+                        ] {
+                            let mut tile = ProjectionTile::with_backend(backend);
+                            tile.set_row_parallelism(parallelism.clone());
+
+                            // Single projection (project_tile path) + reuse on second tensor.
+                            let mut out_a = vec![vec![f32::NAN]; count];
+                            tile.project_with_previous(
+                                None,
+                                &tensor_a,
+                                inputs,
+                                &mut out_a,
+                                pinned,
+                                &|| Ok(()),
+                            )?;
+                            assert_eq!(tile.packed_projections, 0);
+                            assert_eq!(tile.decoded_blocks, 0);
+                            let bits_a: Vec<Vec<u32>> = out_a
+                                .iter()
+                                .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                                .collect();
+                            assert_eq!(
+                                bits_a,
+                                expected_a[..count],
+                                "single f32 mismatch cols={columns} count={count} pinned={pinned} workers={workers}"
+                            );
+
+                            let preps_before: Vec<usize> = tile
+                                .preparations
+                                .iter()
+                                .take(count)
+                                .map(MatvecScratch::preparation_count)
+                                .collect();
+                            let mut out_b = vec![vec![f32::NAN]; count];
+                            tile.project_with_previous(
+                                Some(&tensor_a),
+                                &tensor_b,
+                                inputs,
+                                &mut out_b,
+                                pinned,
+                                &|| Ok(()),
+                            )?;
+                            let preps_after: Vec<usize> = tile
+                                .preparations
+                                .iter()
+                                .take(count)
+                                .map(MatvecScratch::preparation_count)
+                                .collect();
+                            assert_eq!(preps_after, preps_before);
+                            let bits_b: Vec<Vec<u32>> = out_b
+                                .iter()
+                                .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                                .collect();
+                            assert_eq!(
+                                bits_b,
+                                expected_b[..count],
+                                "reused f32 mismatch cols={columns} count={count} pinned={pinned} workers={workers}"
+                            );
+
+                            // Sibling pair projection (project_tile_pair path).
+                            assert!(ProjectionTile::supports_siblings(&[&tensor_a, &tensor_b]));
+                            let mut sib_a = vec![vec![f32::NAN]; count];
+                            let mut sib_b = vec![vec![f32::NAN]; count];
+                            tile.project_siblings_with_previous(
+                                Some(&tensor_b),
+                                &[&tensor_a, &tensor_b],
+                                inputs,
+                                &mut [&mut sib_a, &mut sib_b],
+                                pinned,
+                                &|| Ok(()),
+                            )?;
+                            let sib_bits_a: Vec<Vec<u32>> = sib_a
+                                .iter()
+                                .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                                .collect();
+                            let sib_bits_b: Vec<Vec<u32>> = sib_b
+                                .iter()
+                                .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                                .collect();
+                            assert_eq!(sib_bits_a, expected_a[..count]);
+                            assert_eq!(sib_bits_b, expected_b[..count]);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_f32_preserves_signed_zero_unaligned_bytes_and_rejects_nonfinite() -> Result<()> {
+        for columns in [1_usize, 3, 16, 19] {
+            let row_bytes = columns * 4;
+            let mut neg_zero_bytes = Vec::with_capacity(9 * row_bytes);
+            for _ in 0..9 * columns {
+                neg_zero_bytes.extend_from_slice(&(-0.0_f32).to_le_bytes());
+            }
+            let neg_tensor = Tensor {
+                name: "f32-neg-zero".into(),
+                dimensions: vec![columns, 9],
+                kind: F32,
+                data: Arc::<[u8]>::from(neg_zero_bytes).into(),
+            };
+            let pos_inputs = vec![vec![1.0_f32; columns]; 9];
+            for pinned in [false, true] {
+                let mut scalar_scratch = if pinned {
+                    MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                } else {
+                    MatvecScratch::with_backend(MatvecBackend::Scalar)
+                };
+                let mut expected = Vec::new();
+                matvec_into(&neg_tensor, &pos_inputs[0], &mut expected, &mut scalar_scratch)?;
+                let expected_bits: Vec<u32> = expected.into_iter().map(f32::to_bits).collect();
+                for backend in [MatvecBackend::Scalar, MatvecBackend::ExperimentalNeon] {
+                    let mut tile = ProjectionTile::with_backend(backend);
+                    let mut outputs = vec![Vec::new(); 9];
+                    tile.project(&neg_tensor, &pos_inputs, &mut outputs, pinned, &|| Ok(()))?;
+                    for out in &outputs {
+                        let bits: Vec<u32> = out.iter().copied().map(f32::to_bits).collect();
+                        assert_eq!(bits, expected_bits);
+                    }
+                }
+            }
+
+            // Unaligned `&[u8]` slice check directly on dot_f32_eight_rows / four_rows / row.
+            let mut unaligned = vec![0xaa_u8; 1 + 8 * row_bytes];
+            for row in 0..8 {
+                for col in 0..columns {
+                    let val = [1.25_f32, -2.5, -0.0, 0.5, -0.125][(row + col) % 5];
+                    let off = 1 + row * row_bytes + col * 4;
+                    unaligned[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+            let row_slices: [&[u8]; 8] = std::array::from_fn(|r| {
+                let start = 1 + r * row_bytes;
+                &unaligned[start..start + row_bytes]
+            });
+            let mut preps = Vec::with_capacity(9);
+            for input in &make_f32_inputs(9, columns, 7) {
+                let mut s = MatvecScratch::with_pinned_backend(MatvecBackend::Scalar);
+                let _ = s.prepare(&neg_tensor, input)?;
+                preps.push(s);
+            }
+            for pinned in [false, true] {
+                let scalar8 = dot::dot_f32_eight_rows::<MAX_TILE_TOKENS>(
+                    row_slices,
+                    &preps,
+                    columns,
+                    pinned,
+                    MatvecBackend::Scalar,
+                )?;
+                let neon8 = dot::dot_f32_eight_rows::<MAX_TILE_TOKENS>(
+                    row_slices,
+                    &preps,
+                    columns,
+                    pinned,
+                    MatvecBackend::ExperimentalNeon,
+                )?;
+                for r in 0..8 {
+                    assert_eq!(
+                        neon8[r][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        scalar8[r][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                    );
+                }
+                let neon4 = dot::dot_f32_four_rows::<MAX_TILE_TOKENS>(
+                    [row_slices[0], row_slices[1], row_slices[2], row_slices[3]],
+                    &preps,
+                    columns,
+                    pinned,
+                    MatvecBackend::ExperimentalNeon,
+                )?;
+                let neon1 = dot::dot_f32_row::<MAX_TILE_TOKENS>(
+                    row_slices[7],
+                    &preps,
+                    columns,
+                    pinned,
+                    MatvecBackend::ExperimentalNeon,
+                )?;
+                for r in 0..4 {
+                    assert_eq!(
+                        neon4[r][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                        scalar8[r][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                    );
+                }
+                assert_eq!(
+                    neon1[..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                    scalar8[7][..9].iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+                );
+            }
+
+            // Reject nonfinite weights even when activations are all zero, and recover atomically.
+            let mut bad_bytes = neg_tensor.data.to_vec();
+            let last_elem = bad_bytes.len() - 4;
+            bad_bytes[last_elem..].copy_from_slice(&f32::INFINITY.to_le_bytes());
+            let bad_tensor = Tensor {
+                name: "f32-bad".into(),
+                dimensions: vec![columns, 9],
+                kind: F32,
+                data: Arc::<[u8]>::from(bad_bytes).into(),
+            };
+            let zero_inputs = vec![vec![0.0_f32; columns]; 9];
+            for backend in [MatvecBackend::Scalar, MatvecBackend::ExperimentalNeon] {
+                for pinned in [false, true] {
+                    let mut tile = ProjectionTile::with_backend(backend);
+                    let mut outs = vec![vec![1.0_f32]; 9];
+                    assert!(
+                        tile.project(&bad_tensor, &zero_inputs, &mut outs, pinned, &|| Ok(()))
+                            .is_err()
+                    );
+                    assert!(outs.iter().all(Vec::is_empty));
+                    tile.project(&neg_tensor, &zero_inputs, &mut outs, pinned, &|| Ok(()))?;
+                    assert!(outs.iter().all(|row| row.len() == 9));
+
+                    let mut sib_a = vec![vec![1.0_f32]; 9];
+                    let mut sib_b = vec![vec![1.0_f32]; 9];
+                    assert!(
+                        tile.project_siblings_with_previous(
+                            None,
+                            &[&neg_tensor, &bad_tensor],
+                            &zero_inputs,
+                            &mut [&mut sib_a, &mut sib_b],
+                            pinned,
+                            &|| Ok(()),
+                        )
+                        .is_err()
+                    );
+                    assert!(sib_a.iter().chain(&sib_b).all(Vec::is_empty));
+                }
+            }
         }
         Ok(())
     }

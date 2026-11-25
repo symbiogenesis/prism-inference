@@ -542,6 +542,167 @@ pub(super) fn dot_quantized_four_rows<const TOKENS: usize>(
     None
 }
 
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain the scalar floating dot's rounded F32 products, binary64 sum and final F32 rounding."
+)]
+fn dot_f32_rows_scalar<const ROWS: usize, const TOKENS: usize>(
+    rows: [&[u8]; ROWS],
+    preparations: &[MatvecScratch],
+    columns: usize,
+    pinned: bool,
+) -> Result<[[f32; TOKENS]; ROWS]> {
+    let token_count = preparations.len();
+    if token_count == 0
+        || token_count > TOKENS
+        || columns == 0
+        || columns
+            .checked_mul(4)
+            .is_none_or(|row_bytes| rows.iter().any(|row| row.len() != row_bytes))
+        || preparations
+            .iter()
+            .any(|scratch| scratch.activations.len() != columns)
+    {
+        return Err(invalid("invalid F32 tile geometry"));
+    }
+
+    let mut out = [[0.0_f32; TOKENS]; ROWS];
+    if pinned && columns.is_multiple_of(16) {
+        for (row, out_row) in rows.into_iter().zip(out.iter_mut()) {
+            let mut sums = [[[0.0_f32; 4]; 4]; TOKENS];
+            for (blk_idx, blk) in row.as_chunks::<64>().0.iter().enumerate() {
+                let mut weights = [0.0_f32; 16];
+                for (dst, bytes) in weights.iter_mut().zip(blk.as_chunks::<4>().0) {
+                    *dst = finite(f32::from_le_bytes(*bytes))?;
+                }
+                let col_base = blk_idx * 16;
+                for (tok_sums, scratch) in sums.iter_mut().zip(preparations) {
+                    let act = &scratch.activations[col_base..col_base + 16];
+                    for (reg, reg_lanes) in tok_sums.iter_mut().enumerate() {
+                        for (lane, acc) in reg_lanes.iter_mut().enumerate() {
+                            let idx = reg * 4 + lane;
+                            *acc = weights[idx].mul_add(act[idx], *acc);
+                        }
+                    }
+                }
+            }
+            for (dst, tok_sums) in out_row.iter_mut().zip(sums).take(token_count) {
+                let mut lanes = [0.0_f32; 4];
+                for (index, lane) in lanes.iter_mut().enumerate() {
+                    *lane = (tok_sums[0][index] + tok_sums[2][index])
+                        + (tok_sums[1][index] + tok_sums[3][index]);
+                }
+                *dst = finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))?;
+            }
+        }
+        return Ok(out);
+    }
+
+    let mut sums = [[-0.0_f64; TOKENS]; ROWS];
+    for col in 0..columns {
+        let byte_off = col * 4;
+        let mut weights = [0.0_f32; ROWS];
+        for (dst, row) in weights.iter_mut().zip(rows) {
+            let bytes = <[u8; 4]>::try_from(&row[byte_off..byte_off + 4])?;
+            *dst = finite(f32::from_le_bytes(bytes))?;
+        }
+        for (tok, scratch) in preparations.iter().enumerate() {
+            let act = scratch.activations[col];
+            for (row_sums, &weight) in sums.iter_mut().zip(&weights) {
+                row_sums[tok] += f64::from(weight * act);
+            }
+        }
+    }
+    for (out_row, row_sums) in out.iter_mut().zip(sums) {
+        for (dst, sum) in out_row.iter_mut().zip(row_sums).take(token_count) {
+            *dst = finite(sum as f32)?;
+        }
+    }
+    Ok(out)
+}
+
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "Retain one signature across targets and feature sets."
+)]
+pub(super) fn dot_f32_eight_rows<const TOKENS: usize>(
+    rows: [&[u8]; 8],
+    preparations: &[MatvecScratch],
+    columns: usize,
+    pinned: bool,
+    backend: MatvecBackend,
+) -> Result<[[f32; TOKENS]; 8]> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if backend != MatvecBackend::Scalar
+        && let Some(res) = neon::dot_f32_eight_rows::<TOKENS>(rows, preparations, columns, pinned)
+    {
+        return res;
+    }
+    let _ = backend;
+    dot_f32_rows_scalar::<8, TOKENS>(rows, preparations, columns, pinned)
+}
+
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "Retain one signature across targets and feature sets."
+)]
+pub(super) fn dot_f32_four_rows<const TOKENS: usize>(
+    rows: [&[u8]; 4],
+    preparations: &[MatvecScratch],
+    columns: usize,
+    pinned: bool,
+    backend: MatvecBackend,
+) -> Result<[[f32; TOKENS]; 4]> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if backend != MatvecBackend::Scalar
+        && let Some(res) = neon::dot_f32_four_rows::<TOKENS>(rows, preparations, columns, pinned)
+    {
+        return res;
+    }
+    let _ = backend;
+    dot_f32_rows_scalar::<4, TOKENS>(rows, preparations, columns, pinned)
+}
+
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "Retain one signature across targets and feature sets."
+)]
+pub(super) fn dot_f32_row<const TOKENS: usize>(
+    row: &[u8],
+    preparations: &[MatvecScratch],
+    columns: usize,
+    pinned: bool,
+    backend: MatvecBackend,
+) -> Result<[f32; TOKENS]> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if backend != MatvecBackend::Scalar
+        && let Some(res) = neon::dot_f32_row::<TOKENS>(row, preparations, columns, pinned)
+    {
+        return res;
+    }
+    let _ = backend;
+    Ok(dot_f32_rows_scalar::<1, TOKENS>([row], preparations, columns, pinned)?[0])
+}
+
 fn scalar(weights: &[i16], values: &[i8]) -> i32 {
     weights
         .iter()

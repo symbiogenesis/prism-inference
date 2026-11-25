@@ -1070,21 +1070,30 @@ mod tests {
             metadata: BTreeMap::new(),
             tensors: BTreeMap::new(),
         };
-        for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {
+        for representation in [
+            Representation::Pq2,
+            Representation::CurrentRepackedPtq1,
+            Representation::Bonsai25Pq2,
+            Representation::Bonsai25Ptq1,
+        ] {
             base.identity = representation.model_sha256().into();
             let error = RankOneAdapter::load_swift_representation(&path, &base, representation)
                 .err()
                 .ok_or("unapproved adapter was admitted")?;
             assert!(error.to_string().contains("artifact size mismatch"));
-            let other = if representation == Representation::Pq2 {
-                Representation::CurrentRepackedPtq1
-            } else {
-                Representation::Pq2
-            };
-            let error = RankOneAdapter::load_swift_representation(&path, &base, other)
-                .err()
-                .ok_or("mismatched base representation was admitted")?;
-            assert!(error.to_string().contains("selected current-weight base"));
+            for other in [
+                Representation::Pq2,
+                Representation::CurrentRepackedPtq1,
+                Representation::Bonsai25Pq2,
+                Representation::Bonsai25Ptq1,
+            ] {
+                if other != representation {
+                    let error = RankOneAdapter::load_swift_representation(&path, &base, other)
+                        .err()
+                        .ok_or("mismatched base representation was admitted")?;
+                    assert!(error.to_string().contains("selected current-weight base"));
+                }
+            }
         }
         assert!(RankOneAdapter::load_swift(&path, &base).is_err());
         base.identity = "older-published-PTQ1-checkpoint".into();
@@ -1097,6 +1106,41 @@ mod tests {
             .is_err()
         );
         std::fs::remove_file(path)?;
+        let target = "blk.0.ffn_down.weight";
+        let a_tensor = tensor(&format!("{target}.lora_a"), &[1.0]);
+        let b_tensor = tensor(&format!("{target}.lora_b"), &[2.0]);
+        let mut base_factors_model = Model {
+            identity: "base".into(),
+            metadata: BTreeMap::from([(
+                "general.architecture".into(),
+                MetadataValue::from("qwen35"),
+            )]),
+            tensors: BTreeMap::from([(target.into(), tensor(target, &[0.0]))]),
+        };
+        let mut seen_digests = std::collections::BTreeSet::new();
+        for representation in [
+            Representation::Pq2,
+            Representation::CurrentRepackedPtq1,
+            Representation::Bonsai25Pq2,
+            Representation::Bonsai25Ptq1,
+        ] {
+            base_factors_model.identity = representation.model_sha256().into();
+            let adapter_model = Model {
+                identity: "adapter".into(),
+                metadata: BTreeMap::from([
+                    ("general.architecture".into(), MetadataValue::from("qwen35")),
+                    ("general.type".into(), MetadataValue::from("adapter")),
+                    ("adapter.type".into(), MetadataValue::from("lora")),
+                    ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
+                ]),
+                tensors: BTreeMap::from([
+                    (format!("{target}.lora_a"), a_tensor.clone()),
+                    (format!("{target}.lora_b"), b_tensor.clone()),
+                ]),
+            };
+            let loaded = RankOneAdapter::from_model(adapter_model, &base_factors_model)?;
+            assert!(seen_digests.insert(loaded.execution_identity().to_owned()));
+        }
         Ok(())
     }
 

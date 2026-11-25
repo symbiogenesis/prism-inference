@@ -831,8 +831,10 @@ pub(super) const fn supports_hexagon_native_q2_representation(
         // `NativeQ2Executor`, `NativeQ2ArenaCache`, `plan_native_q2_layers_for_budget`,
         // and `supports_f32` runtime dispatch (`src/graph.rs`, `src/kernels/projection.rs`,
         // `src/graph/prefill.rs`, `src/graph/projection.rs`) all admit both `PQ2` (142) and
-        // `PTQ1_0` (143).
-        | bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1 => true,
+        // `PTQ1_0` (143), including Ternary Bonsai 2.5 27B.
+        | bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1
+        | bonsai_prism_runtime::model::swift::Representation::Bonsai25Pq2
+        | bonsai_prism_runtime::model::swift::Representation::Bonsai25Ptq1 => true,
         bonsai_prism_runtime::model::swift::Representation::NariQ2_5Bpw
         | bonsai_prism_runtime::model::swift::Representation::NariQ3_0Bpw
         | bonsai_prism_runtime::model::swift::Representation::NariQ2_0Bpw => false,
@@ -888,6 +890,8 @@ pub(super) fn hexagon_arena_cache_file_path(
     let repr_slug = match representation {
         bonsai_prism_runtime::model::swift::Representation::Pq2 => "pq2",
         bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1 => "ptq1",
+        bonsai_prism_runtime::model::swift::Representation::Bonsai25Pq2 => "bonsai25-pq2",
+        bonsai_prism_runtime::model::swift::Representation::Bonsai25Ptq1 => "bonsai25-ptq1",
         bonsai_prism_runtime::model::swift::Representation::NariQ2_5Bpw => "nariq-2.5bpw",
         bonsai_prism_runtime::model::swift::Representation::NariQ3_0Bpw => "nariq-3.0bpw",
         bonsai_prism_runtime::model::swift::Representation::NariQ2_0Bpw => "nariq-2.0bpw",

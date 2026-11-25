@@ -25,6 +25,20 @@ pub const REPACKED_PTQ1_BYTES: u64 = 5_946_648_928;
 /// Immutable current-weight export identity from Runner's PTQ1 export receipt.
 pub const REPACKED_PTQ1_SHA256: &str =
     "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5";
+/// Exact byte length of `Ternary-Bonsai-2.5-27B-PQ2_0.gguf`.
+pub const BONSAI_2_5_PQ2_BYTES: u64 = 7_253_354_848;
+/// Immutable pinned `Ternary-Bonsai-2.5-27B-PQ2_0.gguf` SHA-256 identity.
+pub const BONSAI_2_5_PQ2_SHA256: &str =
+    "103a11c94324029d8bae3f8152f30bba414730064cfb77438f8589db72e1aa85";
+/// Exact serialized tensor payload bytes of `Ternary-Bonsai-2.5-27B-PQ2_0.gguf`.
+pub const BONSAI_2_5_PQ2_TENSOR_PAYLOAD_BYTES: usize = 7_242_233_856;
+/// Exact byte length of `Ternary-Bonsai-2.5-27B-PTQ1_0.gguf`.
+pub const BONSAI_2_5_PTQ1_BYTES: u64 = 5_993_834_848;
+/// Immutable pinned `Ternary-Bonsai-2.5-27B-PTQ1_0.gguf` SHA-256 identity.
+pub const BONSAI_2_5_PTQ1_SHA256: &str =
+    "929560ec9d37cf3cadd4b00cc87b51c570082a628dd830b4692dc0b2ed18dbbe";
+/// Exact serialized tensor payload bytes of `Ternary-Bonsai-2.5-27B-PTQ1_0.gguf`.
+pub const BONSAI_2_5_PTQ1_TENSOR_PAYLOAD_BYTES: usize = 5_982_713_856;
 /// Exact length of the pinned `Qwen3.8-27B-NariQ-2.5bpw.gguf` artifact.
 pub const NARIQ_2_5BPW_BYTES: u64 = 8_443_119_712;
 /// Immutable pinned `Qwen3.8-27B-NariQ-2.5bpw.gguf` SHA-256 identity.
@@ -79,6 +93,10 @@ pub enum Representation {
     Pq2,
     /// Verified lossless repack of the current PQ2 weights, not older PTQ weights.
     CurrentRepackedPtq1,
+    /// Verified Ternary Bonsai 2.5 27B PQ2 artifact (`Ternary-Bonsai-2.5-27B-PQ2_0.gguf`).
+    Bonsai25Pq2,
+    /// Verified Ternary Bonsai 2.5 27B PTQ1 artifact (`Ternary-Bonsai-2.5-27B-PTQ1_0.gguf`).
+    Bonsai25Ptq1,
     /// Verified `NariQ` 2.5bpw trellis artifact (`Qwen3.8-27B-NariQ-2.5bpw.gguf`).
     NariQ2_5Bpw,
     /// Verified `NariQ` 3.0bpw trellis artifact (`Qwen3.8-27B-NariQ-3.0bpw.gguf`).
@@ -94,6 +112,8 @@ impl Representation {
         match self {
             Self::Pq2 => "PQ2_0",
             Self::CurrentRepackedPtq1 => "current-repacked-PTQ1_0",
+            Self::Bonsai25Pq2 => "Bonsai-2.5-PQ2_0",
+            Self::Bonsai25Ptq1 => "Bonsai-2.5-PTQ1_0",
             Self::NariQ2_5Bpw => "NariQ-2.5bpw",
             Self::NariQ3_0Bpw => "NariQ-3.0bpw",
             Self::NariQ2_0Bpw => "NariQ-2.0bpw",
@@ -106,6 +126,8 @@ impl Representation {
         match self {
             Self::Pq2 => "Swift-Bonsai-2-PQ2_0",
             Self::CurrentRepackedPtq1 => "Swift-Bonsai-2-current-repacked-PTQ1_0",
+            Self::Bonsai25Pq2 => "Ternary-Bonsai-2.5-27B-PQ2_0",
+            Self::Bonsai25Ptq1 => "Ternary-Bonsai-2.5-27B-PTQ1_0",
             Self::NariQ2_5Bpw => "Qwen3.8-27B-NariQ-2.5bpw",
             Self::NariQ3_0Bpw => "Qwen3.8-27B-NariQ-3.0bpw",
             Self::NariQ2_0Bpw => "Qwen3.8-27B-NariQ-2.0bpw",
@@ -118,6 +140,8 @@ impl Representation {
         match self {
             Self::Pq2 => MODEL_BYTES,
             Self::CurrentRepackedPtq1 => REPACKED_PTQ1_BYTES,
+            Self::Bonsai25Pq2 => BONSAI_2_5_PQ2_BYTES,
+            Self::Bonsai25Ptq1 => BONSAI_2_5_PTQ1_BYTES,
             Self::NariQ2_5Bpw => NARIQ_2_5BPW_BYTES,
             Self::NariQ3_0Bpw => NARIQ_3_0BPW_BYTES,
             Self::NariQ2_0Bpw => NARIQ_2_0BPW_BYTES,
@@ -130,10 +154,18 @@ impl Representation {
         match self {
             Self::Pq2 => MODEL_SHA256,
             Self::CurrentRepackedPtq1 => REPACKED_PTQ1_SHA256,
+            Self::Bonsai25Pq2 => BONSAI_2_5_PQ2_SHA256,
+            Self::Bonsai25Ptq1 => BONSAI_2_5_PTQ1_SHA256,
             Self::NariQ2_5Bpw => NARIQ_2_5BPW_SHA256,
             Self::NariQ3_0Bpw => NARIQ_3_0BPW_SHA256,
             Self::NariQ2_0Bpw => NARIQ_2_0BPW_SHA256,
         }
+    }
+
+    /// Whether this representation selects an opt-in Ternary Bonsai 2.5 27B artifact.
+    #[must_use]
+    pub const fn is_bonsai_2_5(self) -> bool {
+        matches!(self, Self::Bonsai25Pq2 | Self::Bonsai25Ptq1)
     }
 
     /// Whether this representation selects an opt-in `NariQ` trellis artifact.
@@ -159,7 +191,11 @@ impl Representation {
     #[must_use]
     pub const fn model_memory_limit_bytes(self) -> usize {
         match self {
-            Self::Pq2 | Self::CurrentRepackedPtq1 | Self::NariQ2_0Bpw => 8 * 1024 * 1024 * 1024,
+            Self::Pq2
+            | Self::CurrentRepackedPtq1
+            | Self::Bonsai25Pq2
+            | Self::Bonsai25Ptq1
+            | Self::NariQ2_0Bpw => 8 * 1024 * 1024 * 1024,
             Self::NariQ2_5Bpw => 9 * 1024 * 1024 * 1024,
             Self::NariQ3_0Bpw => 11 * 1024 * 1024 * 1024,
         }
@@ -167,8 +203,8 @@ impl Representation {
 
     const fn tensor_kind(self) -> u32 {
         match self {
-            Self::Pq2 => 142,
-            Self::CurrentRepackedPtq1 => 143,
+            Self::Pq2 | Self::Bonsai25Pq2 => 142,
+            Self::CurrentRepackedPtq1 | Self::Bonsai25Ptq1 => 143,
             Self::NariQ2_5Bpw | Self::NariQ2_0Bpw => 45,
             Self::NariQ3_0Bpw => 46,
         }
@@ -176,8 +212,8 @@ impl Representation {
 
     const fn file_type(self) -> u64 {
         match self {
-            Self::Pq2 => 141,
-            Self::CurrentRepackedPtq1 => 143,
+            Self::Pq2 | Self::Bonsai25Pq2 => 141,
+            Self::CurrentRepackedPtq1 | Self::Bonsai25Ptq1 => 143,
             Self::NariQ2_5Bpw | Self::NariQ3_0Bpw | Self::NariQ2_0Bpw => 32,
         }
     }
@@ -186,6 +222,8 @@ impl Representation {
         match self {
             Self::Pq2 => TENSOR_PAYLOAD_BYTES,
             Self::CurrentRepackedPtq1 => 5_935_527_936,
+            Self::Bonsai25Pq2 => BONSAI_2_5_PQ2_TENSOR_PAYLOAD_BYTES,
+            Self::Bonsai25Ptq1 => BONSAI_2_5_PTQ1_TENSOR_PAYLOAD_BYTES,
             Self::NariQ2_5Bpw | Self::NariQ3_0Bpw | Self::NariQ2_0Bpw => 0,
         }
     }
@@ -665,7 +703,10 @@ fn validate_nariq_metadata(metadata: &Metadata, representation: Representation) 
                 ));
             }
         }
-        Representation::Pq2 | Representation::CurrentRepackedPtq1 => {}
+        Representation::Pq2
+        | Representation::CurrentRepackedPtq1
+        | Representation::Bonsai25Pq2
+        | Representation::Bonsai25Ptq1 => {}
     }
     for (key, value) in [
         ("qwen35.rope.freq_base", 10_000_000.0_f32),
@@ -742,15 +783,23 @@ pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
     reason = "Keep the exact shared metadata contract and representation discriminator together."
 )]
 fn validate_metadata_for(metadata: &Metadata, representation: Representation) -> Result<()> {
-    if metadata.len() != 49 {
+    let expected_len = if representation.is_bonsai_2_5() {
+        48
+    } else {
+        49
+    };
+    if metadata.len() != expected_len {
         return Err(invalid("Swift metadata inventory mismatch"));
     }
+    let expected_name = if representation.is_bonsai_2_5() {
+        "Ternary-Bonsai-2.5-27B"
+    } else {
+        "Hf"
+    };
     for (key, value) in [
         ("general.architecture", "qwen35"),
         ("general.type", "model"),
-        ("general.name", "Hf"),
-        ("general.version", "v5"),
-        ("general.basename", "folded"),
+        ("general.name", expected_name),
         ("general.size_label", "27B"),
         (
             "prism.hadamard.transform",
@@ -763,6 +812,30 @@ fn validate_metadata_for(metadata: &Metadata, representation: Representation) ->
     ] {
         if metadata.get(key).and_then(MetadataValue::as_str) != Some(value) {
             return Err(invalid(format!("Swift metadata mismatch: {key}")));
+        }
+    }
+    if representation.is_bonsai_2_5() {
+        if metadata.contains_key("general.version") || metadata.contains_key("general.basename") {
+            return Err(invalid(
+                "Bonsai 2.5 metadata forbids Swift version/basename keys",
+            ));
+        }
+        if metadata
+            .get("general.sampling.min_p")
+            .and_then(MetadataValue::as_f64)
+            .map(f64::to_bits)
+            != Some(f64::from(0.05_f32).to_bits())
+        {
+            return Err(invalid("Swift metadata mismatch: general.sampling.min_p"));
+        }
+    } else {
+        for (key, value) in [("general.version", "v5"), ("general.basename", "folded")] {
+            if metadata.get(key).and_then(MetadataValue::as_str) != Some(value) {
+                return Err(invalid(format!("Swift metadata mismatch: {key}")));
+            }
+        }
+        if metadata.contains_key("general.sampling.min_p") {
+            return Err(invalid("Swift metadata forbids general.sampling.min_p"));
         }
     }
     for (key, value) in [
@@ -948,7 +1021,14 @@ fn expected_tensor_spec(
                     "attn_qkv.weight" => Some((packed, &[5_120, 10_240])),
                     "attn_gate.weight" => Some((packed, &[5_120, 6_144])),
                     "ssm_out.weight" => Some((packed, &[6_144, 5_120])),
-                    "ssm_alpha.weight" | "ssm_beta.weight" => Some((30, &[5_120, 48])),
+                    "ssm_alpha.weight" | "ssm_beta.weight" => Some((
+                        if representation.is_bonsai_2_5() {
+                            0
+                        } else {
+                            30
+                        },
+                        &[5_120, 48],
+                    )),
                     "ssm_conv1d.weight" => Some((0, &[4, 10_240])),
                     "ssm_norm.weight" => Some((0, &[128])),
                     "ssm_a" | "ssm_dt.bias" => Some((0, &[48])),
@@ -963,6 +1043,11 @@ fn expected_tensor_spec(
 fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Vec<u64>)> {
     let mut tensors = BTreeMap::new();
     let packed = representation.tensor_kind();
+    let ssm_kind = if representation.is_bonsai_2_5() {
+        0
+    } else {
+        30
+    };
     for name in ["token_embd.weight", "output.weight"] {
         tensors.insert(name.to_owned(), (packed, vec![5_120, 248_320]));
     }
@@ -992,7 +1077,7 @@ fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Ve
             add("attn_gate.weight", packed, &[5_120, 6_144]);
             add("ssm_out.weight", packed, &[6_144, 5_120]);
             for name in ["ssm_alpha.weight", "ssm_beta.weight"] {
-                add(name, 30, &[5_120, 48]);
+                add(name, ssm_kind, &[5_120, 48]);
             }
             add("ssm_conv1d.weight", 0, &[4, 10_240]);
             add("ssm_norm.weight", 0, &[128]);
@@ -1027,7 +1112,10 @@ fn validate_nariq_inventory(
         Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => {
             EXPECTED_NARIQ_UNBANDED_TENSORS
         }
-        Representation::Pq2 | Representation::CurrentRepackedPtq1 => {
+        Representation::Pq2
+        | Representation::CurrentRepackedPtq1
+        | Representation::Bonsai25Pq2
+        | Representation::Bonsai25Ptq1 => {
             return Err(invalid(
                 "non-NariQ representation passed to NariQ inventory validator",
             ));
@@ -1207,7 +1295,10 @@ fn validate_nariq_inventory(
                 return Err(invalid("invalid unbanded NariQ embedding inventory"));
             }
         }
-        Representation::Pq2 | Representation::CurrentRepackedPtq1 => {}
+        Representation::Pq2
+        | Representation::CurrentRepackedPtq1
+        | Representation::Bonsai25Pq2
+        | Representation::Bonsai25Ptq1 => {}
     }
     Ok((counts, bytes, largest))
 }
@@ -1266,7 +1357,12 @@ fn validate_layouts<'a>(
             .ok_or_else(|| invalid("Swift tensor accounting overflow"))?;
         largest = largest.max(length);
     }
-    if counts != [353, 96, 402] || bytes != representation.tensor_payload_bytes() {
+    let expected_counts = if representation.is_bonsai_2_5() {
+        [449, 0, 402]
+    } else {
+        [353, 96, 402]
+    };
+    if counts != expected_counts || bytes != representation.tensor_payload_bytes() {
         return Err(invalid("Swift tensor payload inventory mismatch"));
     }
     Ok((counts, bytes, largest))
@@ -1659,6 +1755,205 @@ mod tests {
                 Representation::NariQ2_0Bpw
             };
             assert!(validate_nariq_inventory(&descs, other).is_err());
+        }
+        Ok(())
+    }
+
+    fn base_prism_metadata(representation: Representation) -> Metadata {
+        let mut metadata = Metadata::new();
+        let name = if representation.is_bonsai_2_5() {
+            "Ternary-Bonsai-2.5-27B"
+        } else {
+            "Hf"
+        };
+        for (key, value) in [
+            ("general.architecture", "qwen35"),
+            ("general.type", "model"),
+            ("general.name", name),
+            ("general.size_label", "27B"),
+            (
+                "prism.hadamard.transform",
+                "normalized-sylvester-walsh-hadamard",
+            ),
+            ("prism.hadamard.axis", "input-last-dimension"),
+            ("prism.hadamard.sign_mode", "explicit"),
+            ("tokenizer.ggml.model", "gpt2"),
+            ("tokenizer.ggml.pre", "qwen35"),
+            ("tokenizer.chat_template", "dummy-template"),
+        ] {
+            metadata.insert(key.to_owned(), MetadataValue::from(value));
+        }
+        if representation.is_bonsai_2_5() {
+            metadata.insert(
+                "general.sampling.min_p".to_owned(),
+                MetadataValue::F32(0.05_f32),
+            );
+        } else {
+            metadata.insert("general.version".to_owned(), MetadataValue::from("v5"));
+            metadata.insert("general.basename".to_owned(), MetadataValue::from("folded"));
+        }
+        for (key, value) in [
+            ("general.sampling.top_k", 20),
+            ("qwen35.block_count", 64),
+            ("qwen35.context_length", 262_144),
+            ("qwen35.embedding_length", 5_120),
+            ("qwen35.feed_forward_length", 17_408),
+            ("qwen35.attention.head_count", 24),
+            ("qwen35.attention.head_count_kv", 4),
+            ("qwen35.attention.key_length", 256),
+            ("qwen35.attention.value_length", 256),
+            ("qwen35.ssm.conv_kernel", 4),
+            ("qwen35.ssm.state_size", 128),
+            ("qwen35.ssm.group_count", 16),
+            ("qwen35.ssm.time_step_rank", 48),
+            ("qwen35.ssm.inner_size", 6_144),
+            ("qwen35.full_attention_interval", 4),
+            ("qwen35.rope.dimension_count", 64),
+            ("prism.hadamard.version", 1),
+            ("prism.hadamard.block_size", 1_024),
+            ("tokenizer.ggml.eos_token_id", 248_046),
+            ("tokenizer.ggml.padding_token_id", 248_044),
+            ("tokenizer.ggml.bos_token_id", 248_044),
+            ("general.quantization_version", 2),
+            ("general.file_type", representation.file_type()),
+        ] {
+            metadata.insert(key.to_owned(), MetadataValue::U64(value));
+        }
+        for (key, value) in [
+            ("general.sampling.top_p", 0.95_f32),
+            ("general.sampling.temp", 1.0_f32),
+            ("qwen35.rope.freq_base", 10_000_000.0_f32),
+            ("qwen35.attention.layer_norm_rms_epsilon", 0.000_001_f32),
+        ] {
+            metadata.insert(key.to_owned(), MetadataValue::F32(value));
+        }
+        metadata.insert(
+            "prism.hadamard.gdn_v_grouped".to_owned(),
+            MetadataValue::from(true),
+        );
+        metadata.insert(
+            "tokenizer.ggml.add_bos_token".to_owned(),
+            MetadataValue::from(false),
+        );
+        for key in [
+            "qwen35.rope.dimension_sections",
+            "prism.hadamard.sign_widths",
+            "prism.hadamard.sign_values",
+            "prism.hadamard.weight_names",
+            "prism.hadamard.inverse_weight_names",
+            "tokenizer.ggml.tokens",
+            "tokenizer.ggml.token_type",
+            "tokenizer.ggml.merges",
+        ] {
+            metadata.insert(
+                key.to_owned(),
+                MetadataValue::Array(MetadataArray::U32(Vec::new())),
+            );
+        }
+        metadata
+    }
+
+    #[test]
+    fn bonsai_2_5_representations_verify_identities_layouts_and_metadata_contract() -> Result<()> {
+        for (
+            repr,
+            expected_name,
+            expected_id,
+            expected_bytes,
+            expected_sha,
+            expected_payload_bytes,
+            expected_largest,
+            expected_file_type,
+        ) in [
+            (
+                Representation::Bonsai25Pq2,
+                "Bonsai-2.5-PQ2_0",
+                "Ternary-Bonsai-2.5-27B-PQ2_0",
+                BONSAI_2_5_PQ2_BYTES,
+                BONSAI_2_5_PQ2_SHA256,
+                BONSAI_2_5_PQ2_TENSOR_PAYLOAD_BYTES,
+                337_715_200_usize,
+                141_u64,
+            ),
+            (
+                Representation::Bonsai25Ptq1,
+                "Bonsai-2.5-PTQ1_0",
+                "Ternary-Bonsai-2.5-27B-PTQ1_0",
+                BONSAI_2_5_PTQ1_BYTES,
+                BONSAI_2_5_PTQ1_SHA256,
+                BONSAI_2_5_PTQ1_TENSOR_PAYLOAD_BYTES,
+                278_118_400_usize,
+                143_u64,
+            ),
+        ] {
+            assert!(repr.is_bonsai_2_5());
+            assert!(!repr.is_nariq());
+            assert_eq!(repr.name(), expected_name);
+            assert_eq!(repr.model_id(), expected_id);
+            assert_eq!(repr.model_bytes(), expected_bytes);
+            assert_eq!(repr.model_sha256(), expected_sha);
+            assert_eq!(repr.dialect(), PRISM_DIALECT);
+            assert_eq!(repr.model_memory_limit_bytes(), 8 * 1024 * 1024 * 1024);
+            assert_eq!(repr.file_type(), expected_file_type);
+            assert_eq!(repr.tensor_payload_bytes(), expected_payload_bytes);
+
+            let map = expected_tensors(repr);
+            assert_eq!(map.len(), EXPECTED_SWIFT_TENSORS);
+            for (name, (kind, dims)) in &map {
+                let spec =
+                    expected_tensor_spec(name, repr).ok_or_else(|| invalid("missing spec"))?;
+                assert_eq!(spec.0, *kind);
+                assert_eq!(spec.1, dims.as_slice());
+            }
+
+            let descriptors = descriptors(repr);
+            let layouts = || {
+                descriptors.iter().map(|(name, dimensions, kind, bytes)| {
+                    (name.as_str(), dimensions.as_slice(), *kind, *bytes)
+                })
+            };
+            assert_eq!(
+                validate_layouts(repr, descriptors.len(), layouts())?,
+                ([449, 0, 402], expected_payload_bytes, expected_largest)
+            );
+            for other in [
+                Representation::Pq2,
+                Representation::CurrentRepackedPtq1,
+                if repr == Representation::Bonsai25Pq2 {
+                    Representation::Bonsai25Ptq1
+                } else {
+                    Representation::Bonsai25Pq2
+                },
+            ] {
+                assert!(validate_layouts(other, descriptors.len(), layouts()).is_err());
+            }
+
+            // Verify Bonsai 2.5 metadata reaches template check only after all 48 keys match.
+            let b25_meta = base_prism_metadata(repr);
+            assert_eq!(b25_meta.len(), 48);
+            let err = validate_metadata_for(&b25_meta, repr)
+                .err()
+                .ok_or_else(|| invalid("dummy template unexpectedly accepted"))?;
+            assert!(
+                err.to_string()
+                    .contains("Swift embedded template identity mismatch"),
+                "unexpected error before template check: {err}"
+            );
+
+            // Swift metadata (49 keys, general.name = "Hf") must be rejected by Bonsai 2.5 and vice versa.
+            let swift_equiv = if repr == Representation::Bonsai25Pq2 {
+                Representation::Pq2
+            } else {
+                Representation::CurrentRepackedPtq1
+            };
+            let swift_meta = base_prism_metadata(swift_equiv);
+            assert_eq!(swift_meta.len(), 49);
+            assert!(validate_metadata_for(&swift_meta, repr).is_err());
+            assert!(validate_metadata_for(&b25_meta, swift_equiv).is_err());
+
+            let mut missing_min_p = b25_meta.clone();
+            missing_min_p.remove("general.sampling.min_p");
+            assert!(validate_metadata_for(&missing_min_p, repr).is_err());
         }
         Ok(())
     }

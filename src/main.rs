@@ -621,10 +621,15 @@ fn load_decoder(arguments: &Arguments) -> Result<Loaded> {
 }
 
 fn generation_kv_cache(explicit: Option<KvCachePolicy>, verified_identity: &str) -> KvCachePolicy {
-    use bonsai_prism_runtime::model::swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256};
+    use bonsai_prism_runtime::model::swift::{
+        BONSAI_2_5_PQ2_SHA256, BONSAI_2_5_PTQ1_SHA256, MODEL_SHA256, REPACKED_PTQ1_SHA256,
+    };
 
     explicit.unwrap_or({
-        if matches!(verified_identity, MODEL_SHA256 | REPACKED_PTQ1_SHA256) {
+        if matches!(
+            verified_identity,
+            MODEL_SHA256 | REPACKED_PTQ1_SHA256 | BONSAI_2_5_PQ2_SHA256 | BONSAI_2_5_PTQ1_SHA256
+        ) {
             bonsai_prism_runtime::swift_session::DEFAULT_KV_CACHE
         } else {
             KvCachePolicy::F16
@@ -1072,10 +1077,17 @@ mod tests {
     #[test]
     fn cli_kv_cache_policy_defaults_to_verified_swift_k4v4_and_preserves_other_models() -> Result<()>
     {
-        use bonsai_prism_runtime::model::swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256};
+        use bonsai_prism_runtime::model::swift::{
+            BONSAI_2_5_PQ2_SHA256, BONSAI_2_5_PTQ1_SHA256, MODEL_SHA256, REPACKED_PTQ1_SHA256,
+        };
 
         assert_eq!(parse(arguments())?.kv_cache, None);
-        for identity in [MODEL_SHA256, REPACKED_PTQ1_SHA256] {
+        for identity in [
+            MODEL_SHA256,
+            REPACKED_PTQ1_SHA256,
+            BONSAI_2_5_PQ2_SHA256,
+            BONSAI_2_5_PTQ1_SHA256,
+        ] {
             assert_eq!(
                 super::generation_kv_cache(None, identity),
                 KvCachePolicy::Rotated4

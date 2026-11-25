@@ -66,6 +66,9 @@ pub const fn calibrated_non_context_memory_bytes(representation: Representation)
     match representation {
         Representation::Pq2 => NON_CONTEXT_MEMORY_BYTES,
         Representation::CurrentRepackedPtq1 => PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES,
+        Representation::Bonsai25Pq2 | Representation::Bonsai25Ptq1 => {
+            (NON_CONTEXT_MEMORY_BYTES - swift::MODEL_BYTES) + representation.model_bytes()
+        }
         Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw | Representation::NariQ2_0Bpw => {
             (NON_CONTEXT_MEMORY_BYTES - swift::MODEL_BYTES)
                 + representation.model_bytes()
@@ -3571,6 +3574,8 @@ mod tests {
         for sha in [
             MODEL_SHA256,
             REPACKED_PTQ1_SHA256,
+            crate::model::swift::BONSAI_2_5_PQ2_SHA256,
+            crate::model::swift::BONSAI_2_5_PTQ1_SHA256,
             crate::model::swift::NARIQ_2_5BPW_SHA256,
             crate::model::swift::NARIQ_3_0BPW_SHA256,
             crate::model::swift::NARIQ_2_0BPW_SHA256,
@@ -3584,7 +3589,7 @@ mod tests {
     }
 
     #[test]
-    fn calibrated_cow_execution_capacity_accounts_for_nariq_sizes_and_headroom() -> Result<()> {
+    fn calibrated_cow_execution_capacity_accounts_for_bonsai25_and_nariq_sizes() -> Result<()> {
         use super::{
             BranchCheckpoints, NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES, NON_CONTEXT_MEMORY_BYTES,
             Representation, calibrated_cow_execution_memory_bytes,
@@ -3603,6 +3608,28 @@ mod tests {
             PromptReuse::Latest,
             BranchCheckpoints::default(),
         )?;
+        for repr in [Representation::Bonsai25Pq2, Representation::Bonsai25Ptq1] {
+            let fixed = calibrated_non_context_memory_bytes(repr);
+            assert_eq!(
+                fixed,
+                (NON_CONTEXT_MEMORY_BYTES - crate::model::swift::MODEL_BYTES) + repr.model_bytes()
+            );
+            let cow = calibrated_cow_execution_memory_bytes(
+                ctx,
+                repr,
+                None,
+                None,
+                kv,
+                PromptReuse::Latest,
+                BranchCheckpoints::default(),
+            )?;
+            assert_eq!(cow, (pq2 - NON_CONTEXT_MEMORY_BYTES) + fixed);
+        }
+        assert_eq!(
+            calibrated_non_context_memory_bytes(Representation::Bonsai25Pq2)
+                - NON_CONTEXT_MEMORY_BYTES,
+            47_185_920
+        );
         for repr in [
             Representation::NariQ2_5Bpw,
             Representation::NariQ3_0Bpw,

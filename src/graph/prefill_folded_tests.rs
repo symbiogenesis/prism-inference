@@ -1387,3 +1387,101 @@ fn folded_verification_with_decode_only_executor_matches_cpu_and_preserves_rollb
     assert_missing_host_weight_rejects_tiled_verification(&cfg, decode_calls);
     Ok(())
 }
+
+#[test]
+fn bonsai25_f32_ssm_gates_and_stacked_adapters_preserve_prefill_decode_and_folded_parity()
+-> Result<()> {
+    let cfg = HybridConfig::pinned_swift_aligned();
+    let f32_gates = hybrid_model(&cfg);
+    for identity in [
+        crate::model::swift::BONSAI_2_5_PQ2_SHA256,
+        crate::model::swift::BONSAI_2_5_PTQ1_SHA256,
+    ] {
+        let mut seq_model = pq2_mixed_hybrid_model(&cfg);
+        let mut tiled_model = pq2_mixed_hybrid_model(&cfg);
+        let mut wy_model = pq2_mixed_hybrid_model(&cfg);
+        for model in [&mut seq_model, &mut tiled_model, &mut wy_model] {
+            model.identity = identity.to_owned();
+            for (name, tensor) in &f32_gates.tensors {
+                if name.ends_with(".ssm_alpha.weight") || name.ends_with(".ssm_beta.weight") {
+                    model.tensors.insert(name.clone(), tensor.clone());
+                }
+            }
+        }
+        // Confirm F32 recurrent gate weights (`ssm_alpha.weight`, `ssm_beta.weight`) are accepted.
+        assert_eq!(seq_model.tensors["blk.0.ssm_alpha.weight"].kind, 0);
+        assert_eq!(seq_model.tensors["blk.0.ssm_beta.weight"].kind, 0);
+
+        let (r1_seq, mr_seq) = build_folded_test_adapters(&seq_model, &cfg)?;
+        let (r1_tile, mr_tile) = build_folded_test_adapters(&tiled_model, &cfg)?;
+        let (r1_wy, mr_wy) = build_folded_test_adapters(&wy_model, &cfg)?;
+
+        let mut seq = Qwen35::with_state_budget_and_adapters_scope(
+            seq_model,
+            cfg.context,
+            64 * 1024 * 1024,
+            MatvecBackend::Scalar,
+            KvCachePolicy::F16,
+            Some((r1_seq, 1.3)),
+            Some((mr_seq, 0.75)),
+        )?;
+
+        let mut tiled = Qwen35::with_state_budget_and_adapters_scope(
+            tiled_model,
+            cfg.context,
+            64 * 1024 * 1024,
+            MatvecBackend::Scalar,
+            KvCachePolicy::F16,
+            Some((r1_tile, 1.3)),
+            Some((mr_tile, 0.75)),
+        )?;
+        let prefill_scratch = tiled.tiled_prefill_scratch_bytes(8)?;
+        tiled = tiled.with_tiled_prefill(8, prefill_scratch)?;
+        let verify_scratch = tiled.tiled_verification_scratch_bytes()?;
+        tiled = tiled.with_tiled_verification(verify_scratch)?;
+
+        let mut wy = Qwen35::with_state_budget_and_adapters_scope(
+            wy_model,
+            cfg.context,
+            64 * 1024 * 1024,
+            MatvecBackend::Scalar,
+            KvCachePolicy::F16,
+            Some((r1_wy, 1.3)),
+            Some((mr_wy, 0.75)),
+        )?;
+        let wy_prefill = wy.tiled_prefill_scratch_bytes(8)?;
+        wy = wy
+            .with_tiled_prefill(8, wy_prefill)?
+            .with_chunkwise_gdn_prefill()?;
+
+        // Prompt prefill across multiple recurrent/full tokens must match sequential decode.
+        for token in [0, 1, 2] {
+            let _ = seq.evaluate(token)?;
+        }
+        let s_prompt = seq.evaluate(3)?;
+        tiled.ingest_block(&[0, 1, 2], &|| Ok(()))?;
+        let t_prompt = tiled.evaluate(3)?;
+        wy.ingest_block(&[0, 1, 2], &|| Ok(()))?;
+        let w_prompt = wy.evaluate(3)?;
+        assert_logits_bit_eq(&s_prompt, &t_prompt, "bonsai25 tiled prefill");
+        assert_eq!(s_prompt.len(), w_prompt.len());
+        for (idx, (a, b)) in s_prompt.iter().zip(&w_prompt).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4,
+                "bonsai25 wy-f32 prefill logit[{idx}] mismatch: {a} != {b}"
+            );
+        }
+
+        // Folded verification with stacked adapters matches sequential decode bit-for-bit.
+        let mut rows = Vec::new();
+        tiled.evaluate_verification_block_folded(&[], &[4, 5], &mut rows, &|| Ok(()))?;
+        let s4 = seq.evaluate(4)?;
+        let s5 = seq.evaluate(5)?;
+        assert_logits_bit_eq(&s4, &rows[0], "bonsai25 folded verify tok 4");
+        assert_logits_bit_eq(&s5, &rows[1], "bonsai25 folded verify tok 5");
+        tiled.commit_folded_verification(2)?;
+        tiled.flush_folded_verification(&|| Ok(()))?;
+        assert_full_state_bit_eq(&seq, &tiled)?;
+    }
+    Ok(())
+}

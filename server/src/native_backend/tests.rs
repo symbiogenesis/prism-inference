@@ -2888,6 +2888,12 @@ fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
     assert!(worker::supports_hexagon_native_q2_representation(
         Representation::CurrentRepackedPtq1
     ));
+    assert!(worker::supports_hexagon_native_q2_representation(
+        Representation::Bonsai25Pq2
+    ));
+    assert!(worker::supports_hexagon_native_q2_representation(
+        Representation::Bonsai25Ptq1
+    ));
     for nariq in [
         Representation::NariQ2_5Bpw,
         Representation::NariQ3_0Bpw,
@@ -2898,11 +2904,15 @@ fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
 
     let pq2_hex = Representation::Pq2.model_sha256();
     let ptq1_hex = Representation::CurrentRepackedPtq1.model_sha256();
+    let b25_pq2_hex = Representation::Bonsai25Pq2.model_sha256();
+    let b25_ptq1_hex = Representation::Bonsai25Ptq1.model_sha256();
     let pq2_digest = worker::decode_model_identity_sha256(pq2_hex);
     let ptq1_digest = worker::decode_model_identity_sha256(ptq1_hex);
     assert!(pq2_digest.is_some());
     assert!(ptq1_digest.is_some());
     assert_ne!(pq2_digest, ptq1_digest);
+    assert!(worker::decode_model_identity_sha256(b25_pq2_hex).is_some());
+    assert!(worker::decode_model_identity_sha256(b25_ptq1_hex).is_some());
     assert_eq!(worker::decode_model_identity_sha256("short"), None);
     assert_eq!(worker::decode_model_identity_sha256(&"zz".repeat(32)), None);
 
@@ -2916,11 +2926,28 @@ fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
         ptq1_hex,
         168,
     );
+    let b25_pq2_v81 = worker::hexagon_arena_cache_file_path(
+        root,
+        81,
+        Representation::Bonsai25Pq2,
+        b25_pq2_hex,
+        168,
+    );
+    let b25_ptq1_v81 = worker::hexagon_arena_cache_file_path(
+        root,
+        81,
+        Representation::Bonsai25Ptq1,
+        b25_ptq1_hex,
+        168,
+    );
     let pq2_v73 =
         worker::hexagon_arena_cache_file_path(root, 73, Representation::Pq2, pq2_hex, 168);
     let pq2_partial =
         worker::hexagon_arena_cache_file_path(root, 81, Representation::Pq2, pq2_hex, 84);
     assert_ne!(pq2_v81, ptq1_v81);
+    assert_ne!(pq2_v81, b25_pq2_v81);
+    assert_ne!(ptq1_v81, b25_ptq1_v81);
+    assert_ne!(b25_pq2_v81, b25_ptq1_v81);
     assert_ne!(pq2_v81, pq2_v73);
     assert_ne!(pq2_v81, pq2_partial);
 }
@@ -3071,6 +3098,61 @@ fn models_readiness_preserves_hexagon_and_ptq1_schema_keys() {
     assert_eq!(nariq_entry["supports_abliteration_scale"], false);
     assert_eq!(nariq_entry["adapter_sha256"], Value::Null);
     assert_eq!(nariq_entry["supports_daisyrose_scale"], true);
+}
+
+#[test]
+fn models_readiness_supports_bonsai25_pq2_and_ptq1_hexagon_orca_daisyrose_and_vision() {
+    use bonsai_prism_runtime::model::swift::{self, Representation};
+    use profile::ProjectionStartup;
+
+    for (repr, expected_id, expected_sha, expected_name) in [
+        (
+            Representation::Bonsai25Pq2,
+            "Ternary-Bonsai-2.5-27B-PQ2_0",
+            swift::BONSAI_2_5_PQ2_SHA256,
+            "Bonsai-2.5-PQ2_0",
+        ),
+        (
+            Representation::Bonsai25Ptq1,
+            "Ternary-Bonsai-2.5-27B-PTQ1_0",
+            swift::BONSAI_2_5_PTQ1_SHA256,
+            "Bonsai-2.5-PTQ1_0",
+        ),
+    ] {
+        let profile = ModelProfile {
+            placement: Placement::Auto,
+            projection_startup: ProjectionStartup::NativeQ2 {
+                resident_tensors: 168,
+                resident_weight_bytes: 2_888_663_040,
+                host_metadata_bytes: 8064,
+            },
+            representation: repr,
+            adapter: true,
+            daisyrose_adapter: true,
+            daisyrose_adapter_sha256: Some("ef".repeat(32).into()),
+            daisyrose_adapter_max_rank: Some(16),
+            vision: true,
+            image_max_tokens: Some(1_024),
+            ..ModelProfile::default()
+        };
+        let payload = profile.readiness(42);
+        let entry = &payload["data"][0];
+        assert_eq!(entry["id"], expected_id);
+        assert_eq!(entry["model_sha256"], expected_sha);
+        assert_eq!(entry["weight_representation"], expected_name);
+        assert_eq!(entry["supports_abliteration_scale"], true);
+        assert_eq!(
+            entry["adapter_sha256"],
+            bonsai_prism_runtime::model::lora::SWIFT_ADAPTER_SHA256
+        );
+        assert_eq!(entry["supports_daisyrose_scale"], true);
+        assert_eq!(entry["vision"], true);
+        assert_eq!(entry["mmproj_sha256"], swift::MMPROJ_SHA256);
+        assert_eq!(
+            entry["startup_projection"]["effective"],
+            "hexagon-native-q2"
+        );
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]

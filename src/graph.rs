@@ -3633,6 +3633,8 @@ impl Qwen35 {
             model.identity.as_str(),
             crate::model::swift::MODEL_SHA256
                 | crate::model::swift::REPACKED_PTQ1_SHA256
+                | crate::model::swift::BONSAI_2_5_PQ2_SHA256
+                | crate::model::swift::BONSAI_2_5_PTQ1_SHA256
                 | crate::model::swift::NARIQ_2_5BPW_SHA256
                 | crate::model::swift::NARIQ_3_0BPW_SHA256
                 | crate::model::swift::NARIQ_2_0BPW_SHA256

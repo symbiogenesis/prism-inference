@@ -373,6 +373,21 @@ pub fn complete_rich_with_timings(
     session.complete_rich_with_timings(&chat.prompt, cancellation, deadline, timings, emit)
 }
 
+/// Pre-ingest an admitted text prompt prefix into a reusable checkpoint without
+/// evaluating terminal output logits.
+///
+/// # Errors
+/// Rejects faulted admission, multimodal prompts, disabled checkpoint
+/// retention, cancellation, deadline expiration, and runtime errors.
+pub fn warm_prefix(
+    session: &mut SwiftSession,
+    chat: &NativeChat,
+    cancellation: &Cancellation,
+    deadline: impl Into<Option<Instant>>,
+) -> bonsai_prism_runtime::Result<usize> {
+    session.warm_prefix(&chat.prompt, cancellation, deadline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{classify_preparation_error, parse_adapter_scale, parse_adapter_scales};

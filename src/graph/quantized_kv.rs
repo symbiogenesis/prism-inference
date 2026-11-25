@@ -794,6 +794,13 @@ fn prepare_current(
 // Tile attention consumes the committed form of its current row, which must
 // have exactly the same interleaved per-head encoding as ordinary attention.
 // Reserve both append destinations before publishing either row.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Retained serial packed-KV append reference tested directly alongside parallel tile append."
+    )
+)]
 pub(super) fn prepare_tile_append(
     keys: &mut KvCache,
     values: &mut KvCache,
@@ -855,13 +862,6 @@ pub(super) fn prepare_tile_append_parallel(
     )
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "Reusable scratch entry point wired during prefill tile integration."
-    )
-)]
 pub(super) fn prepare_tile_append_parallel_with_scratch(
     keys: &mut KvCache,
     values: &mut KvCache,
@@ -1455,6 +1455,13 @@ fn assign_causal_balanced_items(
 /// Attend already encoded tile rows against their own causal prefixes using
 /// 2D `(token_pair, kv_head)` causal-cost-balanced partitioning and per-worker
 /// `2 * unit`-row score scratch.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Retained convenience entry point tested alongside attend_tile_with_scratch."
+    )
+)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Keep causal history, immutable prepared inputs and bounded tile scratch explicit."
@@ -1489,13 +1496,6 @@ pub(super) fn attend_tile(
     )
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "Reusable scratch entry point for prefill tile loops."
-    )
-)]
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1515,6 +1515,7 @@ pub(super) fn attend_tile_with_scratch(
     tile_scratch: &mut PackedTileScratch,
     parallelism: &RowParallelism,
 ) -> Result<()> {
+    const MAX_WORKER_SCORE_SCRATCH_BYTES: usize = 16 * 1024 * 1024;
     let result = (|| {
         let keys = keys
             .packed
@@ -1546,7 +1547,6 @@ pub(super) fn attend_tile_with_scratch(
         }
         let kv_heads = keys.heads;
         let heads_per_kv = heads / kv_heads;
-        let unit = grouped_head_unit(heads_per_kv, heads_per_kv);
         let ctx = TileContext {
             keys,
             values,
@@ -1566,11 +1566,15 @@ pub(super) fn attend_tile_with_scratch(
         let active_workers = total_items
             .min(parallelism.workers().max(1))
             .min(MAX_ROW_WORKERS);
-        let score_rows_per_worker = if count >= 2 {
-            checked_product(&[2, unit])?
-        } else {
-            unit
-        };
+        let pair_toks = if count >= 2 { 2 } else { 1 };
+        let max_score_elems = MAX_WORKER_SCORE_SCRATCH_BYTES / size_of::<f32>();
+        let row_denom = active_workers
+            .saturating_mul(pair_toks)
+            .saturating_mul(end)
+            .max(1);
+        let max_unit_rows = (max_score_elems / row_denom).clamp(1, heads_per_kv);
+        let unit = grouped_head_unit(heads_per_kv, max_unit_rows);
+        let score_rows_per_worker = checked_product(&[pair_toks, unit])?;
         let worker_score_len = checked_product(&[score_rows_per_worker, end])?;
         let reuse_caller_scores = scores.len() >= worker_score_len;
         let scratch_workers = if reuse_caller_scores {

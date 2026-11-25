@@ -3970,9 +3970,6 @@ impl Qwen35 {
     /// Explicit CPU tiles share this pool and keep cooperative cancellation on
     /// their calling thread while workers finish or stop before the next row.
     pub fn set_row_parallelism(&mut self, parallelism: RowParallelism) {
-        if let Some(tile) = &mut self.tiled_prefill {
-            tile.set_row_parallelism(parallelism.clone());
-        }
         self.workspace
             .adapter
             .set_row_parallelism(parallelism.clone());
@@ -3980,6 +3977,32 @@ impl Qwen35 {
             .projection
             .matvec
             .set_row_parallelism(parallelism);
+        if let Some(tile) = &mut self.tiled_prefill {
+            tile.set_row_parallelism(
+                self.workspace
+                    .projection
+                    .matvec
+                    .clone_prefill_row_parallelism(),
+            );
+        }
+    }
+
+    /// Sets a distinct persistent projection-worker policy for CPU tiled prompt prefill,
+    /// keeping decode at the configured [`Self::set_row_parallelism`] budget.
+    pub fn set_prefill_row_parallelism(&mut self, parallelism: RowParallelism) {
+        if let Some(tile) = &mut self.tiled_prefill {
+            tile.set_row_parallelism(parallelism.clone());
+        }
+        self.workspace
+            .projection
+            .matvec
+            .set_prefill_row_parallelism(parallelism);
+    }
+
+    /// Configured persistent projection-worker budget for CPU tiled prompt prefill.
+    #[must_use]
+    pub const fn prefill_row_workers(&self) -> usize {
+        self.workspace.projection.matvec.prefill_row_workers()
     }
 
     /// Configured packed-projection row-worker budget, serial by default.

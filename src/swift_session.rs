@@ -210,9 +210,9 @@ impl CpuPrefill {
     /// during loading. A larger caller reserve retains its full admission charge.
     ///
     /// # Errors
-    /// Rejects tile sizes other than 8, 16 or 32 and an empty scratch reserve.
+    /// Rejects tile sizes other than 8, 16, 32 or 64 and an empty scratch reserve.
     pub fn new(tokens: usize, scratch_bytes: usize) -> Result<Self> {
-        if !matches!(tokens, 8 | 16 | 32) || scratch_bytes == 0 {
+        if !matches!(tokens, 8 | 16 | 32 | 64) || scratch_bytes == 0 {
             return Err(invalid(
                 "invalid CPU tiled prefill selection or scratch reserve",
             ));
@@ -1602,6 +1602,56 @@ impl SwiftSession {
         self.runtime.decoder().clone_row_parallelism()
     }
 
+    /// Sets a distinct persistent projection-worker policy for CPU tiled prompt
+    /// prefill without altering the batch-1 decode worker budget.
+    pub fn set_prefill_row_parallelism(&mut self, parallelism: RowParallelism) {
+        self.runtime
+            .decoder_mut()
+            .set_prefill_row_parallelism(parallelism);
+    }
+
+    /// Configured persistent projection-worker budget for CPU tiled prompt prefill.
+    #[must_use]
+    pub const fn prefill_row_workers(&self) -> usize {
+        self.runtime.decoder().prefill_row_workers()
+    }
+
+    /// Whether idle prefix warming is admitted by retained checkpoint capacity.
+    #[must_use]
+    pub const fn supports_warm(&self) -> bool {
+        self.runtime.limits().checkpoints > 0
+    }
+
+    /// Pre-ingest a text prompt prefix into a reusable checkpoint without
+    /// evaluating terminal output logits.
+    ///
+    /// # Errors
+    /// Rejects faulted admission, multimodal prompts, mismatched owners or
+    /// adapter scales, disabled checkpoint retention, cancellation, deadline
+    /// expiration, and underlying runtime errors.
+    pub fn warm_prefix(
+        &mut self,
+        prompt: &PreparedChat,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+    ) -> Result<usize> {
+        let deadline = deadline.into();
+        if !prompt.media_chunks.is_empty() {
+            return Err(invalid(
+                "prefix warm does not support multimodal image prompts",
+            ));
+        }
+        self.prepare_completion_prompt(prompt, cancellation, deadline)?;
+        self.runtime.prefill_with_prefix_boundary_until(
+            &prompt.tokens,
+            Prefill {
+                block_tokens: self.cpu_prefill.map_or(64, CpuPrefill::tokens),
+            },
+            cancellation,
+            deadline,
+        )
+    }
+
     /// Look up a named projection tensor in the underlying decoder graph.
     #[must_use]
     pub fn projection_tensor(&self, name: &str) -> Option<&crate::model::Tensor> {
@@ -2770,7 +2820,7 @@ mod tests {
         let context = 8_192;
         let base = NON_CONTEXT_MEMORY_BYTES + u64::try_from(context)? * CONTEXT_TOKEN_MEMORY_BYTES;
         validate_prefill_capacity(context, base, None)?;
-        for tokens in [8, 16, 32] {
+        for tokens in [8, 16, 32, 64] {
             let selected = CpuPrefill::new(tokens, reserve)?;
             assert_eq!(selected.tokens(), tokens);
             assert_eq!(selected.scratch_bytes(), reserve);
@@ -2784,7 +2834,7 @@ mod tests {
                 .is_err()
             );
         }
-        for tokens in [0, 1, 4, 7, 9, 64, usize::MAX] {
+        for tokens in [0, 1, 4, 7, 9, 128, usize::MAX] {
             assert!(CpuPrefill::new(tokens, reserve).is_err());
         }
         assert!(CpuPrefill::new(8, 0).is_err());

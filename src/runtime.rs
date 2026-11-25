@@ -609,6 +609,16 @@ impl<D: Decoder> Runtime<D> {
         &self.decoder
     }
 
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) const fn decoder_mut(&mut self) -> &mut D {
+        &mut self.decoder
+    }
+
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) const fn limits(&self) -> Limits {
+        self.limits
+    }
+
     /// Whether failed backend restoration or reset requires a successful reset.
     #[must_use]
     pub const fn is_faulted(&self) -> bool {
@@ -837,12 +847,34 @@ impl<D: Decoder> Runtime<D> {
         prefill: Prefill,
         cancellation: &Cancellation,
     ) -> Result<usize> {
+        self.prefill_with_prefix_boundary_checked(prefix, prefill, &|| cancellation.check())
+    }
+
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn prefill_with_prefix_boundary_until(
+        &mut self,
+        prefix: &[u32],
+        prefill: Prefill,
+        cancellation: &Cancellation,
+        deadline: impl Into<Option<Instant>>,
+    ) -> Result<usize> {
+        let deadline = deadline.into();
+        self.prefill_with_prefix_boundary_checked(prefix, prefill, &|| {
+            check_deadline(cancellation, deadline, Instant::now())
+        })
+    }
+
+    fn prefill_with_prefix_boundary_checked(
+        &mut self,
+        prefix: &[u32],
+        prefill: Prefill,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<usize> {
         if self.faulted {
             return Err(invalid(
                 "native runtime requires reset after failed restoration",
             ));
         }
-        let check = || cancellation.check();
         check()?;
         if prefix.is_empty()
             || prefix.len() > self.limits.context_tokens
@@ -857,10 +889,10 @@ impl<D: Decoder> Runtime<D> {
                 "invalid prefix-boundary bounds, token IDs, or checkpoint policy",
             ));
         }
-        let rollback = self.capture_transient(0, &check)?;
+        let rollback = self.capture_transient(0, check)?;
         let result = (|| -> Result<(usize, Option<Snapshot<D::Checkpoint>>)> {
             let (reused, _) =
-                self.prepare_with_spans_for_boundary(prefix, &[], false, None, &check)?;
+                self.prepare_with_spans_for_boundary(prefix, &[], false, None, check)?;
             let remaining = prefix.len() - reused;
             self.decoder.admit_work(remaining, 0)?;
             check()?;
@@ -879,7 +911,7 @@ impl<D: Decoder> Runtime<D> {
                 prefill,
                 &mut None,
                 &mut boundary_capture,
-                &check,
+                check,
             )?;
             check()?;
             let already_cached = self
@@ -889,7 +921,7 @@ impl<D: Decoder> Runtime<D> {
             let snapshot = if already_cached {
                 None
             } else {
-                let captured = self.capture_reusable(rollback.bytes, &check).ok();
+                let captured = self.capture_reusable(rollback.bytes, check).ok();
                 check()?;
                 captured
             };

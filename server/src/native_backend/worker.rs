@@ -214,6 +214,34 @@ impl Engine for SwiftSession {
     fn reset(&mut self) -> bonsai_prism_runtime::Result<()> {
         Self::reset(self)
     }
+    fn set_prefill_row_parallelism(
+        &mut self,
+        parallelism: bonsai_prism_runtime::kernels::RowParallelism,
+    ) {
+        Self::set_prefill_row_parallelism(self, parallelism);
+    }
+    fn prefill_row_workers(&self) -> Option<usize> {
+        Some(Self::prefill_row_workers(self))
+    }
+    fn supports_warm(&self) -> bool {
+        Self::supports_warm(self)
+    }
+    fn warm_prefix(
+        &mut self,
+        prepared: &Self::Prepared,
+        cancel: &Cancellation,
+        deadline: Option<Instant>,
+    ) -> Result<usize, NativeBackendError> {
+        check_deadline_or_cancel(cancel, deadline)?;
+        if !Self::supports_warm(self) {
+            return Err(NativeBackendError::Configuration);
+        }
+        crate::native_swift::warm_prefix(self, prepared, cancel, deadline).map_err(|_| {
+            check_deadline_or_cancel(cancel, deadline)
+                .err()
+                .unwrap_or(NativeBackendError::Engine)
+        })
+    }
     fn initialize_worker_thread(&mut self) -> Result<ProjectionStartup, NativeBackendError> {
         initialize_auto_executor(self, None)
     }

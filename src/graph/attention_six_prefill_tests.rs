@@ -833,6 +833,7 @@ fn six_head_attend_tile_balanced_matches_oracle_0_ulp_across_tokens_and_workers(
                         &fixture.current_keys,
                         &fixture.current_values,
                         &mut attended,
+                        &mut [],
                         0.125,
                         &mut scratch,
                         pool,

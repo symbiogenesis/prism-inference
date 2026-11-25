@@ -585,15 +585,7 @@ fn parse_prefill(
                 .ok_or_else(invalid)?
                 .parse::<usize>()
                 .map_err(|_| invalid())?;
-            let prefill = match CpuPrefill::new(tokens, scratch) {
-                Ok(prefill) => prefill,
-                Err(_) if tokens == 64 => {
-                    // Validate paired scratch admission for 64-token tiles cleanly
-                    // until P1/P2 integration raises `CpuPrefill::new`'s ceiling to 64.
-                    CpuPrefill::new(32, scratch).map_err(|_| invalid())?
-                }
-                Err(_) => return Err(invalid()),
-            };
+            let prefill = CpuPrefill::new(tokens, scratch).map_err(|_| invalid())?;
             let prefill = if chunkwise_gdn == Some(true) {
                 prefill.with_chunkwise_gdn()
             } else {

@@ -165,6 +165,15 @@ mod platform {
             Decoder::ingest_block(&mut inner.executor, tokens, check)
         }
 
+        fn ingest_block_and_evaluate_last_into(
+            &mut self,
+            tokens: &[u32],
+            output: &mut Vec<f32>,
+            check: &dyn Fn() -> RuntimeResult<()>,
+        ) -> RuntimeResult<()> {
+            Self::ingest_block_and_evaluate_last_into(self, tokens, output, check)
+        }
+
         fn batched_evaluation_capacity(&self) -> usize {
             self.shared.try_borrow().map_or(0, |inner| {
                 Decoder::batched_evaluation_capacity(&inner.executor)
@@ -210,10 +219,6 @@ mod platform {
     }
 
     impl VulkanBatchedDecoder {
-        #[expect(
-            dead_code,
-            reason = "Staged fused block-prefill + final-token logits helper ready to hook into Decoder integration."
-        )]
         pub(super) fn ingest_block_and_evaluate_last_into(
             &self,
             tokens: &[u32],
@@ -423,38 +428,6 @@ mod platform {
         #[must_use]
         pub(crate) const fn seed(&self) -> u32 {
             self.seed
-        }
-
-        /// Ingests `tokens` through the worker-thread Vulkan executor and writes final-token
-        /// logits into `output`, clearing `output` on error.
-        ///
-        /// Staged helper ready to hook into [`Decoder`] batched prefill integration.
-        #[expect(
-            dead_code,
-            reason = "Staged fused block-prefill + final-token logits helper ready to hook into Decoder integration."
-        )]
-        pub(crate) fn ingest_block_and_evaluate_last_into(
-            &self,
-            tokens: &[u32],
-            output: &mut Vec<f32>,
-            check: &dyn Fn() -> RuntimeResult<()>,
-        ) -> RuntimeResult<()> {
-            output.clear();
-            if self.is_faulted() {
-                return Err(runtime_invalid("Vulkan Swift session requires reset"));
-            }
-            check()?;
-            WORKER_VULKAN_RUNTIME.with_borrow(|slot| {
-                let runtime = slot.as_ref().ok_or_else(|| {
-                    runtime_invalid("Vulkan batched runtime is not initialized on worker thread")
-                })?;
-                if runtime.is_faulted() {
-                    return Err(runtime_invalid("Vulkan batched runtime requires reset"));
-                }
-                runtime
-                    .decoder()
-                    .ingest_block_and_evaluate_last_into(tokens, output, check)
-            })
         }
 
         #[must_use]
@@ -1151,7 +1124,6 @@ mod platform {
         MultiRankAdapterSpec, NativeBackendError, Path, PendingChat, Placement, ProjectionStartup,
         PromptReuse, Representation, TextEvent, WorkerOptions,
     };
-    use bonsai_prism_runtime::Result as RuntimeResult;
 
     pub(in super::super) struct VulkanPreparedChat {
         admitted: AdmittedChat,
@@ -1190,25 +1162,6 @@ mod platform {
         #[must_use]
         pub(crate) const fn seed(&self) -> u32 {
             0
-        }
-
-        #[expect(
-            dead_code,
-            clippy::missing_const_for_fn,
-            reason = "Non-Windows stub matches the Windows VulkanSwiftSession helper signature."
-        )]
-        pub(crate) fn ingest_block_and_evaluate_last_into(
-            &self,
-            _tokens: &[u32],
-            output: &mut Vec<f32>,
-            _check: &dyn Fn() -> RuntimeResult<()>,
-        ) -> RuntimeResult<()> {
-            output.clear();
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Adreno Vulkan batched session requires Windows",
-            )
-            .into())
         }
     }
 

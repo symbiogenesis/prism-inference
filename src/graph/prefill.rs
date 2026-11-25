@@ -99,6 +99,8 @@ pub(super) struct TiledPrefill {
     gdn_conv_outputs: Vec<f32>,
     gdn_head_outputs: Vec<f32>,
     gdn_key_dots: Vec<f32>,
+    packed_kv: super::quantized_kv::PackedTileScratch,
+    six_head: super::attention_six::SixHeadTileScratch,
     chunkwise_gdn: bool,
     verification: bool,
     folded: Option<FoldedVerificationState>,
@@ -228,6 +230,8 @@ impl TiledPrefill {
             gdn_conv_outputs: Vec::new(),
             gdn_head_outputs: Vec::new(),
             gdn_key_dots: Vec::new(),
+            packed_kv: super::quantized_kv::PackedTileScratch::default(),
+            six_head: super::attention_six::SixHeadTileScratch::default(),
             chunkwise_gdn: false,
             verification: false,
             folded: None,
@@ -354,7 +358,10 @@ impl Qwen35 {
                 .max(self.geometry.kv_width()),
             required,
             self.requested_backend(),
-            self.workspace.projection.matvec.clone_row_parallelism(),
+            self.workspace
+                .projection
+                .matvec
+                .clone_prefill_row_parallelism(),
         )?;
         let suffix = format!(":cpu-tiled-ffn-v1:{tokens}");
         self.identity.try_reserve_exact(suffix.len())?;
@@ -3542,21 +3549,19 @@ fn full_attention_tile(
         return Err(error);
     }
     if keys.packed.is_some() || values.packed.is_some() {
-        // Preserve ordinary per-head key/value encoding order. Every append
-        // remains provisional to the layer-major attempt and participates in
-        // the existing whole-request checkpoint/rollback contract.
-        for index in 0..count {
-            check()?;
-            super::quantized_kv::prepare_tile_append(
-                keys,
-                values,
-                &tile.recurrent_gate[index],
-                &tile.beta[index],
-            )?;
-            keys.append(&tile.recurrent_gate[index]);
-            values.append(&tile.beta[index]);
-            check()?;
-        }
+        // Encode rotated/quantized K/V rows in parallel and commit pages in
+        // exact token order. Every append remains provisional to the
+        // layer-major attempt and whole-request checkpoint/rollback contract.
+        check()?;
+        super::quantized_kv::prepare_tile_append_parallel_with_scratch(
+            keys,
+            values,
+            &tile.recurrent_gate[..count],
+            &tile.beta[..count],
+            &mut tile.packed_kv,
+            tile.projector.row_parallelism(),
+        )?;
+        check()?;
         let score_stride = base + count;
         resize_attention_scores(
             count,
@@ -3564,7 +3569,7 @@ fn full_attention_tile(
             keys.maximum / keys.width,
             &mut attention_scratch.scores,
         )?;
-        super::quantized_kv::attend_tile(
+        super::quantized_kv::attend_tile_with_scratch(
             keys,
             values,
             &tile.up[..count],
@@ -3575,6 +3580,7 @@ fn full_attention_tile(
             g.heads,
             1.0 / small_float(g.head)?.sqrt(),
             arithmetic,
+            &mut tile.packed_kv,
             tile.projector.row_parallelism(),
         )?;
         check()?;
@@ -3604,6 +3610,23 @@ fn full_attention_tile(
         keys.maximum / keys.width,
         &mut attention_scratch.scores,
     )?;
+    if six_head_groups && count > 1 && workers > 1 {
+        return super::attention_six::attend_tile_balanced_with_scratch(
+            g,
+            base,
+            &tile.up[..count],
+            &tile.mixed[..count],
+            keys,
+            values,
+            &tile.recurrent_gate[..count],
+            &tile.beta[..count],
+            &mut tile.attended[..count],
+            &mut attention_scratch.scores,
+            scale,
+            &mut tile.six_head,
+            tile.projector.row_parallelism(),
+        );
+    }
     if count < workers && g.kv_heads > 1 {
         let n_chunks = select_2d_attention_chunks(count, g.kv_heads, workers);
         let max_chunk_tokens = count.div_ceil(n_chunks);

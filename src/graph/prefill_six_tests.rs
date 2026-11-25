@@ -282,11 +282,12 @@ fn packed_production_prefill_cancellation_restores_full_state_before_reuse() -> 
     let original_keys = actual.tile.recurrent_gate.clone();
     let original_values = actual.tile.beta.clone();
     let calls = Cell::new(0);
+    // Cancel after parallel provisional KV encoding/append and before packed attention.
     assert!(
         actual
             .run(Arithmetic::PinnedSwift, &|| {
                 calls.set(calls.get() + 1);
-                if calls.get() == 5 {
+                if calls.get() == 3 {
                     Err(invalid("cancelled packed production prefill"))
                 } else {
                     Ok(())
@@ -294,7 +295,7 @@ fn packed_production_prefill_cancellation_restores_full_state_before_reuse() -> 
             })
             .is_err()
     );
-    assert_eq!(calls.get(), 5);
+    assert_eq!(calls.get(), 3);
     assert!(actual.keys.len > saved_keys.len);
     assert!(actual.values.len > saved_values.len);
     actual.keys = saved_keys;

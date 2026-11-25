@@ -579,6 +579,13 @@ fn validate_tile_inputs(
 // Each caller worker owns complete token rows and its six-head score storage.
 // Keep the cache owner immutable and reuse one six-head group at a time rather
 // than falling back to two independent tail heads in Swift's 6:1 GQA geometry.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Retained reference chunk kernel tested directly alongside balanced dispatch."
+    )
+)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Paired causal scoring and publication retain borrowed token rows, exact extents and caller-owned score storage."
@@ -677,6 +684,13 @@ pub(super) fn attend_tile_chunk(
 /// # Errors
 /// Rejects malformed geometry, out-of-range group heads, oversized chunks, and
 /// nonfinite causal reductions before returning.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Retained reference KV-group kernel tested directly alongside balanced dispatch."
+    )
+)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Disjoint 2D (token_chunk, kv_head) prefill tasks borrow immutable prompt slices and write disjoint output/score slices."
@@ -766,13 +780,6 @@ pub(super) fn attend_tile_kv_group(
 
 /// Reusable scratch storage for causal-cost-balanced 2D `(token_pair, kv_head)`
 /// six-head FP16 prefill tile attention.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "Wired into tiled FP16 prefill during integration and tested across worker counts."
-    )
-)]
 #[derive(Default)]
 pub(super) struct SixHeadTileScratch {
     kv_major_outputs: Vec<f32>,
@@ -1039,6 +1046,7 @@ pub(super) fn attend_tile_balanced(
         current_keys,
         current_values,
         attended,
+        &mut [],
         scale,
         &mut scratch,
         parallelism,
@@ -1047,13 +1055,6 @@ pub(super) fn attend_tile_balanced(
 
 /// Evaluates all six-head KV groups across a prefill tile with reusable scratch storage
 /// and causal-cost-balanced 2D `(token_pair, kv_head)` worker scheduling.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "Reusable scratch entry point for causal-balanced FP16 tiled prefill."
-    )
-)]
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1069,6 +1070,7 @@ pub(super) fn attend_tile_balanced_with_scratch(
     current_keys: &[Vec<f32>],
     current_values: &[Vec<f32>],
     attended: &mut [Vec<f32>],
+    caller_scores: &mut [f32],
     scale: f32,
     tile_scratch: &mut SixHeadTileScratch,
     parallelism: &RowParallelism,
@@ -1104,8 +1106,11 @@ pub(super) fn attend_tile_balanced_with_scratch(
         } else {
             score_stride
         };
+        let caller_worker_slots = caller_scores.len() / worker_score_len;
+        let reused_active_workers = caller_worker_slots.min(active_workers);
+        let scratch_active_workers = active_workers - reused_active_workers;
         resize_balanced_f32s(
-            checked_product(&[active_workers, worker_score_len])?,
+            checked_product(&[scratch_active_workers, worker_score_len])?,
             &mut tile_scratch.worker_scores,
         )?;
         if tile_scratch.packed_scratch.len() < active_workers {
@@ -1131,7 +1136,11 @@ pub(super) fn attend_tile_balanced_with_scratch(
 
         if active_workers == 1 {
             let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
-            let worker_scores = &mut tile_scratch.worker_scores[..worker_score_len];
+            let worker_scores = if reused_active_workers == 1 {
+                &mut caller_scores[..worker_score_len]
+            } else {
+                &mut tile_scratch.worker_scores[..worker_score_len]
+            };
             let packed = &mut tile_scratch.packed_scratch[0];
             let mut earliest: Option<(usize, usize, Error)> = None;
             for u in 0..num_token_units {
@@ -1228,15 +1237,28 @@ pub(super) fn attend_tile_balanced_with_scratch(
             let mut tasks: [Option<BalancedWorkerTask<'_>>; MAX_ROW_WORKERS] =
                 std::array::from_fn(|_| None);
             let mut rem_ordered = ordered.as_mut_slice();
-            let mut rem_scores = &mut tile_scratch.worker_scores[..used_workers * worker_score_len];
+            let used_reused_workers = caller_worker_slots.min(used_workers);
+            let used_scratch_workers = used_workers - used_reused_workers;
+            let mut rem_caller_scores =
+                &mut caller_scores[..used_reused_workers * worker_score_len];
+            let mut rem_scores =
+                &mut tile_scratch.worker_scores[..used_scratch_workers * worker_score_len];
             let mut rem_packed = &mut tile_scratch.packed_scratch[..used_workers];
             for (worker, task) in tasks[..used_workers].iter_mut().enumerate() {
                 let (item_chunk, item_tail) =
                     std::mem::take(&mut rem_ordered).split_at_mut(counts[worker]);
                 rem_ordered = item_tail;
-                let (score_chunk, score_tail) =
-                    std::mem::take(&mut rem_scores).split_at_mut(worker_score_len);
-                rem_scores = score_tail;
+                let score_chunk = if worker < used_reused_workers {
+                    let (chunk, score_tail) =
+                        std::mem::take(&mut rem_caller_scores).split_at_mut(worker_score_len);
+                    rem_caller_scores = score_tail;
+                    chunk
+                } else {
+                    let (chunk, score_tail) =
+                        std::mem::take(&mut rem_scores).split_at_mut(worker_score_len);
+                    rem_scores = score_tail;
+                    chunk
+                };
                 let (packed_pair, packed_tail) =
                     std::mem::take(&mut rem_packed).split_at_mut(1);
                 rem_packed = packed_tail;

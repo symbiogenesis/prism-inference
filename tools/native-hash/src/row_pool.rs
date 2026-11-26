@@ -55,18 +55,22 @@ unsafe impl Sync for Job {}
 struct JobSlot(UnsafeCell<Option<Job>>);
 
 // SAFETY: Access to `JobSlot` is strictly serialized: the caller writes under
-// `dispatch_lock` + `state_lock` before advancing `generation` (`Release`), and
-// workers only read after observing the new `generation` (`Acquire`) and exit
-// before decrementing `pending_workers` (`Release`) prior to `ScopeGuard` exit.
+// `dispatch_lock` before advancing `dispatch_state` (`SeqCst`), and workers only
+// read after observing the new generation (`Acquire`/`SeqCst`) and exit before
+// decrementing `pending_workers` (`Release`) prior to `ScopeGuard` exit.
 unsafe impl Send for JobSlot {}
 
 // SAFETY: Workers only perform shared reads of `Job` while `pending_workers > 0`.
 unsafe impl Sync for JobSlot {}
 
+struct WorkerSleep {
+    lock: Mutex<()>,
+    cv: Condvar,
+    sleeping: AtomicBool,
+}
+
 struct Shared {
     dispatch_lock: Mutex<()>,
-    state_lock: Mutex<()>,
-    wake_workers: Condvar,
     done_lock: Mutex<()>,
     done_cv: Condvar,
     dispatch_state: CachePadded<AtomicU64>,
@@ -77,6 +81,7 @@ struct Shared {
     shutdown: CachePadded<AtomicBool>,
     panicked: CachePadded<AtomicBool>,
     worker_panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
+    worker_sleeps: Box<[CachePadded<WorkerSleep>]>,
     job: CachePadded<JobSlot>,
 }
 
@@ -233,10 +238,22 @@ impl NativeRowPool {
                 "Row worker pool exceeds supported background worker limit.",
             ));
         }
+        let bg_workers = worker_count - 1;
+        let mut worker_sleeps = Vec::new();
+        if bg_workers > 0 {
+            worker_sleeps
+                .try_reserve_exact(bg_workers)
+                .map_err(|_| io::Error::other("Failed to reserve row worker wake states."))?;
+            for _ in 0..bg_workers {
+                worker_sleeps.push(CachePadded::new(WorkerSleep {
+                    lock: Mutex::new(()),
+                    cv: Condvar::new(),
+                    sleeping: AtomicBool::new(false),
+                }));
+            }
+        }
         let shared = Arc::new(Shared {
             dispatch_lock: Mutex::new(()),
-            state_lock: Mutex::new(()),
-            wake_workers: Condvar::new(),
             done_lock: Mutex::new(()),
             done_cv: Condvar::new(),
             dispatch_state: CachePadded::new(AtomicU64::new(0)),
@@ -247,10 +264,10 @@ impl NativeRowPool {
             shutdown: CachePadded::new(AtomicBool::new(false)),
             panicked: CachePadded::new(AtomicBool::new(false)),
             worker_panic: Mutex::new(None),
+            worker_sleeps: worker_sleeps.into_boxed_slice(),
             job: CachePadded::new(JobSlot(UnsafeCell::new(None))),
         });
 
-        let bg_workers = worker_count - 1;
         let mut workers = Vec::new();
         if bg_workers > 0 {
             workers
@@ -262,7 +279,7 @@ impl NativeRowPool {
                 let spawn_result = thread::Builder::new()
                     .name(format!("prism-row-{index}"))
                     .stack_size(WORKER_STACK_BYTES)
-                    .spawn(move || worker_loop(&worker_shared));
+                    .spawn(move || worker_loop(&worker_shared, index));
                 match spawn_result {
                     Ok(handle) => workers.push(handle),
                     Err(error) => {
@@ -333,28 +350,16 @@ impl NativeRowPool {
                 .pending_workers
                 .store(needed_bg, Ordering::Release);
             let prev_state = self.shared.dispatch_state.load(Ordering::Relaxed);
-            let next_gen = ((prev_state >> SLOT_BITS).wrapping_add(1)) & GEN_MASK;
-            let slots = u64::try_from(needed_bg).unwrap_or(SLOT_MASK);
+            let mut next_gen = ((prev_state >> SLOT_BITS).wrapping_add(1)) & GEN_MASK;
+            if next_gen == 0 {
+                next_gen = 1;
+            }
+            let active = u64::try_from(needed_bg).unwrap_or(SLOT_MASK);
             self.shared
                 .dispatch_state
-                .store((next_gen << SLOT_BITS) | slots, Ordering::SeqCst);
+                .store((next_gen << SLOT_BITS) | active, Ordering::SeqCst);
             if self.shared.sleeping_workers.load(Ordering::SeqCst) != 0 {
-                let _state_guard = self
-                    .shared
-                    .state_lock
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let remaining =
-                    usize::try_from(self.shared.dispatch_state.load(Ordering::SeqCst) & SLOT_MASK)
-                        .unwrap_or(needed_bg);
-                let sleeping = self.shared.sleeping_workers.load(Ordering::SeqCst);
-                if remaining >= sleeping {
-                    self.shared.wake_workers.notify_all();
-                } else {
-                    for _ in 0..remaining {
-                        self.shared.wake_workers.notify_one();
-                    }
-                }
+                wake_sleeping_workers(&self.shared.worker_sleeps[..needed_bg]);
             }
         }
 
@@ -432,58 +437,59 @@ impl Drop for NativeRowPool {
     }
 }
 
+fn wake_sleeping_workers(sleeps: &[CachePadded<WorkerSleep>]) {
+    for ws in sleeps {
+        if ws.sleeping.load(Ordering::SeqCst) {
+            let _guard = ws.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            ws.cv.notify_one();
+        }
+    }
+}
+
 fn shutdown_workers(shared: &Shared, workers: &mut Vec<JoinHandle<()>>) {
     if workers.is_empty() {
         return;
     }
     shared.shutdown.store(true, Ordering::SeqCst);
     if shared.sleeping_workers.load(Ordering::SeqCst) != 0 {
-        let _guard = shared
-            .state_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        shared.wake_workers.notify_all();
+        wake_sleeping_workers(&shared.worker_sleeps);
     }
     for handle in workers.drain(..) {
         let _ = handle.join();
     }
 }
 
-fn try_claim_slot(dispatch_state: &AtomicU64, seen_generation: &mut u64) -> bool {
-    loop {
-        let current = dispatch_state.load(Ordering::Acquire);
-        let generation = current >> SLOT_BITS;
-        if generation == *seen_generation {
-            return false;
-        }
-        let slots = current & SLOT_MASK;
-        if slots == 0 {
-            *seen_generation = generation;
-            return false;
-        }
-        let next = (generation << SLOT_BITS) | (slots - 1);
-        if dispatch_state
-            .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            *seen_generation = generation;
-            return true;
-        }
+fn check_generation(
+    dispatch_state: &AtomicU64,
+    worker_id: usize,
+    seen_generation: &mut u64,
+    ordering: Ordering,
+) -> bool {
+    let current = dispatch_state.load(ordering);
+    let generation = current >> SLOT_BITS;
+    if generation == *seen_generation {
+        return false;
     }
+    *seen_generation = generation;
+    let active = usize::try_from(current & SLOT_MASK).unwrap_or(usize::MAX);
+    worker_id < active
 }
 
-fn worker_loop(shared: &Shared) {
+fn worker_loop(shared: &Shared, worker_id: usize) {
     let mut seen_generation = 0_u64;
+    let ws = &shared.worker_sleeps[worker_id];
     loop {
         let mut spins = 0_u32;
         loop {
             if shared.shutdown.load(Ordering::Acquire) {
                 return;
             }
-            let current = shared.dispatch_state.load(Ordering::Acquire);
-            if (current >> SLOT_BITS) != seen_generation
-                && try_claim_slot(&shared.dispatch_state, &mut seen_generation)
-            {
+            if check_generation(
+                &shared.dispatch_state,
+                worker_id,
+                &mut seen_generation,
+                Ordering::Acquire,
+            ) {
                 break;
             }
             if spins < SPIN_ITERATIONS {
@@ -491,28 +497,27 @@ fn worker_loop(shared: &Shared) {
                 spins += 1;
                 continue;
             }
-            let mut guard = shared
-                .state_lock
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut guard = ws.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            ws.sleeping.store(true, Ordering::SeqCst);
             shared.sleeping_workers.fetch_add(1, Ordering::SeqCst);
             loop {
                 if shared.shutdown.load(Ordering::SeqCst) {
+                    ws.sleeping.store(false, Ordering::Release);
                     shared.sleeping_workers.fetch_sub(1, Ordering::Release);
                     drop(guard);
                     return;
                 }
-                let current = shared.dispatch_state.load(Ordering::SeqCst);
-                if (current >> SLOT_BITS) != seen_generation
-                    && try_claim_slot(&shared.dispatch_state, &mut seen_generation)
-                {
+                if check_generation(
+                    &shared.dispatch_state,
+                    worker_id,
+                    &mut seen_generation,
+                    Ordering::SeqCst,
+                ) {
                     break;
                 }
-                guard = shared
-                    .wake_workers
-                    .wait(guard)
-                    .unwrap_or_else(PoisonError::into_inner);
+                guard = ws.cv.wait(guard).unwrap_or_else(PoisonError::into_inner);
             }
+            ws.sleeping.store(false, Ordering::Release);
             shared.sleeping_workers.fetch_sub(1, Ordering::Release);
             drop(guard);
             break;

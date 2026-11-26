@@ -149,6 +149,11 @@ pub trait Q8ActivationView {
     fn scale(&self) -> f32;
     /// Returns the group's 32 signed quantization codes in source order.
     fn values(&self) -> &[i8; 32];
+    /// Returns a direct reference to the group's `f32` scale when stored in-struct.
+    #[inline]
+    fn scale_ref(&self) -> Option<&f32> {
+        None
+    }
 }
 
 impl Q8ActivationView for Q8ActivationBlock {
@@ -160,6 +165,11 @@ impl Q8ActivationView for Q8ActivationBlock {
     #[inline]
     fn values(&self) -> &[i8; 32] {
         &self.values
+    }
+
+    #[inline]
+    fn scale_ref(&self) -> Option<&f32> {
+        Some(&self.scale)
     }
 }
 
@@ -173,6 +183,11 @@ impl Q8ActivationView for (&[i8; 32], f32) {
     fn values(&self) -> &[i8; 32] {
         self.0
     }
+
+    #[inline]
+    fn scale_ref(&self) -> Option<&f32> {
+        Some(&self.1)
+    }
 }
 
 impl<T: Q8ActivationView + ?Sized> Q8ActivationView for &T {
@@ -184,6 +199,11 @@ impl<T: Q8ActivationView + ?Sized> Q8ActivationView for &T {
     #[inline]
     fn values(&self) -> &[i8; 32] {
         (*self).values()
+    }
+
+    #[inline]
+    fn scale_ref(&self) -> Option<&f32> {
+        (*self).scale_ref()
     }
 }
 
@@ -416,16 +436,33 @@ pub(super) fn valid_ptq1_8x8_chunks<A: Q8ActivationView>(
             .all(|tok| tok.len() == len && tok.iter().all(|block| block.scale().is_finite()))
 }
 
-pub(super) fn valid_q8_0_rows<const ROWS: usize, A: Q8ActivationView>(
-    rows: [&[u8]; ROWS],
-    activation: &[A],
-) -> bool {
+pub(super) fn valid_q8_0_activation<A: Q8ActivationView>(activation: &[A]) -> Option<usize> {
     let block_count = activation.len();
+    if block_count == 0
+        || block_count.checked_mul(34).is_none()
+        || !activation.iter().all(|block| block.scale().is_finite())
+    {
+        return None;
+    }
+    Some(block_count)
+}
+
+pub(super) fn valid_q8_0_rows_count<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    block_count: usize,
+) -> bool {
     matches!(ROWS, 1 | 4 | 8 | 16)
         && block_count != 0
         && block_count
             .checked_mul(34)
             .is_some_and(|bytes| rows.iter().all(|row| row.len() == bytes))
+}
+
+pub(super) fn valid_q8_0_rows<const ROWS: usize, A: Q8ActivationView>(
+    rows: [&[u8]; ROWS],
+    activation: &[A],
+) -> bool {
+    valid_q8_0_rows_count(rows, activation.len())
         && activation.iter().all(|block| block.scale().is_finite())
 }
 
@@ -2471,6 +2508,53 @@ mod tests {
                 exp16
             );
         }
+    }
+
+    #[test]
+    fn x1_q8_0_prepared_matches_portable_zero_ulp() -> Result<(), &'static str> {
+        use super::portable_q8_0_rows_validated;
+
+        let Some(detected) = crate::Q8Dotprod::detect() else {
+            return Ok(());
+        };
+        for (seed, block_count) in [1_usize, 2, 3, 17, 32].into_iter().enumerate() {
+            let (rows, mut acts) = sample_q8_0_rows16_fixture(block_count, seed + 31);
+            let act_views: Vec<(&[i8; 32], f32)> =
+                acts.iter().map(|b| (&b.values, b.scale)).collect();
+            let r1 = [rows[0].as_slice()];
+            let r4: [&[u8]; 4] = std::array::from_fn(|r| rows[r].as_slice());
+            let r8: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+            let r16: [&[u8]; 16] = std::array::from_fn(|r| rows[r].as_slice());
+            let prep = detected
+                .prepare_scaled(&acts)
+                .ok_or("valid Q8_0 acts must prepare")?;
+            assert_eq!(
+                prep.dot_scaled_rows(r1).map(|v| v.map(f32::to_bits)),
+                portable_q8_0_rows_validated(r1, &acts).map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prep.dot_scaled_rows(r4).map(|v| v.map(f32::to_bits)),
+                portable_q8_0_rows_validated(r4, &acts).map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prep.dot_scaled_rows(r8).map(|v| v.map(f32::to_bits)),
+                portable_q8_0_rows_validated(r8, &acts).map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prep.dot_scaled_rows(r16).map(|v| v.map(f32::to_bits)),
+                portable_q8_0_rows_validated(r16, &acts).map(|v| v.map(f32::to_bits))
+            );
+            let prep_view = detected
+                .prepare_scaled_view(&act_views)
+                .ok_or("valid Q8_0 view must prepare")?;
+            assert_eq!(
+                prep_view.dot_scaled_rows(r16).map(|v| v.map(f32::to_bits)),
+                portable_q8_0_rows_validated(r16, &act_views).map(|v| v.map(f32::to_bits))
+            );
+            acts[block_count / 2].scale = f32::NAN;
+            assert!(detected.prepare_scaled(&acts).is_none());
+        }
+        Ok(())
     }
 
     #[test]

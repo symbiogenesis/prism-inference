@@ -8554,12 +8554,217 @@ fn q8_0_8rows_step<A: super::Q8ActivationView>(
     ))
 }
 
+#[inline]
+fn q8_activation_offsets<A: super::Q8ActivationView>(
+    activation: &[A],
+) -> Option<(usize, usize, usize)> {
+    let first = activation.first()?;
+    let scale_ref = first.scale_ref()?;
+    let base = core::ptr::from_ref(first).addr();
+    let val_off = core::ptr::from_ref(first.values())
+        .addr()
+        .checked_sub(base)?;
+    let scale_off = core::ptr::from_ref(scale_ref).addr().checked_sub(base)?;
+    let stride = size_of::<A>();
+    if val_off.checked_add(32)? <= stride && scale_off.checked_add(4)? <= stride {
+        Some((stride, val_off, scale_off))
+    } else {
+        None
+    }
+}
+
+macro_rules! q8_0_row_sdot_asm {
+    ($p:literal, $acc:literal) => {
+        concat!(
+            "ldp q28, q29, [{",
+            $p,
+            "}], #32\n",
+            "movi ",
+            $acc,
+            ".2d, #0\n",
+            "sdot ",
+            $acc,
+            ".4s, v28.16b, v4.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v29.16b, v5.16b\n",
+        )
+    };
+}
+
+macro_rules! q8_0_8rows_block_asm {
+    () => {
+        concat!(
+            "ldr q4, [{act}, {val_off}]\n",
+            "ldr q5, [{act}, {val_off_hi}]\n",
+            "ldr s3, [{act}, {scale_off}]\n",
+            "add {act}, {act}, {stride}\n",
+            "ldrh {t0:w}, [{p0}], #2\n",
+            "ldrh {t1:w}, [{p1}], #2\n",
+            "fmov s30, {t0:w}\n",
+            "ldrh {t0:w}, [{p2}], #2\n",
+            "ins v30.h[1], {t1:w}\n",
+            "ldrh {t1:w}, [{p3}], #2\n",
+            "ins v30.h[2], {t0:w}\n",
+            "ldrh {t0:w}, [{p4}], #2\n",
+            "ins v30.h[3], {t1:w}\n",
+            "ldrh {t1:w}, [{p5}], #2\n",
+            "ins v30.h[4], {t0:w}\n",
+            "ldrh {t0:w}, [{p6}], #2\n",
+            "ins v30.h[5], {t1:w}\n",
+            "ldrh {t1:w}, [{p7}], #2\n",
+            "ins v30.h[6], {t0:w}\n",
+            "ins v30.h[7], {t1:w}\n",
+            "mov v31.16b, v30.16b\n",
+            "bic v31.8h, #0x80, lsl #8\n",
+            "umax v2.8h, v2.8h, v31.8h\n",
+            "fcvtl v16.4s, v30.4h\n",
+            "fcvtl2 v17.4s, v30.8h\n",
+            "fmul v16.4s, v16.4s, v3.s[0]\n",
+            "fmul v17.4s, v17.4s, v3.s[0]\n",
+            q8_0_row_sdot_asm!("p0", "v20"),
+            q8_0_row_sdot_asm!("p1", "v21"),
+            q8_0_row_sdot_asm!("p2", "v22"),
+            q8_0_row_sdot_asm!("p3", "v23"),
+            q8_0_row_sdot_asm!("p4", "v24"),
+            q8_0_row_sdot_asm!("p5", "v25"),
+            q8_0_row_sdot_asm!("p6", "v26"),
+            q8_0_row_sdot_asm!("p7", "v27"),
+            "addp v20.4s, v20.4s, v21.4s\n",
+            "addp v22.4s, v22.4s, v23.4s\n",
+            "addp v20.4s, v20.4s, v22.4s\n",
+            "scvtf v20.4s, v20.4s\n",
+            "fmul v20.4s, v16.4s, v20.4s\n",
+            "fadd v0.4s, v0.4s, v20.4s\n",
+            "addp v24.4s, v24.4s, v25.4s\n",
+            "addp v26.4s, v26.4s, v27.4s\n",
+            "addp v24.4s, v24.4s, v26.4s\n",
+            "scvtf v24.4s, v24.4s\n",
+            "fmul v24.4s, v17.4s, v24.4s\n",
+            "fadd v1.4s, v1.4s, v24.4s\n",
+        )
+    };
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_8rows_sdot<A: super::Q8ActivationView>(
+    rows: [&[u8]; 8],
+    activation: &[A],
+    stride: usize,
+    val_off: usize,
+    scale_off: usize,
+) -> Option<[f32; 8]> {
+    use core::arch::aarch64::vdupq_n_f32;
+    let block_count = activation.len();
+    let expected = block_count.checked_mul(34)?;
+    if block_count == 0 || rows.iter().any(|r| r.len() != expected) {
+        return None;
+    }
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let p0 = rows[0].as_ptr();
+    let p1 = rows[1].as_ptr();
+    let p2 = rows[2].as_ptr();
+    let p3 = rows[3].as_ptr();
+    let p4 = rows[4].as_ptr();
+    let p5 = rows[5].as_ptr();
+    let p6 = rows[6].as_ptr();
+    let p7 = rows[7].as_ptr();
+    let act = activation.as_ptr().cast::<u8>();
+    let val_off_hi = val_off + 16;
+    let cnt = block_count;
+    let ok: usize;
+    // SAFETY: Caller verified every row covers `block_count * 34` bytes,
+    // `activation` covers `block_count` elements of `A`, and `val_off..+32` /
+    // `scale_off..+4` lie within `size_of::<A>()`.
+    unsafe {
+        core::arch::asm!(
+            "movi v2.2d, #0",
+            "tst {cnt}, #1",
+            "b.eq 1f",
+            q8_0_8rows_block_asm!(),
+            "sub {cnt}, {cnt}, #1",
+            "cbz {cnt}, 2f",
+            "1:",
+            "prfm pldl1keep, [{p0}, #136]",
+            "prfm pldl1keep, [{p1}, #136]",
+            "prfm pldl1keep, [{p2}, #136]",
+            "prfm pldl1keep, [{p3}, #136]",
+            "prfm pldl1keep, [{p4}, #136]",
+            "prfm pldl1keep, [{p5}, #136]",
+            "prfm pldl1keep, [{p6}, #136]",
+            "prfm pldl1keep, [{p7}, #136]",
+            "prfm pldl1keep, [{act}, #128]",
+            q8_0_8rows_block_asm!(),
+            q8_0_8rows_block_asm!(),
+            "subs {cnt}, {cnt}, #2",
+            "b.ne 1b",
+            "2:",
+            "umaxv h28, v2.8h",
+            "fmov {t0:w}, s28",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "cset {ok}, ls",
+            p0 = inout(reg) p0 => _,
+            p1 = inout(reg) p1 => _,
+            p2 = inout(reg) p2 => _,
+            p3 = inout(reg) p3 => _,
+            p4 = inout(reg) p4 => _,
+            p5 = inout(reg) p5 => _,
+            p6 = inout(reg) p6 => _,
+            p7 = inout(reg) p7 => _,
+            act = inout(reg) act => _,
+            stride = in(reg) stride,
+            val_off = in(reg) val_off,
+            val_off_hi = in(reg) val_off_hi,
+            scale_off = in(reg) scale_off,
+            cnt = inout(reg) cnt => _,
+            t0 = out(reg) _,
+            t1 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") sum0,
+            inout("v1") sum1,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v16") _,
+            out("v17") _,
+            out("v20") _,
+            out("v21") _,
+            out("v22") _,
+            out("v23") _,
+            out("v24") _,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return None;
+    }
+    let mut lo = [0.0_f32; 4];
+    let mut hi = [0.0_f32; 4];
+    store_f32x4_neon(sum0, &mut lo);
+    store_f32x4_neon(sum1, &mut hi);
+    let out = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
 #[target_feature(enable = "neon,dotprod")]
 fn q8_0_8rows_sdot_full<A: super::Q8ActivationView>(
     rows: [&[u8]; 8],
     activation: &[A],
 ) -> Option<[f32; 8]> {
     use core::arch::aarch64::{vdupq_n_f32, vdupq_n_u16};
+    if let Some((stride, val_off, scale_off)) = q8_activation_offsets(activation) {
+        return q8_0_8rows_sdot(rows, activation, stride, val_off, scale_off);
+    }
     let block_count = activation.len();
     let row_chunks: [&[[u8; 34]]; 8] = rows.map(|row| row.as_chunks::<34>().0);
     if block_count == 0 || row_chunks.iter().any(|c| c.len() != block_count) {

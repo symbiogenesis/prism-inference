@@ -3926,6 +3926,11 @@ impl bonsai_neon_dot::Q8ActivationView for super::Q8Block {
     fn values(&self) -> &[i8; 32] {
         &self.values
     }
+
+    #[inline]
+    fn scale_ref(&self) -> Option<&f32> {
+        Some(&self.scale)
+    }
 }
 
 pub(super) struct Ptq1Consumer<'a, const PINNED: bool> {
@@ -5222,6 +5227,99 @@ pub(super) fn dot_q8_0_sixteen_rows(
     ])
 }
 
+struct Q8Consumer<'a> {
+    input: &'a [super::Q8Block],
+    prepared: Option<bonsai_neon_dot::Q8Prepared<'a, super::Q8Block>>,
+}
+
+impl<'a> Q8Consumer<'a> {
+    #[inline]
+    fn new(input: &'a [super::Q8Block], row_bytes: usize) -> Result<Self> {
+        let block_count = row_bytes / 34;
+        if block_count == 0 || !row_bytes.is_multiple_of(34) || input.len() != block_count {
+            return Err(crate::invalid("mismatched q8_0 row byte length"));
+        }
+        let prepared = if let Some(detected) = bonsai_neon_dot::Q8Dotprod::detect() {
+            Some(
+                detected
+                    .prepare_scaled_view(input)
+                    .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Self { input, prepared })
+    }
+
+    #[inline]
+    fn dot_row(&self, bytes: &[u8]) -> Result<f32> {
+        if let Some(prepared) = self.prepared {
+            return prepared
+                .dot_scaled_rows::<1>([bytes])
+                .map(|[v]| v)
+                .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"));
+        }
+        dot_q8_0_row(bytes, self.input)
+    }
+
+    #[inline]
+    fn dot_four_rows(&self, rows: [&[u8]; 4]) -> Result<[f32; 4]> {
+        if let Some(prepared) = self.prepared {
+            return prepared
+                .dot_scaled_rows::<4>(rows)
+                .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"));
+        }
+        dot_q8_0_four_rows(rows, self.input)
+    }
+
+    #[inline]
+    fn dot_eight_rows(&self, rows: [&[u8]; 8]) -> Result<[f32; 8]> {
+        if let Some(prepared) = self.prepared {
+            return prepared
+                .dot_scaled_rows::<8>(rows)
+                .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"));
+        }
+        dot_q8_0_eight_rows(rows, self.input)
+    }
+
+    #[inline]
+    fn dot_sixteen_rows(&self, rows: [&[u8]; 16]) -> Result<[f32; 16]> {
+        if let Some(prepared) = self.prepared {
+            return prepared
+                .dot_scaled_rows::<16>(rows)
+                .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"));
+        }
+        dot_q8_0_sixteen_rows(rows, self.input)
+    }
+}
+
+/// Validates `Q8_0` activation scales once per projection and fills output rows across 16/8/4/1-row tiles.
+#[allow(
+    clippy::redundant_pub_crate,
+    dead_code,
+    reason = "Ready-to-wire Q8Prepared row fill helper for kernels.rs integration."
+)]
+pub(crate) fn fill_q8_0_rows_prepared(
+    row_parallelism: &super::RowParallelism,
+    data: &[u8],
+    row_bytes: usize,
+    output: &mut Vec<f32>,
+    row_errors: &mut Vec<Option<crate::Error>>,
+    input: &[super::Q8Block],
+) -> Result<()> {
+    let consumer = Q8Consumer::new(input, row_bytes)?;
+    row_parallelism.fill_sixteen_rows(
+        data,
+        row_bytes,
+        output,
+        row_errors,
+        |rows| consumer.dot_sixteen_rows(rows),
+        |rows| consumer.dot_eight_rows(rows),
+        |rows| consumer.dot_four_rows(rows),
+        |bytes| consumer.dot_row(bytes),
+    )
+}
+
 #[inline]
 #[expect(
     clippy::suboptimal_flops,
@@ -5593,20 +5691,20 @@ fn try_dot_q8_0_eight_rows_tile_fast<const TOKENS: usize>(
     let mut sums = [[0.0_f32; TOKENS]; 8];
     let (chunks8, rem8) = preparations[..token_count].as_chunks::<8>();
     if !chunks8.is_empty() {
-        let mut out_buf = [[[0.0_f32; 8]; 8]; 4];
-        for (batch_idx, batch) in chunks8.chunks(4).enumerate() {
-            let mut arg_chunks: [[&[super::Q8Block]; 8]; 4] = [[&[]; 8]; 4];
+        let mut out_buf = [[[0.0_f32; 8]; 8]; 8];
+        for (batch_idx, batch) in chunks8.chunks(8).enumerate() {
+            let mut arg_chunks: [[&[super::Q8Block]; 8]; 8] = [[&[]; 8]; 8];
             for (c, chunk) in batch.iter().enumerate() {
                 arg_chunks[c] = std::array::from_fn(|t| &chunk[t].q8[..block_count]);
             }
             let out_slice = &mut out_buf[..batch.len()];
             let Some(()) =
-                dotprod.dot_scaled_8x8_chunks(rows, &arg_chunks[..batch.len()], out_slice)
+                dotprod.dot_scaled_8x8_chunks_up_to_8(rows, &arg_chunks[..batch.len()], out_slice)
             else {
                 return Some(Err(crate::invalid("nonfinite tensor or activation value")));
             };
             for (c, chunk_out) in out_slice.iter().enumerate() {
-                let base = (batch_idx * 4 + c) * 8;
+                let base = (batch_idx * 8 + c) * 8;
                 for r in 0..8 {
                     sums[r][base..base + 8].copy_from_slice(&chunk_out[r]);
                 }
@@ -9359,5 +9457,57 @@ mod lora_multi_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fill_q8_0_rows_prepared_matches_scalar_zero_ulp() -> crate::Result<()> {
+        let block_count = 17_usize;
+        let row_bytes = block_count * 34;
+        let rows_count = 29_usize;
+        let mut data = vec![0_u8; rows_count * row_bytes];
+        for r in 0..rows_count {
+            for b in 0..block_count {
+                let off = r * row_bytes + b * 34;
+                let scale_bits = 0x3400_u16 + u16::try_from((r * 13 + b * 7) % 1024)?;
+                data[off..off + 2].copy_from_slice(&scale_bits.to_le_bytes());
+                for k in 0..32 {
+                    let v = i8::try_from(i16::try_from((r * 19 + b * 29 + k * 37) % 255)? - 127)?;
+                    data[off + 2 + k] = v.to_ne_bytes()[0];
+                }
+            }
+        }
+        let mut q8 = Vec::with_capacity(block_count);
+        for b in 0..block_count {
+            let values = std::array::from_fn(|k| {
+                i8::try_from(i16::try_from((b * 41 + k * 23) % 255).unwrap_or(0) - 127).unwrap_or(0)
+            });
+            q8.push(crate::kernels::Q8Block {
+                scale: 0.03125 * f32::from(u16::try_from((b % 17) + 1)?),
+                sum: 0.0,
+                values,
+            });
+        }
+        let mut actual = Vec::new();
+        let mut row_errors = Vec::new();
+        let rp = crate::kernels::RowParallelism::default();
+        super::fill_q8_0_rows_prepared(&rp, &data, row_bytes, &mut actual, &mut row_errors, &q8)?;
+        assert_eq!(actual.len(), rows_count);
+        for (r, row) in data.chunks_exact(row_bytes).enumerate() {
+            let expected = crate::kernels::dot_legacy(crate::kernels::Q8_0, row, &q8)?;
+            assert_eq!(actual[r].to_bits(), expected.to_bits(), "row={r}");
+        }
+        q8[5].scale = f32::NAN;
+        assert!(
+            super::fill_q8_0_rows_prepared(
+                &rp,
+                &data,
+                row_bytes,
+                &mut actual,
+                &mut row_errors,
+                &q8
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

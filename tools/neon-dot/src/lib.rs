@@ -986,7 +986,76 @@ pub struct Q8Dotprod {
     i8mm: bool,
 }
 
+/// A borrowed, finite-scale `Q8_0` activation scope for complete-row execution.
+///
+/// Construction validates every `Q8_0` activation scale once per projection instead
+/// of re-scanning activation scales on every `1`/`4`/`8`/`16`-row tile.
+pub struct Q8Prepared<'a, A = Q8ActivationBlock> {
+    detected: Q8Dotprod,
+    activation: &'a [A],
+}
+
+impl<A> Clone for Q8Prepared<'_, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A> Copy for Q8Prepared<'_, A> {}
+
+impl<A: Q8ActivationView> Q8Prepared<'_, A> {
+    /// Consumes `1`, `4`, `8`, or `16` complete 34-byte `Q8_0` rows using the
+    /// validated activation scope.
+    ///
+    /// Preserves exact `0 ULP` parity with scalar/NEON left-to-right non-FMA
+    /// `(row_scale * act_scale) * int_dot` accumulation. Returns `None` for
+    /// unsupported geometry or nonfinite weights/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows<const ROWS: usize>(self, rows: [&[u8]; ROWS]) -> Option<[f32; ROWS]> {
+        if !scaled::valid_q8_0_rows_count(rows, self.activation.len()) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::q8_0_detected_dot_scaled_rows::<ROWS, A>(self.detected, rows, self.activation)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self.detected;
+            scaled::portable_q8_0_rows_validated::<ROWS, A>(rows, self.activation)
+        }
+    }
+}
+
 impl Q8Dotprod {
+    /// Validates current [`Q8ActivationBlock`] activation scales once per projection.
+    ///
+    /// Returns `None` for empty input, overflowing extents, or nonfinite scales.
+    #[inline]
+    #[must_use]
+    pub fn prepare_scaled(
+        self,
+        activation: &[Q8ActivationBlock],
+    ) -> Option<Q8Prepared<'_, Q8ActivationBlock>> {
+        self.prepare_scaled_view(activation)
+    }
+
+    /// Validates any [`Q8ActivationView`] slice once per projection.
+    ///
+    /// Returns `None` for empty input, overflowing extents, or nonfinite scales.
+    #[inline]
+    #[must_use]
+    pub fn prepare_scaled_view<A: Q8ActivationView>(
+        self,
+        activation: &[A],
+    ) -> Option<Q8Prepared<'_, A>> {
+        let _ = scaled::valid_q8_0_activation(activation)?;
+        Some(Q8Prepared {
+            detected: self,
+            activation,
+        })
+    }
     /// Detects `Q8_0` `SDOT` and/or `I8MM` capability once.
     #[inline]
     #[must_use]

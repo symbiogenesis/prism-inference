@@ -5108,6 +5108,13 @@ fn lora_multi_b_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
         let end_row = start_row + corr_chunk.len();
         let b_chunk = &b_weights[start_row * rank..end_row * rank];
         let base_chunk = &base[start_row..end_row];
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
         if USE_NEON
             && let Some(finite) = W::neon_multi_b(b_chunk, ranks, scale, base_chunk, corr_chunk)
         {

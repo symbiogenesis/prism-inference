@@ -1959,6 +1959,11 @@ impl AdrenoVulkanDevice {
             )));
         }
 
+        let uses_subgroup_shuffle = spirv_uses_group_non_uniform_shuffle(spirv_words);
+        if uses_subgroup_shuffle && !self.capabilities.wave64_subgroup_shuffle {
+            return Err(Error::Unsupported);
+        }
+
         // Adreno QGLC shader compiler uses shared in-process state during concurrent compiles.
         let _compile_guard = QGLC_PIPELINE_COMPILE_LOCK
             .lock()
@@ -1992,10 +1997,16 @@ impl AdrenoVulkanDevice {
             }
         };
 
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        let mut req_subgroup_size =
+            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(64);
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
             .name(c"main");
+        if uses_subgroup_shuffle && self.capabilities.wave64_subgroup_shuffle {
+            stage = stage.push_next(&mut req_subgroup_size);
+        }
         let cp_info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(layout)];
@@ -3096,9 +3107,11 @@ fn inspect_adreno_candidate(
     }
 
     let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut subgroup_size_ctrl_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
     let mut sdot_props = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
     let mut props2 = vk::PhysicalDeviceProperties2::default()
         .push_next(&mut subgroup)
+        .push_next(&mut subgroup_size_ctrl_props)
         .push_next(&mut sdot_props);
     // SAFETY: Querying physical device properties2 chain.
     unsafe { instance.get_physical_device_properties2(phys, &mut props2) };
@@ -3124,11 +3137,26 @@ fn inspect_adreno_candidate(
 
     let mut f16_feats = vk::PhysicalDeviceShaderFloat16Int8Features::default();
     let mut sdot_feats = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+    let mut subgroup_size_ctrl_feats = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
     let mut feats2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut f16_feats)
-        .push_next(&mut sdot_feats);
+        .push_next(&mut sdot_feats)
+        .push_next(&mut subgroup_size_ctrl_feats);
     // SAFETY: Querying physical device features2 chain.
     unsafe { instance.get_physical_device_features2(phys, &mut feats2) };
+
+    let wave64_subgroup_shuffle = subgroup
+        .supported_stages
+        .contains(vk::ShaderStageFlags::COMPUTE)
+        && subgroup
+            .supported_operations
+            .contains(vk::SubgroupFeatureFlags::SHUFFLE)
+        && subgroup_size_ctrl_feats.subgroup_size_control == vk::TRUE
+        && subgroup_size_ctrl_props
+            .required_subgroup_size_stages
+            .contains(vk::ShaderStageFlags::COMPUTE)
+        && subgroup_size_ctrl_props.min_subgroup_size <= 64
+        && subgroup_size_ctrl_props.max_subgroup_size >= 64;
 
     let coop_shapes = if ext_set.contains("VK_KHR_cooperative_matrix") {
         query_coop_mat_shapes(entry, instance, phys)
@@ -3146,6 +3174,7 @@ fn inspect_adreno_candidate(
         driver_version: props.driver_version,
         api_version: props.api_version,
         subgroup_size: subgroup.subgroup_size,
+        wave64_subgroup_shuffle,
         shader_float16: f16_feats.shader_float16 == vk::TRUE,
         shader_integer_dot_product: sdot_feats.shader_integer_dot_product == vk::TRUE,
         integer_dot_4x8_packed_signed_accelerated: sdot_props
@@ -3277,17 +3306,45 @@ fn create_compute_device(
         .queue_priorities(&priorities)];
 
     let enable_sdot = caps.shader_integer_dot_product;
+    let enable_subgroup_ctrl = caps.wave64_subgroup_shuffle;
     let mut sdot_feats = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
         .shader_integer_dot_product(enable_sdot);
+    let mut subgroup_ctrl_feats =
+        vk::PhysicalDeviceSubgroupSizeControlFeatures::default().subgroup_size_control(true);
     let mut create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
     if enable_sdot {
         create_info = create_info.push_next(&mut sdot_feats);
+    }
+    if enable_subgroup_ctrl {
+        create_info = create_info.push_next(&mut subgroup_ctrl_feats);
     }
 
     // SAFETY: `create_info` and enabled feature structs remain live across `create_device`.
     let device = unsafe { instance.create_device(phys, &create_info, None) }
         .map_err(|err| Error::Vulkan(format!("vkCreateDevice failed: {err:?}")))?;
     Ok((device, enable_sdot))
+}
+
+fn spirv_uses_group_non_uniform_shuffle(words: &[u32]) -> bool {
+    const OP_CAPABILITY: u32 = 17;
+    const CAP_GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
+    let mut offset = 5_usize;
+    while offset < words.len() {
+        let header = words[offset];
+        let wc = usize::try_from(header >> 16).unwrap_or(0);
+        let op = header & 0xFFFF;
+        if wc == 0 || offset + wc > words.len() {
+            break;
+        }
+        if op == OP_CAPABILITY && words.get(offset + 1) == Some(&CAP_GROUP_NON_UNIFORM_SHUFFLE) {
+            return true;
+        }
+        if op != OP_CAPABILITY {
+            break;
+        }
+        offset += wc;
+    }
+    false
 }
 
 #[cfg(test)]

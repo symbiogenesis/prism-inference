@@ -530,6 +530,7 @@ mod tests {
             driver_version: 1,
             api_version: 4_210_983,
             subgroup_size: 64,
+            wave64_subgroup_shuffle: true,
             shader_float16: true,
             shader_integer_dot_product: true,
             integer_dot_4x8_packed_signed_accelerated: true,

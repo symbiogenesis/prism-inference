@@ -193,6 +193,9 @@ pub struct VulkanDeviceCapabilities {
     pub api_version: u32,
     /// Preferred/native compute subgroup width (`64` on Adreno X1/X2).
     pub subgroup_size: u32,
+    /// Whether Vulkan 1.3 `subgroupSizeControl` (`RequiredSubgroupSize = 64`) and compute
+    /// subgroup shuffle (`OpGroupNonUniformShuffleXor`) are supported.
+    pub wave64_subgroup_shuffle: bool,
     /// Whether `shaderFloat16` (`VK_KHR_shader_float16_int8`) is supported.
     pub shader_float16: bool,
     /// Whether `VK_KHR_shader_integer_dot_product` is supported.
@@ -237,6 +240,7 @@ impl VulkanDeviceCapabilities {
         hash_bytes(
             &mut hasher,
             &[
+                u8::from(self.wave64_subgroup_shuffle),
                 u8::from(self.shader_float16),
                 u8::from(self.shader_integer_dot_product),
                 u8::from(self.integer_dot_4x8_packed_signed_accelerated),

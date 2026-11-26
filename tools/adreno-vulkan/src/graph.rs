@@ -339,6 +339,7 @@ pub struct VulkanLayerPipelines {
 
 struct PreparedLayerShaders {
     use_sdot: bool,
+    use_wave64: bool,
     proj: PreparedProjectionShaders,
     modules: [PreparedShaderSpec; 52],
     shader_digests_sha256: String,
@@ -347,15 +348,23 @@ struct PreparedLayerShaders {
 impl VulkanLayerPipelines {
     /// Emits and digests every layer, projection, `LoRA`, and attention SPIR-V 1.6 module without
     /// yet opening a Vulkan device or invoking QGLC compilation.
+    fn prepare(use_sdot: bool, use_wave64_shuffle: bool) -> Result<PreparedLayerShaders, Error> {
+        Self::prepare_with_subgroup(use_sdot, use_wave64_shuffle)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Emits and digests all whole-layer, projection, LoRA, batched prefill, and F32/packed-FP16 attention SPIR-V modules sequentially."
     )]
-    fn prepare(use_sdot: bool) -> Result<PreparedLayerShaders, Error> {
-        let proj = ProjectionPipelines::prepare(use_sdot)?;
+    fn prepare_with_subgroup(
+        use_sdot: bool,
+        use_wave64_shuffle: bool,
+    ) -> Result<PreparedLayerShaders, Error> {
+        let proj = ProjectionPipelines::prepare_with_subgroup(use_sdot, use_wave64_shuffle)?;
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v5:")?;
+        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v6:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
+        hash_u32(&mut hasher, u32::from(use_wave64_shuffle))?;
         hash_bytes(&mut hasher, b"proj_bundle:")?;
         hash_bytes(&mut hasher, proj.digest_sha256.as_bytes())?;
 
@@ -379,24 +388,44 @@ impl VulkanLayerPipelines {
         let modules = [
             make_spec(b"attn_qk_scores", spirv::attn_qk_scores(), 3, 8)?,
             make_spec(b"attn_qk_scores_f16kv", spirv::attn_qk_scores_f16kv(), 3, 8)?,
-            make_spec(b"attn_softmax_f16", spirv::attn_softmax_f16(), 2, 8)?,
+            make_spec(
+                b"attn_softmax_f16",
+                spirv::attn_softmax_f16_with_subgroup(use_wave64_shuffle),
+                2,
+                8,
+            )?,
             make_spec(b"attn_pv_accum", spirv::attn_pv_accum(), 3, 8)?,
             make_spec(b"attn_pv_accum_f16kv", spirv::attn_pv_accum_f16kv(), 3, 8)?,
-            make_spec(b"attn_fused_f16prob", spirv::attn_fused_f16prob(), 4, 8)?,
+            make_spec(
+                b"attn_fused_f16prob",
+                spirv::attn_fused_f16prob_with_subgroup(use_wave64_shuffle),
+                4,
+                8,
+            )?,
             make_spec(
                 b"attn_fused_f16prob_f16kv",
-                spirv::attn_fused_f16prob_f16kv(),
+                spirv::attn_fused_f16prob_f16kv_with_subgroup(use_wave64_shuffle),
                 4,
                 8,
             )?,
             make_spec(
                 b"attn_fused_gqa_prefill_f16kv",
-                spirv::attn_fused_gqa_prefill_f16kv(),
+                spirv::attn_fused_gqa_prefill_f16kv_with_subgroup(use_wave64_shuffle),
                 4,
                 8,
             )?,
-            make_spec(b"rms_norm_f32", spirv::rms_norm_f32(), 3, 2)?,
-            make_spec(b"add_rms_norm_f32", spirv::add_rms_norm_f32(), 4, 2)?,
+            make_spec(
+                b"rms_norm_f32",
+                spirv::rms_norm_f32_with_subgroup(use_wave64_shuffle),
+                3,
+                2,
+            )?,
+            make_spec(
+                b"add_rms_norm_f32",
+                spirv::add_rms_norm_f32_with_subgroup(use_wave64_shuffle),
+                4,
+                2,
+            )?,
             make_spec(b"rope_f32", spirv::rope_f32(), 2, 4)?,
             make_spec(b"rope_batched_f32", spirv::rope_batched_f32(), 2, 5)?,
             make_spec(b"mul_sigmoid_f32", spirv::mul_sigmoid_f32(), 2, 1)?,
@@ -413,21 +442,36 @@ impl VulkanLayerPipelines {
                 3,
                 3,
             )?,
-            make_spec(b"l2_norm_f32", spirv::l2_norm_f32(), 1, 3)?,
+            make_spec(
+                b"l2_norm_f32",
+                spirv::l2_norm_f32_with_subgroup(use_wave64_shuffle),
+                1,
+                3,
+            )?,
             make_spec(
                 b"l2_norm_batched_strided_f32",
-                spirv::l2_norm_batched_strided_f32(),
+                spirv::l2_norm_batched_strided_f32_with_subgroup(use_wave64_shuffle),
                 1,
                 5,
             )?,
-            make_spec(b"gdn_step_f32", spirv::gdn_step_f32(), 7, 4)?,
+            make_spec(
+                b"gdn_step_f32",
+                spirv::gdn_step_f32_with_subgroup(use_wave64_shuffle),
+                7,
+                4,
+            )?,
             make_spec(
                 b"gdn_step_batched_token_f32",
-                spirv::gdn_step_batched_token_f32(),
+                spirv::gdn_step_batched_token_f32_with_subgroup(use_wave64_shuffle),
                 5,
                 5,
             )?,
-            make_spec(b"gdn_scan_batched_f32", spirv::gdn_scan_batched_f32(), 5, 5)?,
+            make_spec(
+                b"gdn_scan_batched_f32",
+                spirv::gdn_scan_batched_f32_with_subgroup(use_wave64_shuffle),
+                5,
+                5,
+            )?,
             make_spec(b"gdn_gates_f32", spirv::gdn_gates_f32(), 4, 1)?,
             make_spec(
                 b"gdn_gates_batched_f32",
@@ -500,31 +544,35 @@ impl VulkanLayerPipelines {
             )?,
             make_spec(
                 b"fused_hadamard1024_q8k_pinned",
-                spirv::fused_basis_hadamard1024_q8k_4plane(true),
+                spirv::fused_basis_hadamard1024_q8k_4plane_with_subgroup(true, use_wave64_shuffle),
                 3,
                 7,
             )?,
             make_spec(
                 b"fused_hadamard1024_q8k_unpinned",
-                spirv::fused_basis_hadamard1024_q8k_4plane(false),
+                spirv::fused_basis_hadamard1024_q8k_4plane_with_subgroup(false, use_wave64_shuffle),
                 3,
                 7,
             )?,
             make_spec(
                 b"fused_hadamard1024_q8_0_source",
-                spirv::fused_basis_hadamard1024_q8_0(false, false),
+                spirv::fused_basis_hadamard1024_q8_0_with_subgroup(
+                    false,
+                    false,
+                    use_wave64_shuffle,
+                ),
                 3,
                 7,
             )?,
             make_spec(
                 b"fused_hadamard1024_q8_0_pinned",
-                spirv::fused_basis_hadamard1024_q8_0(true, false),
+                spirv::fused_basis_hadamard1024_q8_0_with_subgroup(true, false, use_wave64_shuffle),
                 3,
                 7,
             )?,
             make_spec(
                 b"fused_hadamard1024_q8_0_pinned_native",
-                spirv::fused_basis_hadamard1024_q8_0(true, true),
+                spirv::fused_basis_hadamard1024_q8_0_with_subgroup(true, true, use_wave64_shuffle),
                 3,
                 7,
             )?,
@@ -534,8 +582,18 @@ impl VulkanLayerPipelines {
                 2,
                 4,
             )?,
-            make_spec(b"f32_matvec", spirv::f32_matvec(), 3, 2)?,
-            make_spec(b"f32_gemm_batched", spirv::f32_gemm_batched(), 3, 3)?,
+            make_spec(
+                b"f32_matvec",
+                spirv::f32_matvec_with_subgroup(use_wave64_shuffle),
+                3,
+                2,
+            )?,
+            make_spec(
+                b"f32_gemm_batched",
+                spirv::f32_gemm_batched_with_subgroup(use_wave64_shuffle),
+                3,
+                3,
+            )?,
             make_spec(b"lora_b_accum_f32", spirv::lora_b_accum_f32(), 3, 3)?,
             make_spec(
                 b"lora_b_accum_batched_f32",
@@ -578,6 +636,7 @@ impl VulkanLayerPipelines {
 
         Ok(PreparedLayerShaders {
             use_sdot,
+            use_wave64: use_wave64_shuffle,
             proj,
             modules,
             shader_digests_sha256,
@@ -748,7 +807,8 @@ impl VulkanLayerPipelines {
     /// Returns [`Error::Unsupported`], [`Error::Vulkan`], or [`Error::InvalidInput`] if pipeline
     /// creation or digest calculation fails.
     pub fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
-        let prepared = Self::prepare(use_sdot)?;
+        let use_wave64 = device.capabilities().wave64_subgroup_shuffle;
+        let prepared = Self::prepare(use_sdot, use_wave64)?;
         Self::compile_prepared(device, prepared)
     }
 
@@ -1315,7 +1375,7 @@ impl VulkanBatchedGraphExecutor {
             config.kernel_path,
             Some(ProjectionKernelPath::PortableIntegerFallback)
         );
-        let prepared = VulkanLayerPipelines::prepare(use_sdot_hint)?;
+        let prepared = VulkanLayerPipelines::prepare(use_sdot_hint, true)?;
         let cached_blob = read_pipeline_cache_file(&cache_path);
         let (device, loaded_from_cache) = match cached_blob.as_deref() {
             Some(blob) => match AdrenoVulkanDevice::open_with_pipeline_cache_data(
@@ -1336,7 +1396,9 @@ impl VulkanBatchedGraphExecutor {
             adapters,
             Some(prepared),
         )?;
-        if (!loaded_from_cache || executor.pipelines.uses_sdot() != use_sdot_hint)
+        if (!loaded_from_cache
+            || executor.pipelines.uses_sdot() != use_sdot_hint
+            || !executor.device.capabilities().wave64_subgroup_shuffle)
             && let Ok(exported) = executor
                 .device
                 .export_pipeline_cache_data(executor.pipelines.shader_digests_sha256())
@@ -1418,8 +1480,11 @@ impl VulkanBatchedGraphExecutor {
         }
         validate_model_tensors_subset(model, &geometry, layer_count, &recurrent_flags)?;
 
+        let use_wave64 = device.capabilities().wave64_subgroup_shuffle;
         let pipelines = match prepared_shaders {
-            Some(prepared) if prepared.use_sdot == use_sdot => {
+            Some(prepared)
+                if prepared.use_sdot == use_sdot && prepared.use_wave64 == use_wave64 =>
+            {
                 VulkanLayerPipelines::compile_prepared(&mut device, prepared)?
             }
             _ => VulkanLayerPipelines::compile(&mut device, use_sdot)?,

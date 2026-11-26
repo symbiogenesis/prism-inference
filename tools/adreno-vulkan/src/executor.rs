@@ -330,10 +330,14 @@ impl ProjectionPipelines {
         clippy::too_many_lines,
         reason = "Emits and digests all 1-tok, 4-tok, 16-tok shared-memory GEMM, quantization, and helper SPIR-V modules sequentially."
     )]
-    pub(crate) fn prepare(use_sdot: bool) -> Result<PreparedProjectionShaders, Error> {
+    pub(crate) fn prepare_with_subgroup(
+        use_sdot: bool,
+        use_wave64_shuffle: bool,
+    ) -> Result<PreparedProjectionShaders, Error> {
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"projection-pipelines-v4:")?;
+        hash_bytes(&mut hasher, b"projection-pipelines-v5:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
+        hash_u32(&mut hasher, u32::from(use_wave64_shuffle))?;
         let mut make_spec = |tag: &'static [u8],
                              words: Vec<u32>,
                              num_buffers: usize,
@@ -488,13 +492,13 @@ impl ProjectionPipelines {
             make_spec(b"ptq1_q8k", spirv::ptq1_q8k_gemv_coalesced(use_sdot), 3, 4)?,
             make_spec(
                 b"quant_q8k_pinned",
-                spirv::quantize_f32_to_q8k_4plane(true),
+                spirv::quantize_f32_to_q8k_4plane_with_subgroup(true, use_wave64_shuffle),
                 2,
                 2,
             )?,
             make_spec(
                 b"quant_q8k_unpinned",
-                spirv::quantize_f32_to_q8k_4plane(false),
+                spirv::quantize_f32_to_q8k_4plane_with_subgroup(false, use_wave64_shuffle),
                 2,
                 2,
             )?,
@@ -594,11 +598,6 @@ impl ProjectionPipelines {
             hadamard,
             dot_scalar,
         })
-    }
-
-    pub(crate) fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
-        let prepared = Self::prepare(use_sdot)?;
-        Self::compile_prepared(device, prepared)
     }
 
     pub(crate) const fn select_pq2_q8k(
@@ -714,7 +713,9 @@ impl VulkanPq2Executor {
         max_cached_weight_bytes: usize,
     ) -> Result<Self, Error> {
         let use_sdot = spirv::path_uses_sdot(kernel_path);
-        let pipes = ProjectionPipelines::compile(&mut device, use_sdot)?;
+        let use_wave64 = device.capabilities().wave64_subgroup_shuffle;
+        let prepared = ProjectionPipelines::prepare_with_subgroup(use_sdot, use_wave64)?;
+        let pipes = ProjectionPipelines::compile_prepared(&mut device, prepared)?;
         let weight_arena = WeightArena::new(&device);
         let caps = device.capabilities();
         let short_hash = &caps.identity_sha256[..16.min(caps.identity_sha256.len())];
@@ -2371,10 +2372,11 @@ impl VulkanAttentionExecutor {
     /// Propagates loader, device selection, or SPIR-V compilation errors.
     pub fn open(scratch_budget_bytes: u64) -> Result<Self, Error> {
         let mut device = AdrenoVulkanDevice::open()?;
+        let use_wave64 = device.capabilities().wave64_subgroup_shuffle;
         let qk_spv = spirv::attn_qk_scores();
-        let softmax_spv = spirv::attn_softmax_f16();
+        let softmax_spv = spirv::attn_softmax_f16_with_subgroup(use_wave64);
         let pv_spv = spirv::attn_pv_accum();
-        let fused_spv = spirv::attn_fused_f16prob();
+        let fused_spv = spirv::attn_fused_f16prob_with_subgroup(use_wave64);
 
         let qk_digest = spirv::shader_digest(&qk_spv)?;
         let softmax_digest = spirv::shader_digest(&softmax_spv)?;

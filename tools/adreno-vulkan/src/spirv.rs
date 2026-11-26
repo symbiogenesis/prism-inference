@@ -80,11 +80,15 @@ const OP_LABEL: u16 = 248;
 const OP_BRANCH: u16 = 249;
 const OP_BRANCH_CONDITIONAL: u16 = 250;
 const OP_RETURN: u16 = 253;
+const OP_GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
+const OP_GROUP_NON_UNIFORM_SHUFFLE_XOR: u16 = 346;
 const OP_S_DOT: u16 = 4450;
 
 const CAPABILITY_SHADER: u32 = 1;
 const CAPABILITY_FLOAT64: u32 = 10;
 const CAPABILITY_INT64: u32 = 11;
+const CAPABILITY_GROUP_NON_UNIFORM: u32 = 61;
+const CAPABILITY_GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
 const CAPABILITY_DOT_PRODUCT_INPUT_4X8_BIT_PACKED: u32 = 6018;
 const CAPABILITY_DOT_PRODUCT: u32 = 6019;
 
@@ -124,6 +128,7 @@ const BUILTIN_LOCAL_INVOCATION_ID: u32 = 27;
 const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28;
 
 const SCOPE_WORKGROUP: u32 = 2;
+const SCOPE_SUBGROUP: u32 = 3;
 const SEMANTICS_ACQUIRE_RELEASE_WORKGROUP: u32 = 0x108;
 const PACKED_FORMAT_4X8_BIT: u32 = 0;
 
@@ -141,6 +146,7 @@ enum AccessMode {
 
 struct ShaderBuilder {
     next_id: u32,
+    use_subgroup_shuffle: bool,
     capabilities: Vec<u32>,
     ext_inst_imports: Vec<u32>,
     memory_model: Vec<u32>,
@@ -210,8 +216,17 @@ fn encode_string(text: &str) -> Vec<u32> {
 
 impl ShaderBuilder {
     fn new(use_sdot: bool, push_u32_count: usize) -> (Self, Option<u32>) {
+        Self::new_with_subgroup(use_sdot, false, push_u32_count)
+    }
+
+    fn new_with_subgroup(
+        use_sdot: bool,
+        use_subgroup_shuffle: bool,
+        push_u32_count: usize,
+    ) -> (Self, Option<u32>) {
         let mut this = Self {
             next_id: 1,
+            use_subgroup_shuffle,
             capabilities: Vec::new(),
             ext_inst_imports: Vec::new(),
             memory_model: Vec::new(),
@@ -257,6 +272,18 @@ impl ShaderBuilder {
         };
 
         push_inst(&mut this.capabilities, OP_CAPABILITY, &[CAPABILITY_SHADER]);
+        if use_subgroup_shuffle {
+            push_inst(
+                &mut this.capabilities,
+                OP_CAPABILITY,
+                &[CAPABILITY_GROUP_NON_UNIFORM],
+            );
+            push_inst(
+                &mut this.capabilities,
+                OP_CAPABILITY,
+                &[CAPABILITY_GROUP_NON_UNIFORM_SHUFFLE],
+            );
+        }
         if use_sdot {
             push_inst(
                 &mut this.capabilities,
@@ -1311,6 +1338,33 @@ impl ShaderBuilder {
             &mut self.fn_body,
             OP_S_DOT,
             &[self.i32_t, id, a_i, b_i, PACKED_FORMAT_4X8_BIT],
+        );
+        id
+    }
+
+    const fn uses_subgroup_shuffle(&self) -> bool {
+        self.use_subgroup_shuffle
+    }
+
+    fn subgroup_shuffle(&mut self, res_t: u32, val: u32, lane_id: u32) -> u32 {
+        let scope = self.const_u32(SCOPE_SUBGROUP);
+        let id = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_GROUP_NON_UNIFORM_SHUFFLE,
+            &[res_t, id, scope, val, lane_id],
+        );
+        id
+    }
+
+    fn subgroup_shuffle_xor(&mut self, res_t: u32, val: u32, mask: u32) -> u32 {
+        let scope = self.const_u32(SCOPE_SUBGROUP);
+        let mask_c = self.const_u32(mask);
+        let id = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_GROUP_NON_UNIFORM_SHUFFLE_XOR,
+            &[res_t, id, scope, val, mask_c],
         );
         id
     }
@@ -4070,13 +4124,34 @@ pub fn ptq1_q8_0_gemm_16tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec
 
 fn q8k_signed_abs_max_shared(
     b: &mut ShaderBuilder,
-    smem_val: u32,
-    smem_idx: u32,
+    smem_val: Option<u32>,
+    smem_idx: Option<u32>,
     lid: u32,
     local_best: u32,
     local_idx: u32,
 ) -> u32 {
     let c0 = b.const_u32(0);
+    if b.uses_subgroup_shuffle() {
+        let mut cur_val = local_best;
+        let mut cur_idx = local_idx;
+        for mask in [32_u32, 16, 8, 4, 2, 1] {
+            let oth_val = b.subgroup_shuffle_xor(b.f32_t, cur_val, mask);
+            let oth_idx = b.subgroup_shuffle_xor(b.u32_t, cur_idx, mask);
+            let abs_c = b.f_abs(cur_val);
+            let abs_o = b.f_abs(oth_val);
+            let abs_gt = b.f_gt(abs_o, abs_c);
+            let abs_eq = b.f_eq(abs_o, abs_c);
+            let idx_lt = b.u_lt(oth_idx, cur_idx);
+            let eq_earlier = b.logical_and(abs_eq, idx_lt);
+            let take_oth = b.logical_or(abs_gt, eq_earlier);
+            cur_val = b.select(b.f32_t, take_oth, oth_val, cur_val);
+            cur_idx = b.select(b.u32_t, take_oth, oth_idx, cur_idx);
+        }
+        return b.subgroup_shuffle(b.f32_t, cur_val, c0);
+    }
+
+    let smem_val = smem_val.unwrap_or(0);
+    let smem_idx = smem_idx.unwrap_or(0);
     let best_bits = b.bitcast(b.u32_t, local_best);
     b.store_wg_u32(smem_val, lid, best_bits);
     b.store_wg_u32(smem_idx, lid, local_idx);
@@ -4162,7 +4237,7 @@ fn q8k_scale_from_max(b: &mut ShaderBuilder, maximum: u32) -> (u32, u32, u32) {
 )]
 fn reduce_and_store_q8k_header(
     b: &mut ShaderBuilder,
-    smem: u32,
+    smem: Option<u32>,
     lid: u32,
     word_in_sub: u32,
     qs: [u32; 4],
@@ -4173,6 +4248,27 @@ fn reduce_and_store_q8k_header(
     let q01 = b.iadd(qs[0], qs[1]);
     let q23 = b.iadd(qs[2], qs[3]);
     let sum4 = b.iadd(q01, q23);
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+
+    if b.uses_subgroup_shuffle() {
+        let mut sum_i = sum4;
+        for mask in [16_u32, 8, 4, 2, 1] {
+            let oth_i = b.subgroup_shuffle_xor(b.i32_t, sum_i, mask);
+            sum_i = b.iadd(sum_i, oth_i);
+        }
+        let is_sub_head = b.u_eq(word_in_sub, c0);
+        b.emit_if(is_sub_head, |b| {
+            let scale_bits = b.bitcast(b.u32_t, scale);
+            b.store_sb_u32(out_buf, out_blk_base, scale_bits);
+            let hsum_u = b.bitcast(b.u32_t, sum_i);
+            let hsum_dst = b.uadd(out_blk_base, c1);
+            b.store_sb_u32(out_buf, hsum_dst, hsum_u);
+        });
+        return;
+    }
+
+    let smem = smem.unwrap_or(0);
     let sum4_u32 = b.bitcast(b.u32_t, sum4);
     b.store_wg_u32(smem, lid, sum4_u32);
     b.workgroup_barrier();
@@ -4193,8 +4289,6 @@ fn reduce_and_store_q8k_header(
         b.workgroup_barrier();
     }
 
-    let c0 = b.const_u32(0);
-    let c1 = b.const_u32(1);
     let is_sub_head = b.u_eq(word_in_sub, c0);
     b.emit_if(is_sub_head, |b| {
         let scale_bits = b.bitcast(b.u32_t, scale);
@@ -4259,12 +4353,27 @@ fn pack_four_i8_to_u32(b: &mut ShaderBuilder, qs: [u32; 4]) -> u32 {
 /// Push constants (`2 Ã— u32`): `[cols, tokens]`. Dispatch: `(cols / 256, tokens, 1)`.
 #[must_use]
 pub fn quantize_f32_to_q8k_4plane(pinned: bool) -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    quantize_f32_to_q8k_4plane_with_subgroup(pinned, false)
+}
+
+/// Emits `F32 -> 4-plane Q8_K` quantizer SPIR-V 1.6 words with optional wave64 subgroup shuffle reductions.
+#[must_use]
+pub fn quantize_f32_to_q8k_4plane_with_subgroup(
+    pinned: bool,
+    use_subgroup_shuffle: bool,
+) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
     let push_var = push_var.unwrap_or(0);
     let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadWrite);
-    let smem = b.workgroup_u32_array(WORKGROUP_X);
-    let smem_idx = b.workgroup_u32_array(WORKGROUP_X);
+    let (smem, smem_idx) = if use_subgroup_shuffle {
+        (None, None)
+    } else {
+        (
+            Some(b.workgroup_u32_array(WORKGROUP_X)),
+            Some(b.workgroup_u32_array(WORKGROUP_X)),
+        )
+    };
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -4365,7 +4474,8 @@ const HADAMARD_1024_WG_X: u32 = 256;
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Maintains clean single-pass SPIR-V emission for fused optional SSM permutation, sign scaling, and 1024-point FWHT in shared memory."
+    clippy::too_many_lines,
+    reason = "Maintains clean single-pass SPIR-V emission for fused optional SSM permutation, sign scaling, and 1024-point FWHT in wave64 registers and shared memory."
 )]
 fn emit_fused_basis_hadamard1024_smem_fwht(
     b: &mut ShaderBuilder,
@@ -4404,6 +4514,103 @@ fn emit_fused_basis_hadamard1024_smem_fwht(
 
     let src_pos_var = b.local_u32_var();
     let val_var = b.local_f32_var();
+    if b.uses_subgroup_shuffle() {
+        let c6 = b.const_u32(6);
+        let c8 = b.const_u32(8);
+        let c63 = b.const_u32(63);
+        let c64 = b.const_u32(64);
+        let subwg = b.ushr(lid, c6);
+        let sub_lid = b.uand(lid, c63);
+        let subwg_base = b.ushl(subwg, c8);
+        let mut chunk_vals = [0_u32; 4];
+        let mut chunk_pos = [0_u32; 4];
+        for (idx, chunk) in (0_u32..4).enumerate() {
+            let chunk_off = b.const_u32(chunk * 64);
+            let chunk_base = b.uadd(subwg_base, chunk_off);
+            let local_pos = b.uadd(chunk_base, sub_lid);
+            chunk_pos[idx] = local_pos;
+            let dst_pos = b.uadd(blk1024_base, local_pos);
+            b.store_var(src_pos_var, dst_pos);
+            b.emit_if(permute_active, |b| {
+                let dst_head = b.udiv(dst_pos, head_dim);
+                let dst_head_off = b.umul(dst_head, head_dim);
+                let d = b.usub(dst_pos, dst_head_off);
+                let key = b.udiv(dst_head, repetitions);
+                let key_rep = b.umul(key, repetitions);
+                let repeat = b.usub(dst_head, key_rep);
+                let rep_k = b.umul(repeat, num_k_heads);
+                let src_head = b.uadd(rep_k, key);
+                let src_head_off = b.umul(src_head, head_dim);
+                let src_pos = b.uadd(src_head_off, d);
+                b.store_var(src_pos_var, src_pos);
+            });
+            let resolved_src = b.load_var_u32(src_pos_var);
+            let global_in_idx = b.uadd(tok_base, resolved_src);
+            let raw_val = b.load_sb_f32(in_buf, global_in_idx);
+            b.store_var(val_var, raw_val);
+            b.emit_if(signs_active, |b| {
+                let sign_v = b.load_sb_f32(sign_buf, dst_pos);
+                let cur_v = b.load_var_f32(val_var);
+                let scaled_v = b.fmul_nc(cur_v, sign_v);
+                b.store_var(val_var, scaled_v);
+            });
+            chunk_vals[idx] = b.load_var_f32(val_var);
+        }
+
+        // Stages 1..=32 are 100% subgroup-local in wave64 registers (0 shared memory, 0 barriers).
+        for half in [1_u32, 2, 4, 8, 16, 32] {
+            let half_c = b.const_u32(half);
+            let masked = b.uand(sub_lid, half_c);
+            let is_right = b.u_ne(masked, c0);
+            for v in &mut chunk_vals {
+                let partner = b.subgroup_shuffle_xor(b.f32_t, *v, half);
+                let sum_f = b.fadd_nc(*v, partner);
+                let diff_f = b.fsub_nc(partner, *v);
+                *v = b.select(b.f32_t, is_right, diff_f, sum_f);
+            }
+        }
+        for (&local_pos, &v) in chunk_pos.iter().zip(&chunk_vals) {
+            let v_u32 = b.bitcast(b.u32_t, v);
+            b.store_wg_u32(smem, local_pos, v_u32);
+        }
+        b.workgroup_barrier();
+
+        let half_var = b.local_u32_var();
+        b.store_var(half_var, c64);
+        b.emit_while(
+            |b| {
+                let h = b.load_var_u32(half_var);
+                b.u_lt(h, c1024)
+            },
+            |b| {
+                let half = b.load_var_u32(half_var);
+                let mask = b.binop(OP_I_SUB, b.u32_t, half, c1);
+                let p1 = b.uadd(lid, c256);
+                for p_idx in [lid, p1] {
+                    let lo = b.uand(p_idx, mask);
+                    let bp = b.binop(OP_I_SUB, b.u32_t, p_idx, lo);
+                    let hi = b.ushl(bp, c1);
+                    let left = b.uor(hi, lo);
+                    let right = b.uor(left, half);
+                    let l_bits = b.load_wg_u32(smem, left);
+                    let r_bits = b.load_wg_u32(smem, right);
+                    let l_val = b.bitcast(b.f32_t, l_bits);
+                    let r_val = b.bitcast(b.f32_t, r_bits);
+                    let sum_f = b.fadd_nc(l_val, r_val);
+                    let diff_f = b.fsub_nc(l_val, r_val);
+                    let sum_u = b.bitcast(b.u32_t, sum_f);
+                    let diff_u = b.bitcast(b.u32_t, diff_f);
+                    b.store_wg_u32(smem, left, sum_u);
+                    b.store_wg_u32(smem, right, diff_u);
+                }
+                b.workgroup_barrier();
+                let next_half = b.ushl(half, c1);
+                b.store_var(half_var, next_half);
+            },
+        );
+        return (cols, norm);
+    }
+
     for k in 0_u32..4 {
         let k_off = b.const_u32(k * HADAMARD_1024_WG_X);
         let local_pos = b.uadd(lid, k_off);
@@ -4484,6 +4691,9 @@ fn fused_q8k_subgroup_abs_max_shared(
     local_best: u32,
     local_idx: u32,
 ) -> u32 {
+    if b.uses_subgroup_shuffle() {
+        return q8k_signed_abs_max_shared(b, None, None, lid, local_best, local_idx);
+    }
     let c6 = b.const_u32(6);
     let c256 = b.const_u32(HADAMARD_1024_WG_X);
     let best_bits = b.bitcast(b.u32_t, local_best);
@@ -4581,7 +4791,9 @@ fn emit_fused_q8k_quant_phase(
     let v1 = b.fmul_nc(raw1, norm);
     let v2 = b.fmul_nc(raw2, norm);
     let v3 = b.fmul_nc(raw3, norm);
-    b.workgroup_barrier();
+    if !b.uses_subgroup_shuffle() {
+        b.workgroup_barrier();
+    }
 
     let mut best_val = v0;
     let mut best_idx = elem_local;
@@ -4618,7 +4830,11 @@ fn emit_fused_q8k_quant_phase(
 
     reduce_and_store_q8k_header(
         b,
-        smem,
+        if b.uses_subgroup_shuffle() {
+            None
+        } else {
+            Some(smem)
+        },
         lid,
         word_in_sub,
         [q0, q1, q2, q3],
@@ -4638,7 +4854,16 @@ fn emit_fused_q8k_quant_phase(
 /// Dispatch: `(cols / 1024, tokens, 1)`.
 #[must_use]
 pub fn fused_basis_hadamard1024_q8k_4plane(pinned: bool) -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 7);
+    fused_basis_hadamard1024_q8k_4plane_with_subgroup(pinned, false)
+}
+
+/// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8K_4plane` with optional wave64 shuffle.
+#[must_use]
+pub fn fused_basis_hadamard1024_q8k_4plane_with_subgroup(
+    pinned: bool,
+    use_subgroup_shuffle: bool,
+) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 7);
     let push_var = push_var.unwrap_or(0);
     let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let sign_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
@@ -4668,7 +4893,17 @@ pub fn fused_basis_hadamard1024_q8k_4plane(pinned: bool) -> Vec<u32> {
 /// Dispatch: `(cols / 1024, tokens, 1)`.
 #[must_use]
 pub fn fused_basis_hadamard1024_q8_0(pinned: bool, native_scale: bool) -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 7);
+    fused_basis_hadamard1024_q8_0_with_subgroup(pinned, native_scale, false)
+}
+
+/// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8_0` with optional wave64 shuffle.
+#[must_use]
+pub fn fused_basis_hadamard1024_q8_0_with_subgroup(
+    pinned: bool,
+    native_scale: bool,
+    use_subgroup_shuffle: bool,
+) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 7);
     let push_var = push_var.unwrap_or(0);
     let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let sign_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
@@ -4707,36 +4942,45 @@ pub fn fused_basis_hadamard1024_q8_0(pinned: bool, native_scale: bool) -> Vec<u3
         vals[i_us] = val;
         abs_vals[i_us] = av;
     }
-    b.workgroup_barrier();
-
     let max01 = b.f_max(abs_vals[0], abs_vals[1]);
     let max23 = b.f_max(abs_vals[2], abs_vals[3]);
     let local_max = b.f_max(max01, max23);
-    let local_max_u = b.bitcast(b.u32_t, local_max);
-    b.store_wg_u32(smem, lid, local_max_u);
-    b.workgroup_barrier();
-
     let q8_blk_local = b.ushr(lid, c3);
     let lane_w = b.uand(lid, c7);
-    for stride in [4_u32, 2, 1] {
-        let sc = b.const_u32(stride);
-        let active = b.u_lt(lane_w, sc);
-        b.emit_if(active, |b| {
-            let oth_slot = b.uadd(lid, sc);
-            let cur_u = b.load_wg_u32(smem, lid);
-            let oth_u = b.load_wg_u32(smem, oth_slot);
-            let cur_f = b.bitcast(b.f32_t, cur_u);
-            let oth_f = b.bitcast(b.f32_t, oth_u);
-            let mx = b.f_max(cur_f, oth_f);
-            let mx_u = b.bitcast(b.u32_t, mx);
-            b.store_wg_u32(smem, lid, mx_u);
-        });
-        b.workgroup_barrier();
-    }
 
-    let grp_head = b.ushl(q8_blk_local, c3);
-    let max_u = b.load_wg_u32(smem, grp_head);
-    let maximum = b.bitcast(b.f32_t, max_u);
+    let maximum = if b.uses_subgroup_shuffle() {
+        let mut mx = local_max;
+        for mask in [4_u32, 2, 1] {
+            let oth = b.subgroup_shuffle_xor(b.f32_t, mx, mask);
+            mx = b.f_max(mx, oth);
+        }
+        mx
+    } else {
+        b.workgroup_barrier();
+        let local_max_u = b.bitcast(b.u32_t, local_max);
+        b.store_wg_u32(smem, lid, local_max_u);
+        b.workgroup_barrier();
+
+        for stride in [4_u32, 2, 1] {
+            let sc = b.const_u32(stride);
+            let active = b.u_lt(lane_w, sc);
+            b.emit_if(active, |b| {
+                let oth_slot = b.uadd(lid, sc);
+                let cur_u = b.load_wg_u32(smem, lid);
+                let oth_u = b.load_wg_u32(smem, oth_slot);
+                let cur_f = b.bitcast(b.f32_t, cur_u);
+                let oth_f = b.bitcast(b.f32_t, oth_u);
+                let mx = b.f_max(cur_f, oth_f);
+                let mx_u = b.bitcast(b.u32_t, mx);
+                b.store_wg_u32(smem, lid, mx_u);
+            });
+            b.workgroup_barrier();
+        }
+
+        let grp_head = b.ushl(q8_blk_local, c3);
+        let max_u = b.load_wg_u32(smem, grp_head);
+        b.bitcast(b.f32_t, max_u)
+    };
     let (scale_bits, inv_scale, zero_blk) = emit_q8_0_scale_and_inv(&mut b, maximum, native_scale);
 
     let mut qs = [0_u32; 4];
@@ -5132,11 +5376,17 @@ fn emit_attn_qk_scores(f16_kv: bool) -> Vec<u32> {
 /// Dispatch: `(1, num_heads, query_len)` with workgroup shared `[f32; 64]`.
 #[must_use]
 pub fn attn_softmax_f16() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 8);
+    attn_softmax_f16_with_subgroup(false)
+}
+
+/// Emits `#40` Stage 2 (`Softmax + binary16 probability rounding`) with optional wave64 subgroup shuffle.
+#[must_use]
+pub fn attn_softmax_f16_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 8);
     let push_var = push_var.unwrap_or(0);
     let scores_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let probs_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -5153,7 +5403,6 @@ pub fn attn_softmax_f16() -> Vec<u32> {
     let qh = b.umul(qi, num_heads);
     let row_head = b.uadd(qh, hi);
     let row_base = b.umul(row_head, total_seq);
-    let c0 = b.const_u32(0);
     let c64 = b.const_u32(WORKGROUP_X);
 
     let score0 = b.load_sb_f32(scores_buf, row_base);
@@ -5167,23 +5416,10 @@ pub fn attn_softmax_f16() -> Vec<u32> {
         b.store_var(max_var, next);
     });
     let my_max = b.load_var_f32(max_var);
-    b.store_wg_f32(wg_reduce, lid, my_max);
-    b.workgroup_barrier();
-
-    for stride in [32_u32, 16, 8, 4, 2, 1] {
-        let sc = b.const_u32(stride);
-        let active = b.u_lt(lid, sc);
-        b.emit_if(active, |b| {
-            let other_idx = b.uadd(lid, sc);
-            let other = b.load_wg_f32(wg_reduce, other_idx);
-            let cur = b.load_wg_f32(wg_reduce, lid);
-            let mx = b.glsl2(b.f32_t, GLSL_FMAX, cur, other);
-            b.store_wg_f32(wg_reduce, lid, mx);
-        });
+    let row_max = emit_wg_reduce_64_val(&mut b, wg_reduce, lid, my_max, true);
+    if !b.uses_subgroup_shuffle() {
         b.workgroup_barrier();
     }
-    let row_max = b.load_wg_f32(wg_reduce, c0);
-    b.workgroup_barrier();
 
     let sum_var = b.local_f32_var();
     let f_zero = b.const_f32(0.0);
@@ -5199,22 +5435,7 @@ pub fn attn_softmax_f16() -> Vec<u32> {
         b.store_var(sum_var, next);
     });
     let my_sum = b.load_var_f32(sum_var);
-    b.store_wg_f32(wg_reduce, lid, my_sum);
-    b.workgroup_barrier();
-
-    for stride in [32_u32, 16, 8, 4, 2, 1] {
-        let sc = b.const_u32(stride);
-        let active = b.u_lt(lid, sc);
-        b.emit_if(active, |b| {
-            let other_idx = b.uadd(lid, sc);
-            let other = b.load_wg_f32(wg_reduce, other_idx);
-            let cur = b.load_wg_f32(wg_reduce, lid);
-            let sm = b.fadd_nc(cur, other);
-            b.store_wg_f32(wg_reduce, lid, sm);
-        });
-        b.workgroup_barrier();
-    }
-    let total_sum = b.load_wg_f32(wg_reduce, c0);
+    let total_sum = emit_wg_reduce_64_val(&mut b, wg_reduce, lid, my_sum, false);
     let f_one = b.const_f32(1.0);
     let inv_sum = b.fdiv(f_one, total_sum);
 
@@ -5321,6 +5542,32 @@ fn emit_attn_pv_accum(f16_kv: bool) -> Vec<u32> {
     b.finish()
 }
 
+fn emit_wg_reduce_64_val(
+    b: &mut ShaderBuilder,
+    wg_reduce: Option<u32>,
+    lid: u32,
+    val: u32,
+    is_max: bool,
+) -> u32 {
+    if b.uses_subgroup_shuffle() {
+        let c0 = b.const_u32(0);
+        let mut cur = val;
+        for mask in [32_u32, 16, 8, 4, 2, 1] {
+            let other = b.subgroup_shuffle_xor(b.f32_t, cur, mask);
+            cur = if is_max {
+                b.glsl2(b.f32_t, GLSL_FMAX, cur, other)
+            } else {
+                b.fadd_nc(cur, other)
+            };
+        }
+        return b.subgroup_shuffle(b.f32_t, cur, c0);
+    }
+    let wg = wg_reduce.unwrap_or(0);
+    b.store_wg_f32(wg, lid, val);
+    b.workgroup_barrier();
+    emit_wg_reduce_64(b, wg, lid, is_max)
+}
+
 fn emit_wg_reduce_64(b: &mut ShaderBuilder, wg_reduce: u32, lid: u32, is_max: bool) -> u32 {
     for stride in [32_u32, 16, 8, 4, 2, 1] {
         let sc = b.const_u32(stride);
@@ -5350,7 +5597,13 @@ fn emit_wg_reduce_64(b: &mut ShaderBuilder, wg_reduce: u32, lid: u32, is_max: bo
 /// Dispatch: `(1, num_heads, query_len)`.
 #[must_use]
 pub fn attn_fused_f16prob() -> Vec<u32> {
-    emit_attn_fused_f16prob(false)
+    emit_attn_fused_f16prob(false, false)
+}
+
+/// Emits `#40` single-dispatch fused attention with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn attn_fused_f16prob_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    emit_attn_fused_f16prob(false, use_subgroup_shuffle)
 }
 
 /// Emits `#40` single-dispatch fused attention reading packed-FP16 `K` and `V` directly via `UnpackHalf2x16`.
@@ -5361,11 +5614,17 @@ pub fn attn_fused_f16prob() -> Vec<u32> {
 /// Dispatch: `(1, num_heads, query_len)`.
 #[must_use]
 pub fn attn_fused_f16prob_f16kv() -> Vec<u32> {
-    emit_attn_fused_f16prob(true)
+    emit_attn_fused_f16prob(true, false)
 }
 
-fn emit_attn_fused_f16prob(f16_kv: bool) -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 8);
+/// Emits `#40` single-dispatch fused `FP16`-KV attention with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn attn_fused_f16prob_f16kv_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    emit_attn_fused_f16prob(true, use_subgroup_shuffle)
+}
+
+fn emit_attn_fused_f16prob(f16_kv: bool, use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 8);
     let push_var = push_var.unwrap_or(0);
     let q_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let kv_elem_ty = if f16_kv { ElemType::U32 } else { ElemType::F32 };
@@ -5374,7 +5633,7 @@ fn emit_attn_fused_f16prob(f16_kv: bool) -> Vec<u32> {
     let o_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
 
     let wg_scores = b.workgroup_f32_array(512);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -5424,10 +5683,10 @@ fn emit_attn_fused_f16prob(f16_kv: bool) -> Vec<u32> {
         b.store_var(max_var, next);
     });
     let my_max = b.load_var_f32(max_var);
-    b.store_wg_f32(wg_reduce, lid, my_max);
-    b.workgroup_barrier();
-    let row_max = emit_wg_reduce_64(&mut b, wg_reduce, lid, true);
-    b.workgroup_barrier();
+    let row_max = emit_wg_reduce_64_val(&mut b, wg_reduce, lid, my_max, true);
+    if !b.uses_subgroup_shuffle() {
+        b.workgroup_barrier();
+    }
 
     let sum_var = b.local_f32_var();
     b.store_var(sum_var, f_zero);
@@ -5441,12 +5700,12 @@ fn emit_attn_fused_f16prob(f16_kv: bool) -> Vec<u32> {
         b.store_var(sum_var, next);
     });
     let my_sum = b.load_var_f32(sum_var);
-    b.store_wg_f32(wg_reduce, lid, my_sum);
-    b.workgroup_barrier();
     let f_one = b.const_f32(1.0);
-    let denom = emit_wg_reduce_64(&mut b, wg_reduce, lid, false);
+    let denom = emit_wg_reduce_64_val(&mut b, wg_reduce, lid, my_sum, false);
     let inv_sum = b.fdiv(f_one, denom);
-    b.workgroup_barrier();
+    if !b.uses_subgroup_shuffle() {
+        b.workgroup_barrier();
+    }
 
     b.emit_for_range(lid, valid_len, c64, |b, k| {
         let e = b.load_wg_f32(wg_scores, k);
@@ -5499,7 +5758,7 @@ struct Gqa6Context {
     v_buf: u32,
     o_buf: u32,
     wg_scores: u32,
-    wg_reduce: u32,
+    wg_reduce: Option<u32>,
     lid: u32,
     valid_len: u32,
     kv_stride: u32,
@@ -5510,6 +5769,39 @@ struct Gqa6Context {
     score_bases: [u32; 6],
     reduce_bases: [u32; 6],
     acc_vars: [u32; 6],
+}
+
+fn emit_gqa6_reduce_64_vals(
+    b: &mut ShaderBuilder,
+    wg_reduce: Option<u32>,
+    reduce_bases: &[u32; 6],
+    lid: u32,
+    vals: [u32; 6],
+    is_max: bool,
+) -> [u32; 6] {
+    if b.uses_subgroup_shuffle() {
+        let c0 = b.const_u32(0);
+        return vals.map(|mut cur| {
+            for mask in [32_u32, 16, 8, 4, 2, 1] {
+                let other = b.subgroup_shuffle_xor(b.f32_t, cur, mask);
+                cur = if is_max {
+                    b.glsl2(b.f32_t, GLSL_FMAX, cur, other)
+                } else {
+                    b.fadd_nc(cur, other)
+                };
+            }
+            b.subgroup_shuffle(b.f32_t, cur, c0)
+        });
+    }
+    let wg = wg_reduce.unwrap_or(0);
+    for (&r_base, &val) in reduce_bases.iter().zip(&vals) {
+        let r_idx = b.uadd(r_base, lid);
+        b.store_wg_f32(wg, r_idx, val);
+    }
+    b.workgroup_barrier();
+    let out = emit_gqa6_wg_reduce_64(b, wg, reduce_bases, lid, is_max);
+    b.workgroup_barrier();
+    out
 }
 
 fn emit_gqa6_wg_reduce_64(
@@ -5639,14 +5931,9 @@ fn emit_gqa6_softmax_phase(b: &mut ShaderBuilder, ctx: &Gqa6Context) {
             b.store_var(acc_var, next);
         }
     });
-    for (&r_base, &acc_var) in ctx.reduce_bases.iter().zip(ctx.acc_vars.iter()) {
-        let my_max = b.load_var_f32(acc_var);
-        let r_idx = b.uadd(r_base, ctx.lid);
-        b.store_wg_f32(ctx.wg_reduce, r_idx, my_max);
-    }
-    b.workgroup_barrier();
-    let row_max = emit_gqa6_wg_reduce_64(b, ctx.wg_reduce, &ctx.reduce_bases, ctx.lid, true);
-    b.workgroup_barrier();
+    let max_vals = ctx.acc_vars.map(|acc_var| b.load_var_f32(acc_var));
+    let row_max =
+        emit_gqa6_reduce_64_vals(b, ctx.wg_reduce, &ctx.reduce_bases, ctx.lid, max_vals, true);
 
     for &acc_var in &ctx.acc_vars {
         b.store_var(acc_var, f_zero);
@@ -5668,15 +5955,16 @@ fn emit_gqa6_softmax_phase(b: &mut ShaderBuilder, ctx: &Gqa6Context) {
             b.store_var(acc_var, next);
         }
     });
-    for (&r_base, &acc_var) in ctx.reduce_bases.iter().zip(ctx.acc_vars.iter()) {
-        let my_sum = b.load_var_f32(acc_var);
-        let r_idx = b.uadd(r_base, ctx.lid);
-        b.store_wg_f32(ctx.wg_reduce, r_idx, my_sum);
-    }
-    b.workgroup_barrier();
-    let denom = emit_gqa6_wg_reduce_64(b, ctx.wg_reduce, &ctx.reduce_bases, ctx.lid, false);
+    let sum_vals = ctx.acc_vars.map(|acc_var| b.load_var_f32(acc_var));
+    let denom = emit_gqa6_reduce_64_vals(
+        b,
+        ctx.wg_reduce,
+        &ctx.reduce_bases,
+        ctx.lid,
+        sum_vals,
+        false,
+    );
     let inv_sum = denom.map(|d| b.fdiv(f_one, d));
-    b.workgroup_barrier();
 
     b.emit_for_range(ctx.lid, ctx.valid_len, c64, |b, k| {
         for (&s_base, &head_inv) in ctx.score_bases.iter().zip(inv_sum.iter()) {
@@ -5735,7 +6023,13 @@ fn emit_gqa6_pv_phase(b: &mut ShaderBuilder, ctx: &Gqa6Context) {
 /// Dispatch: `(1, num_kv_heads, query_len)` with `num_heads == num_kv_heads * 6`.
 #[must_use]
 pub fn attn_fused_gqa_prefill_f16kv() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 8);
+    attn_fused_gqa_prefill_f16kv_with_subgroup(false)
+}
+
+/// Emits GQA-grouped (`6:1`) fused prefill attention with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn attn_fused_gqa_prefill_f16kv_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 8);
     let push_var = push_var.unwrap_or(0);
     let q_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let k_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
@@ -5743,7 +6037,8 @@ pub fn attn_fused_gqa_prefill_f16kv() -> Vec<u32> {
     let o_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
 
     let wg_scores = b.workgroup_f32_array(ATTN_FUSED_GQA6_RATIO * ATTN_FUSED_GQA6_MAX_TOTAL_SEQ);
-    let wg_reduce = b.workgroup_f32_array(ATTN_FUSED_GQA6_RATIO * WORKGROUP_X);
+    let wg_reduce =
+        (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(ATTN_FUSED_GQA6_RATIO * WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -5914,7 +6209,7 @@ fn emit_rms_norm_workgroup_body(
     res_update: Option<(u32, u32)>,
     w_buf: u32,
     out_buf: u32,
-    wg_reduce: u32,
+    wg_reduce: Option<u32>,
     dim: u32,
     eps_bits: u32,
 ) {
@@ -5953,9 +6248,7 @@ fn emit_rms_norm_workgroup_body(
         });
 
         let partial = b.load_var_f32(acc_var);
-        b.store_wg_f32(wg_reduce, lid, partial);
-        b.workgroup_barrier();
-        let sum_sq = emit_wg_reduce_64(b, wg_reduce, lid, false);
+        let sum_sq = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
 
         let dim_f = b.u32_to_f32(dim);
         let mean = b.fdiv(sum_sq, dim_f);
@@ -5981,12 +6274,18 @@ fn emit_rms_norm_workgroup_body(
 /// Push constants (`2 × u32`): `[dim, eps_bits]`. Dispatch: `(1, rows, 1)` (`rows = 1` or `num_heads`).
 #[must_use]
 pub fn rms_norm_f32() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    rms_norm_f32_with_subgroup(false)
+}
+
+/// Emits GPU `RMSNorm` SPIR-V 1.6 words with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn rms_norm_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
     let push_var = push_var.unwrap_or(0);
     let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let w_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let dim = b.load_push(push_var, 0);
     let eps_bits = b.load_push(push_var, 1);
@@ -6013,13 +6312,19 @@ pub fn rms_norm_batched_f32() -> Vec<u32> {
 /// Push constants (`2 × u32`): `[dim, eps_bits]`. Dispatch: `(1, rows, 1)`.
 #[must_use]
 pub fn add_rms_norm_f32() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    add_rms_norm_f32_with_subgroup(false)
+}
+
+/// Emits fused residual update + `RMSNorm` SPIR-V 1.6 words with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn add_rms_norm_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
     let push_var = push_var.unwrap_or(0);
     let res_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
     let delta_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
     let w_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let dim = b.load_push(push_var, 0);
     let eps_bits = b.load_push(push_var, 1);
@@ -6602,7 +6907,7 @@ pub fn conv1d_silu_batched_inplace_f32() -> Vec<u32> {
 fn emit_l2_norm_body(
     b: &mut ShaderBuilder,
     vec_buf: u32,
-    wg_reduce: u32,
+    wg_reduce: Option<u32>,
     lid: u32,
     base: u32,
     head_dim: u32,
@@ -6625,9 +6930,7 @@ fn emit_l2_norm_body(
     });
 
     let partial = b.load_var_f32(acc_var);
-    b.store_wg_f32(wg_reduce, lid, partial);
-    b.workgroup_barrier();
-    let sum_sq = emit_wg_reduce_64(b, wg_reduce, lid, false);
+    let sum_sq = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
 
     let norm = b.f_sqrt(sum_sq);
     let clamped = b.f_max(norm, eps);
@@ -6647,10 +6950,16 @@ fn emit_l2_norm_body(
 /// Push constants (`3 × u32`): `[heads, head_dim, eps_bits]`. Dispatch: `(1, heads, 1)`.
 #[must_use]
 pub fn l2_norm_f32() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 3);
+    l2_norm_f32_with_subgroup(false)
+}
+
+/// Emits per-head `ClampedL2` normalization SPIR-V 1.6 words with optional wave64 subgroup shuffle.
+#[must_use]
+pub fn l2_norm_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 3);
     let push_var = push_var.unwrap_or(0);
     let vec_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -6681,10 +6990,16 @@ pub fn l2_norm_f32() -> Vec<u32> {
 /// Dispatch: `(1, qk_heads, tokens)`.
 #[must_use]
 pub fn l2_norm_batched_strided_f32() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 5);
+    l2_norm_batched_strided_f32_with_subgroup(false)
+}
+
+/// Emits batched strided per-head `ClampedL2` normalization with optional wave64 subgroup shuffle.
+#[must_use]
+pub fn l2_norm_batched_strided_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 5);
     let push_var = push_var.unwrap_or(0);
     let vec_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -6725,7 +7040,7 @@ fn emit_gdn_step_body(
     alpha_buf: u32,
     beta_buf: u32,
     out_buf: u32,
-    wg_reduce: u32,
+    wg_reduce: Option<u32>,
     lid: u32,
     row: u32,
     vh: u32,
@@ -6785,10 +7100,10 @@ fn emit_gdn_step_body(
             b.store_var(k_dot_var, next);
         });
         let partial_k = b.load_var_f32(k_dot_var);
-        b.store_wg_f32(wg_reduce, lid, partial_k);
-        b.workgroup_barrier();
-        let dot_k = emit_wg_reduce_64(b, wg_reduce, lid, false);
-        b.workgroup_barrier();
+        let dot_k = emit_wg_reduce_64_val(b, wg_reduce, lid, partial_k, false);
+        if !b.uses_subgroup_shuffle() {
+            b.workgroup_barrier();
+        }
 
         let err = b.fsub_nc(v_val, dot_k);
         let delta = b.fmul_nc(err, beta_val);
@@ -6811,9 +7126,7 @@ fn emit_gdn_step_body(
             b.store_var(q_dot_var, next);
         });
         let partial_q = b.load_var_f32(q_dot_var);
-        b.store_wg_f32(wg_reduce, lid, partial_q);
-        b.workgroup_barrier();
-        let dot_q = emit_wg_reduce_64(b, wg_reduce, lid, false);
+        let dot_q = emit_wg_reduce_64_val(b, wg_reduce, lid, partial_q, false);
 
         let is_t0 = b.u_eq(lid, c0);
         b.emit_if(is_t0, |b| {
@@ -6840,7 +7153,13 @@ fn emit_gdn_step_body(
 /// Dispatch: `(head_dim, num_v_heads, 1)`.
 #[must_use]
 pub fn gdn_step_f32() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 4);
+    gdn_step_f32_with_subgroup(false)
+}
+
+/// Emits parallel per-head F32 GDN recurrent step with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn gdn_step_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 4);
     let push_var = push_var.unwrap_or(0);
     let state_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
     let q_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
@@ -6849,7 +7168,7 @@ pub fn gdn_step_f32() -> Vec<u32> {
     let alpha_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadOnly);
     let beta_buf = b.storage_buffer(5, ElemType::F32, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(6, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -6886,14 +7205,20 @@ pub fn gdn_step_f32() -> Vec<u32> {
 /// Dispatch: `(head_dim, num_v_heads, 1)`.
 #[must_use]
 pub fn gdn_step_batched_token_f32() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 5);
+    gdn_step_batched_token_f32_with_subgroup(false)
+}
+
+/// Emits token-indexed per-head F32 GDN recurrent step with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn gdn_step_batched_token_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 5);
     let push_var = push_var.unwrap_or(0);
     let state_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
     let qkv_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
     let alpha_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
     let beta_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -6953,7 +7278,7 @@ fn emit_gdn_scan_token_step(
     alpha_buf: u32,
     beta_buf: u32,
     out_buf: u32,
-    wg_reduce: u32,
+    wg_reduce: Option<u32>,
     lid: u32,
     head_dim: u32,
     scale: u32,
@@ -6993,10 +7318,10 @@ fn emit_gdn_scan_token_step(
         });
     }
     let partial_k = b.load_var_f32(k_dot_var);
-    b.store_wg_f32(wg_reduce, lid, partial_k);
-    b.workgroup_barrier();
-    let dot_k = emit_wg_reduce_64(b, wg_reduce, lid, false);
-    b.workgroup_barrier();
+    let dot_k = emit_wg_reduce_64_val(b, wg_reduce, lid, partial_k, false);
+    if !b.uses_subgroup_shuffle() {
+        b.workgroup_barrier();
+    }
 
     let err = b.fsub_nc(v_val, dot_k);
     let delta = b.fmul_nc(err, beta_val);
@@ -7021,10 +7346,10 @@ fn emit_gdn_scan_token_step(
         });
     }
     let partial_q = b.load_var_f32(q_dot_var);
-    b.store_wg_f32(wg_reduce, lid, partial_q);
-    b.workgroup_barrier();
-    let dot_q = emit_wg_reduce_64(b, wg_reduce, lid, false);
-    b.workgroup_barrier();
+    let dot_q = emit_wg_reduce_64_val(b, wg_reduce, lid, partial_q, false);
+    if !b.uses_subgroup_shuffle() {
+        b.workgroup_barrier();
+    }
 
     let is_t0 = b.u_eq(lid, c0);
     b.emit_if(is_t0, |b| {
@@ -7048,14 +7373,20 @@ fn emit_gdn_scan_token_step(
 /// Dispatch: `(ssm_head, v_heads, 1)`.
 #[must_use]
 pub fn gdn_scan_batched_f32() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 5);
+    gdn_scan_batched_f32_with_subgroup(false)
+}
+
+/// Emits single-dispatch register-resident batched F32 GDN scan with optional wave64 subgroup shuffle.
+#[must_use]
+pub fn gdn_scan_batched_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 5);
     let push_var = push_var.unwrap_or(0);
     let state_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadWrite);
     let qkv_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
     let alpha_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
     let beta_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -7738,12 +8069,18 @@ pub fn quantize_f32_to_q8_0_batched(pinned: bool, native_scale: bool) -> Vec<u32
 /// Push constants (`2 × u32`): `[cols, rows]`. Dispatch: `(rows, 1, 1)`.
 #[must_use]
 pub fn f32_matvec() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    f32_matvec_with_subgroup(false)
+}
+
+/// Emits dense `F32` matrix-vector multiplication with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn f32_matvec_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
     let push_var = push_var.unwrap_or(0);
     let w_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let in_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -7772,9 +8109,7 @@ pub fn f32_matvec() -> Vec<u32> {
         });
 
         let partial = b.load_var_f32(acc_var);
-        b.store_wg_f32(wg_reduce, lid, partial);
-        b.workgroup_barrier();
-        let sum = emit_wg_reduce_64(b, wg_reduce, lid, false);
+        let sum = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
 
         let is_t0 = b.u_eq(lid, c0);
         b.emit_if(is_t0, |b| {
@@ -7793,12 +8128,18 @@ pub fn f32_matvec() -> Vec<u32> {
 /// Push constants (`3 × u32`): `[cols, rows, tokens]`. Dispatch: `(rows, tokens.div_ceil(4), 1)`.
 #[must_use]
 pub fn f32_gemm_batched() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 3);
+    f32_gemm_batched_with_subgroup(false)
+}
+
+/// Emits batched 4-token `F32` GEMM SPIR-V 1.6 words with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn f32_gemm_batched_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 3);
     let push_var = push_var.unwrap_or(0);
     let w_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let in_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
-    let wg_reduce = b.workgroup_f32_array(WORKGROUP_X);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
     let lid_vec = b.local_invocation_id();
     let wid_vec = b.workgroup_id();
@@ -7847,13 +8188,11 @@ pub fn f32_gemm_batched() -> Vec<u32> {
         });
 
         for (k, (&tk, &acc_var)) in tok_clamped.iter().zip(&acc_vars).enumerate() {
-            if k > 0 {
+            if k > 0 && !b.uses_subgroup_shuffle() {
                 b.workgroup_barrier();
             }
             let partial = b.load_var_f32(acc_var);
-            b.store_wg_f32(wg_reduce, lid, partial);
-            b.workgroup_barrier();
-            let sum = emit_wg_reduce_64(b, wg_reduce, lid, false);
+            let sum = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
 
             let is_t0 = b.u_eq(lid, c0);
             let valid = b.u_lt(tk, tokens);
@@ -8307,6 +8646,7 @@ pub fn validate_spirv_module(words: &[u32], expected_sdot: Option<bool>) -> Resu
     let mut has_entry_point = false;
     let mut has_exec_mode = false;
     let mut has_sdot = false;
+    let mut has_group_shuffle = false;
     let mut last_opcode = 0_u16;
 
     while offset < words.len() {
@@ -8595,6 +8935,19 @@ pub fn validate_spirv_module(words: &[u32], expected_sdot: Option<bool>) -> Resu
                 check_id(ops[2], "OpSDot vec1")?;
                 check_id(ops[3], "OpSDot vec2")?;
             }
+            OP_GROUP_NON_UNIFORM_SHUFFLE | OP_GROUP_NON_UNIFORM_SHUFFLE_XOR => {
+                if ops.len() != 5 {
+                    return Err(Error::InvalidInput(
+                        "OpGroupNonUniformShuffle* arity invalid".to_owned(),
+                    ));
+                }
+                has_group_shuffle = true;
+                check_id(ops[0], "OpGroupNonUniformShuffle* type")?;
+                register_result(ops[1], "OpGroupNonUniformShuffle*")?;
+                check_id(ops[2], "OpGroupNonUniformShuffle* scope")?;
+                check_id(ops[3], "OpGroupNonUniformShuffle* value")?;
+                check_id(ops[4], "OpGroupNonUniformShuffle* lane_or_mask")?;
+            }
             OP_STORE => {
                 if ops.len() < 2 {
                     return Err(Error::InvalidInput("OpStore truncated".to_owned()));
@@ -8718,6 +9071,15 @@ pub fn validate_spirv_module(words: &[u32], expected_sdot: Option<bool>) -> Resu
     if any_sdot_cap && !has_sdot_caps {
         return Err(Error::InvalidInput(
             "SPIR-V module declares incomplete DotProduct capabilities".to_owned(),
+        ));
+    }
+    if has_group_shuffle
+        && !(capabilities.contains(&CAPABILITY_GROUP_NON_UNIFORM)
+            && capabilities.contains(&CAPABILITY_GROUP_NON_UNIFORM_SHUFFLE))
+    {
+        return Err(Error::InvalidInput(
+            "SPIR-V module emits OpGroupNonUniformShuffle* without GroupNonUniformShuffle capabilities"
+                .to_owned(),
         ));
     }
     match expected_sdot {
@@ -9014,6 +9376,79 @@ mod tests {
             offset += wc;
         }
         assert_eq!(barrier_count, 18);
+        Ok(())
+    }
+
+    #[test]
+    fn wave64_subgroup_shuffle_shaders_are_valid_spirv_and_cut_barriers() -> Result<(), Error> {
+        let count_barriers = |words: &[u32]| -> usize {
+            let mut barriers = 0_usize;
+            let mut offset = 5_usize;
+            while offset < words.len() {
+                let header = words[offset];
+                let wc = usize::try_from(header >> 16).unwrap_or(0);
+                let op = u16::try_from(header & 0xFFFF).unwrap_or(0);
+                if op == OP_CONTROL_BARRIER {
+                    barriers += 1;
+                }
+                offset += wc;
+            }
+            barriers
+        };
+
+        for module in [
+            quantize_f32_to_q8k_4plane_with_subgroup(true, true),
+            quantize_f32_to_q8k_4plane_with_subgroup(false, true),
+            fused_basis_hadamard1024_q8k_4plane_with_subgroup(true, true),
+            fused_basis_hadamard1024_q8k_4plane_with_subgroup(false, true),
+            fused_basis_hadamard1024_q8_0_with_subgroup(false, false, true),
+            fused_basis_hadamard1024_q8_0_with_subgroup(true, false, true),
+            fused_basis_hadamard1024_q8_0_with_subgroup(true, true, true),
+            attn_softmax_f16_with_subgroup(true),
+            attn_fused_f16prob_with_subgroup(true),
+            attn_fused_f16prob_f16kv_with_subgroup(true),
+            attn_fused_gqa_prefill_f16kv_with_subgroup(true),
+            rms_norm_f32_with_subgroup(true),
+            add_rms_norm_f32_with_subgroup(true),
+            l2_norm_f32_with_subgroup(true),
+            l2_norm_batched_strided_f32_with_subgroup(true),
+            gdn_step_f32_with_subgroup(true),
+            gdn_step_batched_token_f32_with_subgroup(true),
+            gdn_scan_batched_f32_with_subgroup(true),
+            f32_matvec_with_subgroup(true),
+            f32_gemm_batched_with_subgroup(true),
+        ] {
+            assert_valid_spirv_structure(&module, Some(false));
+            assert_eq!(shader_digest(&module)?.len(), 64);
+        }
+
+        assert_eq!(
+            count_barriers(&quantize_f32_to_q8k_4plane_with_subgroup(true, true)),
+            0
+        );
+        assert_eq!(count_barriers(&attn_softmax_f16_with_subgroup(true)), 0);
+        assert_eq!(count_barriers(&rms_norm_f32_with_subgroup(true)), 0);
+        assert_eq!(count_barriers(&l2_norm_f32_with_subgroup(true)), 0);
+        assert_eq!(count_barriers(&gdn_step_f32_with_subgroup(true)), 0);
+        assert_eq!(count_barriers(&gdn_scan_batched_f32_with_subgroup(true)), 0);
+        assert_eq!(count_barriers(&f32_matvec_with_subgroup(true)), 0);
+        assert_eq!(count_barriers(&f32_gemm_batched_with_subgroup(true)), 0);
+        assert_eq!(
+            count_barriers(&attn_fused_gqa_prefill_f16kv_with_subgroup(true)),
+            2
+        );
+        assert_eq!(
+            count_barriers(&fused_basis_hadamard1024_q8k_4plane_with_subgroup(
+                true, true
+            )),
+            2
+        );
+        assert_eq!(
+            count_barriers(&fused_basis_hadamard1024_q8_0_with_subgroup(
+                true, true, true
+            )),
+            2
+        );
         Ok(())
     }
 }

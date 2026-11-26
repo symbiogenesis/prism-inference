@@ -25,6 +25,26 @@ const _: () = assert!(core::mem::offset_of!(Pq2Activation, scale) == 0);
 const _: () = assert!(core::mem::offset_of!(Pq2Activation, values) == 4);
 const _: () = assert!(core::mem::offset_of!(Pq2Activation, sum) == 132);
 
+/// Pre-packed two-token `I8MM` (`SMMLA`) activation panel for one 128-column PQ2 block.
+///
+/// Interleaves token pairs `(2p, 2p+1)` once per projection tile via `pair_s8_lo_hi`
+/// so inner 4x8 `SMMLA` loops consume contiguous 16-byte halves with zero permutes.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug)]
+pub struct Pq2I8mmPairBlock {
+    /// Pre-interleaved `(lo, hi)` `i8x16` panels for each of the 8 PQ2 consumption planes.
+    pub planes: [([i8; 16], [i8; 16]); 8],
+    /// Signed sums `[t0.sum, t1.sum]` for the token pair.
+    pub sums: [i32; 2],
+    /// Activation scales `[t0.scale, t1.scale]` for the token pair.
+    pub scales: [f32; 2],
+}
+
+const _: () = assert!(size_of::<Pq2I8mmPairBlock>() == 272);
+const _: () = assert!(core::mem::offset_of!(Pq2I8mmPairBlock, planes) == 0);
+const _: () = assert!(core::mem::offset_of!(Pq2I8mmPairBlock, sums) == 256);
+const _: () = assert!(core::mem::offset_of!(Pq2I8mmPairBlock, scales) == 264);
+
 /// One 32-element quantized `Q8_0` activation group with its original finite scale.
 #[derive(Clone, Copy, Debug)]
 pub struct Q8ActivationBlock {
@@ -203,6 +223,77 @@ pub(super) fn valid_scaled_8x_tokens(rows: [&[u8]; 8], tokens: &[&[Pq2Activation
         && tokens.iter().all(|activation| {
             activation.len() == count && activation.iter().all(|block| block.scale.is_finite())
         })
+}
+
+pub(super) fn valid_pq2_chunks_only(chunks: &[[&[Pq2Activation]; 8]]) -> Option<usize> {
+    if chunks.is_empty() || chunks.len() > 8 {
+        return None;
+    }
+    let count = chunks[0][0].len();
+    if count == 0 || count.checked_mul(34).is_none() {
+        return None;
+    }
+    chunks
+        .iter()
+        .flatten()
+        .all(|activation| {
+            activation.len() == count && activation.iter().all(|block| block.scale.is_finite())
+        })
+        .then_some(count)
+}
+
+pub(super) fn valid_pq2_tokens_only(tokens: &[&[Pq2Activation]]) -> Option<usize> {
+    if tokens.is_empty() || tokens.len() > 8 {
+        return None;
+    }
+    let count = tokens[0].len();
+    if count == 0 || count.checked_mul(34).is_none() {
+        return None;
+    }
+    tokens
+        .iter()
+        .all(|activation| {
+            activation.len() == count && activation.iter().all(|block| block.scale.is_finite())
+        })
+        .then_some(count)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn portable_append_i8mm_pair_blocks(
+    t0: &[Pq2Activation],
+    t1: &[Pq2Activation],
+    out: &mut Vec<Pq2I8mmPairBlock>,
+) {
+    out.reserve(t0.len());
+    for (b0, b1) in t0.iter().zip(t1.iter()) {
+        let mut planes = [([0_i8; 16], [0_i8; 16]); 8];
+        for (plane_idx, dst) in planes.iter_mut().enumerate() {
+            let off = plane_idx * 16;
+            let p0 = &b0.values[off..off + 16];
+            let p1 = &b1.values[off..off + 16];
+            dst.0[..8].copy_from_slice(&p0[..8]);
+            dst.0[8..].copy_from_slice(&p1[..8]);
+            dst.1[..8].copy_from_slice(&p0[8..]);
+            dst.1[8..].copy_from_slice(&p1[8..]);
+        }
+        out.push(Pq2I8mmPairBlock {
+            planes,
+            sums: [b0.sum, b1.sum],
+            scales: [b0.scale, b1.scale],
+        });
+    }
+}
+
+#[cfg(any(test, not(target_arch = "aarch64")))]
+pub(super) fn portable_scaled_8x8_chunks_up_to_8<const FUSED: bool>(
+    rows: [&[u8]; 8],
+    chunks: &[[&[Pq2Activation]; 8]],
+    outputs: &mut [[[f32; 8]; 8]],
+) -> Option<()> {
+    for (c, o) in chunks.chunks(4).zip(outputs.chunks_mut(4)) {
+        portable_scaled_8x8_chunks::<FUSED>(rows, c, o)?;
+    }
+    Some(())
 }
 
 #[cfg(any(test, not(target_arch = "aarch64")))]
@@ -1100,6 +1191,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn assert_chunk_bits_eq(expected: &[[[f32; 8]; 8]], actual: &[[[f32; 8]; 8]]) {
+        for (e, a) in expected.iter().zip(actual.iter()) {
+            for r in 0..8 {
+                assert_eq!(e[r].map(f32::to_bits), a[r].map(f32::to_bits));
+            }
+        }
+    }
+
+    fn check_pq2_prepared_cap(
+        cap: crate::Pq2Dotprod,
+        row_refs: [&[u8]; 8],
+        active_chunks: &[[&[Pq2Activation]; 8]],
+        expected_fused: &[[[f32; 8]; 8]],
+        expected_unfused: &[[[f32; 8]; 8]],
+        block_count: usize,
+    ) -> Result<(), &'static str> {
+        let count = active_chunks.len();
+        let prepared = cap
+            .prepare_scaled_chunks(active_chunks)
+            .ok_or("valid PQ2 chunks must prepare")?;
+        assert_eq!(prepared.block_count(), block_count);
+        let mut panel_storage = Vec::new();
+        for chunk in active_chunks {
+            for p in 0..4 {
+                assert!(
+                    cap.append_i8mm_pair_blocks(chunk[2 * p], chunk[2 * p + 1], &mut panel_storage)
+                        .is_some()
+                );
+            }
+        }
+        let panel_chunks: Vec<[&[super::Pq2I8mmPairBlock]; 4]> = (0..count)
+            .map(|c| {
+                std::array::from_fn(|p| {
+                    let start = (c * 4 + p) * block_count;
+                    &panel_storage[start..start + block_count]
+                })
+            })
+            .collect();
+
+        let mut actual = vec![[[0.0_f32; 8]; 8]; count];
+        assert!(
+            prepared
+                .dot_scaled_8x8_chunks::<true>(row_refs, &mut actual)
+                .is_some()
+        );
+        assert_chunk_bits_eq(expected_fused, &actual);
+
+        assert!(
+            prepared
+                .dot_scaled_8x8_chunks_with_panels::<true>(row_refs, &panel_chunks, &mut actual)
+                .is_some()
+        );
+        assert_chunk_bits_eq(expected_fused, &actual);
+
+        assert!(
+            prepared
+                .dot_scaled_8x8_chunks_with_panels::<false>(row_refs, &panel_chunks, &mut actual)
+                .is_some()
+        );
+        assert_chunk_bits_eq(expected_unfused, &actual);
+
+        let prepared_toks = cap
+            .prepare_scaled_tokens(&active_chunks[0][..3])
+            .ok_or("valid PQ2 remainder tokens must prepare")?;
+        let mut actual_rem = [[0.0_f32; 8]; 8];
+        assert!(
+            prepared_toks
+                .dot_scaled_8x_tokens::<true>(row_refs, &mut actual_rem)
+                .is_some()
+        );
+        for r in 0..8 {
+            for t in 0..3 {
+                assert_eq!(
+                    expected_fused[0][r][t].to_bits(),
+                    actual_rem[r][t].to_bits()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn x1_pq2_prepared_chunks_and_i8mm_panels_match_portable() -> Result<(), &'static str> {
+        let Some(detected) = crate::Pq2Dotprod::detect() else {
+            return Ok(());
+        };
+        #[cfg(target_arch = "aarch64")]
+        let caps = [
+            detected,
+            crate::Pq2Dotprod {
+                i8mm: false,
+                ..detected
+            },
+        ];
+        #[cfg(not(target_arch = "aarch64"))]
+        let caps = [detected];
+
+        for (seed, block_count) in [1_usize, 16, 17, 33].into_iter().enumerate() {
+            let (owned_rows, act_storage) = sample_scaled_8x8_fixture(block_count, seed + 19);
+            let row_refs: [&[u8]; 8] = std::array::from_fn(|r| owned_rows[r].as_slice());
+            let chunk_slices: [[&[Pq2Activation]; 8]; 8] = std::array::from_fn(|c| {
+                std::array::from_fn(|t| act_storage[(c * 8 + t) % act_storage.len()].as_slice())
+            });
+            for count in [1_usize, 4, 8] {
+                let active_chunks = &chunk_slices[..count];
+                let mut expected_fused = vec![[[0.0_f32; 8]; 8]; count];
+                let mut expected_unfused = vec![[[0.0_f32; 8]; 8]; count];
+                assert!(
+                    super::portable_scaled_8x8_chunks_up_to_8::<true>(
+                        row_refs,
+                        active_chunks,
+                        &mut expected_fused
+                    )
+                    .is_some()
+                );
+                assert!(
+                    super::portable_scaled_8x8_chunks_up_to_8::<false>(
+                        row_refs,
+                        active_chunks,
+                        &mut expected_unfused
+                    )
+                    .is_some()
+                );
+
+                for &cap in &caps {
+                    check_pq2_prepared_cap(
+                        cap,
+                        row_refs,
+                        active_chunks,
+                        &expected_fused,
+                        &expected_unfused,
+                        block_count,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

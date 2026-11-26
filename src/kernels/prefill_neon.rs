@@ -818,19 +818,15 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
                     arg_chunks[c] =
                         std::array::from_fn(|t| &chunk[t].pq2_consumption[..block_count]);
                 }
+                let Some(prepared) = dotprod.prepare_scaled_chunks(&arg_chunks[..batch.len()])
+                else {
+                    return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+                };
                 let out_slice = &mut out_buf[..batch.len()];
                 let result = if pinned {
-                    dotprod.dot_scaled_8x8_chunks_up_to_8::<true>(
-                        rows,
-                        &arg_chunks[..batch.len()],
-                        out_slice,
-                    )
+                    prepared.dot_scaled_8x8_chunks::<true>(rows, out_slice)
                 } else {
-                    dotprod.dot_scaled_8x8_chunks_up_to_8::<false>(
-                        rows,
-                        &arg_chunks[..batch.len()],
-                        out_slice,
-                    )
+                    prepared.dot_scaled_8x8_chunks::<false>(rows, out_slice)
                 };
                 let Some(()) = result else {
                     return Some(Err(crate::invalid("nonfinite tensor or activation value")));
@@ -848,11 +844,14 @@ pub(in crate::kernels::prefill) fn dot_pq2_eight_rows<const TOKENS: usize>(
             for (t, scratch) in rem8.iter().enumerate() {
                 rem_acts[t] = &scratch.pq2_consumption[..block_count];
             }
+            let Some(prepared_rem) = dotprod.prepare_scaled_tokens(&rem_acts[..rem8.len()]) else {
+                return Some(Err(crate::invalid("nonfinite tensor or activation value")));
+            };
             let mut rem_out = [[0.0_f32; 8]; 8];
             let result = if pinned {
-                dotprod.dot_scaled_8x_tokens::<true>(rows, &rem_acts[..rem8.len()], &mut rem_out)
+                prepared_rem.dot_scaled_8x_tokens::<true>(rows, &mut rem_out)
             } else {
-                dotprod.dot_scaled_8x_tokens::<false>(rows, &rem_acts[..rem8.len()], &mut rem_out)
+                prepared_rem.dot_scaled_8x_tokens::<false>(rows, &mut rem_out)
             };
             let Some(()) = result else {
                 return Some(Err(crate::invalid("nonfinite tensor or activation value")));

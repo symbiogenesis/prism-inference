@@ -105,6 +105,38 @@ pub(crate) struct ProjectionTile {
     pub(crate) packed_projections: u64,
     pub(crate) decoded_blocks: u64,
     pub(crate) trellis: super::trellis::TrellisScratch,
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    pq2_panels: Vec<bonsai_neon_dot::Pq2I8mmPairBlock>,
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    pq2_panels_tokens: usize,
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    pq2_panels_blocks: usize,
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    pq2_panels_valid: bool,
 }
 
 impl ProjectionTile {
@@ -355,6 +387,73 @@ impl ProjectionTile {
                     }
                 }
             }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            if !reuse_prepared {
+                self.pq2_panels_valid = false;
+            }
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            if tensor.kind == PQ2
+                && inputs.len() >= 8
+                && columns.is_multiple_of(256)
+                && !matches!(self.backend, MatvecBackend::Scalar)
+                && (rows >= 8
+                    || tensors[1..]
+                        .iter()
+                        .any(|t| dimensions(t).is_ok_and(|(_, r, _)| r >= 8)))
+            {
+                let block_count = columns / 128;
+                if self.preparations[..inputs.len()]
+                    .iter()
+                    .all(|scratch| scratch.pq2_consumption.len() >= block_count)
+                    && let Some(dotprod) = self.preparations[0].pq2_consumption.dotprod
+                    && dotprod.has_i8mm()
+                    && (!self.pq2_panels_valid
+                        || self.pq2_panels_tokens != inputs.len()
+                        || self.pq2_panels_blocks != block_count)
+                {
+                    let chunks8_len = inputs.len() / 8;
+                    self.pq2_panels.clear();
+                    let mut packed_ok = true;
+                    for c in 0..chunks8_len {
+                        for p in 0..4 {
+                            let t0 =
+                                &self.preparations[c * 8 + p * 2].pq2_consumption[..block_count];
+                            let t1 = &self.preparations[c * 8 + p * 2 + 1].pq2_consumption
+                                [..block_count];
+                            if dotprod
+                                .append_i8mm_pair_blocks(t0, t1, &mut self.pq2_panels)
+                                .is_none()
+                            {
+                                packed_ok = false;
+                                break;
+                            }
+                        }
+                        if !packed_ok {
+                            break;
+                        }
+                    }
+                    if packed_ok && self.pq2_panels.len() == chunks8_len * 4 * block_count {
+                        self.pq2_panels_valid = true;
+                        self.pq2_panels_tokens = inputs.len();
+                        self.pq2_panels_blocks = block_count;
+                    } else {
+                        self.pq2_panels.clear();
+                        self.pq2_panels_valid = false;
+                    }
+                }
+            }
             if tensor.kind == F32 {
                 let backend = self.backend;
                 let preparations = &self.preparations[..inputs.len()];
@@ -559,7 +658,117 @@ impl ProjectionTile {
                 .packed_projections
                 .saturating_add(u64::try_from(tensors.len())?);
             let backend = self.backend;
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            let pq2_panels_slice = &self.pq2_panels;
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            let pq2_panels_valid = self.pq2_panels_valid
+                && self.pq2_panels_tokens == inputs.len()
+                && self.pq2_panels_blocks == columns / 128;
             let preparations = &self.preparations[..inputs.len()];
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            let pq2_block_count = columns / 128;
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            let (pq2_chunks8, pq2_rem8) = preparations.as_chunks::<8>();
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            let mut pq2_arg_chunks: [[&[bonsai_neon_dot::Pq2Activation]; 8]; 8] = [[&[]; 8]; 8];
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            let mut pq2_rem_acts: [&[bonsai_neon_dot::Pq2Activation]; 8] = [&[]; 8];
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            let mut pq2_panel_chunks: [[&[bonsai_neon_dot::Pq2I8mmPairBlock]; 4]; 8] =
+                [[&[]; 4]; 8];
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            let (pq2_prepared_chunks, pq2_prepared_rem, pq2_has_panels) = if tensor.kind == PQ2
+                && backend != MatvecBackend::Scalar
+                && columns.is_multiple_of(256)
+                && pq2_block_count != 0
+                && !preparations.is_empty()
+                && preparations
+                    .iter()
+                    .all(|scratch| scratch.pq2_consumption.len() >= pq2_block_count)
+                && let Some(dotprod) = preparations[0].pq2_consumption.dotprod
+            {
+                for (c, chunk) in pq2_chunks8.iter().enumerate() {
+                    pq2_arg_chunks[c] =
+                        std::array::from_fn(|t| &chunk[t].pq2_consumption[..pq2_block_count]);
+                }
+                for (t, scratch) in pq2_rem8.iter().enumerate() {
+                    pq2_rem_acts[t] = &scratch.pq2_consumption[..pq2_block_count];
+                }
+                let prep_chunks = if pq2_chunks8.is_empty() {
+                    None
+                } else {
+                    dotprod.prepare_scaled_chunks(&pq2_arg_chunks[..pq2_chunks8.len()])
+                };
+                let prep_rem = if pq2_rem8.is_empty() {
+                    None
+                } else {
+                    dotprod.prepare_scaled_tokens(&pq2_rem_acts[..pq2_rem8.len()])
+                };
+                let has_panels = pq2_panels_valid
+                    && !pq2_chunks8.is_empty()
+                    && pq2_panels_slice.len() >= pq2_chunks8.len() * 4 * pq2_block_count;
+                if has_panels {
+                    for (c, panel_chunk) in
+                        pq2_panel_chunks[..pq2_chunks8.len()].iter_mut().enumerate()
+                    {
+                        for (p, slot) in panel_chunk.iter_mut().enumerate() {
+                            let start = (c * 4 + p) * pq2_block_count;
+                            *slot = &pq2_panels_slice[start..start + pq2_block_count];
+                        }
+                    }
+                }
+                (prep_chunks, prep_rem, has_panels)
+            } else {
+                (None, None, false)
+            };
             let dot_one = |row: &[u8],
                            decoded_blocks: &mut u64|
              -> Result<[f32; MAX_TILE_TOKENS]> {
@@ -689,6 +898,69 @@ impl ProjectionTile {
                 Ok(sums)
             };
             let dot_eight = |rows8: [&[u8]; 8], decoded_blocks: &mut u64| {
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                if pq2_prepared_chunks.is_some() || pq2_prepared_rem.is_some() {
+                    let mut sums = [[0.0_f32; MAX_TILE_TOKENS]; 8];
+                    if let Some(prep_chunks) = pq2_prepared_chunks {
+                        let mut out_buf = [[[0.0_f32; 8]; 8]; 8];
+                        let out_slice = &mut out_buf[..pq2_chunks8.len()];
+                        let ok = match (pq2_has_panels, pinned) {
+                            (true, true) => prep_chunks.dot_scaled_8x8_chunks_with_panels::<true>(
+                                rows8,
+                                &pq2_panel_chunks[..pq2_chunks8.len()],
+                                out_slice,
+                            ),
+                            (true, false) => prep_chunks
+                                .dot_scaled_8x8_chunks_with_panels::<false>(
+                                    rows8,
+                                    &pq2_panel_chunks[..pq2_chunks8.len()],
+                                    out_slice,
+                                ),
+                            (false, true) => {
+                                prep_chunks.dot_scaled_8x8_chunks::<true>(rows8, out_slice)
+                            }
+                            (false, false) => {
+                                prep_chunks.dot_scaled_8x8_chunks::<false>(rows8, out_slice)
+                            }
+                        };
+                        let Some(()) = ok else {
+                            return Err(invalid("nonfinite tensor or activation value"));
+                        };
+                        for (c, chunk_out) in out_slice.iter().enumerate() {
+                            let base = c * 8;
+                            for row in 0..8 {
+                                sums[row][base..base + 8].copy_from_slice(&chunk_out[row]);
+                            }
+                        }
+                    }
+                    if let Some(prep_rem) = pq2_prepared_rem {
+                        let mut rem_out = [[0.0_f32; 8]; 8];
+                        let ok = if pinned {
+                            prep_rem.dot_scaled_8x_tokens::<true>(rows8, &mut rem_out)
+                        } else {
+                            prep_rem.dot_scaled_8x_tokens::<false>(rows8, &mut rem_out)
+                        };
+                        let Some(()) = ok else {
+                            return Err(invalid("nonfinite tensor or activation value"));
+                        };
+                        let base = pq2_chunks8.len() * 8;
+                        let rem_len = pq2_rem8.len();
+                        for row in 0..8 {
+                            sums[row][base..base + rem_len]
+                                .copy_from_slice(&rem_out[row][..rem_len]);
+                        }
+                    }
+                    let block_count_u64 = u64::try_from(pq2_block_count)?;
+                    *decoded_blocks =
+                        decoded_blocks.saturating_add(block_count_u64.saturating_mul(8));
+                    return Ok(sums);
+                }
                 if let Some(res) = dot::dot_eight_rows::<MAX_TILE_TOKENS>(
                     rows8,
                     preparations,

@@ -3335,120 +3335,289 @@ fn widen_row_scales_f16(blocks: &[&[u8; 34]; 8]) -> Option<[[f32; 4]; 2]> {
 }
 
 #[inline]
+#[target_feature(enable = "neon")]
+fn load_f16_scales_x4_pq2(blocks: [&[u8; 34]; 4]) -> core::arch::aarch64::uint16x4_t {
+    use core::arch::aarch64::{vdup_n_u16, vset_lane_u16};
+    let v = vdup_n_u16(u16::from_le_bytes([blocks[0][0], blocks[0][1]]));
+    let v = vset_lane_u16::<1>(u16::from_le_bytes([blocks[1][0], blocks[1][1]]), v);
+    let v = vset_lane_u16::<2>(u16::from_le_bytes([blocks[2][0], blocks[2][1]]), v);
+    vset_lane_u16::<3>(u16::from_le_bytes([blocks[3][0], blocks[3][1]]), v)
+}
+
+#[inline]
 #[target_feature(enable = "neon,i8mm")]
-fn finish_scaled_chunk_4x4_i8mm<const FUSED: bool>(
+fn finish_reg_scaled_4x4_i8mm<const FUSED: bool>(
     acc: [int32x4_t; 4],
     sums_vec: int32x4_t,
-    row_scales: &[f32; 4],
+    row_scales: core::arch::aarch64::float32x4_t,
     act_scales: core::arch::aarch64::float32x4_t,
-    out_rows: &mut [[f32; 8]; 4],
+    f_acc: &mut [[core::arch::aarch64::float32x4_t; 2]; 4],
     hi_quad: usize,
 ) {
-    let d0 = vsubq_s32(
-        vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1])),
-        sums_vec,
-    );
-    let d1 = vsubq_s32(
-        vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1])),
-        sums_vec,
-    );
-    let d2 = vsubq_s32(
-        vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3])),
-        sums_vec,
-    );
-    let d3 = vsubq_s32(
-        vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3])),
-        sums_vec,
-    );
-    let dots = [d0, d1, d2, d3];
-    for ((row_out, &scale), dot_vec) in out_rows.iter_mut().zip(row_scales.iter()).zip(dots) {
-        let quads = row_out.as_chunks_mut::<4>().0;
-        update_scaled_row4::<FUSED>(dot_vec, scale, act_scales, &mut quads[hi_quad]);
+    use core::arch::aarch64::{vcvtq_f32_s32, vmulq_laneq_f32};
+    let dots = [
+        vsubq_s32(
+            vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1])),
+            sums_vec,
+        ),
+        vsubq_s32(
+            vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1])),
+            sums_vec,
+        ),
+        vsubq_s32(
+            vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3])),
+            sums_vec,
+        ),
+        vsubq_s32(
+            vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3])),
+            sums_vec,
+        ),
+    ];
+    let d0 = vmulq_laneq_f32::<0>(act_scales, row_scales);
+    let d1 = vmulq_laneq_f32::<1>(act_scales, row_scales);
+    let d2 = vmulq_laneq_f32::<2>(act_scales, row_scales);
+    let d3 = vmulq_laneq_f32::<3>(act_scales, row_scales);
+    f_acc[0][hi_quad] = f32x4_scale_step::<FUSED>(f_acc[0][hi_quad], d0, vcvtq_f32_s32(dots[0]));
+    f_acc[1][hi_quad] = f32x4_scale_step::<FUSED>(f_acc[1][hi_quad], d1, vcvtq_f32_s32(dots[1]));
+    f_acc[2][hi_quad] = f32x4_scale_step::<FUSED>(f_acc[2][hi_quad], d2, vcvtq_f32_s32(dots[2]));
+    f_acc[3][hi_quad] = f32x4_scale_step::<FUSED>(f_acc[3][hi_quad], d3, vcvtq_f32_s32(dots[3]));
+}
+
+#[inline]
+#[target_feature(enable = "neon,i8mm")]
+fn accumulate_pq2_half_4x8_streaming_i8mm(
+    raw_rows: [uint8x16_t; 4],
+    planes: [&[i8; 128]; 8],
+    half: usize,
+    mask: uint8x16_t,
+    acc_lo: &mut [int32x4_t; 4],
+    acc_hi: &mut [int32x4_t; 4],
+) {
+    let plane_base = half * 4;
+    for plane in 0..4 {
+        let (w01_lo, w01_hi, w23_lo, w23_hi) = unpack_pq2_paired_plane(raw_rows, plane, mask);
+        let chunk = plane_base + plane;
+        let (a01_lo, a01_hi) =
+            pair_s8_lo_hi(plane_s8x16(planes[0], chunk), plane_s8x16(planes[1], chunk));
+        acc_lo[0] = smmla_s32(smmla_s32(acc_lo[0], w01_lo, a01_lo), w01_hi, a01_hi);
+        acc_lo[2] = smmla_s32(smmla_s32(acc_lo[2], w23_lo, a01_lo), w23_hi, a01_hi);
+
+        let (a23_lo, a23_hi) =
+            pair_s8_lo_hi(plane_s8x16(planes[2], chunk), plane_s8x16(planes[3], chunk));
+        acc_lo[1] = smmla_s32(smmla_s32(acc_lo[1], w01_lo, a23_lo), w01_hi, a23_hi);
+        acc_lo[3] = smmla_s32(smmla_s32(acc_lo[3], w23_lo, a23_lo), w23_hi, a23_hi);
+
+        let (b01_lo, b01_hi) =
+            pair_s8_lo_hi(plane_s8x16(planes[4], chunk), plane_s8x16(planes[5], chunk));
+        acc_hi[0] = smmla_s32(smmla_s32(acc_hi[0], w01_lo, b01_lo), w01_hi, b01_hi);
+        acc_hi[2] = smmla_s32(smmla_s32(acc_hi[2], w23_lo, b01_lo), w23_hi, b01_hi);
+
+        let (b23_lo, b23_hi) =
+            pair_s8_lo_hi(plane_s8x16(planes[6], chunk), plane_s8x16(planes[7], chunk));
+        acc_hi[1] = smmla_s32(smmla_s32(acc_hi[1], w01_lo, b23_lo), w01_hi, b23_hi);
+        acc_hi[3] = smmla_s32(smmla_s32(acc_hi[3], w23_lo, b23_lo), w23_hi, b23_hi);
     }
 }
 
+#[inline]
+#[target_feature(enable = "neon,i8mm")]
+fn accumulate_pq2_half_4x8_panels_i8mm(
+    raw_rows: [uint8x16_t; 4],
+    pairs: [&super::Pq2I8mmPairBlock; 4],
+    half: usize,
+    mask: uint8x16_t,
+    acc_lo: &mut [int32x4_t; 4],
+    acc_hi: &mut [int32x4_t; 4],
+) {
+    let plane_base = half * 4;
+    for plane in 0..4 {
+        let (w01_lo, w01_hi, w23_lo, w23_hi) = unpack_pq2_paired_plane(raw_rows, plane, mask);
+        let chunk = plane_base + plane;
+        let a01_lo = load_s8x16(&pairs[0].planes[chunk].0);
+        let a01_hi = load_s8x16(&pairs[0].planes[chunk].1);
+        acc_lo[0] = smmla_s32(smmla_s32(acc_lo[0], w01_lo, a01_lo), w01_hi, a01_hi);
+        acc_lo[2] = smmla_s32(smmla_s32(acc_lo[2], w23_lo, a01_lo), w23_hi, a01_hi);
+
+        let a23_lo = load_s8x16(&pairs[1].planes[chunk].0);
+        let a23_hi = load_s8x16(&pairs[1].planes[chunk].1);
+        acc_lo[1] = smmla_s32(smmla_s32(acc_lo[1], w01_lo, a23_lo), w01_hi, a23_hi);
+        acc_lo[3] = smmla_s32(smmla_s32(acc_lo[3], w23_lo, a23_lo), w23_hi, a23_hi);
+
+        let b01_lo = load_s8x16(&pairs[2].planes[chunk].0);
+        let b01_hi = load_s8x16(&pairs[2].planes[chunk].1);
+        acc_hi[0] = smmla_s32(smmla_s32(acc_hi[0], w01_lo, b01_lo), w01_hi, b01_hi);
+        acc_hi[2] = smmla_s32(smmla_s32(acc_hi[2], w23_lo, b01_lo), w23_hi, b01_hi);
+
+        let b23_lo = load_s8x16(&pairs[3].planes[chunk].0);
+        let b23_hi = load_s8x16(&pairs[3].planes[chunk].1);
+        acc_hi[1] = smmla_s32(smmla_s32(acc_hi[1], w01_lo, b23_lo), w01_hi, b23_hi);
+        acc_hi[3] = smmla_s32(smmla_s32(acc_hi[3], w23_lo, b23_lo), w23_hi, b23_hi);
+    }
+}
+
+#[inline]
+pub(super) fn pq2_append_i8mm_pair_blocks(
+    t0: &[super::Pq2Activation],
+    t1: &[super::Pq2Activation],
+    out: &mut Vec<super::Pq2I8mmPairBlock>,
+) {
+    // SAFETY: Baseline NEON is mandatory on `aarch64` targets and caller verified matching lengths.
+    unsafe { append_pq2_i8mm_pair_blocks(t0, t1, out) };
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn append_pq2_i8mm_pair_blocks(
+    t0: &[super::Pq2Activation],
+    t1: &[super::Pq2Activation],
+    out: &mut Vec<super::Pq2I8mmPairBlock>,
+) {
+    out.reserve(t0.len());
+    for (b0, b1) in t0.iter().zip(t1.iter()) {
+        let mut planes = [([0_i8; 16], [0_i8; 16]); 8];
+        for (plane_idx, dst) in planes.iter_mut().enumerate() {
+            let (lo, hi) = pair_s8_lo_hi(
+                plane_s8x16(&b0.values, plane_idx),
+                plane_s8x16(&b1.values, plane_idx),
+            );
+            store_s8x16(lo, &mut dst.0);
+            store_s8x16(hi, &mut dst.1);
+        }
+        out.push(super::Pq2I8mmPairBlock {
+            planes,
+            sums: [b0.sum, b1.sum],
+            scales: [b0.scale, b1.scale],
+        });
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "K-tiled register-resident 4x8 I8MM kernel preserves exact block_idx order without 32-register spills."
+)]
 #[target_feature(enable = "neon,i8mm")]
 fn dot_scaled_8x8_chunks_i8mm<const FUSED: bool>(
     rows: [&[u8]; 8],
     chunks: &[[&[super::Pq2Activation]; 8]],
     outputs: &mut [[[f32; 8]; 8]],
 ) -> Option<()> {
-    use core::arch::aarch64::vld1q_f32;
+    use core::arch::aarch64::{
+        vand_u16, vcvt_f32_f16, vdup_n_u16, vdupq_n_f32, vld1q_f32, vmax_u16, vmaxv_u16,
+        vreinterpret_f16_u16,
+    };
+    const K_TILE: usize = 16;
     outputs.fill([[0.0_f32; 8]; 8]);
     let block_count = chunks[0][0].len();
     let mask = vdupq_n_u8(3);
+    let mask_7fff = vdup_n_u16(0x7fff);
+    let mut umax_scales = vdup_n_u16(0);
     let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
 
-    for block_idx in 0..block_count {
-        prefetch_row_blocks(&row_chunks, block_idx, block_count);
-        let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
-        let row_scales = widen_row_scales_f16(&blocks)?;
-
-        for (row_half, half_scales_arr) in row_scales.iter().enumerate() {
+    for k_start in (0..block_count).step_by(K_TILE) {
+        let k_end = (k_start + K_TILE).min(block_count);
+        for row_half in 0..2 {
             let rbase = row_half * 4;
-            let (r0_h0, r0_h1) = load_pq2_block_halves(blocks[rbase]);
-            let (r1_h0, r1_h1) = load_pq2_block_halves(blocks[rbase + 1]);
-            let (r2_h0, r2_h1) = load_pq2_block_halves(blocks[rbase + 2]);
-            let (r3_h0, r3_h1) = load_pq2_block_halves(blocks[rbase + 3]);
-            let w_h0 = unpack_pq2_paired_half([r0_h0, r1_h0, r2_h0, r3_h0], mask);
-            let w_h1 = unpack_pq2_paired_half([r0_h1, r1_h1, r2_h1, r3_h1], mask);
             for (chunk, out_chunk) in chunks.iter().zip(outputs.iter_mut()) {
-                if row_half == 0 {
-                    prefetch_pq2_tokens_block(chunk, block_idx, block_count);
-                }
-                let a = [
-                    &chunk[0][block_idx],
-                    &chunk[1][block_idx],
-                    &chunk[2][block_idx],
-                    &chunk[3][block_idx],
-                    &chunk[4][block_idx],
-                    &chunk[5][block_idx],
-                    &chunk[6][block_idx],
-                    &chunk[7][block_idx],
-                ];
-                let planes: [&[i8; 128]; 8] = [
-                    &a[0].values,
-                    &a[1].values,
-                    &a[2].values,
-                    &a[3].values,
-                    &a[4].values,
-                    &a[5].values,
-                    &a[6].values,
-                    &a[7].values,
-                ];
-                let sums_lo = load_s32x4(&[a[0].sum, a[1].sum, a[2].sum, a[3].sum]);
-                let sums_hi = load_s32x4(&[a[4].sum, a[5].sum, a[6].sum, a[7].sum]);
-                let mut acc_lo = [vdupq_n_s32(0); 4];
-                let mut acc_hi = [vdupq_n_s32(0); 4];
-                accumulate_pq2_paired_half_4x8_i8mm(&w_h0, planes, 0, &mut acc_lo, &mut acc_hi);
-                accumulate_pq2_paired_half_4x8_i8mm(&w_h1, planes, 1, &mut acc_lo, &mut acc_hi);
-
-                let scales_lo_arr = [a[0].scale, a[1].scale, a[2].scale, a[3].scale];
-                let scales_hi_arr = [a[4].scale, a[5].scale, a[6].scale, a[7].scale];
-                // SAFETY: fixed 4-element initialized arrays.
-                let act_scales_lo = unsafe { vld1q_f32(scales_lo_arr.as_ptr()) };
-                // SAFETY: fixed 4-element initialized array.
-                let act_scales_hi = unsafe { vld1q_f32(scales_hi_arr.as_ptr()) };
-
                 let out_halves = out_chunk.as_chunks_mut::<4>().0;
-                finish_scaled_chunk_4x4_i8mm::<FUSED>(
-                    acc_lo,
-                    sums_lo,
-                    half_scales_arr,
-                    act_scales_lo,
-                    &mut out_halves[row_half],
-                    0,
-                );
-                finish_scaled_chunk_4x4_i8mm::<FUSED>(
-                    acc_hi,
-                    sums_hi,
-                    half_scales_arr,
-                    act_scales_hi,
-                    &mut out_halves[row_half],
-                    1,
-                );
+                let mut f_acc: [[core::arch::aarch64::float32x4_t; 2]; 4] = if k_start == 0 {
+                    [[vdupq_n_f32(0.0); 2]; 4]
+                } else {
+                    std::array::from_fn(|r| {
+                        let quads = out_halves[row_half][r].as_chunks::<4>().0;
+                        [load_f32x4_neon(&quads[0]), load_f32x4_neon(&quads[1])]
+                    })
+                };
+                for block_idx in k_start..k_end {
+                    let blocks: [&[u8; 34]; 4] = [
+                        &row_chunks[rbase][block_idx],
+                        &row_chunks[rbase + 1][block_idx],
+                        &row_chunks[rbase + 2][block_idx],
+                        &row_chunks[rbase + 3][block_idx],
+                    ];
+                    if block_idx + 2 < k_end {
+                        for block in &row_chunks[rbase..rbase + 4] {
+                            prefetch_l1(block[block_idx + 2].as_ptr());
+                        }
+                        prefetch_pq2_tokens_block(chunk, block_idx + 1, k_end);
+                    }
+                    let scale_u16 = load_f16_scales_x4_pq2(blocks);
+                    umax_scales = vmax_u16(umax_scales, vand_u16(scale_u16, mask_7fff));
+                    let row_scales = vcvt_f32_f16(vreinterpret_f16_u16(scale_u16));
+
+                    let a = [
+                        &chunk[0][block_idx],
+                        &chunk[1][block_idx],
+                        &chunk[2][block_idx],
+                        &chunk[3][block_idx],
+                        &chunk[4][block_idx],
+                        &chunk[5][block_idx],
+                        &chunk[6][block_idx],
+                        &chunk[7][block_idx],
+                    ];
+                    let planes: [&[i8; 128]; 8] = [
+                        &a[0].values,
+                        &a[1].values,
+                        &a[2].values,
+                        &a[3].values,
+                        &a[4].values,
+                        &a[5].values,
+                        &a[6].values,
+                        &a[7].values,
+                    ];
+                    let mut acc_lo = [vdupq_n_s32(0); 4];
+                    let mut acc_hi = [vdupq_n_s32(0); 4];
+                    for half in 0..2 {
+                        let raw_rows = [
+                            load_u8x16(&blocks[0][2..].as_chunks::<16>().0[half]),
+                            load_u8x16(&blocks[1][2..].as_chunks::<16>().0[half]),
+                            load_u8x16(&blocks[2][2..].as_chunks::<16>().0[half]),
+                            load_u8x16(&blocks[3][2..].as_chunks::<16>().0[half]),
+                        ];
+                        accumulate_pq2_half_4x8_streaming_i8mm(
+                            raw_rows,
+                            planes,
+                            half,
+                            mask,
+                            &mut acc_lo,
+                            &mut acc_hi,
+                        );
+                    }
+
+                    let sums_lo = load_s32x4(&[a[0].sum, a[1].sum, a[2].sum, a[3].sum]);
+                    let sums_hi = load_s32x4(&[a[4].sum, a[5].sum, a[6].sum, a[7].sum]);
+                    let scales_lo_arr = [a[0].scale, a[1].scale, a[2].scale, a[3].scale];
+                    let scales_hi_arr = [a[4].scale, a[5].scale, a[6].scale, a[7].scale];
+                    // SAFETY: fixed 4-element initialized arrays.
+                    let act_scales_lo = unsafe { vld1q_f32(scales_lo_arr.as_ptr()) };
+                    // SAFETY: fixed 4-element initialized array.
+                    let act_scales_hi = unsafe { vld1q_f32(scales_hi_arr.as_ptr()) };
+
+                    finish_reg_scaled_4x4_i8mm::<FUSED>(
+                        acc_lo,
+                        sums_lo,
+                        row_scales,
+                        act_scales_lo,
+                        &mut f_acc,
+                        0,
+                    );
+                    finish_reg_scaled_4x4_i8mm::<FUSED>(
+                        acc_hi,
+                        sums_hi,
+                        row_scales,
+                        act_scales_hi,
+                        &mut f_acc,
+                        1,
+                    );
+                }
+                for (r, acc_pair) in f_acc.iter().enumerate() {
+                    let quads = out_halves[row_half][r].as_chunks_mut::<4>().0;
+                    store_f32x4_neon(acc_pair[0], &mut quads[0]);
+                    store_f32x4_neon(acc_pair[1], &mut quads[1]);
+                }
             }
         }
+    }
+    if vmaxv_u16(umax_scales) >= 0x7c00 {
+        return None;
     }
     outputs
         .iter()
@@ -3456,6 +3625,165 @@ fn dot_scaled_8x8_chunks_i8mm<const FUSED: bool>(
         .flatten()
         .all(|v| v.is_finite())
         .then_some(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "K-tiled register-resident 4x8 I8MM kernel consumes pre-packed token-pair panels with zero permutes."
+)]
+#[target_feature(enable = "neon,i8mm")]
+fn dot_scaled_8x8_chunks_panels_i8mm<const FUSED: bool>(
+    rows: [&[u8]; 8],
+    panels: &[[&[super::Pq2I8mmPairBlock]; 4]],
+    outputs: &mut [[[f32; 8]; 8]],
+) -> Option<()> {
+    use core::arch::aarch64::{
+        vand_u16, vcvt_f32_f16, vdup_n_u16, vdupq_n_f32, vmax_u16, vmaxv_u16, vreinterpret_f16_u16,
+    };
+    const K_TILE: usize = 16;
+    outputs.fill([[0.0_f32; 8]; 8]);
+    let block_count = panels[0][0].len();
+    let mask = vdupq_n_u8(3);
+    let mask_7fff = vdup_n_u16(0x7fff);
+    let mut umax_scales = vdup_n_u16(0);
+    let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
+
+    for k_start in (0..block_count).step_by(K_TILE) {
+        let k_end = (k_start + K_TILE).min(block_count);
+        for row_half in 0..2 {
+            let rbase = row_half * 4;
+            for (chunk_panels, out_chunk) in panels.iter().zip(outputs.iter_mut()) {
+                let out_halves = out_chunk.as_chunks_mut::<4>().0;
+                let mut f_acc: [[core::arch::aarch64::float32x4_t; 2]; 4] = if k_start == 0 {
+                    [[vdupq_n_f32(0.0); 2]; 4]
+                } else {
+                    std::array::from_fn(|r| {
+                        let quads = out_halves[row_half][r].as_chunks::<4>().0;
+                        [load_f32x4_neon(&quads[0]), load_f32x4_neon(&quads[1])]
+                    })
+                };
+                for block_idx in k_start..k_end {
+                    let blocks: [&[u8; 34]; 4] = [
+                        &row_chunks[rbase][block_idx],
+                        &row_chunks[rbase + 1][block_idx],
+                        &row_chunks[rbase + 2][block_idx],
+                        &row_chunks[rbase + 3][block_idx],
+                    ];
+                    if block_idx + 2 < k_end {
+                        for block in &row_chunks[rbase..rbase + 4] {
+                            prefetch_l1(block[block_idx + 2].as_ptr());
+                        }
+                        for pair_slice in chunk_panels {
+                            prefetch_l1(pair_slice[block_idx + 2].planes.as_ptr().cast::<u8>());
+                        }
+                    }
+                    let scale_u16 = load_f16_scales_x4_pq2(blocks);
+                    umax_scales = vmax_u16(umax_scales, vand_u16(scale_u16, mask_7fff));
+                    let row_scales = vcvt_f32_f16(vreinterpret_f16_u16(scale_u16));
+
+                    let pairs = [
+                        &chunk_panels[0][block_idx],
+                        &chunk_panels[1][block_idx],
+                        &chunk_panels[2][block_idx],
+                        &chunk_panels[3][block_idx],
+                    ];
+                    let mut acc_lo = [vdupq_n_s32(0); 4];
+                    let mut acc_hi = [vdupq_n_s32(0); 4];
+                    for half in 0..2 {
+                        let raw_rows = [
+                            load_u8x16(&blocks[0][2..].as_chunks::<16>().0[half]),
+                            load_u8x16(&blocks[1][2..].as_chunks::<16>().0[half]),
+                            load_u8x16(&blocks[2][2..].as_chunks::<16>().0[half]),
+                            load_u8x16(&blocks[3][2..].as_chunks::<16>().0[half]),
+                        ];
+                        accumulate_pq2_half_4x8_panels_i8mm(
+                            raw_rows,
+                            pairs,
+                            half,
+                            mask,
+                            &mut acc_lo,
+                            &mut acc_hi,
+                        );
+                    }
+
+                    let sums_lo = load_s32x4(&[
+                        pairs[0].sums[0],
+                        pairs[0].sums[1],
+                        pairs[1].sums[0],
+                        pairs[1].sums[1],
+                    ]);
+                    let sums_hi = load_s32x4(&[
+                        pairs[2].sums[0],
+                        pairs[2].sums[1],
+                        pairs[3].sums[0],
+                        pairs[3].sums[1],
+                    ]);
+                    let act_scales_lo = load_f32x4_neon(&[
+                        pairs[0].scales[0],
+                        pairs[0].scales[1],
+                        pairs[1].scales[0],
+                        pairs[1].scales[1],
+                    ]);
+                    let act_scales_hi = load_f32x4_neon(&[
+                        pairs[2].scales[0],
+                        pairs[2].scales[1],
+                        pairs[3].scales[0],
+                        pairs[3].scales[1],
+                    ]);
+
+                    finish_reg_scaled_4x4_i8mm::<FUSED>(
+                        acc_lo,
+                        sums_lo,
+                        row_scales,
+                        act_scales_lo,
+                        &mut f_acc,
+                        0,
+                    );
+                    finish_reg_scaled_4x4_i8mm::<FUSED>(
+                        acc_hi,
+                        sums_hi,
+                        row_scales,
+                        act_scales_hi,
+                        &mut f_acc,
+                        1,
+                    );
+                }
+                for (r, acc_pair) in f_acc.iter().enumerate() {
+                    let quads = out_halves[row_half][r].as_chunks_mut::<4>().0;
+                    store_f32x4_neon(acc_pair[0], &mut quads[0]);
+                    store_f32x4_neon(acc_pair[1], &mut quads[1]);
+                }
+            }
+        }
+    }
+    if vmaxv_u16(umax_scales) >= 0x7c00 {
+        return None;
+    }
+    outputs
+        .iter()
+        .flatten()
+        .flatten()
+        .all(|v| v.is_finite())
+        .then_some(())
+}
+
+#[inline]
+pub(super) fn pq2_detected_dot_scaled_8x8_chunks_with_panels<const FUSED: bool>(
+    detected: super::Pq2Dotprod,
+    rows: [&[u8]; 8],
+    chunks: &[[&[super::Pq2Activation]; 8]],
+    panels: &[[&[super::Pq2I8mmPairBlock]; 4]],
+    outputs: &mut [[[f32; 8]; 8]],
+) -> Option<()> {
+    if detected.i8mm {
+        // SAFETY: `detected.i8mm` was enabled after CPU/OS I8MM detection, and
+        // the safe parent checked chunk/panel extents and finite activation scales.
+        unsafe { dot_scaled_8x8_chunks_panels_i8mm::<FUSED>(rows, panels, outputs) }
+    } else {
+        // SAFETY: Constructing the unforgeable `Pq2Dotprod` verified CPU/OS
+        // `dotprod` support, and the safe parent checked all slice invariants.
+        unsafe { dot_scaled_8x8_chunks_dotprod::<FUSED>(rows, chunks, outputs) }
+    }
 }
 
 #[target_feature(enable = "neon,dotprod")]

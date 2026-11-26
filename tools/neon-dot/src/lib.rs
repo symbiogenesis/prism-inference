@@ -10,7 +10,9 @@
 #![deny(unsafe_code)]
 
 mod scaled;
-pub use scaled::{Pq2Activation, Ptq1Activation, Q8ActivationBlock, Q8ActivationView};
+pub use scaled::{
+    Pq2Activation, Pq2I8mmPairBlock, Ptq1Activation, Q8ActivationBlock, Q8ActivationView,
+};
 
 pub use bonsai_ternary::{
     checked_float_to_half, float_to_half, half_to_float, unpack_q4_k_scale_min,
@@ -106,7 +108,237 @@ impl Pq2Prepared<'_> {
     }
 }
 
+/// A borrowed, finite-scale PQ2 activation chunk scope for multi-token prefill tiles.
+///
+/// Construction validates every chunk extent and `scale.is_finite()` once per
+/// `ProjectionTile` instead of re-scanning all activation blocks on every 8-row tile.
+#[derive(Clone, Copy)]
+pub struct Pq2PreparedChunks<'a> {
+    detected: Pq2Dotprod,
+    chunks: &'a [[&'a [Pq2Activation]; 8]],
+    block_count: usize,
+}
+
+impl Pq2PreparedChunks<'_> {
+    /// Returns the number of 128-column blocks in each prepared activation chunk.
+    #[inline]
+    #[must_use]
+    pub const fn block_count(self) -> usize {
+        self.block_count
+    }
+
+    /// Consumes 8 complete PQ2 rows across all `1..=8` prepared chunks without
+    /// re-validating activation scales on each row tile.
+    ///
+    /// Returns `None` for mismatched row/output extents or nonfinite weights/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks<const FUSED: bool>(
+        self,
+        rows: [&[u8]; 8],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        if outputs.len() != self.chunks.len() || !scaled::valid_rows(rows, self.block_count) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_scaled_8x8_chunks::<FUSED>(
+                self.detected,
+                rows,
+                self.chunks,
+                outputs,
+            )
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self.detected;
+            scaled::portable_scaled_8x8_chunks_up_to_8::<FUSED>(rows, self.chunks, outputs)
+        }
+    }
+
+    /// Consumes 8 complete PQ2 rows across all `1..=8` prepared chunks using pre-packed
+    /// `(2p, 2p+1)` `I8MM` token-pair panels when `I8MM` is active.
+    ///
+    /// Preserves exact `0 ULP` parity and falls back cleanly when `I8MM` is absent.
+    /// Returns `None` for mismatched row/panel/output extents or nonfinite weights/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks_with_panels<const FUSED: bool>(
+        self,
+        rows: [&[u8]; 8],
+        panels: &[[&[Pq2I8mmPairBlock]; 4]],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        if outputs.len() != self.chunks.len()
+            || panels.len() != self.chunks.len()
+            || !scaled::valid_rows(rows, self.block_count)
+            || !panels
+                .iter()
+                .flatten()
+                .all(|pair_blocks| pair_blocks.len() == self.block_count)
+        {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_scaled_8x8_chunks_with_panels::<FUSED>(
+                self.detected,
+                rows,
+                self.chunks,
+                panels,
+                outputs,
+            )
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self.detected;
+            scaled::portable_scaled_8x8_chunks_up_to_8::<FUSED>(rows, self.chunks, outputs)
+        }
+    }
+}
+
+/// A borrowed, finite-scale PQ2 token scope for `1..=8` remainder tokens.
+///
+/// Construction validates every token extent and `scale.is_finite()` once per
+/// projection tile instead of every 8-row tile.
+#[derive(Clone, Copy)]
+pub struct Pq2PreparedTokens<'a> {
+    detected: Pq2Dotprod,
+    tokens: &'a [&'a [Pq2Activation]],
+    block_count: usize,
+}
+
+impl Pq2PreparedTokens<'_> {
+    /// Consumes 8 complete PQ2 rows across the prepared `1..=8` tokens.
+    ///
+    /// Columns `tokens.len()..8` in `out` are zeroed. Returns `None` for
+    /// mismatched row extents or nonfinite weights/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x_tokens<const FUSED: bool>(
+        self,
+        rows: [&[u8]; 8],
+        out: &mut [[f32; 8]; 8],
+    ) -> Option<()> {
+        if !scaled::valid_rows(rows, self.block_count) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_detected_dot_scaled_8x_tokens::<FUSED>(
+                self.detected,
+                rows,
+                self.tokens,
+                out,
+            )
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self.detected;
+            scaled::portable_scaled_8x_tokens::<FUSED>(rows, self.tokens, out)
+        }
+    }
+}
+
 impl Pq2Dotprod {
+    /// Returns whether runtime CPU/OS detection enabled `I8MM` (`SMMLA`) on this capability.
+    #[inline]
+    #[must_use]
+    pub const fn has_i8mm(self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.i8mm
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    }
+
+    /// Pre-packs a pair of aligned PQ2 activation slices `(t0, t1)` into contiguous
+    /// `SMMLA` panels (`Pq2I8mmPairBlock`), clearing and reusing `out`'s allocation.
+    ///
+    /// Returns `None` for empty/mismatched extents or nonfinite activation scales.
+    #[inline]
+    #[must_use]
+    pub fn pack_i8mm_pair_blocks(
+        self,
+        t0: &[Pq2Activation],
+        t1: &[Pq2Activation],
+        out: &mut Vec<Pq2I8mmPairBlock>,
+    ) -> Option<()> {
+        out.clear();
+        self.append_i8mm_pair_blocks(t0, t1, out)
+    }
+
+    /// Appends pre-packed `SMMLA` panels (`Pq2I8mmPairBlock`) for `(t0, t1)` into `out`
+    /// without clearing prior panels.
+    ///
+    /// Returns `None` for empty/mismatched extents or nonfinite activation scales.
+    #[inline]
+    #[must_use]
+    pub fn append_i8mm_pair_blocks(
+        self,
+        t0: &[Pq2Activation],
+        t1: &[Pq2Activation],
+        out: &mut Vec<Pq2I8mmPairBlock>,
+    ) -> Option<()> {
+        let _ = self;
+        if t0.is_empty()
+            || t0.len() != t1.len()
+            || t0.len().checked_mul(34).is_none()
+            || !t0.iter().chain(t1.iter()).all(|b| b.scale.is_finite())
+        {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_append_i8mm_pair_blocks(t0, t1, out);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            scaled::portable_append_i8mm_pair_blocks(t0, t1, out);
+        }
+        Some(())
+    }
+
+    /// Validates `1..=8` eight-token PQ2 activation chunks once across all row tiles.
+    ///
+    /// Returns `None` for empty/`> 8` chunk slices, mismatched lengths, overflowing
+    /// row extents, or nonfinite activation scales.
+    #[inline]
+    #[must_use]
+    pub fn prepare_scaled_chunks<'a>(
+        self,
+        chunks: &'a [[&'a [Pq2Activation]; 8]],
+    ) -> Option<Pq2PreparedChunks<'a>> {
+        let block_count = scaled::valid_pq2_chunks_only(chunks)?;
+        Some(Pq2PreparedChunks {
+            detected: self,
+            chunks,
+            block_count,
+        })
+    }
+
+    /// Validates `1..=8` PQ2 activation token slices once across all row tiles.
+    ///
+    /// Returns `None` for empty/`> 8` token slices, mismatched lengths, overflowing
+    /// row extents, or nonfinite activation scales.
+    #[inline]
+    #[must_use]
+    pub fn prepare_scaled_tokens<'a>(
+        self,
+        tokens: &'a [&'a [Pq2Activation]],
+    ) -> Option<Pq2PreparedTokens<'a>> {
+        let block_count = scaled::valid_pq2_tokens_only(tokens)?;
+        Some(Pq2PreparedTokens {
+            detected: self,
+            tokens,
+            block_count,
+        })
+    }
+
     /// Validates current activation scales once for any number of row groups.
     ///
     /// The returned scope borrows the activation slice immutably. Replacing or

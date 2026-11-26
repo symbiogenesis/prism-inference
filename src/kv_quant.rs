@@ -94,7 +94,17 @@ pub(crate) struct PreparedQuery<'a> {
 impl PreparedQuery<'_> {
     /// Retains per-record validation and result rounding without rescanning the query.
     pub(crate) fn score(&self, packed: &[u8]) -> Result<f32> {
-        let (scale, codes) = self.quantizer.record(packed)?;
+        let record = self.quantizer.record(packed)?;
+        self.score_with_record(record)
+    }
+
+    /// Scores one already-validated immutable internal page record.
+    pub(crate) fn score_trusted(&self, packed: &[u8]) -> Result<f32> {
+        let record = self.quantizer.trusted_record(packed)?;
+        self.score_with_record(record)
+    }
+
+    fn score_with_record(&self, (scale, codes): (f32, &[u8])) -> Result<f32> {
         if scale == 0.0 {
             return Ok(0.0);
         }
@@ -152,7 +162,17 @@ impl<const G: usize> PreparedQueryGroup<'_, G> {
     /// Scores `G` heads from one packed key row while retaining exact per-head
     /// validation and binary32 rounding.
     pub(crate) fn score_group(&self, packed: &[u8]) -> Result<[f32; G]> {
-        let (scale, codes) = self.quantizer.record(packed)?;
+        let record = self.quantizer.record(packed)?;
+        self.score_group_with_record(record)
+    }
+
+    /// Scores `G` heads from one already-validated immutable internal page record.
+    pub(crate) fn score_group_trusted(&self, packed: &[u8]) -> Result<[f32; G]> {
+        let record = self.quantizer.trusted_record(packed)?;
+        self.score_group_with_record(record)
+    }
+
+    fn score_group_with_record(&self, (scale, codes): (f32, &[u8])) -> Result<[f32; G]> {
         if scale == 0.0 {
             return Ok([0.0; G]);
         }
@@ -217,7 +237,18 @@ pub(crate) struct PreparedQueryPair<'a, const G: usize> {
 impl<const G: usize> PreparedQueryPair<'_, G> {
     /// Scores both token query groups (`2 * G` heads) from one packed key row.
     pub(crate) fn score_pair(&self, packed: &[u8]) -> Result<([f32; G], [f32; G])> {
-        let (scale, codes) = self.quantizer.record(packed)?;
+        let record = self.quantizer.record(packed)?;
+        self.score_pair_with_record(record)
+    }
+
+    /// Scores both token query groups (`2 * G` heads) from one already-validated
+    /// immutable internal page record.
+    pub(crate) fn score_pair_trusted(&self, packed: &[u8]) -> Result<([f32; G], [f32; G])> {
+        let record = self.quantizer.trusted_record(packed)?;
+        self.score_pair_with_record(record)
+    }
+
+    fn score_pair_with_record(&self, (scale, codes): (f32, &[u8])) -> Result<([f32; G], [f32; G])> {
         if scale == 0.0 {
             return Ok(([0.0; G], [0.0; G]));
         }
@@ -335,12 +366,38 @@ impl<const G: usize> ValueGroupPairAccumulator<'_, G> {
         if self.failed {
             return Err(invalid("KV codec accumulation already failed"));
         }
-        let result = self.append_pair(packed, weights0, weights1);
+        let result = self
+            .quantizer
+            .record(packed)
+            .and_then(|rec| self.append_pair_with_record(rec, weights0, weights1));
         self.failed = result.is_err();
         result
     }
 
-    fn append_pair(&mut self, packed: &[u8], weights0: [f32; G], weights1: [f32; G]) -> Result<()> {
+    /// Accumulates one already-validated immutable internal page value row across both token groups.
+    pub(crate) fn accumulate_pair_trusted(
+        &mut self,
+        packed: &[u8],
+        weights0: [f32; G],
+        weights1: [f32; G],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result = self
+            .quantizer
+            .trusted_record(packed)
+            .and_then(|rec| self.append_pair_with_record(rec, weights0, weights1));
+        self.failed = result.is_err();
+        result
+    }
+
+    fn append_pair_with_record(
+        &mut self,
+        (scale, codes): (f32, &[u8]),
+        weights0: [f32; G],
+        weights1: [f32; G],
+    ) -> Result<()> {
         if weights0
             .iter()
             .chain(weights1.iter())
@@ -348,7 +405,6 @@ impl<const G: usize> ValueGroupPairAccumulator<'_, G> {
         {
             return Err(invalid("KV codec weight must be finite"));
         }
-        let (scale, codes) = self.quantizer.record(packed)?;
         let mut weighted_scales = [[0.0_f32; G]; 2];
         let mut any_nonzero = false;
         for (dst, weight) in weighted_scales[0].iter_mut().zip(weights0) {
@@ -529,16 +585,39 @@ impl<const G: usize> ValueGroupAccumulator<'_, G> {
         if self.failed {
             return Err(invalid("KV codec accumulation already failed"));
         }
-        let result = self.append_group(packed, weights);
+        let result = self
+            .quantizer
+            .record(packed)
+            .and_then(|rec| self.append_group_with_record(rec, weights));
         self.failed = result.is_err();
         result
     }
 
-    fn append_group(&mut self, packed: &[u8], weights: [f32; G]) -> Result<()> {
+    /// Accumulates one already-validated immutable internal page value row with `G` weights.
+    pub(crate) fn accumulate_group_trusted(
+        &mut self,
+        packed: &[u8],
+        weights: [f32; G],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result = self
+            .quantizer
+            .trusted_record(packed)
+            .and_then(|rec| self.append_group_with_record(rec, weights));
+        self.failed = result.is_err();
+        result
+    }
+
+    fn append_group_with_record(
+        &mut self,
+        (scale, codes): (f32, &[u8]),
+        weights: [f32; G],
+    ) -> Result<()> {
         if weights.iter().any(|weight| !weight.is_finite()) {
             return Err(invalid("KV codec weight must be finite"));
         }
-        let (scale, codes) = self.quantizer.record(packed)?;
         let mut weighted_scales = [0.0; G];
         let mut any_nonzero = false;
         for (dst, weight) in weighted_scales.iter_mut().zip(weights) {
@@ -639,16 +718,31 @@ impl ValueAccumulator<'_> {
         if self.failed {
             return Err(invalid("KV codec accumulation already failed"));
         }
-        let result = self.append(packed, weight);
+        let result = self
+            .quantizer
+            .record(packed)
+            .and_then(|rec| self.append_with_record(rec, weight));
         self.failed = result.is_err();
         result
     }
 
-    fn append(&mut self, packed: &[u8], weight: f32) -> Result<()> {
+    /// Accumulates one already-validated immutable internal page value row.
+    pub(crate) fn accumulate_trusted(&mut self, packed: &[u8], weight: f32) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result = self
+            .quantizer
+            .trusted_record(packed)
+            .and_then(|rec| self.append_with_record(rec, weight));
+        self.failed = result.is_err();
+        result
+    }
+
+    fn append_with_record(&mut self, (scale, codes): (f32, &[u8]), weight: f32) -> Result<()> {
         if !weight.is_finite() {
             return Err(invalid("KV codec weight must be finite"));
         }
-        let (scale, codes) = self.quantizer.record(packed)?;
         let weighted_scale = weight * scale;
         if !weighted_scale.is_finite() {
             return Err(invalid("KV codec weighted scale overflow"));
@@ -1314,14 +1408,7 @@ impl Quantizer {
     }
 
     fn record<'a>(&self, packed: &'a [u8]) -> Result<(f32, &'a [u8])> {
-        if packed.len() != self.encoded_len() {
-            return Err(invalid("KV codec record length mismatch"));
-        }
-        let bytes: [u8; SCALE_BYTES] = packed[..SCALE_BYTES]
-            .try_into()
-            .map_err(|_| invalid("KV codec scale length mismatch"))?;
-        let scale = f32::from_le_bytes(bytes);
-        let codes = &packed[SCALE_BYTES..];
+        let (scale, codes) = self.trusted_record(packed)?;
         if !scale.is_finite() || scale.is_sign_negative() {
             return Err(invalid("KV codec scale must be finite and nonnegative"));
         }
@@ -1329,6 +1416,16 @@ impl Quantizer {
             return Err(invalid("KV codec zero row must be canonical"));
         }
         Ok((scale, codes))
+    }
+
+    fn trusted_record<'a>(&self, packed: &'a [u8]) -> Result<(f32, &'a [u8])> {
+        if packed.len() != self.encoded_len() {
+            return Err(invalid("KV codec record length mismatch"));
+        }
+        let bytes: [u8; SCALE_BYTES] = packed[..SCALE_BYTES]
+            .try_into()
+            .map_err(|_| invalid("KV codec scale length mismatch"))?;
+        Ok((f32::from_le_bytes(bytes), &packed[SCALE_BYTES..]))
     }
 
     fn add_codes(&self, codes: &[u8], scale: f32, out: &mut [f32; HEAD_DIM]) -> Result<()> {

@@ -100,6 +100,26 @@ pub(super) struct PackedBatchReservation {
     trailing_tail: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct ScheduledWorkItem {
+    pub(super) token_start: usize,
+    pub(super) token_len: usize,
+    pub(super) kv_head: usize,
+    pub(super) out_len: usize,
+}
+
+/// Reusable scheduling buffers for 2D `(token_pair, kv_head)` causal-cost-balanced prefill.
+#[derive(Default)]
+pub(super) struct CausalScheduleScratch {
+    costs: Vec<usize>,
+    token_starts: Vec<usize>,
+    kv_heads_idx: Vec<usize>,
+    order: Vec<usize>,
+    assigned: Vec<usize>,
+    pub(super) item_offsets: Vec<usize>,
+    pub(super) ordered: Vec<ScheduledWorkItem>,
+}
+
 /// Reusable scratch buffers for parallel rotated-KV tile encoding and 2D causal-balanced attention.
 #[derive(Default)]
 pub(super) struct PackedTileScratch {
@@ -107,6 +127,7 @@ pub(super) struct PackedTileScratch {
     encoded_values: Vec<u8>,
     kv_major_outputs: Vec<f32>,
     worker_scores: Vec<f32>,
+    schedule: CausalScheduleScratch,
 }
 
 pub(super) struct PackedCache {
@@ -290,11 +311,25 @@ impl PackedCache {
         }
     }
 
-    fn rows(&self) -> impl Iterator<Item = &[u8]> {
+    fn sealed_rows(&self) -> usize {
+        self.len
+            .saturating_sub(self.tail.len())
+            .checked_div(self.row_bytes)
+            .unwrap_or(0)
+    }
+
+    fn page_rows(&self) -> impl Iterator<Item = &[u8]> {
         self.pages
             .iter()
             .flat_map(|page| page.chunks_exact(self.row_bytes))
-            .chain(self.tail.chunks_exact(self.row_bytes))
+    }
+
+    fn tail_rows(&self) -> impl Iterator<Item = &[u8]> {
+        self.tail.chunks_exact(self.row_bytes)
+    }
+
+    fn rows(&self) -> impl Iterator<Item = &[u8]> {
+        self.page_rows().chain(self.tail_rows())
     }
 
     fn row(&self, position: usize) -> Result<&[u8]> {
@@ -785,6 +820,36 @@ fn prepare_current(
         values.quantizer.encode(value, value_output)?;
     }
     Ok(())
+}
+
+/// Encodes one KV head pair (`HEAD_DIM` channels each) into caller-owned packed
+/// destination slices so callers can fuse quantized KV encoding into parallel head work.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Exposed crate-wide for graph.rs triple-chunk fusion after integration."
+)]
+#[allow(
+    dead_code,
+    reason = "Wired from graph.rs update_triple_chunks after branch integration."
+)]
+pub(crate) fn prepare_current_head(
+    keys: &KvCache,
+    values: &KvCache,
+    current_key_head: &[f32],
+    current_value_head: &[f32],
+    key_out: &mut [u8],
+    value_out: &mut [u8],
+) -> Result<()> {
+    let key_cache = keys
+        .packed
+        .as_ref()
+        .ok_or_else(|| invalid("missing packed keys"))?;
+    let value_cache = values
+        .packed
+        .as_ref()
+        .ok_or_else(|| invalid("missing packed values"))?;
+    key_cache.quantizer.encode(current_key_head, key_out)?;
+    value_cache.quantizer.encode(current_value_head, value_out)
 }
 
 // Tile attention consumes the committed form of its current row, which must
@@ -1371,52 +1436,57 @@ impl<'a> TileContext<'a> {
 
     fn run_item_fixed<const G: usize>(
         &self,
-        item: &mut TileWorkItem<'_>,
+        item: ScheduledWorkItem,
+        output: &mut [f32],
         score_scratch: &mut [f32],
     ) -> std::result::Result<(), (usize, usize, crate::Error)> {
         if item.token_len == 2 {
-            self.run_pair_kv::<G>(item.token_start, item.kv_head, item.output, score_scratch)
+            self.run_pair_kv::<G>(item.token_start, item.kv_head, output, score_scratch)
         } else {
-            self.run_single_kv::<G>(item.token_start, item.kv_head, item.output, score_scratch)
+            self.run_single_kv::<G>(item.token_start, item.kv_head, output, score_scratch)
         }
     }
 
     fn run_item(
         &self,
-        item: &mut TileWorkItem<'_>,
+        item: ScheduledWorkItem,
+        output: &mut [f32],
         score_scratch: &mut [f32],
         unit: usize,
     ) -> std::result::Result<(), (usize, usize, crate::Error)> {
         match unit {
-            6 => self.run_item_fixed::<6>(item, score_scratch),
-            4 => self.run_item_fixed::<4>(item, score_scratch),
-            3 => self.run_item_fixed::<3>(item, score_scratch),
-            2 => self.run_item_fixed::<2>(item, score_scratch),
-            _ => self.run_item_fixed::<1>(item, score_scratch),
+            6 => self.run_item_fixed::<6>(item, output, score_scratch),
+            4 => self.run_item_fixed::<4>(item, output, score_scratch),
+            3 => self.run_item_fixed::<3>(item, output, score_scratch),
+            2 => self.run_item_fixed::<2>(item, output, score_scratch),
+            _ => self.run_item_fixed::<1>(item, output, score_scratch),
         }
     }
 }
 
-struct TileWorkItem<'a> {
-    token_start: usize,
-    token_len: usize,
-    kv_head: usize,
-    output: &'a mut [f32],
-}
-
 struct TileWorkerTask<'a> {
-    items: &'a mut [Option<TileWorkItem<'a>>],
+    items: &'a [ScheduledWorkItem],
+    outputs: &'a mut [f32],
     scores: &'a mut [f32],
     error: Option<(usize, usize, crate::Error)>,
 }
 
-fn assign_causal_balanced_items(
+fn reserve_usize_vec(vec: &mut Vec<usize>, needed: usize) -> Result<()> {
+    vec.clear();
+    if needed > vec.capacity() {
+        vec.try_reserve_exact(needed - vec.capacity())?;
+    }
+    Ok(())
+}
+
+pub(super) fn assign_causal_balanced_items_with_order(
     costs: &[usize],
     token_starts: &[usize],
     kv_heads_idx: &[usize],
     workers: usize,
     assigned: &mut [usize],
     counts: &mut [usize; MAX_ROW_WORKERS],
+    order: &mut Vec<usize>,
 ) -> Result<(usize, [usize; MAX_ROW_WORKERS])> {
     let active_workers = costs.len().min(workers.max(1)).min(MAX_ROW_WORKERS);
     counts.fill(0);
@@ -1424,8 +1494,7 @@ fn assign_causal_balanced_items(
     if active_workers == 0 {
         return Ok((0, loads));
     }
-    let mut order = Vec::new();
-    order.try_reserve_exact(costs.len())?;
+    reserve_usize_vec(order, costs.len())?;
     order.extend(0..costs.len());
     order.sort_by(|&lhs, &rhs| {
         costs[rhs]
@@ -1433,7 +1502,7 @@ fn assign_causal_balanced_items(
             .then_with(|| token_starts[lhs].cmp(&token_starts[rhs]))
             .then_with(|| kv_heads_idx[lhs].cmp(&kv_heads_idx[rhs]))
     });
-    for idx in order {
+    for &idx in order.iter() {
         let mut best_worker = 0_usize;
         let mut best_load = loads[0];
         for (worker, &load) in loads[..active_workers].iter().enumerate().skip(1) {
@@ -1447,6 +1516,134 @@ fn assign_causal_balanced_items(
         assigned[idx] = best_worker;
     }
     Ok((active_workers, loads))
+}
+
+#[cfg(test)]
+fn assign_causal_balanced_items(
+    costs: &[usize],
+    token_starts: &[usize],
+    kv_heads_idx: &[usize],
+    workers: usize,
+    assigned: &mut [usize],
+    counts: &mut [usize; MAX_ROW_WORKERS],
+) -> Result<(usize, [usize; MAX_ROW_WORKERS])> {
+    let mut order = Vec::new();
+    assign_causal_balanced_items_with_order(
+        costs,
+        token_starts,
+        kv_heads_idx,
+        workers,
+        assigned,
+        counts,
+        &mut order,
+    )
+}
+
+pub(super) struct BalancedScheduleSummary {
+    pub(super) used_workers: usize,
+    pub(super) counts: [usize; MAX_ROW_WORKERS],
+    pub(super) worker_out_elems: [usize; MAX_ROW_WORKERS],
+}
+
+pub(super) fn prepare_causal_balanced_schedule(
+    schedule: &mut CausalScheduleScratch,
+    count: usize,
+    first_position: usize,
+    kv_heads: usize,
+    group_out_stride: usize,
+    active_workers: usize,
+) -> Result<BalancedScheduleSummary> {
+    let num_token_units = count.div_ceil(2);
+    let total_items = checked_product(&[num_token_units, kv_heads])?;
+    reserve_usize_vec(&mut schedule.costs, total_items)?;
+    reserve_usize_vec(&mut schedule.token_starts, total_items)?;
+    reserve_usize_vec(&mut schedule.kv_heads_idx, total_items)?;
+    reserve_usize_vec(&mut schedule.assigned, total_items)?;
+    schedule.assigned.resize(total_items, 0);
+    reserve_usize_vec(&mut schedule.item_offsets, total_items)?;
+    schedule.item_offsets.resize(total_items, 0);
+    schedule.ordered.clear();
+    if total_items > schedule.ordered.capacity() {
+        schedule
+            .ordered
+            .try_reserve_exact(total_items - schedule.ordered.capacity())?;
+    }
+    schedule
+        .ordered
+        .resize(total_items, ScheduledWorkItem::default());
+
+    for u in 0..num_token_units {
+        let token_start = u * 2;
+        let token_len = (count - token_start).min(2);
+        let causal_cost = if token_len == 2 {
+            2_usize
+                .saturating_mul(first_position + token_start)
+                .saturating_add(3)
+        } else {
+            (first_position + token_start).saturating_add(1)
+        };
+        for kv_head in 0..kv_heads {
+            schedule.costs.push(causal_cost);
+            schedule.token_starts.push(token_start);
+            schedule.kv_heads_idx.push(kv_head);
+        }
+    }
+
+    let mut counts = [0_usize; MAX_ROW_WORKERS];
+    let (used_workers, _) = assign_causal_balanced_items_with_order(
+        &schedule.costs,
+        &schedule.token_starts,
+        &schedule.kv_heads_idx,
+        active_workers,
+        &mut schedule.assigned,
+        &mut counts,
+        &mut schedule.order,
+    )?;
+
+    let mut worker_out_elems = [0_usize; MAX_ROW_WORKERS];
+    for (&worker, &token_start) in schedule.assigned.iter().zip(&schedule.token_starts) {
+        let token_len = (count - token_start).min(2);
+        worker_out_elems[worker] += token_len * group_out_stride;
+    }
+
+    let mut item_cursor = [0_usize; MAX_ROW_WORKERS];
+    let mut out_cursor = [0_usize; MAX_ROW_WORKERS];
+    let mut running_items = 0_usize;
+    let mut running_out = 0_usize;
+    for worker in 0..used_workers {
+        item_cursor[worker] = running_items;
+        running_items += counts[worker];
+        out_cursor[worker] = running_out;
+        running_out += worker_out_elems[worker];
+    }
+
+    for (idx, ((&worker, &token_start), &kv_head)) in schedule
+        .assigned
+        .iter()
+        .zip(&schedule.token_starts)
+        .zip(&schedule.kv_heads_idx)
+        .enumerate()
+    {
+        let token_len = (count - token_start).min(2);
+        let out_len = token_len * group_out_stride;
+        let slot = item_cursor[worker];
+        item_cursor[worker] += 1;
+        let out_offset = out_cursor[worker];
+        out_cursor[worker] += out_len;
+        schedule.item_offsets[idx] = out_offset;
+        schedule.ordered[slot] = ScheduledWorkItem {
+            token_start,
+            token_len,
+            kv_head,
+            out_len,
+        };
+    }
+
+    Ok(BalancedScheduleSummary {
+        used_workers,
+        counts,
+        worker_out_elems,
+    })
 }
 
 /// Attend already encoded tile rows against their own causal prefixes using
@@ -1599,13 +1796,13 @@ pub(super) fn attend_tile_with_scratch(
                 for kv_head in 0..kv_heads {
                     let (out_slice, tail) = std::mem::take(&mut rem_out).split_at_mut(chunk_len);
                     rem_out = tail;
-                    let mut item = TileWorkItem {
+                    let item = ScheduledWorkItem {
                         token_start,
                         token_len,
                         kv_head,
-                        output: out_slice,
+                        out_len: chunk_len,
                     };
-                    if let Err(err) = ctx.run_item(&mut item, worker_scores, unit) {
+                    if let Err(err) = ctx.run_item(item, out_slice, worker_scores, unit) {
                         let key = (err.0, err.1);
                         if earliest
                             .as_ref()
@@ -1619,74 +1816,36 @@ pub(super) fn attend_tile_with_scratch(
             if let Some((_, _, err)) = earliest {
                 return Err(err);
             }
-        } else {
-            let mut items = Vec::new();
-            items.try_reserve_exact(total_items)?;
-            let mut costs = Vec::new();
-            costs.try_reserve_exact(total_items)?;
-            let mut token_starts = Vec::new();
-            token_starts.try_reserve_exact(total_items)?;
-            let mut kv_heads_idx = Vec::new();
-            kv_heads_idx.try_reserve_exact(total_items)?;
-
-            let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
+            let mut rem_out = &tile_scratch.kv_major_outputs[..total_out_elems];
             for u in 0..num_token_units {
                 let token_start = u * 2;
                 let token_len = (count - token_start).min(2);
-                let causal_cost = if token_len == 2 {
-                    2_usize.saturating_mul(base + token_start).saturating_add(3)
-                } else {
-                    (base + token_start).saturating_add(1)
-                };
                 let chunk_len = token_len * kv_out_len;
                 for kv_head in 0..kv_heads {
-                    let (out_slice, tail) = std::mem::take(&mut rem_out).split_at_mut(chunk_len);
+                    let (kv_block, tail) = rem_out.split_at(chunk_len);
                     rem_out = tail;
-                    costs.push(causal_cost);
-                    token_starts.push(token_start);
-                    kv_heads_idx.push(kv_head);
-                    items.push(TileWorkItem {
-                        token_start,
-                        token_len,
-                        kv_head,
-                        output: out_slice,
-                    });
+                    let dst_offset = kv_head * kv_out_len;
+                    for local_tok in 0..token_len {
+                        let src = &kv_block[local_tok * kv_out_len..(local_tok + 1) * kv_out_len];
+                        attended[token_start + local_tok][dst_offset..dst_offset + kv_out_len]
+                            .copy_from_slice(src);
+                    }
                 }
             }
-            let mut assigned = Vec::new();
-            assigned.try_reserve_exact(total_items)?;
-            assigned.resize(total_items, 0);
-            let mut counts = [0_usize; MAX_ROW_WORKERS];
-            let (used_workers, _) = assign_causal_balanced_items(
-                &costs,
-                &token_starts,
-                &kv_heads_idx,
+        } else {
+            let summary = prepare_causal_balanced_schedule(
+                &mut tile_scratch.schedule,
+                count,
+                base,
+                kv_heads,
+                kv_out_len,
                 active_workers,
-                &mut assigned,
-                &mut counts,
             )?;
-
-            let mut cursor = [0_usize; MAX_ROW_WORKERS];
-            let mut running = 0_usize;
-            for (c_off, &cnt) in cursor[..used_workers]
-                .iter_mut()
-                .zip(&counts[..used_workers])
-            {
-                *c_off = running;
-                running += cnt;
-            }
-            let mut ordered: Vec<Option<TileWorkItem<'_>>> = Vec::new();
-            ordered.try_reserve_exact(total_items)?;
-            ordered.resize_with(total_items, || None);
-            for (item, worker) in items.into_iter().zip(assigned) {
-                let slot = cursor[worker];
-                cursor[worker] += 1;
-                ordered[slot] = Some(item);
-            }
-
+            let used_workers = summary.used_workers;
             let mut tasks: [Option<TileWorkerTask<'_>>; MAX_ROW_WORKERS] =
                 std::array::from_fn(|_| None);
-            let mut rem_ordered = ordered.as_mut_slice();
+            let mut rem_ordered = &tile_scratch.schedule.ordered[..total_items];
+            let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
             let scratch_slice_workers = if reuse_caller_scores {
                 used_workers - 1
             } else {
@@ -1697,9 +1856,11 @@ pub(super) fn attend_tile_with_scratch(
             let mut caller_scores_opt =
                 reuse_caller_scores.then(|| &mut scores[..worker_score_len]);
             for (worker, task) in tasks[..used_workers].iter_mut().enumerate() {
-                let (item_chunk, item_tail) =
-                    std::mem::take(&mut rem_ordered).split_at_mut(counts[worker]);
+                let (item_chunk, item_tail) = rem_ordered.split_at(summary.counts[worker]);
                 rem_ordered = item_tail;
+                let (out_chunk, out_tail) =
+                    std::mem::take(&mut rem_out).split_at_mut(summary.worker_out_elems[worker]);
+                rem_out = out_tail;
                 let score_chunk = caller_scores_opt.take().map_or_else(
                     || {
                         let (chunk, score_tail) =
@@ -1711,6 +1872,7 @@ pub(super) fn attend_tile_with_scratch(
                 );
                 *task = Some(TileWorkerTask {
                     items: item_chunk,
+                    outputs: out_chunk,
                     scores: score_chunk,
                     error: None,
                 });
@@ -1718,8 +1880,12 @@ pub(super) fn attend_tile_with_scratch(
 
             parallelism.update_chunks(&mut tasks[..used_workers], 1, |_, worker_slice| {
                 for task in worker_slice.iter_mut().flatten() {
-                    for item in task.items.iter_mut().flatten() {
-                        if let Err(err) = ctx.run_item(item, task.scores, unit) {
+                    let mut rem_task_out = std::mem::take(&mut task.outputs);
+                    for &item in task.items {
+                        let (out_slice, tail) =
+                            std::mem::take(&mut rem_task_out).split_at_mut(item.out_len);
+                        rem_task_out = tail;
+                        if let Err(err) = ctx.run_item(item, out_slice, task.scores, unit) {
                             let key = (err.0, err.1);
                             if task
                                 .error
@@ -1741,21 +1907,23 @@ pub(super) fn attend_tile_with_scratch(
             if let Some((_, _, err)) = earliest {
                 return Err(err);
             }
-        }
 
-        let mut rem_out = &tile_scratch.kv_major_outputs[..total_out_elems];
-        for u in 0..num_token_units {
-            let token_start = u * 2;
-            let token_len = (count - token_start).min(2);
-            let chunk_len = token_len * kv_out_len;
-            for kv_head in 0..kv_heads {
-                let (kv_block, tail) = rem_out.split_at(chunk_len);
-                rem_out = tail;
-                let dst_offset = kv_head * kv_out_len;
-                for local_tok in 0..token_len {
-                    let src = &kv_block[local_tok * kv_out_len..(local_tok + 1) * kv_out_len];
-                    attended[token_start + local_tok][dst_offset..dst_offset + kv_out_len]
-                        .copy_from_slice(src);
+            let mut idx = 0_usize;
+            for u in 0..num_token_units {
+                let token_start = u * 2;
+                let token_len = (count - token_start).min(2);
+                let chunk_len = token_len * kv_out_len;
+                for kv_head in 0..kv_heads {
+                    let out_offset = tile_scratch.schedule.item_offsets[idx];
+                    idx += 1;
+                    let kv_block =
+                        &tile_scratch.kv_major_outputs[out_offset..out_offset + chunk_len];
+                    let dst_offset = kv_head * kv_out_len;
+                    for local_tok in 0..token_len {
+                        let src = &kv_block[local_tok * kv_out_len..(local_tok + 1) * kv_out_len];
+                        attended[token_start + local_tok][dst_offset..dst_offset + kv_out_len]
+                            .copy_from_slice(src);
+                    }
                 }
             }
         }
@@ -1946,17 +2114,27 @@ impl PackedAttention<'_> {
         let query_refs: [&[f32; HEAD_DIM]; G] =
             std::array::from_fn(|offset| &rotated_queries[offset]);
         let prepared_query = self.keys.quantizer.prepare_query_group(query_refs)?;
-        for (token, row) in self
+        let key_sealed_take = self.history_tokens.min(self.keys.sealed_rows());
+        let key_tail_take = self.history_tokens - key_sealed_take;
+        let mut token = 0_usize;
+        for row in self.keys.page_rows().take(key_sealed_take) {
+            let scores = prepared_query.score_group_trusted(self.keys.record(row, kv_head))?;
+            for (probabilities, score) in score_rows.iter_mut().zip(scores) {
+                probabilities[token] = score * self.scale;
+            }
+            token += 1;
+        }
+        for row in self
             .keys
-            .rows()
-            .take(self.history_tokens)
+            .tail_rows()
+            .take(key_tail_take)
             .chain(std::iter::once(self.current_keys))
-            .enumerate()
         {
             let scores = prepared_query.score_group(self.keys.record(row, kv_head))?;
             for (probabilities, score) in score_rows.iter_mut().zip(scores) {
                 probabilities[token] = score * self.scale;
             }
+            token += 1;
         }
         for probabilities in score_rows.iter_mut() {
             match self.arithmetic {
@@ -1972,10 +2150,13 @@ impl PackedAttention<'_> {
         }
         let mut accumulator = self.values.quantizer.value_group_accumulator::<G>()?;
         let mut packed_weights = [[0.0_f32; G]; PROB_PACK_CHUNK];
-        let mut value_rows = self
+        let val_sealed_take = self.history_tokens.min(self.values.sealed_rows());
+        let val_tail_take = self.history_tokens - val_sealed_take;
+        let mut page_value_rows = self.values.page_rows().take(val_sealed_take);
+        let mut tail_value_rows = self
             .values
-            .rows()
-            .take(self.history_tokens)
+            .tail_rows()
+            .take(val_tail_take)
             .chain(std::iter::once(self.current_values));
         for chunk_start in (0..total_tokens).step_by(PROB_PACK_CHUNK) {
             let chunk_len = (total_tokens - chunk_start).min(PROB_PACK_CHUNK);
@@ -1987,8 +2168,15 @@ impl PackedAttention<'_> {
                     slot[head] = weight;
                 }
             }
-            for &weights in &packed_weights[..chunk_len] {
-                let row = value_rows
+            let sealed_in_chunk = val_sealed_take.saturating_sub(chunk_start).min(chunk_len);
+            for &weights in &packed_weights[..sealed_in_chunk] {
+                let row = page_value_rows
+                    .next()
+                    .ok_or_else(|| invalid("packed value cache row is short"))?;
+                accumulator.accumulate_group_trusted(self.values.record(row, kv_head), weights)?;
+            }
+            for &weights in &packed_weights[sealed_in_chunk..chunk_len] {
+                let row = tail_value_rows
                     .next()
                     .ok_or_else(|| invalid("packed value cache row is short"))?;
                 accumulator.accumulate_group(self.values.record(row, kv_head), weights)?;
@@ -2021,10 +2209,20 @@ impl PackedAttention<'_> {
             &mut query,
         )?;
         let prepared_query = self.keys.quantizer.prepare_query(&query)?;
-        for (score, row) in probabilities.iter_mut().zip(
+        let key_sealed_take = self.history_tokens.min(self.keys.sealed_rows());
+        let key_tail_take = self.history_tokens - key_sealed_take;
+        let (prob_sealed, prob_tail) =
+            probabilities.split_at_mut(key_sealed_take.min(probabilities.len()));
+        for (score, row) in prob_sealed
+            .iter_mut()
+            .zip(self.keys.page_rows().take(key_sealed_take))
+        {
+            *score = prepared_query.score_trusted(self.keys.record(row, kv_head))? * self.scale;
+        }
+        for (score, row) in prob_tail.iter_mut().zip(
             self.keys
-                .rows()
-                .take(self.history_tokens)
+                .tail_rows()
+                .take(key_tail_take)
                 .chain(std::iter::once(self.current_keys)),
         ) {
             *score = prepared_query.score(self.keys.record(row, kv_head))? * self.scale;
@@ -2036,10 +2234,19 @@ impl PackedAttention<'_> {
             }
         }
         let mut accumulator = self.values.quantizer.value_accumulator()?;
-        for (&weight, row) in probabilities.iter().zip(
+        let val_sealed_take = self.history_tokens.min(self.values.sealed_rows());
+        let val_tail_take = self.history_tokens - val_sealed_take;
+        let (w_sealed, w_tail) = probabilities.split_at(val_sealed_take.min(probabilities.len()));
+        for (&weight, row) in w_sealed
+            .iter()
+            .zip(self.values.page_rows().take(val_sealed_take))
+        {
+            accumulator.accumulate_trusted(self.values.record(row, kv_head), weight)?;
+        }
+        for (&weight, row) in w_tail.iter().zip(
             self.values
-                .rows()
-                .take(self.history_tokens)
+                .tail_rows()
+                .take(val_tail_take)
                 .chain(std::iter::once(self.current_values)),
         ) {
             accumulator.accumulate(self.values.record(row, kv_head), weight)?;
@@ -2081,12 +2288,24 @@ fn score_pair_group<const G: usize>(
     let refs0: [&[f32; HEAD_DIM]; G] = std::array::from_fn(|offset| &rotated0[offset]);
     let refs1: [&[f32; HEAD_DIM]; G] = std::array::from_fn(|offset| &rotated1[offset]);
     let prepared_pair = pair[0].keys.quantizer.prepare_query_pair(refs0, refs1)?;
-    for (token, row) in pair[0]
+    let key_sealed_take = pos0.min(pair[0].keys.sealed_rows());
+    let key_tail_take = pos0 - key_sealed_take;
+    let mut token = 0_usize;
+    for row in pair[0].keys.page_rows().take(key_sealed_take) {
+        let (s0, s1) = prepared_pair.score_pair_trusted(pair[0].keys.record(row, kv_head))?;
+        for (probabilities, score) in score_rows[0].iter_mut().zip(s0) {
+            probabilities[token] = score * pair[0].scale;
+        }
+        for (probabilities, score) in score_rows[1].iter_mut().zip(s1) {
+            probabilities[token] = score * pair[1].scale;
+        }
+        token += 1;
+    }
+    for row in pair[0]
         .keys
-        .rows()
-        .take(pos0)
+        .tail_rows()
+        .take(key_tail_take)
         .chain(std::iter::once(pair[0].current_keys))
-        .enumerate()
     {
         let (s0, s1) = prepared_pair.score_pair(pair[0].keys.record(row, kv_head))?;
         for (probabilities, score) in score_rows[0].iter_mut().zip(s0) {
@@ -2095,6 +2314,7 @@ fn score_pair_group<const G: usize>(
         for (probabilities, score) in score_rows[1].iter_mut().zip(s1) {
             probabilities[token] = score * pair[1].scale;
         }
+        token += 1;
     }
     let s1_last = prepared_pair.score_second(pair[1].keys.record(pair[1].current_keys, kv_head))?;
     for (probabilities, score) in score_rows[1].iter_mut().zip(s1_last) {
@@ -2136,10 +2356,13 @@ fn attend_group_pair<const G: usize>(
         .value_group_pair_accumulator::<G>()?;
     let mut packed_w0 = [[0.0_f32; G]; PROB_PACK_CHUNK];
     let mut packed_w1 = [[0.0_f32; G]; PROB_PACK_CHUNK];
-    let mut value_rows = pair[0]
+    let val_sealed_take = pos0.min(pair[0].values.sealed_rows());
+    let val_tail_take = pos0 - val_sealed_take;
+    let mut page_value_rows = pair[0].values.page_rows().take(val_sealed_take);
+    let mut tail_value_rows = pair[0]
         .values
-        .rows()
-        .take(pos0)
+        .tail_rows()
+        .take(val_tail_take)
         .chain(std::iter::once(pair[0].current_values));
     for chunk_start in (0..total0).step_by(PROB_PACK_CHUNK) {
         let chunk_len = (total0 - chunk_start).min(PROB_PACK_CHUNK);
@@ -2157,8 +2380,21 @@ fn attend_group_pair<const G: usize>(
                 slot[head] = w1;
             }
         }
-        for (&w0, &w1) in packed_w0[..chunk_len].iter().zip(&packed_w1[..chunk_len]) {
-            let row = value_rows
+        let sealed_in_chunk = val_sealed_take.saturating_sub(chunk_start).min(chunk_len);
+        for (&w0, &w1) in packed_w0[..sealed_in_chunk]
+            .iter()
+            .zip(&packed_w1[..sealed_in_chunk])
+        {
+            let row = page_value_rows
+                .next()
+                .ok_or_else(|| invalid("packed value cache row is short"))?;
+            accumulator.accumulate_pair_trusted(pair[0].values.record(row, kv_head), w0, w1)?;
+        }
+        for (&w0, &w1) in packed_w0[sealed_in_chunk..chunk_len]
+            .iter()
+            .zip(&packed_w1[sealed_in_chunk..chunk_len])
+        {
+            let row = tail_value_rows
                 .next()
                 .ok_or_else(|| invalid("packed value cache row is short"))?;
             accumulator.accumulate_pair(pair[0].values.record(row, kv_head), w0, w1)?;

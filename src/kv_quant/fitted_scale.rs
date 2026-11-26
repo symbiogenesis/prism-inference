@@ -1,46 +1,56 @@
 //! Encoding-only scale fitting; packed readers retain their existing arithmetic.
 
-use super::{Bits, HEAD_DIM, SCALE_BYTES, scalar};
+use super::{Bits, HEAD_DIM, scalar};
 
-const MAX_CODE_BYTES: usize = super::MAX_RECORD_BYTES - SCALE_BYTES;
+fn unpack_codes(codes: &[u8], bit_width: u8) -> [u8; HEAD_DIM] {
+    std::array::from_fn(|index| {
+        u8::try_from(scalar::read_code(codes, bit_width, index)).unwrap_or(0)
+    })
+}
 
-fn reconstruction_error_f64(
-    row: &[f32; HEAD_DIM],
-    codes: &[u8],
-    bits: Bits,
+fn pack_codes(unpacked: &[u8; HEAD_DIM], bit_width: u8, codes: &mut [u8]) {
+    codes.fill(0);
+    for (index, &code) in unpacked.iter().enumerate() {
+        scalar::write_code(codes, bit_width, index, code);
+    }
+}
+
+fn precompute_targets(row: &[f32; HEAD_DIM], norm_scale: f32) -> [f64; HEAD_DIM] {
+    let norm_scale_f64 = f64::from(norm_scale);
+    std::array::from_fn(|index| f64::from(row[index]) * norm_scale_f64)
+}
+
+fn reconstruction_error_unpacked(
+    targets: &[f64; HEAD_DIM],
+    unpacked_codes: &[u8; HEAD_DIM],
     centroids: &[f32; 16],
-    norm_scale: f32,
     scale: f32,
 ) -> Option<f64> {
     if !scale.is_finite() || scale <= 0.0 {
         return None;
     }
     let mut error = 0.0_f64;
-    for (index, &value) in row.iter().enumerate() {
-        let code = scalar::read_code(codes, bits.bit_width(), index);
-        let reconstructed = scale * centroids[code];
+    for (&target, &code) in targets.iter().zip(unpacked_codes) {
+        let reconstructed = scale * centroids[usize::from(code)];
         if !reconstructed.is_finite() {
             return None;
         }
-        let target = f64::from(value) * f64::from(norm_scale);
         let delta = target - f64::from(reconstructed);
         error = delta.mul_add(delta, error);
     }
     error.is_finite().then_some(error)
 }
 
-fn least_squares_scale(
+fn least_squares_scale_unpacked(
     row: &[f32; HEAD_DIM],
-    codes: &[u8],
-    bits: Bits,
+    unpacked_codes: &[u8; HEAD_DIM],
     centroids: &[f32; 16],
     norm_scale: f32,
 ) -> Option<f32> {
     let mut cross = 0.0_f64;
     let mut energy = 0.0_f64;
-    for (index, &value) in row.iter().enumerate() {
-        let code = scalar::read_code(codes, bits.bit_width(), index);
-        let centroid = f64::from(centroids[code]);
+    for (&value, &code) in row.iter().zip(unpacked_codes) {
+        let centroid = f64::from(centroids[usize::from(code)]);
         cross = f64::from(value).mul_add(centroid, cross);
         energy = centroid.mul_add(centroid, energy);
     }
@@ -49,6 +59,33 @@ fn least_squares_scale(
     }
     let candidate = scalar::checked_f32(f64::from(norm_scale) * (cross / energy)).ok()?;
     (candidate.is_finite() && candidate > 0.0).then_some(candidate)
+}
+
+fn select_from_baseline(
+    row: &[f32; HEAD_DIM],
+    targets: &[f64; HEAD_DIM],
+    unpacked_codes: &[u8; HEAD_DIM],
+    centroids: &[f32; 16],
+    norm_scale: f32,
+    baseline_error: f64,
+) -> (f32, f64) {
+    let Some(candidate) = least_squares_scale_unpacked(row, unpacked_codes, centroids, norm_scale)
+    else {
+        return (norm_scale, baseline_error);
+    };
+    if candidate.to_bits() == norm_scale.to_bits() {
+        return (norm_scale, baseline_error);
+    }
+    let Some(candidate_error) =
+        reconstruction_error_unpacked(targets, unpacked_codes, centroids, candidate)
+    else {
+        return (norm_scale, baseline_error);
+    };
+    if candidate_error < baseline_error {
+        (candidate, candidate_error)
+    } else {
+        (norm_scale, baseline_error)
+    }
 }
 
 /// The target is the normalized, rotated binary32 row times the norm scale in
@@ -61,19 +98,22 @@ pub(super) fn select(
     centroids: &[f32; 16],
     norm_scale: f32,
 ) -> f32 {
-    let Some(candidate) = least_squares_scale(row, codes, bits, centroids, norm_scale) else {
+    let unpacked_codes = unpack_codes(codes, bits.bit_width());
+    let Some(candidate) = least_squares_scale_unpacked(row, &unpacked_codes, centroids, norm_scale)
+    else {
         return norm_scale;
     };
     if candidate.to_bits() == norm_scale.to_bits() {
         return norm_scale;
     }
+    let targets = precompute_targets(row, norm_scale);
     let Some(baseline_error) =
-        reconstruction_error_f64(row, codes, bits, centroids, norm_scale, norm_scale)
+        reconstruction_error_unpacked(&targets, &unpacked_codes, centroids, norm_scale)
     else {
         return norm_scale;
     };
     let Some(candidate_error) =
-        reconstruction_error_f64(row, codes, bits, centroids, norm_scale, candidate)
+        reconstruction_error_unpacked(&targets, &unpacked_codes, centroids, candidate)
     else {
         return norm_scale;
     };
@@ -96,33 +136,34 @@ pub(super) fn cooptimize(
     norm_scale: f32,
     scalar_only: bool,
 ) -> f32 {
-    let code_bytes = codes.len();
     let levels = bits.levels();
     let bit_width = bits.bit_width();
+    let initial_codes = unpack_codes(codes, bit_width);
+    let targets = precompute_targets(row, norm_scale);
 
     let Some(baseline_error) =
-        reconstruction_error_f64(row, codes, bits, centroids, norm_scale, norm_scale)
+        reconstruction_error_unpacked(&targets, &initial_codes, centroids, norm_scale)
     else {
         return norm_scale;
     };
-    let mut best_scale = select(row, codes, bits, centroids, norm_scale);
-    let mut best_error = if best_scale.to_bits() == norm_scale.to_bits() {
-        baseline_error
-    } else {
-        reconstruction_error_f64(row, codes, bits, centroids, norm_scale, best_scale)
-            .unwrap_or(baseline_error)
-    };
-    let mut best_codes = [0_u8; MAX_CODE_BYTES];
-    best_codes[..code_bytes].copy_from_slice(codes);
+    let (mut best_scale, mut best_error) = select_from_baseline(
+        row,
+        &targets,
+        &initial_codes,
+        centroids,
+        norm_scale,
+        baseline_error,
+    );
+    let mut best_codes = initial_codes;
+    let mut codes_changed = false;
 
     let mut current_scale = best_scale;
     for _ in 0..2 {
-        let mut candidate_codes = [0_u8; MAX_CODE_BYTES];
+        let mut candidate_codes = [0_u8; HEAD_DIM];
         let mut requant_ok = true;
-        for (index, &value) in row.iter().enumerate() {
-            let Ok(rescaled) = scalar::checked_f32(
-                (f64::from(value) * f64::from(norm_scale)) / f64::from(current_scale),
-            ) else {
+        let current_scale_f64 = f64::from(current_scale);
+        for (index, &target) in targets.iter().enumerate() {
+            let Ok(rescaled) = scalar::checked_f32(target / current_scale_f64) else {
                 requant_ok = false;
                 break;
             };
@@ -135,51 +176,39 @@ pub(super) fn cooptimize(
                 requant_ok = false;
                 break;
             }
-            scalar::write_code(&mut candidate_codes[..code_bytes], bit_width, index, code);
+            candidate_codes[index] = code;
         }
         if !requant_ok {
             break;
         }
-        if let Some(error) = reconstruction_error_f64(
-            row,
-            &candidate_codes[..code_bytes],
-            bits,
-            centroids,
-            norm_scale,
-            current_scale,
-        ) && error < best_error
+        if let Some(error) =
+            reconstruction_error_unpacked(&targets, &candidate_codes, centroids, current_scale)
+            && error < best_error
         {
             best_error = error;
             best_scale = current_scale;
-            best_codes[..code_bytes].copy_from_slice(&candidate_codes[..code_bytes]);
+            best_codes = candidate_codes;
+            codes_changed = true;
         }
-        if let Some(refit_scale) = least_squares_scale(
-            row,
-            &candidate_codes[..code_bytes],
-            bits,
-            centroids,
-            norm_scale,
-        ) && let Some(error) = reconstruction_error_f64(
-            row,
-            &candidate_codes[..code_bytes],
-            bits,
-            centroids,
-            norm_scale,
-            refit_scale,
-        ) && error < best_error
+        if let Some(refit_scale) =
+            least_squares_scale_unpacked(row, &candidate_codes, centroids, norm_scale)
+            && let Some(error) =
+                reconstruction_error_unpacked(&targets, &candidate_codes, centroids, refit_scale)
+            && error < best_error
         {
             best_error = error;
             best_scale = refit_scale;
-            best_codes[..code_bytes].copy_from_slice(&candidate_codes[..code_bytes]);
+            best_codes = candidate_codes;
+            codes_changed = true;
         }
-        if best_scale.to_bits() == current_scale.to_bits()
-            && best_codes[..code_bytes] == candidate_codes[..code_bytes]
-        {
+        if best_scale.to_bits() == current_scale.to_bits() && best_codes == candidate_codes {
             break;
         }
         current_scale = best_scale;
     }
 
-    codes.copy_from_slice(&best_codes[..code_bytes]);
+    if codes_changed {
+        pack_codes(&best_codes, bit_width, codes);
+    }
     best_scale
 }

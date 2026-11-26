@@ -785,6 +785,7 @@ pub(super) struct SixHeadTileScratch {
     kv_major_outputs: Vec<f32>,
     worker_scores: Vec<f32>,
     packed_scratch: Vec<[Vec<[u16; 6]>; 2]>,
+    schedule: super::quantized_kv::CausalScheduleScratch,
 }
 
 struct BalancedTileContext<'a> {
@@ -870,7 +871,8 @@ impl BalancedTileContext<'_> {
 
     fn run_item(
         &self,
-        item: &mut BalancedWorkItem<'_>,
+        item: super::quantized_kv::ScheduledWorkItem,
+        output: &mut [f32],
         scores: &mut [f32],
         score_stride: usize,
         packed_scratch: &mut [Vec<[u16; 6]>; 2],
@@ -879,7 +881,7 @@ impl BalancedTileContext<'_> {
             self.run_pair(
                 item.token_start,
                 item.kv_head,
-                item.output,
+                output,
                 scores,
                 score_stride,
                 packed_scratch,
@@ -888,7 +890,7 @@ impl BalancedTileContext<'_> {
             self.run_single(
                 item.token_start,
                 item.kv_head,
-                item.output,
+                output,
                 scores,
                 &mut packed_scratch[0],
             )
@@ -896,15 +898,9 @@ impl BalancedTileContext<'_> {
     }
 }
 
-struct BalancedWorkItem<'a> {
-    token_start: usize,
-    token_len: usize,
-    kv_head: usize,
-    output: &'a mut [f32],
-}
-
 struct BalancedWorkerTask<'a> {
-    items: &'a mut [Option<BalancedWorkItem<'a>>],
+    items: &'a [super::quantized_kv::ScheduledWorkItem],
+    outputs: &'a mut [f32],
     scores: &'a mut [f32],
     packed: &'a mut [Vec<[u16; 6]>; 2],
     error: Option<(usize, usize, Error)>,
@@ -960,45 +956,6 @@ fn validate_balanced_tile_inputs(
         return Err(invalid("invalid six-head attention balanced tile geometry"));
     }
     Ok(())
-}
-
-fn assign_causal_balanced_items(
-    costs: &[usize],
-    token_starts: &[usize],
-    kv_heads_idx: &[usize],
-    workers: usize,
-    assigned: &mut [usize],
-    counts: &mut [usize; MAX_ROW_WORKERS],
-) -> Result<(usize, [usize; MAX_ROW_WORKERS])> {
-    let active_workers = costs.len().min(workers.max(1)).min(MAX_ROW_WORKERS);
-    counts.fill(0);
-    let mut loads = [0_usize; MAX_ROW_WORKERS];
-    if active_workers == 0 {
-        return Ok((0, loads));
-    }
-    let mut order = Vec::new();
-    order.try_reserve_exact(costs.len())?;
-    order.extend(0..costs.len());
-    order.sort_by(|&lhs, &rhs| {
-        costs[rhs]
-            .cmp(&costs[lhs])
-            .then_with(|| token_starts[lhs].cmp(&token_starts[rhs]))
-            .then_with(|| kv_heads_idx[lhs].cmp(&kv_heads_idx[rhs]))
-    });
-    for idx in order {
-        let mut best_worker = 0_usize;
-        let mut best_load = loads[0];
-        for (worker, &load) in loads[..active_workers].iter().enumerate().skip(1) {
-            if load < best_load {
-                best_load = load;
-                best_worker = worker;
-            }
-        }
-        loads[best_worker] = loads[best_worker].saturating_add(costs[idx]);
-        counts[best_worker] += 1;
-        assigned[idx] = best_worker;
-    }
-    Ok((active_workers, loads))
 }
 
 fn resize_balanced_f32s(count: usize, output: &mut Vec<f32>) -> Result<()> {
@@ -1150,13 +1107,15 @@ pub(super) fn attend_tile_balanced_with_scratch(
                 for kv_head in 0..kv_heads {
                     let (out_slice, tail) = std::mem::take(&mut rem_out).split_at_mut(chunk_len);
                     rem_out = tail;
-                    let mut item = BalancedWorkItem {
+                    let item = super::quantized_kv::ScheduledWorkItem {
                         token_start,
                         token_len,
                         kv_head,
-                        output: out_slice,
+                        out_len: chunk_len,
                     };
-                    if let Err(err) = ctx.run_item(&mut item, worker_scores, score_stride, packed) {
+                    if let Err(err) =
+                        ctx.run_item(item, out_slice, worker_scores, score_stride, packed)
+                    {
                         let key = (err.0, err.1);
                         if earliest
                             .as_ref()
@@ -1170,76 +1129,37 @@ pub(super) fn attend_tile_balanced_with_scratch(
             if let Some((_, _, err)) = earliest {
                 return Err(err);
             }
-        } else {
-            let mut items = Vec::new();
-            items.try_reserve_exact(total_items)?;
-            let mut costs = Vec::new();
-            costs.try_reserve_exact(total_items)?;
-            let mut token_starts = Vec::new();
-            token_starts.try_reserve_exact(total_items)?;
-            let mut kv_heads_idx = Vec::new();
-            kv_heads_idx.try_reserve_exact(total_items)?;
-
-            let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
+            let mut rem_out = &tile_scratch.kv_major_outputs[..total_out_elems];
             for u in 0..num_token_units {
                 let token_start = u * 2;
                 let token_len = (count - token_start).min(2);
-                let causal_cost = if token_len == 2 {
-                    2_usize
-                        .saturating_mul(first_position + token_start)
-                        .saturating_add(3)
-                } else {
-                    (first_position + token_start).saturating_add(1)
-                };
                 let chunk_len = token_len * group_stride;
                 for kv_head in 0..kv_heads {
-                    let (out_slice, tail) = std::mem::take(&mut rem_out).split_at_mut(chunk_len);
+                    let (kv_block, tail) = rem_out.split_at(chunk_len);
                     rem_out = tail;
-                    costs.push(causal_cost);
-                    token_starts.push(token_start);
-                    kv_heads_idx.push(kv_head);
-                    items.push(BalancedWorkItem {
-                        token_start,
-                        token_len,
-                        kv_head,
-                        output: out_slice,
-                    });
+                    let dst_offset = kv_head * group_stride;
+                    for local_tok in 0..token_len {
+                        let src =
+                            &kv_block[local_tok * group_stride..(local_tok + 1) * group_stride];
+                        attended[token_start + local_tok][dst_offset..dst_offset + group_stride]
+                            .copy_from_slice(src);
+                    }
                 }
             }
-            let mut assigned = Vec::new();
-            assigned.try_reserve_exact(total_items)?;
-            assigned.resize(total_items, 0);
-            let mut counts = [0_usize; MAX_ROW_WORKERS];
-            let (used_workers, _) = assign_causal_balanced_items(
-                &costs,
-                &token_starts,
-                &kv_heads_idx,
+        } else {
+            let summary = super::quantized_kv::prepare_causal_balanced_schedule(
+                &mut tile_scratch.schedule,
+                count,
+                first_position,
+                kv_heads,
+                group_stride,
                 active_workers,
-                &mut assigned,
-                &mut counts,
             )?;
-
-            let mut cursor = [0_usize; MAX_ROW_WORKERS];
-            let mut running = 0_usize;
-            for (c_off, &cnt) in cursor[..used_workers]
-                .iter_mut()
-                .zip(&counts[..used_workers])
-            {
-                *c_off = running;
-                running += cnt;
-            }
-            let mut ordered: Vec<Option<BalancedWorkItem<'_>>> = Vec::new();
-            ordered.try_reserve_exact(total_items)?;
-            ordered.resize_with(total_items, || None);
-            for (item, worker) in items.into_iter().zip(assigned) {
-                let slot = cursor[worker];
-                cursor[worker] += 1;
-                ordered[slot] = Some(item);
-            }
-
+            let used_workers = summary.used_workers;
             let mut tasks: [Option<BalancedWorkerTask<'_>>; MAX_ROW_WORKERS] =
                 std::array::from_fn(|_| None);
-            let mut rem_ordered = ordered.as_mut_slice();
+            let mut rem_ordered = &tile_scratch.schedule.ordered[..total_items];
+            let mut rem_out = &mut tile_scratch.kv_major_outputs[..total_out_elems];
             let used_reused_workers = caller_worker_slots.min(used_workers);
             let used_scratch_workers = used_workers - used_reused_workers;
             let mut rem_caller_scores =
@@ -1248,9 +1168,11 @@ pub(super) fn attend_tile_balanced_with_scratch(
                 &mut tile_scratch.worker_scores[..used_scratch_workers * worker_score_len];
             let mut rem_packed = &mut tile_scratch.packed_scratch[..used_workers];
             for (worker, task) in tasks[..used_workers].iter_mut().enumerate() {
-                let (item_chunk, item_tail) =
-                    std::mem::take(&mut rem_ordered).split_at_mut(counts[worker]);
+                let (item_chunk, item_tail) = rem_ordered.split_at(summary.counts[worker]);
                 rem_ordered = item_tail;
+                let (out_chunk, out_tail) =
+                    std::mem::take(&mut rem_out).split_at_mut(summary.worker_out_elems[worker]);
+                rem_out = out_tail;
                 let score_chunk = if worker < used_reused_workers {
                     let (chunk, score_tail) =
                         std::mem::take(&mut rem_caller_scores).split_at_mut(worker_score_len);
@@ -1266,6 +1188,7 @@ pub(super) fn attend_tile_balanced_with_scratch(
                 rem_packed = packed_tail;
                 *task = Some(BalancedWorkerTask {
                     items: item_chunk,
+                    outputs: out_chunk,
                     scores: score_chunk,
                     packed: &mut packed_pair[0],
                     error: None,
@@ -1274,8 +1197,13 @@ pub(super) fn attend_tile_balanced_with_scratch(
 
             parallelism.update_chunks(&mut tasks[..used_workers], 1, |_, worker_slice| {
                 for task in worker_slice.iter_mut().flatten() {
-                    for item in task.items.iter_mut().flatten() {
-                        if let Err(err) = ctx.run_item(item, task.scores, score_stride, task.packed)
+                    let mut rem_task_out = std::mem::take(&mut task.outputs);
+                    for &item in task.items {
+                        let (out_slice, tail) =
+                            std::mem::take(&mut rem_task_out).split_at_mut(item.out_len);
+                        rem_task_out = tail;
+                        if let Err(err) =
+                            ctx.run_item(item, out_slice, task.scores, score_stride, task.packed)
                         {
                             let key = (err.0, err.1);
                             if task
@@ -1298,24 +1226,28 @@ pub(super) fn attend_tile_balanced_with_scratch(
             if let Some((_, _, err)) = earliest {
                 return Err(err);
             }
-        }
 
-        let mut rem_out = &tile_scratch.kv_major_outputs[..total_out_elems];
-        for u in 0..num_token_units {
-            let token_start = u * 2;
-            let token_len = (count - token_start).min(2);
-            let chunk_len = token_len * group_stride;
-            for kv_head in 0..kv_heads {
-                let (kv_block, tail) = rem_out.split_at(chunk_len);
-                rem_out = tail;
-                let dst_offset = kv_head * group_stride;
-                for local_tok in 0..token_len {
-                    let src = &kv_block[local_tok * group_stride..(local_tok + 1) * group_stride];
-                    attended[token_start + local_tok][dst_offset..dst_offset + group_stride]
-                        .copy_from_slice(src);
+            let mut idx = 0_usize;
+            for u in 0..num_token_units {
+                let token_start = u * 2;
+                let token_len = (count - token_start).min(2);
+                let chunk_len = token_len * group_stride;
+                for kv_head in 0..kv_heads {
+                    let out_offset = tile_scratch.schedule.item_offsets[idx];
+                    idx += 1;
+                    let kv_block =
+                        &tile_scratch.kv_major_outputs[out_offset..out_offset + chunk_len];
+                    let dst_offset = kv_head * group_stride;
+                    for local_tok in 0..token_len {
+                        let src =
+                            &kv_block[local_tok * group_stride..(local_tok + 1) * group_stride];
+                        attended[token_start + local_tok][dst_offset..dst_offset + group_stride]
+                            .copy_from_slice(src);
+                    }
                 }
             }
         }
+
         Ok(())
     })();
     if result.is_err() {

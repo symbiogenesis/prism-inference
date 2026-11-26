@@ -206,29 +206,9 @@ pub(crate) fn dot_pair_eight_rows(
     ])
 }
 
-/// Computes `(dot(states[r], key_t), dot(states[r], query_t))` across eight state rows for
-/// each `(key_t, query_t)` pair in `tokens`, writing into stack-shaped `key_dots` and `query_dots`.
-///
-/// # Errors
-/// Rejects batches exceeding 32 tokens, mismatched vector lengths, or a nonfinite result.
-#[cfg_attr(
-    not(all(
-        feature = "experimental-neon",
-        target_arch = "aarch64",
-        target_os = "windows",
-        target_env = "msvc",
-        target_feature = "neon"
-    )),
-    expect(
-        dead_code,
-        reason = "Dispatched from NEON 8-row GDN prefill and NEON parity tests."
-    )
-)]
-pub(crate) fn dot_pair_eight_rows_tokens(
+fn validate_dot_pair_eight_rows_tokens(
     states: [&[f32]; 8],
     tokens: &[(&[f32], &[f32])],
-    key_dots: &mut [[f32; 32]; 8],
-    query_dots: &mut [[f32; 32]; 8],
 ) -> Result<()> {
     if tokens.len() > 32 {
         return Err(invalid("pinned GDN batch exceeds 32-token chunk limit"));
@@ -243,6 +223,28 @@ pub(crate) fn dot_pair_eight_rows_tokens(
             .any(|(key, query)| key.len() != width || query.len() != width)
     {
         return Err(invalid("pinned GDN dot requires matching vectors"));
+    }
+    Ok(())
+}
+
+/// Computes `(dot(states[r], key_t), dot(states[r], query_t))` across eight state rows for
+/// each `(key_t, query_t)` pair in `tokens`, writing into stack-shaped `key_dots` and `query_dots`.
+///
+/// # Errors
+/// Rejects batches exceeding 32 tokens, mismatched vector lengths, or a nonfinite result.
+#[expect(
+    dead_code,
+    reason = "Retained for NEON row-major parity tests; graph prefill uses token-major layout."
+)]
+pub(crate) fn dot_pair_eight_rows_tokens(
+    states: [&[f32]; 8],
+    tokens: &[(&[f32], &[f32])],
+    key_dots: &mut [[f32; 32]; 8],
+    query_dots: &mut [[f32; 32]; 8],
+) -> Result<()> {
+    validate_dot_pair_eight_rows_tokens(states, tokens)?;
+    if tokens.is_empty() {
+        return Ok(());
     }
     #[cfg(all(
         feature = "experimental-neon",
@@ -268,6 +270,97 @@ pub(crate) fn dot_pair_eight_rows_tokens(
         }
     }
     Ok(())
+}
+
+/// Computes `(dot(states[r], key_t), dot(states[r], query_t))` across eight state rows for
+/// each `(key_t, query_t)` pair in `tokens`, writing into token-major `[token][row]` arrays.
+///
+/// # Errors
+/// Rejects batches exceeding 32 tokens, mismatched vector lengths, or a nonfinite result.
+#[cfg_attr(
+    not(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )),
+    expect(
+        dead_code,
+        reason = "Dispatched from NEON 8-row GDN prefill and NEON parity tests."
+    )
+)]
+pub(crate) fn dot_pair_eight_rows_tokens_major(
+    states: [&[f32]; 8],
+    tokens: &[(&[f32], &[f32])],
+    key_dots: &mut [[f32; 8]; 32],
+    query_dots: &mut [[f32; 8]; 32],
+) -> Result<()> {
+    validate_dot_pair_eight_rows_tokens(states, tokens)?;
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::dot_pair_eight_rows_tokens_major(states, tokens, key_dots, query_dots) {
+        for (k_row, q_row) in key_dots[..tokens.len()]
+            .iter_mut()
+            .zip(&mut query_dots[..tokens.len()])
+        {
+            for (k_val, q_val) in k_row.iter_mut().zip(q_row.iter_mut()) {
+                *k_val = super::finite(*k_val)?;
+                *q_val = super::finite(*q_val)?;
+            }
+        }
+        return Ok(());
+    }
+    for (token, &(first, second)) in tokens.iter().enumerate() {
+        let pairs = dot_pair_eight_rows(states, first, second)?;
+        for (row, &(k_val, q_val)) in pairs.iter().enumerate() {
+            key_dots[token][row] = k_val;
+            query_dots[token][row] = q_val;
+        }
+    }
+    Ok(())
+}
+
+/// Token-major eight-row WY state update, preserving exact non-FMA rounding order.
+pub(crate) fn gdn_wy_update_eight_rows_token_major(
+    states: [&[f32]; 8],
+    last_cumulative: f32,
+    inputs: &[ChunkInput<'_>],
+    scaled_deltas: &[[f32; 8]; 32],
+    matrix_rows: [&mut [f32]; 8],
+) {
+    let [m0, m1, m2, m3, m4, m5, m6, m7] = matrix_rows;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if neon::gdn_wy_update_eight_rows_token_major(
+        states,
+        last_cumulative,
+        inputs,
+        scaled_deltas,
+        [m0, m1, m2, m3, m4, m5, m6, m7],
+    ) {
+        return;
+    }
+    let rows = [m0, m1, m2, m3, m4, m5, m6, m7];
+    for (r, matrix_row) in rows.into_iter().enumerate() {
+        super::scale_slice_into(states[r], last_cumulative, matrix_row);
+        for (prior, input) in inputs.iter().enumerate() {
+            super::add_scaled_slice_in_place(matrix_row, input.key, scaled_deltas[prior][r]);
+        }
+    }
 }
 
 // Floating matrix projections deliberately retain scalar diagnostics and their
@@ -1750,5 +1843,108 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "Scalar reference preserves separate multiply and add roundings."
+    )]
+    fn pinned_gdn_token_major_dots_and_wy_update_match_scalar_zero_ulp() -> Result<()> {
+        for width in [4_usize, 15, 16, 32, 64, 128, 131] {
+            let state_buf: Vec<f32> = (0..8 * width)
+                .map(|i| f32::from(i8::try_from((i * 11) % 17).unwrap_or(0) - 8) * 0.0625)
+                .collect();
+            let states: [&[f32]; 8] =
+                std::array::from_fn(|r| &state_buf[r * width..(r + 1) * width]);
+            let keys: Vec<Vec<f32>> = (0..32)
+                .map(|t| {
+                    (0..width)
+                        .map(|c| {
+                            f32::from(i8::try_from((t * 5 + c * 3) % 13).unwrap_or(0) - 6) * 0.125
+                        })
+                        .collect()
+                })
+                .collect();
+            let queries: Vec<Vec<f32>> = (0..32)
+                .map(|t| {
+                    (0..width)
+                        .map(|c| {
+                            f32::from(i8::try_from((t * 7 + c * 5) % 15).unwrap_or(0) - 7) * 0.0625
+                        })
+                        .collect()
+                })
+                .collect();
+            let vals = [0.5_f32; 8];
+            let inputs: Vec<ChunkInput<'_>> = (0..32)
+                .map(|t| ChunkInput {
+                    query: &queries[t],
+                    key: &keys[t],
+                    value: &vals,
+                    decay: 0.9375,
+                    beta: 0.625,
+                })
+                .collect();
+            let pairs: Vec<(&[f32], &[f32])> = keys
+                .iter()
+                .zip(&queries)
+                .map(|(k, q)| (k.as_slice(), q.as_slice()))
+                .collect();
+            for count in [1_usize, 4, 7, 16, 32] {
+                let mut kd_major = [[f32::NAN; 8]; 32];
+                let mut qd_major = [[f32::NAN; 8]; 32];
+                super::dot_pair_eight_rows_tokens_major(
+                    states,
+                    &pairs[..count],
+                    &mut kd_major,
+                    &mut qd_major,
+                )?;
+                for tok in 0..count {
+                    for row in 0..8 {
+                        let exp_k = dot_scalar(states[row], &keys[tok])?;
+                        let exp_q = dot_scalar(states[row], &queries[tok])?;
+                        assert_eq!(kd_major[tok][row].to_bits(), exp_k.to_bits());
+                        assert_eq!(qd_major[tok][row].to_bits(), exp_q.to_bits());
+                    }
+                }
+                let mut scaled_deltas = [[0.0_f32; 8]; 32];
+                for (t, sd_row) in scaled_deltas[..count].iter_mut().enumerate() {
+                    for (r, slot) in sd_row.iter_mut().enumerate() {
+                        *slot = f32::from(i8::try_from((t * 3 + r * 5) % 11).unwrap_or(0) - 5)
+                            * 0.03125;
+                    }
+                }
+                let last_cum = 0.75_f32;
+                let mut actual_buf = vec![f32::NAN; 8 * width];
+                let (h0, h1) = actual_buf.split_at_mut(4 * width);
+                let (m01, m23) = h0.split_at_mut(2 * width);
+                let (m45, m67) = h1.split_at_mut(2 * width);
+                let (m0, m1) = m01.split_at_mut(width);
+                let (m2, m3) = m23.split_at_mut(width);
+                let (m4, m5) = m45.split_at_mut(width);
+                let (m6, m7) = m67.split_at_mut(width);
+                super::gdn_wy_update_eight_rows_token_major(
+                    states,
+                    last_cum,
+                    &inputs[..count],
+                    &scaled_deltas,
+                    [m0, m1, m2, m3, m4, m5, m6, m7],
+                );
+                for (r, actual_row) in actual_buf.chunks_exact(width).enumerate() {
+                    let mut expected_row = vec![0.0_f32; width];
+                    for (dst, &s) in expected_row.iter_mut().zip(states[r]) {
+                        *dst = last_cum * s;
+                    }
+                    for (prior, input) in inputs[..count].iter().enumerate() {
+                        let sd = scaled_deltas[prior][r];
+                        for (dst, &k) in expected_row.iter_mut().zip(input.key) {
+                            *dst += sd * k;
+                        }
+                    }
+                    assert_eq!(bits(actual_row), bits(&expected_row));
+                }
+            }
+        }
+        Ok(())
     }
 }

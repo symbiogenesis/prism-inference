@@ -214,39 +214,6 @@ fn dot_pair_two_rows(
     results
 }
 
-type TwoRowFourTokenVectors = ([[f32x4<Neon>; 4]; 2], [[f32x4<Neon>; 4]; 2]);
-
-#[inline]
-fn dot_pair_two_rows_four_tokens_lane(
-    neon: Neon,
-    st0: &[f32],
-    st1: &[f32],
-    keys: [&[f32]; 4],
-    queries: [&[f32]; 4],
-    lane_offset: usize,
-) -> TwoRowFourTokenVectors {
-    let zero = f32x4::splat(neon, 0.0);
-    let mut fk = [[zero; 4]; 2];
-    let mut sq = [[zero; 4]; 2];
-    let vectorized = keys[0].len() / 16 * 16;
-    for offset in (0..vectorized).step_by(16) {
-        let idx = offset + lane_offset;
-        let v0 = f32x4::from_slice(neon, &st0[idx..idx + 4]);
-        let v1 = f32x4::from_slice(neon, &st1[idx..idx + 4]);
-        for t in 0..4 {
-            let k = f32x4::from_slice(neon, &keys[t][idx..idx + 4]);
-            fk[0][t] = v0.mul_add_precise(k, fk[0][t]);
-            fk[1][t] = v1.mul_add_precise(k, fk[1][t]);
-        }
-        for t in 0..4 {
-            let q = f32x4::from_slice(neon, &queries[t][idx..idx + 4]);
-            sq[0][t] = v0.mul_add_precise(q, sq[0][t]);
-            sq[1][t] = v1.mul_add_precise(q, sq[1][t]);
-        }
-    }
-    (fk, sq)
-}
-
 #[inline]
 #[expect(
     clippy::suboptimal_flops,
@@ -261,19 +228,52 @@ fn dot_pair_two_rows_four_tokens(
 ) -> ([[f32; 4]; 2], [[f32; 4]; 2]) {
     let len = keys[0].len();
     let vectorized = len / 16 * 16;
-    let (fk0, sq0) = dot_pair_two_rows_four_tokens_lane(neon, st0, st1, keys, queries, 0);
-    let (fk2, sq2) = dot_pair_two_rows_four_tokens_lane(neon, st0, st1, keys, queries, 8);
-    let key_even_pair: [[f32x4<Neon>; 4]; 2] =
-        std::array::from_fn(|r| std::array::from_fn(|t| fk0[r][t] + fk2[r][t]));
-    let query_even_pair: [[f32x4<Neon>; 4]; 2] =
-        std::array::from_fn(|r| std::array::from_fn(|t| sq0[r][t] + sq2[r][t]));
-    let (fk1, sq1) = dot_pair_two_rows_four_tokens_lane(neon, st0, st1, keys, queries, 4);
-    let (fk3, sq3) = dot_pair_two_rows_four_tokens_lane(neon, st0, st1, keys, queries, 12);
+    let zero = f32x4::splat(neon, 0.0);
+    let mut fk = [[[zero; 4]; 4]; 2];
+    let mut sq = [[[zero; 4]; 4]; 2];
+    let st0_chunks = st0[..vectorized].as_chunks::<16>().0;
+    let st1_chunks = st1[..vectorized].as_chunks::<16>().0;
+    let k_chunks = keys.map(|row| row[..vectorized].as_chunks::<16>().0);
+    let q_chunks = queries.map(|row| row[..vectorized].as_chunks::<16>().0);
+    for (b, (st0_block, st1_block)) in st0_chunks.iter().zip(st1_chunks).enumerate() {
+        for half in 0..2 {
+            let off0 = half * 8;
+            let off1 = off0 + 4;
+            let l0 = half * 2;
+            let l1 = l0 + 1;
+            let v0_0 = f32x4::from_slice(neon, &st0_block[off0..off1]);
+            let v0_1 = f32x4::from_slice(neon, &st0_block[off1..off1 + 4]);
+            let v1_0 = f32x4::from_slice(neon, &st1_block[off0..off1]);
+            let v1_1 = f32x4::from_slice(neon, &st1_block[off1..off1 + 4]);
+            for t in 0..4 {
+                let kb = &k_chunks[t][b];
+                let k0 = f32x4::from_slice(neon, &kb[off0..off1]);
+                let k1 = f32x4::from_slice(neon, &kb[off1..off1 + 4]);
+                fk[0][t][l0] = v0_0.mul_add_precise(k0, fk[0][t][l0]);
+                fk[0][t][l1] = v0_1.mul_add_precise(k1, fk[0][t][l1]);
+                fk[1][t][l0] = v1_0.mul_add_precise(k0, fk[1][t][l0]);
+                fk[1][t][l1] = v1_1.mul_add_precise(k1, fk[1][t][l1]);
+            }
+            for t in 0..4 {
+                let qb = &q_chunks[t][b];
+                let q0 = f32x4::from_slice(neon, &qb[off0..off1]);
+                let q1 = f32x4::from_slice(neon, &qb[off1..off1 + 4]);
+                sq[0][t][l0] = v0_0.mul_add_precise(q0, sq[0][t][l0]);
+                sq[0][t][l1] = v0_1.mul_add_precise(q1, sq[0][t][l1]);
+                sq[1][t][l0] = v1_0.mul_add_precise(q0, sq[1][t][l0]);
+                sq[1][t][l1] = v1_1.mul_add_precise(q1, sq[1][t][l1]);
+            }
+        }
+    }
     let mut out_k: [[f32; 4]; 2] = std::array::from_fn(|r| {
-        std::array::from_fn(|t| (key_even_pair[r][t] + (fk1[r][t] + fk3[r][t])).reduce_sum())
+        std::array::from_fn(|t| {
+            ((fk[r][t][0] + fk[r][t][2]) + (fk[r][t][1] + fk[r][t][3])).reduce_sum()
+        })
     });
     let mut out_q: [[f32; 4]; 2] = std::array::from_fn(|r| {
-        std::array::from_fn(|t| (query_even_pair[r][t] + (sq1[r][t] + sq3[r][t])).reduce_sum())
+        std::array::from_fn(|t| {
+            ((sq[r][t][0] + sq[r][t][2]) + (sq[r][t][1] + sq[r][t][3])).reduce_sum()
+        })
     });
     for idx in vectorized..len {
         let a = st0[idx];
@@ -291,14 +291,40 @@ fn dot_pair_two_rows_four_tokens(
 }
 
 /// Computes `(dot(states[r], key_t), dot(states[r], query_t))` across eight state rows for up
-/// to 32 tokens, batching two state rows by four tokens across quarter-stride vector passes
-/// (<= 22 NEON registers, zero spills, 0-ULP bit-exact with `dot_pair_eight_rows`).
+/// to 32 tokens, batching two state rows by four tokens in a single contiguous vector pass
+/// (0-ULP bit-exact with `dot_pair_eight_rows`).
 #[inline]
 pub(super) fn dot_pair_eight_rows_tokens(
     states: [&[f32]; 8],
     tokens: &[(&[f32], &[f32])],
     key_dots: &mut [[f32; 32]; 8],
     query_dots: &mut [[f32; 32]; 8],
+) -> bool {
+    dot_pair_eight_rows_tokens_with(states, tokens, |token, row, k_val, q_val| {
+        key_dots[row][token] = k_val;
+        query_dots[row][token] = q_val;
+    })
+}
+
+/// Token-major variant of `dot_pair_eight_rows_tokens` writing `[token][row]` slices directly.
+#[inline]
+pub(super) fn dot_pair_eight_rows_tokens_major(
+    states: [&[f32]; 8],
+    tokens: &[(&[f32], &[f32])],
+    key_dots: &mut [[f32; 8]; 32],
+    query_dots: &mut [[f32; 8]; 32],
+) -> bool {
+    dot_pair_eight_rows_tokens_with(states, tokens, |token, row, k_val, q_val| {
+        key_dots[token][row] = k_val;
+        query_dots[token][row] = q_val;
+    })
+}
+
+#[inline]
+fn dot_pair_eight_rows_tokens_with(
+    states: [&[f32]; 8],
+    tokens: &[(&[f32], &[f32])],
+    mut store: impl FnMut(usize, usize, f32, f32),
 ) -> bool {
     let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
         return false;
@@ -313,10 +339,8 @@ pub(super) fn dot_pair_eight_rows_tokens(
             let (out_k, out_q) =
                 dot_pair_two_rows_four_tokens(neon, states[r0], states[r0 + 1], keys, queries);
             for t in 0..4 {
-                key_dots[r0][base_t + t] = out_k[0][t];
-                query_dots[r0][base_t + t] = out_q[0][t];
-                key_dots[r0 + 1][base_t + t] = out_k[1][t];
-                query_dots[r0 + 1][base_t + t] = out_q[1][t];
+                store(base_t + t, r0, out_k[0][t], out_q[0][t]);
+                store(base_t + t, r0 + 1, out_k[1][t], out_q[1][t]);
             }
         }
     }
@@ -327,8 +351,7 @@ pub(super) fn dot_pair_eight_rows_tokens(
             return false;
         };
         for (row, &(k_val, q_val)) in pairs.iter().enumerate() {
-            key_dots[row][token] = k_val;
-            query_dots[row][token] = q_val;
+            store(token, row, k_val, q_val);
         }
     }
     true
@@ -1532,36 +1555,36 @@ fn step_eight_rows_into(
     beta: f32,
 ) -> Option<[f32; 8]> {
     let mut scales = [0.0; 8];
-    for (group, ((previous, states), values)) in previous
+    for (group, (previous, values)) in previous
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(values.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let deltas = decay_four_rows_scales(neon, *previous, key, decay, *values, beta)?;
+        scales[group * 4..group * 4 + 4].copy_from_slice(&deltas);
+    }
+    // Every key dot precedes updates, as in the existing eight-row helper.
+    // Re-read L1-resident `previous` in pass 2 so `states` is written only once.
+    let mut outputs = [0.0; 8];
+    for (group, ((previous, states), scales)) in previous
         .as_chunks::<4>()
         .0
         .iter()
         .zip(states.as_chunks_mut::<4>().0)
-        .zip(values.as_chunks::<4>().0)
-        .enumerate()
-    {
-        let deltas = decay_four_rows_into(neon, *previous, states, key, decay, *values, beta)?;
-        scales[group * 4..group * 4 + 4].copy_from_slice(&deltas);
-    }
-    // Every key dot precedes updates, as in the existing eight-row helper.
-    let mut outputs = [0.0; 8];
-    for (group, (states, scales)) in states
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
         .zip(scales.as_chunks::<4>().0)
         .enumerate()
     {
-        let values = update_four_rows_in_place(neon, states, key, query, *scales)?;
+        let values = update_four_rows_from(neon, *previous, states, key, query, decay, *scales)?;
         outputs[group * 4..group * 4 + 4].copy_from_slice(&values);
     }
     Some(outputs)
 }
 
-fn decay_four_rows_into(
+fn decay_four_rows_scales(
     neon: Neon,
     previous: [&[f32]; 4],
-    states: &mut [&mut [f32]; 4],
     key: &[f32],
     decay: f32,
     values: [f32; 4],
@@ -1584,11 +1607,6 @@ fn decay_four_rows_into(
             let d1 = f32x4::from_slice(neon, &prev_block[4..8]) * decays;
             let d2 = f32x4::from_slice(neon, &prev_block[8..12]) * decays;
             let d3 = f32x4::from_slice(neon, &prev_block[12..16]) * decays;
-            let state = &mut states[r][offset..offset + 16];
-            d0.store_slice(&mut state[0..4]);
-            d1.store_slice(&mut state[4..8]);
-            d2.store_slice(&mut state[8..12]);
-            d3.store_slice(&mut state[12..16]);
             s0[r] = d0.mul_add_precise(k0, s0[r]);
             s1[r] = d1.mul_add_precise(k1, s1[r]);
             s2[r] = d2.mul_add_precise(k2, s2[r]);
@@ -1606,13 +1624,16 @@ fn decay_four_rows_into(
     Some(scales)
 }
 
-fn update_four_rows_in_place(
+fn update_four_rows_from(
     neon: Neon,
+    previous: [&[f32]; 4],
     states: &mut [&mut [f32]; 4],
     key: &[f32],
     query: &[f32],
+    decay: f32,
     scales: [f32; 4],
 ) -> Option<[f32; 4]> {
+    let decays = f32x4::splat(neon, decay);
     let scales = scales.map(|scale| f32x4::splat(neon, scale));
     let mut q0 = [f32x4::splat(neon, 0.0); 4];
     let mut q1 = [f32x4::splat(neon, 0.0); 4];
@@ -1635,12 +1656,17 @@ fn update_four_rows_in_place(
         let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
         let offset = b * 16;
         for r in 0..4 {
+            let prev_block = &previous[r][offset..offset + 16];
             let state = &mut states[r][offset..offset + 16];
             let scale = scales[r];
-            let u0 = scale.mul_add_precise(k0, f32x4::from_slice(neon, &state[0..4]));
-            let u1 = scale.mul_add_precise(k1, f32x4::from_slice(neon, &state[4..8]));
-            let u2 = scale.mul_add_precise(k2, f32x4::from_slice(neon, &state[8..12]));
-            let u3 = scale.mul_add_precise(k3, f32x4::from_slice(neon, &state[12..16]));
+            let d0 = f32x4::from_slice(neon, &prev_block[0..4]) * decays;
+            let d1 = f32x4::from_slice(neon, &prev_block[4..8]) * decays;
+            let d2 = f32x4::from_slice(neon, &prev_block[8..12]) * decays;
+            let d3 = f32x4::from_slice(neon, &prev_block[12..16]) * decays;
+            let u0 = scale.mul_add_precise(k0, d0);
+            let u1 = scale.mul_add_precise(k1, d1);
+            let u2 = scale.mul_add_precise(k2, d2);
+            let u3 = scale.mul_add_precise(k3, d3);
             u0.store_slice(&mut state[0..4]);
             u1.store_slice(&mut state[4..8]);
             u2.store_slice(&mut state[8..12]);
@@ -2348,6 +2374,100 @@ pub(super) fn step_four_rows_state_only_tokens_from(
             dot_k = next_dots;
         } else {
             return finish_four_rows_state_only(neon, &mut states, input.key, deltas);
+        }
+    }
+    true
+}
+
+/// Token-major 16-column WY state update across eight rows, preserving the exact
+/// separate binary32 multiply and add rounding order (`0 ULP` with scalar
+/// `scale_slice_into` + `add_scaled_slice_in_place`).
+#[inline]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "Preserve separate binary32 multiply and add roundings matching scale_slice_into and add_scaled_slice_in_place."
+)]
+pub(super) fn gdn_wy_update_eight_rows_token_major(
+    states: [&[f32]; 8],
+    last_cumulative: f32,
+    inputs: &[super::ChunkInput<'_>],
+    scaled_deltas: &[[f32; 8]; 32],
+    matrix_rows: [&mut [f32]; 8],
+) -> bool {
+    let Some(neon) = fearless_simd::Level::baseline().as_neon() else {
+        return false;
+    };
+    let width = matrix_rows[0].len();
+    let count = inputs.len();
+    let scale_vec = f32x4::splat(neon, last_cumulative);
+    let vec16_blocks = width / 16;
+    let [m0, m1, m2, m3, m4, m5, m6, m7] = matrix_rows;
+    let mut rows = [m0, m1, m2, m3, m4, m5, m6, m7];
+    for b in 0..vec16_blocks {
+        let offset = b * 16;
+        for half in 0..2 {
+            let base_r = half * 4;
+            let mut acc = [[f32x4::splat(neon, 0.0); 4]; 4];
+            for r in 0..4 {
+                let s = &states[base_r + r][offset..offset + 16];
+                acc[r] = [
+                    scale_vec * f32x4::from_slice(neon, &s[0..4]),
+                    scale_vec * f32x4::from_slice(neon, &s[4..8]),
+                    scale_vec * f32x4::from_slice(neon, &s[8..12]),
+                    scale_vec * f32x4::from_slice(neon, &s[12..16]),
+                ];
+            }
+            for (prior, input) in inputs[..count].iter().enumerate() {
+                let kb = &input.key[offset..offset + 16];
+                let k0 = f32x4::from_slice(neon, &kb[0..4]);
+                let k1 = f32x4::from_slice(neon, &kb[4..8]);
+                let k2 = f32x4::from_slice(neon, &kb[8..12]);
+                let k3 = f32x4::from_slice(neon, &kb[12..16]);
+                let sd_row = &scaled_deltas[prior];
+                for r in 0..4 {
+                    let sd = f32x4::splat(neon, sd_row[base_r + r]);
+                    acc[r][0] += sd * k0;
+                    acc[r][1] += sd * k1;
+                    acc[r][2] += sd * k2;
+                    acc[r][3] += sd * k3;
+                }
+            }
+            for (out_row, row_acc) in rows[base_r..base_r + 4].iter_mut().zip(acc.iter()) {
+                let out_block = &mut out_row[offset..offset + 16];
+                row_acc[0].store_slice(&mut out_block[0..4]);
+                row_acc[1].store_slice(&mut out_block[4..8]);
+                row_acc[2].store_slice(&mut out_block[8..12]);
+                row_acc[3].store_slice(&mut out_block[12..16]);
+            }
+        }
+    }
+    let vec4_blocks = width / 4;
+    for b in (vec16_blocks * 4)..vec4_blocks {
+        let offset = b * 4;
+        let mut a: [f32x4<Neon>; 8] = std::array::from_fn(|r| {
+            scale_vec * f32x4::from_slice(neon, &states[r][offset..offset + 4])
+        });
+        for (prior, input) in inputs[..count].iter().enumerate() {
+            let k = f32x4::from_slice(neon, &input.key[offset..offset + 4]);
+            let sd_row = &scaled_deltas[prior];
+            for r in 0..8 {
+                a[r] += f32x4::splat(neon, sd_row[r]) * k;
+            }
+        }
+        for (r, out_row) in rows.iter_mut().enumerate() {
+            a[r].store_slice(&mut out_row[offset..offset + 4]);
+        }
+    }
+    let rem_start = vec4_blocks * 4;
+    if rem_start < width {
+        for (r, out_row) in rows.iter_mut().enumerate() {
+            for (idx, out_elem) in out_row.iter_mut().enumerate().take(width).skip(rem_start) {
+                let mut acc = last_cumulative * states[r][idx];
+                for (prior, input) in inputs[..count].iter().enumerate() {
+                    acc += scaled_deltas[prior][r] * input.key[idx];
+                }
+                *out_elem = acc;
+            }
         }
     }
     true

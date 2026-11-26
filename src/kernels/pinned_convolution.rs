@@ -1068,7 +1068,7 @@ fn step_tokens_inner<
         let zero = f32x4::splat(neon, 0.0);
         let one = f32x4::splat(neon, 1.0);
         let mut finite_mask = zero.is_finite();
-        let mut stack_squares = [0.0_f64; 32];
+        let mut stack_squares = [0.0_f64; 64];
         let mut heap_squares = Vec::new();
         let squares: &mut [f64] = if CLAMPED_L2 {
             if count <= stack_squares.len() {

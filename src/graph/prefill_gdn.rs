@@ -48,6 +48,22 @@ const GDN_INPUT_CAPACITY: usize = if crate::kernels::prefill::MAX_TILE_TOKENS > 
     64
 };
 
+std::thread_local! {
+    static WORKER_CARRY_STATE: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_worker_carry_state<R>(f: impl FnOnce(&mut Vec<f32>) -> R) -> R {
+    WORKER_CARRY_STATE.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            f(&mut guard)
+        } else {
+            let mut fallback = Vec::new();
+            f(&mut fallback)
+        }
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Sub-chunk GDN tiles larger than 32 tokens into <=32-token WY chunks with one ping-pong carry buffer."
@@ -313,7 +329,7 @@ fn head_into_eight_row_block_scalar(
     width: usize,
     scale: f32,
     output: &mut [f32],
-    scaled_deltas: &mut [[f32; 32]; 8],
+    scaled_deltas: &mut [[f32; 8]; 32],
 ) -> Result<()> {
     let count = inputs.len();
     let mut deltas = [[0.0_f32; 32]; 8];
@@ -337,9 +353,13 @@ fn head_into_eight_row_block_scalar(
             output[out_base + sub] = value * scale;
         }
     }
-    for sub in 0..8 {
-        for (prior, &delta) in deltas[sub][..count].iter().enumerate() {
-            scaled_deltas[sub][prior] = last_products[prior] * delta;
+    for (prior, (&lp, sd_row)) in last_products[..count]
+        .iter()
+        .zip(&mut scaled_deltas[..count])
+        .enumerate()
+    {
+        for sub in 0..8 {
+            sd_row[sub] = lp * deltas[sub][prior];
         }
     }
     Ok(())
@@ -356,8 +376,8 @@ fn collect_eight_row_state_dots(
     arithmetic: Arithmetic,
     states: [&[f32]; 8],
     inputs: &[Input<'_>],
-    key_dots: &mut [[f32; 32]; 8],
-    query_dots: &mut [[f32; 32]; 8],
+    key_dots: &mut [[f32; 8]; 32],
+    query_dots: &mut [[f32; 8]; 32],
 ) -> Result<()> {
     match arithmetic {
         Arithmetic::PinnedSwift => {
@@ -366,7 +386,7 @@ fn collect_eight_row_state_dots(
             for (slot, input) in pairs[..count].iter_mut().zip(inputs) {
                 *slot = (input.key, input.query);
             }
-            crate::kernels::pinned_gdn::dot_pair_eight_rows_tokens(
+            crate::kernels::pinned_gdn::dot_pair_eight_rows_tokens_major(
                 states,
                 &pairs[..count],
                 key_dots,
@@ -377,8 +397,8 @@ fn collect_eight_row_state_dots(
             for (token, input) in inputs.iter().enumerate() {
                 let pairs = arithmetic.gdn_dot_pair_eight_rows(states, input.key, input.query)?;
                 for row in 0..8 {
-                    key_dots[row][token] = pairs[row].0;
-                    query_dots[row][token] = pairs[row].1;
+                    key_dots[token][row] = pairs[row].0;
+                    query_dots[token][row] = pairs[row].1;
                 }
             }
             Ok(())
@@ -409,7 +429,7 @@ fn head_into_eight_row_block_neon(
     width: usize,
     scale: f32,
     output: &mut [f32],
-    scaled_deltas: &mut [[f32; 32]; 8],
+    scaled_deltas: &mut [[f32; 8]; 32],
 ) -> Result<bool> {
     use fearless_simd::{f32x4, prelude::*};
 
@@ -421,49 +441,17 @@ fn head_into_eight_row_block_neon(
     let mut deltas_lo = [zero; 32];
     let mut deltas_hi = [zero; 32];
     let scale_vec = f32x4::splat(neon, scale);
-    let mut key_dots = [[0.0_f32; 32]; 8];
-    let mut query_dots = [[0.0_f32; 32]; 8];
+    let mut key_dots = [[0.0_f32; 8]; 32];
+    let mut query_dots = [[0.0_f32; 8]; 32];
     collect_eight_row_state_dots(arithmetic, states, inputs, &mut key_dots, &mut query_dots)?;
 
     for token in 0..count {
         let cum_vec = f32x4::splat(neon, cumulative[token]);
         let beta_vec = f32x4::splat(neon, inputs[token].beta);
-        let key_dots_lo = f32x4::from_slice(
-            neon,
-            &[
-                key_dots[0][token],
-                key_dots[1][token],
-                key_dots[2][token],
-                key_dots[3][token],
-            ],
-        );
-        let key_dots_hi = f32x4::from_slice(
-            neon,
-            &[
-                key_dots[4][token],
-                key_dots[5][token],
-                key_dots[6][token],
-                key_dots[7][token],
-            ],
-        );
-        let query_dots_lo = f32x4::from_slice(
-            neon,
-            &[
-                query_dots[0][token],
-                query_dots[1][token],
-                query_dots[2][token],
-                query_dots[3][token],
-            ],
-        );
-        let query_dots_hi = f32x4::from_slice(
-            neon,
-            &[
-                query_dots[4][token],
-                query_dots[5][token],
-                query_dots[6][token],
-                query_dots[7][token],
-            ],
-        );
+        let key_dots_lo = f32x4::from_slice(neon, &key_dots[token][0..4]);
+        let key_dots_hi = f32x4::from_slice(neon, &key_dots[token][4..8]);
+        let query_dots_lo = f32x4::from_slice(neon, &query_dots[token][0..4]);
+        let query_dots_hi = f32x4::from_slice(neon, &query_dots[token][4..8]);
 
         let mut pred_lo = cum_vec * key_dots_lo;
         let mut pred_hi = cum_vec * key_dots_hi;
@@ -498,50 +486,17 @@ fn head_into_eight_row_block_neon(
         out_lo.store_slice(&mut output[out_base..out_base + 4]);
         out_hi.store_slice(&mut output[out_base + 4..out_base + 8]);
     }
-    scatter_scaled_deltas_neon(
-        neon,
-        &last_products[..count],
-        &deltas_lo[..count],
-        &deltas_hi[..count],
-        scaled_deltas,
-    );
-    Ok(true)
-}
-
-#[cfg(all(
-    feature = "experimental-neon",
-    target_arch = "aarch64",
-    target_os = "windows",
-    target_env = "msvc",
-    target_feature = "neon"
-))]
-fn scatter_scaled_deltas_neon(
-    neon: fearless_simd::Neon,
-    last_products: &[f32],
-    deltas_lo: &[fearless_simd::f32x4<fearless_simd::Neon>],
-    deltas_hi: &[fearless_simd::f32x4<fearless_simd::Neon>],
-    scaled_deltas: &mut [[f32; 32]; 8],
-) {
-    use fearless_simd::{f32x4, prelude::*};
-
-    for (prior, ((&lp_scalar, &d_lo), &d_hi)) in last_products
-        .iter()
-        .zip(deltas_lo)
-        .zip(deltas_hi)
-        .enumerate()
+    for (((sd_row, &lp_scalar), &d_lo), &d_hi) in scaled_deltas[..count]
+        .iter_mut()
+        .zip(&last_products[..count])
+        .zip(&deltas_lo[..count])
+        .zip(&deltas_hi[..count])
     {
         let lp = f32x4::splat(neon, lp_scalar);
-        let mut lo = [0.0_f32; 4];
-        let mut hi = [0.0_f32; 4];
-        (lp * d_lo).store_slice(&mut lo);
-        (lp * d_hi).store_slice(&mut hi);
-        for (slot, &val) in scaled_deltas[..4].iter_mut().zip(&lo) {
-            slot[prior] = val;
-        }
-        for (slot, &val) in scaled_deltas[4..8].iter_mut().zip(&hi) {
-            slot[prior] = val;
-        }
+        (lp * d_lo).store_slice(&mut sd_row[0..4]);
+        (lp * d_hi).store_slice(&mut sd_row[4..8]);
     }
+    Ok(true)
 }
 
 #[expect(
@@ -659,7 +614,7 @@ fn head_into(
         let base_row = block_idx * 8;
         let states: [&[f32]; 8] =
             std::array::from_fn(|r| &previous[(base_row + r) * width..(base_row + r + 1) * width]);
-        let mut scaled_deltas = [[0.0_f32; 32]; 8];
+        let mut scaled_deltas = [[0.0_f32; 8]; 32];
         #[cfg(all(
             feature = "experimental-neon",
             target_arch = "aarch64",
@@ -713,13 +668,29 @@ fn head_into(
         let (m2, m3) = m23.split_at_mut(width);
         let (m4, m5) = m45.split_at_mut(width);
         let (m6, m7) = m67.split_at_mut(width);
-        gdn_wy_update_eight_rows(
-            states,
-            last_cumulative,
-            inputs,
-            &scaled_deltas,
-            [m0, m1, m2, m3, m4, m5, m6, m7],
-        );
+        if matches!(arithmetic, Arithmetic::PinnedSwift) {
+            crate::kernels::pinned_gdn::gdn_wy_update_eight_rows_token_major(
+                states,
+                last_cumulative,
+                inputs,
+                &scaled_deltas,
+                [m0, m1, m2, m3, m4, m5, m6, m7],
+            );
+        } else {
+            let mut row_major_deltas = [[0.0_f32; 32]; 8];
+            for (prior, sd_row) in scaled_deltas[..count].iter().enumerate() {
+                for (row_deltas, &val) in row_major_deltas.iter_mut().zip(sd_row) {
+                    row_deltas[prior] = val;
+                }
+            }
+            gdn_wy_update_eight_rows(
+                states,
+                last_cumulative,
+                inputs,
+                &row_major_deltas,
+                [m0, m1, m2, m3, m4, m5, m6, m7],
+            );
+        }
     }
     let four_row_blocks = width / 4;
     for block_idx in (eight_row_blocks * 2)..four_row_blocks {
@@ -920,26 +891,16 @@ impl FoldedRecurrentLayerTape {
             ));
         }
         if kept > 0 {
-            copy_into(
-                &self.pending_raw_conv[..kept * self.conv_width],
-                &mut self.carried_raw_conv,
-            )?;
-            copy_into(
-                &self.pending_keys[..kept * self.key_width],
-                &mut self.carried_keys,
-            )?;
-            copy_into(
-                &self.pending_values[..kept * self.value_width],
-                &mut self.carried_values,
-            )?;
-            copy_into(
-                &self.pending_decay[..kept * self.ssm_values],
-                &mut self.carried_decay,
-            )?;
-            copy_into(
-                &self.pending_beta[..kept * self.ssm_values],
-                &mut self.carried_beta,
-            )?;
+            std::mem::swap(&mut self.carried_raw_conv, &mut self.pending_raw_conv);
+            self.carried_raw_conv.truncate(kept * self.conv_width);
+            std::mem::swap(&mut self.carried_keys, &mut self.pending_keys);
+            self.carried_keys.truncate(kept * self.key_width);
+            std::mem::swap(&mut self.carried_values, &mut self.pending_values);
+            self.carried_values.truncate(kept * self.value_width);
+            std::mem::swap(&mut self.carried_decay, &mut self.pending_decay);
+            self.carried_decay.truncate(kept * self.ssm_values);
+            std::mem::swap(&mut self.carried_beta, &mut self.pending_beta);
+            self.carried_beta.truncate(kept * self.ssm_values);
             self.carried_len = kept;
         }
         self.clear_pending();
@@ -1311,10 +1272,24 @@ pub(super) fn recurrent_tile_folded<'a>(
     )
 }
 
+#[inline]
+#[expect(
+    clippy::imprecise_flops,
+    reason = "Match exact binary32 (1.0 + exp(x)).ln() softplus rounding."
+)]
+fn gdn_decay_beta(raw_alpha: f32, raw_beta: f32, time_bias: f32, decay_weight: f32) -> (f32, f32) {
+    let activation = raw_alpha + time_bias;
+    let softplus = if activation > 20.0 {
+        activation
+    } else {
+        (1.0 + activation.exp()).ln()
+    };
+    ((softplus * decay_weight).exp(), sigmoid(raw_beta))
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::imprecise_flops,
     reason = "Share exact GDN convolution, gating, and state stepping between standard and folded tiles."
 )]
 fn recurrent_tile_with_tape<'a>(
@@ -1572,19 +1547,23 @@ fn recurrent_tile_with_tape<'a>(
                     }
                 }
                 for head in 0..geometry.ssm_values {
-                    let activation = tile.alpha[token][head] + layer.time_bias[head];
-                    let softplus = if activation > 20.0 {
-                        activation
-                    } else {
-                        (1.0 + activation.exp()).ln()
-                    };
-                    tile.alpha[token][head] = (softplus * layer.decay[head]).exp();
-                    tile.beta[token][head] = sigmoid(tile.beta[token][head]);
+                    let (decay, beta) = gdn_decay_beta(
+                        tile.alpha[token][head],
+                        tile.beta[token][head],
+                        layer.time_bias[head],
+                        layer.decay[head],
+                    );
+                    tile.alpha[token][head] = decay;
+                    tile.beta[token][head] = beta;
                 }
             }
             check()?;
         }
     }
+    let parallel_gdn_heads =
+        tile.projector.row_parallelism().workers() > 1 && geometry.ssm_values > 1;
+    let defer_decay_beta =
+        (conv_head_major || parallelize_post_conv) && parallel_gdn_heads && folded.is_none();
     if conv_head_major || parallelize_post_conv {
         if !conv_head_major && !parallelize_conv {
             tile.projector.row_parallelism().update_chunks(
@@ -1600,16 +1579,18 @@ fn recurrent_tile_with_tape<'a>(
                 },
             )?;
         }
-        for (alpha, beta) in tile.alpha[..count].iter_mut().zip(&mut tile.beta[..count]) {
-            for head in 0..geometry.ssm_values {
-                let activation = alpha[head] + layer.time_bias[head];
-                let softplus = if activation > 20.0 {
-                    activation
-                } else {
-                    (1.0 + activation.exp()).ln()
-                };
-                alpha[head] = (softplus * layer.decay[head]).exp();
-                beta[head] = sigmoid(beta[head]);
+        if !defer_decay_beta {
+            for (alpha, beta) in tile.alpha[..count].iter_mut().zip(&mut tile.beta[..count]) {
+                for head in 0..geometry.ssm_values {
+                    let (decay, next_beta) = gdn_decay_beta(
+                        alpha[head],
+                        beta[head],
+                        layer.time_bias[head],
+                        layer.decay[head],
+                    );
+                    alpha[head] = decay;
+                    beta[head] = next_beta;
+                }
             }
         }
     }
@@ -1680,7 +1661,7 @@ fn recurrent_tile_with_tape<'a>(
     }
     let norm = RmsNormWeights::new(&layer.norm)?;
     let mut output_reuse = TileReuse::default();
-    if tile.projector.row_parallelism().workers() > 1 && geometry.ssm_values > 1 {
+    if parallel_gdn_heads {
         if chunkwise {
             for _ in 0..geometry.ssm_values {
                 check()?;
@@ -1705,90 +1686,114 @@ fn recurrent_tile_with_tape<'a>(
             &mut tile.gdn_head_outputs,
             head_out_len,
             |base_head, matrix_chunk, out_chunk| {
-                let mut inputs: [Input<'_>; GDN_INPUT_CAPACITY] = std::array::from_fn(|_| Input {
-                    query: &[],
-                    key: &[],
-                    value: &[],
-                    decay: 0.0,
-                    beta: 0.0,
-                });
-                let mut carry_state = Vec::new();
-                for (offset, (head_matrix, head_out)) in matrix_chunk
-                    .chunks_exact_mut(head_state_len)
-                    .zip(out_chunk.chunks_exact_mut(head_out_len))
-                    .enumerate()
-                {
-                    let head_index = base_head + offset;
-                    let key_head = head_index % geometry.ssm_keys;
-                    if conv_head_major {
-                        let q_head =
-                            &conv_ref[key_head * head_out_len..(key_head + 1) * head_out_len];
-                        let k_head_idx = geometry.ssm_keys + key_head;
-                        let k_head =
-                            &conv_ref[k_head_idx * head_out_len..(k_head_idx + 1) * head_out_len];
-                        let v_head_idx = 2 * geometry.ssm_keys + head_index;
-                        let v_head =
-                            &conv_ref[v_head_idx * head_out_len..(v_head_idx + 1) * head_out_len];
-                        for (token, slot) in inputs[..count].iter_mut().enumerate() {
-                            *slot = Input {
-                                query: &q_head[token * width..(token + 1) * width],
-                                key: &k_head[token * width..(token + 1) * width],
-                                value: &v_head[token * width..(token + 1) * width],
-                                decay: alpha_ref[token][head_index],
-                                beta: beta_ref[token][head_index],
-                            };
-                        }
-                    } else {
-                        for (token, slot) in inputs[..count].iter_mut().enumerate() {
-                            let mixed = &mixed_ref[token];
-                            *slot = Input {
-                                query: &mixed[key_head * width..(key_head + 1) * width],
-                                key: &mixed[geometry.key_width() + key_head * width
-                                    ..geometry.key_width() + (key_head + 1) * width],
-                                value: &mixed[2 * geometry.key_width() + head_index * width
-                                    ..2 * geometry.key_width() + (head_index + 1) * width],
-                                decay: alpha_ref[token][head_index],
-                                beta: beta_ref[token][head_index],
-                            };
-                        }
-                    }
-                    let prev_head =
-                        &prev_ref[head_index * head_state_len..(head_index + 1) * head_state_len];
-                    if chunkwise {
-                        let head_dots = use_shared_key_dots.then(|| {
-                            &key_dots_ref
-                                [key_head * head_dot_stride..(key_head + 1) * head_dot_stride]
+                with_worker_carry_state(|carry_state| {
+                    let mut inputs: [Input<'_>; GDN_INPUT_CAPACITY] =
+                        std::array::from_fn(|_| Input {
+                            query: &[],
+                            key: &[],
+                            value: &[],
+                            decay: 0.0,
+                            beta: 0.0,
                         });
-                        chunkwise_subchunks_into(
-                            arithmetic,
-                            prev_head,
-                            &inputs[..count],
-                            head_dots,
-                            width,
-                            &mut carry_state,
-                            head_matrix,
-                            head_out,
-                        )?;
-                    } else {
-                        exact_head_into(
-                            arithmetic,
-                            prev_head,
-                            &inputs[..count],
-                            head_matrix,
-                            head_out,
-                        )?;
+                    for (offset, (head_matrix, head_out)) in matrix_chunk
+                        .chunks_exact_mut(head_state_len)
+                        .zip(out_chunk.chunks_exact_mut(head_out_len))
+                        .enumerate()
+                    {
+                        let head_index = base_head + offset;
+                        let key_head = head_index % geometry.ssm_keys;
+                        let head_time_bias = layer.time_bias[head_index];
+                        let head_decay = layer.decay[head_index];
+                        if conv_head_major {
+                            let q_head =
+                                &conv_ref[key_head * head_out_len..(key_head + 1) * head_out_len];
+                            let k_head_idx = geometry.ssm_keys + key_head;
+                            let k_head = &conv_ref
+                                [k_head_idx * head_out_len..(k_head_idx + 1) * head_out_len];
+                            let v_head_idx = 2 * geometry.ssm_keys + head_index;
+                            let v_head = &conv_ref
+                                [v_head_idx * head_out_len..(v_head_idx + 1) * head_out_len];
+                            for (token, slot) in inputs[..count].iter_mut().enumerate() {
+                                let (decay, beta) = if defer_decay_beta {
+                                    gdn_decay_beta(
+                                        alpha_ref[token][head_index],
+                                        beta_ref[token][head_index],
+                                        head_time_bias,
+                                        head_decay,
+                                    )
+                                } else {
+                                    (alpha_ref[token][head_index], beta_ref[token][head_index])
+                                };
+                                *slot = Input {
+                                    query: &q_head[token * width..(token + 1) * width],
+                                    key: &k_head[token * width..(token + 1) * width],
+                                    value: &v_head[token * width..(token + 1) * width],
+                                    decay,
+                                    beta,
+                                };
+                            }
+                        } else {
+                            for (token, slot) in inputs[..count].iter_mut().enumerate() {
+                                let mixed = &mixed_ref[token];
+                                let (decay, beta) = if defer_decay_beta {
+                                    gdn_decay_beta(
+                                        alpha_ref[token][head_index],
+                                        beta_ref[token][head_index],
+                                        head_time_bias,
+                                        head_decay,
+                                    )
+                                } else {
+                                    (alpha_ref[token][head_index], beta_ref[token][head_index])
+                                };
+                                *slot = Input {
+                                    query: &mixed[key_head * width..(key_head + 1) * width],
+                                    key: &mixed[geometry.key_width() + key_head * width
+                                        ..geometry.key_width() + (key_head + 1) * width],
+                                    value: &mixed[2 * geometry.key_width() + head_index * width
+                                        ..2 * geometry.key_width() + (head_index + 1) * width],
+                                    decay,
+                                    beta,
+                                };
+                            }
+                        }
+                        let prev_head = &prev_ref
+                            [head_index * head_state_len..(head_index + 1) * head_state_len];
+                        if chunkwise {
+                            let head_dots = use_shared_key_dots.then(|| {
+                                &key_dots_ref
+                                    [key_head * head_dot_stride..(key_head + 1) * head_dot_stride]
+                            });
+                            chunkwise_subchunks_into(
+                                arithmetic,
+                                prev_head,
+                                &inputs[..count],
+                                head_dots,
+                                width,
+                                carry_state,
+                                head_matrix,
+                                head_out,
+                            )?;
+                        } else {
+                            exact_head_into(
+                                arithmetic,
+                                prev_head,
+                                &inputs[..count],
+                                head_matrix,
+                                head_out,
+                            )?;
+                        }
+                        for token in 0..count {
+                            let token_out = &mut head_out[token * width..(token + 1) * width];
+                            arithmetic.normalize_swiglu_in_place(
+                                token_out,
+                                norm,
+                                geometry.epsilon,
+                                &gate_ref[token][head_index * width..(head_index + 1) * width],
+                            )?;
+                        }
                     }
-                    for token in 0..count {
-                        let token_out = &mut head_out[token * width..(token + 1) * width];
-                        arithmetic.normalize_swiglu_in_place(
-                            token_out,
-                            norm,
-                            geometry.epsilon,
-                            &gate_ref[token][head_index * width..(head_index + 1) * width],
-                        )?;
-                    }
-                }
-                Ok(())
+                    Ok(())
+                })
             },
         )?;
         if transforms.can_grouped_block_hadamard(&layer.output, geometry)
@@ -1870,81 +1875,86 @@ fn recurrent_tile_with_tape<'a>(
         });
         let head_out_len = count * width;
         resize_into(head_out_len, &mut tile.gdn_head_outputs)?;
-        let mut carry_state = Vec::new();
-        for head_index in 0..geometry.ssm_values {
-            if chunkwise {
-                check()?;
-            }
-            let key_head = head_index % geometry.ssm_keys;
-            if conv_head_major {
-                let conv_ref: &[f32] = &tile.gdn_conv_outputs;
-                let q_head = &conv_ref[key_head * head_out_len..(key_head + 1) * head_out_len];
-                let k_head_idx = geometry.ssm_keys + key_head;
-                let k_head = &conv_ref[k_head_idx * head_out_len..(k_head_idx + 1) * head_out_len];
-                let v_head_idx = 2 * geometry.ssm_keys + head_index;
-                let v_head = &conv_ref[v_head_idx * head_out_len..(v_head_idx + 1) * head_out_len];
-                for (token, slot) in inputs[..count].iter_mut().enumerate() {
-                    *slot = Input {
-                        query: &q_head[token * width..(token + 1) * width],
-                        key: &k_head[token * width..(token + 1) * width],
-                        value: &v_head[token * width..(token + 1) * width],
-                        decay: tile.alpha[token][head_index],
-                        beta: tile.beta[token][head_index],
-                    };
+        with_worker_carry_state(|carry_state| -> Result<()> {
+            for head_index in 0..geometry.ssm_values {
+                if chunkwise {
+                    check()?;
                 }
-            } else {
-                for (token, slot) in inputs[..count].iter_mut().enumerate() {
-                    let mixed = &tile.mixed[token];
-                    *slot = Input {
-                        query: &mixed[key_head * width..(key_head + 1) * width],
-                        key: &mixed[geometry.key_width() + key_head * width
-                            ..geometry.key_width() + (key_head + 1) * width],
-                        value: &mixed[2 * geometry.key_width() + head_index * width
-                            ..2 * geometry.key_width() + (head_index + 1) * width],
-                        decay: tile.alpha[token][head_index],
-                        beta: tile.beta[token][head_index],
-                    };
+                let key_head = head_index % geometry.ssm_keys;
+                if conv_head_major {
+                    let conv_ref: &[f32] = &tile.gdn_conv_outputs;
+                    let q_head = &conv_ref[key_head * head_out_len..(key_head + 1) * head_out_len];
+                    let k_head_idx = geometry.ssm_keys + key_head;
+                    let k_head =
+                        &conv_ref[k_head_idx * head_out_len..(k_head_idx + 1) * head_out_len];
+                    let v_head_idx = 2 * geometry.ssm_keys + head_index;
+                    let v_head =
+                        &conv_ref[v_head_idx * head_out_len..(v_head_idx + 1) * head_out_len];
+                    for (token, slot) in inputs[..count].iter_mut().enumerate() {
+                        *slot = Input {
+                            query: &q_head[token * width..(token + 1) * width],
+                            key: &k_head[token * width..(token + 1) * width],
+                            value: &v_head[token * width..(token + 1) * width],
+                            decay: tile.alpha[token][head_index],
+                            beta: tile.beta[token][head_index],
+                        };
+                    }
+                } else {
+                    for (token, slot) in inputs[..count].iter_mut().enumerate() {
+                        let mixed = &tile.mixed[token];
+                        *slot = Input {
+                            query: &mixed[key_head * width..(key_head + 1) * width],
+                            key: &mixed[geometry.key_width() + key_head * width
+                                ..geometry.key_width() + (key_head + 1) * width],
+                            value: &mixed[2 * geometry.key_width() + head_index * width
+                                ..2 * geometry.key_width() + (head_index + 1) * width],
+                            decay: tile.alpha[token][head_index],
+                            beta: tile.beta[token][head_index],
+                        };
+                    }
+                }
+                let range = head_index * width * width..(head_index + 1) * width * width;
+                if chunkwise {
+                    let head_dots = use_shared_key_dots.then(|| {
+                        &tile.gdn_key_dots
+                            [key_head * head_dot_stride..(key_head + 1) * head_dot_stride]
+                    });
+                    chunkwise_subchunks_into(
+                        arithmetic,
+                        &previous[range.clone()],
+                        &inputs[..count],
+                        head_dots,
+                        width,
+                        carry_state,
+                        &mut matrix[range],
+                        &mut tile.gdn_head_outputs,
+                    )?;
+                } else {
+                    exact_head_into(
+                        arithmetic,
+                        &previous[range.clone()],
+                        &inputs[..count],
+                        &mut matrix[range],
+                        &mut tile.gdn_head_outputs,
+                    )?;
+                }
+                for token in 0..count {
+                    let token_out = &tile.gdn_head_outputs[token * width..(token + 1) * width];
+                    arithmetic.normalize_swiglu_into(
+                        token_out,
+                        norm,
+                        geometry.epsilon,
+                        &tile.recurrent_gate[token][head_index * width..(head_index + 1) * width],
+                        &mut tile.attended[token][head_index * width..(head_index + 1) * width],
+                    )?;
+                }
+                if chunkwise {
+                    tile.statistics.chunkwise_gdn_heads =
+                        tile.statistics.chunkwise_gdn_heads.saturating_add(1);
                 }
             }
-            let range = head_index * width * width..(head_index + 1) * width * width;
-            if chunkwise {
-                let head_dots = use_shared_key_dots.then(|| {
-                    &tile.gdn_key_dots[key_head * head_dot_stride..(key_head + 1) * head_dot_stride]
-                });
-                chunkwise_subchunks_into(
-                    arithmetic,
-                    &previous[range.clone()],
-                    &inputs[..count],
-                    head_dots,
-                    width,
-                    &mut carry_state,
-                    &mut matrix[range],
-                    &mut tile.gdn_head_outputs,
-                )?;
-            } else {
-                exact_head_into(
-                    arithmetic,
-                    &previous[range.clone()],
-                    &inputs[..count],
-                    &mut matrix[range],
-                    &mut tile.gdn_head_outputs,
-                )?;
-            }
-            for token in 0..count {
-                let token_out = &tile.gdn_head_outputs[token * width..(token + 1) * width];
-                arithmetic.normalize_swiglu_into(
-                    token_out,
-                    norm,
-                    geometry.epsilon,
-                    &tile.recurrent_gate[token][head_index * width..(head_index + 1) * width],
-                    &mut tile.attended[token][head_index * width..(head_index + 1) * width],
-                )?;
-            }
-            if chunkwise {
-                tile.statistics.chunkwise_gdn_heads =
-                    tile.statistics.chunkwise_gdn_heads.saturating_add(1);
-            }
-        }
+            Ok(())
+        })?;
     }
     check()?;
     let _ = project_tile(
@@ -2253,7 +2263,7 @@ mod tests {
         let scale = 1.0 / small_float(width)?.sqrt();
         for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
             let mut scalar_out = vec![f32::NAN; count * width];
-            let mut scalar_sd = [[0.0_f32; 32]; 8];
+            let mut scalar_sd = [[0.0_f32; 8]; 32];
             let base_row = (width / 8 - 1) * 8;
             let states: [&[f32]; 8] =
                 std::array::from_fn(|r| &prev[(base_row + r) * width..(base_row + r + 1) * width]);
@@ -2280,7 +2290,7 @@ mod tests {
             ))]
             {
                 let mut neon_out = vec![f32::NAN; count * width];
-                let mut neon_sd = [[0.0_f32; 32]; 8];
+                let mut neon_sd = [[0.0_f32; 8]; 32];
                 assert!(head_into_eight_row_block_neon(
                     arithmetic,
                     states,
@@ -2301,8 +2311,8 @@ mod tests {
                         assert_eq!(neon_out[idx].to_bits(), scalar_out[idx].to_bits());
                     }
                 }
-                for (n_row, s_row) in neon_sd.iter().zip(&scalar_sd) {
-                    for (n_val, s_val) in n_row[..count].iter().zip(&s_row[..count]) {
+                for (n_row, s_row) in neon_sd[..count].iter().zip(&scalar_sd[..count]) {
+                    for (n_val, s_val) in n_row.iter().zip(s_row) {
                         assert_eq!(n_val.to_bits(), s_val.to_bits());
                     }
                 }

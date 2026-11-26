@@ -521,6 +521,120 @@ impl RowParallelism {
         update(0, first, second, third)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Dispatches five aligned per-head buffers under one pool barrier."
+    )]
+    pub(crate) fn update_quintuple_chunks<A: Send, B: Send, C: Send, D: Send, E: Send>(
+        &self,
+        first: &mut [A],
+        first_unit_size: usize,
+        second: &mut [B],
+        second_unit_size: usize,
+        third: &mut [C],
+        third_unit_size: usize,
+        fourth: &mut [D],
+        fourth_unit_size: usize,
+        fifth: &mut [E],
+        fifth_unit_size: usize,
+        update: impl Fn(usize, &mut [A], &mut [B], &mut [C], &mut [D], &mut [E]) -> Result<()> + Sync,
+    ) -> Result<()> {
+        if first_unit_size == 0
+            || second_unit_size == 0
+            || third_unit_size == 0
+            || fourth_unit_size == 0
+            || fifth_unit_size == 0
+            || !first.len().is_multiple_of(first_unit_size)
+            || !second.len().is_multiple_of(second_unit_size)
+            || !third.len().is_multiple_of(third_unit_size)
+            || !fourth.len().is_multiple_of(fourth_unit_size)
+            || !fifth.len().is_multiple_of(fifth_unit_size)
+        {
+            return Err(invalid(
+                "quintuple target lengths must be multiples of positive unit sizes",
+            ));
+        }
+        let units = first.len() / first_unit_size;
+        if second.len() / second_unit_size != units
+            || third.len() / third_unit_size != units
+            || fourth.len() / fourth_unit_size != units
+            || fifth.len() / fifth_unit_size != units
+        {
+            return Err(invalid("quintuple target unit counts must match"));
+        }
+        #[cfg(not(feature = "parallel-rows"))]
+        if self.uses_pool(units) {
+            return Err(invalid("multiple row workers require parallel-rows"));
+        }
+        #[cfg(feature = "parallel-rows")]
+        if let Some(pool) = &self.pool
+            && units > 1
+        {
+            let task_units = units.div_ceil(self.workers);
+            let first_task_elems = task_units * first_unit_size;
+            let second_task_elems = task_units * second_unit_size;
+            let third_task_elems = task_units * third_unit_size;
+            let fourth_task_elems = task_units * fourth_unit_size;
+            let fifth_task_elems = task_units * fifth_unit_size;
+            let mut slots = std::array::from_fn::<_, MAX_ROW_WORKERS, _>(|_| {
+                (
+                    (
+                        &mut [][..],
+                        &mut [][..],
+                        &mut [][..],
+                        &mut [][..],
+                        &mut [][..],
+                    ),
+                    None::<crate::Error>,
+                )
+            });
+            let mut count = 0;
+            for (slot, ((((first_chunk, second_chunk), third_chunk), fourth_chunk), fifth_chunk)) in
+                slots.iter_mut().zip(
+                    first
+                        .chunks_mut(first_task_elems)
+                        .zip(second.chunks_mut(second_task_elems))
+                        .zip(third.chunks_mut(third_task_elems))
+                        .zip(fourth.chunks_mut(fourth_task_elems))
+                        .zip(fifth.chunks_mut(fifth_task_elems)),
+                )
+            {
+                slot.0 = (
+                    first_chunk,
+                    second_chunk,
+                    third_chunk,
+                    fourth_chunk,
+                    fifth_chunk,
+                );
+                count += 1;
+            }
+            pool.dispatch_mut(
+                &mut slots[..count],
+                |task,
+                 ((first_chunk, second_chunk, third_chunk, fourth_chunk, fifth_chunk), error)| {
+                    if let Err(failure) = update(
+                        task * task_units,
+                        first_chunk,
+                        second_chunk,
+                        third_chunk,
+                        fourth_chunk,
+                        fifth_chunk,
+                    ) {
+                        *error = Some(failure);
+                    }
+                },
+            );
+            if let Some(failure) = slots[..count]
+                .iter_mut()
+                .find_map(|(_, error)| error.take())
+            {
+                return Err(failure);
+            }
+            return Ok(());
+        }
+        update(0, first, second, third, fourth, fifth)
+    }
+
     pub(super) const fn uses_pool(&self, rows: usize) -> bool {
         self.workers > 1 && rows > 1
     }

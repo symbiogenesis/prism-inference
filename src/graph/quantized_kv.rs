@@ -822,34 +822,50 @@ fn prepare_current(
     Ok(())
 }
 
-/// Encodes one KV head pair (`HEAD_DIM` channels each) into caller-owned packed
-/// destination slices so callers can fuse quantized KV encoding into parallel head work.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "Exposed crate-wide for graph.rs triple-chunk fusion after integration."
-)]
-#[allow(
-    dead_code,
-    reason = "Wired from graph.rs update_triple_chunks after branch integration."
-)]
-pub(crate) fn prepare_current_head(
-    keys: &KvCache,
-    values: &KvCache,
-    current_key_head: &[f32],
-    current_value_head: &[f32],
-    key_out: &mut [u8],
-    value_out: &mut [u8],
-) -> Result<()> {
-    let key_cache = keys
-        .packed
-        .as_ref()
-        .ok_or_else(|| invalid("missing packed keys"))?;
-    let value_cache = values
-        .packed
-        .as_ref()
-        .ok_or_else(|| invalid("missing packed values"))?;
-    key_cache.quantizer.encode(current_key_head, key_out)?;
-    value_cache.quantizer.encode(current_value_head, value_out)
+/// Caller-owned disjoint staging slices for fusing current-token KV encoding into head-parallel normalization.
+pub(super) struct PackedPrepareTargets<'a> {
+    pub(super) key_quantizer: &'a Quantizer,
+    pub(super) value_quantizer: &'a Quantizer,
+    pub(super) key_prepared: &'a mut [u8],
+    pub(super) value_prepared: &'a mut [u8],
+    pub(super) key_record_bytes: usize,
+    pub(super) value_record_bytes: usize,
+}
+
+/// Resets `prepared_ready`, resizes current-token staging buffers, and returns disjoint borrows
+/// so head-parallel normalization can encode K/V records without an extra barrier.
+pub(super) fn begin_prepare_current<'a>(
+    keys: &'a mut KvCache,
+    values: &'a mut KvCache,
+    kv_heads: usize,
+) -> Result<Option<PackedPrepareTargets<'a>>> {
+    let (Some(key_cache), Some(value_cache)) = (keys.packed.as_mut(), values.packed.as_mut())
+    else {
+        return Ok(None);
+    };
+    key_cache.prepared_ready = false;
+    value_cache.prepared_ready = false;
+    if kv_heads == 0
+        || key_cache.heads != kv_heads
+        || value_cache.heads != kv_heads
+        || keys.width != kv_heads * HEAD_DIM
+        || values.width != kv_heads * HEAD_DIM
+        || keys.len != values.len
+    {
+        return Ok(None);
+    }
+    resize_bytes(key_cache.row_bytes, &mut key_cache.prepared)?;
+    resize_bytes(value_cache.row_bytes, &mut value_cache.prepared)?;
+    let key_record_bytes = key_cache.quantizer.encoded_len();
+    let value_record_bytes = value_cache.quantizer.encoded_len();
+    Ok(Some(PackedPrepareTargets {
+        key_quantizer: &key_cache.quantizer,
+        value_quantizer: &value_cache.quantizer,
+        key_prepared: &mut key_cache.prepared,
+        value_prepared: &mut value_cache.prepared,
+        key_record_bytes,
+        value_record_bytes,
+    }))
 }
 
 // Tile attention consumes the committed form of its current row, which must
@@ -1127,6 +1143,7 @@ pub(super) fn attend(
         arithmetic,
         parallelism,
         false,
+        false,
     )
 }
 
@@ -1162,6 +1179,43 @@ pub(super) fn attend_with_group_scores(
         arithmetic,
         parallelism,
         true,
+        false,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Matches attend_with_group_scores while skipping redundant current-row encoding when pre-encoded in head-parallel prep."
+)]
+pub(super) fn attend_with_preencoded_group_scores(
+    keys: &mut KvCache,
+    values: &mut KvCache,
+    queries: &[f32],
+    projected: &[f32],
+    current_key: &[f32],
+    current_value: &[f32],
+    attended: &mut [f32],
+    scores: &mut [f32],
+    heads: usize,
+    scale: f32,
+    arithmetic: super::Arithmetic,
+    parallelism: &RowParallelism,
+) -> Result<()> {
+    attend_with_layout(
+        keys,
+        values,
+        queries,
+        projected,
+        current_key,
+        current_value,
+        attended,
+        scores,
+        heads,
+        scale,
+        arithmetic,
+        parallelism,
+        true,
+        true,
     )
 }
 
@@ -1183,6 +1237,7 @@ fn attend_with_layout(
     arithmetic: super::Arithmetic,
     parallelism: &RowParallelism,
     grouped_scores: bool,
+    pre_encoded_current: bool,
 ) -> Result<()> {
     let key_cache = keys
         .packed
@@ -1222,7 +1277,15 @@ fn attend_with_layout(
     if scores.len() != checked_product(&[expected_score_rows, stride])? {
         return Err(invalid("invalid packed attention geometry"));
     }
-    prepare_current(key_cache, value_cache, current_key, current_value)?;
+    if pre_encoded_current {
+        if key_cache.prepared.len() != key_cache.row_bytes
+            || value_cache.prepared.len() != value_cache.row_bytes
+        {
+            return Err(invalid("missing pre-encoded packed current KV row"));
+        }
+    } else {
+        prepare_current(key_cache, value_cache, current_key, current_value)?;
+    }
     let input = PackedAttention {
         keys: key_cache,
         values: value_cache,

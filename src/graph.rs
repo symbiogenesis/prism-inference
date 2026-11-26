@@ -4867,6 +4867,7 @@ impl Evaluation<'_, '_, '_> {
         };
         let parallelism = self.projection.matvec.row_parallelism();
         let heads_per_kv = g.heads / g.kv_heads;
+        let mut packed_preencoded = false;
         if parallelism.workers() > 1 && g.kv_heads > 1 {
             // Partition by KV heads so every worker prepares its own query/KV
             // heads under a single barrier. Defer KV errors until every query
@@ -4874,26 +4875,75 @@ impl Evaluation<'_, '_, '_> {
             // precedence without synchronizing successful tasks with each other.
             // Only provisional scratch changes before complete graph publication.
             let key_value_failure = std::sync::Mutex::new(None);
-            parallelism.update_triple_chunks(
-                query_scratch,
-                heads_per_kv * g.head,
-                key,
-                g.head,
-                value,
-                g.head,
-                |base_kv, query_chunk, key_chunk, value_chunk| {
-                    normalize_queries(base_kv * heads_per_kv, query_chunk)?;
-                    if let Err(error) = normalize_key_values(key_chunk, value_chunk) {
-                        let mut failure = key_value_failure
-                            .lock()
-                            .map_err(|_| invalid("attention preparation failure lock poisoned"))?;
-                        if failure.as_ref().is_none_or(|&(base, _)| base_kv < base) {
-                            *failure = Some((base_kv, error));
+            if let Some(targets) = quantized_kv::begin_prepare_current(keys, values, g.kv_heads)?
+                && query_scratch.len() == g.heads * g.head
+                && key.len() == g.kv_heads * g.head
+                && value.len() == g.kv_heads * g.head
+            {
+                let key_quantizer = targets.key_quantizer;
+                let value_quantizer = targets.value_quantizer;
+                let key_record_bytes = targets.key_record_bytes;
+                let value_record_bytes = targets.value_record_bytes;
+                parallelism.update_quintuple_chunks(
+                    query_scratch,
+                    heads_per_kv * g.head,
+                    key,
+                    g.head,
+                    value,
+                    g.head,
+                    targets.key_prepared,
+                    key_record_bytes,
+                    targets.value_prepared,
+                    value_record_bytes,
+                    |base_kv, query_chunk, key_chunk, value_chunk, key_out, value_out| {
+                        normalize_queries(base_kv * heads_per_kv, query_chunk)?;
+                        let kv_result = (|| -> Result<()> {
+                            normalize_key_values(key_chunk, value_chunk)?;
+                            for (((key_head, out_key), value_head), out_value) in key_chunk
+                                .chunks_exact(g.head)
+                                .zip(key_out.chunks_exact_mut(key_record_bytes))
+                                .zip(value_chunk.chunks_exact(g.head))
+                                .zip(value_out.chunks_exact_mut(value_record_bytes))
+                            {
+                                key_quantizer.encode(key_head, out_key)?;
+                                value_quantizer.encode(value_head, out_value)?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = kv_result {
+                            let mut failure = key_value_failure.lock().map_err(|_| {
+                                invalid("attention preparation failure lock poisoned")
+                            })?;
+                            if failure.as_ref().is_none_or(|&(base, _)| base_kv < base) {
+                                *failure = Some((base_kv, error));
+                            }
                         }
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )?;
+                packed_preencoded = true;
+            } else {
+                parallelism.update_triple_chunks(
+                    query_scratch,
+                    heads_per_kv * g.head,
+                    key,
+                    g.head,
+                    value,
+                    g.head,
+                    |base_kv, query_chunk, key_chunk, value_chunk| {
+                        normalize_queries(base_kv * heads_per_kv, query_chunk)?;
+                        if let Err(error) = normalize_key_values(key_chunk, value_chunk) {
+                            let mut failure = key_value_failure.lock().map_err(|_| {
+                                invalid("attention preparation failure lock poisoned")
+                            })?;
+                            if failure.as_ref().is_none_or(|&(base, _)| base_kv < base) {
+                                *failure = Some((base_kv, error));
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
             if let Some((_, error)) = key_value_failure
                 .into_inner()
                 .map_err(|_| invalid("attention preparation failure lock poisoned"))?
@@ -4929,6 +4979,22 @@ impl Evaluation<'_, '_, '_> {
         let key_ref: &[f32] = key;
         let value_ref: &[f32] = value;
         if keys.packed.is_some() || values.packed.is_some() {
+            if packed_preencoded {
+                return quantized_kv::attend_with_preencoded_group_scores(
+                    keys,
+                    values,
+                    query_ref,
+                    projected,
+                    key_ref,
+                    value_ref,
+                    attended,
+                    scores_scratch,
+                    g.heads,
+                    scale,
+                    arithmetic,
+                    self.projection.matvec.row_parallelism(),
+                );
+            }
             return quantized_kv::attend_with_group_scores(
                 keys,
                 values,

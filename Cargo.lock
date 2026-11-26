@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-neon-dot"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "bonsai-ternary",
 ]
@@ -198,9 +198,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-windows-process"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "899b2bb2ba586db2dce4f2a332b4b8e09ba316c5c14918270c89a8a4a5fcdd59"
+checksum = "e15e19b3c8bd1aa50f4ea72a98a6e6a6a350daea277b01c06ab493a50cd884e1"
 dependencies = [
  "ash",
  "bonsai-neon-dot",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "aho-corasick",
  "base64ct",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "bonsai-adreno-vulkan",
  "bonsai-hexagon-native",

@@ -268,7 +268,6 @@ pub(crate) struct ProjectionPipelines {
     pub(crate) swiglu_unpinned: PipelineId,
     pub(crate) hadamard: PipelineId,
     pub(crate) dot_scalar: PipelineId,
-    pub(crate) digest_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,179 +312,255 @@ pub(crate) const fn supports_16tok_gemm(device: &AdrenoVulkanDevice) -> bool {
         && limits.max_compute_shared_memory_size >= 4_480
 }
 
+pub(crate) struct PreparedShaderSpec {
+    pub(crate) tag: &'static [u8],
+    pub(crate) words: Vec<u32>,
+    pub(crate) num_buffers: usize,
+    pub(crate) push_u32s: usize,
+    pub(crate) digest: String,
+}
+
+pub(crate) struct PreparedProjectionShaders {
+    pub(crate) digest_sha256: String,
+    modules: [PreparedShaderSpec; 30],
+}
+
 impl ProjectionPipelines {
     #[expect(
         clippy::too_many_lines,
-        reason = "Compiles and digests all 1-tok, 4-tok, 16-tok shared-memory GEMM, quantization, and helper SPIR-V pipelines sequentially."
+        reason = "Emits and digests all 1-tok, 4-tok, 16-tok shared-memory GEMM, quantization, and helper SPIR-V modules sequentially."
     )]
-    pub(crate) fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
+    pub(crate) fn prepare(use_sdot: bool) -> Result<PreparedProjectionShaders, Error> {
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
         hash_bytes(&mut hasher, b"projection-pipelines-v4:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
-        let mut make_pipe = |tag: &[u8],
+        let mut make_spec = |tag: &'static [u8],
                              words: Vec<u32>,
                              num_buffers: usize,
                              push_u32s: usize|
-         -> Result<PipelineId, Error> {
+         -> Result<PreparedShaderSpec, Error> {
             let digest = spirv::shader_digest(&words)?;
             hash_bytes(&mut hasher, tag)?;
             hash_bytes(&mut hasher, digest.as_bytes())?;
-            device.create_compute_pipeline(&words, num_buffers, push_u32s)
+            Ok(PreparedShaderSpec {
+                tag,
+                words,
+                num_buffers,
+                push_u32s,
+                digest,
+            })
         };
 
-        let pq2_q8k_fused = make_pipe(
-            b"pq2_q8k_fused",
-            spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
-            3,
-            4,
-        )?;
-        let pq2_q8k_unfused = make_pipe(
-            b"pq2_q8k_unfused",
-            spirv::pq2_q8k_gemv_coalesced(use_sdot, false, false),
-            3,
-            4,
-        )?;
-        let pq2_q8k_fused_res = make_pipe(
-            b"pq2_q8k_fused_res",
-            spirv::pq2_q8k_gemv_coalesced(use_sdot, true, true),
-            4,
-            4,
-        )?;
-        let pq2_q8k_unfused_res = make_pipe(
-            b"pq2_q8k_unfused_res",
-            spirv::pq2_q8k_gemv_coalesced(use_sdot, false, true),
-            4,
-            4,
-        )?;
-        let pq2_q8k_4tok_fused = make_pipe(
-            b"pq2_q8k_4tok_fused",
-            spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, false),
-            3,
-            4,
-        )?;
-        let pq2_q8k_4tok_unfused = make_pipe(
-            b"pq2_q8k_4tok_unfused",
-            spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, false),
-            3,
-            4,
-        )?;
-        let pq2_q8k_4tok_fused_res = make_pipe(
-            b"pq2_q8k_4tok_fused_res",
-            spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, true),
-            4,
-            4,
-        )?;
-        let pq2_q8k_4tok_unfused_res = make_pipe(
-            b"pq2_q8k_4tok_unfused_res",
-            spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, true),
-            4,
-            4,
-        )?;
-        let pq2_q8k_16tok_fused = make_pipe(
-            b"pq2_q8k_16tok_fused",
-            spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, true, false),
-            3,
-            4,
-        )?;
-        let pq2_q8k_16tok_unfused = make_pipe(
-            b"pq2_q8k_16tok_unfused",
-            spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, false, false),
-            3,
-            4,
-        )?;
-        let pq2_q8k_16tok_fused_res = make_pipe(
-            b"pq2_q8k_16tok_fused_res",
-            spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, true, true),
-            4,
-            4,
-        )?;
-        let pq2_q8k_16tok_unfused_res = make_pipe(
-            b"pq2_q8k_16tok_unfused_res",
-            spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, false, true),
-            4,
-            4,
-        )?;
-        let pq2_q8_0 = make_pipe(b"pq2_q8_0", spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?;
-        let pq2_q8_0_4tok = make_pipe(
-            b"pq2_q8_0_4tok",
-            spirv::pq2_q8_0_gemm_4tok_coalesced(use_sdot),
-            3,
-            4,
-        )?;
-        let ptq1_q8_0 = make_pipe(
-            b"ptq1_q8_0",
-            spirv::ptq1_q8_0_gemv_coalesced(use_sdot, false),
-            3,
-            4,
-        )?;
-        let ptq1_q8_0_pinned = make_pipe(
-            b"ptq1_q8_0_pinned",
-            spirv::ptq1_q8_0_gemv_coalesced(use_sdot, true),
-            3,
-            4,
-        )?;
-        let ptq1_q8_0_4tok = make_pipe(
-            b"ptq1_q8_0_4tok",
-            spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, false),
-            3,
-            4,
-        )?;
-        let ptq1_q8_0_4tok_pinned = make_pipe(
-            b"ptq1_q8_0_4tok_pinned",
-            spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, true),
-            3,
-            4,
-        )?;
-        let ptq1_q8_0_16tok = make_pipe(
-            b"ptq1_q8_0_16tok",
-            spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, false),
-            3,
-            4,
-        )?;
-        let ptq1_q8_0_16tok_pinned = make_pipe(
-            b"ptq1_q8_0_16tok_pinned",
-            spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, true),
-            3,
-            4,
-        )?;
-        let q8_0_q8_0 = make_pipe(
-            b"q8_0_q8_0",
-            spirv::q8_0_q8_0_gemv_coalesced(use_sdot),
-            3,
-            4,
-        )?;
-        let q8_0_q8_0_4tok = make_pipe(
-            b"q8_0_q8_0_4tok",
-            spirv::q8_0_q8_0_gemm_4tok_coalesced(use_sdot),
-            3,
-            4,
-        )?;
-        let q8_0_q8_0_16tok = make_pipe(
-            b"q8_0_q8_0_16tok",
-            spirv::q8_0_q8_0_gemm_16tok_coalesced(use_sdot),
-            3,
-            4,
-        )?;
-        let ptq1_q8k = make_pipe(b"ptq1_q8k", spirv::ptq1_q8k_gemv_coalesced(use_sdot), 3, 4)?;
-        let quant_q8k_pinned = make_pipe(
-            b"quant_q8k_pinned",
-            spirv::quantize_f32_to_q8k_4plane(true),
-            2,
-            2,
-        )?;
-        let quant_q8k_unpinned = make_pipe(
-            b"quant_q8k_unpinned",
-            spirv::quantize_f32_to_q8k_4plane(false),
-            2,
-            2,
-        )?;
-        let swiglu_pinned = make_pipe(b"swiglu_pinned", spirv::ffn_swiglu_f32(true), 3, 1)?;
-        let swiglu_unpinned = make_pipe(b"swiglu_unpinned", spirv::ffn_swiglu_f32(false), 3, 1)?;
-        let hadamard = make_pipe(b"hadamard", spirv::ffn_hadamard_f32(), 2, 2)?;
-        let dot_scalar = make_pipe(b"dot_scalar", spirv::dot_f32_scalar(), 3, 1)?;
+        let modules = [
+            make_spec(
+                b"pq2_q8k_fused",
+                spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_unfused",
+                spirv::pq2_q8k_gemv_coalesced(use_sdot, false, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_fused_res",
+                spirv::pq2_q8k_gemv_coalesced(use_sdot, true, true),
+                4,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_unfused_res",
+                spirv::pq2_q8k_gemv_coalesced(use_sdot, false, true),
+                4,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_4tok_fused",
+                spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_4tok_unfused",
+                spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_4tok_fused_res",
+                spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, true),
+                4,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_4tok_unfused_res",
+                spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, true),
+                4,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_16tok_fused",
+                spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, true, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_16tok_unfused",
+                spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, false, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_16tok_fused_res",
+                spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, true, true),
+                4,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_16tok_unfused_res",
+                spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, false, true),
+                4,
+                4,
+            )?,
+            make_spec(b"pq2_q8_0", spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?,
+            make_spec(
+                b"pq2_q8_0_4tok",
+                spirv::pq2_q8_0_gemm_4tok_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0",
+                spirv::ptq1_q8_0_gemv_coalesced(use_sdot, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0_pinned",
+                spirv::ptq1_q8_0_gemv_coalesced(use_sdot, true),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0_4tok",
+                spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0_4tok_pinned",
+                spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, true),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0_16tok",
+                spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0_16tok_pinned",
+                spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, true),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"q8_0_q8_0",
+                spirv::q8_0_q8_0_gemv_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"q8_0_q8_0_4tok",
+                spirv::q8_0_q8_0_gemm_4tok_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"q8_0_q8_0_16tok",
+                spirv::q8_0_q8_0_gemm_16tok_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            make_spec(b"ptq1_q8k", spirv::ptq1_q8k_gemv_coalesced(use_sdot), 3, 4)?,
+            make_spec(
+                b"quant_q8k_pinned",
+                spirv::quantize_f32_to_q8k_4plane(true),
+                2,
+                2,
+            )?,
+            make_spec(
+                b"quant_q8k_unpinned",
+                spirv::quantize_f32_to_q8k_4plane(false),
+                2,
+                2,
+            )?,
+            make_spec(b"swiglu_pinned", spirv::ffn_swiglu_f32(true), 3, 1)?,
+            make_spec(b"swiglu_unpinned", spirv::ffn_swiglu_f32(false), 3, 1)?,
+            make_spec(b"hadamard", spirv::ffn_hadamard_f32(), 2, 2)?,
+            make_spec(b"dot_scalar", spirv::dot_f32_scalar(), 3, 1)?,
+        ];
         let digest_bytes = hasher
             .finish()
             .map_err(|err| Error::InvalidInput(err.to_string()))?;
+
+        Ok(PreparedProjectionShaders {
+            digest_sha256: hex::encode(digest_bytes),
+            modules,
+        })
+    }
+
+    pub(crate) fn compile_prepared(
+        device: &mut AdrenoVulkanDevice,
+        prepared: PreparedProjectionShaders,
+    ) -> Result<Self, Error> {
+        let mut ids = Vec::with_capacity(prepared.modules.len());
+        for spec in prepared.modules {
+            let _ = spec.tag;
+            let _ = spec.digest;
+            ids.push(device.create_compute_pipeline(
+                &spec.words,
+                spec.num_buffers,
+                spec.push_u32s,
+            )?);
+        }
+        let [
+            pq2_q8k_fused,
+            pq2_q8k_unfused,
+            pq2_q8k_fused_res,
+            pq2_q8k_unfused_res,
+            pq2_q8k_4tok_fused,
+            pq2_q8k_4tok_unfused,
+            pq2_q8k_4tok_fused_res,
+            pq2_q8k_4tok_unfused_res,
+            pq2_q8k_16tok_fused,
+            pq2_q8k_16tok_unfused,
+            pq2_q8k_16tok_fused_res,
+            pq2_q8k_16tok_unfused_res,
+            pq2_q8_0,
+            pq2_q8_0_4tok,
+            ptq1_q8_0,
+            ptq1_q8_0_pinned,
+            ptq1_q8_0_4tok,
+            ptq1_q8_0_4tok_pinned,
+            ptq1_q8_0_16tok,
+            ptq1_q8_0_16tok_pinned,
+            q8_0_q8_0,
+            q8_0_q8_0_4tok,
+            q8_0_q8_0_16tok,
+            ptq1_q8k,
+            quant_q8k_pinned,
+            quant_q8k_unpinned,
+            swiglu_pinned,
+            swiglu_unpinned,
+            hadamard,
+            dot_scalar,
+        ]: [PipelineId; 30] = ids
+            .try_into()
+            .map_err(|_| Error::InvalidInput("projection pipeline count mismatch".to_owned()))?;
 
         Ok(Self {
             pq2_q8k_fused,
@@ -518,8 +593,12 @@ impl ProjectionPipelines {
             swiglu_unpinned,
             hadamard,
             dot_scalar,
-            digest_sha256: hex::encode(digest_bytes),
         })
+    }
+
+    pub(crate) fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
+        let prepared = Self::prepare(use_sdot)?;
+        Self::compile_prepared(device, prepared)
     }
 
     pub(crate) const fn select_pq2_q8k(

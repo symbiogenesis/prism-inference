@@ -1962,9 +1962,8 @@ where
         }
     }
 
-    let w6_tail = load_weight(b, w6_idx);
-    let b24 = b.uand(w6_tail, mask_low_byte);
-    let b25_masked = b.uand(w6_tail, mask_hi_byte);
+    let b24 = b.uand(w6_head, mask_low_byte);
+    let b25_masked = b.uand(w6_head, mask_hi_byte);
     let b25_shifted = b.ushl(b25_masked, c8);
     let mut pair = b.uor(b24, b25_shifted);
 

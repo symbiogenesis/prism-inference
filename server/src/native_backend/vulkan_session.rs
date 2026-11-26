@@ -33,7 +33,7 @@ mod platform {
         VulkanBatchedGraphExecutor, VulkanKvPrecision, VulkanMultiRankAdapterSpec,
     };
     use bonsai_prism_runtime::{
-        Decoder, Result as RuntimeResult,
+        Decoder, MAX_PREFILL_BLOCK_TOKENS, Result as RuntimeResult,
         model::{
             Model,
             lora::{MultiRankAdapter, MultiRankPolicy},
@@ -558,7 +558,9 @@ mod platform {
                 runtime.generate_sampled_until_with_timings(
                     &prepared.tokens,
                     &options,
-                    Prefill { block_tokens: 32 },
+                    Prefill {
+                        block_tokens: MAX_PREFILL_BLOCK_TOKENS,
+                    },
                     cancellation,
                     deadline,
                     &mut self.sampler,
@@ -694,6 +696,7 @@ mod platform {
                 tdr_policy: self.tdr_policy,
                 kv_precision: VulkanKvPrecision::Fp16,
                 context_limit: Some(self.context_tokens),
+                pipeline_cache_path: Some(default_vulkan_pipeline_cache_path()),
                 ..Default::default()
             };
             let adapters = VulkanBatchedAdapters {
@@ -938,6 +941,13 @@ mod platform {
         let max_rank = u16::try_from(validated.max_rank())?;
         let meta = (spec.path.to_path_buf(), spec.bytes, spec.sha256.to_owned());
         Ok((loaded, meta, id, max_rank))
+    }
+
+    fn default_vulkan_pipeline_cache_path() -> PathBuf {
+        let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
+        base.join("SwiftBonsai2")
+            .join("vulkan")
+            .join("adreno_pipeline_cache.bin")
     }
 
     fn runtime_invalid(message: &str) -> bonsai_prism_runtime::Error {

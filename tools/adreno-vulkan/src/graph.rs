@@ -9,6 +9,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
+    path::{Path, PathBuf},
 };
 
 use bonsai_native_hash::Hasher;
@@ -32,10 +33,11 @@ use crate::{
         MAX_DESCRIPTOR_SETS_PER_SUBMIT, PipelineId, WeightArena,
     },
     executor::{
-        BatchTokenPath, KIND_PQ2, KIND_PTQ1, KIND_Q8_0, MIN_SCRATCH_BYTES, ProjectionPipelines,
-        Q8_0_WORDS_PER_BLOCK, Q8K_4PLANE_WORDS_PER_HALF, attention_push_constants, checked_grid,
-        ensure_finite_f32, f32_slice_bytes, hadamard_norm_bits, repack_coalesced_into,
-        u32_slice_bytes, validate_matrix, validate_weight_scales,
+        BatchTokenPath, KIND_PQ2, KIND_PTQ1, KIND_Q8_0, MIN_SCRATCH_BYTES,
+        PreparedProjectionShaders, PreparedShaderSpec, ProjectionPipelines, Q8_0_WORDS_PER_BLOCK,
+        Q8K_4PLANE_WORDS_PER_HALF, attention_push_constants, checked_grid, ensure_finite_f32,
+        f32_slice_bytes, hadamard_norm_bits, repack_coalesced_into, u32_slice_bytes,
+        validate_matrix, validate_weight_scales,
     },
     hash_bytes, hash_str, hash_u32, hash_u64, hash_usize, select_attention_plan, spirv,
 };
@@ -110,13 +112,42 @@ impl TdrChunkPolicy {
     /// # Errors
     /// Returns [`Error::InvalidInput`] if `self` fails validation.
     pub fn layer_chunk_ranges(&self, total_layers: usize) -> Result<Vec<Range<usize>>, Error> {
+        self.layer_chunk_ranges_with_limit(total_layers, self.layers_per_submit)
+    }
+
+    /// Returns the effective layers per submit for a batch of `tokens` tokens.
+    ///
+    /// Single-token decode (`tokens == 1`) under the default policy raises chunking to
+    /// [`Self::MAX_LAYERS_PER_SUBMIT`] (`64`) to minimize per-token `vkQueueSubmit` overhead
+    /// while remaining bounded by `max_stages_per_submit` and WDDM TDR margins. Explicit
+    /// non-default policies (such as unit-test chunk overrides) are preserved verbatim.
+    #[must_use]
+    pub const fn effective_layers_per_submit(&self, tokens: usize) -> usize {
+        if tokens == 1 && self.layers_per_submit == Self::DEFAULT_LAYERS_PER_SUBMIT {
+            Self::MAX_LAYERS_PER_SUBMIT
+        } else {
+            self.layers_per_submit
+        }
+    }
+
+    fn layer_chunk_ranges_for_tokens(
+        &self,
+        total_layers: usize,
+        tokens: usize,
+    ) -> Result<Vec<Range<usize>>, Error> {
+        self.layer_chunk_ranges_with_limit(total_layers, self.effective_layers_per_submit(tokens))
+    }
+
+    fn layer_chunk_ranges_with_limit(
+        &self,
+        total_layers: usize,
+        per_submit: usize,
+    ) -> Result<Vec<Range<usize>>, Error> {
         self.validate()?;
-        let mut ranges = Vec::with_capacity(total_layers.div_ceil(self.layers_per_submit));
+        let mut ranges = Vec::with_capacity(total_layers.div_ceil(per_submit));
         let mut start = 0_usize;
         while start < total_layers {
-            let end = start
-                .saturating_add(self.layers_per_submit)
-                .min(total_layers);
+            let end = start.saturating_add(per_submit).min(total_layers);
             ranges.push(start..end);
             start = end;
         }
@@ -210,6 +241,11 @@ pub struct VulkanBatchedConfig {
     /// amortize weight reads across tokens while remaining bounded by `scratch_budget_bytes` and
     /// device `maxStorageBufferRange` limits.
     pub prefill_tile_tokens: usize,
+    /// Optional disk file path for persisting driver `VkPipelineCache` binaries across runs.
+    ///
+    /// When `Some`, [`VulkanBatchedGraphExecutor::open_with_adapters`] attempts to seed the
+    /// Vulkan pipeline cache from this file and exports updated cache data after compilation.
+    pub pipeline_cache_path: Option<PathBuf>,
 }
 
 impl Default for VulkanBatchedConfig {
@@ -224,6 +260,7 @@ impl Default for VulkanBatchedConfig {
             scratch_budget_bytes: 256 * 1024 * 1024,
             pinned_arithmetic: None,
             prefill_tile_tokens: 32,
+            pipeline_cache_path: None,
         }
     }
 }
@@ -300,243 +337,343 @@ pub struct VulkanLayerPipelines {
     shader_digests_sha256: String,
 }
 
+struct PreparedLayerShaders {
+    use_sdot: bool,
+    proj: PreparedProjectionShaders,
+    modules: [PreparedShaderSpec; 52],
+    shader_digests_sha256: String,
+}
+
 impl VulkanLayerPipelines {
-    /// Compiles every layer, projection, `LoRA`, and attention SPIR-V 1.6 pipeline on `device`.
-    ///
-    /// # Errors
-    /// Returns [`Error::Unsupported`], [`Error::Vulkan`], or [`Error::InvalidInput`] if pipeline
-    /// creation or digest calculation fails.
+    /// Emits and digests every layer, projection, `LoRA`, and attention SPIR-V 1.6 module without
+    /// yet opening a Vulkan device or invoking QGLC compilation.
     #[expect(
         clippy::too_many_lines,
-        reason = "Compiles and digests all whole-layer, projection, LoRA, batched prefill, and F32/packed-FP16 attention SPIR-V pipelines sequentially."
+        reason = "Emits and digests all whole-layer, projection, LoRA, batched prefill, and F32/packed-FP16 attention SPIR-V modules sequentially."
     )]
-    pub fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
-        let proj = ProjectionPipelines::compile(device, use_sdot)?;
+    fn prepare(use_sdot: bool) -> Result<PreparedLayerShaders, Error> {
+        let proj = ProjectionPipelines::prepare(use_sdot)?;
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
         hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v5:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
         hash_bytes(&mut hasher, b"proj_bundle:")?;
         hash_bytes(&mut hasher, proj.digest_sha256.as_bytes())?;
 
-        let mut make_pipe = |tag: &[u8],
+        let mut make_spec = |tag: &'static [u8],
                              words: Vec<u32>,
                              num_buffers: usize,
                              push_u32s: usize|
-         -> Result<(PipelineId, String), Error> {
+         -> Result<PreparedShaderSpec, Error> {
             let digest = spirv::shader_digest(&words)?;
             hash_bytes(&mut hasher, tag)?;
             hash_bytes(&mut hasher, digest.as_bytes())?;
-            let pipe = device.create_compute_pipeline(&words, num_buffers, push_u32s)?;
-            Ok((pipe, digest))
+            Ok(PreparedShaderSpec {
+                tag,
+                words,
+                num_buffers,
+                push_u32s,
+                digest,
+            })
         };
 
-        let (attn_qk_scores, attn_qk_digest) =
-            make_pipe(b"attn_qk_scores", spirv::attn_qk_scores(), 3, 8)?;
-        let (attn_qk_scores_f16kv, attn_qk_f16kv_digest) =
-            make_pipe(b"attn_qk_scores_f16kv", spirv::attn_qk_scores_f16kv(), 3, 8)?;
-        let (attn_softmax_f16, attn_softmax_digest) =
-            make_pipe(b"attn_softmax_f16", spirv::attn_softmax_f16(), 2, 8)?;
-        let (attn_pv_accum, attn_pv_digest) =
-            make_pipe(b"attn_pv_accum", spirv::attn_pv_accum(), 3, 8)?;
-        let (attn_pv_accum_f16kv, attn_pv_f16kv_digest) =
-            make_pipe(b"attn_pv_accum_f16kv", spirv::attn_pv_accum_f16kv(), 3, 8)?;
-        let (attn_fused_f16prob, attn_fused_digest) =
-            make_pipe(b"attn_fused_f16prob", spirv::attn_fused_f16prob(), 4, 8)?;
-        let (attn_fused_f16prob_f16kv, attn_fused_f16kv_digest) = make_pipe(
-            b"attn_fused_f16prob_f16kv",
-            spirv::attn_fused_f16prob_f16kv(),
-            4,
-            8,
-        )?;
-        let (attn_fused_gqa_prefill_f16kv, attn_fused_gqa_prefill_f16kv_digest) = make_pipe(
-            b"attn_fused_gqa_prefill_f16kv",
-            spirv::attn_fused_gqa_prefill_f16kv(),
-            4,
-            8,
-        )?;
-
-        let (rms_norm, _) = make_pipe(b"rms_norm_f32", spirv::rms_norm_f32(), 3, 2)?;
-        let (add_rms_norm, _) = make_pipe(b"add_rms_norm_f32", spirv::add_rms_norm_f32(), 4, 2)?;
-        let (rope, _) = make_pipe(b"rope_f32", spirv::rope_f32(), 2, 4)?;
-        let (rope_batched, _) = make_pipe(b"rope_batched_f32", spirv::rope_batched_f32(), 2, 5)?;
-        let (mul_sigmoid, _) = make_pipe(b"mul_sigmoid_f32", spirv::mul_sigmoid_f32(), 2, 1)?;
-        let (conv1d_silu, _) = make_pipe(b"conv1d_silu_f32", spirv::conv1d_silu_f32(), 4, 2)?;
-        let (conv1d_silu_offset, _) = make_pipe(
-            b"conv1d_silu_offset_f32",
-            spirv::conv1d_silu_offset_f32(),
-            4,
-            3,
-        )?;
-        let (conv1d_silu_batched_inplace, _) = make_pipe(
-            b"conv1d_silu_batched_inplace_f32",
-            spirv::conv1d_silu_batched_inplace_f32(),
-            3,
-            3,
-        )?;
-        let (l2_norm, _) = make_pipe(b"l2_norm_f32", spirv::l2_norm_f32(), 1, 3)?;
-        let (l2_norm_batched_strided, _) = make_pipe(
-            b"l2_norm_batched_strided_f32",
-            spirv::l2_norm_batched_strided_f32(),
-            1,
-            5,
-        )?;
-        let (gdn_step, _) = make_pipe(b"gdn_step_f32", spirv::gdn_step_f32(), 7, 4)?;
-        let (gdn_step_batched_token, _) = make_pipe(
-            b"gdn_step_batched_token_f32",
-            spirv::gdn_step_batched_token_f32(),
-            5,
-            5,
-        )?;
-        let (gdn_scan_batched, _) =
-            make_pipe(b"gdn_scan_batched_f32", spirv::gdn_scan_batched_f32(), 5, 5)?;
-        let (gdn_gates, _) = make_pipe(b"gdn_gates_f32", spirv::gdn_gates_f32(), 4, 1)?;
-        let (gdn_gates_batched, _) = make_pipe(
-            b"gdn_gates_batched_f32",
-            spirv::gdn_gates_batched_f32(),
-            4,
-            2,
-        )?;
-        let (deinterleave_q_gate, _) = make_pipe(
-            b"deinterleave_q_gate_f32",
-            spirv::deinterleave_q_gate_f32(),
-            3,
-            2,
-        )?;
-        let (deinterleave_q_gate_batched, _) = make_pipe(
-            b"deinterleave_q_gate_batched_f32",
-            spirv::deinterleave_q_gate_batched_f32(),
-            3,
-            3,
-        )?;
-        let (round_f16, _) = make_pipe(b"round_f16_f32", spirv::round_f16_f32(), 1, 1)?;
-        let (kv_append_f32, _) = make_pipe(b"kv_append_f32", spirv::kv_append_f32(), 2, 2)?;
-        let (kv_append_batched_f32, _) = make_pipe(
-            b"kv_append_batched_f32",
-            spirv::kv_append_batched_f32(),
-            2,
-            3,
-        )?;
-        let (kv_append_f16, _) = make_pipe(b"kv_append_f16", spirv::kv_append_f16(), 2, 2)?;
-        let (kv_append_batched_f16, _) = make_pipe(
-            b"kv_append_batched_f16",
-            spirv::kv_append_batched_f16(),
-            2,
-            3,
-        )?;
-        let (quant_q8_0_source, _) = make_pipe(
-            b"quant_q8_0_source",
-            spirv::quantize_f32_to_q8_0(false, false),
-            2,
-            1,
-        )?;
-        let (quant_q8_0_source_batched, _) = make_pipe(
-            b"quant_q8_0_source_batched",
-            spirv::quantize_f32_to_q8_0_batched(false, false),
-            2,
-            2,
-        )?;
-        let (quant_q8_0_pinned, _) = make_pipe(
-            b"quant_q8_0_pinned",
-            spirv::quantize_f32_to_q8_0(true, false),
-            2,
-            1,
-        )?;
-        let (quant_q8_0_pinned_batched, _) = make_pipe(
-            b"quant_q8_0_pinned_batched",
-            spirv::quantize_f32_to_q8_0_batched(true, false),
-            2,
-            2,
-        )?;
-        let (quant_q8_0_pinned_native, _) = make_pipe(
-            b"quant_q8_0_pinned_native",
-            spirv::quantize_f32_to_q8_0(true, true),
-            2,
-            1,
-        )?;
-        let (quant_q8_0_pinned_native_batched, _) = make_pipe(
-            b"quant_q8_0_pinned_native_batched",
-            spirv::quantize_f32_to_q8_0_batched(true, true),
-            2,
-            2,
-        )?;
-        let (fused_hadamard1024_q8k_pinned, _) = make_pipe(
-            b"fused_hadamard1024_q8k_pinned",
-            spirv::fused_basis_hadamard1024_q8k_4plane(true),
-            3,
-            7,
-        )?;
-        let (fused_hadamard1024_q8k_unpinned, _) = make_pipe(
-            b"fused_hadamard1024_q8k_unpinned",
-            spirv::fused_basis_hadamard1024_q8k_4plane(false),
-            3,
-            7,
-        )?;
-        let (fused_hadamard1024_q8_0_source, _) = make_pipe(
-            b"fused_hadamard1024_q8_0_source",
-            spirv::fused_basis_hadamard1024_q8_0(false, false),
-            3,
-            7,
-        )?;
-        let (fused_hadamard1024_q8_0_pinned, _) = make_pipe(
-            b"fused_hadamard1024_q8_0_pinned",
-            spirv::fused_basis_hadamard1024_q8_0(true, false),
-            3,
-            7,
-        )?;
-        let (fused_hadamard1024_q8_0_pinned_native, _) = make_pipe(
-            b"fused_hadamard1024_q8_0_pinned_native",
-            spirv::fused_basis_hadamard1024_q8_0(true, true),
-            3,
-            7,
-        )?;
-        let (hadamard_batched, _) = make_pipe(
-            b"ffn_hadamard_batched_f32",
-            spirv::ffn_hadamard_batched_f32(),
-            2,
-            4,
-        )?;
-        let (f32_matvec, _) = make_pipe(b"f32_matvec", spirv::f32_matvec(), 3, 2)?;
-        let (f32_gemm_batched, _) =
-            make_pipe(b"f32_gemm_batched", spirv::f32_gemm_batched(), 3, 3)?;
-        let (lora_b_accum, _) = make_pipe(b"lora_b_accum_f32", spirv::lora_b_accum_f32(), 3, 3)?;
-        let (lora_b_accum_batched, _) = make_pipe(
-            b"lora_b_accum_batched_f32",
-            spirv::lora_b_accum_batched_f32(),
-            3,
-            4,
-        )?;
-        let (mul_f32_elemwise, _) =
-            make_pipe(b"mul_f32_elemwise", spirv::mul_f32_elemwise(), 3, 1)?;
-        let (mul_f32_elemwise_batched, _) = make_pipe(
-            b"mul_f32_elemwise_batched",
-            spirv::mul_f32_elemwise_batched(),
-            3,
-            2,
-        )?;
-        let (permute_ssm_heads, _) = make_pipe(
-            b"permute_ssm_heads_f32",
-            spirv::permute_ssm_heads_f32(),
-            2,
-            3,
-        )?;
-        let (permute_ssm_heads_batched, _) = make_pipe(
-            b"permute_ssm_heads_batched_f32",
-            spirv::permute_ssm_heads_batched_f32(),
-            2,
-            4,
-        )?;
-        let (copy_slice, _) = make_pipe(b"copy_slice_f32", spirv::copy_slice_f32(), 2, 2)?;
-        let (copy_slice_offset, _) = make_pipe(
-            b"copy_slice_offset_f32",
-            spirv::copy_slice_offset_f32(),
-            2,
-            3,
-        )?;
+        let modules = [
+            make_spec(b"attn_qk_scores", spirv::attn_qk_scores(), 3, 8)?,
+            make_spec(b"attn_qk_scores_f16kv", spirv::attn_qk_scores_f16kv(), 3, 8)?,
+            make_spec(b"attn_softmax_f16", spirv::attn_softmax_f16(), 2, 8)?,
+            make_spec(b"attn_pv_accum", spirv::attn_pv_accum(), 3, 8)?,
+            make_spec(b"attn_pv_accum_f16kv", spirv::attn_pv_accum_f16kv(), 3, 8)?,
+            make_spec(b"attn_fused_f16prob", spirv::attn_fused_f16prob(), 4, 8)?,
+            make_spec(
+                b"attn_fused_f16prob_f16kv",
+                spirv::attn_fused_f16prob_f16kv(),
+                4,
+                8,
+            )?,
+            make_spec(
+                b"attn_fused_gqa_prefill_f16kv",
+                spirv::attn_fused_gqa_prefill_f16kv(),
+                4,
+                8,
+            )?,
+            make_spec(b"rms_norm_f32", spirv::rms_norm_f32(), 3, 2)?,
+            make_spec(b"add_rms_norm_f32", spirv::add_rms_norm_f32(), 4, 2)?,
+            make_spec(b"rope_f32", spirv::rope_f32(), 2, 4)?,
+            make_spec(b"rope_batched_f32", spirv::rope_batched_f32(), 2, 5)?,
+            make_spec(b"mul_sigmoid_f32", spirv::mul_sigmoid_f32(), 2, 1)?,
+            make_spec(b"conv1d_silu_f32", spirv::conv1d_silu_f32(), 4, 2)?,
+            make_spec(
+                b"conv1d_silu_offset_f32",
+                spirv::conv1d_silu_offset_f32(),
+                4,
+                3,
+            )?,
+            make_spec(
+                b"conv1d_silu_batched_inplace_f32",
+                spirv::conv1d_silu_batched_inplace_f32(),
+                3,
+                3,
+            )?,
+            make_spec(b"l2_norm_f32", spirv::l2_norm_f32(), 1, 3)?,
+            make_spec(
+                b"l2_norm_batched_strided_f32",
+                spirv::l2_norm_batched_strided_f32(),
+                1,
+                5,
+            )?,
+            make_spec(b"gdn_step_f32", spirv::gdn_step_f32(), 7, 4)?,
+            make_spec(
+                b"gdn_step_batched_token_f32",
+                spirv::gdn_step_batched_token_f32(),
+                5,
+                5,
+            )?,
+            make_spec(b"gdn_scan_batched_f32", spirv::gdn_scan_batched_f32(), 5, 5)?,
+            make_spec(b"gdn_gates_f32", spirv::gdn_gates_f32(), 4, 1)?,
+            make_spec(
+                b"gdn_gates_batched_f32",
+                spirv::gdn_gates_batched_f32(),
+                4,
+                2,
+            )?,
+            make_spec(
+                b"deinterleave_q_gate_f32",
+                spirv::deinterleave_q_gate_f32(),
+                3,
+                2,
+            )?,
+            make_spec(
+                b"deinterleave_q_gate_batched_f32",
+                spirv::deinterleave_q_gate_batched_f32(),
+                3,
+                3,
+            )?,
+            make_spec(b"round_f16_f32", spirv::round_f16_f32(), 1, 1)?,
+            make_spec(b"kv_append_f32", spirv::kv_append_f32(), 2, 2)?,
+            make_spec(
+                b"kv_append_batched_f32",
+                spirv::kv_append_batched_f32(),
+                2,
+                3,
+            )?,
+            make_spec(b"kv_append_f16", spirv::kv_append_f16(), 2, 2)?,
+            make_spec(
+                b"kv_append_batched_f16",
+                spirv::kv_append_batched_f16(),
+                2,
+                3,
+            )?,
+            make_spec(
+                b"quant_q8_0_source",
+                spirv::quantize_f32_to_q8_0(false, false),
+                2,
+                1,
+            )?,
+            make_spec(
+                b"quant_q8_0_source_batched",
+                spirv::quantize_f32_to_q8_0_batched(false, false),
+                2,
+                2,
+            )?,
+            make_spec(
+                b"quant_q8_0_pinned",
+                spirv::quantize_f32_to_q8_0(true, false),
+                2,
+                1,
+            )?,
+            make_spec(
+                b"quant_q8_0_pinned_batched",
+                spirv::quantize_f32_to_q8_0_batched(true, false),
+                2,
+                2,
+            )?,
+            make_spec(
+                b"quant_q8_0_pinned_native",
+                spirv::quantize_f32_to_q8_0(true, true),
+                2,
+                1,
+            )?,
+            make_spec(
+                b"quant_q8_0_pinned_native_batched",
+                spirv::quantize_f32_to_q8_0_batched(true, true),
+                2,
+                2,
+            )?,
+            make_spec(
+                b"fused_hadamard1024_q8k_pinned",
+                spirv::fused_basis_hadamard1024_q8k_4plane(true),
+                3,
+                7,
+            )?,
+            make_spec(
+                b"fused_hadamard1024_q8k_unpinned",
+                spirv::fused_basis_hadamard1024_q8k_4plane(false),
+                3,
+                7,
+            )?,
+            make_spec(
+                b"fused_hadamard1024_q8_0_source",
+                spirv::fused_basis_hadamard1024_q8_0(false, false),
+                3,
+                7,
+            )?,
+            make_spec(
+                b"fused_hadamard1024_q8_0_pinned",
+                spirv::fused_basis_hadamard1024_q8_0(true, false),
+                3,
+                7,
+            )?,
+            make_spec(
+                b"fused_hadamard1024_q8_0_pinned_native",
+                spirv::fused_basis_hadamard1024_q8_0(true, true),
+                3,
+                7,
+            )?,
+            make_spec(
+                b"ffn_hadamard_batched_f32",
+                spirv::ffn_hadamard_batched_f32(),
+                2,
+                4,
+            )?,
+            make_spec(b"f32_matvec", spirv::f32_matvec(), 3, 2)?,
+            make_spec(b"f32_gemm_batched", spirv::f32_gemm_batched(), 3, 3)?,
+            make_spec(b"lora_b_accum_f32", spirv::lora_b_accum_f32(), 3, 3)?,
+            make_spec(
+                b"lora_b_accum_batched_f32",
+                spirv::lora_b_accum_batched_f32(),
+                3,
+                4,
+            )?,
+            make_spec(b"mul_f32_elemwise", spirv::mul_f32_elemwise(), 3, 1)?,
+            make_spec(
+                b"mul_f32_elemwise_batched",
+                spirv::mul_f32_elemwise_batched(),
+                3,
+                2,
+            )?,
+            make_spec(
+                b"permute_ssm_heads_f32",
+                spirv::permute_ssm_heads_f32(),
+                2,
+                3,
+            )?,
+            make_spec(
+                b"permute_ssm_heads_batched_f32",
+                spirv::permute_ssm_heads_batched_f32(),
+                2,
+                4,
+            )?,
+            make_spec(b"copy_slice_f32", spirv::copy_slice_f32(), 2, 2)?,
+            make_spec(
+                b"copy_slice_offset_f32",
+                spirv::copy_slice_offset_f32(),
+                2,
+                3,
+            )?,
+        ];
 
         let digest_bytes = hasher
             .finish()
             .map_err(|err| Error::InvalidInput(err.to_string()))?;
         let shader_digests_sha256 = hex::encode(digest_bytes);
+
+        Ok(PreparedLayerShaders {
+            use_sdot,
+            proj,
+            modules,
+            shader_digests_sha256,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Compiles all prepared projection, layer, LoRA, batched prefill, and attention SPIR-V pipelines sequentially."
+    )]
+    fn compile_prepared(
+        device: &mut AdrenoVulkanDevice,
+        prepared: PreparedLayerShaders,
+    ) -> Result<Self, Error> {
+        let proj = ProjectionPipelines::compile_prepared(device, prepared.proj)?;
+        let mut ids = Vec::with_capacity(prepared.modules.len());
+        let mut digests = Vec::with_capacity(8);
+        for (idx, spec) in prepared.modules.into_iter().enumerate() {
+            let _ = spec.tag;
+            if idx < 8 {
+                digests.push(spec.digest);
+            }
+            ids.push(device.create_compute_pipeline(
+                &spec.words,
+                spec.num_buffers,
+                spec.push_u32s,
+            )?);
+        }
+        let [
+            attn_qk_digest,
+            attn_qk_f16kv_digest,
+            attn_softmax_digest,
+            attn_pv_digest,
+            attn_pv_f16kv_digest,
+            attn_fused_digest,
+            attn_fused_f16kv_digest,
+            attn_fused_gqa_prefill_f16kv_digest,
+        ]: [String; 8] = digests
+            .try_into()
+            .map_err(|_| Error::InvalidInput("attention digest count mismatch".to_owned()))?;
+        let [
+            attn_qk_scores,
+            attn_qk_scores_f16kv,
+            attn_softmax_f16,
+            attn_pv_accum,
+            attn_pv_accum_f16kv,
+            attn_fused_f16prob,
+            attn_fused_f16prob_f16kv,
+            attn_fused_gqa_prefill_f16kv,
+            rms_norm,
+            add_rms_norm,
+            rope,
+            rope_batched,
+            mul_sigmoid,
+            conv1d_silu,
+            conv1d_silu_offset,
+            conv1d_silu_batched_inplace,
+            l2_norm,
+            l2_norm_batched_strided,
+            gdn_step,
+            gdn_step_batched_token,
+            gdn_scan_batched,
+            gdn_gates,
+            gdn_gates_batched,
+            deinterleave_q_gate,
+            deinterleave_q_gate_batched,
+            round_f16,
+            kv_append_f32,
+            kv_append_batched_f32,
+            kv_append_f16,
+            kv_append_batched_f16,
+            quant_q8_0_source,
+            quant_q8_0_source_batched,
+            quant_q8_0_pinned,
+            quant_q8_0_pinned_batched,
+            quant_q8_0_pinned_native,
+            quant_q8_0_pinned_native_batched,
+            fused_hadamard1024_q8k_pinned,
+            fused_hadamard1024_q8k_unpinned,
+            fused_hadamard1024_q8_0_source,
+            fused_hadamard1024_q8_0_pinned,
+            fused_hadamard1024_q8_0_pinned_native,
+            hadamard_batched,
+            f32_matvec,
+            f32_gemm_batched,
+            lora_b_accum,
+            lora_b_accum_batched,
+            mul_f32_elemwise,
+            mul_f32_elemwise_batched,
+            permute_ssm_heads,
+            permute_ssm_heads_batched,
+            copy_slice,
+            copy_slice_offset,
+        ]: [PipelineId; 52] = ids
+            .try_into()
+            .map_err(|_| Error::InvalidInput("layer pipeline count mismatch".to_owned()))?;
 
         Ok(Self {
             proj,
@@ -592,7 +729,7 @@ impl VulkanLayerPipelines {
             permute_ssm_heads_batched,
             copy_slice,
             copy_slice_offset,
-            use_sdot,
+            use_sdot: prepared.use_sdot,
             attn_qk_digest,
             attn_qk_f16kv_digest,
             attn_softmax_digest,
@@ -601,8 +738,18 @@ impl VulkanLayerPipelines {
             attn_fused_digest,
             attn_fused_f16kv_digest,
             attn_fused_gqa_prefill_f16kv_digest,
-            shader_digests_sha256,
+            shader_digests_sha256: prepared.shader_digests_sha256,
         })
+    }
+
+    /// Compiles every layer, projection, `LoRA`, and attention SPIR-V 1.6 pipeline on `device`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`], [`Error::Vulkan`], or [`Error::InvalidInput`] if pipeline
+    /// creation or digest calculation fails.
+    pub fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
+        let prepared = Self::prepare(use_sdot)?;
+        Self::compile_prepared(device, prepared)
     }
 
     /// Returns whether this compiled bundle uses hardware `VK_KHR_shader_integer_dot_product` (`OpSDot`).
@@ -815,6 +962,47 @@ impl VulkanBatchedCheckpoint {
             .map_err(|err| Error::InvalidInput(err.to_string()))?;
         Ok(hex::encode(digest))
     }
+}
+
+#[derive(Clone, Copy, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Tracks disjoint scratch buffer usage across sibling basis subgroups inside one projection group."
+)]
+struct ProjectionGroupSync {
+    src_barrier_emitted: bool,
+    used_q8k: bool,
+    used_q8_0: bool,
+    used_perm_tmp: bool,
+    used_sign_tmp: bool,
+    used_transformed: bool,
+}
+
+const MAX_READ_PIPELINE_CACHE_FILE_BYTES: u64 = 64 * 1024 * 1024 + 4096;
+
+fn read_pipeline_cache_file(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_READ_PIPELINE_CACHE_FILE_BYTES {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+fn write_pipeline_cache_file(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp_path, bytes).is_ok() {
+        if std::fs::rename(&tmp_path, path).is_ok() {
+            return;
+        }
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    let _ = std::fs::write(path, bytes);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1117,8 +1305,45 @@ impl VulkanBatchedGraphExecutor {
         config: VulkanBatchedConfig,
         adapters: VulkanBatchedAdapters<'_>,
     ) -> Result<Self, Error> {
-        let device = AdrenoVulkanDevice::open()?;
-        Self::from_device_with_adapters(device, model, config, adapters)
+        let Some(cache_path) = config.pipeline_cache_path.clone() else {
+            let device = AdrenoVulkanDevice::open()?;
+            return Self::from_device_with_adapters(device, model, config, adapters);
+        };
+
+        config.tdr_policy.validate()?;
+        let use_sdot_hint = !matches!(
+            config.kernel_path,
+            Some(ProjectionKernelPath::PortableIntegerFallback)
+        );
+        let prepared = VulkanLayerPipelines::prepare(use_sdot_hint)?;
+        let cached_blob = read_pipeline_cache_file(&cache_path);
+        let (device, loaded_from_cache) = match cached_blob.as_deref() {
+            Some(blob) => match AdrenoVulkanDevice::open_with_pipeline_cache_data(
+                Some(blob),
+                &prepared.shader_digests_sha256,
+            ) {
+                Ok(dev) => (dev, true),
+                Err(Error::InvalidInput(_)) => (AdrenoVulkanDevice::open()?, false),
+                Err(err) => return Err(err),
+            },
+            None => (AdrenoVulkanDevice::open()?, false),
+        };
+
+        let executor = Self::from_device_with_adapters_prepared(
+            device,
+            model,
+            config,
+            adapters,
+            Some(prepared),
+        )?;
+        if (!loaded_from_cache || executor.pipelines.uses_sdot() != use_sdot_hint)
+            && let Ok(exported) = executor
+                .device
+                .export_pipeline_cache_data(executor.pipelines.shader_digests_sha256())
+        {
+            write_pipeline_cache_file(&cache_path, &exported);
+        }
+        Ok(executor)
     }
 
     /// Uploads `model` onto an already-opened [`AdrenoVulkanDevice`] with `config`.
@@ -1139,15 +1364,25 @@ impl VulkanBatchedGraphExecutor {
     /// # Errors
     /// Returns [`Error::Unsupported`], [`Error::InvalidInput`], [`Error::ResourceLimit`],
     /// [`Error::DeviceFault`], or [`Error::Vulkan`].
+    pub fn from_device_with_adapters(
+        device: AdrenoVulkanDevice,
+        model: &Model,
+        config: VulkanBatchedConfig,
+        adapters: VulkanBatchedAdapters<'_>,
+    ) -> Result<Self, Error> {
+        Self::from_device_with_adapters_prepared(device, model, config, adapters, None)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Coordinates single-pass model/adapter validation, GPU weight upload, state/scratch allocation, and deterministic identity hashing."
     )]
-    pub fn from_device_with_adapters(
+    fn from_device_with_adapters_prepared(
         mut device: AdrenoVulkanDevice,
         model: &Model,
         config: VulkanBatchedConfig,
         adapters: VulkanBatchedAdapters<'_>,
+        prepared_shaders: Option<PreparedLayerShaders>,
     ) -> Result<Self, Error> {
         config.tdr_policy.validate()?;
         if config.prefill_tile_tokens == 0 || config.prefill_tile_tokens > MAX_PREFILL_BLOCK_TOKENS
@@ -1183,7 +1418,12 @@ impl VulkanBatchedGraphExecutor {
         }
         validate_model_tensors_subset(model, &geometry, layer_count, &recurrent_flags)?;
 
-        let pipelines = VulkanLayerPipelines::compile(&mut device, use_sdot)?;
+        let pipelines = match prepared_shaders {
+            Some(prepared) if prepared.use_sdot == use_sdot => {
+                VulkanLayerPipelines::compile_prepared(&mut device, prepared)?
+            }
+            _ => VulkanLayerPipelines::compile(&mut device, use_sdot)?,
+        };
         let min_align =
             usize::try_from(device.min_storage_buffer_offset_alignment().max(1)).unwrap_or(256);
         let max_storage_range = device
@@ -2362,7 +2602,7 @@ impl VulkanBatchedGraphExecutor {
         let chunks = self
             .config
             .tdr_policy
-            .layer_chunk_ranges(self.layers.len())?;
+            .layer_chunk_ranges_for_tokens(self.layers.len(), t_len)?;
         let need_logits = logits_out.is_some();
         let total_layers = self.layers.len();
         let min_align = usize::try_from(self.device.min_storage_buffer_offset_alignment().max(1))
@@ -2583,9 +2823,23 @@ impl VulkanBatchedGraphExecutor {
         len_u32: u32,
         tokens_u32: u32,
     ) -> Result<(), Error> {
+        self.record_mul_sign_tokens_with_barrier(
+            in_buf, sign_buf, out_buf, len_u32, tokens_u32, true,
+        )
+    }
+
+    fn record_mul_sign_tokens_with_barrier(
+        &mut self,
+        in_buf: BufferId,
+        sign_buf: BufferId,
+        out_buf: BufferId,
+        len_u32: u32,
+        tokens_u32: u32,
+        barrier: bool,
+    ) -> Result<(), Error> {
         if tokens_u32 == 1 {
             let elem_grid = checked_grid(&self.device, [len_u32.div_ceil(WORKGROUP_X), 1, 1])?;
-            self.batch_recorder.push_barrier(
+            self.batch_recorder.push(
                 self.pipelines.mul_f32_elemwise,
                 &[
                     BufferSpan::whole(in_buf),
@@ -2594,11 +2848,12 @@ impl VulkanBatchedGraphExecutor {
                 ],
                 &[len_u32],
                 elem_grid,
+                barrier,
             );
         } else {
             let elem_grid =
                 checked_grid(&self.device, [len_u32.div_ceil(WORKGROUP_X), tokens_u32, 1])?;
-            self.batch_recorder.push_barrier(
+            self.batch_recorder.push(
                 self.pipelines.mul_f32_elemwise_batched,
                 &[
                     BufferSpan::whole(in_buf),
@@ -2607,6 +2862,7 @@ impl VulkanBatchedGraphExecutor {
                 ],
                 &[len_u32, tokens_u32],
                 elem_grid,
+                barrier,
             );
         }
         Ok(())
@@ -3989,13 +4245,16 @@ impl VulkanBatchedGraphExecutor {
             bases[..base_count].sort_unstable();
         }
 
+        let mut sync = ProjectionGroupSync::default();
         for &basis in &bases[..base_count] {
             let group: Vec<(GpuMatrixWeight, BufferId)> = targets
                 .iter()
                 .copied()
                 .filter(|(w, _)| w.basis() == basis)
                 .collect();
-            self.record_basis_projection_subgroup_tokens(src_buf, basis, &group, tokens)?;
+            self.record_basis_projection_subgroup_tokens(
+                src_buf, basis, &group, tokens, &mut sync,
+            )?;
         }
         self.record_projection_group_adapters_tokens(src_buf, targets, tokens)
     }
@@ -4154,13 +4413,14 @@ impl VulkanBatchedGraphExecutor {
         basis: (bool, bool),
         group: &[(GpuMatrixWeight, BufferId)],
         tokens: usize,
+        sync: &mut ProjectionGroupSync,
     ) -> Result<(), Error> {
         let cols = group[0].0.cols;
         let fused_h1024 = self.can_fuse_hadamard_1024(basis, cols, group);
         let act_buf = if fused_h1024 {
             src_buf
         } else {
-            self.apply_forward_basis_transform_tokens(src_buf, cols, basis, tokens)?
+            self.apply_forward_basis_transform_tokens(src_buf, cols, basis, tokens, sync)?
         };
 
         let needs_q8k = group
@@ -4182,6 +4442,7 @@ impl VulkanBatchedGraphExecutor {
                 tokens,
                 needs_q8k,
                 needs_q8_0_source_or_pinned && needs_ptq1_q8_0 && self.resolved_pinned_arithmetic,
+                sync,
             );
         }
 
@@ -4196,12 +4457,15 @@ impl VulkanBatchedGraphExecutor {
                 .copied()
                 .filter(|(w, _)| w.encoding == WeightEncoding::Ptq1Q8_0)
                 .collect();
-            self.dispatch_prepared_projection_group_tokens(act_buf, cols, &q8_0_pq2, tokens)?;
-            return self
-                .dispatch_prepared_projection_group_tokens(act_buf, cols, &q8_0_ptq1, tokens);
+            self.dispatch_prepared_projection_group_tokens(
+                src_buf, act_buf, cols, &q8_0_pq2, tokens, sync,
+            )?;
+            return self.dispatch_prepared_projection_group_tokens(
+                src_buf, act_buf, cols, &q8_0_ptq1, tokens, sync,
+            );
         }
 
-        self.dispatch_prepared_projection_group_tokens(act_buf, cols, group, tokens)
+        self.dispatch_prepared_projection_group_tokens(src_buf, act_buf, cols, group, tokens, sync)
     }
 
     #[expect(
@@ -4217,6 +4481,7 @@ impl VulkanBatchedGraphExecutor {
         tokens: usize,
         needs_q8k: bool,
         split_pinned_ptq1: bool,
+        sync: &mut ProjectionGroupSync,
     ) -> Result<(), Error> {
         let tokens_u32 = u32::try_from(tokens)
             .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
@@ -4231,7 +4496,8 @@ impl VulkanBatchedGraphExecutor {
             } else {
                 self.pipelines.fused_hadamard1024_q8k_unpinned
             };
-            self.batch_recorder.push_barrier(
+            let barrier = !sync.src_barrier_emitted || sync.used_q8k;
+            self.batch_recorder.push(
                 q8k_pipe,
                 &[
                     BufferSpan::whole(src_buf),
@@ -4240,9 +4506,11 @@ impl VulkanBatchedGraphExecutor {
                 ],
                 &push,
                 grid,
+                barrier,
             );
+            sync.src_barrier_emitted = true;
+            sync.used_q8k = true;
         }
-        let q8k_emitted = needs_q8k;
 
         if split_pinned_ptq1 {
             let q8_0_pq2: Vec<(GpuMatrixWeight, BufferId)> = group
@@ -4255,6 +4523,7 @@ impl VulkanBatchedGraphExecutor {
                 .copied()
                 .filter(|(w, _)| w.encoding == WeightEncoding::Ptq1Q8_0)
                 .collect();
+            let barrier = !sync.src_barrier_emitted || sync.used_q8_0;
             self.batch_recorder.push(
                 self.pipelines.fused_hadamard1024_q8_0_pinned,
                 &[
@@ -4264,8 +4533,10 @@ impl VulkanBatchedGraphExecutor {
                 ],
                 &push,
                 grid,
-                !q8k_emitted,
+                barrier,
             );
+            sync.src_barrier_emitted = true;
+            sync.used_q8_0 = true;
             self.dispatch_projection_weights(src_buf, cols, &q8_0_pq2, tokens)?;
             self.batch_recorder.push_barrier(
                 self.pipelines.fused_hadamard1024_q8_0_pinned_native,
@@ -4294,6 +4565,7 @@ impl VulkanBatchedGraphExecutor {
                 }
                 (true, _) => self.pipelines.fused_hadamard1024_q8_0_pinned,
             };
+            let barrier = !sync.src_barrier_emitted || sync.used_q8_0;
             self.batch_recorder.push(
                 pipe,
                 &[
@@ -4303,8 +4575,10 @@ impl VulkanBatchedGraphExecutor {
                 ],
                 &push,
                 grid,
-                !q8k_emitted,
+                barrier,
             );
+            sync.src_barrier_emitted = true;
+            sync.used_q8_0 = true;
         }
         self.dispatch_projection_weights(src_buf, cols, group, tokens)
     }
@@ -4315,6 +4589,7 @@ impl VulkanBatchedGraphExecutor {
         cols: usize,
         basis: (bool, bool),
         tokens: usize,
+        sync: &mut ProjectionGroupSync,
     ) -> Result<BufferId, Error> {
         let (rotated, grouped_ssm) = basis;
         if !rotated {
@@ -4333,8 +4608,9 @@ impl VulkanBatchedGraphExecutor {
                 .map_err(|_| Error::ResourceLimit("ssm_keys exceeds u32".to_owned()))?;
             let hd = u32::try_from(self.geometry.ssm_head)
                 .map_err(|_| Error::ResourceLimit("ssm_head exceeds u32".to_owned()))?;
+            let barrier = !sync.src_barrier_emitted || sync.used_perm_tmp;
             if tokens == 1 {
-                self.batch_recorder.push_barrier(
+                self.batch_recorder.push(
                     self.pipelines.permute_ssm_heads,
                     &[
                         BufferSpan::whole(cur),
@@ -4342,9 +4618,10 @@ impl VulkanBatchedGraphExecutor {
                     ],
                     &[kh, rep, hd],
                     checked_grid(&self.device, [cols_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                    barrier,
                 );
             } else {
-                self.batch_recorder.push_barrier(
+                self.batch_recorder.push(
                     self.pipelines.permute_ssm_heads_batched,
                     &[
                         BufferSpan::whole(cur),
@@ -4355,19 +4632,26 @@ impl VulkanBatchedGraphExecutor {
                         &self.device,
                         [cols_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
                     )?,
+                    barrier,
                 );
             }
+            sync.src_barrier_emitted = true;
+            sync.used_perm_tmp = true;
             cur = self.scratch.perm_tmp;
         }
 
         if let Some(&sign_buf) = self.transforms.sign_buffers.get(&cols) {
-            self.record_mul_sign_tokens(
+            let barrier = cur != src_buf || !sync.src_barrier_emitted || sync.used_sign_tmp;
+            self.record_mul_sign_tokens_with_barrier(
                 cur,
                 sign_buf,
                 self.scratch.sign_tmp,
                 cols_u32,
                 tokens_u32,
+                barrier,
             )?;
+            sync.src_barrier_emitted = true;
+            sync.used_sign_tmp = true;
             cur = self.scratch.sign_tmp;
         }
 
@@ -4376,8 +4660,9 @@ impl VulkanBatchedGraphExecutor {
                 .map_err(|_| Error::InvalidInput("Hadamard block exceeds u32".to_owned()))?;
             let blk_cnt = u32::try_from(cols / self.transforms.block)
                 .map_err(|_| Error::ResourceLimit("Hadamard grid exceeds u32".to_owned()))?;
+            let barrier = cur != src_buf || !sync.src_barrier_emitted || sync.used_transformed;
             if tokens == 1 {
-                self.batch_recorder.push_barrier(
+                self.batch_recorder.push(
                     self.pipelines.proj.hadamard,
                     &[
                         BufferSpan::whole(cur),
@@ -4385,9 +4670,10 @@ impl VulkanBatchedGraphExecutor {
                     ],
                     &[block_u32, hadamard_norm_bits(block_u32)],
                     checked_grid(&self.device, [blk_cnt, 1, 1])?,
+                    barrier,
                 );
             } else {
-                self.batch_recorder.push_barrier(
+                self.batch_recorder.push(
                     self.pipelines.hadamard_batched,
                     &[
                         BufferSpan::whole(cur),
@@ -4400,8 +4686,11 @@ impl VulkanBatchedGraphExecutor {
                         tokens_u32,
                     ],
                     checked_grid(&self.device, [blk_cnt, tokens_u32, 1])?,
+                    barrier,
                 );
             }
+            sync.src_barrier_emitted = true;
+            sync.used_transformed = true;
             cur = self.scratch.transformed;
         }
 
@@ -4410,10 +4699,12 @@ impl VulkanBatchedGraphExecutor {
 
     fn dispatch_prepared_projection_group_tokens(
         &mut self,
+        src_buf: BufferId,
         act_buf: BufferId,
         cols: usize,
         group: &[(GpuMatrixWeight, BufferId)],
         tokens: usize,
+        sync: &mut ProjectionGroupSync,
     ) -> Result<(), Error> {
         if group.is_empty() {
             return Ok(());
@@ -4440,7 +4731,8 @@ impl VulkanBatchedGraphExecutor {
             } else {
                 self.pipelines.proj.quant_q8k_unpinned
             };
-            self.batch_recorder.push_barrier(
+            let barrier = act_buf != src_buf || !sync.src_barrier_emitted || sync.used_q8k;
+            self.batch_recorder.push(
                 q8k_pipe,
                 &[
                     BufferSpan::whole(act_buf),
@@ -4448,7 +4740,10 @@ impl VulkanBatchedGraphExecutor {
                 ],
                 &[cols_u32, tokens_u32],
                 checked_grid(&self.device, [cols_u32 / 256, tokens_u32, 1])?,
+                barrier,
             );
+            sync.src_barrier_emitted = true;
+            sync.used_q8k = true;
             true
         } else {
             false
@@ -4460,6 +4755,11 @@ impl VulkanBatchedGraphExecutor {
                 BufferSpan::whole(act_buf),
                 BufferSpan::whole(self.scratch.act_q8_0),
             ];
+            let barrier = if act_buf == src_buf {
+                !sync.src_barrier_emitted || sync.used_q8_0
+            } else {
+                !quant_emitted
+            };
             if multi_token {
                 let q8_pipe = match (self.resolved_pinned_arithmetic, q8_kind) {
                     (false, _) => self.pipelines.quant_q8_0_source_batched,
@@ -4476,7 +4776,7 @@ impl VulkanBatchedGraphExecutor {
                         &self.device,
                         [q8_blocks.div_ceil(WORKGROUP_X), tokens_u32, 1],
                     )?,
-                    !quant_emitted,
+                    barrier,
                 );
             } else {
                 let q8_pipe = match (self.resolved_pinned_arithmetic, q8_kind) {
@@ -4489,24 +4789,47 @@ impl VulkanBatchedGraphExecutor {
                     &q8_bufs,
                     &[q8_blocks],
                     checked_grid(&self.device, [q8_blocks.div_ceil(WORKGROUP_X), 1, 1])?,
-                    !quant_emitted,
+                    barrier,
                 );
             }
+            sync.src_barrier_emitted = true;
+            sync.used_q8_0 = true;
+        } else if !quant_emitted && act_buf == src_buf {
+            let first_barrier = !sync.src_barrier_emitted;
+            sync.src_barrier_emitted = true;
+            return self.dispatch_projection_weights_with_first_barrier(
+                act_buf,
+                cols,
+                group,
+                tokens,
+                first_barrier,
+            );
         }
 
         self.dispatch_projection_weights(act_buf, cols, group, tokens)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Dispatches all weight-encoded matrix projections (`Pq2Q8k`, `Pq2Q8_0`, `Ptq1Q8_0`, `Q8_0`, `F32`) from already-quantized or float activation scratch."
-    )]
     fn dispatch_projection_weights(
         &mut self,
         f32_act_buf: BufferId,
         cols: usize,
         group: &[(GpuMatrixWeight, BufferId)],
         tokens: usize,
+    ) -> Result<(), Error> {
+        self.dispatch_projection_weights_with_first_barrier(f32_act_buf, cols, group, tokens, true)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Dispatches all weight-encoded matrix projections (`Pq2Q8k`, `Pq2Q8_0`, `Ptq1Q8_0`, `Q8_0`, `F32`) from already-quantized or float activation scratch."
+    )]
+    fn dispatch_projection_weights_with_first_barrier(
+        &mut self,
+        f32_act_buf: BufferId,
+        cols: usize,
+        group: &[(GpuMatrixWeight, BufferId)],
+        tokens: usize,
+        first_barrier: bool,
     ) -> Result<(), Error> {
         if group.is_empty() {
             return Ok(());
@@ -4523,7 +4846,7 @@ impl VulkanBatchedGraphExecutor {
         for (idx, (weight, out_buf)) in group.iter().enumerate() {
             let rows_u32 = u32::try_from(weight.rows)
                 .map_err(|_| Error::ResourceLimit("projection rows exceed u32".to_owned()))?;
-            let barrier_before = idx == 0;
+            let barrier_before = idx == 0 && first_barrier;
             match weight.encoding {
                 WeightEncoding::Pq2Q8k => {
                     let blocks_per_row = cols / 128;
@@ -5739,7 +6062,7 @@ fn upload_recurrent_attention(
     let conv_state_elems = (geometry.convolution - 1) * channels;
     let conv_state = if conv_state_elems > 0 {
         let conv_bytes = f32_slice_bytes(conv_state_elems)?;
-        let id = guard.alloc_storage(conv_bytes)?;
+        let id = guard.alloc_readback_storage(conv_bytes)?;
         guard.device.fill_buffer_zero(id, 0, conv_bytes)?;
         id
     } else {
@@ -5748,7 +6071,7 @@ fn upload_recurrent_attention(
 
     let matrix_state_elems = geometry.ssm_head * geometry.ssm_head * geometry.ssm_values;
     let matrix_bytes = f32_slice_bytes(matrix_state_elems)?;
-    let matrix_state = guard.alloc_storage(matrix_bytes)?;
+    let matrix_state = guard.alloc_readback_storage(matrix_bytes)?;
     guard
         .device
         .fill_buffer_zero(matrix_state, 0, matrix_bytes)?;
@@ -6938,5 +7261,28 @@ mod tests {
                 grid: [1, 24, 32],
             }
         );
+    }
+
+    #[test]
+    fn tdr_policy_raises_default_decode_layers_per_submit_to_64() -> Result<(), Error> {
+        let default_policy = TdrChunkPolicy::default();
+        assert_eq!(default_policy.effective_layers_per_submit(1), 64);
+        assert_eq!(default_policy.effective_layers_per_submit(32), 8);
+        assert_eq!(
+            default_policy.layer_chunk_ranges_for_tokens(36, 1)?,
+            vec![0..36]
+        );
+        assert_eq!(
+            default_policy.layer_chunk_ranges_for_tokens(36, 32)?,
+            vec![0..8, 8..16, 16..24, 24..32, 32..36]
+        );
+
+        let explicit_one = TdrChunkPolicy::new(1, 1024)?;
+        assert_eq!(explicit_one.effective_layers_per_submit(1), 1);
+        assert_eq!(
+            explicit_one.layer_chunk_ranges_for_tokens(3, 1)?,
+            vec![0..1, 1..2, 2..3]
+        );
+        Ok(())
     }
 }

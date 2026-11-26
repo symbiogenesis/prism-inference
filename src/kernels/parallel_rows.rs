@@ -687,6 +687,25 @@ impl RowParallelism {
 }
 
 #[cfg(feature = "parallel-rows")]
+const CHUNK_WORK_FACTOR: usize = 4;
+
+#[cfg(feature = "parallel-rows")]
+const DECODE_ROW_ALIGN: usize = 16;
+
+#[cfg(feature = "parallel-rows")]
+pub(super) const fn aligned_chunk_rows(rows: usize, workers: usize, align: usize) -> usize {
+    if workers <= 1 || rows <= 1 {
+        return if rows == 0 { 1 } else { rows };
+    }
+    if align > 1 && rows >= workers * align {
+        let target_chunks = workers * CHUNK_WORK_FACTOR;
+        rows.div_ceil(target_chunks).div_ceil(align) * align
+    } else {
+        rows.div_ceil(workers)
+    }
+}
+
+#[cfg(feature = "parallel-rows")]
 fn dispatch_output_chunks(
     pool: &NativeRowPool,
     workers: usize,
@@ -696,8 +715,8 @@ fn dispatch_output_chunks(
     run_chunk: impl Fn(&[u8], &mut [f32]) -> Result<()> + Sync,
 ) -> Result<()> {
     let rows = output.len();
-    let task_rows = rows.div_ceil(workers);
-    let mut slots: [(&mut [f32], Option<crate::Error>); MAX_ROW_WORKERS] =
+    let task_rows = aligned_chunk_rows(rows, workers, DECODE_ROW_ALIGN);
+    let mut slots: [(&mut [f32], Option<crate::Error>); CHUNK_WORK_FACTOR * MAX_ROW_WORKERS] =
         std::array::from_fn(|_| (&mut [][..], None));
     let mut count = 0;
     for (slot, chunk) in slots.iter_mut().zip(output.chunks_mut(task_rows)) {

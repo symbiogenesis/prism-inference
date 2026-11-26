@@ -4,13 +4,87 @@ use super::RowParallelism;
 use crate::{Result, invalid};
 
 #[cfg(feature = "parallel-rows")]
-use super::MAX_ROW_WORKERS;
+use super::{CHUNK_WORK_FACTOR, MAX_ROW_WORKERS, aligned_chunk_rows};
+
+#[cfg(feature = "parallel-rows")]
+const PREFILL_ROW_ALIGN: usize = 8;
 
 #[cfg(feature = "parallel-rows")]
 struct Task<'a, const TOKENS: usize> {
     outputs: [&'a mut [f32]; TOKENS],
     error: Option<crate::Error>,
     decoded_blocks: u64,
+}
+
+#[cfg(feature = "parallel-rows")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared bounded stack tile-chunk dispatcher for single-row and 8/4/1-row tile kernels."
+)]
+fn dispatch_tile_chunks<const TOKENS: usize>(
+    pool: &bonsai_native_hash::row_pool::NativeRowPool,
+    workers: usize,
+    rows: usize,
+    row_bytes: usize,
+    outputs: &mut [Vec<f32>],
+    decoded_blocks: &mut u64,
+    check: &dyn Fn() -> Result<()>,
+    run_task: impl Fn(usize, &mut Task<'_, TOKENS>, &std::sync::atomic::AtomicBool) + Sync,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let task_rows = aligned_chunk_rows(rows, workers, PREFILL_ROW_ALIGN);
+    let task_count = rows.div_ceil(task_rows);
+    // At most 72 * 64 mutable slice descriptors and one error/count per chunk,
+    // all stack-scoped for dynamic work-stealing across Prime/Performance cores.
+    // Existing output capacities were reserved fallibly by the caller; no second
+    // matrix or result transpose exists.
+    let mut tasks: [Task<'_, TOKENS>; CHUNK_WORK_FACTOR * MAX_ROW_WORKERS] =
+        std::array::from_fn(|_| Task {
+            outputs: std::array::from_fn(|_| -> &mut [f32] { &mut [] }),
+            error: None,
+            decoded_blocks: 0,
+        });
+    for (token, output) in outputs.iter_mut().enumerate() {
+        output.resize(rows, 0.0);
+        for (task, chunk) in tasks[..task_count]
+            .iter_mut()
+            .zip(output.chunks_mut(task_rows))
+        {
+            task.outputs[token] = chunk;
+        }
+    }
+    let cancelled = AtomicBool::new(false);
+    let mut cancellation = None;
+    pool.dispatch_mut_with_wait(
+        &mut tasks[..task_count],
+        |index, task| {
+            run_task(index * task_rows * row_bytes, task, &cancelled);
+        },
+        || {
+            if cancellation.is_none()
+                && let Err(error) = check()
+            {
+                cancellation = Some(error);
+                cancelled.store(true, Ordering::Release);
+            }
+        },
+    );
+    for task in &tasks[..task_count] {
+        *decoded_blocks = decoded_blocks.saturating_add(task.decoded_blocks);
+    }
+    // Every row task has joined. Ordered task slots retain the earliest
+    // failing row chunk independently of completion order.
+    if let Some(error) = cancellation {
+        return Err(error);
+    }
+    if let Some(error) = tasks[..task_count]
+        .iter_mut()
+        .find_map(|task| task.error.take())
+    {
+        return Err(error);
+    }
+    check()
 }
 
 #[cfg(feature = "parallel-rows")]
@@ -175,30 +249,17 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && self.uses_pool(rows)
         {
-            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::atomic::Ordering;
 
-            let task_rows = rows.div_ceil(self.workers());
-            let task_count = rows.div_ceil(task_rows);
-            // At most 16 * 64 mutable slice descriptors and one error/count per
-            // worker, all stack-scoped. Existing output capacities were reserved
-            // fallibly by the caller; no second matrix or result transpose exists.
-            let mut tasks: [Task<'_, TOKENS>; MAX_ROW_WORKERS] = std::array::from_fn(|_| Task {
-                outputs: std::array::from_fn(|_| -> &mut [f32] { &mut [] }),
-                error: None,
-                decoded_blocks: 0,
-            });
-            for (token, output) in outputs.iter_mut().enumerate() {
-                output.resize(rows, 0.0);
-                for (task, chunk) in tasks.iter_mut().zip(output.chunks_mut(task_rows)) {
-                    task.outputs[token] = chunk;
-                }
-            }
-            let cancelled = AtomicBool::new(false);
-            let mut cancellation = None;
-            pool.dispatch_mut_with_wait(
-                &mut tasks[..task_count],
-                |index, task| {
-                    let start = index * task_rows * row_bytes;
+            return dispatch_tile_chunks::<TOKENS>(
+                pool,
+                self.workers(),
+                rows,
+                row_bytes,
+                outputs,
+                decoded_blocks,
+                check,
+                |start, task, cancelled| {
                     let bytes = &data[start..start + task.outputs[0].len() * row_bytes];
                     for (row, bytes) in bytes.chunks_exact(row_bytes).enumerate() {
                         if cancelled.load(Ordering::Acquire) {
@@ -219,27 +280,7 @@ impl RowParallelism {
                         }
                     }
                 },
-                || {
-                    if cancellation.is_none()
-                        && let Err(error) = check()
-                    {
-                        cancellation = Some(error);
-                        cancelled.store(true, Ordering::Release);
-                    }
-                },
             );
-            for task in &tasks[..task_count] {
-                *decoded_blocks = decoded_blocks.saturating_add(task.decoded_blocks);
-            }
-            // Every row task has joined. Ordered task slots retain the earliest
-            // failing row chunk independently of completion order.
-            if let Some(error) = cancellation {
-                return Err(error);
-            }
-            if let Some(error) = tasks.iter_mut().find_map(|task| task.error.take()) {
-                return Err(error);
-            }
-            return check();
         }
         for row in data.chunks_exact(row_bytes) {
             check()?;
@@ -283,51 +324,21 @@ impl RowParallelism {
         if let Some(pool) = &self.pool
             && self.uses_pool(rows)
         {
-            use std::sync::atomic::{AtomicBool, Ordering};
-
-            let task_rows = rows.div_ceil(self.workers());
-            let task_count = rows.div_ceil(task_rows);
-            let mut tasks: [Task<'_, TOKENS>; MAX_ROW_WORKERS] = std::array::from_fn(|_| Task {
-                outputs: std::array::from_fn(|_| -> &mut [f32] { &mut [] }),
-                error: None,
-                decoded_blocks: 0,
-            });
-            for (token, output) in outputs.iter_mut().enumerate() {
-                output.resize(rows, 0.0);
-                for (task, chunk) in tasks.iter_mut().zip(output.chunks_mut(task_rows)) {
-                    task.outputs[token] = chunk;
-                }
-            }
-            let cancelled = AtomicBool::new(false);
-            let mut cancellation = None;
-            pool.dispatch_mut_with_wait(
-                &mut tasks[..task_count],
-                |index, task| {
-                    let start = index * task_rows * row_bytes;
+            return dispatch_tile_chunks::<TOKENS>(
+                pool,
+                self.workers(),
+                rows,
+                row_bytes,
+                outputs,
+                decoded_blocks,
+                check,
+                |start, task, cancelled| {
                     let bytes = &data[start..start + task.outputs[0].len() * row_bytes];
                     fill_tile_task(
-                        task, bytes, row_bytes, &cancelled, &dot_eight, &dot_four, &dot,
+                        task, bytes, row_bytes, cancelled, &dot_eight, &dot_four, &dot,
                     );
                 },
-                || {
-                    if cancellation.is_none()
-                        && let Err(error) = check()
-                    {
-                        cancellation = Some(error);
-                        cancelled.store(true, Ordering::Release);
-                    }
-                },
             );
-            for task in &tasks[..task_count] {
-                *decoded_blocks = decoded_blocks.saturating_add(task.decoded_blocks);
-            }
-            if let Some(error) = cancellation {
-                return Err(error);
-            }
-            if let Some(error) = tasks.iter_mut().find_map(|task| task.error.take()) {
-                return Err(error);
-            }
-            return check();
         }
         let mut chunks8 = data.chunks_exact(row_bytes * 8);
         for chunk in chunks8.by_ref() {

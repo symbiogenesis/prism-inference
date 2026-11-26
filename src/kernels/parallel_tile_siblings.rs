@@ -4,7 +4,9 @@ use super::RowParallelism;
 use crate::{Result, invalid};
 
 #[cfg(feature = "parallel-rows")]
-use super::{MAX_ROW_WORKERS, Task, fill_tile_task};
+use super::{
+    CHUNK_WORK_FACTOR, MAX_ROW_WORKERS, PREFILL_ROW_ALIGN, Task, aligned_chunk_rows, fill_tile_task,
+};
 
 #[cfg(feature = "parallel-rows")]
 struct SiblingTask<'a, const TOKENS: usize> {
@@ -48,11 +50,11 @@ impl RowParallelism {
                 sum.checked_add(bytes.len() / row_bytes)
                     .ok_or_else(|| invalid("sibling tile row count overflow"))
             })?;
-            let task_rows = total_rows.div_ceil(self.workers());
-            // ceil(a/t) + ceil(b/t) + ceil(c/t) <= workers + 2.
-            // Token-slice task owners remain within the bounded 32 KiB
-            // caller/task reserve; there is no heap task vector or weight copy.
-            let mut tasks: [SiblingTask<'_, TOKENS>; MAX_ROW_WORKERS + 2] =
+            let task_rows = aligned_chunk_rows(total_rows, self.workers(), PREFILL_ROW_ALIGN);
+            // ceil(a/t) + ceil(b/t) + ceil(c/t) <= CHUNK_WORK_FACTOR * workers + 2.
+            // Token-slice task owners remain stack-scoped for work-stealing across
+            // Prime/Performance cores; there is no heap task vector or weight copy.
+            let mut tasks: [SiblingTask<'_, TOKENS>; CHUNK_WORK_FACTOR * MAX_ROW_WORKERS + 2] =
                 std::array::from_fn(|_| SiblingTask {
                     bytes: &[],
                     rows: Task {
@@ -111,7 +113,10 @@ impl RowParallelism {
             }
             // All tasks joined. Sibling-major slots retain the first failing
             // sibling and then its earliest row chunk, regardless of completion.
-            if let Some(error) = tasks.iter_mut().find_map(|task| task.rows.error.take()) {
+            if let Some(error) = tasks[..task_count]
+                .iter_mut()
+                .find_map(|task| task.rows.error.take())
+            {
                 return Err(error);
             }
             return check();

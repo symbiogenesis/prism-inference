@@ -1047,6 +1047,78 @@ pub(crate) fn dot(mut values: impl Iterator<Item = f32>, weights: &[f32]) -> Res
 /// their totals and reciprocal are evaluated in binary64 before final scaling.
 /// Masked padding contributes exact zeros without allocating padded storage.
 ///
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+fn softmax_max_finite_neon(neon: fearless_simd::Neon, scores: &[f32]) -> Result<f32> {
+    use fearless_simd::{f32x4, prelude::*};
+
+    let mut max_vec = f32x4::splat(neon, f32::NEG_INFINITY);
+    let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
+    let (chunks, tail) = scores.as_chunks::<4>();
+    for chunk in chunks {
+        let v = f32x4::from_slice(neon, chunk);
+        finite_mask &= v.is_finite();
+        max_vec = max_vec.max(v);
+    }
+    if !finite_mask.all_true() || tail.iter().any(|score| !score.is_finite()) {
+        return Err(invalid("invalid pinned attention softmax row"));
+    }
+    let max_lanes = max_vec.to_array();
+    let mut maximum = max_lanes[0]
+        .max(max_lanes[1])
+        .max(max_lanes[2])
+        .max(max_lanes[3]);
+    for &score in tail {
+        maximum = maximum.max(score);
+    }
+    Ok(maximum)
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "Match the native binary64 reciprocal rounded once to binary32."
+)]
+fn softmax_exp_inverse_neon(neon: fearless_simd::Neon, scores: &mut [f32], maximum: f32) -> f32 {
+    use fearless_simd::{f32x4, prelude::*};
+
+    let max_vec = f32x4::splat(neon, maximum);
+    let mut total = 0.0_f64;
+    let (chunks, tail) = scores.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let exp = super::pinned_activations::vector_exp_x4(
+            neon,
+            f32x4::from_slice(neon, chunk) - max_vec,
+        );
+        let arr = exp.to_array();
+        exp.store_slice(chunk);
+        total += f64::from((arr[0] + arr[1]) + (arr[2] + arr[3]));
+    }
+    if !tail.is_empty() {
+        let mut group = [0.0; 4];
+        for (score, output) in tail.iter_mut().zip(&mut group) {
+            *score = super::pinned_activations::vector_exp(*score - maximum);
+            *output = *score;
+        }
+        total += f64::from((group[0] + group[1]) + (group[2] + group[3]));
+    }
+    (1.0_f64 / total) as f32
+}
+
 /// # Errors
 /// Rejects empty, oversized or nonfinite input before mutation.
 #[expect(
@@ -1070,45 +1142,9 @@ fn softmax_with_rounding<const ROUND_F16: bool>(
     ))]
     if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
         use fearless_simd::{f32x4, prelude::*};
-        let mut max_vec = f32x4::splat(neon, f32::NEG_INFINITY);
-        let mut finite_mask = f32x4::splat(neon, 0.0).is_finite();
-        let (chunks, tail) = scores.as_chunks::<4>();
-        for chunk in chunks {
-            let v = f32x4::from_slice(neon, chunk);
-            finite_mask &= v.is_finite();
-            max_vec = max_vec.max(v);
-        }
-        if !finite_mask.all_true() || tail.iter().any(|score| !score.is_finite()) {
-            return Err(invalid("invalid pinned attention softmax row"));
-        }
-        let max_lanes = max_vec.to_array();
-        let mut maximum = max_lanes[0]
-            .max(max_lanes[1])
-            .max(max_lanes[2])
-            .max(max_lanes[3]);
-        for &score in tail {
-            maximum = maximum.max(score);
-        }
-        let max_vec = f32x4::splat(neon, maximum);
-        let mut total = 0.0_f64;
-        let (chunks, tail) = scores.as_chunks_mut::<4>();
-        for chunk in chunks {
-            let exp = super::pinned_activations::vector_exp_x4(
-                neon,
-                f32x4::from_slice(neon, chunk) - max_vec,
-            );
-            exp.store_slice(chunk);
-            total += f64::from((chunk[0] + chunk[1]) + (chunk[2] + chunk[3]));
-        }
-        if !tail.is_empty() {
-            let mut group = [0.0; 4];
-            for (score, output) in tail.iter_mut().zip(&mut group) {
-                *score = super::pinned_activations::vector_exp(*score - maximum);
-                *output = *score;
-            }
-            total += f64::from((group[0] + group[1]) + (group[2] + group[3]));
-        }
-        let inverse = (1.0_f64 / total) as f32;
+
+        let maximum = softmax_max_finite_neon(neon, scores)?;
+        let inverse = softmax_exp_inverse_neon(neon, scores, maximum);
         let inv_vec = f32x4::splat(neon, inverse);
         let (chunks, tail) = scores.as_chunks_mut::<4>();
         for chunk in chunks {
@@ -1235,6 +1271,11 @@ pub(crate) fn pack_f16_rows<const HEADS: usize>(
 ///
 /// # Errors
 /// Rejects empty, mismatched or oversized rows and nonfinite inputs before mutating.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "Match the native binary64 reciprocal rounded once to binary32."
+)]
 pub(crate) fn softmax_pack_f16<const HEADS: usize>(
     mut scores: [&mut [f32]; HEADS],
     packed: &mut [[u16; HEADS]],
@@ -1242,18 +1283,86 @@ pub(crate) fn softmax_pack_f16<const HEADS: usize>(
     if HEADS == 0
         || packed.is_empty()
         || packed.len() > crate::model::swift::CONTEXT_TOKENS
-        || scores
-            .iter()
-            .any(|row| row.len() != packed.len() || row.iter().any(|value| !value.is_finite()))
+        || scores.iter().any(|row| row.len() != packed.len())
     {
         return Err(invalid(
             "invalid pinned softmax packed geometry or nonfinite scores",
         ));
     }
-    for row in &mut scores {
-        softmax(row)?;
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        use fearless_simd::{f32x4, prelude::*};
+
+        // Pass 1 across all heads first so any nonfinite element rejects before mutating any row.
+        let mut maxima = [0.0_f32; HEADS];
+        for (head, row) in scores.iter().enumerate() {
+            maxima[head] = softmax_max_finite_neon(neon, row).map_err(|_| {
+                invalid("invalid pinned softmax packed geometry or nonfinite scores")
+            })?;
+        }
+        // Pass 2: exp(x - max) in-place and sum in registers.
+        let mut inverses = [0.0_f32; HEADS];
+        for (head, row) in scores.iter_mut().enumerate() {
+            inverses[head] = softmax_exp_inverse_neon(neon, row, maxima[head]);
+        }
+        // Fused Pass 3 + Pass 4: scale exp by 1/sum, round to F16, and pack into `[token][head]`.
+        let inv_vecs: [f32x4<fearless_simd::Neon>; HEADS] =
+            std::array::from_fn(|head| f32x4::splat(neon, inverses[head]));
+        let (chunks_packed, tail_packed) = packed.as_chunks_mut::<4>();
+        for (chunk_idx, packed_chunk) in chunks_packed.iter_mut().enumerate() {
+            let base = chunk_idx * 4;
+            for (head, row) in scores.iter().enumerate() {
+                let exp = f32x4::from_slice(neon, &row[base..base + 4]);
+                let bits = super::neon::half_bits_x4(neon, exp * inv_vecs[head]);
+                for (lane, slot) in packed_chunk.iter_mut().enumerate() {
+                    slot[head] = bits[lane];
+                }
+            }
+        }
+        let rem_base = chunks_packed.len() * 4;
+        for (offset, slot) in tail_packed.iter_mut().enumerate() {
+            let idx = rem_base + offset;
+            for (head, dst) in slot.iter_mut().enumerate() {
+                *dst = super::half_bits(scores[head][idx] * inverses[head]);
+            }
+        }
+        return Ok(());
     }
-    pack_f16_rows_unchecked(scores.each_ref().map(|row| &**row), packed);
+    if scores
+        .iter()
+        .any(|row| row.iter().any(|value| !value.is_finite()))
+    {
+        return Err(invalid(
+            "invalid pinned softmax packed geometry or nonfinite scores",
+        ));
+    }
+    let mut inverses = [0.0_f32; HEADS];
+    for (head, row) in scores.iter_mut().enumerate() {
+        let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut total = 0.0_f64;
+        for offset in (0..row.len()).step_by(4) {
+            let mut group = [0.0; 4];
+            for (lane, output) in group.iter_mut().enumerate() {
+                if let Some(score) = row.get_mut(offset + lane) {
+                    *score = super::pinned_activations::vector_exp(*score - maximum);
+                    *output = *score;
+                }
+            }
+            total += f64::from((group[0] + group[1]) + (group[2] + group[3]));
+        }
+        inverses[head] = (1.0_f64 / total) as f32;
+    }
+    for (token, slot) in packed.iter_mut().enumerate() {
+        for (head, dst) in slot.iter_mut().enumerate() {
+            *dst = super::half_bits(scores[head][token] * inverses[head]);
+        }
+    }
     Ok(())
 }
 

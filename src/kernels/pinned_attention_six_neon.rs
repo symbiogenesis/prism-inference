@@ -213,13 +213,137 @@ fn finish_dot_registers<const HEADS: usize>(
     Ok(output)
 }
 
-#[expect(
-    clippy::large_stack_arrays,
-    reason = "Validated six-head inputs share one bounded 24 KiB temporal accumulator."
-)]
+const STACK_PAST_ROWS: usize = 256;
+
+fn collect_past_rows<'a, 'b>(
+    mut past: impl Iterator<Item = &'a [u16]>,
+    past_len: usize,
+    range: &std::ops::Range<usize>,
+    stack: &'b mut [&'a [u16]; STACK_PAST_ROWS],
+    heap: &'b mut Vec<&'a [u16]>,
+) -> Result<&'b [&'a [u16]]> {
+    let rows: &'b [&'a [u16]] = if past_len <= STACK_PAST_ROWS {
+        for slot in &mut stack[..past_len] {
+            *slot = past
+                .next()
+                .and_then(|row| row.get(range.start..range.end))
+                .ok_or_else(|| invalid("pinned attention value row is short"))?;
+        }
+        &stack[..past_len]
+    } else {
+        heap.try_reserve_exact(past_len)?;
+        for _ in 0..past_len {
+            let row = past
+                .next()
+                .and_then(|row| row.get(range.start..range.end))
+                .ok_or_else(|| invalid("pinned attention value row is short"))?;
+            heap.push(row);
+        }
+        heap.as_slice()
+    };
+    if past.next().is_some() {
+        return Err(invalid("pinned attention value row is long"));
+    }
+    Ok(rows)
+}
+
+#[inline]
+fn pad_pair_sums<const HEADS: usize>(
+    neon: Neon,
+    sums: &mut [[[f32x4<Neon>; HEADS]; 2]; 16],
+    valid_tokens: usize,
+    padded_end: usize,
+) {
+    let zero = f32x4::splat(neon, 0.0);
+    for token in valid_tokens..padded_end {
+        for slot in &mut sums[token % 16] {
+            for sum in slot {
+                *sum = zero.mul_add_precise(zero, *sum);
+            }
+        }
+    }
+}
+
+#[inline]
+fn pad_tail_sums<const HEADS: usize>(
+    neon: Neon,
+    sums: &mut [[f32x4<Neon>; HEADS]; 16],
+    valid_tokens: usize,
+    padded_end: usize,
+) {
+    let zero = f32x4::splat(neon, 0.0);
+    for token in valid_tokens..padded_end {
+        for sum in &mut sums[token % 16] {
+            *sum = zero.mul_add_precise(zero, *sum);
+        }
+    }
+}
+
+#[inline]
+fn reduce_pair_sums<const HEADS: usize>(
+    sums: &[[[f32x4<Neon>; HEADS]; 2]; 16],
+    pair_idx: usize,
+    staged: &mut [[f32x4<Neon>; super::VALUE_TILE / 4]; HEADS],
+    finite: &mut fearless_simd::mask32x4<Neon>,
+) {
+    for slot in 0..2 {
+        let group = pair_idx * 2 + slot;
+        for head in 0..HEADS {
+            let lanes: [f32x4<Neon>; 4] = std::array::from_fn(|lane| {
+                (sums[lane][slot][head] + sums[8 + lane][slot][head])
+                    + (sums[4 + lane][slot][head] + sums[12 + lane][slot][head])
+            });
+            let result = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            *finite &= result.is_finite();
+            staged[head][group] = result;
+        }
+    }
+}
+
+#[inline]
+fn reduce_tail_sums<const HEADS: usize>(
+    sums: &[[f32x4<Neon>; HEADS]; 16],
+    group: usize,
+    staged: &mut [[f32x4<Neon>; super::VALUE_TILE / 4]; HEADS],
+    finite: &mut fearless_simd::mask32x4<Neon>,
+) {
+    for head in 0..HEADS {
+        let lanes: [f32x4<Neon>; 4] = std::array::from_fn(|lane| {
+            (sums[lane][head] + sums[8 + lane][head])
+                + (sums[4 + lane][head] + sums[12 + lane][head])
+        });
+        let result = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        *finite &= result.is_finite();
+        staged[head][group] = result;
+    }
+}
+
+fn gate_and_store<const HEADS: usize>(
+    neon: Neon,
+    staged: &[[f32x4<Neon>; super::VALUE_TILE / 4]; HEADS],
+    finite: fearless_simd::mask32x4<Neon>,
+    outputs: [&mut [f32]; HEADS],
+    gates: [&[f32]; HEADS],
+) -> Result<()> {
+    if !finite.all_true() {
+        return Err(invalid("nonfinite pinned attention value reduction"));
+    }
+    let one = f32x4::splat(neon, 1.0);
+    for (head, output) in outputs.into_iter().enumerate() {
+        for (group, output) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let exponentials = f32x4::load_array(
+                neon,
+                std::array::from_fn(|lane| (-gates[head][group * 4 + lane]).exp()),
+            );
+            (staged[head][group] * (one / (one + exponentials))).store_slice(output);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn value_tile_neon<'a>(
     neon: Neon,
-    mut past: impl Iterator<Item = &'a [u16]>,
+    past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
     weights: [&[f32]; 6],
     range: &std::ops::Range<usize>,
@@ -227,59 +351,71 @@ pub(super) fn value_tile_neon<'a>(
     gates: [&[f32]; 6],
 ) -> Result<()> {
     let zero = f32x4::splat(neon, 0.0);
-    let mut sums = [[[zero; super::VALUE_TILE / 4]; 16]; 6];
     let groups = current.len() / 4;
+    let num_pairs = groups / 2;
     let last = weights[0].len() - 1;
-    for token in 0..last {
-        let values = past
-            .next()
-            .and_then(|row| row.get(range.clone()))
-            .ok_or_else(|| invalid("pinned attention value row is short"))?;
-        let weights: [f32x4<Neon>; 6] =
-            std::array::from_fn(|head| f32x4::splat(neon, weights[head][token]));
-        let (pairs, remainder) = values.as_chunks::<8>();
-        for (pair, values) in pairs.iter().enumerate() {
-            let (first, second) = crate::kernels::neon::f16_bits_to_f32_x8(neon, values);
-            for (head, sums) in sums.iter_mut().enumerate() {
-                let sums = &mut sums[token % 16];
-                sums[pair * 2] = first.mul_add_precise(weights[head], sums[pair * 2]);
-                sums[pair * 2 + 1] = second.mul_add_precise(weights[head], sums[pair * 2 + 1]);
-            }
-        }
-        if let Some(values) = remainder.as_chunks::<4>().0.first() {
-            let value = crate::kernels::neon::f16_bits_to_f32_x4(neon, *values);
-            for (head, sums) in sums.iter_mut().enumerate() {
-                let sum = &mut sums[token % 16][pairs.len() * 2];
-                *sum = value.mul_add_precise(weights[head], *sum);
-            }
-        }
-    }
-    if past.next().is_some() {
-        return Err(invalid("pinned attention value row is long"));
-    }
-    for (head, sums) in sums.iter_mut().enumerate() {
-        let weight = f32x4::splat(neon, weights[head][last]);
-        for (group, value) in current.as_chunks::<4>().0.iter().enumerate() {
-            let sum = &mut sums[last % 16][group];
-            *sum = f32x4::load_array(neon, *value).mul_add_precise(weight, *sum);
-        }
-        for token in last + 1..padded_dot_steps(last + 1) {
-            for sum in &mut sums[token % 16][..groups] {
-                *sum = zero.mul_add_precise(zero, *sum);
-            }
-        }
-    }
-    publish(neon, &mut sums, outputs, gates, groups)
-}
+    let mut stack_rows = [&[][..]; STACK_PAST_ROWS];
+    let mut heap_rows = Vec::new();
+    let past_rows = collect_past_rows(past, last, range, &mut stack_rows, &mut heap_rows)?;
+    let padded_end = padded_dot_steps(last + 1);
+    let mut staged = [[zero; super::VALUE_TILE / 4]; 6];
+    let mut finite = zero.is_finite();
+    let last_lane = last % 16;
+    let w_last: [f32x4<Neon>; 6] =
+        std::array::from_fn(|head| f32x4::splat(neon, weights[head][last]));
 
-fn publish(
-    neon: Neon,
-    sums: &mut [[[f32x4<Neon>; super::VALUE_TILE / 4]; 16]; 6],
-    outputs: [&mut [f32]; 6],
-    gates: [&[f32]; 6],
-    groups: usize,
-) -> Result<()> {
-    publish_group(neon, sums, outputs, gates, groups)
+    for pair_idx in 0..num_pairs {
+        let mut sums = [[[zero; 6]; 2]; 16];
+        let ch_base = pair_idx * 8;
+        for (token, &row) in past_rows.iter().enumerate() {
+            let lane = token % 16;
+            let (first, second) =
+                crate::kernels::neon::f16_bits_to_f32_x8(neon, &row.as_chunks::<8>().0[pair_idx]);
+            for head in 0..6 {
+                let w = f32x4::splat(neon, weights[head][token]);
+                sums[lane][0][head] = first.mul_add_precise(w, sums[lane][0][head]);
+                sums[lane][1][head] = second.mul_add_precise(w, sums[lane][1][head]);
+            }
+        }
+        let c0 = f32x4::from_slice(neon, &current[ch_base..ch_base + 4]);
+        let c1 = f32x4::from_slice(neon, &current[ch_base + 4..ch_base + 8]);
+        for head in 0..6 {
+            sums[last_lane][0][head] = c0.mul_add_precise(w_last[head], sums[last_lane][0][head]);
+            sums[last_lane][1][head] = c1.mul_add_precise(w_last[head], sums[last_lane][1][head]);
+        }
+        pad_pair_sums(neon, &mut sums, last + 1, padded_end);
+        reduce_pair_sums(&sums, pair_idx, &mut staged, &mut finite);
+    }
+
+    if !groups.is_multiple_of(2) {
+        let g = groups - 1;
+        let ch_base = g * 4;
+        let mut sums = [[zero; 6]; 16];
+        for (token, &row) in past_rows.iter().enumerate() {
+            let lane = token % 16;
+            let value = crate::kernels::neon::f16_bits_to_f32_x4(
+                neon,
+                [
+                    row[ch_base],
+                    row[ch_base + 1],
+                    row[ch_base + 2],
+                    row[ch_base + 3],
+                ],
+            );
+            for head in 0..6 {
+                let w = f32x4::splat(neon, weights[head][token]);
+                sums[lane][head] = value.mul_add_precise(w, sums[lane][head]);
+            }
+        }
+        let c = f32x4::from_slice(neon, &current[ch_base..ch_base + 4]);
+        for head in 0..6 {
+            sums[last_lane][head] = c.mul_add_precise(w_last[head], sums[last_lane][head]);
+        }
+        pad_tail_sums(neon, &mut sums, last + 1, padded_end);
+        reduce_tail_sums(&sums, g, &mut staged, &mut finite);
+    }
+
+    gate_and_store(neon, &staged, finite, outputs, gates)
 }
 
 #[inline]
@@ -328,139 +464,174 @@ fn decode_pair_group_weights<const HEADS: usize>(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep channel-pair accumulation separated from tail handling cleanly."
+)]
+fn accumulate_packed_pair<const HEADS: usize>(
+    neon: Neon,
+    pair_idx: usize,
+    weight_pairs: &[[[u16; HEADS]; 2]],
+    weight_tail: &[[u16; HEADS]],
+    row_pairs: &[[&[u16]; 2]],
+    row_tail: &[&[u16]],
+    current: &[f32],
+    w_last: [f32x4<Neon>; HEADS],
+    past_len: usize,
+    padded_end: usize,
+    staged: &mut [[f32x4<Neon>; super::VALUE_TILE / 4]; HEADS],
+    finite: &mut fearless_simd::mask32x4<Neon>,
+) {
+    let zero = f32x4::splat(neon, 0.0);
+    let mut sums = [[[zero; HEADS]; 2]; 16];
+    let ch_base = pair_idx * 8;
+    let mut token = 0;
+    for (&[w0_bits, w1_bits], &[row0, row1]) in weight_pairs.iter().zip(row_pairs) {
+        let (w0, w1) = decode_pair_group_weights(neon, w0_bits, w1_bits);
+        let w0_splat = w0.map(|weight| f32x4::splat(neon, weight));
+        let w1_splat = w1.map(|weight| f32x4::splat(neon, weight));
+        let lane0 = token % 16;
+        let lane1 = (token + 1) % 16;
+        token += 2;
+        let (v0_0, v0_1) =
+            crate::kernels::neon::f16_bits_to_f32_x8(neon, &row0.as_chunks::<8>().0[pair_idx]);
+        let (v1_0, v1_1) =
+            crate::kernels::neon::f16_bits_to_f32_x8(neon, &row1.as_chunks::<8>().0[pair_idx]);
+        for h in 0..HEADS {
+            sums[lane0][0][h] = v0_0.mul_add_precise(w0_splat[h], sums[lane0][0][h]);
+            sums[lane0][1][h] = v0_1.mul_add_precise(w0_splat[h], sums[lane0][1][h]);
+            sums[lane1][0][h] = v1_0.mul_add_precise(w1_splat[h], sums[lane1][0][h]);
+            sums[lane1][1][h] = v1_1.mul_add_precise(w1_splat[h], sums[lane1][1][h]);
+        }
+    }
+    if let (Some(&tail_bits), Some(&row)) = (weight_tail.first(), row_tail.first()) {
+        let w_tail = decode_single_group_weights(neon, tail_bits).map(|w| f32x4::splat(neon, w));
+        let lane = token % 16;
+        let (v0, v1) =
+            crate::kernels::neon::f16_bits_to_f32_x8(neon, &row.as_chunks::<8>().0[pair_idx]);
+        for h in 0..HEADS {
+            sums[lane][0][h] = v0.mul_add_precise(w_tail[h], sums[lane][0][h]);
+            sums[lane][1][h] = v1.mul_add_precise(w_tail[h], sums[lane][1][h]);
+        }
+    }
+    let last_lane = past_len % 16;
+    let c0 = f32x4::from_slice(neon, &current[ch_base..ch_base + 4]);
+    let c1 = f32x4::from_slice(neon, &current[ch_base + 4..ch_base + 8]);
+    for h in 0..HEADS {
+        sums[last_lane][0][h] = c0.mul_add_precise(w_last[h], sums[last_lane][0][h]);
+        sums[last_lane][1][h] = c1.mul_add_precise(w_last[h], sums[last_lane][1][h]);
+    }
+    pad_pair_sums(neon, &mut sums, past_len + 1, padded_end);
+    reduce_pair_sums(&sums, pair_idx, staged, finite);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep odd 4-channel tail accumulation separated cleanly."
+)]
+fn accumulate_packed_tail<const HEADS: usize>(
+    neon: Neon,
+    group: usize,
+    weight_pairs: &[[[u16; HEADS]; 2]],
+    weight_tail: &[[u16; HEADS]],
+    row_pairs: &[[&[u16]; 2]],
+    row_tail: &[&[u16]],
+    current: &[f32],
+    w_last: [f32x4<Neon>; HEADS],
+    past_len: usize,
+    padded_end: usize,
+    staged: &mut [[f32x4<Neon>; super::VALUE_TILE / 4]; HEADS],
+    finite: &mut fearless_simd::mask32x4<Neon>,
+) {
+    let zero = f32x4::splat(neon, 0.0);
+    let ch_base = group * 4;
+    let mut sums = [[zero; HEADS]; 16];
+    let mut token = 0;
+    for (&[w0_bits, w1_bits], &[row0, row1]) in weight_pairs.iter().zip(row_pairs) {
+        let (w0, w1) = decode_pair_group_weights(neon, w0_bits, w1_bits);
+        let w0_splat = w0.map(|weight| f32x4::splat(neon, weight));
+        let w1_splat = w1.map(|weight| f32x4::splat(neon, weight));
+        let lane0 = token % 16;
+        let lane1 = (token + 1) % 16;
+        token += 2;
+        let v0 = crate::kernels::neon::f16_bits_to_f32_x4(neon, row0.as_chunks::<4>().0[group]);
+        let v1 = crate::kernels::neon::f16_bits_to_f32_x4(neon, row1.as_chunks::<4>().0[group]);
+        for h in 0..HEADS {
+            sums[lane0][h] = v0.mul_add_precise(w0_splat[h], sums[lane0][h]);
+            sums[lane1][h] = v1.mul_add_precise(w1_splat[h], sums[lane1][h]);
+        }
+    }
+    if let (Some(&tail_bits), Some(&row)) = (weight_tail.first(), row_tail.first()) {
+        let w_tail = decode_single_group_weights(neon, tail_bits).map(|w| f32x4::splat(neon, w));
+        let lane = token % 16;
+        let v = crate::kernels::neon::f16_bits_to_f32_x4(neon, row.as_chunks::<4>().0[group]);
+        for h in 0..HEADS {
+            sums[lane][h] = v.mul_add_precise(w_tail[h], sums[lane][h]);
+        }
+    }
+    let last_lane = past_len % 16;
+    let c = f32x4::from_slice(neon, &current[ch_base..ch_base + 4]);
+    for h in 0..HEADS {
+        sums[last_lane][h] = c.mul_add_precise(w_last[h], sums[last_lane][h]);
+    }
+    pad_tail_sums(neon, &mut sums, past_len + 1, padded_end);
+    reduce_tail_sums(&sums, group, staged, finite);
+}
+
 pub(super) fn value_tile_group_packed_neon<'a, const HEADS: usize>(
     neon: Neon,
-    mut past: impl Iterator<Item = &'a [u16]>,
+    past: impl Iterator<Item = &'a [u16]>,
     current: &[f32],
     weights: &[[u16; HEADS]],
     range: &std::ops::Range<usize>,
     outputs: [&mut [f32]; HEADS],
     gates: [&[f32]; HEADS],
 ) -> Result<()> {
-    const GROUPS: usize = super::VALUE_TILE / 4;
+    let zero = f32x4::splat(neon, 0.0);
     let groups = outputs[0].len() / 4;
+    let num_pairs = groups / 2;
     let past_len = weights.len() - 1;
-    let mut sums = [[[f32x4::splat(neon, 0.0); GROUPS]; 16]; HEADS];
-    let mut token = 0;
+    let mut stack_rows = [&[][..]; STACK_PAST_ROWS];
+    let mut heap_rows = Vec::new();
+    let past_rows = collect_past_rows(past, past_len, range, &mut stack_rows, &mut heap_rows)?;
+    let padded_end = padded_dot_steps(past_len + 1);
+    let mut staged = [[zero; super::VALUE_TILE / 4]; HEADS];
+    let mut finite = zero.is_finite();
     let (weight_pairs, weight_tail) = weights[..past_len].as_chunks::<2>();
-    for [w0_bits, w1_bits] in weight_pairs {
-        let Some(row0) = past.next().and_then(|row| row.get(range.start..range.end)) else {
-            return Err(invalid("pinned attention value row is short"));
-        };
-        let Some(row1) = past.next().and_then(|row| row.get(range.start..range.end)) else {
-            return Err(invalid("pinned attention value row is short"));
-        };
-        let (w0, w1) = decode_pair_group_weights(neon, *w0_bits, *w1_bits);
-        let w0_splat = w0.map(|weight| f32x4::splat(neon, weight));
-        let w1_splat = w1.map(|weight| f32x4::splat(neon, weight));
-        let lane0 = token % 16;
-        let lane1 = (token + 1) % 16;
-        token += 2;
-        let (chunks8_0, rem0) = row0.as_chunks::<8>();
-        let (chunks8_1, rem1) = row1.as_chunks::<8>();
-        for (pair_idx, (c0, c1)) in chunks8_0.iter().zip(chunks8_1).enumerate() {
-            let (v0_0, v0_1) = crate::kernels::neon::f16_bits_to_f32_x8(neon, c0);
-            let (v1_0, v1_1) = crate::kernels::neon::f16_bits_to_f32_x8(neon, c1);
-            let g0 = pair_idx * 2;
-            let g1 = g0 + 1;
-            for h in 0..HEADS {
-                sums[h][lane0][g0] = v0_0.mul_add_precise(w0_splat[h], sums[h][lane0][g0]);
-                sums[h][lane0][g1] = v0_1.mul_add_precise(w0_splat[h], sums[h][lane0][g1]);
-                sums[h][lane1][g0] = v1_0.mul_add_precise(w1_splat[h], sums[h][lane1][g0]);
-                sums[h][lane1][g1] = v1_1.mul_add_precise(w1_splat[h], sums[h][lane1][g1]);
-            }
-        }
-        if let ([vals0], [vals1]) = (rem0.as_chunks::<4>().0, rem1.as_chunks::<4>().0) {
-            let v0 = crate::kernels::neon::f16_bits_to_f32_x4(neon, *vals0);
-            let v1 = crate::kernels::neon::f16_bits_to_f32_x4(neon, *vals1);
-            let g = groups - 1;
-            for h in 0..HEADS {
-                sums[h][lane0][g] = v0.mul_add_precise(w0_splat[h], sums[h][lane0][g]);
-                sums[h][lane1][g] = v1.mul_add_precise(w1_splat[h], sums[h][lane1][g]);
-            }
-        }
-    }
-    if let Some(&tail_bits) = weight_tail.first() {
-        let Some(row) = past.next().and_then(|row| row.get(range.start..range.end)) else {
-            return Err(invalid("pinned attention value row is short"));
-        };
-        let w_tail = decode_single_group_weights(neon, tail_bits).map(|w| f32x4::splat(neon, w));
-        let lane = token % 16;
-        let (chunks8, rem) = row.as_chunks::<8>();
-        for (pair_idx, chunk8) in chunks8.iter().enumerate() {
-            let (v0, v1) = crate::kernels::neon::f16_bits_to_f32_x8(neon, chunk8);
-            let g0 = pair_idx * 2;
-            let g1 = g0 + 1;
-            for h in 0..HEADS {
-                sums[h][lane][g0] = v0.mul_add_precise(w_tail[h], sums[h][lane][g0]);
-                sums[h][lane][g1] = v1.mul_add_precise(w_tail[h], sums[h][lane][g1]);
-            }
-        }
-        if let [vals4] = rem.as_chunks::<4>().0 {
-            let v = crate::kernels::neon::f16_bits_to_f32_x4(neon, *vals4);
-            let g = groups - 1;
-            for h in 0..HEADS {
-                sums[h][lane][g] = v.mul_add_precise(w_tail[h], sums[h][lane][g]);
-            }
-        }
-    }
-    if past.next().is_some() {
-        return Err(invalid("pinned attention value row is long"));
-    }
-    let last_lane = past_len % 16;
+    let (row_pairs, row_tail) = past_rows.as_chunks::<2>();
     let w_last =
         decode_single_group_weights(neon, weights[past_len]).map(|w| f32x4::splat(neon, w));
-    for (g, current_chunk) in current.as_chunks::<4>().0.iter().enumerate() {
-        let v = f32x4::load_array(neon, *current_chunk);
-        for h in 0..HEADS {
-            sums[h][last_lane][g] = v.mul_add_precise(w_last[h], sums[h][last_lane][g]);
-        }
+    for pair_idx in 0..num_pairs {
+        accumulate_packed_pair(
+            neon,
+            pair_idx,
+            weight_pairs,
+            weight_tail,
+            row_pairs,
+            row_tail,
+            current,
+            w_last,
+            past_len,
+            padded_end,
+            &mut staged,
+            &mut finite,
+        );
     }
-    let zero = f32x4::splat(neon, 0.0);
-    for padded_token in past_len + 1..padded_dot_steps(past_len + 1) {
-        let lane = padded_token % 16;
-        for head_sums in &mut sums {
-            for sum in &mut head_sums[lane][..groups] {
-                *sum = zero.mul_add_precise(zero, *sum);
-            }
-        }
+    if !groups.is_multiple_of(2) {
+        accumulate_packed_tail(
+            neon,
+            groups - 1,
+            weight_pairs,
+            weight_tail,
+            row_pairs,
+            row_tail,
+            current,
+            w_last,
+            past_len,
+            padded_end,
+            &mut staged,
+            &mut finite,
+        );
     }
-    publish_group(neon, &mut sums, outputs, gates, groups)
-}
-
-fn publish_group<const HEADS: usize>(
-    neon: Neon,
-    sums: &mut [[[f32x4<Neon>; super::VALUE_TILE / 4]; 16]; HEADS],
-    outputs: [&mut [f32]; HEADS],
-    gates: [&[f32]; HEADS],
-    groups: usize,
-) -> Result<()> {
-    // Stage in dead first-lane storage; reject the complete reduction before
-    // gating or publishing any output, including failures in the last head.
-    let mut finite = f32x4::splat(neon, 0.0).is_finite();
-    for sums in &mut *sums {
-        for group in 0..groups {
-            let lanes: [f32x4<Neon>; 4] = std::array::from_fn(|lane| {
-                (sums[lane][group] + sums[8 + lane][group])
-                    + (sums[4 + lane][group] + sums[12 + lane][group])
-            });
-            let result = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
-            finite &= result.is_finite();
-            sums[0][group] = result;
-        }
-    }
-    if !finite.all_true() {
-        return Err(invalid("nonfinite pinned attention value reduction"));
-    }
-    let one = f32x4::splat(neon, 1.0);
-    for (head, output) in outputs.into_iter().enumerate() {
-        for (group, output) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let exponentials = f32x4::load_array(
-                neon,
-                std::array::from_fn(|lane| (-gates[head][group * 4 + lane]).exp()),
-            );
-            (sums[head][0][group] * (one / (one + exponentials))).store_slice(output);
-        }
-    }
-    Ok(())
+    gate_and_store(neon, &staged, finite, outputs, gates)
 }

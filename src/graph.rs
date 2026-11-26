@@ -2192,7 +2192,9 @@ impl Transforms {
                         .matvec
                         .prepare_f32_executor(weights[index], activation)?
                 } else {
-                    scratch.matvec.prepare(weights[index], activation)?
+                    scratch
+                        .matvec
+                        .prepare_borrowed(weights[index], activation)?
                 };
                 let group_len = weights[index..]
                     .iter()
@@ -4609,7 +4611,7 @@ impl Evaluation<'_, '_, '_> {
             }
         }
         self.project_group_into([up_weight, gate_weight], input, [up, gate])?;
-        if self.adapters.is_any_loaded()
+        if self.adapters.has_target(&down_weight.name)
             && self.transforms.basis(down_weight) == (true, false)
             && self
                 .transforms
@@ -4630,7 +4632,7 @@ impl Evaluation<'_, '_, '_> {
             self.projection.pre_transformed_len = Some(up.len());
             return Ok(());
         }
-        if !self.adapters.is_any_loaded()
+        if !self.adapters.has_target(&down_weight.name)
             && self.transforms.basis(down_weight) == (true, false)
             && self
                 .transforms

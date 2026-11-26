@@ -4485,10 +4485,9 @@ fn project_tile_pair<'a>(
             prepared: None,
         });
     }
-    // Untargeted adapter calls are guaranteed no-ops. Targeted siblings keep
-    // sequential base/adapter order, including their original error precedence.
+    // Untargeted adapter calls are guaranteed no-ops. Apply LoRA adapters
+    // immediately after the fused sibling base projections.
     if executor.is_none()
-        && !adapters.affects_any(&tensors)
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && ProjectionTile::supports_siblings(&tensors)
     {
@@ -4515,6 +4514,10 @@ fn project_tile_pair<'a>(
             matches!(arithmetic, Arithmetic::PinnedSwift),
             check,
         )?;
+        if adapters.is_any_loaded() {
+            adapters.apply_linear_tokens(&tensors[0].name, inputs, outputs_a, adapter_scratch)?;
+            adapters.apply_linear_tokens(&tensors[1].name, inputs, outputs_b, adapter_scratch)?;
+        }
         return Ok(TileReuse {
             basis: Some(tensors[1]),
             prepared: Some(tensors[1]),
@@ -4709,7 +4712,7 @@ fn project_tile_ffn_swiglu<'a>(
     )?;
     let count = inputs.len();
     let up_len = up_outputs.first().map_or(0, Vec::len);
-    if adapters.is_any_loaded()
+    if adapters.has_target(&down.name)
         && up_len > 0
         && transforms.basis(down) == (true, false)
         && transforms.can_block_hadamard_for(down, up_len)
@@ -4760,7 +4763,7 @@ fn project_tile_ffn_swiglu<'a>(
             prepared: None,
         });
     }
-    if !adapters.is_any_loaded()
+    if !adapters.has_target(&down.name)
         && up_len > 0
         && transforms.basis(down) == (true, false)
         && transforms.can_block_hadamard_for(down, up_len)
@@ -4932,10 +4935,9 @@ fn project_tile_triple<'a>(
             prepared: None,
         });
     }
-    // Untargeted adapter calls are guaranteed no-ops. Targeted siblings keep
-    // sequential base/adapter order, including their original error precedence.
+    // Untargeted adapter calls are guaranteed no-ops. Apply LoRA adapters
+    // immediately after the fused sibling base projections.
     if executor.is_none()
-        && !adapters.affects_any(&tensors)
         && transforms.basis(tensors[0]) == transforms.basis(tensors[1])
         && transforms.basis(tensors[0]) == transforms.basis(tensors[2])
         && ProjectionTile::supports_siblings(&tensors)
@@ -4963,6 +4965,15 @@ fn project_tile_triple<'a>(
             matches!(arithmetic, Arithmetic::PinnedSwift),
             check,
         )?;
+        if adapters.is_any_loaded() {
+            for (tensor, outputs) in [
+                (tensors[0], &mut *outputs_a),
+                (tensors[1], &mut *outputs_b),
+                (tensors[2], &mut *outputs_c),
+            ] {
+                adapters.apply_linear_tokens(&tensor.name, inputs, outputs, adapter_scratch)?;
+            }
+        }
         return Ok(TileReuse {
             basis: Some(tensors[2]),
             prepared: Some(tensors[2]),

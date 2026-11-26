@@ -86,7 +86,42 @@ pub struct MultiRankAdapter {
     alpha: f32,
     max_rank: usize,
     storage_bytes: usize,
-    targets: BTreeMap<String, MultiRankTarget>,
+    targets: Box<[(String, MultiRankTarget)]>,
+    lookup_slots: Box<[u32]>,
+    lookup_mask: usize,
+}
+
+#[inline]
+fn target_hash_slot(name: &str, mask: usize) -> usize {
+    let mut hash = 0x811c_9dc5_u32;
+    for &byte in name.as_bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let bytes = hash.to_le_bytes();
+    let folded = u16::from_le_bytes([bytes[0] ^ bytes[2], bytes[1] ^ bytes[3]]);
+    usize::from(folded) & mask
+}
+
+fn build_target_index(targets: &[(String, MultiRankTarget)]) -> Result<(Box<[u32]>, usize)> {
+    let cap = (targets.len().saturating_mul(2))
+        .next_power_of_two()
+        .max(16);
+    if cap > 65_536 || targets.len() >= usize::try_from(u32::MAX)? {
+        return Err(invalid(
+            "multi-rank adapter target count exceeds lookup capacity",
+        ));
+    }
+    let mask = cap - 1;
+    let mut slots = vec![0_u32; cap];
+    for (idx, (name, _)) in targets.iter().enumerate() {
+        let mut slot = target_hash_slot(name, mask);
+        while slots[slot] != 0 {
+            slot = (slot + 1) & mask;
+        }
+        slots[slot] = u32::try_from(idx + 1)?;
+    }
+    Ok((slots.into_boxed_slice(), mask))
 }
 
 impl MultiRankAdapter {
@@ -128,7 +163,7 @@ impl MultiRankAdapter {
         let alpha = resolve_lora_alpha(adapter)?;
         let pairs = collect_lora_pairs(adapter)?;
 
-        let mut targets = BTreeMap::new();
+        let mut sorted_targets = BTreeMap::new();
         let mut max_rank = 0_usize;
         let mut storage_bytes = 0_usize;
         for (target_name, (a_tensor, b_tensor)) in pairs {
@@ -138,9 +173,14 @@ impl MultiRankAdapter {
             storage_bytes = storage_bytes
                 .checked_add(target.storage.retained_bytes())
                 .ok_or_else(|| invalid("multi-rank adapter retained byte overflow"))?;
-            targets.insert(target_name.to_owned(), target);
+            sorted_targets.insert(target_name.to_owned(), target);
         }
 
+        let targets: Box<[(String, MultiRankTarget)]> = sorted_targets
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let (lookup_slots, lookup_mask) = build_target_index(&targets)?;
         let execution_identity =
             compute_execution_identity(&base.identity, policy, alpha, &targets)?;
 
@@ -153,6 +193,8 @@ impl MultiRankAdapter {
             max_rank,
             storage_bytes,
             targets,
+            lookup_slots,
+            lookup_mask,
         })
     }
 
@@ -217,6 +259,34 @@ impl MultiRankAdapter {
         self.storage_bytes
     }
 
+    #[inline]
+    fn lookup_index(&self, target: &str) -> Option<usize> {
+        let mut slot = target_hash_slot(target, self.lookup_mask);
+        loop {
+            let entry_plus_one = self.lookup_slots[slot];
+            if entry_plus_one == 0 {
+                return None;
+            }
+            let idx = usize::try_from(entry_plus_one - 1).ok()?;
+            if self.targets[idx].0 == target {
+                return Some(idx);
+            }
+            slot = (slot + 1) & self.lookup_mask;
+        }
+    }
+
+    #[inline]
+    fn lookup_target(&self, target: &str) -> Option<&MultiRankTarget> {
+        let idx = self.lookup_index(target)?;
+        Some(&self.targets[idx].1)
+    }
+
+    #[inline]
+    fn lookup_target_mut(&mut self, target: &str) -> Option<&mut MultiRankTarget> {
+        let idx = self.lookup_index(target)?;
+        Some(&mut self.targets[idx].1)
+    }
+
     /// Number of target linear matrices in this adapter.
     #[must_use]
     pub fn target_count(&self) -> usize {
@@ -225,19 +295,19 @@ impl MultiRankAdapter {
 
     /// Iterates target tensor names in sorted order.
     pub fn targets(&self) -> impl Iterator<Item = &str> {
-        self.targets.keys().map(String::as_str)
+        self.targets.iter().map(|(name, _)| name.as_str())
     }
 
     /// Returns `true` when this adapter contains weights for `target`.
     #[must_use]
     pub fn has_target(&self, target: &str) -> bool {
-        self.targets.contains_key(target)
+        self.lookup_target(target).is_some()
     }
 
     /// Returns `true` if `target` will be modified when run at `scale`.
     #[must_use]
     pub(crate) fn affects_linear(&self, target: &str, scale: f32) -> bool {
-        Self::validate_scale(scale).is_ok() && scale != 0.0 && self.targets.contains_key(target)
+        Self::validate_scale(scale).is_ok() && scale != 0.0 && self.lookup_target(target).is_some()
     }
 
     pub(crate) fn compact_ffn_down_layers(&self, layers: &[(usize, &[usize])]) -> Result<Self> {
@@ -256,18 +326,18 @@ impl MultiRankAdapter {
                 ));
             }
             if compacted
-                .targets
-                .contains_key(&format!("blk.{layer}.ffn_gate.weight"))
+                .lookup_target(&format!("blk.{layer}.ffn_gate.weight"))
+                .is_some()
                 || compacted
-                    .targets
-                    .contains_key(&format!("blk.{layer}.ffn_up.weight"))
+                    .lookup_target(&format!("blk.{layer}.ffn_up.weight"))
+                    .is_some()
             {
                 return Err(invalid(
                     "multi-rank gate/up adapters are unsupported on compacted FFN layers",
                 ));
             }
             let target_name = format!("blk.{layer}.ffn_down.weight");
-            let Some(entry) = compacted.targets.get_mut(&target_name) else {
+            let Some(entry) = compacted.lookup_target_mut(&target_name) else {
                 continue;
             };
             if entry.in_features != FULL_WIDTH {
@@ -288,8 +358,8 @@ impl MultiRankAdapter {
         }
         compacted.storage_bytes = compacted
             .targets
-            .values()
-            .try_fold(0_usize, |acc, target| {
+            .iter()
+            .try_fold(0_usize, |acc, (_, target)| {
                 acc.checked_add(target.storage.retained_bytes())
             })
             .ok_or_else(|| invalid("multi-rank adapter retained byte overflow"))?;
@@ -318,7 +388,7 @@ impl MultiRankAdapter {
         scratch: &mut Scratch,
     ) -> Result<()> {
         Self::validate_scale(scale)?;
-        let Some(entry) = self.targets.get(target) else {
+        let Some(entry) = self.lookup_target(target) else {
             return Ok(());
         };
         if input.len() != entry.in_features || output.len() != entry.out_features {
@@ -335,7 +405,7 @@ impl MultiRankAdapter {
                 "nonfinite effective LoRA scale for {target}"
             )));
         }
-        let parallelism = scratch.matvec.clone_row_parallelism();
+        let parallelism = scratch.matvec.row_parallelism();
         match &entry.storage {
             MultiRankStorage::F16 { a, b } => {
                 lora_multi_a_f16(
@@ -343,7 +413,7 @@ impl MultiRankAdapter {
                     entry.in_features,
                     input,
                     &mut scratch.multi_ranks,
-                    &parallelism,
+                    parallelism,
                 )?;
                 lora_multi_b_scale_and_finish_f16(
                     b,
@@ -351,7 +421,7 @@ impl MultiRankAdapter {
                     effective_scale,
                     output,
                     &mut scratch.correction,
-                    &parallelism,
+                    parallelism,
                 )?;
             }
             MultiRankStorage::F32 { a, b } => {
@@ -360,7 +430,7 @@ impl MultiRankAdapter {
                     entry.in_features,
                     input,
                     &mut scratch.multi_ranks,
-                    &parallelism,
+                    parallelism,
                 )?;
                 lora_multi_b_scale_and_finish_f32(
                     b,
@@ -368,7 +438,7 @@ impl MultiRankAdapter {
                     effective_scale,
                     output,
                     &mut scratch.correction,
-                    &parallelism,
+                    parallelism,
                 )?;
             }
         }
@@ -395,7 +465,7 @@ impl MultiRankAdapter {
         if inputs.is_empty() {
             return Ok(());
         }
-        let Some(entry) = self.targets.get(target) else {
+        let Some(entry) = self.lookup_target(target) else {
             return Ok(());
         };
         if inputs.iter().any(|input| input.len() != entry.in_features)
@@ -430,7 +500,7 @@ impl MultiRankAdapter {
             }
             &heap_inputs
         };
-        let parallelism = scratch.matvec.clone_row_parallelism();
+        let parallelism = scratch.matvec.row_parallelism();
         match &entry.storage {
             MultiRankStorage::F16 { a, b } => {
                 lora_multi_a_tokens_f16(
@@ -439,7 +509,7 @@ impl MultiRankAdapter {
                     entry.rank,
                     input_refs,
                     &mut scratch.multi_ranks,
-                    &parallelism,
+                    parallelism,
                 )?;
                 lora_multi_b_scale_and_finish_tokens_f16(
                     b,
@@ -448,7 +518,7 @@ impl MultiRankAdapter {
                     effective_scale,
                     outputs,
                     &mut scratch.correction,
-                    &parallelism,
+                    parallelism,
                 )?;
             }
             MultiRankStorage::F32 { a, b } => {
@@ -458,7 +528,7 @@ impl MultiRankAdapter {
                     entry.rank,
                     input_refs,
                     &mut scratch.multi_ranks,
-                    &parallelism,
+                    parallelism,
                 )?;
                 lora_multi_b_scale_and_finish_tokens_f32(
                     b,
@@ -467,7 +537,7 @@ impl MultiRankAdapter {
                     effective_scale,
                     outputs,
                     &mut scratch.correction,
-                    &parallelism,
+                    parallelism,
                 )?;
             }
         }
@@ -765,11 +835,33 @@ fn decode_f32_slice(tensor: &Tensor, expected_elems: usize, target: &str) -> Res
     Ok(values.into_boxed_slice())
 }
 
+fn hash_u16_le_chunks(hasher: &mut bonsai_native_hash::Hasher, values: &[u16]) -> Result<()> {
+    let mut buf = [0_u8; 4096];
+    for chunk in values.chunks(2048) {
+        for (dst, &bits) in buf.as_chunks_mut::<2>().0.iter_mut().zip(chunk) {
+            *dst = bits.to_le_bytes();
+        }
+        hasher.update(&buf[..chunk.len() * 2])?;
+    }
+    Ok(())
+}
+
+fn hash_f32_le_chunks(hasher: &mut bonsai_native_hash::Hasher, values: &[f32]) -> Result<()> {
+    let mut buf = [0_u8; 4096];
+    for chunk in values.chunks(1024) {
+        for (dst, &val) in buf.as_chunks_mut::<4>().0.iter_mut().zip(chunk) {
+            *dst = val.to_bits().to_le_bytes();
+        }
+        hasher.update(&buf[..chunk.len() * 4])?;
+    }
+    Ok(())
+}
+
 fn compute_execution_identity(
     base_identity: &str,
     policy: MultiRankPolicy,
     alpha: f32,
-    targets: &BTreeMap<String, MultiRankTarget>,
+    targets: &[(String, MultiRankTarget)],
 ) -> Result<String> {
     let mut hasher = bonsai_native_hash::Hasher::new()?;
     hash_len_bytes(&mut hasher, IDENTITY_DOMAIN)?;
@@ -786,23 +878,15 @@ fn compute_execution_identity(
         match &target.storage {
             MultiRankStorage::F16 { a, b } => {
                 hasher.update(&u64::try_from(a.len())?.to_le_bytes())?;
-                for &bits in a {
-                    hasher.update(&bits.to_le_bytes())?;
-                }
+                hash_u16_le_chunks(&mut hasher, a)?;
                 hasher.update(&u64::try_from(b.len())?.to_le_bytes())?;
-                for &bits in b {
-                    hasher.update(&bits.to_le_bytes())?;
-                }
+                hash_u16_le_chunks(&mut hasher, b)?;
             }
             MultiRankStorage::F32 { a, b } => {
                 hasher.update(&u64::try_from(a.len())?.to_le_bytes())?;
-                for &val in a {
-                    hasher.update(&val.to_bits().to_le_bytes())?;
-                }
+                hash_f32_le_chunks(&mut hasher, a)?;
                 hasher.update(&u64::try_from(b.len())?.to_le_bytes())?;
-                for &val in b {
-                    hasher.update(&val.to_bits().to_le_bytes())?;
-                }
+                hash_f32_le_chunks(&mut hasher, b)?;
             }
         }
     }

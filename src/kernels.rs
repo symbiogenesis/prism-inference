@@ -25,6 +25,7 @@ mod iqfit;
 mod iquants;
 mod kquants;
 mod legacy;
+mod lora_fast;
 mod parallel_rows;
 pub(crate) mod trellis;
 pub use parallel_rows::{MAX_ROW_WORKERS, RowParallelism};
@@ -2030,7 +2031,16 @@ impl MatvecScratch {
         tensor: &Tensor,
         input: &'a [f32],
     ) -> Result<PreparedMatvec<'a>> {
-        self.prepare_with_quantization(tensor, input, true)
+        self.prepare_with_quantization_dims(tensor, input, true, false, true)
+    }
+
+    /// Prepares one exact activation vector without copying `F32` inputs into `activations`.
+    pub(crate) fn prepare_borrowed<'a>(
+        &'a mut self,
+        tensor: &Tensor,
+        input: &'a [f32],
+    ) -> Result<PreparedMatvec<'a>> {
+        self.prepare_with_quantization_dims(tensor, input, true, false, false)
     }
 
     /// Prepares one exact `F32` activation vector for an external `F32`
@@ -2044,7 +2054,7 @@ impl MatvecScratch {
         tensor: &Tensor,
         input: &'a [f32],
     ) -> Result<PreparedMatvec<'a>> {
-        self.prepare_with_quantization_dims(tensor, input, false, false)
+        self.prepare_with_quantization_dims(tensor, input, false, false, false)
     }
 
     pub(crate) fn prepare_with_executor<'a>(
@@ -2054,7 +2064,7 @@ impl MatvecScratch {
         executor: &(impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<PreparedMatvec<'a>> {
         let allow_released = tensor.data.is_empty() && executor.has_released_host_weight(tensor);
-        self.prepare_with_quantization_dims(tensor, input, true, allow_released)
+        self.prepare_with_quantization_dims(tensor, input, true, allow_released, false)
     }
 
     pub(crate) fn prepare_f32_executor_with<'a>(
@@ -2064,7 +2074,7 @@ impl MatvecScratch {
         executor: &(impl Pq2ProjectionExecutor + ?Sized),
     ) -> Result<PreparedMatvec<'a>> {
         let allow_released = tensor.data.is_empty() && executor.has_released_host_weight(tensor);
-        self.prepare_with_quantization_dims(tensor, input, false, allow_released)
+        self.prepare_with_quantization_dims(tensor, input, false, allow_released, false)
     }
 
     pub(crate) fn shares_contract_with(
@@ -2080,21 +2090,13 @@ impl MatvecScratch {
                 == ActivationContract::for_tensor(second, second_columns, self.pinned_accumulation))
     }
 
-    fn prepare_with_quantization<'a>(
-        &'a mut self,
-        tensor: &Tensor,
-        input: &'a [f32],
-        quantized: bool,
-    ) -> Result<PreparedMatvec<'a>> {
-        self.prepare_with_quantization_dims(tensor, input, quantized, false)
-    }
-
     fn prepare_with_quantization_dims<'a>(
         &'a mut self,
         tensor: &Tensor,
         input: &'a [f32],
         quantized: bool,
         allow_released: bool,
+        retain_f32_activations: bool,
     ) -> Result<PreparedMatvec<'a>> {
         self.reset_diagnostics();
         self.statistics.preparations = self.statistics.preparations.saturating_add(1);
@@ -2103,7 +2105,7 @@ impl MatvecScratch {
             input,
             quantized,
             allow_released,
-            false,
+            retain_f32_activations,
         ) {
             Ok(contract) => contract,
             Err(error) => {
@@ -2511,7 +2513,7 @@ pub fn matvec_into(
     scratch: &mut MatvecScratch,
 ) -> Result<()> {
     let result = scratch
-        .prepare(tensor, input)
+        .prepare_borrowed(tensor, input)
         .and_then(|mut prepared| prepared.matvec_into(tensor, output));
     if result.is_err() {
         output.clear();
@@ -4492,6 +4494,13 @@ trait MultiLoraScalarWeight: Copy + Sync {
         None
     }
 
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
     fn neon_multi_b(
         _b_weights: &[Self],
         _ranks: &[f32],
@@ -4502,6 +4511,13 @@ trait MultiLoraScalarWeight: Copy + Sync {
         None
     }
 
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
     fn neon_multi_b_tokens(
         _b_weights: &[Self],
         _ranks: &[f32],
@@ -4510,6 +4526,23 @@ trait MultiLoraScalarWeight: Copy + Sync {
         _base_outputs: &[&[f32]],
         _start_row: usize,
         _correction: &mut [f32],
+    ) -> Option<bool> {
+        None
+    }
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    fn neon_multi_b_tokens_in_place(
+        _b_weights: &[Self],
+        _ranks: &[f32],
+        _rank: usize,
+        _scale: f32,
+        _outputs: &mut [Vec<f32>],
     ) -> Option<bool> {
         None
     }
@@ -4591,7 +4624,16 @@ impl MultiLoraScalarWeight for u16 {
         base_output: &[f32],
         correction: &mut [f32],
     ) -> Option<bool> {
-        neon::lora_multi_b_scale_and_finish_f16(b_weights, ranks, scale, base_output, correction)
+        if base_output.len() < 4 {
+            return neon::lora_multi_b_scale_and_finish_f16(
+                b_weights,
+                ranks,
+                scale,
+                base_output,
+                correction,
+            );
+        }
+        lora_fast::lora_multi_b_f16(b_weights, ranks, scale, base_output, correction)
     }
 
     #[cfg(all(
@@ -4619,6 +4661,23 @@ impl MultiLoraScalarWeight for u16 {
             start_row,
             correction,
         )
+    }
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    fn neon_multi_b_tokens_in_place(
+        b_weights: &[Self],
+        ranks: &[f32],
+        rank: usize,
+        scale: f32,
+        outputs: &mut [Vec<f32>],
+    ) -> Option<bool> {
+        lora_fast::lora_multi_b_tokens_in_place_f16(b_weights, ranks, rank, scale, outputs)
     }
 }
 
@@ -4698,7 +4757,16 @@ impl MultiLoraScalarWeight for f32 {
         base_output: &[f32],
         correction: &mut [f32],
     ) -> Option<bool> {
-        neon::lora_multi_b_scale_and_finish_f32(b_weights, ranks, scale, base_output, correction)
+        if base_output.len() < 4 {
+            return neon::lora_multi_b_scale_and_finish_f32(
+                b_weights,
+                ranks,
+                scale,
+                base_output,
+                correction,
+            );
+        }
+        lora_fast::lora_multi_b_f32(b_weights, ranks, scale, base_output, correction)
     }
 
     #[cfg(all(
@@ -4726,6 +4794,23 @@ impl MultiLoraScalarWeight for f32 {
             start_row,
             correction,
         )
+    }
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    fn neon_multi_b_tokens_in_place(
+        b_weights: &[Self],
+        ranks: &[f32],
+        rank: usize,
+        scale: f32,
+        outputs: &mut [Vec<f32>],
+    ) -> Option<bool> {
+        lora_fast::lora_multi_b_tokens_in_place_f32(b_weights, ranks, rank, scale, outputs)
     }
 }
 
@@ -4844,7 +4929,20 @@ fn lora_multi_a_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
     };
     let result = if a_weights.len() >= MULTI_A_PARALLEL_ELEM_THRESHOLD && parallelism.workers() > 1
     {
-        parallelism.update_chunks(&mut ranks_out[..rank], 1, run_chunk)
+        if rank.is_multiple_of(4) {
+            parallelism.update_chunks(&mut ranks_out[..rank], 4, |base_unit, chunk| {
+                run_chunk(base_unit * 4, chunk)
+            })
+        } else if rank >= 8 {
+            let aligned = (rank / 4) * 4;
+            parallelism
+                .update_chunks(&mut ranks_out[..aligned], 4, |base_unit, chunk| {
+                    run_chunk(base_unit * 4, chunk)
+                })
+                .and_then(|()| run_chunk(aligned, &mut ranks_out[aligned..rank]))
+        } else {
+            run_chunk(0, &mut ranks_out[..rank])
+        }
     } else {
         run_chunk(0, &mut ranks_out[..rank])
     };
@@ -4904,7 +5002,16 @@ fn lora_multi_a_tokens_rank_parallel<W: MultiLoraScalarWeight, const USE_NEON: b
         reserve_f32_scratch(&mut heap_buf, needed)?;
         &mut heap_buf[..needed]
     };
-    parallelism.update_chunks(rank_major, n_tokens, run_rank_chunk)?;
+    let unit_rows = if rank >= 8 && rank.is_multiple_of(4) {
+        4
+    } else if rank.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
+    parallelism.update_chunks(rank_major, unit_rows * n_tokens, |base_unit, chunk| {
+        run_rank_chunk(base_unit * unit_rows, chunk)
+    })?;
     for (t, tok_out) in ranks_out[..needed].chunks_exact_mut(rank).enumerate() {
         for (r, dst) in tok_out.iter_mut().enumerate() {
             *dst = rank_major[r * n_tokens + t];
@@ -5027,7 +5134,12 @@ fn lora_multi_b_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
         Ok(())
     };
     let result = if out_features >= MULTI_B_PARALLEL_ROW_THRESHOLD && parallelism.workers() > 1 {
-        parallelism.update_chunks(&mut correction[..out_features], 1, run_chunk)
+        let unit_rows = if out_features.is_multiple_of(4) { 4 } else { 1 };
+        parallelism.update_chunks(
+            &mut correction[..out_features],
+            unit_rows,
+            |base_unit, chunk| run_chunk(base_unit * unit_rows, chunk),
+        )
     } else {
         run_chunk(0, &mut correction[..out_features])
     };
@@ -5036,6 +5148,71 @@ fn lora_multi_b_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
     }
     correction.clear();
     result
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn lora_multi_b_tokens_small_rows<W: MultiLoraScalarWeight>(
+    b_weights: &[W],
+    ranks: &[f32],
+    rank: usize,
+    scale: f32,
+    outputs: &mut [Vec<f32>],
+    correction: &mut Vec<f32>,
+) -> Result<bool> {
+    let n_tokens = outputs.len();
+    let out_features = outputs[0].len();
+    let needed = out_features
+        .checked_mul(n_tokens)
+        .ok_or_else(|| invalid("multi-rank LoRA correction buffer overflow"))?;
+    reserve_f32_scratch(correction, needed)?;
+    let mut stack_slices: [&[f32]; prefill::MAX_TILE_TOKENS] = [&[]; prefill::MAX_TILE_TOKENS];
+    let mut heap_slices = Vec::new();
+    let base_outputs: &[&[f32]] = if n_tokens <= prefill::MAX_TILE_TOKENS {
+        for (slot, out) in stack_slices[..n_tokens].iter_mut().zip(outputs.iter()) {
+            *slot = out.as_slice();
+        }
+        &stack_slices[..n_tokens]
+    } else {
+        heap_slices.try_reserve(n_tokens)?;
+        for out in outputs.iter() {
+            heap_slices.push(out.as_slice());
+        }
+        &heap_slices
+    };
+    let status = W::neon_multi_b_tokens(
+        b_weights,
+        ranks,
+        rank,
+        scale,
+        base_outputs,
+        0,
+        &mut correction[..needed],
+    );
+    match status {
+        Some(true) => {
+            for (row, corr_row) in correction[..needed].chunks_exact(n_tokens).enumerate() {
+                for (out, &value) in outputs.iter_mut().zip(corr_row) {
+                    out[row] = value;
+                }
+            }
+            correction.clear();
+            Ok(true)
+        }
+        Some(false) => {
+            correction.clear();
+            Err(invalid("non-finite multi-rank LoRA output"))
+        }
+        None => {
+            correction.clear();
+            Ok(false)
+        }
+    }
 }
 
 fn lora_multi_b_tokens_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
@@ -5061,83 +5238,71 @@ fn lora_multi_b_tokens_impl<W: MultiLoraScalarWeight, const USE_NEON: bool>(
     {
         return Err(invalid("multi-rank LoRA B token batch dimension mismatch"));
     }
-    let needed = out_features
-        .checked_mul(n_tokens)
-        .ok_or_else(|| invalid("multi-rank LoRA correction buffer overflow"))?;
-    reserve_f32_scratch(correction, needed)?;
-
-    let result = {
-        let mut stack_slices: [&[f32]; prefill::MAX_TILE_TOKENS] = [&[]; prefill::MAX_TILE_TOKENS];
-        let mut heap_slices = Vec::new();
-        let base_outputs: &[&[f32]] = if n_tokens <= prefill::MAX_TILE_TOKENS {
-            for (slot, out) in stack_slices[..n_tokens].iter_mut().zip(outputs.iter()) {
-                *slot = out.as_slice();
-            }
-            &stack_slices[..n_tokens]
-        } else {
-            heap_slices.try_reserve(n_tokens)?;
-            for out in outputs.iter() {
-                heap_slices.push(out.as_slice());
-            }
-            &heap_slices
-        };
-
-        let run_chunk = |start_row: usize, corr_chunk: &mut [f32]| -> Result<()> {
-            let rows = corr_chunk.len() / n_tokens;
-            let b_chunk = &b_weights[start_row * rank..(start_row + rows) * rank];
-            if USE_NEON
-                && let Some(finite) = W::neon_multi_b_tokens(
-                    b_chunk,
-                    ranks,
-                    rank,
-                    scale,
-                    base_outputs,
-                    start_row,
-                    corr_chunk,
-                )
-            {
-                return if finite {
-                    Ok(())
-                } else {
-                    Err(invalid("non-finite multi-rank LoRA output"))
-                };
-            }
-            for (local_row, (b_row, corr_slots)) in b_chunk
-                .chunks_exact(rank)
-                .zip(corr_chunk.chunks_exact_mut(n_tokens))
-                .enumerate()
-            {
-                let global_row = start_row + local_row;
-                for (t, (&base_slice, corr_slot)) in
-                    base_outputs.iter().zip(corr_slots.iter_mut()).enumerate()
-                {
-                    let tok_ranks = &ranks[t * rank..(t + 1) * rank];
-                    let dot = dot_multi_scalar(b_row, tok_ranks);
-                    let updated = dot.mul_add(scale, base_slice[global_row]);
-                    if !updated.is_finite() {
-                        return Err(invalid("non-finite multi-rank LoRA output"));
-                    }
-                    *corr_slot = updated;
-                }
-            }
-            Ok(())
-        };
-
-        if out_features >= MULTI_B_PARALLEL_ROW_THRESHOLD && parallelism.workers() > 1 {
-            parallelism.update_chunks(&mut correction[..needed], n_tokens, run_chunk)
-        } else {
-            run_chunk(0, &mut correction[..needed])
-        }
-    };
-    if result.is_ok() {
-        for (row, corr_row) in correction[..needed].chunks_exact(n_tokens).enumerate() {
-            for (out, &value) in outputs.iter_mut().zip(corr_row) {
-                out[row] = value;
-            }
-        }
+    if n_tokens == 1 {
+        return lora_multi_b_impl::<W, USE_NEON>(
+            b_weights,
+            ranks,
+            scale,
+            &mut outputs[0],
+            correction,
+            parallelism,
+        );
     }
-    correction.clear();
-    result
+    if !is_finite_slice(ranks) {
+        return Err(invalid("non-finite multi-rank LoRA rank activation"));
+    }
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if USE_NEON
+        && out_features < 4
+        && lora_multi_b_tokens_small_rows(b_weights, ranks, rank, scale, outputs, correction)?
+    {
+        return Ok(());
+    }
+
+    let run_token_chunk = |start_token: usize, out_chunk: &mut [Vec<f32>]| -> Result<()> {
+        let tok_ranks = &ranks[start_token * rank..(start_token + out_chunk.len()) * rank];
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if USE_NEON
+            && let Some(finite) =
+                W::neon_multi_b_tokens_in_place(b_weights, tok_ranks, rank, scale, out_chunk)
+        {
+            return if finite {
+                Ok(())
+            } else {
+                Err(invalid("non-finite multi-rank LoRA output"))
+            };
+        }
+        for (t_off, out_vec) in out_chunk.iter_mut().enumerate() {
+            let r_slice = &tok_ranks[t_off * rank..(t_off + 1) * rank];
+            for (b_row, slot) in b_weights.chunks_exact(rank).zip(out_vec.iter_mut()) {
+                let dot = dot_multi_scalar(b_row, r_slice);
+                let updated = dot.mul_add(scale, *slot);
+                if !updated.is_finite() {
+                    return Err(invalid("non-finite multi-rank LoRA output"));
+                }
+                *slot = updated;
+            }
+        }
+        Ok(())
+    };
+
+    if out_features >= MULTI_B_PARALLEL_ROW_THRESHOLD && parallelism.workers() > 1 {
+        parallelism.update_chunks(outputs, 1, run_token_chunk)
+    } else {
+        run_token_chunk(0, outputs)
+    }
 }
 
 pub(crate) fn lora_multi_a_f16(

@@ -628,7 +628,7 @@ mod tests {
             sib_scratch.set_row_parallelism(RowParallelism::new(4)?);
             let mut outs = [Vec::new(), Vec::new(), Vec::new()];
             {
-                let mut prep = sib_scratch.prepare(&first, &input)?;
+                let mut prep = sib_scratch.prepare_borrowed(&first, &input)?;
                 prep.matvec_f32_siblings_into(&[&first, &second, &third], &mut outs.each_mut())?;
             }
             assert_eq!(sib_scratch.activations.capacity(), 0);

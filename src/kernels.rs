@@ -2752,15 +2752,13 @@ impl PreparedMatvec<'_> {
                 ))]
                 if !matches!(scratch.requested_backend(), MatvecBackend::Scalar) {
                     if tensor.kind == Q8_0 {
-                        return scratch.row_parallelism.fill_sixteen_rows(
+                        return neon::fill_q8_0_rows_prepared(
+                            &scratch.row_parallelism,
                             &tensor.data,
                             row_bytes,
                             output,
                             &mut scratch.row_errors,
-                            |rows| neon::dot_q8_0_sixteen_rows(rows, q8),
-                            |rows| neon::dot_q8_0_eight_rows(rows, q8),
-                            |rows| neon::dot_q8_0_four_rows(rows, q8),
-                            |bytes| neon::dot_q8_0_row(bytes, q8),
+                            q8,
                         );
                     }
                     if tensor.kind == Q4_0 {

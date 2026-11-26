@@ -5294,12 +5294,7 @@ impl<'a> Q8Consumer<'a> {
 }
 
 /// Validates `Q8_0` activation scales once per projection and fills output rows across 16/8/4/1-row tiles.
-#[allow(
-    clippy::redundant_pub_crate,
-    dead_code,
-    reason = "Ready-to-wire Q8Prepared row fill helper for kernels.rs integration."
-)]
-pub(crate) fn fill_q8_0_rows_prepared(
+pub(super) fn fill_q8_0_rows_prepared(
     row_parallelism: &super::RowParallelism,
     data: &[u8],
     row_bytes: usize,

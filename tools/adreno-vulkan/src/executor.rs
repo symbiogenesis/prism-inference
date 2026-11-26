@@ -250,17 +250,30 @@ pub(crate) struct ProjectionPipelines {
     pub(crate) pq2_q8k_16tok_unfused: PipelineId,
     pub(crate) pq2_q8k_16tok_fused_res: PipelineId,
     pub(crate) pq2_q8k_16tok_unfused_res: PipelineId,
+    pub(crate) pq2_q8k_32tok_fused: PipelineId,
+    pub(crate) pq2_q8k_32tok_unfused: PipelineId,
+    pub(crate) pq2_q8k_32tok_fused_res: PipelineId,
+    pub(crate) pq2_q8k_32tok_unfused_res: PipelineId,
+    pub(crate) pq2_q8k_splitk_fused: PipelineId,
+    pub(crate) pq2_q8k_splitk_unfused: PipelineId,
     pub(crate) pq2_q8_0: PipelineId,
     pub(crate) pq2_q8_0_4tok: PipelineId,
+    pub(crate) pq2_q8_0_splitk: PipelineId,
     pub(crate) ptq1_q8_0: PipelineId,
     pub(crate) ptq1_q8_0_pinned: PipelineId,
     pub(crate) ptq1_q8_0_4tok: PipelineId,
     pub(crate) ptq1_q8_0_4tok_pinned: PipelineId,
     pub(crate) ptq1_q8_0_16tok: PipelineId,
     pub(crate) ptq1_q8_0_16tok_pinned: PipelineId,
+    pub(crate) ptq1_q8_0_32tok: PipelineId,
+    pub(crate) ptq1_q8_0_32tok_pinned: PipelineId,
+    pub(crate) ptq1_q8_0_splitk: PipelineId,
+    pub(crate) ptq1_q8_0_splitk_pinned: PipelineId,
     pub(crate) q8_0_q8_0: PipelineId,
     pub(crate) q8_0_q8_0_4tok: PipelineId,
     pub(crate) q8_0_q8_0_16tok: PipelineId,
+    pub(crate) q8_0_q8_0_32tok: PipelineId,
+    pub(crate) q8_0_q8_0_splitk: PipelineId,
     pub(crate) ptq1_q8k: PipelineId,
     pub(crate) quant_q8k_pinned: PipelineId,
     pub(crate) quant_q8k_unpinned: PipelineId,
@@ -275,11 +288,14 @@ pub(crate) enum BatchTokenPath {
     Single,
     Four,
     Sixteen,
+    ThirtyTwo,
 }
 
 impl BatchTokenPath {
     pub(crate) const fn for_tokens(device: &AdrenoVulkanDevice, tokens: usize) -> Self {
-        if tokens >= 8 && supports_16tok_gemm(device) {
+        if tokens >= 17 && supports_32tok_gemm(device) {
+            Self::ThirtyTwo
+        } else if tokens >= 8 && supports_16tok_gemm(device) {
             Self::Sixteen
         } else if tokens > 1 {
             Self::Four
@@ -293,13 +309,14 @@ impl BatchTokenPath {
             Self::Single => tokens_u32,
             Self::Four => tokens_u32.div_ceil(4),
             Self::Sixteen => tokens_u32.div_ceil(16),
+            Self::ThirtyTwo => tokens_u32.div_ceil(32),
         }
     }
 
     pub(crate) const fn grid_y_four_tok_cap(self, tokens_u32: u32) -> u32 {
         match self {
             Self::Single => tokens_u32,
-            Self::Four | Self::Sixteen => tokens_u32.div_ceil(4),
+            Self::Four | Self::Sixteen | Self::ThirtyTwo => tokens_u32.div_ceil(4),
         }
     }
 }
@@ -312,6 +329,22 @@ pub(crate) const fn supports_16tok_gemm(device: &AdrenoVulkanDevice) -> bool {
         && limits.max_compute_shared_memory_size >= 4_480
 }
 
+pub(crate) const fn supports_32tok_gemm(device: &AdrenoVulkanDevice) -> bool {
+    let limits = &device.capabilities().compute_limits;
+    limits.max_compute_work_group_invocations >= 512
+        && limits.max_compute_work_group_size[0] >= 64
+        && limits.max_compute_work_group_size[1] >= 8
+        && limits.max_compute_shared_memory_size >= 13_056
+}
+
+pub(crate) const fn supports_splitk_gemv(device: &AdrenoVulkanDevice) -> bool {
+    let limits = &device.capabilities().compute_limits;
+    limits.max_compute_work_group_invocations >= 256
+        && limits.max_compute_work_group_size[0] >= 64
+        && limits.max_compute_work_group_size[1] >= 4
+        && limits.max_compute_shared_memory_size >= 1_024
+}
+
 pub(crate) struct PreparedShaderSpec {
     pub(crate) tag: &'static [u8],
     pub(crate) words: Vec<u32>,
@@ -322,20 +355,20 @@ pub(crate) struct PreparedShaderSpec {
 
 pub(crate) struct PreparedProjectionShaders {
     pub(crate) digest_sha256: String,
-    modules: [PreparedShaderSpec; 30],
+    modules: [PreparedShaderSpec; 43],
 }
 
 impl ProjectionPipelines {
     #[expect(
         clippy::too_many_lines,
-        reason = "Emits and digests all 1-tok, 4-tok, 16-tok shared-memory GEMM, quantization, and helper SPIR-V modules sequentially."
+        reason = "Emits and digests all 1-tok, Split-K, 4-tok, 16-tok, 32-tok shared-memory GEMM, quantization, and helper SPIR-V modules sequentially."
     )]
     pub(crate) fn prepare_with_subgroup(
         use_sdot: bool,
         use_wave64_shuffle: bool,
     ) -> Result<PreparedProjectionShaders, Error> {
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"projection-pipelines-v5:")?;
+        hash_bytes(&mut hasher, b"projection-pipelines-v6:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
         hash_u32(&mut hasher, u32::from(use_wave64_shuffle))?;
         let mut make_spec = |tag: &'static [u8],
@@ -428,10 +461,52 @@ impl ProjectionPipelines {
                 4,
                 4,
             )?,
+            make_spec(
+                b"pq2_q8k_32tok_fused",
+                spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, true, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_32tok_unfused",
+                spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, false, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_32tok_fused_res",
+                spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, true, true),
+                4,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_32tok_unfused_res",
+                spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, false, true),
+                4,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_splitk_fused",
+                spirv::pq2_q8k_gemv_splitk(use_sdot, true, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8k_splitk_unfused",
+                spirv::pq2_q8k_gemv_splitk(use_sdot, false, false),
+                3,
+                4,
+            )?,
             make_spec(b"pq2_q8_0", spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?,
             make_spec(
                 b"pq2_q8_0_4tok",
                 spirv::pq2_q8_0_gemm_4tok_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8_0_splitk",
+                spirv::pq2_q8_0_gemv_splitk(use_sdot),
                 3,
                 4,
             )?,
@@ -472,6 +547,30 @@ impl ProjectionPipelines {
                 4,
             )?,
             make_spec(
+                b"ptq1_q8_0_32tok",
+                spirv::ptq1_q8_0_gemm_32tok_coalesced(use_sdot, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0_32tok_pinned",
+                spirv::ptq1_q8_0_gemm_32tok_coalesced(use_sdot, true),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0_splitk",
+                spirv::ptq1_q8_0_gemv_splitk(use_sdot, false),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"ptq1_q8_0_splitk_pinned",
+                spirv::ptq1_q8_0_gemv_splitk(use_sdot, true),
+                3,
+                4,
+            )?,
+            make_spec(
                 b"q8_0_q8_0",
                 spirv::q8_0_q8_0_gemv_coalesced(use_sdot),
                 3,
@@ -486,6 +585,18 @@ impl ProjectionPipelines {
             make_spec(
                 b"q8_0_q8_0_16tok",
                 spirv::q8_0_q8_0_gemm_16tok_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"q8_0_q8_0_32tok",
+                spirv::q8_0_q8_0_gemm_32tok_coalesced(use_sdot),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"q8_0_q8_0_splitk",
+                spirv::q8_0_q8_0_gemv_splitk(use_sdot),
                 3,
                 4,
             )?,
@@ -517,6 +628,10 @@ impl ProjectionPipelines {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Compiles all 43 prepared projection SPIR-V modules into Vulkan compute pipelines."
+    )]
     pub(crate) fn compile_prepared(
         device: &mut AdrenoVulkanDevice,
         prepared: PreparedProjectionShaders,
@@ -544,17 +659,30 @@ impl ProjectionPipelines {
             pq2_q8k_16tok_unfused,
             pq2_q8k_16tok_fused_res,
             pq2_q8k_16tok_unfused_res,
+            pq2_q8k_32tok_fused,
+            pq2_q8k_32tok_unfused,
+            pq2_q8k_32tok_fused_res,
+            pq2_q8k_32tok_unfused_res,
+            pq2_q8k_splitk_fused,
+            pq2_q8k_splitk_unfused,
             pq2_q8_0,
             pq2_q8_0_4tok,
+            pq2_q8_0_splitk,
             ptq1_q8_0,
             ptq1_q8_0_pinned,
             ptq1_q8_0_4tok,
             ptq1_q8_0_4tok_pinned,
             ptq1_q8_0_16tok,
             ptq1_q8_0_16tok_pinned,
+            ptq1_q8_0_32tok,
+            ptq1_q8_0_32tok_pinned,
+            ptq1_q8_0_splitk,
+            ptq1_q8_0_splitk_pinned,
             q8_0_q8_0,
             q8_0_q8_0_4tok,
             q8_0_q8_0_16tok,
+            q8_0_q8_0_32tok,
+            q8_0_q8_0_splitk,
             ptq1_q8k,
             quant_q8k_pinned,
             quant_q8k_unpinned,
@@ -562,7 +690,7 @@ impl ProjectionPipelines {
             swiglu_unpinned,
             hadamard,
             dot_scalar,
-        ]: [PipelineId; 30] = ids
+        ]: [PipelineId; 43] = ids
             .try_into()
             .map_err(|_| Error::InvalidInput("projection pipeline count mismatch".to_owned()))?;
 
@@ -579,17 +707,30 @@ impl ProjectionPipelines {
             pq2_q8k_16tok_unfused,
             pq2_q8k_16tok_fused_res,
             pq2_q8k_16tok_unfused_res,
+            pq2_q8k_32tok_fused,
+            pq2_q8k_32tok_unfused,
+            pq2_q8k_32tok_fused_res,
+            pq2_q8k_32tok_unfused_res,
+            pq2_q8k_splitk_fused,
+            pq2_q8k_splitk_unfused,
             pq2_q8_0,
             pq2_q8_0_4tok,
+            pq2_q8_0_splitk,
             ptq1_q8_0,
             ptq1_q8_0_pinned,
             ptq1_q8_0_4tok,
             ptq1_q8_0_4tok_pinned,
             ptq1_q8_0_16tok,
             ptq1_q8_0_16tok_pinned,
+            ptq1_q8_0_32tok,
+            ptq1_q8_0_32tok_pinned,
+            ptq1_q8_0_splitk,
+            ptq1_q8_0_splitk_pinned,
             q8_0_q8_0,
             q8_0_q8_0_4tok,
             q8_0_q8_0_16tok,
+            q8_0_q8_0_32tok,
+            q8_0_q8_0_splitk,
             ptq1_q8k,
             quant_q8k_pinned,
             quant_q8k_unpinned,
@@ -619,14 +760,32 @@ impl ProjectionPipelines {
             (BatchTokenPath::Sixteen, false, false) => self.pq2_q8k_16tok_unfused,
             (BatchTokenPath::Sixteen, true, true) => self.pq2_q8k_16tok_fused_res,
             (BatchTokenPath::Sixteen, false, true) => self.pq2_q8k_16tok_unfused_res,
+            (BatchTokenPath::ThirtyTwo, true, false) => self.pq2_q8k_32tok_fused,
+            (BatchTokenPath::ThirtyTwo, false, false) => self.pq2_q8k_32tok_unfused,
+            (BatchTokenPath::ThirtyTwo, true, true) => self.pq2_q8k_32tok_fused_res,
+            (BatchTokenPath::ThirtyTwo, false, true) => self.pq2_q8k_32tok_unfused_res,
+        }
+    }
+
+    pub(crate) const fn select_pq2_q8k_decode_splitk(&self, fused: bool) -> PipelineId {
+        if fused {
+            self.pq2_q8k_splitk_fused
+        } else {
+            self.pq2_q8k_splitk_unfused
         }
     }
 
     pub(crate) const fn select_pq2_q8_0(&self, path: BatchTokenPath) -> PipelineId {
         match path {
             BatchTokenPath::Single => self.pq2_q8_0,
-            BatchTokenPath::Four | BatchTokenPath::Sixteen => self.pq2_q8_0_4tok,
+            BatchTokenPath::Four | BatchTokenPath::Sixteen | BatchTokenPath::ThirtyTwo => {
+                self.pq2_q8_0_4tok
+            }
         }
+    }
+
+    pub(crate) const fn select_pq2_q8_0_decode_splitk(&self) -> PipelineId {
+        self.pq2_q8_0_splitk
     }
 
     pub(crate) const fn select_ptq1_q8_0(&self, pinned: bool, path: BatchTokenPath) -> PipelineId {
@@ -637,6 +796,16 @@ impl ProjectionPipelines {
             (BatchTokenPath::Four, true) => self.ptq1_q8_0_4tok_pinned,
             (BatchTokenPath::Sixteen, false) => self.ptq1_q8_0_16tok,
             (BatchTokenPath::Sixteen, true) => self.ptq1_q8_0_16tok_pinned,
+            (BatchTokenPath::ThirtyTwo, false) => self.ptq1_q8_0_32tok,
+            (BatchTokenPath::ThirtyTwo, true) => self.ptq1_q8_0_32tok_pinned,
+        }
+    }
+
+    pub(crate) const fn select_ptq1_q8_0_decode_splitk(&self, pinned: bool) -> PipelineId {
+        if pinned {
+            self.ptq1_q8_0_splitk_pinned
+        } else {
+            self.ptq1_q8_0_splitk
         }
     }
 
@@ -645,7 +814,12 @@ impl ProjectionPipelines {
             BatchTokenPath::Single => self.q8_0_q8_0,
             BatchTokenPath::Four => self.q8_0_q8_0_4tok,
             BatchTokenPath::Sixteen => self.q8_0_q8_0_16tok,
+            BatchTokenPath::ThirtyTwo => self.q8_0_q8_0_32tok,
         }
+    }
+
+    pub(crate) const fn select_q8_0_q8_0_decode_splitk(&self) -> PipelineId {
+        self.q8_0_q8_0_splitk
     }
 }
 
@@ -928,7 +1102,9 @@ impl VulkanPq2Executor {
             .ok_or_else(|| Error::ResourceLimit("projection output count overflow".to_owned()))?;
         let act_bytes = u32_slice_bytes(act_words.len())?;
         let out_bytes = f32_slice_bytes(total_outputs)?;
-        let grid_y = if is_16tok_pipeline(&self.pipes, pipeline) {
+        let grid_y = if is_32tok_pipeline(&self.pipes, pipeline) {
+            tokens_u32.div_ceil(32)
+        } else if is_16tok_pipeline(&self.pipes, pipeline) {
             tokens_u32.div_ceil(16)
         } else if is_4tok_pipeline(&self.pipes, pipeline) {
             tokens_u32.div_ceil(4)
@@ -2722,6 +2898,16 @@ fn is_4tok_pipeline(pipes: &ProjectionPipelines, pipe: PipelineId) -> bool {
         || pipe == pipes.q8_0_q8_0_4tok
 }
 
+fn is_32tok_pipeline(pipes: &ProjectionPipelines, pipe: PipelineId) -> bool {
+    pipe == pipes.pq2_q8k_32tok_fused
+        || pipe == pipes.pq2_q8k_32tok_unfused
+        || pipe == pipes.pq2_q8k_32tok_fused_res
+        || pipe == pipes.pq2_q8k_32tok_unfused_res
+        || pipe == pipes.ptq1_q8_0_32tok
+        || pipe == pipes.ptq1_q8_0_32tok_pinned
+        || pipe == pipes.q8_0_q8_0_32tok
+}
+
 fn is_16tok_pipeline(pipes: &ProjectionPipelines, pipe: PipelineId) -> bool {
     pipe == pipes.pq2_q8k_16tok_fused
         || pipe == pipes.pq2_q8k_16tok_unfused
@@ -3321,5 +3507,360 @@ mod tests {
             data: Arc::<[u8]>::from(vec![0_u8; Q8_0_BLOCK_BYTES]).into(),
         };
         assert!(validate_matrix(&bad_len, KIND_Q8_0, 32).is_err());
+    }
+
+    #[test]
+    #[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "End-to-end live Adreno parity check across all three 32-token double-buffered GEMMs."
+    )]
+    fn gemm32_pq2_q8_0_and_ptq1_match_1tok_at_t32() -> Result<(), Error> {
+        let mut dev = AdrenoVulkanDevice::open()?;
+        let sdot = dev.capabilities().supports_integer_dot_4x8();
+        let cols = 1024_usize;
+        let rows = 131_usize;
+        let tokens = 32_usize;
+        let pq2_bpr = cols / 128;
+        let q8_bpr = cols / 32;
+
+        let make_coal = |bpr: usize| -> Vec<u32> {
+            let rg = rows.div_ceil(64);
+            let mut out = vec![0_u32; rg * bpr * 544];
+            for (i, w) in out.iter_mut().enumerate() {
+                let in_tile = i % 544;
+                if in_tile < 32 {
+                    *w = 0x3800_3400; // two small finite f16 scales (0.25, 0.5)
+                } else {
+                    *w = u32::try_from((i * 17 + 3) & 0xFFFF_FFFF).unwrap_or(0);
+                }
+            }
+            out
+        };
+        let w_544 = make_coal(q8_bpr);
+        let w_ptq1 = {
+            let rg = rows.div_ceil(64);
+            let mut out = vec![0_u32; rg * pq2_bpr * 448];
+            for (i, w) in out.iter_mut().enumerate() {
+                let in_tile = i % 448;
+                if in_tile >= 384 {
+                    *w = 0x3400_0010;
+                } else {
+                    *w = u32::try_from((i * 13 + 1) & 0x0FFF_0FFF).unwrap_or(0);
+                }
+            }
+            out
+        };
+        let act_q8k: Vec<u32> = (0..tokens * pq2_bpr * 34)
+            .map(|i| {
+                if i % 34 == 0 {
+                    0.125_f32.to_bits()
+                } else if i % 34 == 1 {
+                    12_i32.cast_unsigned()
+                } else {
+                    0x0102_0304_u32.wrapping_add(u32::try_from(i).unwrap_or(0))
+                }
+            })
+            .collect();
+        let act_q8_0: Vec<u32> = (0..tokens * q8_bpr * 9)
+            .map(|i| {
+                if i % 9 == 0 {
+                    0.125_f32.to_bits()
+                } else {
+                    0x01FF_02FE_u32.wrapping_add(u32::try_from(i).unwrap_or(0))
+                }
+            })
+            .collect();
+
+        let b_w544 = dev.create_storage_buffer(u32_slice_bytes(w_544.len())?)?;
+        let b_ptq1 = dev.create_storage_buffer(u32_slice_bytes(w_ptq1.len())?)?;
+        let buf_act_q8k = dev.create_storage_buffer(u32_slice_bytes(act_q8k.len())?)?;
+        let buf_act_q8_0 = dev.create_storage_buffer(u32_slice_bytes(act_q8_0.len())?)?;
+        let b_ref = dev.create_storage_buffer(f32_slice_bytes(tokens * rows)?)?;
+        let b_32 = dev.create_storage_buffer(f32_slice_bytes(tokens * rows)?)?;
+        dev.write_buffer_u32(b_w544, &w_544)?;
+        dev.write_buffer_u32(b_ptq1, &w_ptq1)?;
+        dev.write_buffer_u32(buf_act_q8k, &act_q8k)?;
+        dev.write_buffer_u32(buf_act_q8_0, &act_q8_0)?;
+
+        let rows_u32 = u32::try_from(rows).unwrap_or(0);
+        let tokens_u32 = u32::try_from(tokens).unwrap_or(0);
+        let tile_x = rows_u32.div_ceil(64);
+        let mut out_ref = vec![0.0_f32; tokens * rows];
+        let mut out_32 = vec![0.0_f32; tokens * rows];
+
+        for use_sdot in if sdot { vec![false, true] } else { vec![false] } {
+            // 1. PQ2 x Q8K
+            let p_ref = dev.create_compute_pipeline(
+                &spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
+                3,
+                4,
+            )?;
+            let p_32 = dev.create_compute_pipeline(
+                &spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, true, false),
+                3,
+                4,
+            )?;
+            let push_k = [
+                rows_u32,
+                u32::try_from(pq2_bpr).unwrap_or(0),
+                tokens_u32,
+                u32::try_from(pq2_bpr * 34).unwrap_or(0),
+            ];
+            dev.submit_compute(
+                p_ref,
+                &[b_w544, buf_act_q8k, b_ref],
+                &push_k,
+                [tile_x, tokens_u32, 1],
+            )?;
+            dev.submit_compute(p_32, &[b_w544, buf_act_q8k, b_32], &push_k, [tile_x, 1, 1])?;
+            dev.read_buffer_f32(b_ref, &mut out_ref)?;
+            dev.read_buffer_f32(b_32, &mut out_32)?;
+            for (i, (&a, &b)) in out_32.iter().zip(&out_ref).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "pq2_q8k T=32 sdot={use_sdot} idx={i}"
+                );
+            }
+
+            // 2. Q8_0 x Q8_0
+            let q_ref =
+                dev.create_compute_pipeline(&spirv::q8_0_q8_0_gemv_coalesced(use_sdot), 3, 4)?;
+            let q_32 = dev.create_compute_pipeline(
+                &spirv::q8_0_q8_0_gemm_32tok_coalesced(use_sdot),
+                3,
+                4,
+            )?;
+            let push_8 = [
+                rows_u32,
+                u32::try_from(q8_bpr).unwrap_or(0),
+                tokens_u32,
+                u32::try_from(q8_bpr * 9).unwrap_or(0),
+            ];
+            dev.submit_compute(
+                q_ref,
+                &[b_w544, buf_act_q8_0, b_ref],
+                &push_8,
+                [tile_x, tokens_u32, 1],
+            )?;
+            dev.submit_compute(q_32, &[b_w544, buf_act_q8_0, b_32], &push_8, [tile_x, 1, 1])?;
+            dev.read_buffer_f32(b_ref, &mut out_ref)?;
+            dev.read_buffer_f32(b_32, &mut out_32)?;
+            for (i, (&a, &b)) in out_32.iter().zip(&out_ref).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "q8_0 T=32 sdot={use_sdot} idx={i}"
+                );
+            }
+
+            // 3. PTQ1 x Q8_0
+            for pinned in [false, true] {
+                let t_ref = dev.create_compute_pipeline(
+                    &spirv::ptq1_q8_0_gemv_coalesced(use_sdot, pinned),
+                    3,
+                    4,
+                )?;
+                let t_32 = dev.create_compute_pipeline(
+                    &spirv::ptq1_q8_0_gemm_32tok_coalesced(use_sdot, pinned),
+                    3,
+                    4,
+                )?;
+                let push_t = [
+                    rows_u32,
+                    u32::try_from(pq2_bpr).unwrap_or(0),
+                    tokens_u32,
+                    u32::try_from(pq2_bpr * 36).unwrap_or(0),
+                ];
+                dev.submit_compute(
+                    t_ref,
+                    &[b_ptq1, buf_act_q8_0, b_ref],
+                    &push_t,
+                    [tile_x, tokens_u32, 1],
+                )?;
+                dev.submit_compute(t_32, &[b_ptq1, buf_act_q8_0, b_32], &push_t, [tile_x, 1, 1])?;
+                dev.read_buffer_f32(b_ref, &mut out_ref)?;
+                dev.read_buffer_f32(b_32, &mut out_32)?;
+                for (i, (&a, &b)) in out_32.iter().zip(&out_ref).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "ptq1 T=32 sdot={use_sdot} pinned={pinned} idx={i}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "End-to-end live Adreno parity check across Split-K decode GEMVs."
+    )]
+    fn splitk_decode_gemvs_compile_and_match_1tok_within_1e4() -> Result<(), Error> {
+        let mut dev = AdrenoVulkanDevice::open()?;
+        if !supports_splitk_gemv(&dev) {
+            return Ok(());
+        }
+        let sdot = dev.capabilities().supports_integer_dot_4x8();
+        let cols = 2048_usize;
+        let rows = 131_usize;
+        let pq2_bpr = cols / 128;
+        let q8_bpr = cols / 32;
+        let rg = rows.div_ceil(64);
+
+        let w_544: Vec<u32> = (0..rg * q8_bpr * 544)
+            .map(|i| {
+                if i % 544 < 32 {
+                    0x3400_3200
+                } else {
+                    u32::try_from((i * 17 + 3) & 0xFFFF_FFFF).unwrap_or(0)
+                }
+            })
+            .collect();
+        let w_ptq1: Vec<u32> = (0..rg * pq2_bpr * 448)
+            .map(|i| {
+                if i % 448 >= 384 {
+                    0x3400_0010
+                } else {
+                    u32::try_from((i * 13 + 1) & 0x0FFF_0FFF).unwrap_or(0)
+                }
+            })
+            .collect();
+        let act_q8k: Vec<u32> = (0..pq2_bpr * 34)
+            .map(|i| {
+                if i % 34 == 0 {
+                    0.0625_f32.to_bits()
+                } else if i % 34 == 1 {
+                    12_i32.cast_unsigned()
+                } else {
+                    0x0102_0304_u32.wrapping_add(u32::try_from(i).unwrap_or(0))
+                }
+            })
+            .collect();
+        let act_q8_0: Vec<u32> = (0..q8_bpr * 9)
+            .map(|i| {
+                if i % 9 == 0 {
+                    0.0625_f32.to_bits()
+                } else {
+                    0x01FF_02FE_u32.wrapping_add(u32::try_from(i).unwrap_or(0))
+                }
+            })
+            .collect();
+
+        let b_w544 = dev.create_storage_buffer(u32_slice_bytes(w_544.len())?)?;
+        let b_ptq1 = dev.create_storage_buffer(u32_slice_bytes(w_ptq1.len())?)?;
+        let buf_act_q8k = dev.create_storage_buffer(u32_slice_bytes(act_q8k.len())?)?;
+        let buf_act_q8_0 = dev.create_storage_buffer(u32_slice_bytes(act_q8_0.len())?)?;
+        let b_ref = dev.create_storage_buffer(f32_slice_bytes(rows)?)?;
+        let buf_splitk = dev.create_storage_buffer(f32_slice_bytes(rows)?)?;
+        dev.write_buffer_u32(b_w544, &w_544)?;
+        dev.write_buffer_u32(b_ptq1, &w_ptq1)?;
+        dev.write_buffer_u32(buf_act_q8k, &act_q8k)?;
+        dev.write_buffer_u32(buf_act_q8_0, &act_q8_0)?;
+
+        let rows_u32 = u32::try_from(rows).unwrap_or(0);
+        let tile_x = rows_u32.div_ceil(64);
+        let mut out_ref = vec![0.0_f32; rows];
+        let mut out_sk = vec![0.0_f32; rows];
+
+        for use_sdot in if sdot { vec![false, true] } else { vec![false] } {
+            let push_k = [
+                rows_u32,
+                u32::try_from(pq2_bpr).unwrap_or(0),
+                1,
+                u32::try_from(pq2_bpr * 34).unwrap_or(0),
+            ];
+            let p_ref = dev.create_compute_pipeline(
+                &spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
+                3,
+                4,
+            )?;
+            let p_sk = dev.create_compute_pipeline(
+                &spirv::pq2_q8k_gemv_splitk(use_sdot, true, false),
+                3,
+                4,
+            )?;
+            dev.submit_compute(
+                p_ref,
+                &[b_w544, buf_act_q8k, b_ref],
+                &push_k,
+                [tile_x, 1, 1],
+            )?;
+            dev.submit_compute(
+                p_sk,
+                &[b_w544, buf_act_q8k, buf_splitk],
+                &push_k,
+                [tile_x, 1, 1],
+            )?;
+            dev.read_buffer_f32(b_ref, &mut out_ref)?;
+            dev.read_buffer_f32(buf_splitk, &mut out_sk)?;
+            for (i, (&a, &b)) in out_sk.iter().zip(&out_ref).enumerate() {
+                assert!((a - b).abs() <= 1e-4, "pq2_q8k splitk idx={i} {a} vs {b}");
+            }
+
+            let push_8 = [
+                rows_u32,
+                u32::try_from(q8_bpr).unwrap_or(0),
+                1,
+                u32::try_from(q8_bpr * 9).unwrap_or(0),
+            ];
+            let q_ref =
+                dev.create_compute_pipeline(&spirv::q8_0_q8_0_gemv_coalesced(use_sdot), 3, 4)?;
+            let q_sk =
+                dev.create_compute_pipeline(&spirv::q8_0_q8_0_gemv_splitk(use_sdot), 3, 4)?;
+            dev.submit_compute(
+                q_ref,
+                &[b_w544, buf_act_q8_0, b_ref],
+                &push_8,
+                [tile_x, 1, 1],
+            )?;
+            dev.submit_compute(
+                q_sk,
+                &[b_w544, buf_act_q8_0, buf_splitk],
+                &push_8,
+                [tile_x, 1, 1],
+            )?;
+            dev.read_buffer_f32(b_ref, &mut out_ref)?;
+            dev.read_buffer_f32(buf_splitk, &mut out_sk)?;
+            for (i, (&a, &b)) in out_sk.iter().zip(&out_ref).enumerate() {
+                assert!((a - b).abs() <= 1e-4, "q8_0 splitk idx={i} {a} vs {b}");
+            }
+
+            let push_t = [
+                rows_u32,
+                u32::try_from(pq2_bpr).unwrap_or(0),
+                1,
+                u32::try_from(pq2_bpr * 36).unwrap_or(0),
+            ];
+            let t_ref = dev.create_compute_pipeline(
+                &spirv::ptq1_q8_0_gemv_coalesced(use_sdot, true),
+                3,
+                4,
+            )?;
+            let t_sk =
+                dev.create_compute_pipeline(&spirv::ptq1_q8_0_gemv_splitk(use_sdot, true), 3, 4)?;
+            dev.submit_compute(
+                t_ref,
+                &[b_ptq1, buf_act_q8_0, b_ref],
+                &push_t,
+                [tile_x, 1, 1],
+            )?;
+            dev.submit_compute(
+                t_sk,
+                &[b_ptq1, buf_act_q8_0, buf_splitk],
+                &push_t,
+                [tile_x, 1, 1],
+            )?;
+            dev.read_buffer_f32(b_ref, &mut out_ref)?;
+            dev.read_buffer_f32(buf_splitk, &mut out_sk)?;
+            for (i, (&a, &b)) in out_sk.iter().zip(&out_ref).enumerate() {
+                assert!((a - b).abs() <= 1e-4, "ptq1 splitk idx={i} {a} vs {b}");
+            }
+        }
+        Ok(())
     }
 }

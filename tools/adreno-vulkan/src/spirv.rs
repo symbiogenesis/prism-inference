@@ -42,6 +42,7 @@ const OP_STORE: u16 = 62;
 const OP_ACCESS_CHAIN: u16 = 65;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
+const OP_COMPOSITE_CONSTRUCT: u16 = 80;
 const OP_COMPOSITE_EXTRACT: u16 = 81;
 const OP_CONVERT_F_TO_S: u16 = 110;
 const OP_CONVERT_S_TO_F: u16 = 111;
@@ -54,6 +55,7 @@ const OP_F_SUB: u16 = 131;
 const OP_I_MUL: u16 = 132;
 const OP_F_MUL: u16 = 133;
 const OP_U_DIV: u16 = 134;
+const OP_U_MOD: u16 = 137;
 const OP_F_DIV: u16 = 136;
 const OP_LOGICAL_OR: u16 = 166;
 const OP_LOGICAL_AND: u16 = 167;
@@ -136,6 +138,9 @@ const PACKED_FORMAT_4X8_BIT: u32 = 0;
 enum ElemType {
     U32,
     F32,
+    Uvec4,
+    #[expect(dead_code, reason = "Used by vec4 GDN decode and attention kernels.")]
+    Vec4,
 }
 
 #[derive(Clone, Copy)]
@@ -165,6 +170,8 @@ struct ShaderBuilder {
     f32_t: u32,
     vec2f32_t: u32,
     vec3u32_t: u32,
+    uvec4_t: u32,
+    vec4f32_t: u32,
 
     ptr_input_vec3u32_t: u32,
     ptr_input_u32_t: u32,
@@ -174,15 +181,23 @@ struct ShaderBuilder {
     ptr_push_u32_t: Option<u32>,
     ptr_sb_u32_t: Option<u32>,
     ptr_sb_f32_t: Option<u32>,
+    ptr_sb_uvec4_t: Option<u32>,
+    ptr_sb_vec4f32_t: Option<u32>,
     ptr_wg_f32_t: Option<u32>,
     ptr_wg_u32_t: Option<u32>,
 
     rt_u32_t: Option<u32>,
     rt_f32_t: Option<u32>,
+    rt_uvec4_t: Option<u32>,
+    rt_vec4f32_t: Option<u32>,
     ro_u32_buf_t: Option<u32>,
     rw_u32_buf_t: Option<u32>,
     ro_f32_buf_t: Option<u32>,
     rw_f32_buf_t: Option<u32>,
+    ro_uvec4_buf_t: Option<u32>,
+    rw_uvec4_buf_t: Option<u32>,
+    ro_vec4f32_buf_t: Option<u32>,
+    rw_vec4f32_buf_t: Option<u32>,
 
     u32_consts: BTreeMap<u32, u32>,
     i32_consts: BTreeMap<u32, u32>,
@@ -219,6 +234,10 @@ impl ShaderBuilder {
         Self::new_with_subgroup(use_sdot, false, push_u32_count)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Initializes all SPIR-V type/pointer/constant caches and entry block."
+    )]
     fn new_with_subgroup(
         use_sdot: bool,
         use_subgroup_shuffle: bool,
@@ -244,6 +263,8 @@ impl ShaderBuilder {
             f32_t: 0,
             vec2f32_t: 0,
             vec3u32_t: 0,
+            uvec4_t: 0,
+            vec4f32_t: 0,
             ptr_input_vec3u32_t: 0,
             ptr_input_u32_t: 0,
             ptr_fn_f32_t: None,
@@ -252,14 +273,22 @@ impl ShaderBuilder {
             ptr_push_u32_t: None,
             ptr_sb_u32_t: None,
             ptr_sb_f32_t: None,
+            ptr_sb_uvec4_t: None,
+            ptr_sb_vec4f32_t: None,
             ptr_wg_f32_t: None,
             ptr_wg_u32_t: None,
             rt_u32_t: None,
             rt_f32_t: None,
+            rt_uvec4_t: None,
+            rt_vec4f32_t: None,
             ro_u32_buf_t: None,
             rw_u32_buf_t: None,
             ro_f32_buf_t: None,
             rw_f32_buf_t: None,
+            ro_uvec4_buf_t: None,
+            rw_uvec4_buf_t: None,
+            ro_vec4f32_buf_t: None,
+            rw_vec4f32_buf_t: None,
             u32_consts: BTreeMap::new(),
             i32_consts: BTreeMap::new(),
             f32_consts: BTreeMap::new(),
@@ -366,6 +395,18 @@ impl ShaderBuilder {
             &mut self.types_consts_globals,
             OP_TYPE_VECTOR,
             &[self.vec3u32_t, self.u32_t, 3],
+        );
+        self.uvec4_t = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_VECTOR,
+            &[self.uvec4_t, self.u32_t, 4],
+        );
+        self.vec4f32_t = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_VECTOR,
+            &[self.vec4f32_t, self.f32_t, 4],
         );
         self.ptr_input_vec3u32_t = self.alloc_id();
         push_inst(
@@ -645,6 +686,42 @@ impl ShaderBuilder {
                 self.rt_f32_t = Some(rt);
                 rt
             }
+            ElemType::Uvec4 => {
+                if let Some(id) = self.rt_uvec4_t {
+                    return id;
+                }
+                let rt = self.alloc_id();
+                push_inst(
+                    &mut self.types_consts_globals,
+                    OP_TYPE_RUNTIME_ARRAY,
+                    &[rt, self.uvec4_t],
+                );
+                push_inst(
+                    &mut self.annotations,
+                    OP_DECORATE,
+                    &[rt, DECORATION_ARRAY_STRIDE, 16],
+                );
+                self.rt_uvec4_t = Some(rt);
+                rt
+            }
+            ElemType::Vec4 => {
+                if let Some(id) = self.rt_vec4f32_t {
+                    return id;
+                }
+                let rt = self.alloc_id();
+                push_inst(
+                    &mut self.types_consts_globals,
+                    OP_TYPE_RUNTIME_ARRAY,
+                    &[rt, self.vec4f32_t],
+                );
+                push_inst(
+                    &mut self.annotations,
+                    OP_DECORATE,
+                    &[rt, DECORATION_ARRAY_STRIDE, 16],
+                );
+                self.rt_vec4f32_t = Some(rt);
+                rt
+            }
         }
     }
 
@@ -655,6 +732,10 @@ impl ShaderBuilder {
             (ElemType::F32, AccessMode::ReadOnly) => &mut self.ro_f32_buf_t,
             (ElemType::F32, AccessMode::ReadWrite) => &mut self.rw_f32_buf_t,
             (ElemType::U32, AccessMode::ReadWrite) => &mut self.rw_u32_buf_t,
+            (ElemType::Uvec4, AccessMode::ReadOnly) => &mut self.ro_uvec4_buf_t,
+            (ElemType::Uvec4, AccessMode::ReadWrite) => &mut self.rw_uvec4_buf_t,
+            (ElemType::Vec4, AccessMode::ReadOnly) => &mut self.ro_vec4f32_buf_t,
+            (ElemType::Vec4, AccessMode::ReadWrite) => &mut self.rw_vec4f32_buf_t,
         };
         let struct_t = if let Some(id) = *cache {
             id
@@ -665,6 +746,10 @@ impl ShaderBuilder {
                 (ElemType::F32, AccessMode::ReadOnly) => &mut self.ro_f32_buf_t,
                 (ElemType::F32, AccessMode::ReadWrite) => &mut self.rw_f32_buf_t,
                 (ElemType::U32, AccessMode::ReadWrite) => &mut self.rw_u32_buf_t,
+                (ElemType::Uvec4, AccessMode::ReadOnly) => &mut self.ro_uvec4_buf_t,
+                (ElemType::Uvec4, AccessMode::ReadWrite) => &mut self.rw_uvec4_buf_t,
+                (ElemType::Vec4, AccessMode::ReadOnly) => &mut self.ro_vec4f32_buf_t,
+                (ElemType::Vec4, AccessMode::ReadWrite) => &mut self.rw_vec4f32_buf_t,
             } = Some(s);
             s
         };
@@ -747,6 +832,34 @@ impl ShaderBuilder {
             &[id, STORAGE_STORAGE_BUFFER, self.f32_t],
         );
         self.ptr_sb_f32_t = Some(id);
+        id
+    }
+
+    fn ptr_sb_uvec4(&mut self) -> u32 {
+        if let Some(id) = self.ptr_sb_uvec4_t {
+            return id;
+        }
+        let id = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_POINTER,
+            &[id, STORAGE_STORAGE_BUFFER, self.uvec4_t],
+        );
+        self.ptr_sb_uvec4_t = Some(id);
+        id
+    }
+
+    fn ptr_sb_vec4f32(&mut self) -> u32 {
+        if let Some(id) = self.ptr_sb_vec4f32_t {
+            return id;
+        }
+        let id = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_POINTER,
+            &[id, STORAGE_STORAGE_BUFFER, self.vec4f32_t],
+        );
+        self.ptr_sb_vec4f32_t = Some(id);
         id
     }
 
@@ -1004,6 +1117,69 @@ impl ShaderBuilder {
         push_inst(&mut self.fn_body, OP_STORE, &[ptr, val]);
     }
 
+    fn load_sb_uvec4(&mut self, buf_var: u32, idx: u32) -> u32 {
+        let ptr_t = self.ptr_sb_uvec4();
+        let zero = self.const_u32(0);
+        let ptr = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_ACCESS_CHAIN,
+            &[ptr_t, ptr, buf_var, zero, idx],
+        );
+        let val = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_LOAD, &[self.uvec4_t, val, ptr]);
+        val
+    }
+
+    #[expect(dead_code, reason = "Used by vec4 GDN decode and attention kernels.")]
+    fn load_sb_vec4(&mut self, buf_var: u32, idx: u32) -> u32 {
+        let ptr_t = self.ptr_sb_vec4f32();
+        let zero = self.const_u32(0);
+        let ptr = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_ACCESS_CHAIN,
+            &[ptr_t, ptr, buf_var, zero, idx],
+        );
+        let val = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_LOAD, &[self.vec4f32_t, val, ptr]);
+        val
+    }
+
+    #[allow(dead_code, reason = "Used by vectorized vec4 storage stores.")]
+    fn store_sb_vec4(&mut self, buf_var: u32, idx: u32, val: u32) {
+        let ptr_t = self.ptr_sb_vec4f32();
+        let zero = self.const_u32(0);
+        let ptr = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_ACCESS_CHAIN,
+            &[ptr_t, ptr, buf_var, zero, idx],
+        );
+        push_inst(&mut self.fn_body, OP_STORE, &[ptr, val]);
+    }
+
+    fn composite_extract(&mut self, res_t: u32, composite: u32, index: u32) -> u32 {
+        let id = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_COMPOSITE_EXTRACT,
+            &[res_t, id, composite, index],
+        );
+        id
+    }
+
+    #[allow(dead_code, reason = "Used to construct vec4/uvec4 composites.")]
+    fn composite_construct(&mut self, res_t: u32, components: &[u32]) -> u32 {
+        let id = self.alloc_id();
+        let mut ops = Vec::with_capacity(2 + components.len());
+        ops.push(res_t);
+        ops.push(id);
+        ops.extend_from_slice(components);
+        push_inst(&mut self.fn_body, OP_COMPOSITE_CONSTRUCT, &ops);
+        id
+    }
+
     fn load_wg_f32(&mut self, arr_var: u32, idx: u32) -> u32 {
         let ptr_t = self.ptr_wg_f32();
         let ptr = self.alloc_id();
@@ -1044,6 +1220,10 @@ impl ShaderBuilder {
 
     fn udiv(&mut self, a: u32, b: u32) -> u32 {
         self.binop(OP_U_DIV, self.u32_t, a, b)
+    }
+
+    fn umod(&mut self, a: u32, b: u32) -> u32 {
+        self.binop(OP_U_MOD, self.u32_t, a, b)
     }
 
     fn iadd(&mut self, a: u32, b: u32) -> u32 {
@@ -4120,6 +4300,1255 @@ pub fn ptq1_q8_0_gemm_16tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec
     });
 
     b.finish_with_local_size([64, 8, 1])
+}
+
+struct Workgroup32TokIds {
+    lane: u32,
+    wy: u32,
+    tid: u32,
+    row: u32,
+    rows: u32,
+    blocks_per_row: u32,
+    tokens: u32,
+    act_words_per_token: u32,
+    rg_vec_base: u32,
+    row_ok: u32,
+    wg_ok: u32,
+    tks: [u32; 4],
+}
+
+fn setup_32tok_workgroup(
+    b: &mut ShaderBuilder,
+    push_var: u32,
+    tile_words: u32,
+) -> Workgroup32TokIds {
+    let wid = b.workgroup_id();
+    let lid = b.local_invocation_id();
+    let rg = b.load_input_component(wid, 0);
+    let tok_tile = b.load_input_component(wid, 1);
+    let lane = b.load_input_component(lid, 0);
+    let wy = b.load_input_component(lid, 1);
+
+    let rows = b.load_push(push_var, 0);
+    let blocks_per_row = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let act_words_per_token = b.load_push(push_var, 3);
+
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let c4 = b.const_u32(4);
+    let c32 = b.const_u32(32);
+    let c64 = b.const_u32(64);
+
+    let tid_hi = b.umul(wy, c64);
+    let tid = b.uadd(tid_hi, lane);
+    let rg_start = b.umul(rg, c64);
+    let row = b.uadd(rg_start, lane);
+    let tok_base = b.umul(tok_tile, c32);
+
+    let wy4 = b.umul(wy, c4);
+    let tk0 = b.uadd(tok_base, wy4);
+    let tk1 = b.uadd(tk0, c1);
+    let tk2 = b.uadd(tk0, c2);
+    let tk3 = b.uadd(tk0, c3);
+
+    let tile_vecs = b.const_u32(tile_words / 4);
+    let rg_tiles = b.umul(rg, blocks_per_row);
+    let rg_vec_base = b.umul(rg_tiles, tile_vecs);
+
+    let rg_ok = b.u_lt(rg_start, rows);
+    let tok_ok = b.u_lt(tok_base, tokens);
+    let wg_ok = b.logical_and(rg_ok, tok_ok);
+    let row_ok = b.u_lt(row, rows);
+
+    Workgroup32TokIds {
+        lane,
+        wy,
+        tid,
+        row,
+        rows,
+        blocks_per_row,
+        tokens,
+        act_words_per_token,
+        rg_vec_base,
+        row_ok,
+        wg_ok,
+        tks: [tk0, tk1, tk2, tk3],
+    }
+}
+
+fn clamp_four_token_bases_from_tks(
+    b: &mut ShaderBuilder,
+    tks: [u32; 4],
+    tokens: u32,
+    stride: u32,
+) -> [u32; 4] {
+    let c1 = b.const_u32(1);
+    let last_tok = b.usub(tokens, c1);
+    tks.map(|tk| {
+        let ok = b.u_lt(tk, tokens);
+        let clamped = b.select(b.u32_t, ok, tk, last_tok);
+        b.umul(clamped, stride)
+    })
+}
+
+fn select_four_u32(b: &mut ShaderBuilder, idx: u32, vals: [u32; 4]) -> u32 {
+    let c0 = b.const_u32(0);
+    let c2 = b.const_u32(2);
+    let is_0 = b.u_eq(idx, c0);
+    let is_2 = b.u_eq(idx, c2);
+    let low_lt2 = b.u_lt(idx, c2);
+    let lo = b.select(b.u32_t, is_0, vals[0], vals[1]);
+    let hi = b.select(b.u32_t, is_2, vals[2], vals[3]);
+    b.select(b.u32_t, low_lt2, lo, hi)
+}
+
+fn load_uvec4_to_smem(
+    b: &mut ShaderBuilder,
+    buf: u32,
+    smem: u32,
+    vec_base: u32,
+    smem_base: u32,
+    tid: u32,
+    vec_count: u32,
+) {
+    let limit = b.const_u32(vec_count);
+    let c4 = b.const_u32(4);
+    let ok = b.u_lt(tid, limit);
+    b.emit_if(ok, |b| {
+        let g_idx = b.uadd(vec_base, tid);
+        let vec = b.load_sb_uvec4(buf, g_idx);
+        let tid4 = b.umul(tid, c4);
+        let dst = b.uadd(smem_base, tid4);
+        for comp in 0_u32..4 {
+            let word = b.composite_extract(b.u32_t, vec, comp);
+            let s_idx = if comp == 0 {
+                dst
+            } else {
+                let comp_c = b.const_u32(comp);
+                b.uadd(dst, comp_c)
+            };
+            b.store_wg_u32(smem, s_idx, word);
+        }
+    });
+}
+
+fn prefetch_uvec4_to_vars(
+    b: &mut ShaderBuilder,
+    buf: u32,
+    vec_base: u32,
+    tid: u32,
+    vec_count: u32,
+    vars: &[u32; 4],
+) {
+    let limit = b.const_u32(vec_count);
+    let ok = b.u_lt(tid, limit);
+    b.emit_if(ok, |b| {
+        let g_idx = b.uadd(vec_base, tid);
+        let vec = b.load_sb_uvec4(buf, g_idx);
+        for (comp, &var) in vars.iter().enumerate() {
+            let comp_u32 = u32::try_from(comp).unwrap_or(0);
+            let word = b.composite_extract(b.u32_t, vec, comp_u32);
+            b.store_var(var, word);
+        }
+    });
+}
+
+fn commit_vars_to_smem_uvec4(
+    b: &mut ShaderBuilder,
+    smem: u32,
+    smem_base: u32,
+    tid: u32,
+    vec_count: u32,
+    vars: &[u32; 4],
+) {
+    let limit = b.const_u32(vec_count);
+    let c4 = b.const_u32(4);
+    let ok = b.u_lt(tid, limit);
+    b.emit_if(ok, |b| {
+        let tid4 = b.umul(tid, c4);
+        let dst = b.uadd(smem_base, tid4);
+        for (comp, &var) in vars.iter().enumerate() {
+            let word = b.load_var_u32(var);
+            let s_idx = if comp == 0 {
+                dst
+            } else {
+                let comp_c = b.const_u32(u32::try_from(comp).unwrap_or(0));
+                b.uadd(dst, comp_c)
+            };
+            b.store_wg_u32(smem, s_idx, word);
+        }
+    });
+}
+
+fn store_32tok_quad_outputs<F>(
+    b: &mut ShaderBuilder,
+    out_buf: u32,
+    res_buf: Option<u32>,
+    ids: &Workgroup32TokIds,
+    mut read_final: F,
+) where
+    F: FnMut(&mut ShaderBuilder, usize) -> u32,
+{
+    for (quad_idx, &tk) in ids.tks.iter().enumerate() {
+        let tok_ok = b.u_lt(tk, ids.tokens);
+        let out_ok = b.logical_and(ids.row_ok, tok_ok);
+        b.emit_if(out_ok, |b| {
+            let tok_out = b.umul(tk, ids.rows);
+            let out_idx = b.uadd(tok_out, ids.row);
+            let final_val = read_final(b, quad_idx);
+            store_maybe_residual_f32(b, out_buf, res_buf, out_idx, final_val);
+        });
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Inner double-buffered shared-memory K-block accumulation helper for 32-token PQ2 x Q8K GEMM."
+)]
+fn emit_pq2_q8k_32tok_block(
+    b: &mut ShaderBuilder,
+    smem_w: u32,
+    smem_act: u32,
+    w_smem_base: u32,
+    lane: u32,
+    s_act_bases: [u32; 4],
+    isum_vars: [u32; 4],
+    acc_vars: [u32; 4],
+    use_sdot: bool,
+    fused: bool,
+) {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c4 = b.const_u32(4);
+    let c8 = b.const_u32(8);
+    let c32 = b.const_u32(32);
+    let c64 = b.const_u32(64);
+    let i_zero = b.const_i32(0);
+
+    for &iv in &isum_vars {
+        b.store_var(iv, i_zero);
+    }
+
+    b.emit_for_range(c0, c8, c1, |b, word_j| {
+        let j64 = b.umul(word_j, c64);
+        let w_off = b.uadd(c32, j64);
+        let w_local = b.uadd(w_off, lane);
+        let w_idx = b.uadd(w_smem_base, w_local);
+        let pq_word = b.load_wg_u32(smem_w, w_idx);
+        let q = coalesced_pq2_unpack_4digits(b, pq_word);
+
+        let j4 = b.umul(word_j, c4);
+        let plane_off = b.uadd(c2, j4);
+
+        for (&s_base, &iv) in s_act_bases.iter().zip(&isum_vars) {
+            let pbase = b.uadd(s_base, plane_off);
+            let part = dot_pq2_4digits_from_loader(
+                b,
+                q,
+                |b, idx| b.load_wg_u32(smem_act, idx),
+                pbase,
+                use_sdot,
+            );
+            let prev = b.load_var_i32(iv);
+            let next = b.iadd(prev, part);
+            b.store_var(iv, next);
+        }
+    });
+
+    let w_scale =
+        coalesced_pq2_scale_from_loader(b, |b, idx| b.load_wg_u32(smem_w, idx), w_smem_base, lane);
+
+    for ((&s_base, &iv), &av) in s_act_bases.iter().zip(&isum_vars).zip(&acc_vars) {
+        let act_scale_u32 = b.load_wg_u32(smem_act, s_base);
+        let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+        let hsum_idx = b.uadd(s_base, c1);
+        let hsum_u32 = b.load_wg_u32(smem_act, hsum_idx);
+        let half_sum = b.bitcast(b.i32_t, hsum_u32);
+        let int_sum = b.load_var_i32(iv);
+        let corrected = b.isub(int_sum, half_sum);
+        let float_dot = b.i32_to_f32(corrected);
+        let d = b.fmul_nc(w_scale, act_scale);
+        let prev = b.load_var_f32(av);
+        let next = if fused {
+            b.fma(d, float_dot, prev)
+        } else {
+            let prod = b.fmul_nc(d, float_dot);
+            b.fadd_nc(prev, prod)
+        };
+        b.store_var(av, next);
+    }
+}
+
+/// Emits 32-token double-buffered `uvec4` shared-weight `PQ2_0` × 4-plane `Q8_K` prefill GEMM SPIR-V 1.6 (`(64, 8, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(32), 1)`.
+/// Uses `smem_w[2 * 544] + smem_act[2 * 1088]` (`13,056 B` workgroup shared memory) with
+/// 128-bit `uvec4` global weight loads and 1 barrier per K-block.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Double-buffered 32-token PQ2 x Q8K GEMM with uvec4 weight staging and register prefetch."
+)]
+#[must_use]
+pub fn pq2_q8k_gemm_32tok_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let res_buf = has_residual.then(|| b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly));
+
+    let smem_w = b.workgroup_u32_array(2 * 544);
+    let smem_act = b.workgroup_u32_array(2 * 1088);
+    let ids = setup_32tok_workgroup(&mut b, push_var, 544);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let acc_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        let isum_vars = [
+            b.local_i32_var(),
+            b.local_i32_var(),
+            b.local_i32_var(),
+            b.local_i32_var(),
+        ];
+        let w_pre = [
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+        ];
+        let act_pre = [
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+        ];
+        let f_zero = b.const_f32(0.0);
+        for &av in &acc_vars {
+            b.store_var(av, f_zero);
+        }
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c34 = b.const_u32(34);
+        let c68 = b.const_u32(68);
+        let c102 = b.const_u32(102);
+        let c136 = b.const_u32(136);
+        let c544 = b.const_u32(544);
+        let c1088 = b.const_u32(1088);
+
+        let tok_act_bases =
+            clamp_four_token_bases_from_tks(b, ids.tks, ids.tokens, ids.act_words_per_token);
+        let wy_act_off = b.umul(ids.wy, c136);
+        let s_rel_0 = wy_act_off;
+        let s_rel_1 = b.uadd(wy_act_off, c34);
+        let s_rel_2 = b.uadd(wy_act_off, c68);
+        let s_rel_3 = b.uadd(wy_act_off, c102);
+        let s_rels = [s_rel_0, s_rel_1, s_rel_2, s_rel_3];
+
+        let has_any_blk = b.u_lt(c0, ids.blocks_per_row);
+        b.emit_if(has_any_blk, |b| {
+            // Prologue: load block 0 directly into smem[0].
+            load_uvec4_to_smem(b, weights_buf, smem_w, ids.rg_vec_base, c0, ids.tid, 136);
+            let lane_ok = b.u_lt(ids.lane, c34);
+            b.emit_if(lane_ok, |b| {
+                for (&t_base, &s_rel) in tok_act_bases.iter().zip(&s_rels) {
+                    let g_idx = b.uadd(t_base, ids.lane);
+                    let val = b.load_sb_u32(act_buf, g_idx);
+                    let s_idx = b.uadd(s_rel, ids.lane);
+                    b.store_wg_u32(smem_act, s_idx, val);
+                }
+            });
+            b.workgroup_barrier();
+
+            b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
+                let cur_buf = b.uand(blk, c1);
+                let next_buf = b.uxor(cur_buf, c1);
+                let next_blk = b.uadd(blk, c1);
+                let has_next = b.u_lt(next_blk, ids.blocks_per_row);
+
+                b.emit_if(has_next, |b| {
+                    let next_vec_off = b.umul(next_blk, c136);
+                    let next_vec_base = b.uadd(ids.rg_vec_base, next_vec_off);
+                    prefetch_uvec4_to_vars(b, weights_buf, next_vec_base, ids.tid, 136, &w_pre);
+
+                    let next_act_off = b.umul(next_blk, c34);
+                    b.emit_if(lane_ok, |b| {
+                        let a_off = b.uadd(next_act_off, ids.lane);
+                        for (&t_base, &ap) in tok_act_bases.iter().zip(&act_pre) {
+                            let g_idx = b.uadd(t_base, a_off);
+                            let val = b.load_sb_u32(act_buf, g_idx);
+                            b.store_var(ap, val);
+                        }
+                    });
+                });
+
+                let w_cur_base = b.umul(cur_buf, c544);
+                let act_cur_base = b.umul(cur_buf, c1088);
+                let s_cur_bases = [
+                    b.uadd(act_cur_base, s_rel_0),
+                    b.uadd(act_cur_base, s_rel_1),
+                    b.uadd(act_cur_base, s_rel_2),
+                    b.uadd(act_cur_base, s_rel_3),
+                ];
+
+                emit_pq2_q8k_32tok_block(
+                    b,
+                    smem_w,
+                    smem_act,
+                    w_cur_base,
+                    ids.lane,
+                    s_cur_bases,
+                    isum_vars,
+                    acc_vars,
+                    use_sdot,
+                    fused,
+                );
+
+                b.emit_if(has_next, |b| {
+                    let w_next_base = b.umul(next_buf, c544);
+                    commit_vars_to_smem_uvec4(b, smem_w, w_next_base, ids.tid, 136, &w_pre);
+
+                    let act_next_base = b.umul(next_buf, c1088);
+                    b.emit_if(lane_ok, |b| {
+                        for (&s_rel, &ap) in s_rels.iter().zip(&act_pre) {
+                            let s_base = b.uadd(act_next_base, s_rel);
+                            let s_idx = b.uadd(s_base, ids.lane);
+                            let val = b.load_var_u32(ap);
+                            b.store_wg_u32(smem_act, s_idx, val);
+                        }
+                    });
+                    b.workgroup_barrier();
+                });
+            });
+        });
+
+        store_32tok_quad_outputs(b, out_buf, res_buf, &ids, |b, q_idx| {
+            b.load_var_f32(acc_vars[q_idx])
+        });
+    });
+
+    b.finish_with_local_size([64, 8, 1])
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Inner double-buffered shared-memory K-block accumulation helper for 32-token Q8_0 x Q8_0 GEMM."
+)]
+fn emit_q8_0_q8_0_32tok_block(
+    b: &mut ShaderBuilder,
+    smem_w: u32,
+    smem_act: u32,
+    w_smem_base: u32,
+    lane: u32,
+    s_act_bases: [u32; 4],
+    isum_vars: [u32; 4],
+    acc_vars: [u32; 4],
+    use_sdot: bool,
+) {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c8 = b.const_u32(8);
+    let c32 = b.const_u32(32);
+    let c64 = b.const_u32(64);
+    let i_zero = b.const_i32(0);
+
+    for &iv in &isum_vars {
+        b.store_var(iv, i_zero);
+    }
+
+    b.emit_for_range(c0, c8, c1, |b, word_j| {
+        let j64 = b.umul(word_j, c64);
+        let w_off = b.uadd(c32, j64);
+        let w_local = b.uadd(w_off, lane);
+        let w_idx = b.uadd(w_smem_base, w_local);
+        let w_word = b.load_wg_u32(smem_w, w_idx);
+        let act_off = b.uadd(c1, word_j);
+
+        let a_words = s_act_bases.map(|s_base| {
+            let a_idx = b.uadd(s_base, act_off);
+            b.load_wg_u32(smem_act, a_idx)
+        });
+
+        let dots = if use_sdot {
+            a_words.map(|aw| b.sdot_packed(w_word, aw))
+        } else {
+            let weights_i32 = unpack_packed4_s8_to_i32(b, w_word);
+            a_words.map(|aw| portable_dot4_i32_weights(b, weights_i32, aw))
+        };
+        for (&iv, dot) in isum_vars.iter().zip(dots) {
+            let prev = b.load_var_i32(iv);
+            let next = b.iadd(prev, dot);
+            b.store_var(iv, next);
+        }
+    });
+
+    let w_scale =
+        coalesced_pq2_scale_from_loader(b, |b, idx| b.load_wg_u32(smem_w, idx), w_smem_base, lane);
+
+    for ((&s_base, &iv), &av) in s_act_bases.iter().zip(&isum_vars).zip(&acc_vars) {
+        let act_scale_u32 = b.load_wg_u32(smem_act, s_base);
+        let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+        let d = b.fmul_nc(w_scale, act_scale);
+        let int_sum = b.load_var_i32(iv);
+        let sum_f32 = b.i32_to_f32(int_sum);
+        let contrib = b.fmul_nc(d, sum_f32);
+        let prev = b.load_var_f32(av);
+        let next = b.fadd_nc(prev, contrib);
+        b.store_var(av, next);
+    }
+}
+
+/// Emits 32-token double-buffered `uvec4` shared-weight `Q8_0` × `Q8_0` prefill GEMM SPIR-V 1.6 (`(64, 8, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(32), 1)`.
+/// Uses `smem_w[2 * 544] + smem_act[2 * 288]` (`6,656 B` workgroup shared memory) with
+/// 128-bit `uvec4` global weight loads and 1 barrier per K-block.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Double-buffered 32-token Q8_0 x Q8_0 GEMM with uvec4 weight staging and register prefetch."
+)]
+#[must_use]
+pub fn q8_0_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let smem_w = b.workgroup_u32_array(2 * 544);
+    let smem_act = b.workgroup_u32_array(2 * 288);
+    let ids = setup_32tok_workgroup(&mut b, push_var, 544);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let acc_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        let isum_vars = [
+            b.local_i32_var(),
+            b.local_i32_var(),
+            b.local_i32_var(),
+            b.local_i32_var(),
+        ];
+        let w_pre = [
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+        ];
+        let act_pre = b.local_u32_var();
+        let f_zero = b.const_f32(0.0);
+        for &av in &acc_vars {
+            b.store_var(av, f_zero);
+        }
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c9 = b.const_u32(9);
+        let c18 = b.const_u32(18);
+        let c27 = b.const_u32(27);
+        let c36 = b.const_u32(36);
+        let w_tile_vecs = b.const_u32(136);
+        let c288 = b.const_u32(288);
+        let c544 = b.const_u32(544);
+
+        let tok_act_bases =
+            clamp_four_token_bases_from_tks(b, ids.tks, ids.tokens, ids.act_words_per_token);
+        let wy_act_off = b.umul(ids.wy, c36);
+        let s_rel_0 = wy_act_off;
+        let s_rel_1 = b.uadd(wy_act_off, c9);
+        let s_rel_2 = b.uadd(wy_act_off, c18);
+        let s_rel_3 = b.uadd(wy_act_off, c27);
+
+        let lane_ok = b.u_lt(ids.lane, c36);
+        let local_t = b.udiv(ids.lane, c9);
+        let local_w = b.umod(ids.lane, c9);
+        let my_tok_act_base = select_four_u32(b, local_t, tok_act_bases);
+        let my_s_rel = b.uadd(wy_act_off, ids.lane);
+
+        let has_any_blk = b.u_lt(c0, ids.blocks_per_row);
+        b.emit_if(has_any_blk, |b| {
+            load_uvec4_to_smem(b, weights_buf, smem_w, ids.rg_vec_base, c0, ids.tid, 136);
+            b.emit_if(lane_ok, |b| {
+                let g_idx = b.uadd(my_tok_act_base, local_w);
+                let val = b.load_sb_u32(act_buf, g_idx);
+                b.store_wg_u32(smem_act, my_s_rel, val);
+            });
+            b.workgroup_barrier();
+
+            b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
+                let cur_buf = b.uand(blk, c1);
+                let next_buf = b.uxor(cur_buf, c1);
+                let next_blk = b.uadd(blk, c1);
+                let has_next = b.u_lt(next_blk, ids.blocks_per_row);
+
+                b.emit_if(has_next, |b| {
+                    let next_vec_off = b.umul(next_blk, w_tile_vecs);
+                    let next_vec_base = b.uadd(ids.rg_vec_base, next_vec_off);
+                    prefetch_uvec4_to_vars(b, weights_buf, next_vec_base, ids.tid, 136, &w_pre);
+
+                    let next_act_off = b.umul(next_blk, c9);
+                    b.emit_if(lane_ok, |b| {
+                        let a_off = b.uadd(next_act_off, local_w);
+                        let g_idx = b.uadd(my_tok_act_base, a_off);
+                        let val = b.load_sb_u32(act_buf, g_idx);
+                        b.store_var(act_pre, val);
+                    });
+                });
+
+                let w_cur_base = b.umul(cur_buf, c544);
+                let act_cur_base = b.umul(cur_buf, c288);
+                let s_cur_bases = [
+                    b.uadd(act_cur_base, s_rel_0),
+                    b.uadd(act_cur_base, s_rel_1),
+                    b.uadd(act_cur_base, s_rel_2),
+                    b.uadd(act_cur_base, s_rel_3),
+                ];
+
+                emit_q8_0_q8_0_32tok_block(
+                    b,
+                    smem_w,
+                    smem_act,
+                    w_cur_base,
+                    ids.lane,
+                    s_cur_bases,
+                    isum_vars,
+                    acc_vars,
+                    use_sdot,
+                );
+
+                b.emit_if(has_next, |b| {
+                    let w_next_base = b.umul(next_buf, c544);
+                    commit_vars_to_smem_uvec4(b, smem_w, w_next_base, ids.tid, 136, &w_pre);
+
+                    let act_next_base = b.umul(next_buf, c288);
+                    b.emit_if(lane_ok, |b| {
+                        let s_idx = b.uadd(act_next_base, my_s_rel);
+                        let val = b.load_var_u32(act_pre);
+                        b.store_wg_u32(smem_act, s_idx, val);
+                    });
+                    b.workgroup_barrier();
+                });
+            });
+        });
+
+        store_32tok_quad_outputs(b, out_buf, None, &ids, |b, q_idx| {
+            b.load_var_f32(acc_vars[q_idx])
+        });
+    });
+
+    b.finish_with_local_size([64, 8, 1])
+}
+
+/// Emits 32-token double-buffered `uvec4` shared-weight `PTQ1_0` × `Q8_0` prefill GEMM SPIR-V 1.6 (`(64, 8, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(32), 1)`.
+/// Uses `smem_w[2 * 448] + smem_act[2 * 1152]` (`12,800 B` workgroup shared memory) with
+/// 128-bit `uvec4` loads for both weights and activations and 1 barrier per K-block.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Double-buffered 32-token PTQ1_0 x Q8_0 GEMM with uvec4 weight and activation staging."
+)]
+#[must_use]
+pub fn ptq1_q8_0_gemm_32tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let smem_w = b.workgroup_u32_array(2 * 448);
+    let smem_act = b.workgroup_u32_array(2 * 1152);
+    let ids = setup_32tok_workgroup(&mut b, push_var, 448);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let f_zero = b.const_f32(0.0);
+        let lane_vars = if pinned_4lane {
+            std::array::from_fn(|_| {
+                [
+                    b.local_f32_var(),
+                    b.local_f32_var(),
+                    b.local_f32_var(),
+                    b.local_f32_var(),
+                ]
+            })
+        } else {
+            std::array::from_fn(|_| {
+                let v = b.local_f32_var();
+                [v, v, v, v]
+            })
+        };
+        for row_vars in &lane_vars {
+            let count = if pinned_4lane { 4 } else { 1 };
+            for &var in &row_vars[..count] {
+                b.store_var(var, f_zero);
+            }
+        }
+
+        let w_pre = [
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+        ];
+        let act_pre = [
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+        ];
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c2 = b.const_u32(2);
+        let c4 = b.const_u32(4);
+        let c9 = b.const_u32(9);
+        let c36 = b.const_u32(36);
+        let c72 = b.const_u32(72);
+        let c108 = b.const_u32(108);
+        let c112 = b.const_u32(112);
+        let c144 = b.const_u32(144);
+        let c448 = b.const_u32(448);
+        let act_tile_words = b.const_u32(1152);
+
+        let act_vecs_per_token = b.ushr(ids.act_words_per_token, c2);
+        let tok_act_vec_bases =
+            clamp_four_token_bases_from_tks(b, ids.tks, ids.tokens, act_vecs_per_token);
+        let wy_act_off = b.umul(ids.wy, c144);
+        let s_rel_0 = wy_act_off;
+        let s_rel_1 = b.uadd(wy_act_off, c36);
+        let s_rel_2 = b.uadd(wy_act_off, c72);
+        let s_rel_3 = b.uadd(wy_act_off, c108);
+
+        let lane_ok = b.u_lt(ids.lane, c36);
+        let local_t = b.udiv(ids.lane, c9);
+        let local_vec = b.umod(ids.lane, c9);
+        let my_tok_act_vec_base = select_four_u32(b, local_t, tok_act_vec_bases);
+        let lane4 = b.umul(ids.lane, c4);
+        let my_s_rel_words = b.uadd(wy_act_off, lane4);
+
+        let has_any_blk = b.u_lt(c0, ids.blocks_per_row);
+        b.emit_if(has_any_blk, |b| {
+            load_uvec4_to_smem(b, weights_buf, smem_w, ids.rg_vec_base, c0, ids.tid, 112);
+            b.emit_if(lane_ok, |b| {
+                let g_idx = b.uadd(my_tok_act_vec_base, local_vec);
+                let vec = b.load_sb_uvec4(act_buf, g_idx);
+                for comp in 0_u32..4 {
+                    let word = b.composite_extract(b.u32_t, vec, comp);
+                    let s_idx = if comp == 0 {
+                        my_s_rel_words
+                    } else {
+                        let comp_c = b.const_u32(comp);
+                        b.uadd(my_s_rel_words, comp_c)
+                    };
+                    b.store_wg_u32(smem_act, s_idx, word);
+                }
+            });
+            b.workgroup_barrier();
+
+            b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
+                let cur_buf = b.uand(blk, c1);
+                let next_buf = b.uxor(cur_buf, c1);
+                let next_blk = b.uadd(blk, c1);
+                let has_next = b.u_lt(next_blk, ids.blocks_per_row);
+
+                b.emit_if(has_next, |b| {
+                    let next_vec_off = b.umul(next_blk, c112);
+                    let next_vec_base = b.uadd(ids.rg_vec_base, next_vec_off);
+                    prefetch_uvec4_to_vars(b, weights_buf, next_vec_base, ids.tid, 112, &w_pre);
+
+                    let next_act_vec_off = b.umul(next_blk, c9);
+                    b.emit_if(lane_ok, |b| {
+                        let a_off = b.uadd(next_act_vec_off, local_vec);
+                        let g_idx = b.uadd(my_tok_act_vec_base, a_off);
+                        let vec = b.load_sb_uvec4(act_buf, g_idx);
+                        for (comp, &ap) in act_pre.iter().enumerate() {
+                            let comp_u32 = u32::try_from(comp).unwrap_or(0);
+                            let word = b.composite_extract(b.u32_t, vec, comp_u32);
+                            b.store_var(ap, word);
+                        }
+                    });
+                });
+
+                let w_cur_base = b.umul(cur_buf, c448);
+                let wbase = b.uadd(w_cur_base, ids.lane);
+                let act_cur_base = b.umul(cur_buf, act_tile_words);
+                let s_cur_bases = [
+                    b.uadd(act_cur_base, s_rel_0),
+                    b.uadd(act_cur_base, s_rel_1),
+                    b.uadd(act_cur_base, s_rel_2),
+                    b.uadd(act_cur_base, s_rel_3),
+                ];
+
+                emit_ptq1_q8_0_stream_block(
+                    b,
+                    |b, idx| b.load_wg_u32(smem_w, idx),
+                    |b, idx| b.load_wg_u32(smem_act, idx),
+                    wbase,
+                    64,
+                    s_cur_bases,
+                    use_sdot,
+                    pinned_4lane,
+                    &lane_vars,
+                );
+
+                b.emit_if(has_next, |b| {
+                    let w_next_base = b.umul(next_buf, c448);
+                    commit_vars_to_smem_uvec4(b, smem_w, w_next_base, ids.tid, 112, &w_pre);
+
+                    let act_next_base = b.umul(next_buf, act_tile_words);
+                    b.emit_if(lane_ok, |b| {
+                        let dst = b.uadd(act_next_base, my_s_rel_words);
+                        for (comp, &ap) in act_pre.iter().enumerate() {
+                            let word = b.load_var_u32(ap);
+                            let s_idx = if comp == 0 {
+                                dst
+                            } else {
+                                let comp_c = b.const_u32(u32::try_from(comp).unwrap_or(0));
+                                b.uadd(dst, comp_c)
+                            };
+                            b.store_wg_u32(smem_act, s_idx, word);
+                        }
+                    });
+                    b.workgroup_barrier();
+                });
+            });
+        });
+
+        store_32tok_quad_outputs(b, out_buf, None, &ids, |b, q_idx| {
+            finalize_ptq1_lane_vars(b, &lane_vars[q_idx], pinned_4lane)
+        });
+    });
+
+    b.finish_with_local_size([64, 8, 1])
+}
+
+struct SplitKGemvIds {
+    lane: u32,
+    wy: u32,
+    rg: u32,
+    row: u32,
+    token: u32,
+    rows: u32,
+    blocks_per_row: u32,
+    act_words_per_token: u32,
+    row_ok: u32,
+    wg_ok: u32,
+}
+
+fn setup_splitk_gemv(b: &mut ShaderBuilder, push_var: u32) -> SplitKGemvIds {
+    let wid = b.workgroup_id();
+    let lid = b.local_invocation_id();
+    let rg = b.load_input_component(wid, 0);
+    let token = b.load_input_component(wid, 1);
+    let lane = b.load_input_component(lid, 0);
+    let wy = b.load_input_component(lid, 1);
+
+    let rows = b.load_push(push_var, 0);
+    let blocks_per_row = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let act_words_per_token = b.load_push(push_var, 3);
+
+    let c64 = b.const_u32(64);
+    let rg_start = b.umul(rg, c64);
+    let row = b.uadd(rg_start, lane);
+    let rg_ok = b.u_lt(rg_start, rows);
+    let tok_ok = b.u_lt(token, tokens);
+    let wg_ok = b.logical_and(rg_ok, tok_ok);
+    let row_ok = b.u_lt(row, rows);
+
+    SplitKGemvIds {
+        lane,
+        wy,
+        rg,
+        row,
+        token,
+        rows,
+        blocks_per_row,
+        act_words_per_token,
+        row_ok,
+        wg_ok,
+    }
+}
+
+fn finalize_splitk_store(
+    b: &mut ShaderBuilder,
+    smem_acc: u32,
+    out_buf: u32,
+    res_buf: Option<u32>,
+    ids: &SplitKGemvIds,
+    partial_val: u32,
+) {
+    let c0 = b.const_u32(0);
+    let c64 = b.const_u32(64);
+    let c128 = b.const_u32(128);
+    let c192 = b.const_u32(192);
+
+    let wy64 = b.umul(ids.wy, c64);
+    let smem_idx = b.uadd(wy64, ids.lane);
+    let partial_bits = b.bitcast(b.u32_t, partial_val);
+    b.store_wg_u32(smem_acc, smem_idx, partial_bits);
+    b.workgroup_barrier();
+
+    let is_wy0 = b.u_eq(ids.wy, c0);
+    let write_ok = b.logical_and(is_wy0, ids.row_ok);
+    b.emit_if(write_ok, |b| {
+        let s0_bits = b.load_wg_u32(smem_acc, ids.lane);
+        let s0 = b.bitcast(b.f32_t, s0_bits);
+        let idx1 = b.uadd(c64, ids.lane);
+        let s1_bits = b.load_wg_u32(smem_acc, idx1);
+        let s1 = b.bitcast(b.f32_t, s1_bits);
+        let idx2 = b.uadd(c128, ids.lane);
+        let s2_bits = b.load_wg_u32(smem_acc, idx2);
+        let s2 = b.bitcast(b.f32_t, s2_bits);
+        let idx3 = b.uadd(c192, ids.lane);
+        let s3_bits = b.load_wg_u32(smem_acc, idx3);
+        let s3 = b.bitcast(b.f32_t, s3_bits);
+        let s01 = b.fadd_nc(s0, s1);
+        let s23 = b.fadd_nc(s2, s3);
+        let total = b.fadd_nc(s01, s23);
+        let tok_out = b.umul(ids.token, ids.rows);
+        let out_idx = b.uadd(tok_out, ids.row);
+        store_maybe_residual_f32(b, out_buf, res_buf, out_idx, total);
+    });
+}
+
+/// Emits intra-workgroup 4-way Split-K coalesced `PQ2_0` × 4-plane `Q8_K` GEMV (`(64, 4, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens, 1)`.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn pq2_q8k_gemv_splitk(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let res_buf = has_residual.then(|| b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly));
+
+    let smem_acc = b.workgroup_u32_array(256);
+    let ids = setup_splitk_gemv(&mut b, push_var);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let acc_var = b.local_f32_var();
+        let f_zero = b.const_f32(0.0);
+        b.store_var(acc_var, f_zero);
+
+        b.emit_if(ids.row_ok, |b| {
+            let c1 = b.const_u32(1);
+            let c4 = b.const_u32(4);
+            let c34 = b.const_u32(34);
+            let c544 = b.const_u32(544);
+
+            let rg_tiles = b.umul(ids.rg, ids.blocks_per_row);
+            let rg_base = b.umul(rg_tiles, c544);
+            let tok_act_base = b.umul(ids.token, ids.act_words_per_token);
+
+            b.emit_for_range(ids.wy, ids.blocks_per_row, c4, |b, blk| {
+                let blk_off = b.umul(blk, c544);
+                let tile_base = b.uadd(rg_base, blk_off);
+                let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, ids.lane);
+
+                let act_off = b.umul(blk, c34);
+                let act_blk_base = b.uadd(tok_act_base, act_off);
+                let act_scale_u32 = b.load_sb_u32(act_buf, act_blk_base);
+                let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+                let hsum_idx = b.uadd(act_blk_base, c1);
+                let hsum_u32 = b.load_sb_u32(act_buf, hsum_idx);
+                let half_sum = b.bitcast(b.i32_t, hsum_u32);
+
+                let mut int_sum = b.const_i32(0);
+                for word_j in 0_u32..8 {
+                    let w_off = b.const_u32(32 + word_j * 64);
+                    let w_lane_off = b.uadd(w_off, ids.lane);
+                    let w_idx = b.uadd(tile_base, w_lane_off);
+                    let pq_word = b.load_sb_u32(weights_buf, w_idx);
+                    let q = coalesced_pq2_unpack_4digits(b, pq_word);
+
+                    let plane_off = b.const_u32(2 + word_j * 4);
+                    let plane_base = b.uadd(act_blk_base, plane_off);
+                    let part = dot_pq2_4digits_with_act(b, q, act_buf, plane_base, use_sdot);
+                    int_sum = b.iadd(int_sum, part);
+                }
+
+                let corrected = b.isub(int_sum, half_sum);
+                let float_dot = b.i32_to_f32(corrected);
+                let d = b.fmul_nc(w_scale, act_scale);
+                let prev = b.load_var_f32(acc_var);
+                let next = if fused {
+                    b.fma(d, float_dot, prev)
+                } else {
+                    let prod = b.fmul_nc(d, float_dot);
+                    b.fadd_nc(prev, prod)
+                };
+                b.store_var(acc_var, next);
+            });
+        });
+
+        let partial = b.load_var_f32(acc_var);
+        finalize_splitk_store(b, smem_acc, out_buf, res_buf, &ids, partial);
+    });
+
+    b.finish_with_local_size([64, 4, 1])
+}
+
+/// Emits intra-workgroup 4-way Split-K coalesced `PQ2_0` × `Q8_0` GEMV (`(64, 4, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens, 1)`.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn pq2_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let smem_acc = b.workgroup_u32_array(256);
+    let ids = setup_splitk_gemv(&mut b, push_var);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let acc_var = b.local_f32_var();
+        let f_zero = b.const_f32(0.0);
+        b.store_var(acc_var, f_zero);
+
+        b.emit_if(ids.row_ok, |b| {
+            let c1 = b.const_u32(1);
+            let c2 = b.const_u32(2);
+            let c3 = b.const_u32(3);
+            let c4 = b.const_u32(4);
+            let c8 = b.const_u32(8);
+            let c16 = b.const_u32(16);
+            let c24 = b.const_u32(24);
+            let c36 = b.const_u32(36);
+            let c544 = b.const_u32(544);
+
+            let rg_tiles = b.umul(ids.rg, ids.blocks_per_row);
+            let rg_base = b.umul(rg_tiles, c544);
+            let tok_act_base = b.umul(ids.token, ids.act_words_per_token);
+
+            b.emit_for_range(ids.wy, ids.blocks_per_row, c4, |b, blk| {
+                let blk_off = b.umul(blk, c544);
+                let tile_base = b.uadd(rg_base, blk_off);
+                let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, ids.lane);
+
+                let blk_act_off = b.umul(blk, c36);
+                let blk_act_base = b.uadd(tok_act_base, blk_act_off);
+
+                let mut block_sum = f_zero;
+                for grp in 0_u32..4 {
+                    let grp_off_c = b.const_u32(grp * 9);
+                    let grp_base = b.uadd(blk_act_base, grp_off_c);
+                    let act_scale_u32 = b.load_sb_u32(act_buf, grp_base);
+                    let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+
+                    let mut grp_int = b.const_i32(0);
+                    for pair_idx in 0_u32..2 {
+                        let word_j = grp * 2 + pair_idx;
+                        let w_off = b.const_u32(32 + word_j * 64);
+                        let w_lane_off = b.uadd(w_off, ids.lane);
+                        let w_idx = b.uadd(tile_base, w_lane_off);
+                        let pq_word = b.load_sb_u32(weights_buf, w_idx);
+
+                        let act_w_off = b.const_u32(1 + pair_idx * 4);
+                        let act_w_start = b.uadd(grp_base, act_w_off);
+                        let aw0 = b.load_sb_u32(act_buf, act_w_start);
+                        let a_i1 = b.uadd(act_w_start, c1);
+                        let aw1 = b.load_sb_u32(act_buf, a_i1);
+                        let a_i2 = b.uadd(act_w_start, c2);
+                        let aw2 = b.load_sb_u32(act_buf, a_i2);
+                        let a_i3 = b.uadd(act_w_start, c3);
+                        let aw3 = b.load_sb_u32(act_buf, a_i3);
+
+                        let b0 = pq_word;
+                        let b1 = b.ushr(pq_word, c8);
+                        let b2 = b.ushr(pq_word, c16);
+                        let b3 = b.ushr(pq_word, c24);
+
+                        for (raw_byte, act_w) in [(b0, aw0), (b1, aw1), (b2, aw2), (b3, aw3)] {
+                            let dot = if use_sdot {
+                                let packed = swar_pack_4x2bit_to_4xi8(b, raw_byte);
+                                b.sdot_packed(packed, act_w)
+                            } else {
+                                portable_dot4_from_2bit_byte(b, raw_byte, act_w)
+                            };
+                            grp_int = b.iadd(grp_int, dot);
+                        }
+                    }
+
+                    let grp_f32 = b.i32_to_f32(grp_int);
+                    let grp_scaled = b.fmul_nc(act_scale, grp_f32);
+                    block_sum = b.fadd_nc(block_sum, grp_scaled);
+                }
+
+                let prev = b.load_var_f32(acc_var);
+                let contrib = b.fmul_nc(w_scale, block_sum);
+                let next = b.fadd_nc(prev, contrib);
+                b.store_var(acc_var, next);
+            });
+        });
+
+        let partial = b.load_var_f32(acc_var);
+        finalize_splitk_store(b, smem_acc, out_buf, None, &ids, partial);
+    });
+
+    b.finish_with_local_size([64, 4, 1])
+}
+
+/// Emits intra-workgroup 4-way Split-K coalesced `Q8_0` × `Q8_0` GEMV (`(64, 4, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens, 1)`.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn q8_0_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let smem_acc = b.workgroup_u32_array(256);
+    let ids = setup_splitk_gemv(&mut b, push_var);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let acc_var = b.local_f32_var();
+        let f_zero = b.const_f32(0.0);
+        b.store_var(acc_var, f_zero);
+
+        b.emit_if(ids.row_ok, |b| {
+            let c4 = b.const_u32(4);
+            let c9 = b.const_u32(9);
+            let c544 = b.const_u32(544);
+
+            let rg_tiles = b.umul(ids.rg, ids.blocks_per_row);
+            let rg_base = b.umul(rg_tiles, c544);
+            let tok_act_base = b.umul(ids.token, ids.act_words_per_token);
+
+            b.emit_for_range(ids.wy, ids.blocks_per_row, c4, |b, blk| {
+                let blk_off = b.umul(blk, c544);
+                let tile_base = b.uadd(rg_base, blk_off);
+                let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, ids.lane);
+
+                let blk_act_off = b.umul(blk, c9);
+                let blk_act_base = b.uadd(tok_act_base, blk_act_off);
+                let act_scale_u32 = b.load_sb_u32(act_buf, blk_act_base);
+                let act_scale = b.bitcast(b.f32_t, act_scale_u32);
+
+                let mut isum = b.const_i32(0);
+                for word_j in 0_u32..8 {
+                    let w_off = b.const_u32(32 + word_j * 64);
+                    let w_lane_off = b.uadd(w_off, ids.lane);
+                    let w_idx = b.uadd(tile_base, w_lane_off);
+                    let w_word = b.load_sb_u32(weights_buf, w_idx);
+
+                    let act_off = b.const_u32(1 + word_j);
+                    let act_idx = b.uadd(blk_act_base, act_off);
+                    let act_word = b.load_sb_u32(act_buf, act_idx);
+
+                    let dot = if use_sdot {
+                        b.sdot_packed(w_word, act_word)
+                    } else {
+                        portable_dot4_packed4_s8(b, w_word, act_word)
+                    };
+                    isum = b.iadd(isum, dot);
+                }
+
+                let d = b.fmul_nc(w_scale, act_scale);
+                let sum_f32 = b.i32_to_f32(isum);
+                let contrib = b.fmul_nc(d, sum_f32);
+                let prev = b.load_var_f32(acc_var);
+                let next = b.fadd_nc(prev, contrib);
+                b.store_var(acc_var, next);
+            });
+        });
+
+        let partial = b.load_var_f32(acc_var);
+        finalize_splitk_store(b, smem_acc, out_buf, None, &ids, partial);
+    });
+
+    b.finish_with_local_size([64, 4, 1])
+}
+
+/// Emits intra-workgroup 4-way Split-K coalesced `PTQ1_0` × `Q8_0` GEMV (`(64, 4, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens, 1)`.
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn ptq1_q8_0_gemv_splitk(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let smem_acc = b.workgroup_u32_array(256);
+    let ids = setup_splitk_gemv(&mut b, push_var);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let f_zero = b.const_f32(0.0);
+        let lane_vars = if pinned_4lane {
+            [
+                b.local_f32_var(),
+                b.local_f32_var(),
+                b.local_f32_var(),
+                b.local_f32_var(),
+            ]
+        } else {
+            let v = b.local_f32_var();
+            [v, v, v, v]
+        };
+        let init_count = if pinned_4lane { 4 } else { 1 };
+        for &var in &lane_vars[..init_count] {
+            b.store_var(var, f_zero);
+        }
+
+        b.emit_if(ids.row_ok, |b| {
+            let c4 = b.const_u32(4);
+            let c36 = b.const_u32(36);
+            let c448 = b.const_u32(448);
+
+            let rg_tiles = b.umul(ids.rg, ids.blocks_per_row);
+            let rg_base = b.umul(rg_tiles, c448);
+            let tok_act_base = b.umul(ids.token, ids.act_words_per_token);
+
+            b.emit_for_range(ids.wy, ids.blocks_per_row, c4, |b, blk| {
+                let blk_off = b.umul(blk, c448);
+                let tile_base = b.uadd(rg_base, blk_off);
+                let wbase = b.uadd(tile_base, ids.lane);
+                let blk_act_off = b.umul(blk, c36);
+                let blk_act_base = b.uadd(tok_act_base, blk_act_off);
+
+                emit_ptq1_q8_0_stream_block(
+                    b,
+                    |b, idx| b.load_sb_u32(weights_buf, idx),
+                    |b, idx| b.load_sb_u32(act_buf, idx),
+                    wbase,
+                    64,
+                    [blk_act_base],
+                    use_sdot,
+                    pinned_4lane,
+                    &[lane_vars],
+                );
+            });
+        });
+
+        let partial = finalize_ptq1_lane_vars(b, &lane_vars, pinned_4lane);
+        finalize_splitk_store(b, smem_acc, out_buf, None, &ids, partial);
+    });
+
+    b.finish_with_local_size([64, 4, 1])
 }
 
 fn q8k_signed_abs_max_shared(
@@ -8208,9 +9637,9 @@ pub fn f32_gemm_batched_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
     b.finish()
 }
 
-/// Emits dense `F32` `LoRA` B accumulation SPIR-V 1.6 words (`output[row] += scale * dot(B[row], ranks)`).
+/// Emits dense `F32` `LoRA` B accumulation SPIR-V 1.6 words (`output[row] += scale * dot(B[:, row], ranks)`).
 ///
-/// Bindings: `0` read-only `b_weights` (`f32`, `[out_features, rank]` row-major),
+/// Bindings: `0` read-only `b_weights` (`f32`, `[rank, out_features]` row-major coalesced),
 /// `1` read-only `ranks` (`f32`, `[rank]`), `2` read-write `output` (`f32`, `[out_features]`).
 /// Push constants (`3 × u32`): `[out_features, rank, scale_bits]`.
 /// Dispatch: `(out_features.div_ceil(64), 1, 1)`.
@@ -8234,12 +9663,12 @@ pub fn lora_b_accum_f32() -> Vec<u32> {
         let c0 = b.const_u32(0);
         let c1 = b.const_u32(1);
         let f_zero = b.const_f32(0.0);
-        let row_base = b.umul(row, rank);
 
         let acc_var = b.local_f32_var();
         b.store_var(acc_var, f_zero);
         b.emit_for_range(c0, rank, c1, |b, r| {
-            let b_idx = b.uadd(row_base, r);
+            let rank_base = b.umul(r, out_features);
+            let b_idx = b.uadd(rank_base, row);
             let bv = b.load_sb_f32(b_buf, b_idx);
             let rv = b.load_sb_f32(ranks_buf, r);
             let prod = b.fmul_nc(bv, rv);
@@ -8258,9 +9687,9 @@ pub fn lora_b_accum_f32() -> Vec<u32> {
     b.finish()
 }
 
-/// Emits batched 4-token `F32` `LoRA` B accumulation SPIR-V 1.6 words (`output[t, row] += scale * dot(B[row], ranks[t])`).
+/// Emits batched 4-token `F32` `LoRA` B accumulation SPIR-V 1.6 words (`output[t, row] += scale * dot(B[:, row], ranks[t])`).
 ///
-/// Bindings: `0` read-only `b_weights` (`f32`, `[out_features, rank]` row-major),
+/// Bindings: `0` read-only `b_weights` (`f32`, `[rank, out_features]` row-major coalesced),
 /// `1` read-only `ranks` (`f32`, `[tokens, rank]`), `2` read-write `output` (`f32`, `[tokens, out_features]`).
 /// Push constants (`4 × u32`): `[out_features, rank, tokens, scale_bits]`.
 /// Dispatch: `(out_features.div_ceil(64), tokens.div_ceil(4), 1)`.
@@ -8291,7 +9720,6 @@ pub fn lora_b_accum_batched_f32() -> Vec<u32> {
         let c0 = b.const_u32(0);
         let c1 = b.const_u32(1);
         let f_zero = b.const_f32(0.0);
-        let row_base = b.umul(row, rank);
         let (tok_clamped, tok_rank_bases) = clamp_four_token_act_bases(b, tok_base, tokens, rank);
 
         let acc_vars = [
@@ -8305,7 +9733,8 @@ pub fn lora_b_accum_batched_f32() -> Vec<u32> {
         }
 
         b.emit_for_range(c0, rank, c1, |b, r| {
-            let b_idx = b.uadd(row_base, r);
+            let rank_base = b.umul(r, out_features);
+            let b_idx = b.uadd(rank_base, row);
             let bv = b.load_sb_f32(b_buf, b_idx);
             for (&r_base, &acc_var) in tok_rank_bases.iter().zip(&acc_vars) {
                 let r_idx = b.uadd(r_base, r);
@@ -8327,6 +9756,349 @@ pub fn lora_b_accum_batched_f32() -> Vec<u32> {
                 let cur = b.load_sb_f32(out_buf, out_idx);
                 let updated = b.fadd_nc(cur, scaled);
                 b.store_sb_f32(out_buf, out_idx, updated);
+            });
+        }
+    });
+
+    b.finish()
+}
+
+/// Emits packed `F16` matrix-vector multiplication (`UnpackHalf2x16`) with optional wave64 subgroup shuffle reduction.
+///
+/// Bindings: `0` read-only packed `f16x2` weights (`u32`, `[rows, cols.div_ceil(2)]`),
+/// `1` read-only `input` (`f32`), `2` writable `output` (`f32`).
+/// Push constants (`2 × u32`): `[cols, rows]`. Dispatch: `(rows, 1, 1)`.
+#[must_use]
+pub fn f16_matvec_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
+    let push_var = push_var.unwrap_or(0);
+    let w_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let in_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let row = b.load_input_component(wid_vec, 0);
+    let cols = b.load_push(push_var, 0);
+    let rows = b.load_push(push_var, 1);
+
+    let row_ok = b.u_lt(row, rows);
+    b.emit_if(row_ok, |b| {
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c64 = b.const_u32(WORKGROUP_X);
+        let f_zero = b.const_f32(0.0);
+        let cols_p1 = b.uadd(cols, c1);
+        let col_words = b.ushr(cols_p1, c1);
+        let row_base = b.umul(row, col_words);
+
+        let acc_var = b.local_f32_var();
+        b.store_var(acc_var, f_zero);
+        b.emit_for_range(lid, col_words, c64, |b, pair_idx| {
+            let w_idx = b.uadd(row_base, pair_idx);
+            let w_packed = b.load_sb_u32(w_buf, w_idx);
+            let (w0, w1) = b.unpack_half_pair(w_packed);
+            let c0_idx = b.ushl(pair_idx, c1);
+            let c1_idx = b.uadd(c0_idx, c1);
+
+            let x0 = b.load_sb_f32(in_buf, c0_idx);
+            let p0 = b.fmul_nc(w0, x0);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.fadd_nc(prev, p0);
+            b.store_var(acc_var, next);
+
+            let has_hi = b.u_lt(c1_idx, cols);
+            b.emit_if(has_hi, |b| {
+                let x1 = b.load_sb_f32(in_buf, c1_idx);
+                let p1 = b.fmul_nc(w1, x1);
+                let prev2 = b.load_var_f32(acc_var);
+                let next2 = b.fadd_nc(prev2, p1);
+                b.store_var(acc_var, next2);
+            });
+        });
+
+        let partial = b.load_var_f32(acc_var);
+        let sum = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
+
+        let is_t0 = b.u_eq(lid, c0);
+        b.emit_if(is_t0, |b| {
+            b.store_sb_f32(out_buf, row, sum);
+        });
+    });
+
+    b.finish()
+}
+
+/// Emits batched 4-token packed `F16` GEMM (`UnpackHalf2x16`) with optional wave64 subgroup shuffle reduction.
+///
+/// Bindings: `0` read-only packed `f16x2` weights (`u32`, `[rows, cols.div_ceil(2)]`),
+/// `1` read-only `input` (`f32`, `[tokens, cols]`), `2` writable `output` (`f32`, `[tokens, rows]`).
+/// Push constants (`3 × u32`): `[cols, rows, tokens]`. Dispatch: `(rows, tokens.div_ceil(4), 1)`.
+#[must_use]
+pub fn f16_gemm_batched_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 3);
+    let push_var = push_var.unwrap_or(0);
+    let w_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let in_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let row = b.load_input_component(wid_vec, 0);
+    let tok_tile = b.load_input_component(wid_vec, 1);
+
+    let cols = b.load_push(push_var, 0);
+    let rows = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+
+    let c4 = b.const_u32(4);
+    let tok_base = b.umul(tok_tile, c4);
+    let row_ok = b.u_lt(row, rows);
+    let tok_ok = b.u_lt(tok_base, tokens);
+    let in_bounds = b.logical_and(row_ok, tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c64 = b.const_u32(WORKGROUP_X);
+        let f_zero = b.const_f32(0.0);
+        let cols_p1 = b.uadd(cols, c1);
+        let col_words = b.ushr(cols_p1, c1);
+        let row_base = b.umul(row, col_words);
+        let (tok_clamped, tok_in_bases) = clamp_four_token_act_bases(b, tok_base, tokens, cols);
+
+        let acc_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        for v in acc_vars {
+            b.store_var(v, f_zero);
+        }
+
+        b.emit_for_range(lid, col_words, c64, |b, pair_idx| {
+            let w_idx = b.uadd(row_base, pair_idx);
+            let w_packed = b.load_sb_u32(w_buf, w_idx);
+            let (w0, w1) = b.unpack_half_pair(w_packed);
+            let c0_idx = b.ushl(pair_idx, c1);
+            let c1_idx = b.uadd(c0_idx, c1);
+            let has_hi = b.u_lt(c1_idx, cols);
+
+            for (&in_base, &acc_var) in tok_in_bases.iter().zip(&acc_vars) {
+                let x0_idx = b.uadd(in_base, c0_idx);
+                let x0 = b.load_sb_f32(in_buf, x0_idx);
+                let p0 = b.fmul_nc(w0, x0);
+                let prev = b.load_var_f32(acc_var);
+                let next = b.fadd_nc(prev, p0);
+                b.store_var(acc_var, next);
+            }
+            b.emit_if(has_hi, |b| {
+                for (&in_base, &acc_var) in tok_in_bases.iter().zip(&acc_vars) {
+                    let x1_idx = b.uadd(in_base, c1_idx);
+                    let x1 = b.load_sb_f32(in_buf, x1_idx);
+                    let p1 = b.fmul_nc(w1, x1);
+                    let prev = b.load_var_f32(acc_var);
+                    let next = b.fadd_nc(prev, p1);
+                    b.store_var(acc_var, next);
+                }
+            });
+        });
+
+        for (k, (&tk, &acc_var)) in tok_clamped.iter().zip(&acc_vars).enumerate() {
+            if k > 0 && !b.uses_subgroup_shuffle() {
+                b.workgroup_barrier();
+            }
+            let partial = b.load_var_f32(acc_var);
+            let sum = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
+
+            let is_t0 = b.u_eq(lid, c0);
+            let valid = b.u_lt(tk, tokens);
+            let write_ok = b.logical_and(is_t0, valid);
+            b.emit_if(write_ok, |b| {
+                let tok_out = b.umul(tk, rows);
+                let out_idx = b.uadd(tok_out, row);
+                b.store_sb_f32(out_buf, out_idx, sum);
+            });
+        }
+    });
+
+    b.finish()
+}
+
+/// Emits packed `F16` `LoRA` B accumulation SPIR-V 1.6 words (`UnpackHalf2x16`, coalesced `[rank, out_words]`).
+///
+/// Each invocation accumulates 2 adjacent output rows (`row0 = gid.x * 2`, `row1 = row0 + 1`).
+/// Bindings: `0` read-only packed `b_weights` (`u32`, `[rank, out_features.div_ceil(2)]`),
+/// `1` read-only `ranks` (`f32`, `[rank]`), `2` read-write `output` (`f32`, `[out_features]`).
+/// Push constants (`3 × u32`): `[out_features, rank, scale_bits]`.
+/// Dispatch: `(out_features.div_ceil(2).div_ceil(64), 1, 1)`.
+#[must_use]
+pub fn lora_b_accum_f16() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 3);
+    let push_var = push_var.unwrap_or(0);
+    let b_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let ranks_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let pair_idx = b.load_input_component(gid, 0);
+    let out_features = b.load_push(push_var, 0);
+    let rank = b.load_push(push_var, 1);
+    let scale_bits = b.load_push(push_var, 2);
+    let scale = b.bitcast(b.f32_t, scale_bits);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let out_p1 = b.uadd(out_features, c1);
+    let out_words = b.ushr(out_p1, c1);
+    let in_bounds = b.u_lt(pair_idx, out_words);
+
+    b.emit_if(in_bounds, |b| {
+        let f_zero = b.const_f32(0.0);
+        let acc0 = b.local_f32_var();
+        let acc1 = b.local_f32_var();
+        b.store_var(acc0, f_zero);
+        b.store_var(acc1, f_zero);
+
+        b.emit_for_range(c0, rank, c1, |b, r| {
+            let rank_base = b.umul(r, out_words);
+            let b_idx = b.uadd(rank_base, pair_idx);
+            let b_packed = b.load_sb_u32(b_buf, b_idx);
+            let (b0, b1) = b.unpack_half_pair(b_packed);
+            let rv = b.load_sb_f32(ranks_buf, r);
+
+            let p0 = b.fmul_nc(b0, rv);
+            let prev0 = b.load_var_f32(acc0);
+            let n0 = b.fadd_nc(prev0, p0);
+            b.store_var(acc0, n0);
+
+            let p1 = b.fmul_nc(b1, rv);
+            let prev1 = b.load_var_f32(acc1);
+            let n1 = b.fadd_nc(prev1, p1);
+            b.store_var(acc1, n1);
+        });
+
+        let row0 = b.ushl(pair_idx, c1);
+        let row1 = b.uadd(row0, c1);
+        let a0_val = b.load_var_f32(acc0);
+        let s0 = b.fmul_nc(a0_val, scale);
+        let cur0 = b.load_sb_f32(out_buf, row0);
+        let sum0 = b.fadd_nc(cur0, s0);
+        b.store_sb_f32(out_buf, row0, sum0);
+
+        let has_row1 = b.u_lt(row1, out_features);
+        b.emit_if(has_row1, |b| {
+            let a1_val = b.load_var_f32(acc1);
+            let s1 = b.fmul_nc(a1_val, scale);
+            let cur1 = b.load_sb_f32(out_buf, row1);
+            let sum1 = b.fadd_nc(cur1, s1);
+            b.store_sb_f32(out_buf, row1, sum1);
+        });
+    });
+
+    b.finish()
+}
+
+/// Emits batched 4-token packed `F16` `LoRA` B accumulation SPIR-V 1.6 words (`UnpackHalf2x16`, coalesced `[rank, out_words]`).
+///
+/// Bindings: `0` read-only packed `b_weights` (`u32`, `[rank, out_features.div_ceil(2)]`),
+/// `1` read-only `ranks` (`f32`, `[tokens, rank]`), `2` read-write `output` (`f32`, `[tokens, out_features]`).
+/// Push constants (`4 × u32`): `[out_features, rank, tokens, scale_bits]`.
+/// Dispatch: `(out_features.div_ceil(2).div_ceil(64), tokens.div_ceil(4), 1)`.
+#[must_use]
+pub fn lora_b_accum_batched_f16() -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(false, 4);
+    let push_var = push_var.unwrap_or(0);
+    let b_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let ranks_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let gid = b.global_invocation_id();
+    let pair_idx = b.load_input_component(gid, 0);
+    let tok_tile = b.load_input_component(gid, 1);
+    let out_features = b.load_push(push_var, 0);
+    let rank = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+    let scale_bits = b.load_push(push_var, 3);
+    let scale = b.bitcast(b.f32_t, scale_bits);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c4 = b.const_u32(4);
+    let out_p1 = b.uadd(out_features, c1);
+    let out_words = b.ushr(out_p1, c1);
+    let tok_base = b.umul(tok_tile, c4);
+    let pair_ok = b.u_lt(pair_idx, out_words);
+    let tok_ok = b.u_lt(tok_base, tokens);
+    let in_bounds = b.logical_and(pair_ok, tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let f_zero = b.const_f32(0.0);
+        let (tok_clamped, tok_rank_bases) = clamp_four_token_act_bases(b, tok_base, tokens, rank);
+
+        let acc0_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        let acc1_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        for v in acc0_vars.into_iter().chain(acc1_vars) {
+            b.store_var(v, f_zero);
+        }
+
+        b.emit_for_range(c0, rank, c1, |b, r| {
+            let rank_base = b.umul(r, out_words);
+            let b_idx = b.uadd(rank_base, pair_idx);
+            let b_packed = b.load_sb_u32(b_buf, b_idx);
+            let (b0, b1) = b.unpack_half_pair(b_packed);
+            for ((&r_base, &a0), &a1) in tok_rank_bases.iter().zip(&acc0_vars).zip(&acc1_vars) {
+                let r_idx = b.uadd(r_base, r);
+                let rv = b.load_sb_f32(ranks_buf, r_idx);
+                let p0 = b.fmul_nc(b0, rv);
+                let prev0 = b.load_var_f32(a0);
+                let n0 = b.fadd_nc(prev0, p0);
+                b.store_var(a0, n0);
+                let p1 = b.fmul_nc(b1, rv);
+                let prev1 = b.load_var_f32(a1);
+                let n1 = b.fadd_nc(prev1, p1);
+                b.store_var(a1, n1);
+            }
+        });
+
+        let row0 = b.ushl(pair_idx, c1);
+        let row1 = b.uadd(row0, c1);
+        let has_row1 = b.u_lt(row1, out_features);
+
+        for ((&tk, &a0), &a1) in tok_clamped.iter().zip(&acc0_vars).zip(&acc1_vars) {
+            let valid = b.u_lt(tk, tokens);
+            b.emit_if(valid, |b| {
+                let tok_out = b.umul(tk, out_features);
+                let out0 = b.uadd(tok_out, row0);
+                let a0_val = b.load_var_f32(a0);
+                let s0 = b.fmul_nc(a0_val, scale);
+                let cur0 = b.load_sb_f32(out_buf, out0);
+                let sum0 = b.fadd_nc(cur0, s0);
+                b.store_sb_f32(out_buf, out0, sum0);
+
+                b.emit_if(has_row1, |b| {
+                    let out1 = b.uadd(tok_out, row1);
+                    let a1_val = b.load_var_f32(a1);
+                    let s1 = b.fmul_nc(a1_val, scale);
+                    let cur1 = b.load_sb_f32(out_buf, out1);
+                    let sum1 = b.fadd_nc(cur1, s1);
+                    b.store_sb_f32(out_buf, out1, sum1);
+                });
             });
         }
     });
@@ -9449,6 +11221,63 @@ mod tests {
             )),
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gemm32_splitk_and_f16_lora_shaders_are_valid_spirv() -> Result<(), Error> {
+        for (module, expected_sdot) in [
+            (pq2_q8k_gemm_32tok_coalesced(true, true, false), Some(true)),
+            (
+                pq2_q8k_gemm_32tok_coalesced(false, false, true),
+                Some(false),
+            ),
+            (q8_0_q8_0_gemm_32tok_coalesced(true), Some(true)),
+            (q8_0_q8_0_gemm_32tok_coalesced(false), Some(false)),
+            (ptq1_q8_0_gemm_32tok_coalesced(true, true), Some(true)),
+            (ptq1_q8_0_gemm_32tok_coalesced(false, false), Some(false)),
+            (pq2_q8k_gemv_splitk(true, true, false), Some(true)),
+            (pq2_q8k_gemv_splitk(false, false, true), Some(false)),
+            (pq2_q8_0_gemv_splitk(true), Some(true)),
+            (pq2_q8_0_gemv_splitk(false), Some(false)),
+            (q8_0_q8_0_gemv_splitk(true), Some(true)),
+            (q8_0_q8_0_gemv_splitk(false), Some(false)),
+            (ptq1_q8_0_gemv_splitk(true, true), Some(true)),
+            (ptq1_q8_0_gemv_splitk(false, false), Some(false)),
+            (f16_matvec_with_subgroup(false), Some(false)),
+            (f16_matvec_with_subgroup(true), Some(false)),
+            (f16_gemm_batched_with_subgroup(false), Some(false)),
+            (f16_gemm_batched_with_subgroup(true), Some(false)),
+            (lora_b_accum_f16(), Some(false)),
+            (lora_b_accum_batched_f16(), Some(false)),
+        ] {
+            assert_valid_spirv_structure(&module, expected_sdot);
+            assert_eq!(shader_digest(&module)?.len(), 64);
+        }
+        assert_eq!(
+            extract_local_size(&pq2_q8k_gemm_32tok_coalesced(true, true, false))?,
+            [64, 8, 1]
+        );
+        assert_eq!(
+            extract_local_size(&pq2_q8k_gemv_splitk(true, true, false))?,
+            [64, 4, 1]
+        );
+        let count_barriers = |words: &[u32]| -> usize {
+            let mut barriers = 0_usize;
+            let mut offset = 5_usize;
+            while offset < words.len() {
+                let header = words[offset];
+                let wc = usize::try_from(header >> 16).unwrap_or(0);
+                let op = u16::try_from(header & 0xFFFF).unwrap_or(0);
+                if op == OP_CONTROL_BARRIER {
+                    barriers += 1;
+                }
+                offset += wc;
+            }
+            barriers
+        };
+        assert_eq!(count_barriers(&f16_matvec_with_subgroup(true)), 0);
+        assert_eq!(count_barriers(&f16_gemm_batched_with_subgroup(true)), 0);
         Ok(())
     }
 }

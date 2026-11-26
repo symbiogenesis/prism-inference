@@ -36,8 +36,8 @@ use crate::{
         BatchTokenPath, KIND_PQ2, KIND_PTQ1, KIND_Q8_0, MIN_SCRATCH_BYTES,
         PreparedProjectionShaders, PreparedShaderSpec, ProjectionPipelines, Q8_0_WORDS_PER_BLOCK,
         Q8K_4PLANE_WORDS_PER_HALF, attention_push_constants, checked_grid, ensure_finite_f32,
-        f32_slice_bytes, hadamard_norm_bits, repack_coalesced_into, u32_slice_bytes,
-        validate_matrix, validate_weight_scales,
+        f32_slice_bytes, hadamard_norm_bits, repack_coalesced_into, supports_splitk_gemv,
+        u32_slice_bytes, validate_matrix, validate_weight_scales,
     },
     hash_bytes, hash_str, hash_u32, hash_u64, hash_usize, select_attention_plan, spirv,
 };
@@ -317,8 +317,12 @@ pub struct VulkanLayerPipelines {
     hadamard_batched: PipelineId,
     f32_matvec: PipelineId,
     f32_gemm_batched: PipelineId,
+    f16_matvec: PipelineId,
+    f16_gemm_batched: PipelineId,
     lora_b_accum: PipelineId,
     lora_b_accum_batched: PipelineId,
+    lora_b_accum_f16: PipelineId,
+    lora_b_accum_batched_f16: PipelineId,
     mul_f32_elemwise: PipelineId,
     mul_f32_elemwise_batched: PipelineId,
     permute_ssm_heads: PipelineId,
@@ -341,7 +345,7 @@ struct PreparedLayerShaders {
     use_sdot: bool,
     use_wave64: bool,
     proj: PreparedProjectionShaders,
-    modules: [PreparedShaderSpec; 52],
+    modules: [PreparedShaderSpec; 56],
     shader_digests_sha256: String,
 }
 
@@ -594,10 +598,29 @@ impl VulkanLayerPipelines {
                 3,
                 3,
             )?,
+            make_spec(
+                b"f16_matvec",
+                spirv::f16_matvec_with_subgroup(use_wave64_shuffle),
+                3,
+                2,
+            )?,
+            make_spec(
+                b"f16_gemm_batched",
+                spirv::f16_gemm_batched_with_subgroup(use_wave64_shuffle),
+                3,
+                3,
+            )?,
             make_spec(b"lora_b_accum_f32", spirv::lora_b_accum_f32(), 3, 3)?,
             make_spec(
                 b"lora_b_accum_batched_f32",
                 spirv::lora_b_accum_batched_f32(),
+                3,
+                4,
+            )?,
+            make_spec(b"lora_b_accum_f16", spirv::lora_b_accum_f16(), 3, 3)?,
+            make_spec(
+                b"lora_b_accum_batched_f16",
+                spirv::lora_b_accum_batched_f16(),
                 3,
                 4,
             )?,
@@ -722,15 +745,19 @@ impl VulkanLayerPipelines {
             hadamard_batched,
             f32_matvec,
             f32_gemm_batched,
+            f16_matvec,
+            f16_gemm_batched,
             lora_b_accum,
             lora_b_accum_batched,
+            lora_b_accum_f16,
+            lora_b_accum_batched_f16,
             mul_f32_elemwise,
             mul_f32_elemwise_batched,
             permute_ssm_heads,
             permute_ssm_heads_batched,
             copy_slice,
             copy_slice_offset,
-        ]: [PipelineId; 52] = ids
+        ]: [PipelineId; 56] = ids
             .try_into()
             .map_err(|_| Error::InvalidInput("layer pipeline count mismatch".to_owned()))?;
 
@@ -780,8 +807,12 @@ impl VulkanLayerPipelines {
             hadamard_batched,
             f32_matvec,
             f32_gemm_batched,
+            f16_matvec,
+            f16_gemm_batched,
             lora_b_accum,
             lora_b_accum_batched,
+            lora_b_accum_f16,
+            lora_b_accum_batched_f16,
             mul_f32_elemwise,
             mul_f32_elemwise_batched,
             permute_ssm_heads,
@@ -1142,6 +1173,7 @@ struct GpuLoraFactor {
     out_features: usize,
     rank: usize,
     scaling: f32,
+    is_f16: bool,
 }
 
 #[derive(Default)]
@@ -1226,11 +1258,7 @@ struct GpuGraphScratch {
     rope_freqs: BufferId,
     rope_freqs_staging: [BufferId; 2],
     lora_ranks: BufferId,
-    #[expect(
-        dead_code,
-        reason = "Reserved per-bank staging slots aligned with tile scratch layout."
-    )]
-    lora_ranks_staging: [BufferId; 2],
+    lora_ranks_staging: [BufferId; 3],
     attn_scores: BufferId,
     attn_probs: BufferId,
     attn_score_bytes: u64,
@@ -4333,32 +4361,49 @@ impl VulkanBatchedGraphExecutor {
         let Some(scale) = self.multi_rank_scale.filter(|&s| s != 0.0) else {
             return Ok(());
         };
+        let mut active: Vec<(GpuLoraFactor, BufferId)> = Vec::with_capacity(targets.len());
         for &(weight, out_buf) in targets {
             if let Some(lora) = weight.multi_rank {
-                self.record_linear_lora_tokens(src_buf, out_buf, lora, scale, tokens)?;
+                active.push((lora, out_buf));
+            }
+        }
+        if active.is_empty() {
+            return Ok(());
+        }
+        let rank_bufs = [
+            self.scratch.lora_ranks,
+            self.scratch.lora_ranks_staging[0],
+            self.scratch.lora_ranks_staging[1],
+            self.scratch.lora_ranks_staging[2],
+        ];
+        for chunk in active.chunks(rank_bufs.len()) {
+            for (idx, &(lora, _)) in chunk.iter().enumerate() {
+                self.record_linear_lora_a_tokens(src_buf, rank_bufs[idx], lora, tokens, idx == 0)?;
+            }
+            for (idx, &(lora, out_buf)) in chunk.iter().enumerate() {
+                self.record_linear_lora_b_tokens(
+                    rank_bufs[idx],
+                    out_buf,
+                    lora,
+                    scale,
+                    tokens,
+                    idx == 0,
+                )?;
             }
         }
         Ok(())
     }
 
-    fn record_linear_lora_tokens(
+    fn record_linear_lora_a_tokens(
         &mut self,
         src_buf: BufferId,
-        out_buf: BufferId,
+        ranks_buf: BufferId,
         lora: GpuLoraFactor,
-        user_scale: f32,
         tokens: usize,
+        barrier_before: bool,
     ) -> Result<(), Error> {
-        let effective_scale = user_scale * lora.scaling;
-        if !effective_scale.is_finite() {
-            return Err(Error::InvalidInput(
-                "non-finite effective GPU LoRA scale".to_owned(),
-            ));
-        }
         let in_u32 = u32::try_from(lora.in_features)
             .map_err(|_| Error::ResourceLimit("LoRA in_features exceeds u32".to_owned()))?;
-        let out_u32 = u32::try_from(lora.out_features)
-            .map_err(|_| Error::ResourceLimit("LoRA out_features exceeds u32".to_owned()))?;
         let rank_u32 = u32::try_from(lora.rank)
             .map_err(|_| Error::ResourceLimit("LoRA rank exceeds u32".to_owned()))?;
         let tokens_u32 = u32::try_from(tokens)
@@ -4366,47 +4411,105 @@ impl VulkanBatchedGraphExecutor {
 
         // `src_buf` holds unrotated original activations across the whole projection group.
         if tokens == 1 {
-            self.batch_recorder.push_barrier(
-                self.pipelines.f32_matvec,
+            let pipe = if lora.is_f16 {
+                self.pipelines.f16_matvec
+            } else {
+                self.pipelines.f32_matvec
+            };
+            self.batch_recorder.push(
+                pipe,
                 &[
                     lora.a_span,
                     BufferSpan::whole(src_buf),
-                    BufferSpan::whole(self.scratch.lora_ranks),
+                    BufferSpan::whole(ranks_buf),
                 ],
                 &[in_u32, rank_u32],
                 checked_grid(&self.device, [rank_u32, 1, 1])?,
-            );
-            self.batch_recorder.push_barrier(
-                self.pipelines.lora_b_accum,
-                &[
-                    lora.b_span,
-                    BufferSpan::whole(self.scratch.lora_ranks),
-                    BufferSpan::whole(out_buf),
-                ],
-                &[out_u32, rank_u32, effective_scale.to_bits()],
-                checked_grid(&self.device, [out_u32.div_ceil(WORKGROUP_X), 1, 1])?,
+                barrier_before,
             );
         } else {
             let tok_tiles = tokens_u32.div_ceil(4);
-            self.batch_recorder.push_barrier(
-                self.pipelines.f32_gemm_batched,
+            let pipe = if lora.is_f16 {
+                self.pipelines.f16_gemm_batched
+            } else {
+                self.pipelines.f32_gemm_batched
+            };
+            self.batch_recorder.push(
+                pipe,
                 &[
                     lora.a_span,
                     BufferSpan::whole(src_buf),
-                    BufferSpan::whole(self.scratch.lora_ranks),
+                    BufferSpan::whole(ranks_buf),
                 ],
                 &[in_u32, rank_u32, tokens_u32],
                 checked_grid(&self.device, [rank_u32, tok_tiles, 1])?,
+                barrier_before,
             );
-            self.batch_recorder.push_barrier(
-                self.pipelines.lora_b_accum_batched,
+        }
+        Ok(())
+    }
+
+    fn record_linear_lora_b_tokens(
+        &mut self,
+        ranks_buf: BufferId,
+        out_buf: BufferId,
+        lora: GpuLoraFactor,
+        user_scale: f32,
+        tokens: usize,
+        barrier_before: bool,
+    ) -> Result<(), Error> {
+        let effective_scale = user_scale * lora.scaling;
+        if !effective_scale.is_finite() {
+            return Err(Error::InvalidInput(
+                "non-finite effective GPU LoRA scale".to_owned(),
+            ));
+        }
+        let out_u32 = u32::try_from(lora.out_features)
+            .map_err(|_| Error::ResourceLimit("LoRA out_features exceeds u32".to_owned()))?;
+        let rank_u32 = u32::try_from(lora.rank)
+            .map_err(|_| Error::ResourceLimit("LoRA rank exceeds u32".to_owned()))?;
+        let tokens_u32 = u32::try_from(tokens)
+            .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
+        let grid_x = if lora.is_f16 {
+            out_u32.div_ceil(2).div_ceil(WORKGROUP_X)
+        } else {
+            out_u32.div_ceil(WORKGROUP_X)
+        };
+
+        if tokens == 1 {
+            let pipe = if lora.is_f16 {
+                self.pipelines.lora_b_accum_f16
+            } else {
+                self.pipelines.lora_b_accum
+            };
+            self.batch_recorder.push(
+                pipe,
                 &[
                     lora.b_span,
-                    BufferSpan::whole(self.scratch.lora_ranks),
+                    BufferSpan::whole(ranks_buf),
+                    BufferSpan::whole(out_buf),
+                ],
+                &[out_u32, rank_u32, effective_scale.to_bits()],
+                checked_grid(&self.device, [grid_x, 1, 1])?,
+                barrier_before,
+            );
+        } else {
+            let tok_tiles = tokens_u32.div_ceil(4);
+            let pipe = if lora.is_f16 {
+                self.pipelines.lora_b_accum_batched_f16
+            } else {
+                self.pipelines.lora_b_accum_batched
+            };
+            self.batch_recorder.push(
+                pipe,
+                &[
+                    lora.b_span,
+                    BufferSpan::whole(ranks_buf),
                     BufferSpan::whole(out_buf),
                 ],
                 &[out_u32, rank_u32, tokens_u32, effective_scale.to_bits()],
-                checked_grid(&self.device, [out_u32.div_ceil(WORKGROUP_X), tok_tiles, 1])?,
+                checked_grid(&self.device, [grid_x, tok_tiles, 1])?,
+                barrier_before,
             );
         }
         Ok(())
@@ -4904,6 +5007,7 @@ impl VulkanBatchedGraphExecutor {
         let tokens_u32 = u32::try_from(tokens)
             .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
         let multi_token = tokens > 1;
+        let use_decode_splitk = !multi_token && cols > 1024 && supports_splitk_gemv(&self.device);
         let batch_path = BatchTokenPath::for_tokens(&self.device, tokens);
         let tok_tiles_16y = batch_path.grid_y(tokens_u32);
         let tile_y_4 = batch_path.grid_y_four_tok_cap(tokens_u32);
@@ -4920,11 +5024,17 @@ impl VulkanBatchedGraphExecutor {
                     })?;
                     let act_words = u32::try_from(blocks_per_row * Q8K_4PLANE_WORDS_PER_HALF)
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
-                    let pipe = self.pipelines.proj.select_pq2_q8k(
-                        self.resolved_pinned_arithmetic,
-                        batch_path,
-                        false,
-                    );
+                    let pipe = if use_decode_splitk && rows_u32 <= 4096 && blocks_per_row >= 8 {
+                        self.pipelines
+                            .proj
+                            .select_pq2_q8k_decode_splitk(self.resolved_pinned_arithmetic)
+                    } else {
+                        self.pipelines.proj.select_pq2_q8k(
+                            self.resolved_pinned_arithmetic,
+                            batch_path,
+                            false,
+                        )
+                    };
                     self.batch_recorder.push(
                         pipe,
                         &[
@@ -4951,18 +5061,34 @@ impl VulkanBatchedGraphExecutor {
                     })?;
                     let act_words = u32::try_from((cols / 32) * Q8_0_WORDS_PER_BLOCK)
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
+                    let splitk = use_decode_splitk && rows_u32 <= 4096 && blocks_per_row >= 8;
                     let (pipe, tok_tiles_y) = match weight.encoding {
-                        WeightEncoding::Pq2Q8_0 => {
-                            (self.pipelines.proj.select_pq2_q8_0(batch_path), tile_y_4)
-                        }
+                        WeightEncoding::Pq2Q8_0 => (
+                            if splitk {
+                                self.pipelines.proj.select_pq2_q8_0_decode_splitk()
+                            } else {
+                                self.pipelines.proj.select_pq2_q8_0(batch_path)
+                            },
+                            tile_y_4,
+                        ),
                         WeightEncoding::Ptq1Q8_0 => (
-                            self.pipelines
-                                .proj
-                                .select_ptq1_q8_0(self.resolved_pinned_arithmetic, batch_path),
+                            if splitk {
+                                self.pipelines
+                                    .proj
+                                    .select_ptq1_q8_0_decode_splitk(self.resolved_pinned_arithmetic)
+                            } else {
+                                self.pipelines
+                                    .proj
+                                    .select_ptq1_q8_0(self.resolved_pinned_arithmetic, batch_path)
+                            },
                             tok_tiles_16y,
                         ),
                         WeightEncoding::Q8_0 => (
-                            self.pipelines.proj.select_q8_0_q8_0(batch_path),
+                            if splitk {
+                                self.pipelines.proj.select_q8_0_q8_0_decode_splitk()
+                            } else {
+                                self.pipelines.proj.select_q8_0_q8_0(batch_path)
+                            },
                             tok_tiles_16y,
                         ),
                         WeightEncoding::Pq2Q8k | WeightEncoding::F32 => {
@@ -5750,9 +5876,89 @@ fn upload_arena_words(
     Ok(span)
 }
 
+fn repack_lora_b_f32_coalesced(words: &[u32], rank: usize, out_features: usize) -> Vec<u32> {
+    let mut out = vec![0_u32; rank * out_features];
+    for row in 0..out_features {
+        let src_base = row * rank;
+        for r in 0..rank {
+            out[r * out_features + row] = words[src_base + r];
+        }
+    }
+    out
+}
+
+fn decode_lora_f16_packed_a(
+    tensor: &Tensor,
+    in_features: usize,
+    rank: usize,
+) -> Result<Vec<u32>, Error> {
+    let expected_bytes = in_features
+        .checked_mul(rank)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| Error::ResourceLimit("F16 LoRA A byte size overflow".to_owned()))?;
+    if tensor.data.len() != expected_bytes {
+        return Err(Error::InvalidInput(format!(
+            "F16 LoRA tensor '{}' byte length mismatch",
+            tensor.name
+        )));
+    }
+    let halves = tensor.data.as_chunks::<2>().0;
+    let in_words = in_features.div_ceil(2);
+    let mut packed = Vec::with_capacity(rank * in_words);
+    for r in 0..rank {
+        let row_base = r * in_features;
+        for pair in 0..in_words {
+            let c0 = pair * 2;
+            let lo = u16::from_le_bytes(halves[row_base + c0]);
+            let hi = if c0 + 1 < in_features {
+                u16::from_le_bytes(halves[row_base + c0 + 1])
+            } else {
+                0
+            };
+            packed.push(u32::from(lo) | (u32::from(hi) << 16));
+        }
+    }
+    Ok(packed)
+}
+
+fn decode_lora_f16_packed_b_coalesced(
+    tensor: &Tensor,
+    rank: usize,
+    out_features: usize,
+) -> Result<Vec<u32>, Error> {
+    let expected_bytes = rank
+        .checked_mul(out_features)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| Error::ResourceLimit("F16 LoRA B byte size overflow".to_owned()))?;
+    if tensor.data.len() != expected_bytes {
+        return Err(Error::InvalidInput(format!(
+            "F16 LoRA tensor '{}' byte length mismatch",
+            tensor.name
+        )));
+    }
+    let halves = tensor.data.as_chunks::<2>().0;
+    let out_words = out_features.div_ceil(2);
+    let mut packed = Vec::with_capacity(rank * out_words);
+    for r in 0..rank {
+        for pair in 0..out_words {
+            let row0 = pair * 2;
+            let lo = u16::from_le_bytes(halves[row0 * rank + r]);
+            let hi = if row0 + 1 < out_features {
+                u16::from_le_bytes(halves[(row0 + 1) * rank + r])
+            } else {
+                0
+            };
+            packed.push(u32::from(lo) | (u32::from(hi) << 16));
+        }
+    }
+    Ok(packed)
+}
+
 struct PreparedLinearLoraFactor {
     a_words: Vec<u32>,
     b_words: Vec<u32>,
+    a_packed_f16: Option<Vec<u32>>,
+    b_packed_f16: Option<Vec<u32>>,
     in_features: usize,
     out_features: usize,
     rank: usize,
@@ -5767,6 +5973,10 @@ struct PreparedAdapters {
     multi_rank_scale: Option<f32>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Validates, repacks/packs F32/F16 LoRA adapters, and hashes adapter content SHA-256."
+)]
 fn prepare_adapters_upload(
     base_model: &Model,
     _geometry: &GraphGeometry,
@@ -5830,12 +6040,29 @@ fn prepare_adapters_upload(
             })?;
             let scaling = alpha / f32::from(rank_u16);
             let a_words = decode_lora_words(a_tensor)?;
-            let b_words = decode_lora_words(b_tensor)?;
+            let b_words_raw = decode_lora_words(b_tensor)?;
+            let b_words = repack_lora_b_f32_coalesced(&b_words_raw, *rank, *out_features);
+            let is_f16 = a_tensor.kind == 1 && b_tensor.kind == 1;
+            let a_packed_f16 = if is_f16 {
+                Some(decode_lora_f16_packed_a(a_tensor, *in_features, *rank)?)
+            } else {
+                None
+            };
+            let b_packed_f16 = if is_f16 {
+                Some(decode_lora_f16_packed_b_coalesced(
+                    b_tensor,
+                    *rank,
+                    *out_features,
+                )?)
+            } else {
+                None
+            };
             hash_str(&mut hasher, b"mr-tgt:", target)?;
             hash_usize(&mut hasher, *in_features)?;
             hash_usize(&mut hasher, *out_features)?;
             hash_usize(&mut hasher, *rank)?;
             hash_u32(&mut hasher, a_tensor.kind)?;
+            hash_u32(&mut hasher, b_tensor.kind)?;
             for &w in &a_words {
                 hash_u32(&mut hasher, w)?;
             }
@@ -5847,6 +6074,8 @@ fn prepare_adapters_upload(
                 PreparedLinearLoraFactor {
                     a_words,
                     b_words,
+                    a_packed_f16,
+                    b_packed_f16,
                     in_features: *in_features,
                     out_features: *out_features,
                     rank: *rank,
@@ -5889,8 +6118,14 @@ fn parse_and_upload_adapters(
         ..UploadedAdapters::default()
     };
     for (target, factor) in prepared.multi_rank_linear {
-        let a_span = upload_arena_words(&factor.a_words, guard)?;
-        let b_span = upload_arena_words(&factor.b_words, guard)?;
+        let (a_upload, b_upload, is_f16) =
+            if let (Some(ap), Some(bp)) = (&factor.a_packed_f16, &factor.b_packed_f16) {
+                (ap.as_slice(), bp.as_slice(), true)
+            } else {
+                (factor.a_words.as_slice(), factor.b_words.as_slice(), false)
+            };
+        let a_span = upload_arena_words(a_upload, guard)?;
+        let b_span = upload_arena_words(b_upload, guard)?;
         uploaded.multi_rank_linear.insert(
             target,
             GpuLoraFactor {
@@ -5900,6 +6135,7 @@ fn parse_and_upload_adapters(
                 out_features: factor.out_features,
                 rank: factor.rank,
                 scaling: factor.scaling,
+                is_f16,
             },
         );
     }
@@ -6524,6 +6760,7 @@ fn allocate_scratch(
         lora_ranks: guard.alloc_storage(sizes[16])?,
         lora_ranks_staging: [
             guard.alloc_storage(sizes[25])?,
+            guard.alloc_storage(sizes[26])?,
             guard.alloc_storage(sizes[26])?,
         ],
         attn_scores: guard.alloc_storage(sizes[17])?,

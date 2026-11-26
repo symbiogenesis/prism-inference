@@ -1977,21 +1977,17 @@ mod tests {
     }
 
     fn ptq1_test_caps() -> Option<Vec<crate::Ptq1Dotprod>> {
+        let detected = crate::Ptq1Dotprod::detect()?;
         #[cfg(target_arch = "aarch64")]
-        {
-            let detected = crate::Ptq1Dotprod::detect()?;
-            Some(vec![
-                detected,
-                crate::Ptq1Dotprod {
-                    i8mm: false,
-                    ..detected
-                },
-            ])
-        }
+        return Some(vec![
+            detected,
+            crate::Ptq1Dotprod {
+                i8mm: false,
+                ..detected
+            },
+        ]);
         #[cfg(not(target_arch = "aarch64"))]
-        {
-            Some(vec![crate::Ptq1Dotprod { _detected: () }])
-        }
+        Some(vec![detected])
     }
 
     fn q8_0_test_caps() -> Option<Vec<crate::Q8Dotprod>> {

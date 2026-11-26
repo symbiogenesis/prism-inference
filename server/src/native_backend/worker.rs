@@ -9,7 +9,10 @@ use bonsai_prism_runtime::{
     runtime::{Cancellation, Completion, GenerationTimings},
     swift_session::{RichTextEvent, SwiftSession, TextEvent, TokenLogprobInfo},
 };
-#[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+#[cfg(any(
+    test,
+    all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
+))]
 use std::path::PathBuf;
 use std::{
     path::Path,
@@ -266,6 +269,13 @@ impl Engine for SwiftSession {
     }
 }
 
+#[cfg_attr(
+    not(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")),
+    allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Windows ARM64 attaches the auto projection executor on session"
+    )
+)]
 fn initialize_auto_executor(
     session: &mut SwiftSession,
     arena_cache_dir: Option<&Path>,

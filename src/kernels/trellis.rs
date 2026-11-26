@@ -676,6 +676,8 @@ fn dispatch_strip_matvec(
 ) -> Result<()> {
     #[cfg(all(
         target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
         feature = "experimental-neon",
         target_feature = "neon"
     ))]
@@ -696,6 +698,8 @@ fn dispatch_strip_matmul_tokens(
 ) -> Result<()> {
     #[cfg(all(
         target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
         feature = "experimental-neon",
         target_feature = "neon"
     ))]

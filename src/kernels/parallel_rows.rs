@@ -254,7 +254,7 @@ impl RowParallelism {
         }
     }
 
-    /// Derives a worker policy sharing this instance's underlying [`NativeRowPool`]
+    /// Derives a worker policy sharing this instance's underlying `NativeRowPool`
     /// with active concurrency capped to `1..=self.pool_workers()`.
     ///
     /// Selecting `1` retains serial execution without dispatching background threads.
@@ -282,7 +282,7 @@ impl RowParallelism {
         Err(invalid("multiple row workers require parallel-rows"))
     }
 
-    /// Creates a `(decode, prefill)` pair of policies sharing one [`NativeRowPool`]
+    /// Creates a `(decode, prefill)` pair of policies sharing one `NativeRowPool`
     /// sized to `max(decode_workers, prefill_workers)` (`<= MAX_ROW_WORKERS`).
     ///
     /// # Errors

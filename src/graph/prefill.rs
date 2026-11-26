@@ -279,7 +279,7 @@ impl Qwen35 {
     ///
     /// # Errors
     /// Rejects unsupported tile token counts (outside 8, 16, 32, or 64 when
-    /// enabled by [`crate::kernels::prefill::MAX_TILE_TOKENS`]) and size overflow.
+    /// enabled by `crate::kernels::prefill::MAX_TILE_TOKENS`) and size overflow.
     pub fn tiled_prefill_scratch_bytes(&self, tokens: usize) -> Result<usize> {
         if !matches!(tokens, 8 | 16 | 32 | 64) || tokens > crate::kernels::prefill::MAX_TILE_TOKENS
         {
@@ -7210,8 +7210,13 @@ mod fused_last_token_tests {
             tensors: model.tensors.clone(),
             identity: model.identity.clone(),
         };
+        #[cfg(feature = "parallel-rows")]
+        let workers = 4;
+        #[cfg(not(feature = "parallel-rows"))]
+        let workers = 1;
+
         let mut sequential = Qwen35::new(cloned, 32)?;
-        sequential.set_row_parallelism(RowParallelism::new(4)?);
+        sequential.set_row_parallelism(RowParallelism::new(workers)?);
         for &token in &[0_u32, 1, 2, 3, 2, 0, 1, 2, 3] {
             sequential.ingest(token)?;
         }
@@ -7220,7 +7225,7 @@ mod fused_last_token_tests {
         let mut tiled = Qwen35::new(model, 32)?;
         let scratch = tiled.tiled_prefill_scratch_bytes(8)?;
         tiled = tiled.with_tiled_prefill(8, scratch)?;
-        tiled.set_row_parallelism(RowParallelism::new(4)?);
+        tiled.set_row_parallelism(RowParallelism::new(workers)?);
         let mut actual_logits = Vec::new();
         // Two tiles: leading 8-token tile runs narrow_last_layer (parallel state-only conv/matrix);
         // final 2-token tile exercises fused residual add + last-layer evaluation.

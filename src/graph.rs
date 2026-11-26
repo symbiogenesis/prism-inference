@@ -2471,7 +2471,7 @@ impl Transforms {
             let signs = self.signs_for(weight, input.len());
             if parallelism.workers() > 1
                 && self.block >= 256
-                && input.len() >= self.block.saturating_mul(16)
+                && input.len() >= self.block.saturating_mul(4)
             {
                 return parallelism.update_chunks(transformed, self.block, |base_block, chunk| {
                     for (local_idx, out_block) in chunk.chunks_exact_mut(self.block).enumerate() {
@@ -4098,6 +4098,7 @@ impl Qwen35 {
         };
         let total_layers = self.layers.len();
         let narrow_final = logits.is_none() && self.narrow_last_layer;
+        let mut pending_residual = false;
         for (layer_idx, ((layer, state), delta)) in self
             .layers
             .iter()
@@ -4118,7 +4119,15 @@ impl Qwen35 {
             let attention_timer = timings
                 .as_deref_mut()
                 .map(|record| record.attention(layer_idx));
-            evaluation.normalize_for_into(hidden, &layer.norm, normalized, first_attn_target)?;
+            evaluation.normalize_or_add_for_into(
+                pending_residual,
+                hidden,
+                attention,
+                &layer.norm,
+                normalized,
+                first_attn_target,
+            )?;
+            pending_residual = false;
             if is_narrow_final {
                 match (&layer.attention, state) {
                     (Attention::Full(weights), LayerState::Full { .. }) => {
@@ -4265,15 +4274,17 @@ impl Qwen35 {
                 {
                     compensation.apply(normalized, attention)?;
                 }
-                add_finite(hidden, attention, "decoder layer output")?;
+                pending_residual = true;
             }
             timing::complete(ffn_timer);
         }
         if let Some(logits) = logits {
             match &self.output {
                 OutputHead::Plain(output_tensor) => {
-                    evaluation.normalize_for_into(
+                    evaluation.normalize_or_add_for_into(
+                        pending_residual,
                         hidden,
+                        attention,
                         &self.output_norm,
                         normalized,
                         output_tensor,
@@ -4281,6 +4292,9 @@ impl Qwen35 {
                     evaluation.project_into(output_tensor, normalized, logits)?;
                 }
                 OutputHead::Trellis(weight) => {
+                    if pending_residual {
+                        add_finite(hidden, attention, "decoder layer output")?;
+                    }
                     evaluation.normalize_plain_into(hidden, &self.output_norm, normalized)?;
                     crate::kernels::trellis::trellis_matvec_into(
                         weight,
@@ -4292,6 +4306,9 @@ impl Qwen35 {
                     )?;
                 }
                 OutputHead::TrellisBanded(head) => {
+                    if pending_residual {
+                        add_finite(hidden, attention, "decoder layer output")?;
+                    }
                     evaluation.normalize_plain_into(hidden, &self.output_norm, normalized)?;
                     head.matvec_into(
                         normalized,
@@ -4303,6 +4320,8 @@ impl Qwen35 {
                 }
             }
             finite(logits, "output logits")?;
+        } else if pending_residual {
+            add_finite(hidden, attention, "decoder layer output")?;
         }
         // Reserve every append before changing numerical state. Deltas retain
         // their allocations across tokens but never alias checkpoint storage.
@@ -4444,6 +4463,22 @@ impl Evaluation<'_, '_, '_> {
             .normalize(input, weight, self.geometry.epsilon, output)
     }
 
+    fn normalize_or_add_for_into(
+        &mut self,
+        pending_residual: bool,
+        values: &mut [f32],
+        delta: &[f32],
+        weight: &[f32],
+        output: &mut Vec<f32>,
+        first_target: &Tensor,
+    ) -> Result<()> {
+        if pending_residual {
+            self.add_normalize_for_into(values, delta, weight, output, first_target)
+        } else {
+            self.normalize_for_into(values, weight, output, first_target)
+        }
+    }
+
     fn add_normalize_for_into(
         &mut self,
         values: &mut [f32],
@@ -4462,29 +4497,27 @@ impl Evaluation<'_, '_, '_> {
             let signs = self.transforms.signs_for(first_target, values.len());
             let parallelism = self.projection.matvec.clone_row_parallelism();
             self.projection.fusions.add_norm_hadamard.attempt();
-            if self
-                .arithmetic
-                .add_normalize_hadamard_into(
-                    values,
-                    delta,
-                    weight,
-                    self.geometry.epsilon,
-                    self.transforms.block,
-                    signs,
-                    &parallelism,
-                    output,
-                    &mut self.projection.transformed,
-                )
-                .is_ok()
-            {
-                self.projection.fusions.add_norm_hadamard.complete();
-                self.projection.pre_transformed_len = Some(values.len());
-                return Ok(());
+            match self.arithmetic.add_normalize_hadamard_into(
+                values,
+                delta,
+                weight,
+                self.geometry.epsilon,
+                self.transforms.block,
+                signs,
+                &parallelism,
+                output,
+                &mut self.projection.transformed,
+            ) {
+                Ok(()) => {
+                    self.projection.fusions.add_norm_hadamard.complete();
+                    self.projection.pre_transformed_len = Some(values.len());
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.projection.fusions.add_norm_hadamard.fallback();
+                    return Err(error);
+                }
             }
-            self.projection.fusions.add_norm_hadamard.fallback();
-            return self
-                .arithmetic
-                .normalize(values, weight, self.geometry.epsilon, output);
         }
         self.arithmetic
             .add_normalize(values, delta, weight, self.geometry.epsilon, output)
@@ -5857,7 +5890,10 @@ impl Decoder for Qwen35 {
             layers: if self.position == 0 {
                 Vec::new()
             } else {
-                copy_state(&self.state)?
+                copy_state_with_parallelism(
+                    &self.state,
+                    self.workspace.projection.matvec.row_parallelism(),
+                )?
             },
             projection_plan_digest: None,
         })
@@ -5878,7 +5914,11 @@ impl Decoder for Qwen35 {
         if self.position == 0 {
             target.layers.clear();
         } else {
-            copy_state_into(&self.state, &mut target.layers)?;
+            copy_state_into_with_parallelism(
+                &self.state,
+                &mut target.layers,
+                self.workspace.projection.matvec.row_parallelism(),
+            )?;
         }
         target.provenance = self.provenance.clone();
         target.context_limit = self.context_limit;
@@ -5914,7 +5954,12 @@ impl Decoder for Qwen35 {
             // existing live storage; scratch and other snapshots remain private.
             return self.reset();
         }
-        restore_state_in_place(&mut self.state, &checkpoint.layers, checkpoint.position)?;
+        restore_state_in_place_with_parallelism(
+            &mut self.state,
+            &checkpoint.layers,
+            checkpoint.position,
+            self.workspace.projection.matvec.row_parallelism(),
+        )?;
         self.position = checkpoint.position;
         self.mrope_position = checkpoint.mrope_position;
         self.state_consistent = true;
@@ -6678,27 +6723,92 @@ fn copy_string_into(value: &str, target: &mut String) -> Result<()> {
     Ok(())
 }
 
+fn copy_layer_state(state: &LayerState) -> Result<LayerState> {
+    match state {
+        LayerState::Full { keys, values } => Ok(LayerState::Full {
+            keys: keys.copy()?,
+            values: values.copy()?,
+        }),
+        LayerState::Recurrent {
+            convolution,
+            matrix,
+        } => Ok(LayerState::Recurrent {
+            convolution: copy_values(convolution)?,
+            matrix: copy_values(matrix)?,
+        }),
+    }
+}
+
+#[cfg(test)]
 fn copy_state(states: &[LayerState]) -> Result<Vec<LayerState>> {
+    copy_state_with_parallelism(states, &RowParallelism::default())
+}
+
+fn copy_state_with_parallelism(
+    states: &[LayerState],
+    parallelism: &RowParallelism,
+) -> Result<Vec<LayerState>> {
     let mut result = capacity(states.len())?;
+    if parallelism.workers() > 1 && states.len() >= 4 {
+        let mut slots = capacity(states.len())?;
+        slots.resize_with(states.len(), || None);
+        parallelism.update_chunks(&mut slots, 1, |base_layer, chunk| {
+            for (offset, slot) in chunk.iter_mut().enumerate() {
+                *slot = Some(copy_layer_state(&states[base_layer + offset])?);
+            }
+            Ok(())
+        })?;
+        for slot in slots {
+            result.push(slot.ok_or_else(|| invalid("parallel checkpoint copy omitted a layer"))?);
+        }
+        return Ok(result);
+    }
     for state in states {
-        result.push(match state {
-            LayerState::Full { keys, values } => LayerState::Full {
-                keys: keys.copy()?,
-                values: values.copy()?,
-            },
-            LayerState::Recurrent {
-                convolution,
-                matrix,
-            } => LayerState::Recurrent {
-                convolution: copy_values(convolution)?,
-                matrix: copy_values(matrix)?,
-            },
-        });
+        result.push(copy_layer_state(state)?);
     }
     Ok(result)
 }
 
+#[cfg(test)]
 fn copy_state_into(states: &[LayerState], target: &mut Vec<LayerState>) -> Result<()> {
+    copy_state_into_with_parallelism(states, target, &RowParallelism::default())
+}
+
+fn copy_layer_state_into(source: &LayerState, existing: &mut LayerState) -> Result<()> {
+    match (source, existing) {
+        (
+            LayerState::Full { keys, values },
+            LayerState::Full {
+                keys: existing_keys,
+                values: existing_values,
+            },
+        ) => {
+            keys.copy_into(existing_keys)?;
+            values.copy_into(existing_values)?;
+        }
+        (
+            LayerState::Recurrent {
+                convolution,
+                matrix,
+            },
+            LayerState::Recurrent {
+                convolution: existing_convolution,
+                matrix: existing_matrix,
+            },
+        ) => {
+            existing_convolution.copy_from_slice(convolution);
+            existing_matrix.copy_from_slice(matrix);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn copy_state_into_with_parallelism(
+    states: &[LayerState],
+    target: &mut Vec<LayerState>,
+    parallelism: &RowParallelism,
+) -> Result<()> {
     let compatible = states.len() == target.len()
         && states
             .iter()
@@ -6730,8 +6840,16 @@ fn copy_state_into(states: &[LayerState], target: &mut Vec<LayerState>) -> Resul
                 _ => false,
             });
     if !compatible {
-        *target = copy_state(states)?;
+        *target = copy_state_with_parallelism(states, parallelism)?;
         return Ok(());
+    }
+    if parallelism.workers() > 1 && states.len() >= 4 {
+        return parallelism.update_chunks(target.as_mut_slice(), 1, |base_layer, chunk| {
+            for (offset, existing) in chunk.iter_mut().enumerate() {
+                copy_layer_state_into(&states[base_layer + offset], existing)?;
+            }
+            Ok(())
+        });
     }
     for (source, existing) in states.iter().zip(target.iter_mut()) {
         if let (
@@ -6765,10 +6883,54 @@ fn copy_state_into(states: &[LayerState], target: &mut Vec<LayerState>) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn restore_state_in_place(
     states: &mut [LayerState],
     checkpoint: &[LayerState],
     expected_position: usize,
+) -> Result<()> {
+    restore_state_in_place_with_parallelism(
+        states,
+        checkpoint,
+        expected_position,
+        &RowParallelism::default(),
+    )
+}
+
+fn apply_layer_restore_in_place(state: &mut LayerState, saved: &LayerState) {
+    match (state, saved) {
+        (
+            LayerState::Full { keys, values },
+            LayerState::Full {
+                keys: saved_keys,
+                values: saved_values,
+            },
+        ) => {
+            keys.apply_restore_in_place(saved_keys);
+            values.apply_restore_in_place(saved_values);
+        }
+        (
+            LayerState::Recurrent {
+                convolution,
+                matrix,
+            },
+            LayerState::Recurrent {
+                convolution: saved_convolution,
+                matrix: saved_matrix,
+            },
+        ) => {
+            convolution.copy_from_slice(saved_convolution);
+            matrix.copy_from_slice(saved_matrix);
+        }
+        _ => {}
+    }
+}
+
+fn restore_state_in_place_with_parallelism(
+    states: &mut [LayerState],
+    checkpoint: &[LayerState],
+    expected_position: usize,
+    parallelism: &RowParallelism,
 ) -> Result<()> {
     if states.len() != checkpoint.len() {
         return Err(invalid("checkpoint has incompatible layer state"));
@@ -6812,33 +6974,16 @@ fn restore_state_in_place(
             values.reserve_restore(saved_values, Some(expected_position))?;
         }
     }
+    if parallelism.workers() > 1 && states.len() >= 4 {
+        return parallelism.update_chunks(states, 1, |base_layer, chunk| {
+            for (offset, state) in chunk.iter_mut().enumerate() {
+                apply_layer_restore_in_place(state, &checkpoint[base_layer + offset]);
+            }
+            Ok(())
+        });
+    }
     for (state, saved) in states.iter_mut().zip(checkpoint) {
-        match (state, saved) {
-            (
-                LayerState::Full { keys, values },
-                LayerState::Full {
-                    keys: saved_keys,
-                    values: saved_values,
-                },
-            ) => {
-                keys.apply_restore_in_place(saved_keys);
-                values.apply_restore_in_place(saved_values);
-            }
-            (
-                LayerState::Recurrent {
-                    convolution,
-                    matrix,
-                },
-                LayerState::Recurrent {
-                    convolution: saved_convolution,
-                    matrix: saved_matrix,
-                },
-            ) => {
-                convolution.copy_from_slice(saved_convolution);
-                matrix.copy_from_slice(saved_matrix);
-            }
-            _ => {}
-        }
+        apply_layer_restore_in_place(state, saved);
     }
     Ok(())
 }

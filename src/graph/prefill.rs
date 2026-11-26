@@ -936,14 +936,72 @@ impl Qwen35 {
             .folded
             .take()
             .ok_or_else(|| invalid("missing folded verification state"))?;
-        let result = (|| -> Result<()> {
+        let result = Self::flush_folded_recurrent_layers(
+            &self.layers,
+            &mut self.state,
+            &mut self.workspace.deltas,
+            &self.geometry,
+            self.arithmetic,
+            &mut tile,
+            &mut folded,
+        );
+        if result.is_err() {
+            folded.clear_all();
+            self.state_consistent = false;
+        }
+        tile.folded = Some(folded);
+        self.tiled_prefill = Some(tile);
+        result
+    }
+
+    fn flush_folded_recurrent_layers(
+        layers: &[Layer],
+        states: &mut [LayerState],
+        deltas: &mut [LayerDelta],
+        geometry: &Geometry,
+        arithmetic: Arithmetic,
+        tile: &mut TiledPrefill,
+        folded: &mut FoldedVerificationState,
+    ) -> Result<()> {
+        let rec_count = layers
+            .iter()
+            .filter(|layer| matches!(layer.attention, Attention::Recurrent(_)))
+            .count();
+        if tile.projector.row_parallelism().workers() > 1
+            && folded.layers.len() >= 4
+            && folded.layers.len() == rec_count
+        {
+            let mut tasks = super::capacity(rec_count)?;
+            let mut layer_tapes = folded.layers.iter_mut();
+            for ((layer, state), delta) in layers.iter().zip(states).zip(deltas) {
+                if matches!(layer.attention, Attention::Recurrent(_)) {
+                    let layer_tape = layer_tapes.next().ok_or_else(|| {
+                        invalid("folded verification recurrent layer tape missing")
+                    })?;
+                    tasks.push((state, delta, layer_tape));
+                }
+            }
+            tile.projector
+                .row_parallelism()
+                .update_chunks(&mut tasks, 1, |_, chunk| {
+                    let serial_projector = ProjectionTile::default();
+                    let mut unused_outputs = Vec::new();
+                    for (state, delta, layer_tape) in chunk {
+                        gdn::flush_recurrent_carry_layer(
+                            layer_tape,
+                            state,
+                            delta,
+                            geometry,
+                            arithmetic,
+                            &serial_projector,
+                            &mut unused_outputs,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+        } else {
             let mut rec_idx = 0_usize;
-            for ((layer, state), delta) in self
-                .layers
-                .iter()
-                .zip(&mut self.state)
-                .zip(&mut self.workspace.deltas)
-            {
+            for ((layer, state), delta) in layers.iter().zip(states).zip(deltas) {
                 if matches!(layer.attention, Attention::Recurrent(_)) {
                     let layer_tape = folded.layers.get_mut(rec_idx).ok_or_else(|| {
                         invalid("folded verification recurrent layer tape missing")
@@ -953,23 +1011,16 @@ impl Qwen35 {
                         layer_tape,
                         state,
                         delta,
-                        &self.geometry,
-                        self.arithmetic,
+                        geometry,
+                        arithmetic,
                         &tile.projector,
                         &mut tile.gdn_head_outputs,
                     )?;
                 }
             }
-            folded.carried_tokens.clear();
-            Ok(())
-        })();
-        if result.is_err() {
-            folded.clear_all();
-            self.state_consistent = false;
         }
-        tile.folded = Some(folded);
-        self.tiled_prefill = Some(tile);
-        result
+        folded.carried_tokens.clear();
+        Ok(())
     }
 
     pub(super) fn ingest_prefill_block(

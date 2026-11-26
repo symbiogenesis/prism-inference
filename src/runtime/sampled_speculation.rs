@@ -549,14 +549,7 @@ impl<D: Decoder> Runtime<D> {
             self.recycle_batch_rows(rows);
             return Err(error);
         }
-        if rows.len() != block.len()
-            || rows.iter().any(|row| {
-                row.len() != self.decoder.vocab_size()
-                    || row.is_empty()
-                    || row.len() > 1_048_576
-                    || !crate::kernels::is_finite_slice(row)
-            })
-        {
+        if super::verification::invalid_batched_logits(&self.decoder, &rows, block.len()) {
             self.recycle_batch_rows(rows);
             return Err(invalid("folded batched decoder returned invalid logits"));
         }
@@ -727,14 +720,7 @@ impl<D: Decoder> Runtime<D> {
         self.decoder.evaluate_batch_into(draft, &mut rows, check)?;
         self.record_batch_row_witness(&row_caps_before, &rows);
         check()?;
-        if rows.len() != draft.len()
-            || rows.iter().any(|row| {
-                row.len() != self.decoder.vocab_size()
-                    || row.is_empty()
-                    || row.len() > 1_048_576
-                    || !crate::kernels::is_finite_slice(row)
-            })
-        {
+        if super::verification::invalid_batched_logits(&self.decoder, &rows, draft.len()) {
             self.recycle_snapshot(checkpoint);
             self.recycle_batch_rows(rows);
             return Err(invalid("batched decoder returned invalid logits"));

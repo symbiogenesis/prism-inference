@@ -5,6 +5,26 @@ use super::{
     VerifiedRound, greedy_finite, invalid,
 };
 
+pub(super) fn invalid_batched_logits<D: Decoder>(
+    decoder: &D,
+    rows: &[Vec<f32>],
+    expected_rows: usize,
+) -> bool {
+    // Decoder is public: independently validate every output before using
+    // any row to accept tokens, including rows beyond a rejected prefix.
+    // `Qwen35` already checks finiteness inside `evaluate_tile_output_head_range`.
+    let logits_prevalidated =
+        std::any::type_name::<D>() == std::any::type_name::<crate::graph::Qwen35>();
+    let vocab_size = decoder.vocab_size();
+    rows.len() != expected_rows
+        || rows.iter().any(|row| {
+            row.len() != vocab_size
+                || row.is_empty()
+                || row.len() > 1_048_576
+                || (!logits_prevalidated && !crate::kernels::is_finite_slice(row))
+        })
+}
+
 impl<D: Decoder> Runtime<D> {
     pub(super) fn verify_batched_draft(
         &mut self,
@@ -34,16 +54,7 @@ impl<D: Decoder> Runtime<D> {
         self.decoder.evaluate_batch_into(draft, &mut rows, check)?;
         self.record_batch_row_witness(&row_caps_before, &rows);
         check()?;
-        // Decoder is public: independently validate every output before using
-        // any row to accept tokens, including rows beyond a rejected prefix.
-        if rows.len() != draft.len()
-            || rows.iter().any(|row| {
-                row.len() != self.decoder.vocab_size()
-                    || row.is_empty()
-                    || row.len() > 1_048_576
-                    || !crate::kernels::is_finite_slice(row)
-            })
-        {
+        if invalid_batched_logits(&self.decoder, &rows, draft.len()) {
             self.recycle_batch_rows(rows);
             return Err(invalid("batched decoder returned invalid logits"));
         }

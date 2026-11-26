@@ -2624,28 +2624,29 @@ impl PreparedMatvec<'_> {
                 if tensor.kind == PTQ1
                     && matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon)
                 {
-                    let q8 = &scratch.q8;
                     if scratch.pinned_accumulation {
+                        let consumer = neon::Ptq1Consumer::<true>::new(&scratch.q8, row_bytes);
                         return scratch.row_parallelism.fill_sixteen_rows(
                             &tensor.data,
                             row_bytes,
                             output,
                             &mut scratch.row_errors,
-                            |rows| neon::dot_ptq1_sixteen_rows_pinned(rows, q8),
-                            |rows| neon::dot_ptq1_eight_rows_pinned(rows, q8),
-                            |rows| neon::dot_ptq1_four_rows_pinned(rows, q8),
-                            |bytes| neon::dot_ptq1_row_pinned(bytes, q8),
+                            |rows| consumer.dot_sixteen_rows(rows),
+                            |rows| consumer.dot_eight_rows(rows),
+                            |rows| consumer.dot_four_rows(rows),
+                            |bytes| consumer.dot_row(bytes),
                         );
                     }
+                    let consumer = neon::Ptq1Consumer::<false>::new(&scratch.q8, row_bytes);
                     return scratch.row_parallelism.fill_sixteen_rows(
                         &tensor.data,
                         row_bytes,
                         output,
                         &mut scratch.row_errors,
-                        |rows| neon::dot_ptq1_sixteen_rows_source(rows, q8),
-                        |rows| neon::dot_ptq1_eight_rows_source(rows, q8),
-                        |rows| neon::dot_ptq1_four_rows_source(rows, q8),
-                        |bytes| neon::dot_ptq1_row_source(bytes, q8),
+                        |rows| consumer.dot_sixteen_rows(rows),
+                        |rows| consumer.dot_eight_rows(rows),
+                        |rows| consumer.dot_four_rows(rows),
+                        |bytes| consumer.dot_row(bytes),
                     );
                 }
                 scratch.row_parallelism.fill(

@@ -7,8 +7,8 @@ use core::arch::aarch64::{
     int8x16_t, int32x4_t, uint8x8_t, uint8x16_t, vaddq_s32, vaddvq_s32, vandq_u8, vcgeq_u8,
     vcltq_u8, vcombine_s8, vcombine_s32, vcombine_u8, vdotq_s32, vdupq_n_s32, vdupq_n_u8,
     vget_high_s8, vget_high_s32, vget_low_s8, vget_low_s32, vld1_u8, vld1q_s8, vld1q_s32, vld1q_u8,
-    vmulq_u8, vpaddlq_s8, vpaddlq_s16, vreinterpretq_s8_u8, vshrq_n_u8, vst1q_s8, vst1q_s32,
-    vsubq_s8, vsubq_s32, vuzp1q_s8, vuzp1q_s32, vuzp2q_s8, vuzp2q_s32,
+    vmulq_u8, vpaddlq_s8, vpaddlq_s16, vreinterpret_u8_u16, vreinterpretq_s8_u8, vshrq_n_u8,
+    vst1q_s8, vst1q_s32, vsubq_s8, vsubq_s32, vuzp1q_s8, vuzp1q_s32, vuzp2q_s8, vuzp2q_s32,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -221,45 +221,43 @@ fn store_f32x4_neon(vec: core::arch::aarch64::float32x4_t, out: &mut [f32; 4]) {
 /// trits in 3 instructions without widening.
 #[inline]
 #[target_feature(enable = "neon")]
-fn extract_trit_s8x16(v: uint8x16_t) -> int8x16_t {
-    let lt_86 = vreinterpretq_s8_u8(vcltq_u8(v, vdupq_n_u8(86)));
-    let ge_171 = vreinterpretq_s8_u8(vcgeq_u8(v, vdupq_n_u8(171)));
+fn extract_trit_s8x16_consts(v: uint8x16_t, c86: uint8x16_t, c171: uint8x16_t) -> int8x16_t {
+    let lt_86 = vreinterpretq_s8_u8(vcltq_u8(v, c86));
+    let ge_171 = vreinterpretq_s8_u8(vcgeq_u8(v, c171));
     vsubq_s8(lt_86, ge_171)
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
+fn extract_trit_s8x16(v: uint8x16_t) -> int8x16_t {
+    extract_trit_s8x16_consts(v, vdupq_n_u8(86), vdupq_n_u8(171))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn unpack_ptq1_vectors(packed: &[u8; 28]) -> [int8x16_t; 8] {
+    use core::arch::aarch64::vdup_n_u16;
     const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
     const POW3_MID_23: [u8; 16] = [9, 9, 9, 9, 9, 9, 9, 9, 27, 27, 27, 27, 27, 27, 27, 27];
     const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
 
-    let first_bytes: [u8; 16] = [
-        packed[0], packed[1], packed[2], packed[3], packed[4], packed[5], packed[6], packed[7],
-        packed[8], packed[9], packed[10], packed[11], packed[12], packed[13], packed[14],
-        packed[15],
-    ];
-    let q0 = load_u8x16(&first_bytes);
-    let t0 = extract_trit_s8x16(q0);
-    let t1 = extract_trit_s8x16(vmulq_u8(q0, vdupq_n_u8(3)));
-    let t2 = extract_trit_s8x16(vmulq_u8(q0, vdupq_n_u8(9)));
-    let t3 = extract_trit_s8x16(vmulq_u8(q0, vdupq_n_u8(27)));
-    let t4 = extract_trit_s8x16(vmulq_u8(q0, vdupq_n_u8(81)));
+    let c86 = vdupq_n_u8(86);
+    let c171 = vdupq_n_u8(171);
+    let q0 = load_u8x16(&packed[..16].as_chunks::<16>().0[0]);
+    let t0 = extract_trit_s8x16_consts(q0, c86, c171);
+    let t1 = extract_trit_s8x16_consts(vmulq_u8(q0, vdupq_n_u8(3)), c86, c171);
+    let t2 = extract_trit_s8x16_consts(vmulq_u8(q0, vdupq_n_u8(9)), c86, c171);
+    let t3 = extract_trit_s8x16_consts(vmulq_u8(q0, vdupq_n_u8(27)), c86, c171);
+    let t4 = extract_trit_s8x16_consts(vmulq_u8(q0, vdupq_n_u8(81)), c86, c171);
 
-    let mid_half: [u8; 8] = [
-        packed[16], packed[17], packed[18], packed[19], packed[20], packed[21], packed[22],
-        packed[23],
-    ];
-    let q_mid_half = load_u8x8(&mid_half);
+    let q_mid_half = load_u8x8(&packed[16..24].as_chunks::<8>().0[0]);
     let q_mid = vcombine_u8(q_mid_half, q_mid_half);
-    let t5 = extract_trit_s8x16(vmulq_u8(q_mid, load_u8x16(&POW3_MID_01)));
-    let t6 = extract_trit_s8x16(vmulq_u8(q_mid, load_u8x16(&POW3_MID_23)));
+    let t5 = extract_trit_s8x16_consts(vmulq_u8(q_mid, load_u8x16(&POW3_MID_01)), c86, c171);
+    let t6 = extract_trit_s8x16_consts(vmulq_u8(q_mid, load_u8x16(&POW3_MID_23)), c86, c171);
 
-    let qh0 = packed[24];
-    let qh1 = packed[25];
-    let tail_half: [u8; 8] = [qh0, qh1, qh0, qh1, qh0, qh1, qh0, qh1];
-    let q_tail = vcombine_u8(q_mid_half, load_u8x8(&tail_half));
-    let t7 = extract_trit_s8x16(vmulq_u8(q_tail, load_u8x16(&POW3_TAIL)));
+    let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([packed[24], packed[25]])));
+    let q_tail = vcombine_u8(q_mid_half, tail_half);
+    let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, load_u8x16(&POW3_TAIL)), c86, c171);
 
     [t0, t1, t2, t3, t4, t5, t6, t7]
 }
@@ -4360,6 +4358,7 @@ fn ptq1_validate_row_scales<const ROWS: usize>(blocks: &[&[u8; 28]; ROWS]) -> Op
 #[inline]
 #[target_feature(enable = "neon")]
 fn unpack_ptq1_group(packed: &[u8; 28], group: usize) -> (int8x16_t, int8x16_t) {
+    use core::arch::aarch64::vdup_n_u16;
     const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
     const POW3_MID_23: [u8; 16] = [9, 9, 9, 9, 9, 9, 9, 9, 27, 27, 27, 27, 27, 27, 27, 27];
     const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
@@ -4391,10 +4390,9 @@ fn unpack_ptq1_group(packed: &[u8; 28], group: usize) -> (int8x16_t, int8x16_t) 
         _ => {
             let q_mid_half = load_u8x8(&packed[16..24].as_chunks::<8>().0[0]);
             let q_mid = vcombine_u8(q_mid_half, q_mid_half);
-            let qh0 = packed[24];
-            let qh1 = packed[25];
-            let tail_half = [qh0, qh1, qh0, qh1, qh0, qh1, qh0, qh1];
-            let q_tail = vcombine_u8(q_mid_half, load_u8x8(&tail_half));
+            let tail_half =
+                vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([packed[24], packed[25]])));
+            let q_tail = vcombine_u8(q_mid_half, tail_half);
             (
                 extract_trit_s8x16(vmulq_u8(q_mid, load_u8x16(&POW3_MID_23))),
                 extract_trit_s8x16(vmulq_u8(q_tail, load_u8x16(&POW3_TAIL))),
@@ -4403,69 +4401,230 @@ fn unpack_ptq1_group(packed: &[u8; 28], group: usize) -> (int8x16_t, int8x16_t) 
     }
 }
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn ptq1_validate_four_scales_vec(
+    blocks: [&[u8; 28]; 4],
+) -> Option<core::arch::aarch64::float32x4_t> {
+    use core::arch::aarch64::{
+        vand_u16, vcvt_f32_f16, vdup_n_u16, vld1_u16, vmaxv_u16, vreinterpret_f16_u16,
+    };
+    let bits = [
+        ptq1_scale_u16(blocks[0]),
+        ptq1_scale_u16(blocks[1]),
+        ptq1_scale_u16(blocks[2]),
+        ptq1_scale_u16(blocks[3]),
+    ];
+    // SAFETY: `bits` is an initialized 4-element `u16` array; `vld1_u16` requires no alignment.
+    let raw = unsafe { vld1_u16(bits.as_ptr()) };
+    if vmaxv_u16(vand_u16(raw, vdup_n_u16(0x7fff))) >= 0x7c00 {
+        return None;
+    }
+    Some(vcvt_f32_f16(vreinterpret_f16_u16(raw)))
+}
+
 #[target_feature(enable = "neon,dotprod")]
-fn ptq1_scaled_rows_dotprod<const ROWS: usize, const PINNED: bool, A: super::Q8ActivationView>(
-    rows: [&[u8]; ROWS],
+fn ptq1_scaled_1row_pinned_dotprod<A: super::Q8ActivationView>(
+    row_chunks: &[[u8; 28]],
     activation: &[A],
-) -> Option<[f32; ROWS]> {
-    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vmulq_f32};
+) -> Option<f32> {
+    use core::arch::aarch64::{
+        vcvtq_f32_s32, vdup_n_u16, vdupq_n_f32, vfmaq_laneq_f32, vget_low_u8, vmulq_f32,
+    };
+    const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
+    const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
 
-    let row_chunks: [&[[u8; 28]]; ROWS] = rows.map(|row| row.as_chunks::<28>().0);
-    let block_count = row_chunks[0].len();
+    let c86 = vdupq_n_u8(86);
+    let c171 = vdupq_n_u8(171);
+    let c3 = vdupq_n_u8(3);
+    let c9 = vdupq_n_u8(9);
+    let pow3_mid_01 = load_u8x16(&POW3_MID_01);
+    let pow3_tail = load_u8x16(&POW3_TAIL);
+    let mut lane = vdupq_n_f32(0.0);
 
-    if PINNED {
-        let mut lanes = [vdupq_n_f32(0.0); ROWS];
-        for block_idx in 0..block_count {
-            if ROWS >= 8 {
-                prefetch_row_blocks(&row_chunks, block_idx, block_count);
-            }
-            let blocks: [&[u8; 28]; ROWS] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
-            let row_scales = ptq1_validate_row_scales(&blocks)?;
-            let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
-            let a_scales: [f32; 4] = std::array::from_fn(|g| act_groups[g].scale());
-            let a_pairs: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|g| {
-                let ah = act_groups[g].values().as_chunks::<16>().0;
-                (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
-            });
-            for ((block_half, scale_half), lane_half) in blocks
-                .chunks(8)
-                .zip(row_scales.chunks(8))
-                .zip(lanes.chunks_mut(8))
-            {
-                for ((&block, &rs), lane_slot) in block_half
-                    .iter()
-                    .zip(scale_half.iter())
-                    .zip(lane_half.iter_mut())
-                {
-                    let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(block);
-                    let s0 = sdot32_vec(t0, t1, a_pairs[0].0, a_pairs[0].1);
-                    let mut lane =
-                        vfmaq_f32(*lane_slot, vcvtq_f32_s32(s0), vdupq_n_f32(rs * a_scales[0]));
-                    let s1 = sdot32_vec(t2, t3, a_pairs[1].0, a_pairs[1].1);
-                    lane = vfmaq_f32(lane, vcvtq_f32_s32(s1), vdupq_n_f32(rs * a_scales[1]));
-                    let s2 = sdot32_vec(t4, t5, a_pairs[2].0, a_pairs[2].1);
-                    lane = vfmaq_f32(lane, vcvtq_f32_s32(s2), vdupq_n_f32(rs * a_scales[2]));
-                    let s3 = sdot32_vec(t6, t7, a_pairs[3].0, a_pairs[3].1);
-                    *lane_slot = vfmaq_f32(lane, vcvtq_f32_s32(s3), vdupq_n_f32(rs * a_scales[3]));
-                }
-            }
-        }
-        let mut out = [0.0_f32; ROWS];
-        for (dst, lane) in out.iter_mut().zip(lanes) {
-            let mut l = [0.0_f32; 4];
-            store_f32x4_neon(lane, &mut l);
-            *dst = (l[0] + l[1]) + (l[2] + l[3]);
-        }
-        return out.iter().all(|v| v.is_finite()).then_some(out);
+    for (block_idx, block) in row_chunks.iter().enumerate() {
+        let rs = ptq1_validate_row_scales(&[block])?[0];
+        let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
+        let a_scales_v = load_f32x4_neon(&[
+            act_groups[0].scale(),
+            act_groups[1].scale(),
+            act_groups[2].scale(),
+            act_groups[3].scale(),
+        ]);
+        let rs_a = vmulq_f32(vdupq_n_f32(rs), a_scales_v);
+
+        let mut q = load_u8x16(&block[..16].as_chunks::<16>().0[0]);
+        let t0 = extract_trit_s8x16_consts(q, c86, c171);
+        q = vmulq_u8(q, c3);
+        let t1 = extract_trit_s8x16_consts(q, c86, c171);
+        let ah0 = act_groups[0].values().as_chunks::<16>().0;
+        let s0 = sdot32_vec(t0, t1, load_s8x16(&ah0[0]), load_s8x16(&ah0[1]));
+        lane = vfmaq_laneq_f32::<0>(lane, vcvtq_f32_s32(s0), rs_a);
+
+        q = vmulq_u8(q, c3);
+        let t2 = extract_trit_s8x16_consts(q, c86, c171);
+        q = vmulq_u8(q, c3);
+        let t3 = extract_trit_s8x16_consts(q, c86, c171);
+        let ah1 = act_groups[1].values().as_chunks::<16>().0;
+        let s1 = sdot32_vec(t2, t3, load_s8x16(&ah1[0]), load_s8x16(&ah1[1]));
+        lane = vfmaq_laneq_f32::<1>(lane, vcvtq_f32_s32(s1), rs_a);
+
+        let t4 = extract_trit_s8x16_consts(vmulq_u8(q, c3), c86, c171);
+        let q_mid_half = load_u8x8(&block[16..24].as_chunks::<8>().0[0]);
+        let qm = vmulq_u8(vcombine_u8(q_mid_half, q_mid_half), pow3_mid_01);
+        let t5 = extract_trit_s8x16_consts(qm, c86, c171);
+        let ah2 = act_groups[2].values().as_chunks::<16>().0;
+        let s2 = sdot32_vec(t4, t5, load_s8x16(&ah2[0]), load_s8x16(&ah2[1]));
+        lane = vfmaq_laneq_f32::<2>(lane, vcvtq_f32_s32(s2), rs_a);
+
+        let t6 = extract_trit_s8x16_consts(vmulq_u8(qm, c9), c86, c171);
+        let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([block[24], block[25]])));
+        let q_tail = vcombine_u8(vget_low_u8(qm), tail_half);
+        let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, pow3_tail), c86, c171);
+        let ah3 = act_groups[3].values().as_chunks::<16>().0;
+        let s3 = sdot32_vec(t6, t7, load_s8x16(&ah3[0]), load_s8x16(&ah3[1]));
+        lane = vfmaq_laneq_f32::<3>(lane, vcvtq_f32_s32(s3), rs_a);
     }
 
-    let mut outputs = [0.0_f32; ROWS];
+    let mut l = [0.0_f32; 4];
+    store_f32x4_neon(lane, &mut l);
+    let out = (l[0] + l[1]) + (l[2] + l[3]);
+    out.is_finite().then_some(out)
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn ptq1_scaled_4rows_pinned_dotprod<A: super::Q8ActivationView>(
+    row_chunks: [&[[u8; 28]]; 4],
+    activation: &[A],
+) -> Option<[f32; 4]> {
+    use core::arch::aarch64::{
+        vcvtq_f32_s32, vdup_n_u16, vdupq_n_f32, vfmaq_laneq_f32, vget_low_u8, vmulq_laneq_f32,
+    };
+    const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
+    const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
+
+    let block_count = row_chunks[0].len();
+    let c86 = vdupq_n_u8(86);
+    let c171 = vdupq_n_u8(171);
+    let c3 = vdupq_n_u8(3);
+    let c9 = vdupq_n_u8(9);
+    let pow3_mid_01 = load_u8x16(&POW3_MID_01);
+    let pow3_tail = load_u8x16(&POW3_TAIL);
+    let mut lanes = [vdupq_n_f32(0.0); 4];
+
     for block_idx in 0..block_count {
-        if ROWS >= 8 {
-            prefetch_row_blocks(&row_chunks, block_idx, block_count);
+        prefetch_row_blocks(&row_chunks, block_idx, block_count);
+        let blocks: [&[u8; 28]; 4] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
+        let rs_v = ptq1_validate_four_scales_vec(blocks)?;
+        let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
+        let a_scales_v = load_f32x4_neon(&[
+            act_groups[0].scale(),
+            act_groups[1].scale(),
+            act_groups[2].scale(),
+            act_groups[3].scale(),
+        ]);
+        let rs_a = [
+            vmulq_laneq_f32::<0>(a_scales_v, rs_v),
+            vmulq_laneq_f32::<1>(a_scales_v, rs_v),
+            vmulq_laneq_f32::<2>(a_scales_v, rs_v),
+            vmulq_laneq_f32::<3>(a_scales_v, rs_v),
+        ];
+
+        let mut q = [
+            load_u8x16(&blocks[0][..16].as_chunks::<16>().0[0]),
+            load_u8x16(&blocks[1][..16].as_chunks::<16>().0[0]),
+            load_u8x16(&blocks[2][..16].as_chunks::<16>().0[0]),
+            load_u8x16(&blocks[3][..16].as_chunks::<16>().0[0]),
+        ];
+
+        {
+            let ah = act_groups[0].values().as_chunks::<16>().0;
+            let a0 = load_s8x16(&ah[0]);
+            let a1 = load_s8x16(&ah[1]);
+            for r in 0..4 {
+                let t0 = extract_trit_s8x16_consts(q[r], c86, c171);
+                q[r] = vmulq_u8(q[r], c3);
+                let t1 = extract_trit_s8x16_consts(q[r], c86, c171);
+                let s = sdot32_vec(t0, t1, a0, a1);
+                lanes[r] = vfmaq_laneq_f32::<0>(lanes[r], vcvtq_f32_s32(s), rs_a[r]);
+            }
         }
-        let blocks: [&[u8; 28]; ROWS] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
-        let row_scales = ptq1_validate_row_scales(&blocks)?;
+
+        {
+            let ah = act_groups[1].values().as_chunks::<16>().0;
+            let a0 = load_s8x16(&ah[0]);
+            let a1 = load_s8x16(&ah[1]);
+            for r in 0..4 {
+                q[r] = vmulq_u8(q[r], c3);
+                let t2 = extract_trit_s8x16_consts(q[r], c86, c171);
+                q[r] = vmulq_u8(q[r], c3);
+                let t3 = extract_trit_s8x16_consts(q[r], c86, c171);
+                let s = sdot32_vec(t2, t3, a0, a1);
+                lanes[r] = vfmaq_laneq_f32::<1>(lanes[r], vcvtq_f32_s32(s), rs_a[r]);
+            }
+        }
+
+        let mut qm = [vdupq_n_u8(0); 4];
+        {
+            let ah = act_groups[2].values().as_chunks::<16>().0;
+            let a0 = load_s8x16(&ah[0]);
+            let a1 = load_s8x16(&ah[1]);
+            for r in 0..4 {
+                let t4 = extract_trit_s8x16_consts(vmulq_u8(q[r], c3), c86, c171);
+                let q_mid_half = load_u8x8(&blocks[r][16..24].as_chunks::<8>().0[0]);
+                qm[r] = vmulq_u8(vcombine_u8(q_mid_half, q_mid_half), pow3_mid_01);
+                let t5 = extract_trit_s8x16_consts(qm[r], c86, c171);
+                let s = sdot32_vec(t4, t5, a0, a1);
+                lanes[r] = vfmaq_laneq_f32::<2>(lanes[r], vcvtq_f32_s32(s), rs_a[r]);
+            }
+        }
+
+        {
+            let ah = act_groups[3].values().as_chunks::<16>().0;
+            let a0 = load_s8x16(&ah[0]);
+            let a1 = load_s8x16(&ah[1]);
+            for r in 0..4 {
+                let t6 = extract_trit_s8x16_consts(vmulq_u8(qm[r], c9), c86, c171);
+                let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([
+                    blocks[r][24],
+                    blocks[r][25],
+                ])));
+                let q_tail = vcombine_u8(vget_low_u8(qm[r]), tail_half);
+                let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, pow3_tail), c86, c171);
+                let s = sdot32_vec(t6, t7, a0, a1);
+                lanes[r] = vfmaq_laneq_f32::<3>(lanes[r], vcvtq_f32_s32(s), rs_a[r]);
+            }
+        }
+    }
+
+    let mut out = [0.0_f32; 4];
+    for (dst, lane) in out.iter_mut().zip(lanes) {
+        let mut l = [0.0_f32; 4];
+        store_f32x4_neon(lane, &mut l);
+        *dst = (l[0] + l[1]) + (l[2] + l[3]);
+    }
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn ptq1_scaled_1row_source_dotprod<A: super::Q8ActivationView>(
+    row_chunks: &[[u8; 28]],
+    activation: &[A],
+) -> Option<f32> {
+    use core::arch::aarch64::{vcvtq_f32_s32, vdup_n_u16, vget_low_u8, vmulq_f32};
+    const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
+    const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
+
+    let c86 = vdupq_n_u8(86);
+    let c171 = vdupq_n_u8(171);
+    let c3 = vdupq_n_u8(3);
+    let c9 = vdupq_n_u8(9);
+    let pow3_mid_01 = load_u8x16(&POW3_MID_01);
+    let pow3_tail = load_u8x16(&POW3_TAIL);
+    let mut output = 0.0_f32;
+
+    for (block_idx, block) in row_chunks.iter().enumerate() {
+        let rs = ptq1_validate_row_scales(&[block])?[0];
         let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
         let act_scales = load_f32x4_neon(&[
             act_groups[0].scale(),
@@ -4473,30 +4632,198 @@ fn ptq1_scaled_rows_dotprod<const ROWS: usize, const PINNED: bool, A: super::Q8A
             act_groups[2].scale(),
             act_groups[3].scale(),
         ]);
-        let a_pairs: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|g| {
-            let ah = act_groups[g].values().as_chunks::<16>().0;
-            (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
-        });
-        for (r, (&block, &rs)) in blocks.iter().zip(row_scales.iter()).enumerate() {
-            let [t0, t1, t2, t3, t4, t5, t6, t7] = unpack_ptq1_vectors(block);
-            let g0 = sdot32_vec(t0, t1, a_pairs[0].0, a_pairs[0].1);
-            let g1 = sdot32_vec(t2, t3, a_pairs[1].0, a_pairs[1].1);
-            let g2 = sdot32_vec(t4, t5, a_pairs[2].0, a_pairs[2].1);
-            let g3 = sdot32_vec(t6, t7, a_pairs[3].0, a_pairs[3].1);
-            let dots = vcvtq_f32_s32(reduce4_s32x4(g0, g1, g2, g3));
-            let mut prod = [0.0_f32; 4];
-            store_f32x4_neon(vmulq_f32(dots, act_scales), &mut prod);
-            let dot_sum = (((0.0_f32 + prod[0]) + prod[1]) + prod[2]) + prod[3];
-            #[expect(
-                clippy::suboptimal_flops,
-                reason = "Preserve PTQ1 SOURCE non-FMA block rounding order."
-            )]
-            {
-                outputs[r] += rs * dot_sum;
-            }
+
+        let mut q = load_u8x16(&block[..16].as_chunks::<16>().0[0]);
+        let t0 = extract_trit_s8x16_consts(q, c86, c171);
+        q = vmulq_u8(q, c3);
+        let t1 = extract_trit_s8x16_consts(q, c86, c171);
+        let ah0 = act_groups[0].values().as_chunks::<16>().0;
+        let g0 = sdot32_vec(t0, t1, load_s8x16(&ah0[0]), load_s8x16(&ah0[1]));
+
+        q = vmulq_u8(q, c3);
+        let t2 = extract_trit_s8x16_consts(q, c86, c171);
+        q = vmulq_u8(q, c3);
+        let t3 = extract_trit_s8x16_consts(q, c86, c171);
+        let ah1 = act_groups[1].values().as_chunks::<16>().0;
+        let g1 = sdot32_vec(t2, t3, load_s8x16(&ah1[0]), load_s8x16(&ah1[1]));
+
+        let t4 = extract_trit_s8x16_consts(vmulq_u8(q, c3), c86, c171);
+        let q_mid_half = load_u8x8(&block[16..24].as_chunks::<8>().0[0]);
+        let qm = vmulq_u8(vcombine_u8(q_mid_half, q_mid_half), pow3_mid_01);
+        let t5 = extract_trit_s8x16_consts(qm, c86, c171);
+        let ah2 = act_groups[2].values().as_chunks::<16>().0;
+        let g2 = sdot32_vec(t4, t5, load_s8x16(&ah2[0]), load_s8x16(&ah2[1]));
+
+        let t6 = extract_trit_s8x16_consts(vmulq_u8(qm, c9), c86, c171);
+        let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([block[24], block[25]])));
+        let q_tail = vcombine_u8(vget_low_u8(qm), tail_half);
+        let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, pow3_tail), c86, c171);
+        let ah3 = act_groups[3].values().as_chunks::<16>().0;
+        let g3 = sdot32_vec(t6, t7, load_s8x16(&ah3[0]), load_s8x16(&ah3[1]));
+
+        let dots = vcvtq_f32_s32(reduce4_s32x4(g0, g1, g2, g3));
+        let mut prod = [0.0_f32; 4];
+        store_f32x4_neon(vmulq_f32(dots, act_scales), &mut prod);
+        let dot_sum = (((0.0_f32 + prod[0]) + prod[1]) + prod[2]) + prod[3];
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "Preserve PTQ1 SOURCE non-FMA block rounding order."
+        )]
+        {
+            output += rs * dot_sum;
         }
     }
-    outputs.iter().all(|v| v.is_finite()).then_some(outputs)
+
+    output.is_finite().then_some(output)
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn ptq1_scaled_4rows_source_dotprod<A: super::Q8ActivationView>(
+    row_chunks: [&[[u8; 28]]; 4],
+    activation: &[A],
+) -> Option<[f32; 4]> {
+    use core::arch::aarch64::{
+        vaddq_f32, vcvtq_f32_s32, vdup_n_u16, vdupq_n_f32, vget_low_u8, vmulq_f32, vmulq_laneq_f32,
+    };
+    const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
+    const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
+
+    let block_count = row_chunks[0].len();
+    let c86 = vdupq_n_u8(86);
+    let c171 = vdupq_n_u8(171);
+    let c3 = vdupq_n_u8(3);
+    let c9 = vdupq_n_u8(9);
+    let pow3_mid_01 = load_u8x16(&POW3_MID_01);
+    let pow3_tail = load_u8x16(&POW3_TAIL);
+    let zero_f = vdupq_n_f32(0.0);
+    let mut outputs = zero_f;
+
+    for block_idx in 0..block_count {
+        prefetch_row_blocks(&row_chunks, block_idx, block_count);
+        let blocks: [&[u8; 28]; 4] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
+        let rs_v = ptq1_validate_four_scales_vec(blocks)?;
+        let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
+        let act_scales = load_f32x4_neon(&[
+            act_groups[0].scale(),
+            act_groups[1].scale(),
+            act_groups[2].scale(),
+            act_groups[3].scale(),
+        ]);
+
+        let mut q = [
+            load_u8x16(&blocks[0][..16].as_chunks::<16>().0[0]),
+            load_u8x16(&blocks[1][..16].as_chunks::<16>().0[0]),
+            load_u8x16(&blocks[2][..16].as_chunks::<16>().0[0]),
+            load_u8x16(&blocks[3][..16].as_chunks::<16>().0[0]),
+        ];
+
+        let rg0 = {
+            let ah = act_groups[0].values().as_chunks::<16>().0;
+            let a0 = load_s8x16(&ah[0]);
+            let a1 = load_s8x16(&ah[1]);
+            let mut s = [vdupq_n_s32(0); 4];
+            for r in 0..4 {
+                let t0 = extract_trit_s8x16_consts(q[r], c86, c171);
+                q[r] = vmulq_u8(q[r], c3);
+                let t1 = extract_trit_s8x16_consts(q[r], c86, c171);
+                s[r] = sdot32_vec(t0, t1, a0, a1);
+            }
+            reduce4_s32x4(s[0], s[1], s[2], s[3])
+        };
+
+        let rg1 = {
+            let ah = act_groups[1].values().as_chunks::<16>().0;
+            let a0 = load_s8x16(&ah[0]);
+            let a1 = load_s8x16(&ah[1]);
+            let mut s = [vdupq_n_s32(0); 4];
+            for r in 0..4 {
+                q[r] = vmulq_u8(q[r], c3);
+                let t2 = extract_trit_s8x16_consts(q[r], c86, c171);
+                q[r] = vmulq_u8(q[r], c3);
+                let t3 = extract_trit_s8x16_consts(q[r], c86, c171);
+                s[r] = sdot32_vec(t2, t3, a0, a1);
+            }
+            reduce4_s32x4(s[0], s[1], s[2], s[3])
+        };
+
+        let mut qm = [vdupq_n_u8(0); 4];
+        let rg2 = {
+            let ah = act_groups[2].values().as_chunks::<16>().0;
+            let a0 = load_s8x16(&ah[0]);
+            let a1 = load_s8x16(&ah[1]);
+            let mut s = [vdupq_n_s32(0); 4];
+            for r in 0..4 {
+                let t4 = extract_trit_s8x16_consts(vmulq_u8(q[r], c3), c86, c171);
+                let q_mid_half = load_u8x8(&blocks[r][16..24].as_chunks::<8>().0[0]);
+                qm[r] = vmulq_u8(vcombine_u8(q_mid_half, q_mid_half), pow3_mid_01);
+                let t5 = extract_trit_s8x16_consts(qm[r], c86, c171);
+                s[r] = sdot32_vec(t4, t5, a0, a1);
+            }
+            reduce4_s32x4(s[0], s[1], s[2], s[3])
+        };
+
+        let rg3 = {
+            let ah = act_groups[3].values().as_chunks::<16>().0;
+            let a0 = load_s8x16(&ah[0]);
+            let a1 = load_s8x16(&ah[1]);
+            let mut s = [vdupq_n_s32(0); 4];
+            for r in 0..4 {
+                let t6 = extract_trit_s8x16_consts(vmulq_u8(qm[r], c9), c86, c171);
+                let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([
+                    blocks[r][24],
+                    blocks[r][25],
+                ])));
+                let q_tail = vcombine_u8(vget_low_u8(qm[r]), tail_half);
+                let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, pow3_tail), c86, c171);
+                s[r] = sdot32_vec(t6, t7, a0, a1);
+            }
+            reduce4_s32x4(s[0], s[1], s[2], s[3])
+        };
+
+        let p0 = vmulq_laneq_f32::<0>(vcvtq_f32_s32(rg0), act_scales);
+        let p1 = vmulq_laneq_f32::<1>(vcvtq_f32_s32(rg1), act_scales);
+        let p2 = vmulq_laneq_f32::<2>(vcvtq_f32_s32(rg2), act_scales);
+        let p3 = vmulq_laneq_f32::<3>(vcvtq_f32_s32(rg3), act_scales);
+        let dot_sum = vaddq_f32(vaddq_f32(vaddq_f32(vaddq_f32(zero_f, p0), p1), p2), p3);
+        // Preserve PTQ1 SOURCE non-FMA block rounding order (`outputs + rs * dot_sum`).
+        outputs = vaddq_f32(outputs, vmulq_f32(rs_v, dot_sum));
+    }
+
+    let mut out = [0.0_f32; 4];
+    store_f32x4_neon(outputs, &mut out);
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn ptq1_scaled_rows_dotprod<const ROWS: usize, const PINNED: bool, A: super::Q8ActivationView>(
+    rows: [&[u8]; ROWS],
+    activation: &[A],
+) -> Option<[f32; ROWS]> {
+    let row_chunks: [&[[u8; 28]]; ROWS] = rows.map(|row| row.as_chunks::<28>().0);
+    let mut out = [0.0_f32; ROWS];
+    if ROWS == 1 {
+        let val = if PINNED {
+            ptq1_scaled_1row_pinned_dotprod(row_chunks[0], activation)?
+        } else {
+            ptq1_scaled_1row_source_dotprod(row_chunks[0], activation)?
+        };
+        out[0] = val;
+        return Some(out);
+    }
+    for (&chunks4, dst4) in row_chunks
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<4>().0)
+    {
+        let res = if PINNED {
+            ptq1_scaled_4rows_pinned_dotprod(chunks4, activation)?
+        } else {
+            ptq1_scaled_4rows_source_dotprod(chunks4, activation)?
+        };
+        dst4.copy_from_slice(&res);
+    }
+    Some(out)
 }
 
 #[target_feature(enable = "neon,dotprod")]
@@ -4912,32 +5239,33 @@ fn ptq1_pinned_quad_block<A: super::Q8ActivationView>(
     act_base: usize,
     acc: &mut [[core::arch::aarch64::float32x4_t; 4]; 4],
 ) {
-    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32};
+    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_laneq_f32, vmulq_f32};
 
     for group in 0..4 {
         let act_idx = act_base + group;
-        let a_scales = [
+        let a_scales = load_f32x4_neon(&[
             tok_quad[0][act_idx].scale(),
             tok_quad[1][act_idx].scale(),
             tok_quad[2][act_idx].scale(),
             tok_quad[3][act_idx].scale(),
-        ];
+        ]);
         let a_pairs: [(int8x16_t, int8x16_t); 4] = std::array::from_fn(|t| {
             let ah = tok_quad[t][act_idx].values().as_chunks::<16>().0;
             (load_s8x16(&ah[0]), load_s8x16(&ah[1]))
         });
         for (acc_row, (&row_rs, row_trits)) in acc.iter_mut().zip(rs.iter().zip(block_trits.iter()))
         {
+            let rs_a = vmulq_f32(a_scales, vdupq_n_f32(row_rs));
             let w0 = row_trits[group * 2];
             let w1 = row_trits[group * 2 + 1];
-            for t in 0..4 {
-                let sdot = sdot32_vec(w0, w1, a_pairs[t].0, a_pairs[t].1);
-                acc_row[t] = vfmaq_f32(
-                    acc_row[t],
-                    vcvtq_f32_s32(sdot),
-                    vdupq_n_f32(row_rs * a_scales[t]),
-                );
-            }
+            let s0 = sdot32_vec(w0, w1, a_pairs[0].0, a_pairs[0].1);
+            let s1 = sdot32_vec(w0, w1, a_pairs[1].0, a_pairs[1].1);
+            let s2 = sdot32_vec(w0, w1, a_pairs[2].0, a_pairs[2].1);
+            let s3 = sdot32_vec(w0, w1, a_pairs[3].0, a_pairs[3].1);
+            acc_row[0] = vfmaq_laneq_f32::<0>(acc_row[0], vcvtq_f32_s32(s0), rs_a);
+            acc_row[1] = vfmaq_laneq_f32::<1>(acc_row[1], vcvtq_f32_s32(s1), rs_a);
+            acc_row[2] = vfmaq_laneq_f32::<2>(acc_row[2], vcvtq_f32_s32(s2), rs_a);
+            acc_row[3] = vfmaq_laneq_f32::<3>(acc_row[3], vcvtq_f32_s32(s3), rs_a);
         }
     }
 }

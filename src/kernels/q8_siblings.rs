@@ -92,8 +92,27 @@ impl PreparedMatvec<'_> {
                 super::super::MatvecBackend::ExperimentalNeon
             )
         {
-            let q8 = &scratch.q8;
-            let pinned = scratch.pinned_accumulation;
+            if scratch.pinned_accumulation {
+                let consumer =
+                    super::super::neon::Ptq1Consumer::<true>::new(&scratch.q8, row_bytes);
+                return scratch.row_parallelism.fill_siblings(
+                    &data[..tensors.len()],
+                    row_bytes,
+                    outputs,
+                    |bytes, output| {
+                        super::super::parallel_rows::fill_sixteen_batched_chunk(
+                            output,
+                            bytes,
+                            row_bytes,
+                            &|rows| consumer.dot_sixteen_rows(rows),
+                            &|rows| consumer.dot_eight_rows(rows),
+                            &|rows| consumer.dot_four_rows(rows),
+                            &|bytes| consumer.dot_row(bytes),
+                        )
+                    },
+                );
+            }
+            let consumer = super::super::neon::Ptq1Consumer::<false>::new(&scratch.q8, row_bytes);
             return scratch.row_parallelism.fill_siblings(
                 &data[..tensors.len()],
                 row_bytes,
@@ -103,34 +122,10 @@ impl PreparedMatvec<'_> {
                         output,
                         bytes,
                         row_bytes,
-                        &|rows| {
-                            if pinned {
-                                super::super::neon::dot_ptq1_sixteen_rows_pinned(rows, q8)
-                            } else {
-                                super::super::neon::dot_ptq1_sixteen_rows_source(rows, q8)
-                            }
-                        },
-                        &|rows| {
-                            if pinned {
-                                super::super::neon::dot_ptq1_eight_rows_pinned(rows, q8)
-                            } else {
-                                super::super::neon::dot_ptq1_eight_rows_source(rows, q8)
-                            }
-                        },
-                        &|rows| {
-                            if pinned {
-                                super::super::neon::dot_ptq1_four_rows_pinned(rows, q8)
-                            } else {
-                                super::super::neon::dot_ptq1_four_rows_source(rows, q8)
-                            }
-                        },
-                        &|bytes| {
-                            if pinned {
-                                super::super::neon::dot_ptq1_row_pinned(bytes, q8)
-                            } else {
-                                super::super::neon::dot_ptq1_row_source(bytes, q8)
-                            }
-                        },
+                        &|rows| consumer.dot_sixteen_rows(rows),
+                        &|rows| consumer.dot_eight_rows(rows),
+                        &|rows| consumer.dot_four_rows(rows),
+                        &|bytes| consumer.dot_row(bytes),
                     )
                 },
             );

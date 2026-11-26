@@ -3928,6 +3928,83 @@ impl bonsai_neon_dot::Q8ActivationView for super::Q8Block {
     }
 }
 
+pub(super) struct Ptq1Consumer<'a, const PINNED: bool> {
+    input: &'a [super::Q8Block],
+    prepared: Option<bonsai_neon_dot::Ptq1Prepared<'a, super::Q8Block>>,
+}
+
+impl<'a, const PINNED: bool> Ptq1Consumer<'a, PINNED> {
+    #[inline]
+    pub(super) fn new(input: &'a [super::Q8Block], row_bytes: usize) -> Self {
+        let block_count = row_bytes / 28;
+        let prepared =
+            (block_count != 0 && row_bytes.is_multiple_of(28) && input.len() >= block_count * 4)
+                .then(|| {
+                    bonsai_neon_dot::Ptq1Dotprod::detect()
+                        .and_then(|d| d.prepare_scaled_view(&input[..block_count * 4]))
+                })
+                .flatten();
+        Self { input, prepared }
+    }
+
+    #[inline]
+    pub(super) fn dot_row(&self, bytes: &[u8]) -> Result<f32> {
+        if let Some(prepared) = self.prepared {
+            return prepared
+                .dot_scaled_rows::<1, PINNED>([bytes])
+                .map(|[v]| v)
+                .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"));
+        }
+        if PINNED {
+            dot_ptq1_row_pinned(bytes, self.input)
+        } else {
+            dot_ptq1_row_source(bytes, self.input)
+        }
+    }
+
+    #[inline]
+    pub(super) fn dot_four_rows(&self, rows: [&[u8]; 4]) -> Result<[f32; 4]> {
+        if let Some(prepared) = self.prepared {
+            return prepared
+                .dot_scaled_rows::<4, PINNED>(rows)
+                .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"));
+        }
+        if PINNED {
+            dot_ptq1_four_rows_pinned(rows, self.input)
+        } else {
+            dot_ptq1_four_rows_source(rows, self.input)
+        }
+    }
+
+    #[inline]
+    pub(super) fn dot_eight_rows(&self, rows: [&[u8]; 8]) -> Result<[f32; 8]> {
+        if let Some(prepared) = self.prepared {
+            return prepared
+                .dot_scaled_rows::<8, PINNED>(rows)
+                .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"));
+        }
+        if PINNED {
+            dot_ptq1_eight_rows_pinned(rows, self.input)
+        } else {
+            dot_ptq1_eight_rows_source(rows, self.input)
+        }
+    }
+
+    #[inline]
+    pub(super) fn dot_sixteen_rows(&self, rows: [&[u8]; 16]) -> Result<[f32; 16]> {
+        if let Some(prepared) = self.prepared {
+            return prepared
+                .dot_scaled_rows::<16, PINNED>(rows)
+                .ok_or_else(|| crate::invalid("nonfinite tensor or activation value"));
+        }
+        if PINNED {
+            dot_ptq1_sixteen_rows_pinned(rows, self.input)
+        } else {
+            dot_ptq1_sixteen_rows_source(rows, self.input)
+        }
+    }
+}
+
 #[inline]
 fn try_dot_ptq1_rows_dotprod<const ROWS: usize, const PINNED: bool>(
     rows: [&[u8]; ROWS],

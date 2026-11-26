@@ -149,21 +149,34 @@ pub(super) fn portable_scaled_8x_tokens<const FUSED: bool>(
     Some(())
 }
 
+pub(super) fn valid_ptq1_activation<A: Q8ActivationView>(activation: &[A]) -> Option<usize> {
+    if activation.is_empty() || !activation.len().is_multiple_of(4) {
+        return None;
+    }
+    let block_count = activation.len() / 4;
+    block_count.checked_mul(28)?;
+    activation
+        .iter()
+        .all(|block| block.scale().is_finite())
+        .then_some(block_count)
+}
+
+pub(super) fn valid_ptq1_row_extents<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    block_count: usize,
+) -> bool {
+    matches!(ROWS, 1 | 4 | 8 | 16)
+        && block_count
+            .checked_mul(28)
+            .is_some_and(|bytes| rows.iter().all(|row| row.len() == bytes))
+}
+
 pub(super) fn valid_ptq1_rows<const ROWS: usize, A: Q8ActivationView>(
     rows: [&[u8]; ROWS],
     activation: &[A],
 ) -> bool {
-    if !matches!(ROWS, 1 | 4 | 8 | 16)
-        || activation.is_empty()
-        || !activation.len().is_multiple_of(4)
-    {
-        return false;
-    }
-    let block_count = activation.len() / 4;
-    block_count
-        .checked_mul(28)
-        .is_some_and(|bytes| rows.iter().all(|row| row.len() == bytes))
-        && activation.iter().all(|block| block.scale().is_finite())
+    valid_ptq1_activation(activation)
+        .is_some_and(|block_count| valid_ptq1_row_extents(rows, block_count))
 }
 
 pub(super) fn valid_ptq1_8x_tokens<A: Q8ActivationView>(rows: [&[u8]; 8], tokens: &[&[A]]) -> bool {
@@ -1521,6 +1534,103 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn x1_ptq1_prepared_matches_portable_and_rejects_bad_inputs() {
+        use super::portable_ptq1_rows_validated;
+
+        #[cfg(target_arch = "aarch64")]
+        let Some(detected) = crate::Ptq1Dotprod::detect() else {
+            return;
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let detected = crate::Ptq1Dotprod { _detected: () };
+
+        assert!(detected.prepare_scaled(&[]).is_none());
+        let (rows, mut acts) = sample_ptq1_fixture_blocks(5, 19);
+        assert!(detected.prepare_scaled(&acts[0][..7]).is_none());
+        acts[0][2].scale = f32::NAN;
+        assert!(detected.prepare_scaled(&acts[0]).is_none());
+        acts[0][2].scale = 0.25;
+
+        let prepared = detected.prepare_scaled(&acts[0]);
+        assert!(prepared.is_some());
+        let Some(prepared) = prepared else {
+            return;
+        };
+        let r1 = [rows[0].as_slice()];
+        let r4: [&[u8]; 4] = std::array::from_fn(|r| rows[r].as_slice());
+        let r8: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+        let r16: [&[u8]; 16] = std::array::from_fn(|r| rows[r].as_slice());
+
+        assert_eq!(
+            prepared
+                .dot_scaled_rows::<1, true>(r1)
+                .map(|v| v.map(f32::to_bits)),
+            portable_ptq1_rows_validated::<1, true, _>(r1, &acts[0]).map(|v| v.map(f32::to_bits))
+        );
+        assert_eq!(
+            prepared
+                .dot_scaled_rows::<1, false>(r1)
+                .map(|v| v.map(f32::to_bits)),
+            portable_ptq1_rows_validated::<1, false, _>(r1, &acts[0]).map(|v| v.map(f32::to_bits))
+        );
+        assert_eq!(
+            prepared
+                .dot_scaled_rows::<4, true>(r4)
+                .map(|v| v.map(f32::to_bits)),
+            portable_ptq1_rows_validated::<4, true, _>(r4, &acts[0]).map(|v| v.map(f32::to_bits))
+        );
+        assert_eq!(
+            prepared
+                .dot_scaled_rows::<4, false>(r4)
+                .map(|v| v.map(f32::to_bits)),
+            portable_ptq1_rows_validated::<4, false, _>(r4, &acts[0]).map(|v| v.map(f32::to_bits))
+        );
+        assert_eq!(
+            prepared
+                .dot_scaled_rows::<8, true>(r8)
+                .map(|v| v.map(f32::to_bits)),
+            portable_ptq1_rows_validated::<8, true, _>(r8, &acts[0]).map(|v| v.map(f32::to_bits))
+        );
+        assert_eq!(
+            prepared
+                .dot_scaled_rows::<8, false>(r8)
+                .map(|v| v.map(f32::to_bits)),
+            portable_ptq1_rows_validated::<8, false, _>(r8, &acts[0]).map(|v| v.map(f32::to_bits))
+        );
+        assert_eq!(
+            prepared
+                .dot_scaled_rows::<16, true>(r16)
+                .map(|v| v.map(f32::to_bits)),
+            portable_ptq1_rows_validated::<16, true, _>(r16, &acts[0]).map(|v| v.map(f32::to_bits))
+        );
+        assert_eq!(
+            prepared
+                .dot_scaled_rows::<16, false>(r16)
+                .map(|v| v.map(f32::to_bits)),
+            portable_ptq1_rows_validated::<16, false, _>(r16, &acts[0])
+                .map(|v| v.map(f32::to_bits))
+        );
+
+        assert!(
+            prepared
+                .dot_scaled_rows::<2, true>([rows[0].as_slice(), rows[1].as_slice()])
+                .is_none()
+        );
+        assert!(
+            prepared
+                .dot_scaled_rows::<1, true>([&rows[0][..28]])
+                .is_none()
+        );
+        for bad_f16 in [0x7c00_u16, 0x7e00] {
+            let mut bad_rows = rows.clone();
+            bad_rows[7][28 + 26..28 + 28].copy_from_slice(&bad_f16.to_le_bytes());
+            let bad16: [&[u8]; 16] = std::array::from_fn(|r| bad_rows[r].as_slice());
+            assert!(prepared.dot_scaled_rows::<16, true>(bad16).is_none());
+            assert!(prepared.dot_scaled_rows::<16, false>(bad16).is_none());
+        }
     }
 
     fn sample_q8_0_fixture(

@@ -437,6 +437,56 @@ pub struct Ptq1Dotprod {
     i8mm: bool,
 }
 
+/// A borrowed, finite-scale `PTQ1_0` activation scope for complete-row execution.
+///
+/// Construction checks every `Q8_0` activation scale and alignment once. The immutable
+/// borrow prevents changes or replacement while row workers share this scope.
+pub struct Ptq1Prepared<'a, A = Q8ActivationBlock> {
+    detected: Ptq1Dotprod,
+    activation: &'a [A],
+    block_count: usize,
+}
+
+impl<A> Clone for Ptq1Prepared<'_, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A> Copy for Ptq1Prepared<'_, A> {}
+
+impl<A: Q8ActivationView> Ptq1Prepared<'_, A> {
+    /// Consumes `1`, `4`, `8`, or `16` complete 28-byte `PTQ1_0` rows using the validated scope.
+    ///
+    /// Row extents, packed weight scales and final results remain checked on every call.
+    /// Preserves exact `0 ULP` parity for both `PINNED = true` (4-lane FMA reduction)
+    /// and `PINNED = false` (`SOURCE` non-FMA group reduction).
+    /// Returns `None` for unsupported geometry or nonfinite weights/results.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows<const ROWS: usize, const PINNED: bool>(
+        self,
+        rows: [&[u8]; ROWS],
+    ) -> Option<[f32; ROWS]> {
+        if !scaled::valid_ptq1_row_extents(rows, self.block_count) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::ptq1_detected_dot_scaled_rows::<ROWS, PINNED, A>(
+                self.detected,
+                rows,
+                self.activation,
+            )
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self.detected;
+            scaled::portable_ptq1_rows_validated::<ROWS, PINNED, A>(rows, self.activation)
+        }
+    }
+}
+
 impl Ptq1Dotprod {
     /// Detects `PTQ1_0` `SDOT` and optional `I8MM` capability once.
     #[inline]
@@ -449,6 +499,35 @@ impl Ptq1Dotprod {
             _detected: (),
             #[cfg(target_arch = "aarch64")]
             i8mm,
+        })
+    }
+
+    /// Validates current `Q8_0` activation scales once for any number of `PTQ1_0` row groups.
+    ///
+    /// Returns `None` for empty/unaligned inputs, overflowing extents, or nonfinite scales.
+    #[inline]
+    #[must_use]
+    pub fn prepare_scaled(
+        self,
+        activation: &[Q8ActivationBlock],
+    ) -> Option<Ptq1Prepared<'_, Q8ActivationBlock>> {
+        self.prepare_scaled_view(activation)
+    }
+
+    /// Validates any [`Q8ActivationView`] slice once for `PTQ1_0` row groups.
+    ///
+    /// Returns `None` for empty/unaligned inputs, overflowing extents, or nonfinite scales.
+    #[inline]
+    #[must_use]
+    pub fn prepare_scaled_view<A: Q8ActivationView>(
+        self,
+        activation: &[A],
+    ) -> Option<Ptq1Prepared<'_, A>> {
+        let block_count = scaled::valid_ptq1_activation(activation)?;
+        Some(Ptq1Prepared {
+            detected: self,
+            activation,
+            block_count,
         })
     }
 

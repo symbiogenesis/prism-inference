@@ -17,7 +17,7 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-bonsai-ternary = { version = "=0.1.5", path = "../ternary" }
+bonsai-ternary = { version = "=0.1.6", path = "../ternary" }
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]

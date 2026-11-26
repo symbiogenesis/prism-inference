@@ -42,15 +42,15 @@ required-features = ["cli"]
 [dependencies]
 aho-corasick = "=1.1.5"
 rayon = { version = "=1.12.0", optional = true }
-bonsai-ternary = { version = "=0.1.5", path = "tools/ternary" }
-bonsai-gguf = { version = "=0.1.9", path = "tools/gguf", default-features = false }
-bonsai-prism = { version = "=0.1.8", path = "tools/prism" }
+bonsai-ternary = { version = "=0.1.6", path = "tools/ternary" }
+bonsai-gguf = { version = "=0.1.10", path = "tools/gguf", default-features = false }
+bonsai-prism = { version = "=0.1.9", path = "tools/prism" }
 serde_json = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 regex = "=1.13.1"
 fancy-regex = "=0.20.2"
 unicode-normalization-alignments = "=0.1.12"
-bonsai-native-hash = { version = "=0.1.6", path = "tools/native-hash" }
+bonsai-native-hash = { version = "=0.1.7", path = "tools/native-hash" }
 base64ct = { version = "=1.8.3", default-features = false, features = ["alloc"] }
 crc32fast = { version = "=1.5.5", default-features = false }
 fdeflate = "=0.3.7"
@@ -58,7 +58,7 @@ hex.workspace = true
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))'.dependencies]
 fearless_simd = { version = "=1.2.0", optional = true }
-bonsai-neon-dot = { version = "=0.1.8", path = "tools/neon-dot", optional = true }
+bonsai-neon-dot = { version = "=0.1.9", path = "tools/neon-dot", optional = true }
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }

@@ -136,7 +136,7 @@ fn tile_profile(graph: Qwen35, verification: bool) -> Result<Qwen35> {
 fn ordered_profile_fixture(pinned: bool, full_last: bool) -> Model {
     let mut model = profile_fixture();
     if pinned {
-        model.identity = bonsai_prism_runtime::model::swift::MODEL_SHA256.to_owned();
+        model.identity = bonsai_prism_runtime::model::swift::BONSAI_2_5_PQ2_SHA256.to_owned();
     }
     if full_last {
         model.metadata.insert(
@@ -268,19 +268,19 @@ fn rotated_kv_tiled_cancellation_restores_pages_and_adapter_provenance() -> Resu
     for policy in [KvCachePolicy::Rotated4, KvCachePolicy::Rotated4Keys3Values] {
         let build = |scale| -> Result<Qwen35> {
             let model = profile_fixture();
-            let factors = rank_one_factors(
+            let factors = lora_factors(
                 &model,
-                &["blk.0.attn_output.weight", "blk.1.ssm_out.weight"],
+                &["blk.0.attn_output.weight", "blk.1.attn_gate.weight"],
                 0.125,
             );
-            let adapter = RankOneAdapter::from_model(factors, &model)?;
-            Qwen35::with_rank_one_adapter_and_kv(
+            let adapter =
+                MultiRankAdapter::from_model(&model, &factors, MultiRankPolicy::AnyLinear)?;
+            Qwen35::with_adapters_and_kv(
                 model,
                 CONTEXT,
                 BUDGET,
                 MatvecBackend::Auto,
-                adapter,
-                scale,
+                Some((adapter, scale)),
                 policy,
             )
         };
@@ -312,7 +312,7 @@ fn rotated_kv_tiled_cancellation_restores_pages_and_adapter_provenance() -> Resu
         assert_eq!(graph_bits(&actual)?, before);
         assert_eq!(bits(actual.evaluate(1)?), bits(expected.evaluate(1)?));
         assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
-        actual.reset_with_adapter_scale(0.0)?;
+        actual.reset_with_adapter_scales(Some(0.0))?;
         assert!(actual.restore(&checkpoint).is_err());
         assert_eq!(actual.batched_evaluation_capacity(), 8);
         assert!(actual.identity().contains(":cpu-tiled-verify-v1"));
@@ -339,19 +339,18 @@ fn rotated_kv_tiled_cancellation_restores_pages_and_adapter_provenance() -> Resu
 
 fn adapted_runtime_graph(policy: KvCachePolicy, tiled: bool) -> Result<Qwen35> {
     let model = profile_fixture();
-    let factors = rank_one_factors(
+    let factors = lora_factors(
         &model,
-        &["blk.0.attn_output.weight", "blk.1.ssm_out.weight"],
+        &["blk.0.attn_output.weight", "blk.1.attn_gate.weight"],
         0.125,
     );
-    let adapter = RankOneAdapter::from_model(factors, &model)?;
-    let graph = Qwen35::with_rank_one_adapter_and_kv(
+    let adapter = MultiRankAdapter::from_model(&model, &factors, MultiRankPolicy::AnyLinear)?;
+    let graph = Qwen35::with_adapters_and_kv(
         model,
         CONTEXT,
         BUDGET,
         MatvecBackend::Auto,
-        adapter,
-        1.3,
+        Some((adapter, 1.3)),
         policy,
     )?;
     if tiled {
@@ -631,19 +630,18 @@ fn rotated_kv_graph_and_adapter_identities_reject_foreign_checkpoints() -> Resul
         assert_eq!(graph_bits(&actual)?, before);
 
         let base = profile_fixture();
-        let factors = rank_one_factors(&base, &["blk.0.attn_output.weight"], 0.125);
-        let correction = RankOneAdapter::from_model(factors, &base)?;
-        let mut adapted = Qwen35::with_rank_one_adapter_and_kv(
+        let factors = lora_factors(&base, &["blk.0.attn_output.weight"], 0.125);
+        let correction = MultiRankAdapter::from_model(&base, &factors, MultiRankPolicy::AnyLinear)?;
+        let mut adapted = Qwen35::with_adapters_and_kv(
             base,
             CONTEXT,
             BUDGET,
             MatvecBackend::Scalar,
-            correction,
-            1.3,
+            Some((correction, 1.3)),
             policy,
         )?;
         assert_eq!(
-            adapted.adapter_scale().map(f32::to_bits),
+            adapted.multi_rank_adapter_scale().map(f32::to_bits),
             Some(1.3_f32.to_bits())
         );
         assert_eq!(adapted.kv_cache_policy(), policy);
@@ -653,14 +651,12 @@ fn rotated_kv_graph_and_adapter_identities_reject_foreign_checkpoints() -> Resul
                 .contains(&format!("kv-{}-d256-rht3-v1", policy.name()))
         );
         assert!(
-            adapted
-                .identity()
-                .contains(":rank-one-lora-v1:rank-one-fixture:sha256=")
+            adapted.identity().contains(":multi-rank-lora-v1:")
                 && adapted.identity().contains(":3fa66666")
         );
         adapted.evaluate(0)?;
         let previous = adapted.checkpoint()?;
-        adapted.reset_with_adapter_scale(0.0)?;
+        adapted.reset_with_adapter_scales(Some(0.0))?;
         assert_eq!(adapted.kv_cache_policy(), policy);
         assert!(
             adapted
@@ -994,24 +990,23 @@ fn parallel_rotated_kv_delivery_and_cancellation_restore_complete_page_boundary(
 
 fn profile_runtime(policy: KvCachePolicy, scale: f32) -> Result<Runtime<Qwen35>> {
     let base = profile_fixture();
-    let factors = rank_one_factors(
+    let factors = lora_factors(
         &base,
         &[
             "blk.0.attn_output.weight",
-            "blk.1.ssm_out.weight",
+            "blk.1.attn_gate.weight",
             "blk.1.ffn_down.weight",
         ],
         0.125,
     );
-    let adapter = RankOneAdapter::from_model(factors, &base)?;
+    let adapter = MultiRankAdapter::from_model(&base, &factors, MultiRankPolicy::AnyLinear)?;
     Runtime::new(
-        Qwen35::with_rank_one_adapter_and_kv(
+        Qwen35::with_adapters_and_kv(
             base,
             CONTEXT,
             BUDGET,
             MatvecBackend::Auto,
-            adapter,
-            scale,
+            Some((adapter, scale)),
             policy,
         )?,
         Limits {
@@ -1034,10 +1029,14 @@ fn compare_profile_request(
     };
     let policy = runtime.decoder().kv_cache_policy();
     let previous = runtime.tokens().to_vec();
-    let previous_scale = runtime.decoder().adapter_scale().map(f32::to_bits);
+    let previous_scale = runtime
+        .decoder()
+        .multi_rank_adapter_scale()
+        .map(f32::to_bits);
     let before = graph_bits(runtime.decoder())?;
     runtime.prepare_profile_request(Some(scale), PromptReuse::Latest)?;
-    let unchanged = previous_scale == Some(scale.to_bits());
+    let normalized = MultiRankAdapter::normalize_scale(scale);
+    let unchanged = previous_scale == Some(normalized.to_bits());
     if unchanged {
         assert_eq!(runtime.tokens(), previous);
         assert_eq!(graph_bits(runtime.decoder())?, before);
@@ -1047,8 +1046,11 @@ fn compare_profile_request(
     }
     assert_eq!(runtime.decoder().kv_cache_policy(), policy);
     assert_eq!(
-        runtime.decoder().adapter_scale().map(f32::to_bits),
-        Some(scale.to_bits())
+        runtime
+            .decoder()
+            .multi_rank_adapter_scale()
+            .map(f32::to_bits),
+        Some(normalized.to_bits())
     );
     let mut reference_sampler = sampler.clone();
     profile_request_failures(runtime, prompt, &options, sampler)?;

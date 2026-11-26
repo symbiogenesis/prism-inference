@@ -46,7 +46,6 @@ pub(crate) struct CanonicalRequest<'a> {
     pub(crate) output_tokens: usize,
     pub(crate) enable_thinking: bool,
     pub(crate) reasoning_effort: ReasoningEffort,
-    pub(crate) adapter_scale: Option<f32>,
     pub(crate) multi_rank_scale: Option<f32>,
     pub(crate) sampler: SwiftSamplerConfig,
 }
@@ -89,7 +88,6 @@ fn parse_optional_u32(value: &serde_json::Value, key: &str) -> Result<Option<u32
 
 pub(crate) fn parse_canonical_request(
     value: &serde_json::Value,
-    has_rank_one: bool,
     has_multi_rank: bool,
 ) -> Result<CanonicalRequest<'_>, Rejection> {
     let messages = value.get("messages").ok_or(Rejection::ChatSchema)?;
@@ -112,8 +110,7 @@ pub(crate) fn parse_canonical_request(
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| usize::try_from(n).ok())
         .ok_or(Rejection::CompletionLimit)?;
-    let (adapter_scale, multi_rank_scale) =
-        parse_adapter_scales(value, has_rank_one, has_multi_rank)?;
+    let multi_rank_scale = parse_adapter_scales(value, has_multi_rank)?;
     let top_k = match value.get("top_k") {
         None => SwiftSamplerConfig::default().top_k,
         Some(raw) => raw
@@ -178,7 +175,6 @@ pub(crate) fn parse_canonical_request(
         output_tokens,
         enable_thinking,
         reasoning_effort,
-        adapter_scale,
         multi_rank_scale,
         sampler,
     })
@@ -197,15 +193,11 @@ pub fn prepare(session: &SwiftSession, pending: PendingChat) -> Result<NativeCha
     let admitted = pending.admit_with_context(session.context_tokens(), |body| {
         let value: serde_json::Value =
             serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?;
-        let request = parse_canonical_request(
-            &value,
-            session.adapter_identity().is_some(),
-            session.secondary_adapter_identity().is_some(),
-        )?;
+        let request =
+            parse_canonical_request(&value, session.secondary_adapter_identity().is_some())?;
         let options = SwiftRequestOptions {
             enable_thinking: request.enable_thinking,
             reasoning_effort: request.reasoning_effort,
-            adapter_scale: request.adapter_scale,
             multi_rank_scale: request.multi_rank_scale,
             sampler: request.sampler,
         };
@@ -253,48 +245,25 @@ fn parse_adapter_scale(value: &serde_json::Value) -> Result<Option<f32>, Rejecti
 
 pub(crate) fn parse_adapter_scales(
     value: &serde_json::Value,
-    has_rank_one: bool,
     has_multi_rank: bool,
-) -> Result<(Option<f32>, Option<f32>), Rejection> {
+) -> Result<Option<f32>, Rejection> {
     let Some(lora) = value.get("lora") else {
-        return Ok((None, has_multi_rank.then_some(0.0)));
+        return Ok(has_multi_rank.then_some(0.0));
     };
     let Some(entries) = lora.as_array() else {
         return Err(Rejection::ChatSchema);
     };
-    if !(1..=2).contains(&entries.len()) {
+    if entries.len() != 1 || !has_multi_rank {
         return Err(Rejection::ChatSchema);
     }
-    let mut slot0: Option<f32> = None;
-    let mut slot1: Option<f32> = None;
-    for entry in entries {
-        let id = entry
-            .get("id")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or(Rejection::ChatSchema)?;
-        let scale = parse_scale_value(&entry["scale"])?;
-        match id {
-            0 if slot0.is_none() => slot0 = Some(scale),
-            1 if slot1.is_none() => slot1 = Some(scale),
-            _ => return Err(Rejection::ChatSchema),
-        }
+    let id = entries[0]
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(Rejection::ChatSchema)?;
+    if id != 0 {
+        return Err(Rejection::ChatSchema);
     }
-    match (has_rank_one, has_multi_rank) {
-        (false, false) => Err(Rejection::ChatSchema),
-        (true, false) => match (slot0, slot1) {
-            (Some(r1), None) => Ok((Some(r1), None)),
-            _ => Err(Rejection::ChatSchema),
-        },
-        (false, true) => match (slot0, slot1) {
-            (Some(mr), None) => Ok((None, Some(mr))),
-            _ => Err(Rejection::ChatSchema),
-        },
-        (true, true) => match (slot0, slot1) {
-            (Some(r1), Some(mr)) => Ok((Some(r1), Some(mr))),
-            (Some(r1), None) => Ok((Some(r1), Some(0.0))),
-            _ => Err(Rejection::ChatSchema),
-        },
-    }
+    Ok(Some(parse_scale_value(&entries[0]["scale"])?))
 }
 
 pub(crate) fn classify_preparation_error(
@@ -395,57 +364,25 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parse_adapter_scales_maps_stacked_ids_and_defaults_daisyrose_to_zero() {
+    fn parse_adapter_scales_defaults_daisyrose_to_zero_and_validates_id() {
+        assert_eq!(parse_adapter_scales(&json!({}), false), Ok(None));
+        assert_eq!(parse_adapter_scales(&json!({}), true), Ok(Some(0.0)));
         assert_eq!(
-            parse_adapter_scales(&json!({}), false, false),
-            Ok((None, None))
+            parse_adapter_scales(&json!({"lora": [{"id": 0, "scale": 0.75}]}), true),
+            Ok(Some(0.75))
         );
-        assert_eq!(
-            parse_adapter_scales(&json!({}), false, true),
-            Ok((None, Some(0.0)))
-        );
-        assert_eq!(
-            parse_adapter_scales(&json!({"lora": [{"id": 0, "scale": 1.3}]}), true, true),
-            Ok((Some(1.3), Some(0.0)))
-        );
-        assert_eq!(
-            parse_adapter_scales(
-                &json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}]}),
-                true,
-                true
-            ),
-            Ok((Some(1.3), Some(0.5)))
-        );
-        assert_eq!(
-            parse_adapter_scales(
-                &json!({"lora": [{"id": 1, "scale": 0.5}, {"id": 0, "scale": 1.3}]}),
-                true,
-                true
-            ),
-            Ok((Some(1.3), Some(0.5)))
-        );
-        assert_eq!(
-            parse_adapter_scales(&json!({"lora": [{"id": 0, "scale": 0.75}]}), false, true),
-            Ok((None, Some(0.75)))
-        );
-        for (body, r1, mr) in [
-            (json!({"lora": [{"id": 1, "scale": 0.5}]}), true, true),
-            (
-                json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 0, "scale": 0.5}]}),
-                true,
-                true,
-            ),
+        for (body, mr) in [
+            (json!({"lora": [{"id": 1, "scale": 0.5}]}), true),
             (
                 json!({"lora": [{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}]}),
                 true,
-                false,
             ),
-            (json!({"lora": [{"id": 0, "scale": 0.5}]}), false, false),
+            (json!({"lora": [{"id": 0, "scale": 0.5}]}), false),
         ] {
             assert_eq!(
-                parse_adapter_scales(&body, r1, mr),
+                parse_adapter_scales(&body, mr),
                 Err(Rejection::ChatSchema),
-                "expected rejection for {body} (r1={r1}, mr={mr})"
+                "expected rejection for {body} (mr={mr})"
             );
         }
     }

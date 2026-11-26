@@ -692,13 +692,13 @@ fn private_canonical_body_rejects_overrides_duplicates_and_unknown_fields() -> T
 fn private_adapter_scale_requires_selected_profile_and_exact_count_binding() -> TestResult {
     run(async {
         let profile = ModelProfile {
-            representation: bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1,
-            adapter: true,
+            representation: bonsai_prism_runtime::model::swift::Representation::Bonsai25Ptq1,
+            daisyrose_adapter: true,
             ..ModelProfile::default()
         };
         let original = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
         let mut value: Value = serde_json::from_slice(&original)?;
-        assert!(canonical_for_profile(&original, &profile).is_err());
+        assert!(canonical_for_profile(&original, &profile).is_ok());
         for invalid in [
             Value::Null,
             json!([]),
@@ -819,15 +819,13 @@ fn private_context_capacity_controls_admission_and_readiness() -> Result<(), Nat
 
 #[test]
 fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scale() {
-    use bonsai_prism_runtime::model::{
-        lora::SWIFT_ADAPTER_SHA256,
-        swift::{self, Representation},
-    };
+    use bonsai_prism_runtime::model::swift::{self, Representation};
     let legacy = ModelProfile::default().readiness(42);
     assert_eq!(
         legacy,
-        json!({"data":[{"id":"Swift-Bonsai-2-PQ2_0", "object":"model",
-        "model_sha256":swift::MODEL_SHA256, "template_sha256":swift::TEMPLATE_SHA256,
+        json!({"data":[{"id":"Ternary-Bonsai-2.5-27B-PQ2_0", "object":"model",
+        "model_sha256":swift::BONSAI_2_5_PQ2_SHA256, "template_sha256":swift::TEMPLATE_SHA256,
+        "weight_representation":"Bonsai-2.5-PQ2_0",
         "runtime":"prism-inference", "supports_cognitive_controls":true,
         "context_tokens":8192, "seed":42, "row_workers":1,
         "startup_projection":{"schema_version":1,"requested":"auto","effective":"cpu",
@@ -852,58 +850,35 @@ fn private_profile_readiness_binds_exact_representation_adapter_and_dynamic_scal
     expected_vision["data"][0]["mmproj_sha256"] = json!(swift::MMPROJ_SHA256);
     expected_vision["data"][0]["image_max_tokens"] = json!(1_024);
     assert_eq!(vision, expected_vision);
-    for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {
-        for adapter in [false, true] {
+    let daisy_sha = "cd".repeat(32);
+    for representation in [Representation::Bonsai25Pq2, Representation::Bonsai25Ptq1] {
+        for daisyrose in [false, true] {
             let reply = ModelProfile {
                 representation,
-                adapter,
+                daisyrose_adapter: daisyrose,
+                daisyrose_adapter_sha256: daisyrose.then(|| Arc::from(daisy_sha.as_str())),
+                daisyrose_adapter_max_rank: daisyrose.then_some(16),
                 ..ModelProfile::default()
             }
             .readiness(17);
             let selected = &reply["data"][0];
             assert_eq!(selected["model_sha256"], representation.model_sha256());
-            if adapter || representation != Representation::Pq2 {
-                assert_eq!(selected["weight_representation"], representation.name());
-                assert_eq!(
-                    selected["adapter_sha256"],
-                    json!(adapter.then_some(SWIFT_ADAPTER_SHA256))
-                );
-                assert_eq!(selected["supports_abliteration_scale"], adapter);
-                assert_eq!(
-                    selected.get("abliteration_scale_range"),
-                    adapter.then_some(&json!([0, 2]))
-                );
+            assert_eq!(selected["weight_representation"], representation.name());
+            if daisyrose {
+                assert_eq!(selected["supports_daisyrose_scale"], json!(true));
+                assert_eq!(selected["daisyrose_scale_range"], json!([0, 2]));
+                assert_eq!(selected["daisyrose_adapter_sha256"], json!(daisy_sha));
+                assert_eq!(selected["daisyrose_adapter_max_rank"], json!(16));
+            } else {
+                assert!(selected.get("supports_daisyrose_scale").is_none());
             }
         }
     }
-    let daisy_sha = "cd".repeat(32);
-    let stacked = ModelProfile {
-        adapter: true,
-        daisyrose_adapter: true,
-        daisyrose_adapter_sha256: Some(Arc::from(daisy_sha.as_str())),
-        daisyrose_adapter_max_rank: Some(16),
-        ..ModelProfile::default()
-    }
-    .readiness(19);
-    assert_eq!(stacked["data"][0]["supports_daisyrose_scale"], json!(true));
-    assert_eq!(stacked["data"][0]["daisyrose_scale_range"], json!([0, 2]));
-    assert_eq!(
-        stacked["data"][0]["daisyrose_adapter_sha256"],
-        json!(daisy_sha)
-    );
-    assert_eq!(stacked["data"][0]["daisyrose_adapter_max_rank"], json!(16));
 }
 
 #[test]
-fn canonical_stacked_daisyrose_lora_validates_ids_and_defaults() -> TestResult {
+fn canonical_daisyrose_lora_validates_id_and_defaults() -> TestResult {
     let base_bytes = pending(true, 128).map_err(|e| format!("{e:?}"))?.body;
-    let both = ModelProfile {
-        adapter: true,
-        daisyrose_adapter: true,
-        daisyrose_adapter_sha256: Some(Arc::from("cd".repeat(32))),
-        daisyrose_adapter_max_rank: Some(16),
-        ..ModelProfile::default()
-    };
     let daisy_only = ModelProfile {
         daisyrose_adapter: true,
         daisyrose_adapter_sha256: Some(Arc::from("cd".repeat(32))),
@@ -911,35 +886,19 @@ fn canonical_stacked_daisyrose_lora_validates_ids_and_defaults() -> TestResult {
         ..ModelProfile::default()
     };
 
-    // Stacked profile allows [0] or [0, 1], forbids empty or omitting id 0.
-    assert!(canonical_for_profile(&base_bytes, &both).is_err());
     assert!(canonical_for_profile(&base_bytes, &daisy_only).is_ok());
-
-    for valid_both in [
-        json!([{"id": 0, "scale": 1.3}]),
-        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}]),
-        json!([{"id": 1, "scale": 0.5}, {"id": 0, "scale": 1.3}]),
-    ] {
-        let mut value: Value = serde_json::from_slice(&base_bytes)?;
-        value["lora"] = valid_both;
-        assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &both).is_ok());
-    }
-    for invalid_both in [
-        json!([{"id": 1, "scale": 0.5}]),
-        json!([{"id": 0, "scale": 1.3}, {"id": 0, "scale": 0.5}]),
-        json!([{"id": 0, "scale": 1.3}, {"id": 2, "scale": 0.5}]),
-        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 2.1}]),
-    ] {
-        let mut value: Value = serde_json::from_slice(&base_bytes)?;
-        value["lora"] = invalid_both;
-        assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &both).is_err());
-    }
 
     let mut value: Value = serde_json::from_slice(&base_bytes)?;
     value["lora"] = json!([{"id": 0, "scale": 0.75}]);
     assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &daisy_only).is_ok());
-    value["lora"] = json!([{"id": 1, "scale": 0.75}]);
-    assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &daisy_only).is_err());
+    for invalid in [
+        json!([{"id": 1, "scale": 0.75}]),
+        json!([{"id": 0, "scale": 1.3}, {"id": 0, "scale": 0.5}]),
+        json!([{"id": 0, "scale": 2.1}]),
+    ] {
+        value["lora"] = invalid;
+        assert!(canonical_for_profile(&serde_json::to_vec(&value)?, &daisy_only).is_err());
+    }
     Ok(())
 }
 
@@ -1147,7 +1106,7 @@ fn private_cpu_speculation_readiness_binds_sampler_profile_and_all_reserves() ->
             let prefill = CpuPrefill::new(8, 64 * 1024 * 1024)?;
             let speculation = CpuSpeculation::new(tokens, 16 * 1024 * 1024, STATE_MEMORY_BYTES)?;
             let identity: Arc<str> = Arc::from(format!(
-                "{}:rank-one-lora-v1:adapter:3fa66666:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
+                "{}:multi-rank-lora-v1:daisyrose:3fa66666:cpu-tiled-ffn-v1:8:cpu-tiled-verify-v1",
                 cpu_base_graph_identity(cache),
             ));
             let observed = Observation {
@@ -1659,7 +1618,7 @@ fn private_adapter_signed_zero_changes_require_recounting() -> TestResult {
         let observed = Observation::default();
         let mut worker =
             Worker::new(FakeEngine(observed.clone()), 42).map_err(|e| format!("{e:?}"))?;
-        worker.profile.adapter = true;
+        worker.profile.daisyrose_adapter = true;
         let mut value: Value =
             serde_json::from_slice(&pending(true, 128).map_err(|e| format!("{e:?}"))?.body)?;
         let mut bodies = Vec::new();
@@ -2088,8 +2047,8 @@ fn private_unacknowledged_deadline_and_terminal_failure_restore_then_close_admis
             if adapter {
                 worker.profile = ModelProfile {
                     representation:
-                        bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1,
-                    adapter: true,
+                        bonsai_prism_runtime::model::swift::Representation::Bonsai25Ptq1,
+                    daisyrose_adapter: true,
                     ..ModelProfile::default()
                 };
                 value["lora"] = json!([{"id":0,"scale":1.3}]);
@@ -2603,7 +2562,7 @@ fn run_broker_pipe_client_script(
         String::from_utf8(pipe_read_stream(&mut c_to_p_r, 3)?).map_err(std::io::Error::other)?;
     pipe_write_frame(&mut p_to_c_w, 3, KIND_EOF, &[])?;
     assert!(models.starts_with("HTTP/1.1 200 OK"));
-    assert!(models.contains("Swift-Bonsai-2-PQ2_0"));
+    assert!(models.contains("Ternary-Bonsai-2.5-27B-PQ2_0"));
 
     send_open_req(
         &mut p_to_c_w,
@@ -2883,12 +2842,6 @@ fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
     use std::path::Path;
 
     assert!(worker::supports_hexagon_native_q2_representation(
-        Representation::Pq2
-    ));
-    assert!(worker::supports_hexagon_native_q2_representation(
-        Representation::CurrentRepackedPtq1
-    ));
-    assert!(worker::supports_hexagon_native_q2_representation(
         Representation::Bonsai25Pq2
     ));
     assert!(worker::supports_hexagon_native_q2_representation(
@@ -2902,30 +2855,17 @@ fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
         assert!(!worker::supports_hexagon_native_q2_representation(nariq));
     }
 
-    let pq2_hex = Representation::Pq2.model_sha256();
-    let ptq1_hex = Representation::CurrentRepackedPtq1.model_sha256();
     let b25_pq2_hex = Representation::Bonsai25Pq2.model_sha256();
     let b25_ptq1_hex = Representation::Bonsai25Ptq1.model_sha256();
-    let pq2_digest = worker::decode_model_identity_sha256(pq2_hex);
-    let ptq1_digest = worker::decode_model_identity_sha256(ptq1_hex);
-    assert!(pq2_digest.is_some());
-    assert!(ptq1_digest.is_some());
-    assert_ne!(pq2_digest, ptq1_digest);
-    assert!(worker::decode_model_identity_sha256(b25_pq2_hex).is_some());
-    assert!(worker::decode_model_identity_sha256(b25_ptq1_hex).is_some());
+    let b25_pq2_digest = worker::decode_model_identity_sha256(b25_pq2_hex);
+    let b25_ptq1_digest = worker::decode_model_identity_sha256(b25_ptq1_hex);
+    assert!(b25_pq2_digest.is_some());
+    assert!(b25_ptq1_digest.is_some());
+    assert_ne!(b25_pq2_digest, b25_ptq1_digest);
     assert_eq!(worker::decode_model_identity_sha256("short"), None);
     assert_eq!(worker::decode_model_identity_sha256(&"zz".repeat(32)), None);
 
     let root = Path::new("cache-root");
-    let pq2_v81 =
-        worker::hexagon_arena_cache_file_path(root, 81, Representation::Pq2, pq2_hex, 168);
-    let ptq1_v81 = worker::hexagon_arena_cache_file_path(
-        root,
-        81,
-        Representation::CurrentRepackedPtq1,
-        ptq1_hex,
-        168,
-    );
     let b25_pq2_v81 = worker::hexagon_arena_cache_file_path(
         root,
         81,
@@ -2940,16 +2880,23 @@ fn hexagon_representation_and_arena_cache_path_key_distinguish_identities() {
         b25_ptq1_hex,
         168,
     );
-    let pq2_v73 =
-        worker::hexagon_arena_cache_file_path(root, 73, Representation::Pq2, pq2_hex, 168);
-    let pq2_partial =
-        worker::hexagon_arena_cache_file_path(root, 81, Representation::Pq2, pq2_hex, 84);
-    assert_ne!(pq2_v81, ptq1_v81);
-    assert_ne!(pq2_v81, b25_pq2_v81);
-    assert_ne!(ptq1_v81, b25_ptq1_v81);
+    let b25_pq2_v73 = worker::hexagon_arena_cache_file_path(
+        root,
+        73,
+        Representation::Bonsai25Pq2,
+        b25_pq2_hex,
+        168,
+    );
+    let b25_pq2_partial = worker::hexagon_arena_cache_file_path(
+        root,
+        81,
+        Representation::Bonsai25Pq2,
+        b25_pq2_hex,
+        84,
+    );
     assert_ne!(b25_pq2_v81, b25_ptq1_v81);
-    assert_ne!(pq2_v81, pq2_v73);
-    assert_ne!(pq2_v81, pq2_partial);
+    assert_ne!(b25_pq2_v81, b25_pq2_v73);
+    assert_ne!(b25_pq2_v81, b25_pq2_partial);
 }
 
 #[test]
@@ -3039,13 +2986,13 @@ fn models_readiness_preserves_hexagon_and_ptq1_schema_keys() {
             resident_weight_bytes: 2_888_663_040,
             host_metadata_bytes: 8064,
         },
-        representation: Representation::Pq2,
+        representation: Representation::Bonsai25Pq2,
         ..ModelProfile::default()
     };
     let pq2_json = pq2_full.readiness(42);
     let pq2_entry = &pq2_json["data"][0];
-    assert_eq!(pq2_entry["id"], "Swift-Bonsai-2-PQ2_0");
-    assert_eq!(pq2_entry["model_sha256"], swift::MODEL_SHA256);
+    assert_eq!(pq2_entry["id"], "Ternary-Bonsai-2.5-27B-PQ2_0");
+    assert_eq!(pq2_entry["model_sha256"], swift::BONSAI_2_5_PQ2_SHA256);
     assert_eq!(
         pq2_entry["startup_projection"]["effective"],
         "hexagon-native-q2"
@@ -3066,16 +3013,16 @@ fn models_readiness_preserves_hexagon_and_ptq1_schema_keys() {
             resident_weight_bytes: 1_444_331_520,
             host_metadata_bytes: 4032,
         },
-        representation: Representation::CurrentRepackedPtq1,
+        representation: Representation::Bonsai25Ptq1,
         ..ModelProfile::default()
     };
     let ptq1_json = ptq1_partial.readiness(42);
     let ptq1_entry = &ptq1_json["data"][0];
-    assert_eq!(ptq1_entry["id"], "Swift-Bonsai-2-current-repacked-PTQ1_0");
-    assert_eq!(ptq1_entry["model_sha256"], swift::REPACKED_PTQ1_SHA256);
+    assert_eq!(ptq1_entry["id"], "Ternary-Bonsai-2.5-27B-PTQ1_0");
+    assert_eq!(ptq1_entry["model_sha256"], swift::BONSAI_2_5_PTQ1_SHA256);
     assert_eq!(
         ptq1_entry["weight_representation"],
-        Representation::CurrentRepackedPtq1.name()
+        Representation::Bonsai25Ptq1.name()
     );
     assert_eq!(
         ptq1_entry["startup_projection"]["effective"],
@@ -3095,13 +3042,11 @@ fn models_readiness_preserves_hexagon_and_ptq1_schema_keys() {
     assert_eq!(nariq_entry["id"], "Qwen3.8-27B-NariQ-2.5bpw");
     assert_eq!(nariq_entry["model_sha256"], swift::NARIQ_2_5BPW_SHA256);
     assert_eq!(nariq_entry["weight_representation"], "NariQ-2.5bpw");
-    assert_eq!(nariq_entry["supports_abliteration_scale"], false);
-    assert_eq!(nariq_entry["adapter_sha256"], Value::Null);
     assert_eq!(nariq_entry["supports_daisyrose_scale"], true);
 }
 
 #[test]
-fn models_readiness_supports_bonsai25_pq2_and_ptq1_hexagon_orca_daisyrose_and_vision() {
+fn models_readiness_supports_bonsai25_pq2_and_ptq1_hexagon_daisyrose_and_vision() {
     use bonsai_prism_runtime::model::swift::{self, Representation};
     use profile::ProjectionStartup;
 
@@ -3127,7 +3072,6 @@ fn models_readiness_supports_bonsai25_pq2_and_ptq1_hexagon_orca_daisyrose_and_vi
                 host_metadata_bytes: 8064,
             },
             representation: repr,
-            adapter: true,
             daisyrose_adapter: true,
             daisyrose_adapter_sha256: Some("ef".repeat(32).into()),
             daisyrose_adapter_max_rank: Some(16),
@@ -3140,11 +3084,6 @@ fn models_readiness_supports_bonsai25_pq2_and_ptq1_hexagon_orca_daisyrose_and_vi
         assert_eq!(entry["id"], expected_id);
         assert_eq!(entry["model_sha256"], expected_sha);
         assert_eq!(entry["weight_representation"], expected_name);
-        assert_eq!(entry["supports_abliteration_scale"], true);
-        assert_eq!(
-            entry["adapter_sha256"],
-            bonsai_prism_runtime::model::lora::SWIFT_ADAPTER_SHA256
-        );
         assert_eq!(entry["supports_daisyrose_scale"], true);
         assert_eq!(entry["vision"], true);
         assert_eq!(entry["mmproj_sha256"], swift::MMPROJ_SHA256);
@@ -3317,8 +3256,8 @@ fn hexagon_arena_cache_save_writes_verified_header_for_pq2_and_ptq1() -> TestRes
     };
 
     for (arch, repr, tensor) in [
-        (81_u32, Representation::Pq2, pq2_tensor),
-        (73_u32, Representation::CurrentRepackedPtq1, ptq1_tensor),
+        (81_u32, Representation::Bonsai25Pq2, pq2_tensor),
+        (73_u32, Representation::Bonsai25Ptq1, ptq1_tensor),
     ] {
         let sha_hex = repr.model_sha256();
         let sha_bytes = worker::decode_model_identity_sha256(sha_hex)
@@ -3517,91 +3456,29 @@ fn vulkan_session_adapter_scale_actions() -> TestResult {
     use bonsai_prism_runtime::runtime::PromptReuse;
 
     assert_eq!(
-        vulkan_session::decide_adapter_scale_action(
-            Some(1.3),
-            None,
-            Some(1.3),
-            None,
-            PromptReuse::Latest,
-        )?,
+        vulkan_session::decide_adapter_scale_action(Some(1.3), Some(1.3), PromptReuse::Latest)?,
         vulkan_session::AdapterScaleAction::Reuse
     );
     assert_eq!(
-        vulkan_session::decide_adapter_scale_action(
-            Some(1.3),
-            None,
-            Some(0.5),
-            None,
-            PromptReuse::Latest,
-        )?,
+        vulkan_session::decide_adapter_scale_action(Some(1.3), Some(0.5), PromptReuse::Latest)?,
         vulkan_session::AdapterScaleAction::Reset {
-            update_scales: Some((Some(0.5), None)),
+            update_scale: Some(0.5),
         }
     );
-    let r1_neg_zero = vulkan_session::decide_adapter_scale_action(
-        Some(0.0),
-        None,
-        Some(-0.0),
-        None,
-        PromptReuse::Latest,
-    )?;
-    match r1_neg_zero {
-        vulkan_session::AdapterScaleAction::Reset {
-            update_scales: Some((Some(scale), None)),
-        } => assert_eq!(scale.to_bits(), (-0.0_f32).to_bits()),
-        other => return Err(format!("unexpected rank-one scale action: {other:?}").into()),
-    }
+    let neg_zero =
+        vulkan_session::decide_adapter_scale_action(Some(0.0), Some(-0.0), PromptReuse::Latest)?;
+    assert_eq!(neg_zero, vulkan_session::AdapterScaleAction::Reuse);
     assert_eq!(
-        vulkan_session::decide_adapter_scale_action(
-            None,
-            Some(0.0),
-            None,
-            Some(-0.0),
-            PromptReuse::Latest,
-        )?,
-        vulkan_session::AdapterScaleAction::Reuse
-    );
-    assert_eq!(
-        vulkan_session::decide_adapter_scale_action(
-            Some(1.3),
-            Some(0.0),
-            Some(1.3),
-            Some(0.0),
-            PromptReuse::Disabled,
-        )?,
+        vulkan_session::decide_adapter_scale_action(Some(1.3), Some(1.3), PromptReuse::Disabled,)?,
         vulkan_session::AdapterScaleAction::Reset {
-            update_scales: Some((Some(1.3), Some(0.0))),
+            update_scale: Some(1.3),
         }
     );
     for bad in [
-        vulkan_session::decide_adapter_scale_action(
-            Some(1.3),
-            None,
-            None,
-            None,
-            PromptReuse::Latest,
-        ),
-        vulkan_session::decide_adapter_scale_action(
-            Some(1.3),
-            None,
-            Some(f32::NAN),
-            None,
-            PromptReuse::Latest,
-        ),
-        vulkan_session::decide_adapter_scale_action(
-            None,
-            Some(0.0),
-            None,
-            Some(3.0),
-            PromptReuse::Latest,
-        ),
-        vulkan_session::decide_adapter_scale_action(
-            Some(1.3),
-            None,
-            Some(-0.1),
-            None,
-            PromptReuse::Latest,
-        ),
+        vulkan_session::decide_adapter_scale_action(Some(1.3), None, PromptReuse::Latest),
+        vulkan_session::decide_adapter_scale_action(Some(1.3), Some(f32::NAN), PromptReuse::Latest),
+        vulkan_session::decide_adapter_scale_action(Some(0.0), Some(3.0), PromptReuse::Latest),
+        vulkan_session::decide_adapter_scale_action(Some(1.3), Some(-0.1), PromptReuse::Latest),
     ] {
         assert!(bad.is_err());
     }
@@ -3615,16 +3492,15 @@ fn vulkan_session_canonical_request_and_error_classification() -> TestResult {
         "messages": [{"role": "user", "content": "hi"}],
         "chat_template_kwargs": {"enable_thinking": false},
         "max_completion_tokens": 16,
-        "lora": [{"id": 0, "scale": 0.75}, {"id": 1, "scale": 0.25}],
+        "lora": [{"id": 0, "scale": 0.25}],
     });
-    let parsed = crate::native_swift::parse_canonical_request(&valid_value, true, true)
+    let parsed = crate::native_swift::parse_canonical_request(&valid_value, true)
         .map_err(|err| format!("parse_canonical_request failed: {err:?}"))?;
     assert_eq!(parsed.output_tokens, 16);
     assert!(!parsed.enable_thinking);
-    assert_eq!(parsed.adapter_scale, Some(0.75));
     assert_eq!(parsed.multi_rank_scale, Some(0.25));
     assert_eq!(
-        crate::native_swift::parse_canonical_request(&json!({"messages": []}), false, false).err(),
+        crate::native_swift::parse_canonical_request(&json!({"messages": []}), false).err(),
         Some(Rejection::ChatSchema)
     );
     let generic_err = std::io::Error::other("broken");
@@ -3732,8 +3608,7 @@ fn vulkan_session_load_rejects_invalid_profiles_without_gpu() {
     assert!(
         VulkanSwiftSession::load_profile_with_adapters(
             &missing_path,
-            Representation::Pq2,
-            None,
+            Representation::Bonsai25Pq2,
             None,
             7,
             0,
@@ -3746,8 +3621,7 @@ fn vulkan_session_load_rejects_invalid_profiles_without_gpu() {
     assert!(
         VulkanSwiftSession::load_profile_with_adapters(
             &missing_path,
-            Representation::Pq2,
-            None,
+            Representation::Bonsai25Pq2,
             None,
             7,
             1,
@@ -3760,8 +3634,7 @@ fn vulkan_session_load_rejects_invalid_profiles_without_gpu() {
     assert!(
         VulkanSwiftSession::load_profile_with_adapters(
             &missing_path,
-            Representation::Pq2,
-            None,
+            Representation::Bonsai25Pq2,
             None,
             7,
             1,

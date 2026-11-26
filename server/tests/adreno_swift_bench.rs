@@ -78,8 +78,7 @@ mod live {
         let parallelism = RowParallelism::new(ROW_WORKERS)?;
         let session = SwiftSession::load_profile_with_execution_and_reuse(
             &model_path,
-            Representation::Pq2,
-            None,
+            Representation::Bonsai25Pq2,
             MatvecBackend::Auto,
             42,
             parallelism,

@@ -15,7 +15,7 @@ use crate::{
     Result,
     model::{
         Model,
-        lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
+        lora::{MultiRankAdapter, MultiRankPolicy},
     },
 };
 
@@ -40,7 +40,7 @@ struct Fixture {
     up: Tensor,
     down: Tensor,
     transforms: Transforms,
-    adapter: RankOneAdapter,
+    adapter: MultiRankAdapter,
 }
 
 struct TileResult {
@@ -78,6 +78,7 @@ impl Fixture {
                 ("general.architecture".into(), MetadataValue::from("qwen35")),
                 ("general.type".into(), MetadataValue::from("adapter")),
                 ("adapter.type".into(), MetadataValue::from("lora")),
+                ("adapter.lora.alpha".into(), MetadataValue::from(1.0_f32)),
                 ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
             ]),
             tensors: BTreeMap::from([(a.name.clone(), a), (b.name.clone(), b)]),
@@ -110,7 +111,7 @@ impl Fixture {
                 )]),
                 ..Transforms::default()
             },
-            adapter: RankOneAdapter::from_model(factors, &base)?,
+            adapter: MultiRankAdapter::from_model(&base, &factors, MultiRankPolicy::AnyLinear)?,
             gate,
             up,
             down,
@@ -148,7 +149,10 @@ impl Fixture {
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
-            adapters: ActiveAdapters::rank_one(Some(&self.adapter), scale),
+            adapters: ActiveAdapters {
+                multi_rank: Some(&self.adapter),
+                multi_rank_scale: scale,
+            },
             adapter_scratch: &mut adapter_scratch,
             executor: None,
         };
@@ -211,7 +215,10 @@ impl Fixture {
             &self.transforms,
             &self.geometry,
             arithmetic,
-            ActiveAdapters::rank_one(Some(&self.adapter), scale),
+            ActiveAdapters {
+                multi_rank: Some(&self.adapter),
+                multi_rank_scale: scale,
+            },
             &mut adapter_scratch,
             &mut projection_scratch,
             TileReuse::default(),
@@ -236,7 +243,10 @@ impl Fixture {
             &self.transforms,
             &self.geometry,
             arithmetic,
-            ActiveAdapters::rank_one(Some(&self.adapter), scale),
+            ActiveAdapters {
+                multi_rank: Some(&self.adapter),
+                multi_rank_scale: scale,
+            },
             &mut adapter_scratch,
             &mut projection_scratch,
             reuse,
@@ -547,47 +557,23 @@ impl crate::kernels::Pq2ProjectionExecutor for RecordingFfnExecutor {
         Ok(())
     }
 
-    fn supports_f32_ffn_chain_lora(&self, tensors: [&Tensor; 3]) -> bool {
-        self.allow_chain_lora && tensors.iter().all(|tensor| tensor.kind == 142)
+    fn supports_f32_ffn_chain_lora(&self, _tensors: [&Tensor; 3]) -> bool {
+        false
     }
 
     fn project_f32_ffn_chain_lora(
         &mut self,
-        [gate, up, down]: [&Tensor; 3],
-        activation: &[f32],
-        residual: Option<&[f32]>,
-        hadamard_block_size: Option<u32>,
-        lora_a: &[f32],
-        pinned: bool,
-        output: &mut Vec<f32>,
+        _tensors: [&Tensor; 3],
+        _activation: &[f32],
+        _residual: Option<&[f32]>,
+        _hadamard_block_size: Option<u32>,
+        _lora_a: &[f32],
+        _pinned: bool,
+        _output: &mut Vec<f32>,
     ) -> Result<f32> {
-        self.chain_calls += 1;
-        let mut mid = Vec::new();
-        let mut gate_out = Vec::new();
-        self.cpu_matvec(gate, activation, &mut gate_out)?;
-        self.cpu_matvec(up, activation, &mut mid)?;
-        self.arithmetic.swiglu_in_place(&gate_out, &mut mid)?;
-        let _ = (hadamard_block_size, pinned);
-        let mut rank = Vec::new();
-        let adapter_scratch = self.arithmetic.scratch(MatvecBackend::Scalar);
-        crate::kernels::lora_a_dot(lora_a, &mid, &mut rank, &adapter_scratch)?;
-        let lora_dot = rank
-            .first()
-            .copied()
-            .ok_or_else(|| crate::invalid("missing lora dot"))?;
-        let mut rotated = Vec::new();
-        let down_input = if self.transforms.basis(down).0 {
-            self.transforms
-                .transform_into(down, &mid, &self.geometry, &mut rotated)?;
-            rotated.as_slice()
-        } else {
-            mid.as_slice()
-        };
-        self.cpu_matvec(down, down_input, output)?;
-        if let Some(residual) = residual {
-            super::super::add_finite(output, residual, "test ffn chain lora")?;
-        }
-        Ok(lora_dot)
+        Err(crate::invalid(
+            "ffn_chain_lora unused after RankOneAdapter removal",
+        ))
     }
 }
 
@@ -597,8 +583,8 @@ struct Pq2FfnFixture {
     gate: Tensor,
     up: Tensor,
     down: Tensor,
-    down_adapter: RankOneAdapter,
-    attn_adapter: RankOneAdapter,
+    down_adapter: MultiRankAdapter,
+    attn_adapter: MultiRankAdapter,
 }
 
 impl Pq2FfnFixture {
@@ -607,7 +593,7 @@ impl Pq2FfnFixture {
         let up = pq2_tensor("blk.0.ffn_up.weight", 1);
         let down = pq2_tensor("blk.0.ffn_down.weight", 2);
         let attn_out = pq2_tensor("blk.0.attn_output.weight", 3);
-        let adapter_for = |target: &Tensor| -> Result<RankOneAdapter> {
+        let adapter_for = |target: &Tensor| -> Result<MultiRankAdapter> {
             let base = Model {
                 metadata: BTreeMap::from([(
                     "general.architecture".into(),
@@ -629,12 +615,13 @@ impl Pq2FfnFixture {
                     ("general.architecture".into(), MetadataValue::from("qwen35")),
                     ("general.type".into(), MetadataValue::from("adapter")),
                     ("adapter.type".into(), MetadataValue::from("lora")),
+                    ("adapter.lora.alpha".into(), MetadataValue::from(1.0_f32)),
                     ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
                 ]),
                 tensors: BTreeMap::from([(a.name.clone(), a), (b.name.clone(), b)]),
                 identity: "pq2-adapter-factors".into(),
             };
-            RankOneAdapter::from_model(factors, &base)
+            MultiRankAdapter::from_model(&base, &factors, MultiRankPolicy::AnyLinear)
         };
         Ok(Self {
             geometry: Geometry {
@@ -676,7 +663,7 @@ impl Pq2FfnFixture {
     fn run_decode(
         &self,
         arithmetic: Arithmetic,
-        adapter: Option<&RankOneAdapter>,
+        adapter: Option<&MultiRankAdapter>,
         scale: f32,
         input: &[f32],
         residual: &[f32],
@@ -698,7 +685,10 @@ impl Pq2FfnFixture {
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut projection,
-            adapters: ActiveAdapters::rank_one(adapter, scale),
+            adapters: ActiveAdapters {
+                multi_rank: adapter,
+                multi_rank_scale: scale,
+            },
             adapter_scratch: &mut adapter_scratch,
             executor: executor.map(as_executor),
         };
@@ -734,7 +724,7 @@ impl Pq2FfnFixture {
     fn run_tile(
         &self,
         arithmetic: Arithmetic,
-        adapter: Option<&RankOneAdapter>,
+        adapter: Option<&MultiRankAdapter>,
         scale: f32,
         inputs: &[Vec<f32>],
         residuals: &[Vec<f32>],
@@ -754,7 +744,10 @@ impl Pq2FfnFixture {
             &self.transforms,
             &self.geometry,
             arithmetic,
-            ActiveAdapters::rank_one(adapter, scale),
+            ActiveAdapters {
+                multi_rank: adapter,
+                multi_rank_scale: scale,
+            },
             TileReuse::default(),
             [&self.gate, &self.up, &self.down],
             inputs,
@@ -769,7 +762,10 @@ impl Pq2FfnFixture {
                 &self.transforms,
                 &self.geometry,
                 arithmetic,
-                ActiveAdapters::rank_one(adapter, scale),
+                ActiveAdapters {
+                    multi_rank: adapter,
+                    multi_rank_scale: scale,
+                },
                 &mut adapter_scratch,
                 &mut projection_scratch,
                 TileReuse::default(),
@@ -788,7 +784,10 @@ impl Pq2FfnFixture {
                 &self.transforms,
                 &self.geometry,
                 arithmetic,
-                ActiveAdapters::rank_one(adapter, scale),
+                ActiveAdapters {
+                    multi_rank: adapter,
+                    multi_rank_scale: scale,
+                },
                 &mut adapter_scratch,
                 &mut projection_scratch,
                 reuse,
@@ -947,7 +946,10 @@ fn external_ffn_chain_and_swiglu_unlock_for_inactive_and_down_only_lora() -> Res
             mrope_positions: [0; 4],
             frequencies_ready: false,
             projection: &mut proj,
-            adapters: ActiveAdapters::rank_one(Some(&fixture.down_adapter), 1.3),
+            adapters: ActiveAdapters {
+                multi_rank: Some(&fixture.down_adapter),
+                multi_rank_scale: 1.3,
+            },
             adapter_scratch: &mut adapter_scratch,
             executor: Some(&mut untargeted_exec),
         };
@@ -962,185 +964,6 @@ fn external_ffn_chain_and_swiglu_unlock_for_inactive_and_down_only_lora() -> Res
         )?);
         assert_eq!(untargeted_exec.chain_calls, 1);
     }
-    Ok(())
-}
-
-#[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Verify no-residual, residual decode parity, and sparse fallback in one self-contained scale=1.3 LoRA chain check"
-)]
-fn external_ffn_chain_lora_fuses_down_only_lora_at_scale_1_3_and_matches_rank_one_adapter()
--> Result<()> {
-    let fixture = Pq2FfnFixture::new()?;
-    let input: Vec<f32> = (0..128)
-        .map(|i| if i % 2 == 0 { 0.375 } else { -0.25 })
-        .collect();
-    let residual = vec![0.125_f32; 128];
-
-    for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
-        // 1. No-residual direct try_project_ffn_chain_into: bitwise identical to CPU RankOneAdapter at scale=1.3.
-        let mut expected_proj = ProjectionScratch {
-            matvec: arithmetic.scratch(MatvecBackend::Scalar),
-            ..ProjectionScratch::default()
-        };
-        let mut expected_adapter_scratch = AdapterScratch::new(
-            MatvecBackend::Scalar,
-            matches!(arithmetic, Arithmetic::PinnedSwift),
-        );
-        let mut expected_eval = Evaluation {
-            geometry: &fixture.geometry,
-            arithmetic,
-            transforms: &fixture.transforms,
-            position: 0,
-            mrope_positions: [0; 4],
-            frequencies_ready: false,
-            projection: &mut expected_proj,
-            adapters: ActiveAdapters::rank_one(Some(&fixture.down_adapter), 1.3),
-            adapter_scratch: &mut expected_adapter_scratch,
-            executor: None,
-        };
-        let mut gate_out = Vec::new();
-        let mut up_out = Vec::new();
-        let mut expected_no_res = Vec::new();
-        expected_eval.project_ffn_swiglu_into(
-            &fixture.gate,
-            &fixture.up,
-            &fixture.down,
-            &input,
-            &mut gate_out,
-            &mut up_out,
-        )?;
-        expected_eval.project_into(&fixture.down, &up_out, &mut expected_no_res)?;
-
-        let mut exec_no_res = fixture.executor(arithmetic);
-        exec_no_res.allow_chain_lora = true;
-        let mut actual_proj = ProjectionScratch {
-            matvec: arithmetic.scratch(MatvecBackend::Scalar),
-            ..ProjectionScratch::default()
-        };
-        let mut actual_adapter_scratch = AdapterScratch::new(
-            MatvecBackend::Scalar,
-            matches!(arithmetic, Arithmetic::PinnedSwift),
-        );
-        let mut actual_eval = Evaluation {
-            geometry: &fixture.geometry,
-            arithmetic,
-            transforms: &fixture.transforms,
-            position: 0,
-            mrope_positions: [0; 4],
-            frequencies_ready: false,
-            projection: &mut actual_proj,
-            adapters: ActiveAdapters::rank_one(Some(&fixture.down_adapter), 1.3),
-            adapter_scratch: &mut actual_adapter_scratch,
-            executor: Some(&mut exec_no_res),
-        };
-        let mut actual_no_res = Vec::new();
-        assert!(actual_eval.try_project_ffn_chain_into(
-            &fixture.gate,
-            &fixture.up,
-            &fixture.down,
-            &input,
-            None,
-            &mut actual_no_res,
-        )?);
-        same_bits(
-            &actual_no_res,
-            &expected_no_res,
-            "scale=1.3 fused ffn chain lora without residual",
-        );
-        assert_eq!(
-            actual_eval.projection.fusions.external_ffn_chain.completed,
-            1
-        );
-        assert_eq!(exec_no_res.chain_calls, 1);
-
-        // 2. With residual via run_decode: completes external_ffn_chain with zero swiglu/separate down calls.
-        let (expected_with_res, _) = fixture.run_decode(
-            arithmetic,
-            Some(&fixture.down_adapter),
-            1.3,
-            &input,
-            &residual,
-            None,
-        )?;
-        let mut exec = fixture.executor(arithmetic);
-        exec.allow_chain_lora = true;
-        let (actual_with_res, summary) = fixture.run_decode(
-            arithmetic,
-            Some(&fixture.down_adapter),
-            1.3,
-            &input,
-            &residual,
-            Some(&mut exec),
-        )?;
-        assert_eq!(summary.external_ffn_chain.completed, 1);
-        assert_eq!(summary.external_ffn_swiglu.completed, 0);
-        assert_eq!(exec.chain_calls, 1);
-        assert_eq!(exec.swiglu_calls, 0);
-        assert_eq!(exec.project_calls, 0);
-        for (idx, (&actual, &expected)) in
-            actual_with_res.iter().zip(&expected_with_res).enumerate()
-        {
-            assert!(
-                (actual - expected).abs() <= 1e-6,
-                "scale=1.3 residual diff at {idx}: actual={actual}, expected={expected}"
-            );
-        }
-    }
-
-    // 3. Sparse LoRA A falls back cleanly without breaking chain fusion for dense adapters.
-    let sparse_base = Model {
-        metadata: BTreeMap::from([("general.architecture".into(), MetadataValue::from("qwen35"))]),
-        tensors: BTreeMap::from([(fixture.down.name.clone(), fixture.down.clone())]),
-        identity: "pq2-sparse-adapter-base".into(),
-    };
-    let sparse_in: Vec<f32> = (0..128).map(|i| if i < 8 { 0.125 } else { 0.0 }).collect();
-    let sparse_out = vec![0.25_f32; 128];
-    let mut sparse_down_adapter = RankOneAdapter::from_model(
-        Model {
-            metadata: BTreeMap::from([
-                ("general.architecture".into(), MetadataValue::from("qwen35")),
-                ("general.type".into(), MetadataValue::from("adapter")),
-                ("adapter.type".into(), MetadataValue::from("lora")),
-                ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
-            ]),
-            tensors: BTreeMap::from([
-                (
-                    format!("{}.lora_a", fixture.down.name),
-                    tensor(
-                        &format!("{}.lora_a", fixture.down.name),
-                        &[128, 1],
-                        &sparse_in,
-                    ),
-                ),
-                (
-                    format!("{}.lora_b", fixture.down.name),
-                    tensor(
-                        &format!("{}.lora_b", fixture.down.name),
-                        &[1, 128],
-                        &sparse_out,
-                    ),
-                ),
-            ]),
-            identity: "pq2-sparse-adapter-factors".into(),
-        },
-        &sparse_base,
-    )?;
-    sparse_down_adapter.enable_sparse_a()?;
-    let mut sparse_exec = fixture.executor(Arithmetic::PinnedSwift);
-    sparse_exec.allow_chain_lora = true;
-    let (_, sparse_summary) = fixture.run_decode(
-        Arithmetic::PinnedSwift,
-        Some(&sparse_down_adapter),
-        1.3,
-        &input,
-        &residual,
-        Some(&mut sparse_exec),
-    )?;
-    assert_eq!(sparse_summary.external_ffn_chain.completed, 0);
-    assert_eq!(sparse_summary.external_ffn_swiglu.completed, 1);
-    assert_eq!(sparse_exec.chain_calls, 0);
     Ok(())
 }
 
@@ -1483,8 +1306,6 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
             frequencies_ready: false,
             projection: &mut projection,
             adapters: ActiveAdapters {
-                rank_one: Some(&fixture.down_adapter),
-                rank_one_scale: 1.3,
                 multi_rank: Some(&multi_rank),
                 multi_rank_scale: mr_scale,
             },
@@ -1520,26 +1341,26 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
     };
 
     for arithmetic in [Arithmetic::Source, Arithmetic::PinnedSwift] {
-        // 1. At DaisyRose scale 0.0, external_ffn_chain_lora stays fused and matches Orca-only bit-for-bit.
-        let mut orca_exec = fixture.executor(arithmetic);
-        orca_exec.allow_chain_lora = true;
-        let (orca_only, orca_stats) = fixture.run_decode(
+        // 1. At DaisyRose scale 0.0, external_ffn_chain stays fused and matches base bit-for-bit.
+        let mut base_exec = fixture.executor(arithmetic);
+        base_exec.allow_chain_lora = true;
+        let (base_only, base_stats) = fixture.run_decode(
             arithmetic,
-            Some(&fixture.down_adapter),
-            1.3,
+            None,
+            0.0,
             &inputs[0],
             &residuals[0],
-            Some(&mut orca_exec),
+            Some(&mut base_exec),
         )?;
         let mut zero_exec = fixture.executor(arithmetic);
         zero_exec.allow_chain_lora = true;
         let (stacked_zero, zero_stats) = run_decode_stacked(arithmetic, 0.0, Some(&mut zero_exec))?;
-        assert_eq!(orca_stats.external_ffn_chain.completed, 1);
+        assert_eq!(base_stats.external_ffn_chain.completed, 1);
         assert_eq!(zero_stats.external_ffn_chain.completed, 1);
         assert_eq!(zero_stats.external_ffn_swiglu.completed, 0);
         assert_eq!(zero_exec.chain_calls, 1);
         assert_eq!(zero_exec.swiglu_calls, 0);
-        same_bits(&stacked_zero, &orca_only, "stacked DaisyRose=0 bypass");
+        same_bits(&stacked_zero, &base_only, "DaisyRose=0 bypass");
 
         // 2. At DaisyRose scale 0.5, chain falls back while external_ffn_swiglu remains fused,
         //    and matches CPU fallback + tiled prefill bit-for-bit.
@@ -1557,7 +1378,7 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
                 .copied()
                 .map(f32::to_bits)
                 .collect::<Vec<_>>(),
-            orca_only
+            base_only
                 .iter()
                 .copied()
                 .map(f32::to_bits)
@@ -1580,8 +1401,6 @@ fn multi_rank_npu_friendly_keeps_chain_at_zero_and_swiglu_at_nonzero_and_matches
         );
         let mut tiled_exec = fixture.executor(arithmetic);
         let adapters = ActiveAdapters {
-            rank_one: Some(&fixture.down_adapter),
-            rank_one_scale: 1.3,
             multi_rank: Some(&multi_rank),
             multi_rank_scale: 0.5,
         };
@@ -1921,50 +1740,7 @@ fn build_sparse_heterogeneous_four_layer_pq2_model() -> Model {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Builds stacked RankOne + sparse heterogeneous-rank MultiRankAdapter pairs across 4 layers."
-)]
-fn build_sparse_heterogeneous_adapters(base: &Model) -> Result<(RankOneAdapter, MultiRankAdapter)> {
-    let mut r1_tensors = BTreeMap::new();
-    for (idx, target) in [
-        "blk.0.ffn_down.weight",
-        "blk.1.ffn_down.weight",
-        "blk.2.ffn_down.weight",
-        "blk.3.ffn_down.weight",
-        "blk.0.ssm_out.weight",
-        "blk.3.attn_output.weight",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let a_vals: Vec<f32> = (0..128)
-            .map(|i| if (i + idx) % 3 == 0 { 0.125 } else { -0.0625 })
-            .collect();
-        let b_vals: Vec<f32> = (0..128)
-            .map(|i| if (i + idx) % 2 == 0 { 0.25 } else { -0.125 })
-            .collect();
-        r1_tensors.insert(
-            format!("{target}.lora_a"),
-            tensor(&format!("{target}.lora_a"), &[128, 1], &a_vals),
-        );
-        r1_tensors.insert(
-            format!("{target}.lora_b"),
-            tensor(&format!("{target}.lora_b"), &[1, 128], &b_vals),
-        );
-    }
-    let r1_model = Model {
-        metadata: BTreeMap::from([
-            ("general.architecture".into(), MetadataValue::from("qwen35")),
-            ("general.type".into(), MetadataValue::from("adapter")),
-            ("adapter.type".into(), MetadataValue::from("lora")),
-            ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
-        ]),
-        tensors: r1_tensors,
-        identity: "r1-sparse-heterogeneous".into(),
-    };
-    let rank_one = RankOneAdapter::from_model(r1_model, base)?;
-
+fn build_sparse_heterogeneous_adapters(base: &Model) -> Result<MultiRankAdapter> {
     let f16_bytes = |vals: &[f32]| -> crate::model::TensorBytes {
         vals.iter()
             .flat_map(|v| crate::kernels::half_bits(*v).to_le_bytes())
@@ -2034,7 +1810,7 @@ fn build_sparse_heterogeneous_adapters(base: &Model) -> Result<(RankOneAdapter, 
     let multi_rank = MultiRankAdapter::from_model(base, &mr_model, MultiRankPolicy::NpuFriendly)?;
     assert_eq!(multi_rank.max_rank(), 4);
     assert!(!multi_rank.has_target("blk.1.ffn_down.weight"));
-    Ok((rank_one, multi_rank))
+    Ok(multi_rank)
 }
 
 #[expect(
@@ -2182,7 +1958,7 @@ fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp
     use crate::graph::{KvCachePolicy, Qwen35};
 
     let base_model = build_sparse_heterogeneous_four_layer_pq2_model();
-    let (rank_one, multi_rank) = build_sparse_heterogeneous_adapters(&base_model)?;
+    let multi_rank = build_sparse_heterogeneous_adapters(&base_model)?;
     let geometry = Geometry {
         embedding: 128,
         feed_forward: 128,
@@ -2231,8 +2007,6 @@ fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp
             arithmetic,
             blk1_tensors,
             ActiveAdapters {
-                rank_one: Some(&rank_one),
-                rank_one_scale: 1.3,
                 multi_rank: Some(&multi_rank),
                 multi_rank_scale: 0.5,
             },
@@ -2249,7 +2023,7 @@ fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp
             &transforms,
             arithmetic,
             blk1_tensors,
-            ActiveAdapters::rank_one(Some(&rank_one), 1.3),
+            ActiveAdapters::default(),
             &inputs[0],
             None,
             None,
@@ -2257,18 +2031,18 @@ fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp
         same_bits(
             &blk1_active,
             &blk1_cpu_oracle,
-            "blk.1 omitted MultiRank retains chain_lora with 0-ULP parity",
+            "blk.1 omitted MultiRank retains chain with 0-ULP parity",
         );
 
-        // 2. Targeted ffn_down layers (blk.0 rank 2, blk.3 rank 4) keep chain_lora at scale=0.0
-        //    (0-ULP with Orca-only) and keep external_ffn_swiglu fused at scale=0.5 (0-ULP vs CPU decode & tiled prefill).
+        // 2. Targeted ffn_down layers (blk.0 rank 2, blk.3 rank 4) keep chain at scale=0.0
+        //    and keep external_ffn_swiglu fused at scale=0.5 (0-ULP vs CPU decode & tiled prefill).
         for layer_idx in [0_usize, 3] {
             let layer_tensors = [
                 &base_model.tensors[&format!("blk.{layer_idx}.ffn_gate.weight")],
                 &base_model.tensors[&format!("blk.{layer_idx}.ffn_up.weight")],
                 &base_model.tensors[&format!("blk.{layer_idx}.ffn_down.weight")],
             ];
-            let mut orca_exec = RecordingFfnExecutor {
+            let mut base_exec = RecordingFfnExecutor {
                 arithmetic,
                 transforms: Transforms::read(&base_model, &geometry)?,
                 geometry: geometry.clone(),
@@ -2277,15 +2051,15 @@ fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp
                 swiglu_calls: 0,
                 project_calls: 0,
             };
-            let (orca_only, orca_stats) = eval_layer_ffn_decode(
+            let (base_only, base_stats) = eval_layer_ffn_decode(
                 &geometry,
                 &transforms,
                 arithmetic,
                 layer_tensors,
-                ActiveAdapters::rank_one(Some(&rank_one), 1.3),
+                ActiveAdapters::default(),
                 &inputs[0],
                 Some(&residuals[0]),
-                Some(&mut orca_exec),
+                Some(&mut base_exec),
             )?;
             let mut zero_exec = RecordingFfnExecutor {
                 arithmetic,
@@ -2302,8 +2076,6 @@ fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp
                 arithmetic,
                 layer_tensors,
                 ActiveAdapters {
-                    rank_one: Some(&rank_one),
-                    rank_one_scale: 1.3,
                     multi_rank: Some(&multi_rank),
                     multi_rank_scale: 0.0,
                 },
@@ -2311,17 +2083,15 @@ fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp
                 Some(&residuals[0]),
                 Some(&mut zero_exec),
             )?;
-            assert_eq!(orca_stats.external_ffn_chain.completed, 1);
+            assert_eq!(base_stats.external_ffn_chain.completed, 1);
             assert_eq!(zero_stats.external_ffn_chain.completed, 1);
             same_bits(
                 &stacked_zero,
-                &orca_only,
-                &format!("blk.{layer_idx} scale=0.0 matches Orca-only 0-ULP"),
+                &base_only,
+                &format!("blk.{layer_idx} scale=0.0 matches base 0-ULP"),
             );
 
             let active_adapters = ActiveAdapters {
-                rank_one: Some(&rank_one),
-                rank_one_scale: 1.3,
                 multi_rank: Some(&multi_rank),
                 multi_rank_scale: 0.5,
             };
@@ -2395,13 +2165,11 @@ fn sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp
     //    scale=0.5 mixed chain_lora=2 + swiglu=2 fusion counts, and 0-ULP tiled vs CPU decode).
     let make_graph = |mr: Option<(MultiRankAdapter, f32)>| -> Result<Qwen35> {
         let m = build_sparse_heterogeneous_four_layer_pq2_model();
-        let (r1, _) = build_sparse_heterogeneous_adapters(&m)?;
         Qwen35::with_adapters_and_kv(
             m,
             32,
             64 * 1024 * 1024,
             MatvecBackend::Scalar,
-            Some((r1, 1.3)),
             mr,
             KvCachePolicy::F16,
         )

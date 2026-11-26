@@ -6,7 +6,10 @@ use std::sync::Arc;
 use bonsai_gguf::MetadataValue;
 
 use super::*;
-use crate::model::{Model, lora::RankOneAdapter};
+use crate::model::{
+    Model,
+    lora::{MultiRankAdapter, MultiRankPolicy},
+};
 
 fn packed(name: &str, rows: usize) -> Tensor {
     let symbol = name.bytes().fold(rows.to_le_bytes()[0], |sum, byte| {
@@ -37,7 +40,7 @@ struct Fixture {
     tensors: [Tensor; 3],
     prior: Tensor,
     transforms: Transforms,
-    adapter: RankOneAdapter,
+    adapter: MultiRankAdapter,
 }
 
 impl Fixture {
@@ -71,6 +74,7 @@ impl Fixture {
                 ("general.architecture".into(), MetadataValue::from("qwen35")),
                 ("general.type".into(), MetadataValue::from("adapter")),
                 ("adapter.type".into(), MetadataValue::from("lora")),
+                ("adapter.lora.alpha".into(), MetadataValue::from(1.0_f32)),
                 ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
             ]),
             tensors: BTreeMap::from([(a.name.clone(), a), (b.name.clone(), b)]),
@@ -107,7 +111,7 @@ impl Fixture {
                 )]),
                 ..Transforms::default()
             },
-            adapter: RankOneAdapter::from_model(factors, &base)?,
+            adapter: MultiRankAdapter::from_model(&base, &factors, MultiRankPolicy::AnyLinear)?,
             tensors,
             prior,
         })
@@ -174,7 +178,10 @@ impl Fixture {
                 &self.transforms,
                 &self.geometry,
                 arithmetic,
-                ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
+                ActiveAdapters {
+                    multi_rank: Some(&self.adapter),
+                    multi_rank_scale: 1.3,
+                },
                 &mut adapter_scratch,
                 &mut projection,
                 previous,
@@ -198,7 +205,10 @@ impl Fixture {
                     &self.transforms,
                     &self.geometry,
                     arithmetic,
-                    ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
+                    ActiveAdapters {
+                        multi_rank: Some(&self.adapter),
+                        multi_rank_scale: 1.3,
+                    },
                     &mut adapter_scratch,
                     &mut projection,
                     previous,
@@ -216,7 +226,10 @@ impl Fixture {
                     &self.transforms,
                     &self.geometry,
                     arithmetic,
-                    ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
+                    ActiveAdapters {
+                        multi_rank: Some(&self.adapter),
+                        multi_rank_scale: 1.3,
+                    },
                     &mut adapter_scratch,
                     &mut projection,
                     previous,
@@ -237,7 +250,10 @@ impl Fixture {
                     &self.transforms,
                     &self.geometry,
                     arithmetic,
-                    ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
+                    ActiveAdapters {
+                        multi_rank: Some(&self.adapter),
+                        multi_rank_scale: 1.3,
+                    },
                     &mut adapter_scratch,
                     &mut projection,
                     previous,
@@ -267,7 +283,10 @@ impl Fixture {
             &self.transforms,
             &self.geometry,
             arithmetic,
-            ActiveAdapters::rank_one(Some(&self.adapter), 1.3),
+            ActiveAdapters {
+                multi_rank: Some(&self.adapter),
+                multi_rank_scale: 1.3,
+            },
             &mut adapter_scratch,
             &mut projection,
             previous,

@@ -72,8 +72,7 @@ fn load() -> Result<SwiftSession> {
     let parallelism = RowParallelism::new(row_workers.unwrap_or(1))?;
     SwiftSession::load_profile_with_kv_cache(
         &model,
-        swift::Representation::Pq2,
-        None,
+        swift::Representation::Bonsai25Pq2,
         backend.unwrap_or(MatvecBackend::Auto),
         seed.ok_or_else(bad)?,
         parallelism,
@@ -119,7 +118,7 @@ fn write_readiness(session: &SwiftSession, output: &mut impl Write) -> Result<()
         MatvecBackend::ExperimentalNeon => "neon",
     };
     let mut readiness = json!({
-        "type":"ready", "model_sha256":swift::MODEL_SHA256,
+        "type":"ready", "model_sha256":swift::BONSAI_2_5_PQ2_SHA256,
         "protocol":"bonsai-swift-worker-v1", "template_sha256":swift::TEMPLATE_SHA256,
         "vocab_size":swift::VOCAB_SIZE,
         "prism_commit":"73bfe6cc485554822f80c473a3c0c4f25e80f41b",

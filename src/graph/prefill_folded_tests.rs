@@ -10,7 +10,7 @@ use super::*;
 use crate::Decoder;
 use crate::graph::KvCachePolicy;
 use crate::model::Model;
-use crate::model::lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter};
+use crate::model::lora::{MultiRankAdapter, MultiRankPolicy};
 
 fn f32_tensor(name: &str, dimensions: &[usize], values: &[f32]) -> Tensor {
     Tensor {
@@ -332,60 +332,27 @@ fn hybrid_model(cfg: &HybridConfig) -> Model {
 fn hybrid_model_with_identity(cfg: &HybridConfig, arithmetic: Arithmetic) -> Model {
     let mut model = hybrid_model(cfg);
     if matches!(arithmetic, Arithmetic::PinnedSwift) {
-        model.identity = crate::model::swift::MODEL_SHA256.to_owned();
+        model.identity = crate::model::swift::BONSAI_2_5_PQ2_SHA256.to_owned();
     }
     model
 }
 
-fn build_folded_test_adapters(
-    model: &Model,
-    cfg: &HybridConfig,
-) -> Result<(RankOneAdapter, MultiRankAdapter)> {
-    let mut rank_one_tensors = BTreeMap::new();
-    let target_r1 = "blk.0.ffn_down.weight";
-    rank_one_tensors.insert(
-        format!("{target_r1}.lora_a"),
-        f32_tensor(
-            &format!("{target_r1}.lora_a"),
-            &[cfg.ffn, 1],
-            &pattern(cfg.ffn, 21, 0.125),
-        ),
-    );
-    rank_one_tensors.insert(
-        format!("{target_r1}.lora_b"),
-        f32_tensor(
-            &format!("{target_r1}.lora_b"),
-            &[1, cfg.embedding],
-            &pattern(cfg.embedding, 22, 0.125),
-        ),
-    );
-    let r1_model = Model {
-        metadata: BTreeMap::from([
-            (
-                "general.architecture".to_owned(),
-                MetadataValue::from("qwen35"),
-            ),
-            ("general.type".to_owned(), MetadataValue::from("adapter")),
-            ("adapter.type".to_owned(), MetadataValue::from("lora")),
-            (
-                "adapter.lora_alpha".to_owned(),
-                MetadataValue::from(1.0_f32),
-            ),
-        ]),
-        tensors: rank_one_tensors,
-        identity: "r1-folded-test".to_owned(),
-    };
-    let r1 = RankOneAdapter::from_model(r1_model, model)?;
-
+fn build_folded_test_adapters(model: &Model, cfg: &HybridConfig) -> Result<MultiRankAdapter> {
     let mut mr_tensors = BTreeMap::new();
     let val_w = cfg.ssm_values * cfg.ssm_head;
     let conv_w = 2 * cfg.ssm_keys * cfg.ssm_head + val_w;
     let q_gate_w = cfg.heads * cfg.head * 2;
-    for (target, in_f, out_f, seed) in [
-        ("blk.0.attn_qkv.weight", cfg.embedding, conv_w, 31),
-        ("blk.1.attn_q.weight", cfg.embedding, q_gate_w, 32),
+    for (target, in_f, out_f, rank, seed) in [
+        (
+            "blk.0.ffn_down.weight",
+            cfg.ffn,
+            cfg.embedding,
+            1_usize,
+            21_usize,
+        ),
+        ("blk.0.attn_qkv.weight", cfg.embedding, conv_w, 2, 31),
+        ("blk.1.attn_q.weight", cfg.embedding, q_gate_w, 2, 32),
     ] {
-        let rank = 2;
         mr_tensors.insert(
             format!("{target}.lora_a"),
             f32_tensor(
@@ -419,8 +386,7 @@ fn build_folded_test_adapters(
         tensors: mr_tensors,
         identity: "mr-folded-test".to_owned(),
     };
-    let mr = MultiRankAdapter::from_model(model, &mr_model, MultiRankPolicy::AnyLinear)?;
-    Ok((r1, mr))
+    MultiRankAdapter::from_model(model, &mr_model, MultiRankPolicy::AnyLinear)
 }
 
 fn configure_folded(
@@ -432,13 +398,12 @@ fn configure_folded(
     with_stacked_adapters: bool,
 ) -> Result<Qwen35> {
     let mut decoder = if with_stacked_adapters {
-        let (r1, mr) = build_folded_test_adapters(&model, cfg)?;
+        let mr = build_folded_test_adapters(&model, cfg)?;
         Qwen35::with_adapters_and_kv(
             model,
             cfg.context,
             64 * 1024 * 1024,
             MatvecBackend::Scalar,
-            Some((r1, 0.75)),
             Some((mr, 0.5)),
             kv_policy,
         )?
@@ -878,64 +843,10 @@ fn four_layer_hybrid_model(cfg: &HybridConfig, arithmetic: Arithmetic) -> Model 
     model
 }
 
-fn build_folded_rank_one_adapter(model: &Model, cfg: &HybridConfig) -> Result<RankOneAdapter> {
-    let val_w = cfg.ssm_values * cfg.ssm_head;
-    let attn_out_in = cfg.heads * cfg.head;
-    let mut r1_tensors = BTreeMap::new();
-    for (idx, (target, in_f, out_f)) in [
-        ("blk.0.ffn_down.weight", cfg.ffn, cfg.embedding),
-        ("blk.0.ssm_out.weight", val_w, cfg.embedding),
-        ("blk.1.ffn_down.weight", cfg.ffn, cfg.embedding),
-        ("blk.2.ssm_out.weight", val_w, cfg.embedding),
-        ("blk.3.ffn_down.weight", cfg.ffn, cfg.embedding),
-        ("blk.3.attn_output.weight", attn_out_in, cfg.embedding),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        r1_tensors.insert(
-            format!("{target}.lora_a"),
-            f32_tensor(
-                &format!("{target}.lora_a"),
-                &[in_f, 1],
-                &pattern(in_f, 21 + idx, 0.125),
-            ),
-        );
-        r1_tensors.insert(
-            format!("{target}.lora_b"),
-            f32_tensor(
-                &format!("{target}.lora_b"),
-                &[1, out_f],
-                &pattern(out_f, 29 + idx, 0.125),
-            ),
-        );
-    }
-    RankOneAdapter::from_model(
-        Model {
-            metadata: BTreeMap::from([
-                (
-                    "general.architecture".to_owned(),
-                    MetadataValue::from("qwen35"),
-                ),
-                ("general.type".to_owned(), MetadataValue::from("adapter")),
-                ("adapter.type".into(), MetadataValue::from("lora")),
-                (
-                    "adapter.lora_alpha".to_owned(),
-                    MetadataValue::from(1.0_f32),
-                ),
-            ]),
-            tensors: r1_tensors,
-            identity: "r1-folded-heterogeneous".to_owned(),
-        },
-        model,
-    )
-}
-
 fn build_sparse_heterogeneous_folded_adapters(
     model: &Model,
     cfg: &HybridConfig,
-) -> Result<(RankOneAdapter, MultiRankAdapter)> {
-    let r1 = build_folded_rank_one_adapter(model, cfg)?;
+) -> Result<MultiRankAdapter> {
     let val_w = cfg.ssm_values * cfg.ssm_head;
     let conv_w = 2 * cfg.ssm_keys * cfg.ssm_head + val_w;
     let q_gate_w = cfg.heads * cfg.head * 2;
@@ -999,7 +910,7 @@ fn build_sparse_heterogeneous_folded_adapters(
     )?;
     assert_eq!(mr.max_rank(), 4);
     assert!(!mr.has_target("blk.1.ffn_down.weight"));
-    Ok((r1, mr))
+    Ok(mr)
 }
 
 fn configure_four_layer_folded(
@@ -1009,13 +920,12 @@ fn configure_four_layer_folded(
     mr_scale: Option<f32>,
 ) -> Result<Qwen35> {
     let model = four_layer_hybrid_model(cfg, arithmetic);
-    let (r1, mr) = build_sparse_heterogeneous_folded_adapters(&model, cfg)?;
+    let mr = build_sparse_heterogeneous_folded_adapters(&model, cfg)?;
     let mut decoder = Qwen35::with_adapters_and_kv(
         model,
         cfg.context,
         64 * 1024 * 1024,
         MatvecBackend::Scalar,
-        Some((r1, 1.3)),
         mr_scale.map(|scale| (mr, scale)),
         KvCachePolicy::Rotated4FittedKv,
     )?;
@@ -1412,9 +1322,9 @@ fn bonsai25_f32_ssm_gates_and_stacked_adapters_preserve_prefill_decode_and_folde
         assert_eq!(seq_model.tensors["blk.0.ssm_alpha.weight"].kind, 0);
         assert_eq!(seq_model.tensors["blk.0.ssm_beta.weight"].kind, 0);
 
-        let (r1_seq, mr_seq) = build_folded_test_adapters(&seq_model, &cfg)?;
-        let (r1_tile, mr_tile) = build_folded_test_adapters(&tiled_model, &cfg)?;
-        let (r1_wy, mr_wy) = build_folded_test_adapters(&wy_model, &cfg)?;
+        let mr_seq = build_folded_test_adapters(&seq_model, &cfg)?;
+        let mr_tile = build_folded_test_adapters(&tiled_model, &cfg)?;
+        let mr_wy = build_folded_test_adapters(&wy_model, &cfg)?;
 
         let mut seq = Qwen35::with_state_budget_and_adapters_scope(
             seq_model,
@@ -1422,7 +1332,6 @@ fn bonsai25_f32_ssm_gates_and_stacked_adapters_preserve_prefill_decode_and_folde
             64 * 1024 * 1024,
             MatvecBackend::Scalar,
             KvCachePolicy::F16,
-            Some((r1_seq, 1.3)),
             Some((mr_seq, 0.75)),
         )?;
 
@@ -1432,7 +1341,6 @@ fn bonsai25_f32_ssm_gates_and_stacked_adapters_preserve_prefill_decode_and_folde
             64 * 1024 * 1024,
             MatvecBackend::Scalar,
             KvCachePolicy::F16,
-            Some((r1_tile, 1.3)),
             Some((mr_tile, 0.75)),
         )?;
         let prefill_scratch = tiled.tiled_prefill_scratch_bytes(8)?;
@@ -1446,7 +1354,6 @@ fn bonsai25_f32_ssm_gates_and_stacked_adapters_preserve_prefill_decode_and_folde
             64 * 1024 * 1024,
             MatvecBackend::Scalar,
             KvCachePolicy::F16,
-            Some((r1_wy, 1.3)),
             Some((mr_wy, 0.75)),
         )?;
         let wy_prefill = wy.tiled_prefill_scratch_bytes(8)?;

@@ -22,7 +22,7 @@ use bonsai_gguf::MetadataValueRef;
 use bonsai_gguf::{MetadataArray, MetadataValue};
 use bonsai_prism_runtime::graph::{Qwen35, StateComponent};
 use bonsai_prism_runtime::kernels::{MatvecBackend, MatvecFallbackReason, round_f16};
-use bonsai_prism_runtime::model::lora::RankOneAdapter;
+use bonsai_prism_runtime::model::lora::{MultiRankAdapter, MultiRankPolicy};
 use bonsai_prism_runtime::model::{Model, Tensor};
 use bonsai_prism_runtime::runtime::{
     Cancellation, Generation, Limits, Prefill, PromptReuse, Runtime,
@@ -129,25 +129,14 @@ fn fixture(recurrent: bool) -> Model {
     }
 }
 
-fn rank_one_factors(base: &Model, targets: &[&str], value: f32) -> Model {
+fn lora_factors(base: &Model, targets: &[&str], value: f32) -> Model {
     let mut tensors = BTreeMap::new();
     for &target in targets {
         let dimensions = &base.tensors[target].dimensions;
         let input = dimensions[0];
         let output = dimensions[1];
-        let a_shape = if target == "token_embd.weight" {
-            [1, output]
-        } else {
-            [input, 1]
-        };
-        let b_shape = [
-            1,
-            if target == "token_embd.weight" {
-                input
-            } else {
-                output
-            },
-        ];
+        let a_shape = [input, 1];
+        let b_shape = [1, output];
         for (suffix, shape) in [("lora_a", a_shape), ("lora_b", b_shape)] {
             let name = format!("{target}.{suffix}");
             tensors.insert(
@@ -159,13 +148,24 @@ fn rank_one_factors(base: &Model, targets: &[&str], value: f32) -> Model {
     Model {
         metadata: metadata!({"general.architecture":"qwen35", "general.type":"adapter", "adapter.type":"lora", "adapter.lora_alpha":1.0_f32}),
         tensors,
-        identity: "rank-one-fixture".to_owned(),
+        identity: "multi-rank-fixture".to_owned(),
     }
 }
 
-fn rank_one_graph(base: Model, factors: Model, scale: f32) -> Result<Qwen35> {
-    let adapter = RankOneAdapter::from_model(factors, &base)?;
-    Qwen35::with_rank_one_adapter(base, 16, 1024 * 1024, MatvecBackend::Scalar, adapter, scale)
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Takes ownership of the synthetic adapter fixture alongside the base model."
+)]
+fn lora_graph(base: Model, factors: Model, scale: f32) -> Result<Qwen35> {
+    let adapter = MultiRankAdapter::from_model(&base, &factors, MultiRankPolicy::AnyLinear)?;
+    Qwen35::with_adapters_and_kv(
+        base,
+        16,
+        1024 * 1024,
+        MatvecBackend::Scalar,
+        Some((adapter, scale)),
+        bonsai_prism_runtime::graph::KvCachePolicy::F16,
+    )
 }
 
 fn graph_bits(graph: &Qwen35) -> Result<Vec<u32>> {
@@ -178,22 +178,18 @@ fn graph_bits(graph: &Qwen35) -> Result<Vec<u32>> {
 }
 
 #[test]
-fn rank_one_zero_scale_preserves_full_and_recurrent_logits_and_state_bits() -> Result<()> {
+fn multi_rank_zero_scale_preserves_full_and_recurrent_logits_and_state_bits() -> Result<()> {
     for recurrent in [false, true] {
         for scale in [0.0, -0.0] {
             let target = if recurrent {
-                "blk.0.ssm_out.weight"
+                "blk.0.attn_gate.weight"
             } else {
                 "blk.0.attn_output.weight"
             };
             let base = fixture(recurrent);
             // These finite factors overflow if either correction product runs.
-            let factors = rank_one_factors(
-                &base,
-                &["token_embd.weight", "blk.0.ffn_down.weight", target],
-                f32::MAX,
-            );
-            let mut actual = rank_one_graph(base, factors, scale)?;
+            let factors = lora_factors(&base, &["blk.0.ffn_down.weight", target], f32::MAX);
+            let mut actual = lora_graph(base, factors, scale)?;
             let mut expected = Qwen35::new(fixture(recurrent), 16)?;
             for token in [0, 1, 1, 0] {
                 assert_eq!(
@@ -240,10 +236,10 @@ fn writer_transform(base: &mut Model, target: &str, inverse_embedding: bool) {
 }
 
 #[test]
-fn rank_one_residual_writer_uses_unrotated_activations() -> Result<()> {
+fn multi_rank_residual_writer_uses_unrotated_activations() -> Result<()> {
     for recurrent in [false, true] {
         let target = if recurrent {
-            "blk.0.ssm_out.weight"
+            "blk.0.attn_gate.weight"
         } else {
             "blk.0.attn_output.weight"
         };
@@ -251,7 +247,7 @@ fn rank_one_residual_writer_uses_unrotated_activations() -> Result<()> {
         base.tensors
             .insert(target.to_owned(), weight(target, &[2, 2], &[0.0; 4]));
         writer_transform(&mut base, target, false);
-        let mut factors = rank_one_factors(&base, &[target], 0.0);
+        let mut factors = lora_factors(&base, &[target], 0.0);
         let a_name = format!("{target}.lora_a");
         let b_name = format!("{target}.lora_b");
         factors
@@ -260,7 +256,7 @@ fn rank_one_residual_writer_uses_unrotated_activations() -> Result<()> {
         factors
             .tensors
             .insert(b_name.clone(), weight(&b_name, &[1, 2], &[0.0, 1.0]));
-        let mut actual = rank_one_graph(base, factors, 1.0)?;
+        let mut actual = lora_graph(base, factors, 1.0)?;
         let mut control = fixture(recurrent);
         control.tensors.insert(
             target.to_owned(),
@@ -276,70 +272,10 @@ fn rank_one_residual_writer_uses_unrotated_activations() -> Result<()> {
 }
 
 #[test]
-fn rank_one_embedding_correction_follows_inverse_transform() -> Result<()> {
-    let mut base = fixture(false);
-    writer_transform(&mut base, "output.weight", true);
-    let mut factors = rank_one_factors(&base, &["token_embd.weight"], 0.0);
-    factors.tensors.insert(
-        "token_embd.weight.lora_a".into(),
-        weight("token_embd.weight.lora_a", &[1, 2], &[0.5, -0.25]),
-    );
-    factors.tensors.insert(
-        "token_embd.weight.lora_b".into(),
-        weight("token_embd.weight.lora_b", &[1, 2], &[0.25, 1.0]),
-    );
-    // Put the independently corrected primal rows into a plain embedding;
-    // output.weight's transform remains identical in both graphs.
-    let mut control = fixture(false);
-    writer_transform(&mut control, "output.weight", false);
-    let half = 1.0_f32 / 2.0_f32.sqrt();
-    control.tensors.insert(
-        "token_embd.weight".into(),
-        weight(
-            "token_embd.weight",
-            &[2, 2],
-            &[-half + 0.125, half + 0.5, -half - 0.0625, -half - 0.25],
-        ),
-    );
-    let mut actual = rank_one_graph(base, factors, 1.0)?;
-    let mut expected = Qwen35::new(control, 16)?;
-    for token in [0, 1, 1, 0] {
-        assert_eq!(actual.evaluate(token)?, expected.evaluate(token)?);
-    }
-    Ok(())
-}
-
-#[test]
-fn rank_one_embedding_admission_rejects_tied_output_head_at_every_scale() -> Result<()> {
-    for scale in [0.0, 1.3] {
-        let mut tied = fixture(false);
-        tied.tensors.remove("output.weight");
-        let factors = rank_one_factors(&tied, &["token_embd.weight"], 0.125);
-        let Err(error) = rank_one_graph(tied, factors, scale) else {
-            return Err("tied-output embedding adapter was admitted".into());
-        };
-        assert_eq!(
-            error.to_string(),
-            "rank-one embedding adapter requires a separate output head"
-        );
-
-        let separate = fixture(false);
-        let factors = rank_one_factors(&separate, &["token_embd.weight"], 0.125);
-        rank_one_graph(separate, factors, scale)?.evaluate(0)?;
-
-        let mut tied = fixture(false);
-        tied.tensors.remove("output.weight");
-        let factors = rank_one_factors(&tied, &["blk.0.ffn_down.weight"], 0.125);
-        rank_one_graph(tied, factors, scale)?.evaluate(0)?;
-    }
-    Ok(())
-}
-
-#[test]
-fn rank_one_admission_rejects_factor_schema_and_base_drift() -> Result<()> {
+fn multi_rank_admission_rejects_factor_schema_and_base_drift() -> Result<()> {
     for invalid in 0..9 {
         let base = fixture(false);
-        let mut factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
+        let mut factors = lora_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
         let name = "blk.0.ffn_down.weight.lora_a";
         match invalid {
             0 => {
@@ -361,65 +297,70 @@ fn rank_one_admission_rejects_factor_schema_and_base_drift() -> Result<()> {
                 factors.tensors.remove("blk.0.ffn_down.weight.lora_b");
             }
             4 => {
-                factors.tensors.get_mut(name).ok_or("missing factor")?.kind = 1;
+                factors.tensors.get_mut(name).ok_or("missing factor")?.kind = 2;
             }
             5 => {
                 factors
                     .tensors
                     .get_mut(name)
                     .ok_or("missing factor")?
-                    .dimensions = vec![2, 2];
+                    .dimensions = vec![3, 1];
             }
             6 => {
                 factors.tensors.get_mut(name).ok_or("missing factor")?.data =
                     Arc::<[u8]>::from(f32::INFINITY.to_le_bytes()).into();
             }
             7 => {
-                factors.tensors.get_mut(name).ok_or("missing factor")?.name = "alias".into();
+                let mut renamed = factors.tensors.remove(name).ok_or("missing factor")?;
+                renamed.name = "alias".into();
+                factors.tensors.insert("alias".into(), renamed);
             }
             _ => {
-                factors.identity.clear();
+                factors
+                    .metadata
+                    .insert("general.type".into(), metadata!("model"));
             }
         }
-        assert!(RankOneAdapter::from_model(factors, &base).is_err());
+        assert!(MultiRankAdapter::from_model(&base, &factors, MultiRankPolicy::AnyLinear).is_err());
     }
     for scale in [f32::NAN, f32::INFINITY, -0.1, 2.1] {
         let base = fixture(false);
-        let factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
-        assert!(rank_one_graph(base, factors, scale).is_err());
+        let factors = lora_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
+        assert!(lora_graph(base, factors, scale).is_err());
     }
     let base = fixture(false);
-    let adapter = RankOneAdapter::from_model(
-        rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25),
+    let adapter = MultiRankAdapter::from_model(
         &base,
+        &lora_factors(&base, &["blk.0.ffn_down.weight"], 0.25),
+        MultiRankPolicy::AnyLinear,
     )?;
     let mut other = fixture(false);
     other.identity = "other".into();
     assert!(
-        Qwen35::with_rank_one_adapter(other, 16, 1024 * 1024, MatvecBackend::Scalar, adapter, 1.0)
-            .is_err()
+        Qwen35::with_adapters_and_kv(
+            other,
+            16,
+            1024 * 1024,
+            MatvecBackend::Scalar,
+            Some((adapter, 1.0)),
+            bonsai_prism_runtime::graph::KvCachePolicy::F16,
+        )
+        .is_err()
     );
     Ok(())
 }
 
 #[test]
-fn rank_one_checkpoint_and_failed_generation_preserve_complete_state() -> Result<()> {
+fn multi_rank_checkpoint_and_failed_generation_preserve_complete_state() -> Result<()> {
     let base = fixture(true);
-    let factors = rank_one_factors(
+    let factors = lora_factors(
         &base,
-        &[
-            "token_embd.weight",
-            "blk.0.ssm_out.weight",
-            "blk.0.ffn_down.weight",
-        ],
+        &["blk.0.attn_gate.weight", "blk.0.ffn_down.weight"],
         0.125,
     );
-    let mut graph = rank_one_graph(base, factors, 1.3)?;
+    let mut graph = lora_graph(base, factors, 1.3)?;
     assert!(
-        graph
-            .identity()
-            .contains(":rank-one-lora-v1:rank-one-fixture:sha256=")
-            && graph.identity().contains(":3fa66666")
+        graph.identity().contains(":multi-rank-lora-v1:") && graph.identity().contains(":3fa66666")
     );
     graph.evaluate(0)?;
     let checkpoint = graph.checkpoint()?;
@@ -454,15 +395,15 @@ fn rank_one_checkpoint_and_failed_generation_preserve_complete_state() -> Result
 }
 
 #[test]
-fn rank_one_writer_overflow_restores_previous_committed_request() -> Result<()> {
+fn multi_rank_writer_overflow_restores_previous_committed_request() -> Result<()> {
     let base = fixture(false);
     let target = "blk.0.attn_output.weight";
-    let mut factors = rank_one_factors(&base, &[target], f32::MAX);
+    let mut factors = lora_factors(&base, &[target], f32::MAX);
     let a_name = format!("{target}.lora_a");
     factors
         .tensors
         .insert(a_name.clone(), weight(&a_name, &[2, 1], &[0.0, f32::MAX]));
-    let graph = rank_one_graph(base, factors, 1.3)?;
+    let graph = lora_graph(base, factors, 1.3)?;
     let mut runtime = Runtime::new(
         graph,
         Limits {
@@ -1179,8 +1120,8 @@ fn pinned_arithmetic_requires_exact_swift_identity_and_survives_recovery() -> Re
     // qualification. The separate verified-loader tests bind production
     // identities to complete file hashes, and native captures own arithmetic.
     for identity in [
-        bonsai_prism_runtime::model::swift::MODEL_SHA256,
-        bonsai_prism_runtime::model::swift::REPACKED_PTQ1_SHA256,
+        bonsai_prism_runtime::model::swift::BONSAI_2_5_PQ2_SHA256,
+        bonsai_prism_runtime::model::swift::BONSAI_2_5_PTQ1_SHA256,
     ] {
         let mut model = preparation_fixture(true, true);
         model.identity = identity.to_owned();
@@ -1673,8 +1614,8 @@ fn empty_checkpoint_restores_hybrid_pages_and_preserves_nonempty_snapshot() -> R
 fn empty_checkpoint_rejects_foreign_and_stale_adapter_provenance() -> Result<()> {
     let graph = || {
         let base = fixture(true);
-        let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
-        rank_one_graph(base, factors, 1.3)
+        let factors = lora_factors(&base, &["blk.0.attn_gate.weight"], 0.125);
+        lora_graph(base, factors, 1.3)
     };
     let mut decoder = graph()?;
     let empty = decoder.checkpoint()?;
@@ -1685,7 +1626,7 @@ fn empty_checkpoint_rejects_foreign_and_stale_adapter_provenance() -> Result<()>
     assert_eq!(graph_bits(&foreign)?, before);
     // Even restoring the original scale cannot renew an old empty snapshot.
     for scale in [0.0, 1.3] {
-        decoder.reset_with_adapter_scale(scale)?;
+        decoder.reset_with_adapter_scales(Some(scale))?;
         decoder.ingest(0)?;
         let before = graph_bits(&decoder)?;
         assert!(decoder.restore(&empty).is_err());
@@ -2445,36 +2386,12 @@ fn grouped_gdn_value_rotation_matches_unfolded_output_weights() -> Result<()> {
 }
 
 #[test]
-fn rank_one_grouped_ssm_branch_retains_original_untiled_input_order() -> Result<()> {
-    let (mut control, mut base) = grouped_gdn_models();
-    let target = "blk.0.ssm_out.weight";
-    base.tensors
-        .insert(target.into(), weight(target, &[8, 2], &[0.0; 16]));
-    let a = [1.0, 0.0, 0.0, -0.25, 0.0, 0.5, 0.0, 0.0];
-    let b = [0.5, -0.25];
-    let mut factors = rank_one_factors(&base, &[target], 0.0);
-    let a_name = format!("{target}.lora_a");
-    let b_name = format!("{target}.lora_b");
-    factors
-        .tensors
-        .insert(a_name.clone(), weight(&a_name, &[8, 1], &a));
-    factors
-        .tensors
-        .insert(b_name.clone(), weight(&b_name, &[1, 2], &b));
-    let matrix: Vec<_> = b
-        .iter()
-        .flat_map(|b| a.iter().map(move |a| a * b))
-        .collect();
-    control
-        .tensors
-        .insert(target.into(), weight(target, &[8, 2], &matrix));
-    let mut actual = rank_one_graph(base, factors, 1.0)?;
-    let mut expected = Qwen35::new(control, 16)?;
-    for token in [0, 1, 0, 1] {
-        assert_eq!(actual.evaluate(token)?, expected.evaluate(token)?);
-        assert_eq!(graph_bits(&actual)?, graph_bits(&expected)?);
+fn multi_rank_rejects_ssm_out_even_with_grouped_gdn() {
+    let (_control, base) = grouped_gdn_models();
+    let factors = lora_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
+    for policy in [MultiRankPolicy::AnyLinear, MultiRankPolicy::NpuFriendly] {
+        assert!(MultiRankAdapter::from_model(&base, &factors, policy).is_err());
     }
-    Ok(())
 }
 
 #[cfg(feature = "cli")]
@@ -3156,32 +3073,33 @@ fn native_driver_rejects_text_vocabulary_mismatch_before_emitting() -> Result<()
 }
 
 #[test]
-fn rank_one_scale_reset_clears_live_state_and_invalidates_same_scale_and_change_back_checkpoints()
+fn multi_rank_scale_reset_clears_live_state_and_invalidates_same_scale_and_change_back_checkpoints()
 -> Result<()> {
     for recurrent in [false, true] {
         let target = if recurrent {
-            "blk.0.ssm_out.weight"
+            "blk.0.attn_gate.weight"
         } else {
             "blk.0.attn_output.weight"
         };
         let base = fixture(recurrent);
-        let factors = rank_one_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
-        let mut graph = rank_one_graph(base, factors, 1.3)?;
+        let factors = lora_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
+        let mut graph = lora_graph(base, factors, 1.3)?;
         graph.evaluate(0)?;
         let first = graph.checkpoint()?;
         for scale in [1.3, 0.0, -0.0, 2.0, 1.3] {
             let previous = graph.checkpoint()?;
-            graph.reset_with_adapter_scale(scale)?;
+            graph.reset_with_adapter_scales(Some(scale))?;
+            let normalized = MultiRankAdapter::normalize_scale(scale);
             assert_eq!(
-                graph.adapter_scale().map(f32::to_bits),
-                Some(scale.to_bits())
+                graph.multi_rank_adapter_scale().map(f32::to_bits),
+                Some(normalized.to_bits())
             );
             assert!(graph.restore(&previous).is_err());
             assert!(graph.restore(&first).is_err());
             assert!(graph_bits(&graph)?.iter().all(|bits| *bits == 0));
             let base = fixture(recurrent);
-            let factors = rank_one_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
-            let mut fresh = rank_one_graph(base, factors, scale)?;
+            let factors = lora_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
+            let mut fresh = lora_graph(base, factors, scale)?;
             assert_eq!(graph.identity(), fresh.identity());
             assert_eq!(graph.evaluate(1)?, fresh.evaluate(1)?);
             assert_eq!(graph_bits(&graph)?, graph_bits(&fresh)?);
@@ -3191,12 +3109,12 @@ fn rank_one_scale_reset_clears_live_state_and_invalidates_same_scale_and_change_
 }
 
 #[test]
-fn rank_one_runtime_scale_reset_drops_prefixes_and_retains_cancel_and_failure_rollback()
+fn multi_rank_runtime_scale_reset_drops_prefixes_and_retains_cancel_and_failure_rollback()
 -> Result<()> {
     let base = fixture(true);
-    let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
+    let factors = lora_factors(&base, &["blk.0.attn_gate.weight"], 0.125);
     let mut runtime = Runtime::new(
-        rank_one_graph(base, factors, 1.3)?,
+        lora_graph(base, factors, 1.3)?,
         Limits {
             context_tokens: 16,
             checkpoints: 2,
@@ -3210,7 +3128,7 @@ fn rank_one_runtime_scale_reset_drops_prefixes_and_retains_cancel_and_failure_ro
     runtime.generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?;
     assert_ne!(runtime.tokens(), &[0_u32; 0]);
     assert_eq!(runtime.checkpoint_count(), 1);
-    runtime.reset_with_adapter_scale(0.0)?;
+    runtime.reset_with_adapter_scales(Some(0.0))?;
     assert_eq!(runtime.tokens(), &[0_u32; 0]);
     assert_eq!(runtime.checkpoint_count(), 0);
     let empty = graph_bits(runtime.decoder())?;
@@ -3234,21 +3152,21 @@ fn rank_one_runtime_scale_reset_drops_prefixes_and_retains_cancel_and_failure_ro
     assert!(!runtime.is_faulted());
     let completion = runtime.generate(&[1], &options, &Cancellation::default(), |_| Ok(()))?;
     assert_eq!(completion.reused_tokens, 0);
-    assert_eq!(runtime.decoder().adapter_scale(), Some(0.0));
+    assert_eq!(runtime.decoder().multi_rank_adapter_scale(), Some(0.0));
     Ok(())
 }
 
 #[test]
-fn rank_one_invalid_scale_or_absent_adapter_rejects_before_mutation() -> Result<()> {
+fn multi_rank_invalid_scale_or_absent_adapter_rejects_before_mutation() -> Result<()> {
     let base = fixture(true);
-    let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
-    let mut graph = rank_one_graph(base, factors, 1.3)?;
+    let factors = lora_factors(&base, &["blk.0.attn_gate.weight"], 0.125);
+    let mut graph = lora_graph(base, factors, 1.3)?;
     graph.evaluate(0)?;
     let before = graph_bits(&graph)?;
     let identity = graph.identity().to_owned();
     let checkpoint = graph.checkpoint()?;
     for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 2.01] {
-        assert!(graph.reset_with_adapter_scale(scale).is_err());
+        assert!(graph.reset_with_adapter_scales(Some(scale)).is_err());
         assert_eq!(graph.identity(), identity);
         assert_eq!(graph_bits(&graph)?, before);
         graph.restore(&checkpoint)?;
@@ -3256,8 +3174,8 @@ fn rank_one_invalid_scale_or_absent_adapter_rejects_before_mutation() -> Result<
     for adapter in [false, true] {
         let base = fixture(true);
         let graph = if adapter {
-            let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
-            rank_one_graph(base, factors, 1.3)?
+            let factors = lora_factors(&base, &["blk.0.attn_gate.weight"], 0.125);
+            lora_graph(base, factors, 1.3)?
         } else {
             Qwen35::new(base, 16)?
         };
@@ -3282,7 +3200,7 @@ fn rank_one_invalid_scale_or_absent_adapter_rejects_before_mutation() -> Result<
         let bits = graph_bits(runtime.decoder())?;
         assert!(
             runtime
-                .reset_with_adapter_scale(if adapter { f32::NAN } else { 0.0 })
+                .reset_with_adapter_scales(Some(if adapter { f32::NAN } else { 0.0 }))
                 .is_err()
         );
         assert_eq!(runtime.tokens(), tokens);
@@ -3297,12 +3215,12 @@ fn profile_runtime(recurrent: bool, scale: Option<f32>) -> Result<Runtime<Qwen35
     let base = fixture(recurrent);
     let decoder = if let Some(scale) = scale {
         let target = if recurrent {
-            "blk.0.ssm_out.weight"
+            "blk.0.attn_gate.weight"
         } else {
             "blk.0.attn_output.weight"
         };
-        let factors = rank_one_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
-        rank_one_graph(base, factors, scale)?
+        let factors = lora_factors(&base, &[target, "blk.0.ffn_down.weight"], 0.125);
+        lora_graph(base, factors, scale)?
     } else {
         Qwen35::new(base, 16)?
     };
@@ -3465,11 +3383,12 @@ fn profile_reuse_preserves_only_exact_scale_bits_and_explicit_reset_boundary() -
     for recurrent in [false, true] {
         let mut runtime = profile_runtime(recurrent, Some(1.3))?;
         for scale in [1.3_f32, 1.3, 0.0, -0.0, 2.0, 1.3] {
-            let old_scale = runtime.decoder().adapter_scale();
+            let old_scale = runtime.decoder().multi_rank_adapter_scale();
+            let normalized = MultiRankAdapter::normalize_scale(scale);
             let tokens = runtime.tokens().to_vec();
             let bits = graph_bits(runtime.decoder())?;
             runtime.prepare_profile_request(Some(scale), PromptReuse::Latest)?;
-            if old_scale.map(f32::to_bits) == Some(scale.to_bits()) {
+            if old_scale.map(f32::to_bits) == Some(normalized.to_bits()) {
                 assert_eq!(runtime.tokens(), tokens);
                 assert_eq!(graph_bits(runtime.decoder())?, bits);
             } else {
@@ -3477,8 +3396,11 @@ fn profile_reuse_preserves_only_exact_scale_bits_and_explicit_reset_boundary() -
                 assert!(graph_bits(runtime.decoder())?.iter().all(|&bits| bits == 0));
             }
             assert_eq!(
-                runtime.decoder().adapter_scale().map(f32::to_bits),
-                Some(scale.to_bits())
+                runtime
+                    .decoder()
+                    .multi_rank_adapter_scale()
+                    .map(f32::to_bits),
+                Some(normalized.to_bits())
             );
             runtime.generate(&[0], &options, &Cancellation::default(), |_| Ok(()))?;
             let mut reference = profile_runtime(recurrent, Some(scale))?;

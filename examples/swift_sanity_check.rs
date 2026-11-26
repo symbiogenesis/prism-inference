@@ -16,10 +16,7 @@ use bonsai_prism_runtime::{
     Result,
     graph::KvCachePolicy,
     kernels::{MatvecBackend, RowParallelism},
-    model::{
-        lora::{EditedAdapter, SWIFT_ADAPTER_BYTES, SWIFT_ADAPTER_SHA256},
-        swift::Representation,
-    },
+    model::swift::Representation,
     runtime::{Cancellation, Finish, GenerationPhase, GenerationTimings, PromptReuse},
     swift_session::{SwiftSession, TextEvent},
 };
@@ -95,32 +92,18 @@ fn lowercase_hex(value: &str, length: usize) -> bool {
 }
 
 impl Request {
-    fn adapter_sha256(&self) -> Option<&str> {
-        if self.condition == "edited" {
-            self.edited_adapter_sha256.as_deref()
-        } else {
-            self.adapter_path.as_ref().map(|_| SWIFT_ADAPTER_SHA256)
-        }
-    }
-
     fn validate(&self) -> Result<()> {
-        let edited = self.condition == "edited";
         if !self.model_path.is_absolute()
             || !self.output_path.is_absolute()
             || self
                 .adapter_path
                 .as_ref()
                 .is_some_and(|path| !path.is_absolute())
-            || !matches!(self.condition.as_str(), "standard" | "none" | "edited")
-            || (self.condition != "none") != self.adapter_path.is_some()
+            || self.condition != "none"
+            || self.adapter_path.is_some()
             || !lowercase_hex(&self.source_commit, 40)
-            || self.edited_adapter_sha256.is_some() != edited
-            || self.edited_adapter_bytes.is_some() != edited
-            || (edited
-                && (self.edited_adapter_bytes != Some(SWIFT_ADAPTER_BYTES)
-                    || self.edited_adapter_sha256.as_deref().is_none_or(|hash| {
-                        !lowercase_hex(hash, 64) || hash == SWIFT_ADAPTER_SHA256
-                    })))
+            || self.edited_adapter_sha256.is_some()
+            || self.edited_adapter_bytes.is_some()
         {
             return Err(reject(
                 "Invalid fixed factual smoke profile or source declaration.",
@@ -146,72 +129,31 @@ fn timing_record(timings: &GenerationTimings) -> Value {
         "committedGeneratedTokens":timings.committed_generated_tokens})
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "One fixed arm retains loading, all four answers and cleanup in one transaction."
-)]
 fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<()> {
     record["stage"] = json!("executable-identity");
     record["executableSha256"] = json!(hash_file(&std::env::current_exe()?)?);
     check(deadline)?;
     record["stage"] = json!("model-load");
     let started = Instant::now();
-    let session = if request.condition == "edited" {
-        SwiftSession::load_edited_profile_with_context(
-            &request.model_path,
-            Representation::Pq2,
-            EditedAdapter {
-                path: request
-                    .adapter_path
-                    .as_deref()
-                    .ok_or_else(|| reject("Missing edited adapter."))?,
-                bytes: request
-                    .edited_adapter_bytes
-                    .ok_or_else(|| reject("Missing edited adapter length."))?,
-                sha256: request
-                    .edited_adapter_sha256
-                    .as_deref()
-                    .ok_or_else(|| reject("Missing edited adapter digest."))?,
-            },
-            MatvecBackend::ExperimentalNeon,
-            42,
-            RowParallelism::new(4)?,
-            KvCachePolicy::Rotated4,
-            256,
-        )
-    } else {
-        SwiftSession::load_profile_with_context(
-            &request.model_path,
-            Representation::Pq2,
-            request.adapter_path.as_deref(),
-            MatvecBackend::ExperimentalNeon,
-            42,
-            RowParallelism::new(4)?,
-            KvCachePolicy::Rotated4,
-            256,
-        )
-    };
+    let session = SwiftSession::load_profile_with_context(
+        &request.model_path,
+        Representation::Bonsai25Pq2,
+        MatvecBackend::ExperimentalNeon,
+        42,
+        RowParallelism::new(4)?,
+        KvCachePolicy::Rotated4,
+        256,
+    );
     record["loadMilliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
     let mut session = session?;
     session.set_projection_executor(None);
-    if session.row_workers() != 4
-        || session.prompt_reuse() != PromptReuse::Disabled
-        || session.adapter_identity() != request.adapter_sha256()
-    {
+    if session.row_workers() != 4 || session.prompt_reuse() != PromptReuse::Disabled {
         return Err(reject(
             "The factual smoke session disagrees with its fixed profile.",
         ));
     }
     record["modelLoaded"] = json!(true);
-    record["adapterStorage"] = session.adapter_storage().map_or(Value::Null, |storage| json!({
-        "linearABytes":storage.linear_a_bytes, "embeddingABytes":storage.embedding_a_bytes,
-        "uniqueBBytes":storage.unique_b_bytes, "indexBytes":storage.index_bytes,
-        "totalPayloadBytes":storage.total_payload_bytes,
-        "linearACoefficients":storage.linear_a_coefficients,
-        "storedLinearACoefficients":storage.stored_linear_a_coefficients,
-        "sparseSites":storage.sparse_sites,
-        "scope":"Retained coefficient/index allocation capacity, excluding allocator/container overhead and scratch."
-    }));
+    record["adapterStorage"] = Value::Null;
     record["graphIdentity"] = json!(session.decoder_identity());
     for (id, prompt, expected) in CASES {
         check(deadline)?;
@@ -219,12 +161,8 @@ fn execute(request: &Request, deadline: Instant, record: &mut Value) -> Result<(
         session.reset()?;
         let messages = json!([{"role":"user", "content":prompt}]);
         let started = Instant::now();
-        let prepared = session.prepare_with_settings(
-            &messages,
-            OUTPUT_TOKENS,
-            false,
-            request.adapter_path.as_ref().map(|_| 1.3),
-        )?;
+        let prepared =
+            session.prepare_with_adapter_scales(&messages, OUTPUT_TOKENS, false, None)?;
         if prepared.prompt_tokens() > 128 {
             return Err(reject("The fixed prompt exceeded 128 tokens."));
         }
@@ -327,11 +265,11 @@ fn run() -> Result<()> {
         .open(&request.output_path)?;
     let mut record = json!({"schemaVersion":2, "kind":"swift-fixed-factual-smoke",
         "sourceCommitDeclaration":request.source_commit, "condition":request.condition,
-        "modelSha256":Representation::Pq2.model_sha256(), "weightRepresentation":"PQ2_0",
-        "adapterSha256":request.adapter_sha256(),
-        "adapterSourceSha256":if request.condition == "edited" {Some(SWIFT_ADAPTER_SHA256)} else {None},
-        "adapterArithmetic":if request.condition == "edited" {"edited-sparse-a-u16-f64-v1"} else {"native-dense"},
-        "adapterScaleBits":if request.adapter_path.is_some() {"3fa66666"} else {"00000000"},
+        "modelSha256":Representation::Bonsai25Pq2.model_sha256(), "weightRepresentation":"Bonsai-2.5-PQ2_0",
+        "adapterSha256":Value::Null,
+        "adapterSourceSha256":Value::Null,
+        "adapterArithmetic":"native-dense",
+        "adapterScaleBits":"00000000",
         "rowWorkers":4, "backend":"experimental-neon-cpu", "kvCache":"rsq4",
         "contextTokens":256, "outputTokensPerCase":OUTPUT_TOKENS, "seed":42,
         "thinking":false, "promptReuse":"disabled", "cases":[], "armCompleted":false,
@@ -360,23 +298,23 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, SWIFT_ADAPTER_BYTES, normalized};
+    use super::{Request, normalized};
     use serde_json::json;
 
     #[test]
-    fn edited_arm_requires_new_digest_length_and_adapter() -> bonsai_prism_runtime::Result<()> {
+    fn none_arm_rejects_legacy_edited_and_adapter_fields() -> bonsai_prism_runtime::Result<()> {
         let root = std::env::current_dir()?;
         let value = json!({"modelPath":root.join("model.gguf"),
-            "adapterPath":root.join("edited.gguf"), "outputPath":root.join("facts.json"),
-            "condition":"edited", "editedAdapterSha256":"a".repeat(64),
-            "editedAdapterBytes":SWIFT_ADAPTER_BYTES,
+            "outputPath":root.join("facts.json"),
+            "condition":"none",
             "sourceCommit":"b".repeat(40), "deadlineUnixMilliseconds":1});
         let request: Request = serde_json::from_value(value.clone())?;
         request.validate()?;
         for (field, bad) in [
-            ("adapterPath", serde_json::Value::Null),
+            ("adapterPath", json!(root.join("edited.gguf"))),
             ("editedAdapterBytes", json!(1)),
-            ("editedAdapterSha256", json!("A".repeat(64))),
+            ("editedAdapterSha256", json!("a".repeat(64))),
+            ("condition", json!("edited")),
             ("condition", json!("standard")),
         ] {
             let mut invalid = value.clone();

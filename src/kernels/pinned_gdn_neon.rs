@@ -109,6 +109,7 @@ pub(super) fn dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> Option<(
 
 /// Computes `[dot(state, inputs[0]), dot(state, inputs[1]), dot(state, inputs[2]), dot(state, inputs[3])]`
 /// in a single pass over `state`, reusing each `state` vector load across all four four-register FMA trees.
+#[cfg(test)]
 #[inline]
 #[expect(
     clippy::suboptimal_flops,

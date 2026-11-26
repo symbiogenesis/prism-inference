@@ -31,16 +31,12 @@ mod platform {
     use bonsai_adreno_vulkan::{
         TdrChunkPolicy, VulkanBatchedAdapters, VulkanBatchedCheckpoint, VulkanBatchedConfig,
         VulkanBatchedGraphExecutor, VulkanKvPrecision, VulkanMultiRankAdapterSpec,
-        VulkanRankOneAdapterSpec,
     };
     use bonsai_prism_runtime::{
         Decoder, Result as RuntimeResult,
         model::{
             Model,
-            lora::{
-                MultiRankAdapter, MultiRankPolicy, RankOneAdapter, SWIFT_ADAPTER_BYTES,
-                SWIFT_ADAPTER_MEMORY_BYTES, SWIFT_ADAPTER_SHA256,
-            },
+            lora::{MultiRankAdapter, MultiRankPolicy},
             swift,
         },
         runtime::{GenerationTimings, Limits, Prefill, Runtime},
@@ -53,14 +49,14 @@ mod platform {
         text_output::Utf8Output,
         vocabulary::Vocabulary,
     };
-    use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, rc::Rc};
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     const MAX_CHECKPOINT_SLOTS: usize =
         bonsai_prism_runtime::swift_session::MAX_REUSABLE_CHECKPOINTS;
 
     struct SharedVulkanBatchedExecutor {
         executor: VulkanBatchedGraphExecutor,
-        pending_scales: Option<(Option<f32>, Option<f32>)>,
+        pending_multi_rank_scale: Option<f32>,
     }
 
     pub(super) struct VulkanBatchedDecoder {
@@ -104,10 +100,10 @@ mod platform {
                 .shared
                 .try_borrow_mut()
                 .map_err(|_| runtime_invalid("Vulkan batched executor borrow conflict"))?;
-            if let Some((rank_one_scale, multi_rank_scale)) = inner.pending_scales.take() {
+            if let Some(multi_rank_scale) = inner.pending_multi_rank_scale.take() {
                 inner
                     .executor
-                    .reset_with_adapter_scales(rank_one_scale, multi_rank_scale)
+                    .reset_with_adapter_scales(Some(multi_rank_scale))
                     .map_err(bonsai_adreno_vulkan::Error::into_runtime_error)?;
                 self.identity.clear();
                 self.identity.push_str(inner.executor.identity_sha256());
@@ -250,22 +246,18 @@ mod platform {
 
     struct PendingVulkanUpload {
         model: Model,
-        rank_one_model: Option<Model>,
         multi_rank_model: Option<Model>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub(in super::super) enum AdapterScaleAction {
         Reuse,
-        Reset {
-            update_scales: Option<(Option<f32>, Option<f32>)>,
-        },
+        Reset { update_scale: Option<f32> },
     }
 
     pub(in super::super) struct VulkanPreparedChat {
         owner: Arc<()>,
         admitted: AdmittedChat,
-        adapter_scale: Option<f32>,
         multi_rank_scale: Option<f32>,
         tokens: Vec<u32>,
         output_tokens: usize,
@@ -298,9 +290,7 @@ mod platform {
         owner: Arc<()>,
         model_path: PathBuf,
         representation: Representation,
-        adapter_path: Option<PathBuf>,
         daisyrose_lora: Option<(PathBuf, u64, String)>,
-        adapter_identity: Option<String>,
         secondary_adapter_identity: Option<Arc<str>>,
         secondary_adapter_max_rank: Option<u16>,
         chat: SwiftChatSession,
@@ -334,7 +324,6 @@ mod platform {
         pub(crate) fn load_profile_with_adapters(
             path: &Path,
             representation: Representation,
-            adapter_path: Option<&Path>,
             multi_rank_adapter: Option<MultiRankAdapterSpec<'_>>,
             seed: u32,
             row_workers: usize,
@@ -368,14 +357,6 @@ mod platform {
                 .with_context_tokens(context_tokens)?;
             let vocabulary = Vocabulary::from_metadata(&model.metadata, swift::VOCAB_SIZE)?;
 
-            let (rank_one_model, adapter_identity) = match adapter_path {
-                Some(adapter_path) => {
-                    let (loaded, id) =
-                        load_verified_rank_one_adapter(&model, representation, adapter_path)?;
-                    (Some(loaded), Some(id))
-                }
-                None => (None, None),
-            };
             let (
                 multi_rank_model,
                 daisyrose_lora,
@@ -400,9 +381,7 @@ mod platform {
                 owner: Arc::new(()),
                 model_path: path.to_path_buf(),
                 representation,
-                adapter_path: adapter_path.map(Path::to_path_buf),
                 daisyrose_lora,
-                adapter_identity,
                 secondary_adapter_identity,
                 secondary_adapter_max_rank,
                 chat,
@@ -419,7 +398,6 @@ mod platform {
                 delivery_fault: false,
                 pending_upload: Some(PendingVulkanUpload {
                     model,
-                    rank_one_model,
                     multi_rank_model,
                 }),
             })
@@ -449,7 +427,6 @@ mod platform {
             &self,
             pending: PendingChat,
         ) -> Result<VulkanPreparedChat, Rejection> {
-            let has_rank_one = self.adapter_identity.is_some();
             let has_multi_rank = self.secondary_adapter_identity.is_some();
             let mut prepared = None;
             let admitted = pending.admit_with_context(self.context_tokens, |body| {
@@ -458,13 +435,7 @@ mod platform {
                 }
                 let value: serde_json::Value =
                     serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?;
-                let request = crate::native_swift::parse_canonical_request(
-                    &value,
-                    has_rank_one,
-                    has_multi_rank,
-                )?;
-                validate_adapter_scale(has_rank_one, request.adapter_scale)
-                    .map_err(|_| Rejection::ChatSchema)?;
+                let request = crate::native_swift::parse_canonical_request(&value, has_multi_rank)?;
                 validate_multi_rank_scale(has_multi_rank, request.multi_rank_scale)
                     .map_err(|_| Rejection::ChatSchema)?;
                 if !request.sampler.is_canonical_default_sampling()
@@ -489,19 +460,17 @@ mod platform {
                     prompt.tokenization.token_ids,
                     request.output_tokens,
                     request.enable_thinking,
-                    request.adapter_scale,
                     request
                         .multi_rank_scale
                         .map(MultiRankAdapter::normalize_scale),
                 ));
                 Ok(count)
             })?;
-            let (tokens, output_tokens, enable_thinking, adapter_scale, multi_rank_scale) =
+            let (tokens, output_tokens, enable_thinking, multi_rank_scale) =
                 prepared.ok_or(Rejection::TokenCountUnavailable)?;
             Ok(VulkanPreparedChat {
                 owner: Arc::clone(&self.owner),
                 admitted,
-                adapter_scale,
                 multi_rank_scale,
                 tokens,
                 output_tokens,
@@ -526,7 +495,6 @@ mod platform {
                     "prepared Vulkan prompt belongs to another session",
                 ));
             }
-            validate_adapter_scale(self.adapter_identity.is_some(), prepared.adapter_scale)?;
             validate_multi_rank_scale(
                 self.secondary_adapter_identity.is_some(),
                 prepared.multi_rank_scale,
@@ -556,9 +524,7 @@ mod platform {
                         return Err(runtime_invalid("Vulkan batched executor faulted"));
                     }
                     decide_adapter_scale_action(
-                        inner.executor.rank_one_scale(),
                         inner.executor.multi_rank_scale(),
-                        prepared.adapter_scale,
                         prepared.multi_rank_scale,
                         prompt_reuse,
                     )?
@@ -568,13 +534,13 @@ mod platform {
                 }
                 match action {
                     AdapterScaleAction::Reuse => {}
-                    AdapterScaleAction::Reset { update_scales } => {
-                        if let Some((r1, mr)) = update_scales {
+                    AdapterScaleAction::Reset { update_scale } => {
+                        if let Some(mr) = update_scale {
                             let mut inner =
                                 runtime.decoder().shared.try_borrow_mut().map_err(|_| {
                                     runtime_invalid("Vulkan executor borrow conflict")
                                 })?;
-                            inner.pending_scales = Some((r1, mr));
+                            inner.pending_multi_rank_scale = Some(mr);
                         }
                         runtime.reset()?;
                     }
@@ -619,18 +585,10 @@ mod platform {
         type Prepared = VulkanPreparedChat;
 
         fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
-            if self
-                .adapter_identity
-                .as_deref()
-                .is_some_and(|identity| identity != SWIFT_ADAPTER_SHA256)
-            {
-                return Err(NativeBackendError::Configuration);
-            }
             Ok(ModelProfile {
                 placement: Placement::Vulkan,
                 projection_startup: ProjectionStartup::default(),
                 representation: self.representation,
-                adapter: self.adapter_identity.is_some(),
                 daisyrose_adapter: self.secondary_adapter_identity.is_some(),
                 daisyrose_adapter_sha256: self.secondary_adapter_identity.clone(),
                 daisyrose_adapter_max_rank: self.secondary_adapter_max_rank,
@@ -699,7 +657,7 @@ mod platform {
                     runtime_invalid("Vulkan batched runtime is not initialized on worker thread")
                 })?;
                 if let Ok(mut inner) = runtime.decoder().shared.try_borrow_mut() {
-                    inner.pending_scales = None;
+                    inner.pending_multi_rank_scale = None;
                 }
                 runtime.reset()
             })?;
@@ -720,13 +678,12 @@ mod platform {
             if placement != Placement::Vulkan {
                 return Err(NativeBackendError::Configuration);
             }
-            let _ = (&self.model_path, &self.adapter_path, &self.daisyrose_lora);
+            let _ = (&self.model_path, &self.daisyrose_lora);
             WORKER_VULKAN_RUNTIME.with_borrow_mut(|slot| {
                 let _ = slot.take();
             });
             let PendingVulkanUpload {
                 model,
-                rank_one_model,
                 multi_rank_model,
             } = self
                 .pending_upload
@@ -740,12 +697,6 @@ mod platform {
                 ..Default::default()
             };
             let adapters = VulkanBatchedAdapters {
-                rank_one: rank_one_model
-                    .as_ref()
-                    .map(|adapter| VulkanRankOneAdapterSpec {
-                        adapter,
-                        scale: 1.3,
-                    }),
                 multi_rank: multi_rank_model
                     .as_ref()
                     .map(|adapter| VulkanMultiRankAdapterSpec {
@@ -764,7 +715,6 @@ mod platform {
 
             // Free host weight storage immediately after GPU upload.
             drop(model);
-            drop(rank_one_model);
             drop(multi_rank_model);
 
             let identity: Arc<str> = Arc::from(format!(
@@ -785,7 +735,7 @@ mod platform {
             let decoder = VulkanBatchedDecoder {
                 shared: Rc::new(RefCell::new(SharedVulkanBatchedExecutor {
                     executor,
-                    pending_scales: None,
+                    pending_multi_rank_scale: None,
                 })),
                 identity: exec_identity,
                 vocab_size,
@@ -808,21 +758,10 @@ mod platform {
     }
 
     pub(in super::super) fn decide_adapter_scale_action(
-        current_r1: Option<f32>,
         current_mr: Option<f32>,
-        rank_one_scale: Option<f32>,
         multi_rank_scale: Option<f32>,
         reuse: PromptReuse,
     ) -> RuntimeResult<AdapterScaleAction> {
-        match (current_r1, rank_one_scale) {
-            (None, None) => {}
-            (Some(_), Some(scale)) => validate_adapter_scale(true, Some(scale))?,
-            _ => {
-                return Err(runtime_invalid(
-                    "request scale does not match the loaded adapter",
-                ));
-            }
-        }
         let normalized_mr = match (current_mr, multi_rank_scale) {
             (None, None) => None,
             (Some(_), Some(scale)) => {
@@ -835,14 +774,13 @@ mod platform {
                 ));
             }
         };
-        let scales_match = current_r1.map(f32::to_bits) == rank_one_scale.map(f32::to_bits)
-            && current_mr.map(f32::to_bits) == normalized_mr.map(f32::to_bits);
+        let scales_match = current_mr.map(f32::to_bits) == normalized_mr.map(f32::to_bits);
         if matches!(reuse, PromptReuse::Latest | PromptReuse::PromptEndAndLatest) && scales_match {
             return Ok(AdapterScaleAction::Reuse);
         }
-        let update_scales = (rank_one_scale.is_some() || normalized_mr.is_some())
-            .then_some((rank_one_scale, normalized_mr));
-        Ok(AdapterScaleAction::Reset { update_scales })
+        Ok(AdapterScaleAction::Reset {
+            update_scale: normalized_mr,
+        })
     }
 
     pub(in super::super) fn compute_active_resident_weights(
@@ -975,40 +913,6 @@ mod platform {
         Ok(0)
     }
 
-    fn load_verified_rank_one_adapter(
-        model: &Model,
-        representation: Representation,
-        adapter_path: &Path,
-    ) -> RuntimeResult<(Model, String)> {
-        if model.identity != representation.model_sha256() {
-            return Err(runtime_invalid(
-                "approved Swift adapter requires the exact selected current-weight base",
-            ));
-        }
-        let mut loaded = Model::load(
-            adapter_path,
-            SWIFT_ADAPTER_BYTES,
-            SWIFT_ADAPTER_SHA256,
-            SWIFT_ADAPTER_MEMORY_BYTES,
-        )?;
-        loaded.share_lora_b();
-        let validated = RankOneAdapter::from_model(clone_model(&loaded), model)?;
-        let has_unit_alpha = if let Some(value) = loaded.metadata.get("adapter.lora_alpha")
-            && let Some(alpha) = value.as_f64()
-        {
-            alpha.to_bits() == 1.0_f64.to_bits()
-        } else {
-            false
-        };
-        if validated.target_count() != 129 || !has_unit_alpha {
-            return Err(runtime_invalid(
-                "approved Swift adapter inventory or alpha mismatch",
-            ));
-        }
-        let id = validated.identity().to_owned();
-        Ok((loaded, id))
-    }
-
     type VerifiedMultiRank = (Model, (PathBuf, u64, String), Arc<str>, u16);
 
     fn load_verified_multi_rank_adapter(
@@ -1036,26 +940,8 @@ mod platform {
         Ok((loaded, meta, id, max_rank))
     }
 
-    fn clone_model(model: &Model) -> Model {
-        Model {
-            metadata: BTreeMap::clone(&model.metadata),
-            tensors: model.tensors.clone(),
-            identity: model.identity.clone(),
-        }
-    }
-
     fn runtime_invalid(message: &str) -> bonsai_prism_runtime::Error {
         std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
-    }
-
-    fn validate_adapter_scale(loaded: bool, scale: Option<f32>) -> RuntimeResult<()> {
-        match (loaded, scale) {
-            (false, None) => Ok(()),
-            (true, Some(scale)) if scale.is_finite() && (0.0..=2.0).contains(&scale) => Ok(()),
-            _ => Err(runtime_invalid(
-                "Swift adapter scale does not match the loaded profile",
-            )),
-        }
     }
 
     fn validate_multi_rank_scale(loaded: bool, scale: Option<f32>) -> RuntimeResult<()> {
@@ -1144,7 +1030,6 @@ mod platform {
         pub(crate) fn load_profile_with_adapters(
             _path: &Path,
             _representation: Representation,
-            _adapter_path: Option<&Path>,
             _multi_rank_adapter: Option<MultiRankAdapterSpec<'_>>,
             _seed: u32,
             _row_workers: usize,

@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, path::Path};
 use bonsai_gguf::MetadataValue;
 use bonsai_ternary::half_to_float;
 
-use super::{Model, Scratch, Tensor, hash_len_bytes};
+use super::{Scratch, hash_len_bytes};
 use crate::{
     Result, invalid,
     kernels::{
@@ -14,6 +14,7 @@ use crate::{
         lora_multi_b_scale_and_finish_tokens_f16, lora_multi_b_scale_and_finish_tokens_f32,
         prefill::MAX_TILE_TOKENS,
     },
+    model::{Model, Tensor},
 };
 
 const MAX_MULTI_RANK: usize = 256;

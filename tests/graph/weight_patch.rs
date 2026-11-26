@@ -1,8 +1,6 @@
 //! Original-basis observation, additive composition and checkpoint isolation.
 
-use super::{
-    Decoder, MatvecBackend, Qwen35, Result, fixture, rank_one_factors, rank_one_graph, weight,
-};
+use super::{Decoder, MatvecBackend, Qwen35, Result, fixture, lora_factors, lora_graph, weight};
 use bonsai_gguf::MetadataValue;
 use bonsai_prism_runtime::graph::weight_patch::{FfnPatch, FfnProbe};
 
@@ -54,8 +52,8 @@ fn ffn_probe_zero_preserves_unpatched_bits_and_observes_gated_basis() -> Result<
 #[test]
 fn ffn_probe_composes_after_adapter_and_rejects_foreign_state() -> Result<()> {
     let base = active_ffn();
-    let factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
-    let graph = rank_one_graph(base, factors, 1.3)?;
+    let factors = lora_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
+    let graph = lora_graph(base, factors, 1.3)?;
     let old_checkpoint = graph.checkpoint()?;
     let patch = FfnPatch::new(vec![0.0, 1.0], vec![0.0, 0.5], 1.0)?;
     let mut probe = FfnProbe::new(graph, 0, Some(patch))?;
@@ -63,8 +61,8 @@ fn ffn_probe_composes_after_adapter_and_rejects_foreign_state() -> Result<()> {
     let mut original = FfnProbe::new(
         {
             let base = active_ffn();
-            let factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
-            rank_one_graph(base, factors, 1.3)?
+            let factors = lora_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
+            lora_graph(base, factors, 1.3)?
         },
         0,
         None,
@@ -204,12 +202,12 @@ fn ffn_surrogate_captures_exact_normalized_input_and_adapter_delta_before_add() 
             "blk.0.ffn_down.weight".into(),
             weight("blk.0.ffn_down.weight", &[2, 2], &[0.0, 0.0, 0.5, 0.0]),
         );
-        let mut factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
+        let mut factors = lora_factors(&base, &["blk.0.ffn_down.weight"], 0.25);
         factors.tensors.insert(
             "blk.0.ffn_down.weight.lora_b".into(),
             weight("blk.0.ffn_down.weight.lora_b", &[1, 2], &[1e-10; 2]),
         );
-        rank_one_graph(base, factors, 1.3)
+        lora_graph(base, factors, 1.3)
     };
     let mut teacher = FfnProbe::new(graph()?, 0, None)?;
     let mut hidden_teacher = FfnProbe::new(graph()?, 0, None)?;

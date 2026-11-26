@@ -2,10 +2,7 @@
 
 use bonsai_prism_runtime::{
     graph::KvCachePolicy,
-    model::{
-        lora::SWIFT_ADAPTER_SHA256,
-        swift::{self, Representation},
-    },
+    model::swift::{self, Representation},
     runtime::PromptReuse,
     swift_session::{CpuPrefill, CpuSpeculation},
 };
@@ -213,7 +210,6 @@ pub(super) struct ModelProfile {
     pub placement: Placement,
     pub projection_startup: ProjectionStartup,
     pub representation: Representation,
-    pub adapter: bool,
     pub daisyrose_adapter: bool,
     pub daisyrose_adapter_sha256: Option<Arc<str>>,
     pub daisyrose_adapter_max_rank: Option<u16>,
@@ -235,7 +231,6 @@ impl Default for ModelProfile {
             placement: Placement::Auto,
             projection_startup: ProjectionStartup::default(),
             representation: Representation::default(),
-            adapter: false,
             daisyrose_adapter: false,
             daisyrose_adapter_sha256: None,
             daisyrose_adapter_max_rank: None,
@@ -279,14 +274,7 @@ impl ModelProfile {
                 model["projection_backend"] = json!("composite-hexagon-vulkan");
             }
         }
-        if self.representation != Representation::Pq2 || self.adapter {
-            model["weight_representation"] = json!(self.representation.name());
-            model["adapter_sha256"] = json!(self.adapter.then_some(SWIFT_ADAPTER_SHA256));
-            model["supports_abliteration_scale"] = json!(self.adapter);
-            if self.adapter {
-                model["abliteration_scale_range"] = json!([0, 2]);
-            }
-        }
+        model["weight_representation"] = json!(self.representation.name());
         if self.daisyrose_adapter {
             model["supports_daisyrose_scale"] = json!(true);
             model["daisyrose_scale_range"] = json!([0, 2]);

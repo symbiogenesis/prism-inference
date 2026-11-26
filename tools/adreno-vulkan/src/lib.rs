@@ -29,7 +29,7 @@ pub use executor::{VulkanAttentionExecutor, VulkanPq2Executor};
 pub use graph::{
     TdrChunkPolicy, VulkanBatchedAdapters, VulkanBatchedCheckpoint, VulkanBatchedConfig,
     VulkanBatchedGraphExecutor, VulkanKvPrecision, VulkanLayerPipelines,
-    VulkanMultiRankAdapterSpec, VulkanRankOneAdapterSpec,
+    VulkanMultiRankAdapterSpec,
 };
 
 /// Error returned by native Adreno Vulkan initialization, planning, or execution.

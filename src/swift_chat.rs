@@ -188,7 +188,7 @@ impl SwiftChatSession {
     /// Rejects identity, template, tokenizer, special declarations, resource
     /// bounds, malformed input, allocation failures and file I/O errors.
     pub fn load(path: &Path, memory_limit: usize) -> Result<Self> {
-        Self::load_representation(path, memory_limit, Representation::Pq2)
+        Self::load_representation(path, memory_limit, Representation::Bonsai25Pq2)
     }
 
     /// Verify the explicitly selected current-weight artifact and prepare chat.
@@ -224,7 +224,7 @@ impl SwiftChatSession {
     /// Rejects a foreign identity, malformed metadata, unsupported tokenizer or
     /// template, incorrect special declarations and resource/allocation errors.
     pub fn from_metadata(model: &ModelMetadata) -> Result<Self> {
-        Self::from_metadata_representation(model, Representation::Pq2)
+        Self::from_metadata_representation(model, Representation::Bonsai25Pq2)
     }
 
     /// Prepare chat from already verified metadata for an explicit representation.
@@ -255,7 +255,7 @@ impl SwiftChatSession {
     /// Rejects foreign identity, embedding/vocabulary mismatch and the same
     /// template/tokenizer metadata errors as [`Self::from_metadata`].
     pub fn from_model(model: &Model) -> Result<Self> {
-        Self::from_model_representation(model, Representation::Pq2)
+        Self::from_model_representation(model, Representation::Bonsai25Pq2)
     }
 
     /// Reuse verified executable metadata for an explicitly selected representation.
@@ -1082,9 +1082,9 @@ mod tests {
             metadata: meta,
             tensors: BTreeMap::from([("token_embd.vocab_gather".to_owned(), gather)]),
         };
-        // Rejects PQ2/PTQ1 when `token_embd.weight` is missing
+        // Rejects Bonsai 2.5 PQ2 when `token_embd.weight` is missing
         assert!(
-            SwiftChatSession::from_model_representation(&banded_model, Representation::Pq2)
+            SwiftChatSession::from_model_representation(&banded_model, Representation::Bonsai25Pq2)
                 .is_err()
         );
         // Rejects add_eos_token = true on NariQ

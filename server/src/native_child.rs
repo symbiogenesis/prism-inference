@@ -5,10 +5,7 @@ use std::{ffi::OsString, io, path::PathBuf};
 use bonsai_prism_runtime::{
     graph::KvCachePolicy,
     kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism},
-    model::{
-        lora::{SWIFT_ADAPTER_BYTES, SWIFT_ADAPTER_SHA256},
-        swift::{MMPROJ_BYTES, MMPROJ_SHA256, Representation},
-    },
+    model::swift::{MMPROJ_BYTES, MMPROJ_SHA256, Representation},
     runtime::PromptReuse,
     swift_session::{
         BranchCheckpoints, CpuPrefill, CpuSpeculation, DEFAULT_MAX_IMAGE_TOKENS, MAX_IMAGE_TOKENS,
@@ -56,7 +53,6 @@ struct Config {
     row_workers: usize,
     prefill_row_workers: usize,
     representation: Representation,
-    adapter: Option<PathBuf>,
     daisyrose_lora: Option<DaisyRoseConfig>,
     mmproj: Option<PathBuf>,
     image_max_tokens: usize,
@@ -112,10 +108,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     let mut row_workers = None;
     let mut prefill_row_workers = None;
     let mut cpu_family = None;
-    let mut repacked_ptq1 = false;
     let mut nariq: Option<Representation> = None;
     let mut bonsai25: Option<Representation> = None;
-    let mut adapter = None;
     let (mut daisyrose_path, mut daisyrose_bytes, mut daisyrose_sha256) = (None, None, None);
     let mut mmproj = None;
     let mut image_max_tokens = None;
@@ -138,17 +132,9 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             broker_pipe = true;
             continue;
         }
-        if argument == "--use-repacked-ptq1"
-            && !repacked_ptq1
-            && nariq.is_none()
-            && bonsai25.is_none()
-        {
-            repacked_ptq1 = true;
-            continue;
-        }
         let value = arguments.next().ok_or_else(invalid)?;
         match argument.to_str() {
-            Some("--nariq") if nariq.is_none() && bonsai25.is_none() && !repacked_ptq1 => {
+            Some("--nariq") if nariq.is_none() && bonsai25.is_none() => {
                 nariq = Some(match value.to_str() {
                     Some("2.5bpw") => Representation::NariQ2_5Bpw,
                     Some("3.0bpw") => Representation::NariQ3_0Bpw,
@@ -156,7 +142,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
                     _ => return Err(invalid()),
                 });
             }
-            Some("--bonsai-2-5") if bonsai25.is_none() && nariq.is_none() && !repacked_ptq1 => {
+            Some("--bonsai-2-5") if bonsai25.is_none() && nariq.is_none() => {
                 bonsai25 = Some(match value.to_str() {
                     Some("pq2") => Representation::Bonsai25Pq2,
                     Some("ptq1") => Representation::Bonsai25Ptq1,
@@ -165,7 +151,6 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
             }
             Some("--model") if model.is_none() => model = Some(PathBuf::from(value)),
             Some("--key-file") if key.is_none() => key = Some(PathBuf::from(value)),
-            Some("--abliterate-lora") if adapter.is_none() => adapter = Some(PathBuf::from(value)),
             Some("--daisyrose-lora") if daisyrose_path.is_none() => {
                 daisyrose_path = Some(PathBuf::from(value));
             }
@@ -364,12 +349,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         seed: seed.filter(|&n| n != u32::MAX).ok_or_else(invalid)?,
         row_workers: resolved_row_workers,
         prefill_row_workers: resolved_prefill_row_workers,
-        representation: nariq.or(bonsai25).unwrap_or(if repacked_ptq1 {
-            Representation::CurrentRepackedPtq1
-        } else {
-            Representation::Pq2
-        }),
-        adapter,
+        representation: nariq.or(bonsai25).unwrap_or(Representation::Bonsai25Pq2),
         daisyrose_lora,
         mmproj,
         image_max_tokens: resolved_image_max_tokens,
@@ -395,7 +375,6 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
     };
     if let Some(expected_sections) = config.verified_sections {
         let configured_sections = 1_usize
-            + usize::from(config.adapter.is_some())
             + usize::from(config.daisyrose_lora.is_some())
             + usize::from(config.mmproj.is_some());
         if expected_sections != configured_sections {
@@ -406,8 +385,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         return Err(invalid());
     }
     if config.representation.is_nariq()
-        && (config.adapter.is_some()
-            || config.mmproj.is_some()
+        && (config.mmproj.is_some()
             || config.hexagon_arena_cache.is_some()
             || matches!(config.placement, Placement::Vulkan | Placement::Composite))
     {
@@ -473,7 +451,6 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Config> {
         return Err(invalid());
     }
     for path in std::iter::once(&config.model)
-        .chain(config.adapter.as_ref())
         .chain(config.daisyrose_lora.as_ref().map(|item| &item.path))
         .chain(config.mmproj.as_ref())
     {
@@ -758,14 +735,6 @@ fn expected_verified_sections(config: &Config) -> io::Result<Vec<(u32, u64, [u8;
         config.representation.model_bytes(),
         decode_sha256_hex(config.representation.model_sha256())?,
     ));
-    if config.adapter.is_some() {
-        let slot = u32::try_from(expected.len()).map_err(|_| invalid())?;
-        expected.push((
-            slot,
-            SWIFT_ADAPTER_BYTES,
-            decode_sha256_hex(SWIFT_ADAPTER_SHA256)?,
-        ));
-    }
     if let Some(ref daisyrose) = config.daisyrose_lora {
         let slot = u32::try_from(expected.len()).map_err(|_| invalid())?;
         expected.push((slot, daisyrose.bytes, decode_sha256_hex(&daisyrose.sha256)?));
@@ -1045,7 +1014,6 @@ fn load_prepared_backend(config: &Config) -> io::Result<PreparedBackend> {
         let session = crate::native_backend::VulkanSwiftSession::load_profile_with_adapters(
             &config.model,
             config.representation,
-            config.adapter.as_deref(),
             daisyrose,
             config.seed,
             config.row_workers,
@@ -1062,7 +1030,6 @@ fn load_prepared_backend(config: &Config) -> io::Result<PreparedBackend> {
     let mut session = SwiftSession::load_profile_with_adapters(
         &config.model,
         config.representation,
-        config.adapter.as_deref(),
         daisyrose,
         MatvecBackend::Auto,
         config.seed,
@@ -1709,8 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn native_child_selects_ptq1_and_approved_adapter_only_with_explicit_options() -> io::Result<()>
-    {
+    fn native_child_selects_bonsai25_ptq1_and_rejects_removed_legacy_options() -> io::Result<()> {
         let (directory, [model, key, adapter]) = files()?;
         let base = vec![
             OsString::from("--native-engine-child"),
@@ -1724,40 +1690,24 @@ mod tests {
             "42".into(),
         ];
         let default = parse(base.clone())?;
-        assert_eq!(default.representation, Representation::Pq2);
-        assert!(default.adapter.is_none());
+        assert_eq!(default.representation, Representation::Bonsai25Pq2);
         let mut missing = base.clone();
         missing[2] = directory.path().join("missing.gguf").into_os_string();
         assert!(parse(missing).is_err());
         let mut nonregular = base.clone();
         nonregular[2] = directory.path().as_os_str().to_owned();
         assert!(parse(nonregular).is_err());
-        for repacked in [false, true] {
-            let mut selected = base.clone();
-            if repacked {
-                selected.push("--use-repacked-ptq1".into());
-            }
-            selected.extend([OsString::from("--abliterate-lora"), adapter.clone()]);
-            let config = parse(selected.clone())?;
-            assert_eq!(
-                config.representation,
-                if repacked {
-                    Representation::CurrentRepackedPtq1
-                } else {
-                    Representation::Pq2
-                }
-            );
-            assert_eq!(config.adapter, Some(PathBuf::from(&adapter)));
-            selected.extend([OsString::from("--abliterate-lora"), adapter.clone()]);
-            assert!(parse(selected).is_err());
-        }
+        let mut ptq1 = base.clone();
+        ptq1.extend([OsString::from("--bonsai-2-5"), "ptq1".into()]);
+        let config = parse(ptq1)?;
+        assert_eq!(config.representation, Representation::Bonsai25Ptq1);
         for extra in [
-            vec!["--use-repacked-ptq1", "--use-repacked-ptq1"],
-            vec!["--abliterate-lora", "relative.gguf"],
-            vec!["--abliteration-scale", "1.3"],
+            vec![OsString::from("--use-repacked-ptq1")],
+            vec![OsString::from("--abliterate-lora"), adapter],
+            vec![OsString::from("--abliteration-scale"), "1.3".into()],
         ] {
             let mut invalid = base.clone();
-            invalid.extend(extra.into_iter().map(OsString::from));
+            invalid.extend(extra);
             assert!(parse(invalid).is_err());
         }
         Ok(())
@@ -1766,7 +1716,7 @@ mod tests {
     #[test]
     fn native_child_selects_nariq_with_daisyrose_and_rejects_incompatible_modes() -> io::Result<()>
     {
-        let (directory, [model, key, adapter]) = files()?;
+        let (directory, [model, key, _adapter]) = files()?;
         let daisy = directory.path().join("daisyrose.gguf");
         std::fs::write(&daisy, [])?;
         let mmproj = directory.path().join("mmproj.gguf");
@@ -1807,7 +1757,6 @@ mod tests {
             let cfg = parse(args)?;
             assert_eq!(cfg.representation, expected_repr);
             assert!(cfg.daisyrose_lora.is_some());
-            assert!(cfg.adapter.is_none());
             assert!(cfg.mmproj.is_none());
         }
 
@@ -1829,15 +1778,6 @@ mod tests {
             invalid_args.extend(bad.into_iter().map(OsString::from));
             assert!(parse(invalid_args).is_err());
         }
-        let mut with_abliterate = base.clone();
-        with_abliterate.extend([
-            OsString::from("--nariq"),
-            "2.5bpw".into(),
-            OsString::from("--abliterate-lora"),
-            adapter,
-        ]);
-        assert!(parse(with_abliterate).is_err());
-
         let mut with_mmproj = base.clone();
         with_mmproj.extend([
             OsString::from("--nariq"),
@@ -1859,8 +1799,8 @@ mod tests {
     }
 
     #[test]
-    fn native_child_selects_bonsai25_with_orca_daisyrose_mmproj_and_placements() -> io::Result<()> {
-        let (directory, [model, key, adapter]) = files()?;
+    fn native_child_selects_bonsai25_with_daisyrose_mmproj_and_placements() -> io::Result<()> {
+        let (directory, [model, key, _adapter]) = files()?;
         let daisy = directory.path().join("daisyrose.gguf");
         std::fs::write(&daisy, [])?;
         let mmproj = directory.path().join("mmproj.gguf");
@@ -1892,8 +1832,6 @@ mod tests {
                 args.extend([
                     OsString::from("--bonsai-2-5"),
                     OsString::from(flag),
-                    OsString::from("--abliterate-lora"),
-                    adapter.clone(),
                     OsString::from("--daisyrose-lora"),
                     daisy.clone().into_os_string(),
                     OsString::from("--daisyrose-lora-bytes"),
@@ -1911,7 +1849,6 @@ mod tests {
                 }
                 let cfg = parse(args)?;
                 assert_eq!(cfg.representation, expected_repr);
-                assert!(cfg.adapter.is_some());
                 assert!(cfg.daisyrose_lora.is_some());
                 assert_eq!(cfg.mmproj.is_some(), with_mmproj);
             }
@@ -1931,8 +1868,6 @@ mod tests {
             crate::configuration::REQUIRED_AVAILABLE_BYTES + 47_185_920
         );
         for bad in [
-            vec!["--bonsai-2-5", "pq2", "--use-repacked-ptq1"],
-            vec!["--use-repacked-ptq1", "--bonsai-2-5", "ptq1"],
             vec!["--bonsai-2-5", "pq2", "--nariq", "2.5bpw"],
             vec!["--nariq", "2.5bpw", "--bonsai-2-5", "ptq1"],
             vec!["--bonsai-2-5", "pq2", "--bonsai-2-5", "ptq1"],
@@ -2424,7 +2359,7 @@ mod tests {
         use bonsai_prism_runtime::swift_session::{
             calibrated_cow_execution_memory_bytes, selected_state_budget,
         };
-        let (directory, [model, key, adapter]) = files()?;
+        let (directory, [model, key, _adapter]) = files()?;
         let mmproj = directory.path().join("mmproj.gguf");
         std::fs::write(&mmproj, [])?;
 
@@ -2443,20 +2378,18 @@ mod tests {
         sec1.extend(["--verified-sections", "1"].map(OsString::from));
         assert!(parse(sec1).is_err());
 
-        let mut sec3 = pipe_base.clone();
-        sec3.extend([
-            "--abliterate-lora".into(),
-            adapter,
+        let mut sec2 = pipe_base.clone();
+        sec2.extend([
             "--mmproj".into(),
             mmproj.into_os_string(),
             "--verified-sections".into(),
-            "3".into(),
+            "2".into(),
         ]);
-        assert_eq!(parse(sec3.clone())?.verified_sections, Some(3));
-        // Wrong count against 3 artifacts must fail.
-        sec3.pop();
-        sec3.push("2".into());
-        assert!(parse(sec3).is_err());
+        assert_eq!(parse(sec2.clone())?.verified_sections, Some(2));
+        // Wrong count against 2 artifacts must fail.
+        sec2.pop();
+        sec2.push("3".into());
+        assert!(parse(sec2).is_err());
 
         for bad_count in ["0", "9", "abc"] {
             let mut bad = pipe_base.clone();
@@ -2482,7 +2415,7 @@ mod tests {
         let context = 262_144_usize;
         let ptq1_cow_mem = calibrated_cow_execution_memory_bytes(
             context,
-            Representation::CurrentRepackedPtq1,
+            Representation::Bonsai25Ptq1,
             None,
             None,
             KvCachePolicy::Rotated4,
@@ -2492,7 +2425,8 @@ mod tests {
         .map_err(io::Error::other)?;
         let mut calibrated = pipe_base.clone();
         calibrated.extend([
-            "--use-repacked-ptq1".into(),
+            "--bonsai-2-5".into(),
+            "ptq1".into(),
             "--kv-cache".into(),
             "rsq4".into(),
             "--prompt-reuse".into(),
@@ -2509,11 +2443,11 @@ mod tests {
         assert_eq!(parsed_cow.capacity, Some((context, ptq1_cow_mem)));
 
         let mut below_cow = calibrated.clone();
-        below_cow[14] = (ptq1_cow_mem - 1).to_string().into();
+        below_cow[15] = (ptq1_cow_mem - 1).to_string().into();
         assert!(parse(below_cow).is_err());
 
         let mut conservative = calibrated.clone();
-        conservative[16] = "conservative".into();
+        conservative[17] = "conservative".into();
         assert!(parse(conservative).is_err());
 
         // Missing capacity with calibrated-cow or unknown policy string must fail.
@@ -2524,7 +2458,7 @@ mod tests {
         dup_policy.extend(["--admission-policy", "calibrated-cow"].map(OsString::from));
         assert!(parse(dup_policy).is_err());
         let mut unknown_policy = calibrated;
-        unknown_policy[16] = "auto".into();
+        unknown_policy[17] = "auto".into();
         assert!(parse(unknown_policy).is_err());
 
         // Ensure spec checkpoint helper aligns with selected_state_budget.
@@ -2538,7 +2472,7 @@ mod tests {
     #[test]
     fn native_child_daisyrose_lora_verified_sections_and_partial_flag_rejection() -> io::Result<()>
     {
-        let (directory, [model, _key, adapter]) = files()?;
+        let (directory, [model, _key, _adapter]) = files()?;
         let mmproj = directory.path().join("mmproj.gguf");
         std::fs::write(&mmproj, [])?;
         let daisy = directory.path().join("daisyrose.gguf");
@@ -2554,10 +2488,8 @@ mod tests {
             "42".into(),
         ];
 
-        let mut sec4 = pipe_base.clone();
-        sec4.extend([
-            "--abliterate-lora".into(),
-            adapter,
+        let mut sec3 = pipe_base.clone();
+        sec3.extend([
             "--daisyrose-lora".into(),
             daisy.clone().into_os_string(),
             "--daisyrose-lora-bytes".into(),
@@ -2567,19 +2499,19 @@ mod tests {
             "--mmproj".into(),
             mmproj.into_os_string(),
             "--verified-sections".into(),
-            "4".into(),
+            "3".into(),
         ]);
-        let parsed_sec4 = parse(sec4.clone())?;
-        assert_eq!(parsed_sec4.verified_sections, Some(4));
-        let expected_sec4 = expected_verified_sections(&parsed_sec4)?;
-        assert_eq!(expected_sec4.len(), 4);
-        assert_eq!(expected_sec4[2].0, 2);
-        assert_eq!(expected_sec4[2].1, 4096);
-        assert_eq!(expected_sec4[3].0, 3);
+        let parsed_sec3 = parse(sec3.clone())?;
+        assert_eq!(parsed_sec3.verified_sections, Some(3));
+        let expected_sec3 = expected_verified_sections(&parsed_sec3)?;
+        assert_eq!(expected_sec3.len(), 3);
+        assert_eq!(expected_sec3[1].0, 1);
+        assert_eq!(expected_sec3[1].1, 4096);
+        assert_eq!(expected_sec3[2].0, 2);
 
-        let last_idx = sec4.len() - 1;
-        sec4[last_idx] = "3".into();
-        assert!(parse(sec4).is_err());
+        let last_idx = sec3.len() - 1;
+        sec3[last_idx] = "2".into();
+        assert!(parse(sec3).is_err());
 
         let mut partial = pipe_base;
         partial.extend([
@@ -2647,7 +2579,7 @@ mod tests {
     fn native_child_vulkan_placement_defaults_and_accepts_f16_configurations() -> io::Result<()> {
         use bonsai_prism_runtime::swift_session::{CONTEXT_TOKEN_MEMORY_BYTES, STATE_MEMORY_BYTES};
 
-        let (_directory, [model, key, adapter]) = files()?;
+        let (_directory, [model, key, _adapter]) = files()?;
         let base: Vec<OsString> = vec![
             "--native-engine-child".into(),
             "--model".into(),
@@ -2689,9 +2621,8 @@ mod tests {
 
         let mut variant = base;
         variant.extend([
-            "--use-repacked-ptq1".into(),
-            "--abliterate-lora".into(),
-            adapter,
+            "--bonsai-2-5".into(),
+            "ptq1".into(),
             "--prompt-reuse".into(),
             "prompt-end-and-latest".into(),
             "--context-tokens".into(),
@@ -2701,10 +2632,7 @@ mod tests {
         ]);
         let variant_cfg = parse(variant)?;
         assert_eq!(variant_cfg.placement, Placement::Vulkan);
-        assert_eq!(
-            variant_cfg.representation,
-            Representation::CurrentRepackedPtq1
-        );
+        assert_eq!(variant_cfg.representation, Representation::Bonsai25Ptq1);
         assert_eq!(variant_cfg.prompt_reuse, PromptReuse::PromptEndAndLatest);
         Ok(())
     }

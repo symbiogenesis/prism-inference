@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use super::{
     Deadline, Decoder, EXECUTION_PROFILE, FfnProbe, GROUP_OMISSION_PROFILE, Hasher,
-    MAX_CAPTURE_BYTES, Qwen35, Representation, Request, Result, SURROGATE_INPUT_BASIS,
-    SWIFT_ADAPTER_SHA256, Value, factor_hash, hex, json, publish, reject,
+    MAX_CAPTURE_BYTES, Qwen35, Representation, Request, Result, SURROGATE_INPUT_BASIS, Value,
+    factor_hash, hex, json, publish, reject,
 };
 
 fn digest(domain: &[u8], bytes: &[u8]) -> Result<String> {
@@ -80,7 +80,7 @@ pub(super) fn capture(
     let source = json!({
         "modelSha256":representation.model_sha256(),"runtimeSha256":executable_sha256,
         "runtimeSourceCommit":request.runtime_source_commit,
-        "adapterSha256":request.adapter_path.as_ref().map(|_| SWIFT_ADAPTER_SHA256),
+        "adapterSha256":Value::Null,
         "adapterScaleBits":format!("{:08x}",scale.to_bits()),
         "weightRepresentation":representation.name(),"executionProfile":EXECUTION_PROFILE,
         "graphIdentity":original_graph,

@@ -22,8 +22,7 @@ fn load_session(selection: &Selection) -> Result<SwiftSession> {
     // Only the reviewed 0.1.23 baseline uses its intrinsic FP16 graph loader.
     SwiftSession::load_profile_with_row_parallelism(
         &selection.model,
-        Representation::Pq2,
-        Some(&selection.adapter),
+        Representation::Bonsai25Pq2,
         MatvecBackend::ExperimentalNeon,
         42,
         RowParallelism::new(4)?,
@@ -34,8 +33,7 @@ fn load_session(selection: &Selection) -> Result<SwiftSession> {
 fn load_session(selection: &Selection) -> Result<SwiftSession> {
     SwiftSession::load_profile_with_kv_cache(
         &selection.model,
-        Representation::Pq2,
-        Some(&selection.adapter),
+        Representation::Bonsai25Pq2,
         MatvecBackend::ExperimentalNeon,
         42,
         RowParallelism::new(4)?,

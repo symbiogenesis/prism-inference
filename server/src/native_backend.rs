@@ -785,22 +785,9 @@ fn validate_canonical_lora(
             }
         }
     }
-    match (profile.adapter, profile.daisyrose_adapter, entries) {
-        (false, false | true, None) => Ok(None),
-        (true, false, Some(items)) | (false, true, Some(items))
-            if items.len() == 1 && items[0].id == 0 =>
-        {
-            Ok(Some(items))
-        }
-        (true, true, Some(items)) => match items.as_slice() {
-            [only] if only.id == 0 => Ok(Some(items)),
-            [first, second]
-                if (first.id == 0 && second.id == 1) || (first.id == 1 && second.id == 0) =>
-            {
-                Ok(Some(items))
-            }
-            _ => Err(NativeBackendError::Schema),
-        },
+    match (profile.daisyrose_adapter, entries) {
+        (false | true, None) => Ok(None),
+        (true, Some(items)) if items.len() == 1 && items[0].id == 0 => Ok(Some(items)),
         _ => Err(NativeBackendError::Schema),
     }
 }

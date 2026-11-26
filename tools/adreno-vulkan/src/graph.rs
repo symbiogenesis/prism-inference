@@ -17,8 +17,8 @@ use bonsai_prism_runtime::{
     kernels::{row_into, validate_tensor},
     model::{
         Model, Tensor,
-        lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
-        swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256},
+        lora::{MultiRankAdapter, MultiRankPolicy},
+        swift::{BONSAI_2_5_PQ2_SHA256, BONSAI_2_5_PTQ1_SHA256},
     },
     sampling::FiniteLogits,
 };
@@ -163,18 +163,6 @@ impl VulkanKvPrecision {
     }
 }
 
-/// Rank-one `LoRA` adapter input for [`VulkanBatchedGraphExecutor`].
-///
-/// Accepts a GGUF adapter [`Model`] validated through [`RankOneAdapter::from_model`] and uploads
-/// all linear and embedding `F32` factors directly into GPU resident memory.
-#[derive(Debug)]
-pub struct VulkanRankOneAdapterSpec<'a> {
-    /// Loaded GGUF adapter [`Model`] conforming to [`RankOneAdapter`].
-    pub adapter: &'a Model,
-    /// Initial adapter scale multiplier (`0.0..=2.0`, finite; `0.0` bypasses execution).
-    pub scale: f32,
-}
-
 /// Multi-rank `LoRA` adapter input (`F16`/`F32`) for [`VulkanBatchedGraphExecutor`].
 ///
 /// Accepts a GGUF adapter [`Model`] validated through [`MultiRankAdapter::from_model`] under
@@ -189,11 +177,9 @@ pub struct VulkanMultiRankAdapterSpec<'a> {
     pub scale: f32,
 }
 
-/// Optional GPU-resident rank-one and multi-rank `LoRA` adapters attached at executor construction.
+/// Optional GPU-resident multi-rank `LoRA` adapters attached at executor construction.
 #[derive(Debug, Default)]
 pub struct VulkanBatchedAdapters<'a> {
-    /// Optional rank-one `LoRA` adapter (`token_embd`, `attn_output`, `ssm_out`, `ffn_down`).
-    pub rank_one: Option<VulkanRankOneAdapterSpec<'a>>,
     /// Optional stackable multi-rank `LoRA` adapter (`F16`/`F32`).
     pub multi_rank: Option<VulkanMultiRankAdapterSpec<'a>>,
 }
@@ -910,21 +896,11 @@ struct GpuLoraFactor {
     scaling: f32,
 }
 
-#[derive(Clone, Debug)]
-struct GpuRankOneEmbed {
-    a_values: Vec<f32>,
-    b_span: BufferSpan,
-    alpha: f32,
-}
-
 #[derive(Default)]
 struct UploadedAdapters {
-    rank_one_linear: BTreeMap<String, GpuLoraFactor>,
-    rank_one_embed: Option<GpuRankOneEmbed>,
     multi_rank_linear: BTreeMap<String, GpuLoraFactor>,
     max_rank: usize,
     content_sha256: String,
-    rank_one_scale: Option<f32>,
     multi_rank_scale: Option<f32>,
 }
 
@@ -936,7 +912,6 @@ struct GpuMatrixWeight {
     rows: usize,
     rotated: bool,
     grouped_ssm: bool,
-    rank_one: Option<GpuLoraFactor>,
     multi_rank: Option<GpuLoraFactor>,
 }
 
@@ -946,10 +921,6 @@ impl GpuMatrixWeight {
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Allocated once per layer during executor construction."
-)]
 enum GpuLayerAttention {
     Recurrent {
         qkv: GpuMatrixWeight,
@@ -1007,6 +978,10 @@ struct GpuGraphScratch {
     rope_freqs: BufferId,
     rope_freqs_staging: [BufferId; 2],
     lora_ranks: BufferId,
+    #[expect(
+        dead_code,
+        reason = "Reserved per-bank staging slots aligned with tile scratch layout."
+    )]
     lora_ranks_staging: [BufferId; 2],
     attn_scores: BufferId,
     attn_probs: BufferId,
@@ -1097,11 +1072,8 @@ pub struct VulkanBatchedGraphExecutor {
     host_embed_scratch: Vec<f32>,
     host_embed_tile_scratch: Vec<f32>,
     host_rope_freqs: Vec<f32>,
-    host_lora_ranks: Vec<f32>,
     staging_bank_in_flight: [bool; 2],
     next_staging_bank: usize,
-    rank_one_embed: Option<GpuRankOneEmbed>,
-    rank_one_scale: Option<f32>,
     multi_rank_scale: Option<f32>,
     base_provenance_sha256: String,
     provenance_nonce: u64,
@@ -1135,7 +1107,7 @@ impl VulkanBatchedGraphExecutor {
     }
 
     /// Opens the native Adreno Vulkan device and uploads `model` together with GPU-resident
-    /// `LoRA` adapters (`RankOneAdapter` / `MultiRankAdapter`).
+    /// `MultiRankAdapter` weights.
     ///
     /// # Errors
     /// Returns [`Error::Unsupported`], [`Error::InvalidInput`], [`Error::ResourceLimit`],
@@ -1200,10 +1172,7 @@ impl VulkanBatchedGraphExecutor {
         let resolved_context_limit = geometry.context_limit;
         let resolved_pinned_arithmetic = config.pinned_arithmetic.unwrap_or(matches!(
             model.identity.as_str(),
-            MODEL_SHA256
-                | REPACKED_PTQ1_SHA256
-                | bonsai_prism_runtime::model::swift::BONSAI_2_5_PQ2_SHA256
-                | bonsai_prism_runtime::model::swift::BONSAI_2_5_PTQ1_SHA256
+            BONSAI_2_5_PQ2_SHA256 | BONSAI_2_5_PTQ1_SHA256
         ));
 
         let embedding = lookup_tensor(model, "token_embd.weight", &[geometry.embedding, 0])?;
@@ -1375,17 +1344,13 @@ impl VulkanBatchedGraphExecutor {
             &pipelines,
             &uploaded_adapters.content_sha256,
         )?;
-        let identity_sha256 = compute_executor_identity(
-            &base_provenance_sha256,
-            uploaded_adapters.rank_one_scale,
-            uploaded_adapters.multi_rank_scale,
-        )?;
+        let identity_sha256 =
+            compute_executor_identity(&base_provenance_sha256, uploaded_adapters.multi_rank_scale)?;
 
         let _ = min_align;
         let alloc_tile = scratch.allocated_tile_tokens;
         let host_rope_freqs = vec![0.0_f32; alloc_tile * geometry.rope];
         let host_embed_tile_scratch = Vec::with_capacity(alloc_tile * geometry.embedding);
-        let host_lora_ranks = Vec::with_capacity(alloc_tile);
         Ok(Self {
             device,
             pipelines,
@@ -1406,11 +1371,8 @@ impl VulkanBatchedGraphExecutor {
             host_embed_scratch: Vec::with_capacity(geometry.embedding),
             host_embed_tile_scratch,
             host_rope_freqs,
-            host_lora_ranks,
             staging_bank_in_flight: [false; 2],
             next_staging_bank: 0,
-            rank_one_embed: uploaded_adapters.rank_one_embed,
-            rank_one_scale: uploaded_adapters.rank_one_scale,
             multi_rank_scale: uploaded_adapters.multi_rank_scale,
             base_provenance_sha256,
             provenance_nonce: 0,
@@ -1566,31 +1528,10 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
-    /// Returns the active rank-one `LoRA` adapter scale, or `None` when none is loaded.
-    #[must_use]
-    pub const fn rank_one_scale(&self) -> Option<f32> {
-        self.rank_one_scale
-    }
-
     /// Returns the active multi-rank `LoRA` adapter scale, or `None` when none is loaded.
     #[must_use]
     pub const fn multi_rank_scale(&self) -> Option<f32> {
         self.multi_rank_scale
-    }
-
-    /// Dynamically updates the rank-one `LoRA` scale (`0.0..=2.0`) and invalidates executor identity
-    /// and prior checkpoints without freeing or re-uploading GPU weights.
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidInput`] if no rank-one adapter is loaded, `scale` is outside finite
-    /// `0.0..=2.0`, or identity hashing fails.
-    pub fn set_rank_one_scale(&mut self, scale: f32) -> Result<(), Error> {
-        if self.rank_one_scale.is_none() {
-            return Err(Error::InvalidInput(
-                "rank-one adapter scale update requires a loaded rank-one adapter".to_owned(),
-            ));
-        }
-        self.set_adapter_scales(Some(scale), self.multi_rank_scale)
     }
 
     /// Dynamically updates the multi-rank `LoRA` scale (`0.0..=2.0`) and invalidates executor
@@ -1605,42 +1546,21 @@ impl VulkanBatchedGraphExecutor {
                 "multi-rank adapter scale update requires a loaded multi-rank adapter".to_owned(),
             ));
         }
-        self.set_adapter_scales(self.rank_one_scale, Some(scale))
+        self.set_adapter_scales(Some(scale))
     }
 
-    /// Atomically updates loaded rank-one and multi-rank `LoRA` scales and invalidates identity and
-    /// prior checkpoints.
+    /// Updates the loaded multi-rank `LoRA` scale and invalidates identity and prior checkpoints.
     ///
     /// # Errors
-    /// Rejects scale mismatches against the loaded adapters, scales outside finite `0.0..=2.0`,
+    /// Rejects scale mismatches against the loaded adapter, scales outside finite `0.0..=2.0`,
     /// or identity hashing failures without mutating existing scales.
-    pub fn set_adapter_scales(
-        &mut self,
-        rank_one_scale: Option<f32>,
-        multi_rank_scale: Option<f32>,
-    ) -> Result<(), Error> {
-        let (resolved_r1, resolved_mr) =
-            self.validate_adapter_scale_update(rank_one_scale, multi_rank_scale)?;
-        let new_identity =
-            compute_executor_identity(&self.base_provenance_sha256, resolved_r1, resolved_mr)?;
-        self.rank_one_scale = resolved_r1;
+    pub fn set_adapter_scales(&mut self, multi_rank_scale: Option<f32>) -> Result<(), Error> {
+        let resolved_mr = self.validate_adapter_scale_update(multi_rank_scale)?;
+        let new_identity = compute_executor_identity(&self.base_provenance_sha256, resolved_mr)?;
         self.multi_rank_scale = resolved_mr;
         self.identity_sha256 = new_identity;
         self.provenance_nonce = self.provenance_nonce.wrapping_add(1);
         Ok(())
-    }
-
-    /// Resets all GPU recurrent/KV state to position `0` and updates the rank-one `LoRA` scale.
-    ///
-    /// # Errors
-    /// Rejects missing adapters, invalid scales, or Vulkan reset failures.
-    pub fn reset_with_rank_one_scale(&mut self, scale: f32) -> Result<(), Error> {
-        if self.rank_one_scale.is_none() {
-            return Err(Error::InvalidInput(
-                "rank-one adapter scale update requires a loaded rank-one adapter".to_owned(),
-            ));
-        }
-        self.reset_with_adapter_scales(Some(scale), self.multi_rank_scale)
     }
 
     /// Resets all GPU recurrent/KV state to position `0` and updates the multi-rank `LoRA` scale.
@@ -1653,26 +1573,22 @@ impl VulkanBatchedGraphExecutor {
                 "multi-rank adapter scale update requires a loaded multi-rank adapter".to_owned(),
             ));
         }
-        self.reset_with_adapter_scales(self.rank_one_scale, Some(scale))
+        self.reset_with_adapter_scales(Some(scale))
     }
 
-    /// Atomically resets all GPU recurrent/KV state to position `0`, updates loaded adapter scales,
-    /// and invalidates prior checkpoints.
+    /// Atomically resets all GPU recurrent/KV state to position `0`, updates the loaded adapter
+    /// scale, and invalidates prior checkpoints.
     ///
     /// # Errors
     /// Rejects scale mismatches against loaded adapters, scales outside finite `0.0..=2.0`,
     /// identity hashing failures, or Vulkan reset errors.
     pub fn reset_with_adapter_scales(
         &mut self,
-        rank_one_scale: Option<f32>,
         multi_rank_scale: Option<f32>,
     ) -> Result<(), Error> {
-        let (resolved_r1, resolved_mr) =
-            self.validate_adapter_scale_update(rank_one_scale, multi_rank_scale)?;
-        let new_identity =
-            compute_executor_identity(&self.base_provenance_sha256, resolved_r1, resolved_mr)?;
+        let resolved_mr = self.validate_adapter_scale_update(multi_rank_scale)?;
+        let new_identity = compute_executor_identity(&self.base_provenance_sha256, resolved_mr)?;
         self.reset()?;
-        self.rank_one_scale = resolved_r1;
         self.multi_rank_scale = resolved_mr;
         self.identity_sha256 = new_identity;
         self.provenance_nonce = self.provenance_nonce.wrapping_add(1);
@@ -1681,50 +1597,27 @@ impl VulkanBatchedGraphExecutor {
 
     fn validate_adapter_scale_update(
         &self,
-        rank_one_scale: Option<f32>,
         multi_rank_scale: Option<f32>,
-    ) -> Result<(Option<f32>, Option<f32>), Error> {
-        if self.rank_one_scale.is_none() && self.multi_rank_scale.is_none() {
+    ) -> Result<Option<f32>, Error> {
+        if self.multi_rank_scale.is_none() {
             return Err(Error::InvalidInput(
-                "adapter scale update requires at least one loaded LoRA adapter".to_owned(),
+                "adapter scale update requires a loaded multi-rank LoRA adapter".to_owned(),
             ));
         }
-        let resolved_r1 = match (self.rank_one_scale, rank_one_scale) {
-            (Some(_), Some(scale)) => {
-                validate_rank_one_scale(scale)?;
-                Some(scale)
-            }
-            (Some(_), None) => {
-                return Err(Error::InvalidInput(
-                    "rank-one adapter requires a rank-one scale".to_owned(),
-                ));
-            }
-            (None, None) => None,
-            (None, Some(_)) => {
-                return Err(Error::InvalidInput(
-                    "rank-one scale provided without a loaded rank-one adapter".to_owned(),
-                ));
-            }
-        };
-        let resolved_mr = match (self.multi_rank_scale, multi_rank_scale) {
+        match (self.multi_rank_scale, multi_rank_scale) {
             (Some(_), Some(scale)) => {
                 MultiRankAdapter::validate_scale(scale)
                     .map_err(|err| Error::InvalidInput(err.to_string()))?;
-                Some(MultiRankAdapter::normalize_scale(scale))
+                Ok(Some(MultiRankAdapter::normalize_scale(scale)))
             }
-            (Some(_), None) => {
-                return Err(Error::InvalidInput(
-                    "multi-rank adapter requires a multi-rank scale".to_owned(),
-                ));
-            }
-            (None, None) => None,
-            (None, Some(_)) => {
-                return Err(Error::InvalidInput(
-                    "multi-rank scale provided without a loaded multi-rank adapter".to_owned(),
-                ));
-            }
-        };
-        Ok((resolved_r1, resolved_mr))
+            (Some(_), None) => Err(Error::InvalidInput(
+                "multi-rank adapter requires a multi-rank scale".to_owned(),
+            )),
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(Error::InvalidInput(
+                "multi-rank scale provided without a loaded multi-rank adapter".to_owned(),
+            )),
+        }
     }
 
     /// Captures a host-side snapshot of all mutable GPU recurrent and KV-cache state.
@@ -2355,44 +2248,6 @@ impl VulkanBatchedGraphExecutor {
         }
     }
 
-    fn write_tile_embed_lora(
-        &mut self,
-        tokens: &[u32],
-        lora_dst: BufferId,
-    ) -> Result<Option<(BufferSpan, f32)>, Error> {
-        let Some((embed_lora, scale)) = self
-            .rank_one_embed
-            .as_ref()
-            .zip(self.rank_one_scale)
-            .filter(|&(_, s)| s != 0.0)
-        else {
-            return Ok(None);
-        };
-        let effective_scale = scale * embed_lora.alpha;
-        if !effective_scale.is_finite() {
-            return Err(Error::InvalidInput(
-                "embedding LoRA scalar or scale is non-finite".to_owned(),
-            ));
-        }
-        self.host_lora_ranks.clear();
-        for &token in tokens {
-            let token_idx = usize::try_from(token)
-                .map_err(|_| Error::InvalidInput("token index overflow".to_owned()))?;
-            let a_val = embed_lora.a_values.get(token_idx).copied().ok_or_else(|| {
-                Error::InvalidInput("embedding LoRA token out of bounds".to_owned())
-            })?;
-            if !a_val.is_finite() {
-                return Err(Error::InvalidInput(
-                    "embedding LoRA scalar or scale is non-finite".to_owned(),
-                ));
-            }
-            self.host_lora_ranks.push(a_val);
-        }
-        self.device
-            .write_buffer_f32(lora_dst, &self.host_lora_ranks)?;
-        Ok(Some((embed_lora.b_span, effective_scale)))
-    }
-
     fn prepare_tile_host_inputs(&mut self, tokens: &[u32]) -> Result<PreparedTileUpload, Error> {
         if !self.device.has_unwaited_slots() {
             self.staging_bank_in_flight = [false; 2];
@@ -2410,22 +2265,16 @@ impl VulkanBatchedGraphExecutor {
             None
         };
 
-        let (hidden_dst, lora_dst, rope_dst) = if let Some(bank) = staged_bank {
+        let (hidden_dst, rope_dst) = if let Some(bank) = staged_bank {
             (
                 self.scratch.hidden_staging[bank],
-                self.scratch.lora_ranks_staging[bank],
                 self.scratch.rope_freqs_staging[bank],
             )
         } else {
-            (
-                self.scratch.hidden,
-                self.scratch.lora_ranks,
-                self.scratch.rope_freqs,
-            )
+            (self.scratch.hidden, self.scratch.rope_freqs)
         };
 
         self.write_tile_embeddings(tokens, hidden_dst)?;
-        let active_embed_lora = self.write_tile_embed_lora(tokens, lora_dst)?;
 
         let has_full_layers = self
             .layers
@@ -2451,7 +2300,6 @@ impl VulkanBatchedGraphExecutor {
         }
 
         Ok(PreparedTileUpload {
-            active_embed_lora,
             staged_bank,
             has_full_layers,
         })
@@ -2509,10 +2357,7 @@ impl VulkanBatchedGraphExecutor {
         check: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
         let t_len = tokens.len();
-        let t_u32 = u32::try_from(t_len)
-            .map_err(|_| Error::ResourceLimit("tile token count exceeds u32".to_owned()))?;
         let prepared = self.prepare_tile_host_inputs(tokens)?;
-        let active_embed_lora = prepared.active_embed_lora;
 
         let chunks = self
             .config
@@ -2539,15 +2384,6 @@ impl VulkanBatchedGraphExecutor {
                         total_embed_u32,
                         true,
                     )?;
-                    if active_embed_lora.is_some() {
-                        this.record_copy_slice(
-                            this.scratch.lora_ranks_staging[bank],
-                            0,
-                            this.scratch.lora_ranks,
-                            t_u32,
-                            false,
-                        )?;
-                    }
                     if prepared.has_full_layers {
                         let total_rope_u32 =
                             u32::try_from(t_len * this.geometry.rope).map_err(|_| {
@@ -2565,36 +2401,6 @@ impl VulkanBatchedGraphExecutor {
                 }
                 if this.transforms.inverse_embedding {
                     this.record_inverse_embedding_transform_tokens(t_len)?;
-                }
-                if let Some((b_span, eff_scale)) = active_embed_lora {
-                    let embed_u32 = u32::try_from(this.geometry.embedding)
-                        .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
-                    if t_len == 1 {
-                        this.batch_recorder.push_barrier(
-                            this.pipelines.lora_b_accum,
-                            &[
-                                b_span,
-                                BufferSpan::whole(this.scratch.lora_ranks),
-                                BufferSpan::whole(this.scratch.hidden),
-                            ],
-                            &[embed_u32, 1, eff_scale.to_bits()],
-                            checked_grid(&this.device, [embed_u32.div_ceil(WORKGROUP_X), 1, 1])?,
-                        );
-                    } else {
-                        this.batch_recorder.push_barrier(
-                            this.pipelines.lora_b_accum_batched,
-                            &[
-                                b_span,
-                                BufferSpan::whole(this.scratch.lora_ranks),
-                                BufferSpan::whole(this.scratch.hidden),
-                            ],
-                            &[embed_u32, 1, t_u32, eff_scale.to_bits()],
-                            checked_grid(
-                                &this.device,
-                                [embed_u32.div_ceil(WORKGROUP_X), t_u32.div_ceil(4), 1],
-                            )?,
-                        );
-                    }
                 }
                 Ok(())
             };
@@ -4200,16 +4006,11 @@ impl VulkanBatchedGraphExecutor {
         targets: &[(GpuMatrixWeight, BufferId)],
         tokens: usize,
     ) -> Result<(), Error> {
-        let r1_scale = self.rank_one_scale.filter(|&s| s != 0.0);
-        let mr_scale = self.multi_rank_scale.filter(|&s| s != 0.0);
-        if r1_scale.is_none() && mr_scale.is_none() {
+        let Some(scale) = self.multi_rank_scale.filter(|&s| s != 0.0) else {
             return Ok(());
-        }
+        };
         for &(weight, out_buf) in targets {
-            if let (Some(scale), Some(lora)) = (r1_scale, weight.rank_one) {
-                self.record_linear_lora_tokens(src_buf, out_buf, lora, scale, tokens)?;
-            }
-            if let (Some(scale), Some(lora)) = (mr_scale, weight.multi_rank) {
+            if let Some(lora) = weight.multi_rank {
                 self.record_linear_lora_tokens(src_buf, out_buf, lora, scale, tokens)?;
             }
         }
@@ -5473,24 +5274,6 @@ fn load_and_upload_vector(
     guard.alloc_f32_buffer(row_scratch)
 }
 
-fn clone_model(model: &Model) -> Model {
-    Model {
-        metadata: model.metadata.clone(),
-        tensors: model.tensors.clone(),
-        identity: model.identity.clone(),
-    }
-}
-
-fn validate_rank_one_scale(scale: f32) -> Result<(), Error> {
-    if scale.is_finite() && (0.0..=2.0).contains(&scale) {
-        Ok(())
-    } else {
-        Err(Error::InvalidInput(
-            "rank-one adapter scale must be finite and in 0..=2".to_owned(),
-        ))
-    }
-}
-
 fn parse_blk_target(target: &str) -> Option<(usize, &str)> {
     let rest = target.strip_prefix("blk.")?;
     let (layer_str, suffix) = rest.split_once('.')?;
@@ -5499,33 +5282,6 @@ fn parse_blk_target(target: &str) -> Option<(usize, &str)> {
     }
     let layer_idx = layer_str.parse::<usize>().ok()?;
     Some((layer_idx, suffix))
-}
-
-fn is_live_rank_one_target(
-    target: &str,
-    recurrent_flags: &[bool],
-    has_separate_output: bool,
-) -> Result<bool, Error> {
-    if target == "token_embd.weight" {
-        if !has_separate_output {
-            return Err(Error::InvalidInput(
-                "rank-one embedding adapter requires a separate output head".to_owned(),
-            ));
-        }
-        return Ok(true);
-    }
-    let Some((layer_idx, suffix)) = parse_blk_target(target) else {
-        return Ok(false);
-    };
-    let Some(&is_recurrent) = recurrent_flags.get(layer_idx) else {
-        return Ok(false);
-    };
-    Ok(match suffix {
-        "ffn_down.weight" => true,
-        "ssm_out.weight" => is_recurrent,
-        "attn_output.weight" => !is_recurrent,
-        _ => false,
-    })
 }
 
 fn is_live_multi_rank_target(target: &str, recurrent_flags: &[bool]) -> bool {
@@ -5606,12 +5362,6 @@ fn upload_arena_words(
     Ok(span)
 }
 
-struct PreparedRankOneEmbed {
-    a_values: Vec<f32>,
-    b_words: Vec<u32>,
-    alpha: f32,
-}
-
 struct PreparedLinearLoraFactor {
     a_words: Vec<u32>,
     b_words: Vec<u32>,
@@ -5623,107 +5373,22 @@ struct PreparedLinearLoraFactor {
 
 #[derive(Default)]
 struct PreparedAdapters {
-    rank_one_linear: BTreeMap<String, PreparedLinearLoraFactor>,
-    rank_one_embed: Option<PreparedRankOneEmbed>,
     multi_rank_linear: BTreeMap<String, PreparedLinearLoraFactor>,
     max_rank: usize,
     content_sha256: String,
-    rank_one_scale: Option<f32>,
     multi_rank_scale: Option<f32>,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Validates RankOneAdapter and MultiRankAdapter contracts, preserves per-site heterogeneous ranks, and hashes deterministic adapter provenance."
-)]
 fn prepare_adapters_upload(
     base_model: &Model,
-    geometry: &GraphGeometry,
+    _geometry: &GraphGeometry,
     recurrent_flags: &[bool],
-    has_separate_output: bool,
+    _has_separate_output: bool,
     adapters: VulkanBatchedAdapters<'_>,
 ) -> Result<PreparedAdapters, Error> {
     let mut prepared = PreparedAdapters::default();
     let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
     hash_bytes(&mut hasher, b"vk-batched-adapters-v1:")?;
-
-    if let Some(spec) = adapters.rank_one {
-        validate_rank_one_scale(spec.scale)?;
-        let validated = RankOneAdapter::from_model(clone_model(spec.adapter), base_model)
-            .map_err(|err| Error::InvalidInput(err.to_string()))?;
-        let alpha = meta_f32(spec.adapter, "adapter.lora_alpha")?;
-        hash_str(&mut hasher, b"r1-id:", validated.identity())?;
-        hash_u32(&mut hasher, alpha.to_bits())?;
-        hash_usize(&mut hasher, validated.target_count())?;
-
-        for (name, a_tensor) in &spec.adapter.tensors {
-            let Some(target) = name.strip_suffix(".lora_a") else {
-                continue;
-            };
-            if !is_live_rank_one_target(target, recurrent_flags, has_separate_output)? {
-                return Err(Error::InvalidInput(
-                    "rank-one adapter target is outside the live GPU graph".to_owned(),
-                ));
-            }
-            let b_tensor = spec
-                .adapter
-                .tensors
-                .get(&format!("{target}.lora_b"))
-                .ok_or_else(|| {
-                    Error::InvalidInput("rank-one adapter B factor missing".to_owned())
-                })?;
-            let base_tensor = base_model
-                .tensors
-                .get(target)
-                .ok_or_else(|| Error::InvalidInput("rank-one base target missing".to_owned()))?;
-            let [in_features, out_features] = base_tensor.dimensions.as_slice() else {
-                return Err(Error::InvalidInput(
-                    "rank-one base target must be rank 2".to_owned(),
-                ));
-            };
-            let a_words = decode_lora_words(a_tensor)?;
-            let b_words = decode_lora_words(b_tensor)?;
-            hash_str(&mut hasher, b"r1-tgt:", target)?;
-            hash_usize(&mut hasher, a_words.len())?;
-            for &w in &a_words {
-                hash_u32(&mut hasher, w)?;
-            }
-            hash_usize(&mut hasher, b_words.len())?;
-            for &w in &b_words {
-                hash_u32(&mut hasher, w)?;
-            }
-
-            if target == "token_embd.weight" {
-                let a_values: Vec<f32> = a_words.into_iter().map(f32::from_bits).collect();
-                if a_values.len() != geometry.vocabulary || b_words.len() != geometry.embedding {
-                    return Err(Error::InvalidInput(
-                        "rank-one embedding adapter shape mismatch".to_owned(),
-                    ));
-                }
-                prepared.rank_one_embed = Some(PreparedRankOneEmbed {
-                    a_values,
-                    b_words,
-                    alpha,
-                });
-            } else {
-                prepared.rank_one_linear.insert(
-                    target.to_owned(),
-                    PreparedLinearLoraFactor {
-                        a_words,
-                        b_words,
-                        in_features: *in_features,
-                        out_features: *out_features,
-                        rank: 1,
-                        scaling: alpha,
-                    },
-                );
-                prepared.max_rank = prepared.max_rank.max(1);
-            }
-        }
-        prepared.rank_one_scale = Some(spec.scale);
-    } else {
-        hash_bytes(&mut hasher, b"r1-none")?;
-    }
 
     if let Some(spec) = adapters.multi_rank {
         MultiRankAdapter::validate_scale(spec.scale)
@@ -5832,33 +5497,9 @@ fn parse_and_upload_adapters(
     let mut uploaded = UploadedAdapters {
         max_rank: prepared.max_rank,
         content_sha256: prepared.content_sha256,
-        rank_one_scale: prepared.rank_one_scale,
         multi_rank_scale: prepared.multi_rank_scale,
         ..UploadedAdapters::default()
     };
-    if let Some(embed) = prepared.rank_one_embed {
-        let b_span = upload_arena_words(&embed.b_words, guard)?;
-        uploaded.rank_one_embed = Some(GpuRankOneEmbed {
-            a_values: embed.a_values,
-            b_span,
-            alpha: embed.alpha,
-        });
-    }
-    for (target, factor) in prepared.rank_one_linear {
-        let a_span = upload_arena_words(&factor.a_words, guard)?;
-        let b_span = upload_arena_words(&factor.b_words, guard)?;
-        uploaded.rank_one_linear.insert(
-            target,
-            GpuLoraFactor {
-                a_span,
-                b_span,
-                in_features: factor.in_features,
-                out_features: factor.out_features,
-                rank: factor.rank,
-                scaling: factor.scaling,
-            },
-        );
-    }
     for (target, factor) in prepared.multi_rank_linear {
         let a_span = upload_arena_words(&factor.a_words, guard)?;
         let b_span = upload_arena_words(&factor.b_words, guard)?;
@@ -5968,11 +5609,6 @@ fn upload_matrix_tensor(
     guard
         .device
         .write_buffer_u32_at(span.buffer, span.offset, repack_scratch)?;
-    let rank_one = adapters
-        .rank_one_linear
-        .get(&tensor.name)
-        .copied()
-        .filter(|lora| lora.in_features == cols && lora.out_features == rows);
     let multi_rank = adapters
         .multi_rank_linear
         .get(&tensor.name)
@@ -5985,7 +5621,6 @@ fn upload_matrix_tensor(
         rows,
         rotated,
         grouped_ssm,
-        rank_one,
         multi_rank,
     })
 }
@@ -6236,7 +5871,6 @@ fn upload_full_attention(
 }
 
 struct PreparedTileUpload {
-    active_embed_lora: Option<(BufferSpan, f32)>,
     staged_bank: Option<usize>,
     has_full_layers: bool,
 }
@@ -6676,7 +6310,6 @@ const fn select_fused_attention_dispatch(
 
 fn compute_executor_identity(
     base_provenance_sha256: &str,
-    rank_one_scale: Option<f32>,
     multi_rank_scale: Option<f32>,
 ) -> Result<String, Error> {
     let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -6685,13 +6318,6 @@ fn compute_executor_identity(
         b"vk-batched-exec-id-v1:",
         base_provenance_sha256,
     )?;
-    match rank_one_scale {
-        Some(scale) => {
-            hash_bytes(&mut hasher, &[1])?;
-            hash_u32(&mut hasher, scale.to_bits())?;
-        }
-        None => hash_bytes(&mut hasher, &[0])?,
-    }
     match multi_rank_scale {
         Some(scale) => {
             hash_bytes(&mut hasher, &[1])?;
@@ -6910,14 +6536,14 @@ mod tests {
     #[test]
     fn executor_identity_changes_with_adapter_scales() -> Result<(), Error> {
         let base = "base-prov-123";
-        let id_none = compute_executor_identity(base, None, None)?;
-        let id_r1_1 = compute_executor_identity(base, Some(1.0), None)?;
-        let id_r1_0 = compute_executor_identity(base, Some(0.0), None)?;
-        let id_r1_mr = compute_executor_identity(base, Some(1.0), Some(0.5))?;
-        assert_ne!(id_none, id_r1_1);
-        assert_ne!(id_r1_1, id_r1_0);
-        assert_ne!(id_r1_1, id_r1_mr);
-        assert_eq!(id_r1_1, compute_executor_identity(base, Some(1.0), None)?);
+        let id_none = compute_executor_identity(base, None)?;
+        let id_mr_1 = compute_executor_identity(base, Some(1.0))?;
+        let id_mr_0 = compute_executor_identity(base, Some(0.0))?;
+        let id_mr_half = compute_executor_identity(base, Some(0.5))?;
+        assert_ne!(id_none, id_mr_1);
+        assert_ne!(id_mr_1, id_mr_0);
+        assert_ne!(id_mr_1, id_mr_half);
+        assert_eq!(id_mr_1, compute_executor_identity(base, Some(1.0))?);
         Ok(())
     }
 
@@ -7043,44 +6669,6 @@ mod tests {
         }
     }
 
-    fn test_heterogeneous_r1_adapter() -> Model {
-        use bonsai_gguf::MetadataValue;
-
-        Model {
-            metadata: BTreeMap::from([
-                (
-                    "general.architecture".to_owned(),
-                    MetadataValue::from("qwen35"),
-                ),
-                ("general.type".to_owned(), MetadataValue::from("adapter")),
-                ("adapter.type".to_owned(), MetadataValue::from("lora")),
-                (
-                    "adapter.lora_alpha".to_owned(),
-                    MetadataValue::from(1.0_f32),
-                ),
-            ]),
-            tensors: BTreeMap::from([
-                (
-                    "blk.0.ffn_down.weight.lora_a".to_owned(),
-                    test_heterogeneous_f32_tensor("blk.0.ffn_down.weight.lora_a", &[32, 1], 0.25),
-                ),
-                (
-                    "blk.0.ffn_down.weight.lora_b".to_owned(),
-                    test_heterogeneous_f32_tensor("blk.0.ffn_down.weight.lora_b", &[1, 16], 0.5),
-                ),
-                (
-                    "blk.1.ffn_down.weight.lora_a".to_owned(),
-                    test_heterogeneous_f32_tensor("blk.1.ffn_down.weight.lora_a", &[32, 1], 0.25),
-                ),
-                (
-                    "blk.1.ffn_down.weight.lora_b".to_owned(),
-                    test_heterogeneous_f32_tensor("blk.1.ffn_down.weight.lora_b", &[1, 16], 0.5),
-                ),
-            ]),
-            identity: "vk-r1-id".to_owned(),
-        }
-    }
-
     fn test_heterogeneous_mr_adapter(blk3_rank: usize) -> Model {
         use bonsai_gguf::MetadataValue;
 
@@ -7148,7 +6736,6 @@ mod tests {
             context_limit: 32,
         };
         let base_model = test_heterogeneous_base_model(&geometry);
-        let r1_model = test_heterogeneous_r1_adapter();
         let mr_model = test_heterogeneous_mr_adapter(6);
         let recurrent_flags = [true, true, true, false];
         let prepare = |mr: &Model| {
@@ -7158,10 +6745,6 @@ mod tests {
                 &recurrent_flags,
                 true,
                 VulkanBatchedAdapters {
-                    rank_one: Some(VulkanRankOneAdapterSpec {
-                        adapter: &r1_model,
-                        scale: 1.3,
-                    }),
                     multi_rank: Some(VulkanMultiRankAdapterSpec {
                         adapter: mr,
                         policy: MultiRankPolicy::NpuFriendly,
@@ -7172,7 +6755,6 @@ mod tests {
         };
         let prepared = prepare(&mr_model)?;
         assert_eq!(prepared.max_rank, 6);
-        assert_eq!(prepared.rank_one_linear.len(), 2);
         assert_eq!(prepared.multi_rank_linear.len(), 7);
         assert!(
             !prepared

@@ -13,7 +13,7 @@ use std::{
 use bonsai_adreno_vulkan::{
     AttentionStrategy, CommandBatchRecorder, ProjectionKernelPath, TdrChunkPolicy,
     VulkanBatchedAdapters, VulkanBatchedConfig, VulkanBatchedGraphExecutor, VulkanKvPrecision,
-    VulkanMultiRankAdapterSpec, VulkanPq2Executor, VulkanRankOneAdapterSpec,
+    VulkanMultiRankAdapterSpec, VulkanPq2Executor,
     device::{AdrenoVulkanDevice, BufferId, BufferSpan, ComputeStage},
     spirv,
 };
@@ -24,7 +24,7 @@ use bonsai_prism_runtime::{
     kernels::{MatvecBackend, Pq2ProjectionExecutor, Q8Block, Q8KBlock},
     model::{
         Model, Tensor,
-        lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
+        lora::{MultiRankAdapter, MultiRankPolicy},
     },
     runtime::{Limits, Runtime},
 };
@@ -81,58 +81,6 @@ fn base_adapter_metadata(alpha: f32) -> BTreeMap<String, MetadataValue> {
     metadata.insert("adapter.type".to_owned(), MetadataValue::from("lora"));
     metadata.insert("adapter.lora_alpha".to_owned(), MetadataValue::from(alpha));
     metadata
-}
-
-fn synthetic_rank_one_adapter(
-    base: &Model,
-    identity: &str,
-    alpha: f32,
-    include_embed: bool,
-    kind: u32,
-) -> ModelResult {
-    let mut tensors = BTreeMap::new();
-    let targets = [
-        "token_embd.weight",
-        "blk.0.ssm_out.weight",
-        "blk.2.attn_output.weight",
-        "blk.2.ffn_down.weight",
-    ];
-    for (idx, target) in targets.into_iter().enumerate() {
-        if target == "token_embd.weight" && !include_embed {
-            continue;
-        }
-        let base_tensor = base
-            .tensors
-            .get(target)
-            .ok_or_else(|| format!("missing base tensor {target}"))?;
-        let [input_dim, output_dim] = base_tensor.dimensions.as_slice() else {
-            return Err(format!("base tensor {target} is not 2D").into());
-        };
-        let (a_dims, b_dims) = if target == "token_embd.weight" {
-            ([1_usize, *output_dim], [1_usize, *input_dim])
-        } else {
-            ([*input_dim, 1_usize], [1_usize, *output_dim])
-        };
-        let a_len = a_dims[0] * a_dims[1];
-        let b_len = b_dims[0] * b_dims[1];
-        let a_vals = fill_pattern(a_len, 0.013, 100 + idx * 2);
-        let b_vals = fill_pattern(b_len, 0.011, 101 + idx * 2);
-        let a_name = format!("{target}.lora_a");
-        let b_name = format!("{target}.lora_b");
-        tensors.insert(
-            a_name.clone(),
-            adapter_tensor(&a_name, &a_dims, kind, &a_vals)?,
-        );
-        tensors.insert(
-            b_name.clone(),
-            adapter_tensor(&b_name, &b_dims, kind, &b_vals)?,
-        );
-    }
-    Ok(Model {
-        metadata: base_adapter_metadata(alpha),
-        tensors,
-        identity: identity.to_owned(),
-    })
 }
 
 fn synthetic_multi_rank_adapter(
@@ -1017,7 +965,6 @@ fn live_direct_f16kv_attention_strategies_match_cpu_qwen35() -> TestResult {
             64 * 1024 * 1024,
             MatvecBackend::Auto,
             None,
-            None,
             KvCachePolicy::F16,
         )?;
         let mut gpu = VulkanBatchedGraphExecutor::open(
@@ -1046,21 +993,18 @@ fn live_direct_f16kv_attention_strategies_match_cpu_qwen35() -> TestResult {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Tests stacked RankOne + MultiRank GPU LoRA parity, 0.0 bypass, scale invalidation, and F32 multi-rank."
+    reason = "Tests MultiRank GPU LoRA parity, 0.0 bypass, scale invalidation, and F32 multi-rank."
 )]
 #[test]
 #[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
-fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestResult {
+fn live_lora_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestResult {
     let base_id = "live-lora-parity";
     let cpu_model_adapted = synthetic_hybrid_qwen35_model(base_id)?;
     let gpu_model_adapted = synthetic_hybrid_qwen35_model(base_id)?;
-    let r1_model = synthetic_rank_one_adapter(&cpu_model_adapted, "r1-lora-id", 1.5, true, 0)?;
-    let r1_gpu_model = synthetic_rank_one_adapter(&gpu_model_adapted, "r1-lora-id", 1.5, true, 0)?;
     let mr_model = synthetic_multi_rank_adapter(&cpu_model_adapted, "mr-f16-lora-id", 2.0, 4, 1)?;
     let mr_gpu_model =
         synthetic_multi_rank_adapter(&gpu_model_adapted, "mr-f16-lora-id", 2.0, 4, 1)?;
 
-    let cpu_r1 = RankOneAdapter::from_model(r1_model, &cpu_model_adapted)?;
     let cpu_mr =
         MultiRankAdapter::from_model(&cpu_model_adapted, &mr_model, MultiRankPolicy::AnyLinear)?;
     let mut cpu_adapted = Qwen35::with_adapters_and_kv(
@@ -1068,7 +1012,6 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
         16,
         64 * 1024 * 1024,
         MatvecBackend::Auto,
-        Some((cpu_r1, 0.75)),
         Some((cpu_mr, 1.25)),
         KvCachePolicy::F16,
     )?;
@@ -1077,10 +1020,6 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
         &gpu_model_adapted,
         VulkanBatchedConfig::default(),
         VulkanBatchedAdapters {
-            rank_one: Some(VulkanRankOneAdapterSpec {
-                adapter: &r1_gpu_model,
-                scale: 0.75,
-            }),
             multi_rank: Some(VulkanMultiRankAdapterSpec {
                 adapter: &mr_gpu_model,
                 policy: MultiRankPolicy::AnyLinear,
@@ -1088,25 +1027,23 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
             }),
         },
     )?;
-    assert_eq!(gpu.rank_one_scale(), Some(0.75));
     assert_eq!(gpu.multi_rank_scale(), Some(1.25));
     let id_adapted = gpu.identity_sha256().to_owned();
 
     let ref_t0 = cpu_adapted.evaluate(0)?;
     let gpu_t0 = gpu.evaluate_token(0)?;
-    assert_close(&gpu_t0, &ref_t0, 2e-4, "stacked lora token 0");
+    assert_close(&gpu_t0, &ref_t0, 2e-4, "multi-rank lora token 0");
     let saved_snap = gpu.checkpoint()?;
 
     cpu_adapted.ingest(1)?;
     gpu.ingest_token(1)?;
     let ref_t2 = cpu_adapted.evaluate(2)?;
     let gpu_t2 = gpu.evaluate_token(2)?;
-    assert_close(&gpu_t2, &ref_t2, 2e-4, "stacked lora token 2");
+    assert_close(&gpu_t2, &ref_t2, 2e-4, "multi-rank lora token 2");
 
     // Fast-path `scale == 0.0` bypass must change identity, invalidate stale checkpoints,
     // and match unadapted base CPU logits cleanly.
-    gpu.reset_with_adapter_scales(Some(0.0), Some(0.0))?;
-    assert_eq!(gpu.rank_one_scale(), Some(0.0));
+    gpu.reset_with_adapter_scales(Some(0.0))?;
     assert_eq!(gpu.multi_rank_scale(), Some(0.0));
     let id_zero = gpu.identity_sha256().to_owned();
     assert_ne!(id_zero, id_adapted);
@@ -1118,7 +1055,6 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
         64 * 1024 * 1024,
         MatvecBackend::Auto,
         None,
-        None,
         KvCachePolicy::F16,
     )?;
     let cpu_base_t0 = cpu_base.evaluate(0)?;
@@ -1129,32 +1065,26 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
     assert_close(&gpu_zero_t1, &cpu_base_t1, 1e-4, "scale 0.0 bypass token 1");
 
     // Dynamic scale updates invalidate identity and reproduce updated CPU reference after reset.
-    gpu.set_rank_one_scale(0.5)?;
-    let id_half_zero = gpu.identity_sha256().to_owned();
-    assert_ne!(id_half_zero, id_zero);
-    assert_ne!(id_half_zero, id_adapted);
     gpu.set_multi_rank_scale(1.0)?;
-    let id_half_one = gpu.identity_sha256().to_owned();
-    assert_ne!(id_half_one, id_half_zero);
+    let id_one = gpu.identity_sha256().to_owned();
+    assert_ne!(id_one, id_zero);
+    assert_ne!(id_one, id_adapted);
     gpu.reset()?;
-    assert_eq!(gpu.identity_sha256(), id_half_one);
+    assert_eq!(gpu.identity_sha256(), id_one);
 
     // Reject invalid scales and verify error does not mutate configured scales.
-    assert!(gpu.set_rank_one_scale(-0.1).is_err());
-    assert!(gpu.set_rank_one_scale(2.5).is_err());
+    assert!(gpu.set_multi_rank_scale(-0.1).is_err());
+    assert!(gpu.set_multi_rank_scale(2.5).is_err());
     assert!(gpu.set_multi_rank_scale(f32::NAN).is_err());
-    assert_eq!(gpu.rank_one_scale(), Some(0.5));
     assert_eq!(gpu.multi_rank_scale(), Some(1.0));
 
     let base_cpu2 = synthetic_hybrid_qwen35_model(base_id)?;
-    let r1_2 = synthetic_rank_one_adapter(&base_cpu2, "r1-lora-id", 1.5, true, 0)?;
     let mr_2 = synthetic_multi_rank_adapter(&base_cpu2, "mr-f16-lora-id", 2.0, 4, 1)?;
     let mut cpu_updated = Qwen35::with_adapters_and_kv(
         base_cpu2,
         16,
         64 * 1024 * 1024,
         MatvecBackend::Auto,
-        Some((RankOneAdapter::from_model(r1_2, &gpu_model_adapted)?, 0.5)),
         Some((
             MultiRankAdapter::from_model(&gpu_model_adapted, &mr_2, MultiRankPolicy::AnyLinear)?,
             1.0,
@@ -1165,7 +1095,7 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
     let gpu_upd_t0 = gpu.evaluate_token(0)?;
     assert_close(&gpu_upd_t0, &cpu_upd_t0, 2e-4, "rescaled lora token 0");
 
-    // Verify F32 multi-rank adapter path and error when setting rank-one on multi-rank-only executor.
+    // Verify F32 multi-rank adapter path.
     let f32_host_model = synthetic_hybrid_qwen35_model("mr-f32-base")?;
     let f32_device_model = synthetic_hybrid_qwen35_model("mr-f32-base")?;
     let mr_f32 = synthetic_multi_rank_adapter(&f32_host_model, "mr-f32-lora-id", 3.0, 4, 0)?;
@@ -1174,7 +1104,6 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
         16,
         64 * 1024 * 1024,
         MatvecBackend::Auto,
-        None,
         Some((
             MultiRankAdapter::from_model(&f32_device_model, &mr_f32, MultiRankPolicy::AnyLinear)?,
             1.25,
@@ -1185,7 +1114,6 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
         &f32_device_model,
         VulkanBatchedConfig::default(),
         VulkanBatchedAdapters {
-            rank_one: None,
             multi_rank: Some(VulkanMultiRankAdapterSpec {
                 adapter: &mr_f32,
                 policy: MultiRankPolicy::AnyLinear,
@@ -1193,7 +1121,6 @@ fn live_lora_rank_one_multi_rank_and_dynamic_scale_match_cpu_qwen35() -> TestRes
             }),
         },
     )?;
-    assert!(gpu_mr_f32.set_rank_one_scale(1.0).is_err());
     let cpu_f32_t0 = cpu_mr_f32.evaluate(0)?;
     let gpu_f32_t0 = gpu_mr_f32.evaluate_token(0)?;
     assert_close(&gpu_f32_t0, &cpu_f32_t0, 2e-4, "f32 multi-rank token 0");
@@ -1316,7 +1243,6 @@ fn live_batched_prefill_matches_sequential_ingest_and_checkpoint() -> TestResult
             64 * 1024 * 1024,
             MatvecBackend::Auto,
             None,
-            None,
             KvCachePolicy::F16,
         )?;
         let mut seq_refs = Vec::new();
@@ -1403,21 +1329,16 @@ fn live_batched_prefill_matches_sequential_ingest_and_checkpoint() -> TestResult
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Tests odd-128 Q8_0 4-token GEMM, stacked RankOne+MultiRank LoRA, zero-scale bypass, sub-tiled attention fallback, and cancellation rollback."
+    reason = "Tests odd-128 Q8_0 4-token GEMM, MultiRank LoRA, zero-scale bypass, sub-tiled attention fallback, and cancellation rollback."
 )]
 #[test]
 #[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
 fn live_batched_prefill_odd128_q8_0_lora_subtile_and_cancellation() -> TestResult {
-    // 1. Odd-128 column hybrid model + stacked RankOne + MultiRank LoRA across T=1, 3, 7, 16.
+    // 1. Odd-128 column hybrid model + MultiRank LoRA across T=1, 3, 7, 16.
     let base_seq_model = synthetic_hybrid_qwen35_model_with_layout("odd128-lora", 384, 384, 32)?;
     let base_bat_model = synthetic_hybrid_qwen35_model_with_layout("odd128-lora", 384, 384, 32)?;
-    let r1_model = synthetic_rank_one_adapter(&base_seq_model, "r1-odd128", 1.5, true, 0)?;
     let mr_model = synthetic_multi_rank_adapter(&base_seq_model, "mr-odd128", 2.0, 4, 1)?;
     let make_adapters = || VulkanBatchedAdapters {
-        rank_one: Some(VulkanRankOneAdapterSpec {
-            adapter: &r1_model,
-            scale: 0.75,
-        }),
         multi_rank: Some(VulkanMultiRankAdapterSpec {
             adapter: &mr_model,
             policy: MultiRankPolicy::AnyLinear,
@@ -1453,8 +1374,8 @@ fn live_batched_prefill_odd128_q8_0_lora_subtile_and_cancellation() -> TestResul
     assert_close(&bat_logits, &seq_logits, 2e-4, "odd128 lora batched vs seq");
 
     // Zero-scale LoRA bypass in batched mode must match unadapted sequential base.
-    seq_exec.reset_with_adapter_scales(Some(0.0), Some(0.0))?;
-    bat_exec.reset_with_adapter_scales(Some(0.0), Some(0.0))?;
+    seq_exec.reset_with_adapter_scales(Some(0.0))?;
+    bat_exec.reset_with_adapter_scales(Some(0.0))?;
     for &t in &tokens[..4] {
         seq_exec.ingest_token(t)?;
     }
@@ -2643,7 +2564,6 @@ fn live_prefill_16tok_fused_h1024_and_decode_gdn_hybrid_parity() -> TestResult {
             64,
             64 * 1024 * 1024,
             MatvecBackend::Auto,
-            None,
             None,
             KvCachePolicy::F16,
         )?;

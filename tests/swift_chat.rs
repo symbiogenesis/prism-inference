@@ -132,17 +132,13 @@ fn swift_pinned_template_supports_low_medium_and_xhigh_reasoning_efforts() -> Re
 
 #[test]
 fn swift_chat_rejects_foreign_model_and_unverified_template_before_tokenizer_build() -> Result<()> {
-    let fixture = capture()?;
     let mut metadata = ModelMetadata {
         metadata: bonsai_gguf::Metadata::new(),
         vocab_size: 248_320,
         identity: "0".repeat(64),
     };
     assert!(SwiftChatSession::from_metadata(&metadata).is_err());
-    metadata.identity = fixture["model_sha256"]
-        .as_str()
-        .ok_or("missing model hash")?
-        .into();
+    metadata.identity = swift::BONSAI_2_5_PQ2_SHA256.into();
     metadata.metadata.insert(
         "general.architecture".into(),
         bonsai_gguf::MetadataValue::String("qwen35".into()),
@@ -194,7 +190,7 @@ fn synthetic_swift_metadata() -> Result<ModelMetadata> {
         types[id] = 3;
     }
     Ok(ModelMetadata {
-        identity: swift::MODEL_SHA256.into(),
+        identity: swift::BONSAI_2_5_PQ2_SHA256.into(),
         vocab_size: swift::VOCAB_SIZE,
         metadata: Metadata::from([
             ("general.architecture".into(), MetadataValue::from("qwen35")),
@@ -244,17 +240,15 @@ fn swift_chat_current_weight_selection_preserves_exact_template_tokens_and_defau
     let mut model = synthetic_swift_metadata()?;
     let pq2 = SwiftChatSession::from_metadata(&model)?;
     assert!(
-        SwiftChatSession::from_metadata_representation(&model, Representation::CurrentRepackedPtq1)
+        SwiftChatSession::from_metadata_representation(&model, Representation::Bonsai25Ptq1)
             .is_err()
     );
-    model.identity = swift::REPACKED_PTQ1_SHA256.into();
+    model.identity = swift::BONSAI_2_5_PTQ1_SHA256.into();
     assert!(SwiftChatSession::from_metadata(&model).is_err());
-    let ptq1 = SwiftChatSession::from_metadata_representation(
-        &model,
-        Representation::CurrentRepackedPtq1,
-    )?;
+    let ptq1 =
+        SwiftChatSession::from_metadata_representation(&model, Representation::Bonsai25Ptq1)?;
     assert_ne!(pq2.identity(), ptq1.identity());
-    assert_eq!(ptq1.identity(), swift::REPACKED_PTQ1_SHA256);
+    assert_eq!(ptq1.identity(), swift::BONSAI_2_5_PTQ1_SHA256);
     assert_eq!(pq2.template_sha256(), ptq1.template_sha256());
     assert_eq!(pq2.stop_tokens(), ptq1.stop_tokens());
     for thinking in [false, true] {
@@ -266,16 +260,16 @@ fn swift_chat_current_weight_selection_preserves_exact_template_tokens_and_defau
     }
     model.identity = "older-published-PTQ1-checkpoint".into();
     assert!(
-        SwiftChatSession::from_metadata_representation(&model, Representation::CurrentRepackedPtq1)
+        SwiftChatSession::from_metadata_representation(&model, Representation::Bonsai25Ptq1)
             .is_err()
     );
-    model.identity = swift::REPACKED_PTQ1_SHA256.into();
+    model.identity = swift::BONSAI_2_5_PTQ1_SHA256.into();
     model.metadata.insert(
         "tokenizer.chat_template".into(),
         MetadataValue::from(format!("{TEMPLATE}\n")),
     );
     assert!(
-        SwiftChatSession::from_metadata_representation(&model, Representation::CurrentRepackedPtq1)
+        SwiftChatSession::from_metadata_representation(&model, Representation::Bonsai25Ptq1)
             .is_err()
     );
     Ok(())

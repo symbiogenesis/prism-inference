@@ -120,16 +120,10 @@ fn initialize_with_options(
 impl Engine for SwiftSession {
     type Prepared = crate::native_swift::NativeChat;
     fn profile(&self) -> Result<ModelProfile, NativeBackendError> {
-        if self.adapter_identity().is_some_and(|identity| {
-            identity != bonsai_prism_runtime::model::lora::SWIFT_ADAPTER_SHA256
-        }) {
-            return Err(NativeBackendError::Configuration);
-        }
         Ok(ModelProfile {
             placement: Placement::Auto,
             projection_startup: ProjectionStartup::default(),
             representation: self.representation(),
-            adapter: self.adapter_identity().is_some(),
             daisyrose_adapter: self.secondary_adapter_identity().is_some(),
             daisyrose_adapter_sha256: self.secondary_adapter_identity().map(Arc::from),
             daisyrose_adapter_max_rank: self
@@ -886,13 +880,7 @@ pub(super) const fn supports_hexagon_native_q2_representation(
     representation: bonsai_prism_runtime::model::swift::Representation,
 ) -> bool {
     match representation {
-        bonsai_prism_runtime::model::swift::Representation::Pq2
-        // `NativeQ2Executor`, `NativeQ2ArenaCache`, `plan_native_q2_layers_for_budget`,
-        // and `supports_f32` runtime dispatch (`src/graph.rs`, `src/kernels/projection.rs`,
-        // `src/graph/prefill.rs`, `src/graph/projection.rs`) all admit both `PQ2` (142) and
-        // `PTQ1_0` (143), including Ternary Bonsai 2.5 27B.
-        | bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1
-        | bonsai_prism_runtime::model::swift::Representation::Bonsai25Pq2
+        bonsai_prism_runtime::model::swift::Representation::Bonsai25Pq2
         | bonsai_prism_runtime::model::swift::Representation::Bonsai25Ptq1 => true,
         bonsai_prism_runtime::model::swift::Representation::NariQ2_5Bpw
         | bonsai_prism_runtime::model::swift::Representation::NariQ3_0Bpw
@@ -947,8 +935,6 @@ pub(super) fn hexagon_arena_cache_file_path(
     tensor_count: usize,
 ) -> PathBuf {
     let repr_slug = match representation {
-        bonsai_prism_runtime::model::swift::Representation::Pq2 => "pq2",
-        bonsai_prism_runtime::model::swift::Representation::CurrentRepackedPtq1 => "ptq1",
         bonsai_prism_runtime::model::swift::Representation::Bonsai25Pq2 => "bonsai25-pq2",
         bonsai_prism_runtime::model::swift::Representation::Bonsai25Ptq1 => "bonsai25-ptq1",
         bonsai_prism_runtime::model::swift::Representation::NariQ2_5Bpw => "nariq-2.5bpw",

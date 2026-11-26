@@ -5,7 +5,7 @@
 //! starts no server, loads no weights and changes no runtime selection.
 #![forbid(unsafe_code)]
 
-use bonsai_prism_runtime::model::{lora::SWIFT_ADAPTER_SHA256, swift};
+use bonsai_prism_runtime::model::swift;
 use serde_json::{Value, json};
 use std::{
     fs::{File, OpenOptions},
@@ -265,7 +265,7 @@ impl Evidence {
     fn write(&mut self, status: &str) -> Check<()> {
         let value = json!({"schemaVersion":1,"status":status,"completedSteps":self.steps,
             "readiness":self.readiness,
-            "scope":"original-pq2-approved-adapter-reset-every-request-private-http",
+            "scope":"bonsai-2-5-pq2-reset-every-request-private-http",
             "fullStateNumericalParityQualified":false,"performanceQualified":false,
             "activeGraphCancellationQualified":false,"completeStateRollbackQualified":false,
             "processOwnershipQualified":false,"defaultPromotionQualified":false});
@@ -286,29 +286,26 @@ fn readiness_identity(ready: &Value) -> Check<Value> {
     let model = &ready["data"][0];
     require(ready["data"].as_array().is_some_and(|a| a.len() == 1))?;
     require(
-        model["model_sha256"] == swift::MODEL_SHA256
+        model["model_sha256"] == swift::BONSAI_2_5_PQ2_SHA256
             && model["template_sha256"] == swift::TEMPLATE_SHA256,
     )?;
+    require(model["weight_representation"] == "Bonsai-2.5-PQ2_0")?;
     require(
-        model["adapter_sha256"] == SWIFT_ADAPTER_SHA256
-            && model["weight_representation"] == "PQ2_0",
-    )?;
-    require(
-        model["supports_abliteration_scale"] == true
-            && model["abliteration_scale_range"] == json!([0, 2]),
+        model["supports_daisyrose_scale"].is_boolean()
+            && model["daisyrose_scale_range"] == json!([0, 2]),
     )?;
     require(model.get("prompt_reuse").is_none())?;
     require(
-        model["id"] == "Swift-Bonsai-2-PQ2_0"
+        model["id"] == "Ternary-Bonsai-2.5-27B-PQ2_0"
             && model["runtime"] == "prism-inference"
             && model["context_tokens"] == 8192,
     )?;
     let seed = model["seed"].as_u64().ok_or_else(invalid)?;
     require(u32::try_from(seed).is_ok() && seed != u64::from(u32::MAX))?;
     Ok(
-        json!({"modelSha256":swift::MODEL_SHA256,"templateSha256":swift::TEMPLATE_SHA256,
-        "adapterSha256":SWIFT_ADAPTER_SHA256,"seed":seed,"contextTokens":8192,
-        "weightRepresentation":"PQ2_0","servingStatePolicy":"reset-every-request"}),
+        json!({"modelSha256":swift::BONSAI_2_5_PQ2_SHA256,"templateSha256":swift::TEMPLATE_SHA256,
+        "daisyroseAdapterSha256":model["daisyrose_adapter_sha256"],"seed":seed,"contextTokens":8192,
+        "weightRepresentation":"Bonsai-2.5-PQ2_0","servingStatePolicy":"reset-every-request"}),
     )
 }
 
@@ -439,14 +436,14 @@ mod tests {
 
     #[test]
     fn readiness_binds_the_exact_profile_and_observed_seed() -> Check<()> {
-        let ready = json!({"data":[{"id":"Swift-Bonsai-2-PQ2_0","runtime":"prism-inference",
-            "model_sha256":swift::MODEL_SHA256,"template_sha256":swift::TEMPLATE_SHA256,
-            "adapter_sha256":SWIFT_ADAPTER_SHA256,"weight_representation":"PQ2_0",
-            "supports_abliteration_scale":true,"abliteration_scale_range":[0,2],"context_tokens":8192,"seed":42}]});
+        let ready = json!({"data":[{"id":"Ternary-Bonsai-2.5-27B-PQ2_0","runtime":"prism-inference",
+            "model_sha256":swift::BONSAI_2_5_PQ2_SHA256,"template_sha256":swift::TEMPLATE_SHA256,
+            "daisyrose_adapter_sha256":Value::Null,"weight_representation":"Bonsai-2.5-PQ2_0",
+            "supports_daisyrose_scale":false,"daisyrose_scale_range":[0,2],"context_tokens":8192,"seed":42}]});
         assert_eq!(readiness_identity(&ready)?["seed"], 42);
         for (field, value) in [
             ("model_sha256", json!("wrong")),
-            ("adapter_sha256", Value::Null),
+            ("weight_representation", json!("other")),
             ("runtime", json!("other")),
             ("context_tokens", json!(4096)),
             ("seed", json!(u32::MAX)),

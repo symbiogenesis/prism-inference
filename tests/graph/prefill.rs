@@ -68,8 +68,8 @@ fn tiled_prefill_packed_ffn_and_adapter_preserve_original_basis_bits() -> Result
             for scale in [0.0, 1.3] {
                 let build = || -> Result<Qwen35> {
                     let model = backend_fixture(recurrent, kind, width)?;
-                    let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
-                    rank_one_graph(model, factors, scale)
+                    let factors = lora_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+                    lora_graph(model, factors, scale)
                 };
                 let mut expected = build()?;
                 let graph = build()?;
@@ -109,8 +109,8 @@ fn tiled_prefill_parallel_workers_preserve_state_restore_and_policy_changes() ->
                 for select_before_tile in [false, true] {
                     let build = || -> Result<Qwen35> {
                         let model = backend_fixture(recurrent, kind, width)?;
-                        let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
-                        rank_one_graph(model, factors, scale)
+                        let factors = lora_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+                        lora_graph(model, factors, scale)
                     };
                     let mut expected = build()?;
                     let mut graph = build()?;
@@ -294,8 +294,8 @@ fn tiled_prefill_runtime_failure_restores_all_layer_state_before_replay() -> Res
 fn tiled_prefill_adapter_scale_reset_preserves_execution_identity_and_provenance() -> Result<()> {
     for chunkwise in [false, true] {
         let base = fixture(true);
-        let factors = rank_one_factors(&base, &["blk.0.ssm_out.weight"], 0.125);
-        let graph = rank_one_graph(base, factors, 1.3)?;
+        let factors = lora_factors(&base, &["blk.0.attn_gate.weight"], 0.125);
+        let graph = lora_graph(base, factors, 1.3)?;
         let required = graph.tiled_prefill_scratch_bytes(8)?;
         let graph = graph.with_tiled_prefill(8, required)?;
         let mut graph = if chunkwise {
@@ -308,7 +308,7 @@ fn tiled_prefill_adapter_scale_reset_preserves_execution_identity_and_provenance
         let original_checkpoint = graph.checkpoint()?;
         for scale in [1.3, 0.5, 1.3] {
             let old = graph.checkpoint()?;
-            graph.reset_with_adapter_scale(scale)?;
+            graph.reset_with_adapter_scales(Some(scale))?;
             assert!(graph.identity().contains(":cpu-tiled-ffn-v1:8"));
             assert_eq!(graph.identity().contains(":gdn-wy-f32-v1"), chunkwise);
             assert!(graph.restore(&old).is_err());
@@ -491,7 +491,7 @@ fn parallel_grouped_hybrid_fixture(pinned: bool) -> Model {
     }
     model.tensors = tensors;
     model.identity = if pinned {
-        bonsai_prism_runtime::model::swift::MODEL_SHA256.to_owned()
+        bonsai_prism_runtime::model::swift::BONSAI_2_5_PQ2_SHA256.to_owned()
     } else {
         "parallel-grouped-hybrid-fixture".to_owned()
     };

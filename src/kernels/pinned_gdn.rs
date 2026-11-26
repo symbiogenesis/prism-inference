@@ -95,6 +95,7 @@ pub(crate) fn dot_pair(state: &[f32], first: &[f32], second: &[f32]) -> Result<(
 ///
 /// # Errors
 /// Rejects unequal vector lengths or a nonfinite result.
+#[cfg(test)]
 pub(crate) fn dot_four(state: &[f32], inputs: [&[f32]; 4]) -> Result<[f32; 4]> {
     let width = state.len();
     if inputs.iter().any(|input| input.len() != width) {

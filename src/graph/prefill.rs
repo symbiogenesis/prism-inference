@@ -1175,7 +1175,6 @@ impl Qwen35 {
         &self,
         tokens: &[u32],
         tile: &mut TiledPrefill,
-        adapter_scratch: &mut AdapterScratch,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         let count = tokens.len();
@@ -1231,16 +1230,6 @@ impl Qwen35 {
                     }
                 }
             }
-            if let Some(adapter) = &self.adapter {
-                for (token, hidden) in tokens.iter().zip(&mut tile.hidden[..count]) {
-                    adapter.embedding(
-                        usize::try_from(*token)?,
-                        self.adapter_scale,
-                        hidden,
-                        adapter_scratch,
-                    )?;
-                }
-            }
             return Ok(());
         }
         for (token, hidden) in tokens.iter().zip(&mut tile.hidden) {
@@ -1254,14 +1243,6 @@ impl Qwen35 {
                 self.transforms
                     .rotate_with_parallelism(hidden, tile.projector.row_parallelism())?;
                 self.transforms.sign(hidden);
-            }
-            if let Some(adapter) = &self.adapter {
-                adapter.embedding(
-                    usize::try_from(*token)?,
-                    self.adapter_scale,
-                    hidden,
-                    adapter_scratch,
-                )?;
             }
         }
         Ok(())
@@ -2207,13 +2188,8 @@ impl Qwen35 {
         let count = tokens.len();
         let base = self.position;
         let mrope_base = self.mrope_position;
-        let mut adapter_scratch = std::mem::take(&mut self.workspace.adapter);
-        let embed_result = self.embed_tile_tokens(tokens, tile, &mut adapter_scratch, check);
-        self.workspace.adapter = adapter_scratch;
-        embed_result?;
+        self.embed_tile_tokens(tokens, tile, check)?;
         let adapters = ActiveAdapters {
-            rank_one: self.adapter.as_ref(),
-            rank_one_scale: self.adapter_scale,
             multi_rank: self.multi_rank_adapter.as_ref(),
             multi_rank_scale: self.multi_rank_adapter_scale,
         };
@@ -2328,16 +2304,11 @@ impl Qwen35 {
         let count = tokens.len();
         let base = self.position;
         let mrope_base = self.mrope_position;
-        let mut adapter_scratch = std::mem::take(&mut self.workspace.adapter);
-        let embed_result = self.embed_tile_tokens(tokens, tile, &mut adapter_scratch, check);
-        self.workspace.adapter = adapter_scratch;
-        embed_result?;
+        self.embed_tile_tokens(tokens, tile, check)?;
         // Mark live state inconsistent before any layer-major mutation so any
         // mid-tile error or cancellation leaves state unavailable until explicit
         // reset or restore, and keep `position` at the last committed prefix.
         let adapters = ActiveAdapters {
-            rank_one: self.adapter.as_ref(),
-            rank_one_scale: self.adapter_scale,
             multi_rank: self.multi_rank_adapter.as_ref(),
             multi_rank_scale: self.multi_rank_adapter_scale,
         };
@@ -5452,7 +5423,6 @@ mod chunkwise_kv_tests {
                 MAX_STATE_BYTES,
                 MatvecBackend::Scalar,
                 None,
-                None,
                 policy,
             )?;
             let scratch = seq_base.tiled_prefill_scratch_bytes(8)?;
@@ -5466,7 +5436,6 @@ mod chunkwise_kv_tests {
                 16,
                 MAX_STATE_BYTES,
                 MatvecBackend::Scalar,
-                None,
                 None,
                 policy,
             )?;
@@ -5493,7 +5462,6 @@ mod chunkwise_kv_tests {
                 16,
                 MAX_STATE_BYTES,
                 MatvecBackend::Scalar,
-                None,
                 None,
                 policy,
             )?;
@@ -6249,7 +6217,6 @@ mod state_only_gdn_tests {
             MAX_STATE_BYTES,
             MatvecBackend::Auto,
             None,
-            None,
             super::super::KvCachePolicy::F16,
         )?
         .with_tiled_prefill(tile_tokens, 1 << 20)
@@ -6752,7 +6719,6 @@ mod fused_last_token_tests {
             MAX_STATE_BYTES,
             MatvecBackend::Scalar,
             None,
-            None,
             policy,
         )?;
         graph.set_last_layer_prefill_narrowing(narrow_last);
@@ -7127,7 +7093,11 @@ mod fused_last_token_tests {
             convolution: 2,
         };
         let norm_weight = vec![1.0_f32; len];
-        let parallelism = RowParallelism::new(4)?;
+        let parallelism = if cfg!(feature = "parallel-rows") {
+            RowParallelism::new(4)?
+        } else {
+            RowParallelism::default()
+        };
         let mut hidden = vec![vec![1.0_f32; len]; 2];
         let mut delta = vec![vec![0.5_f32; len]; 2];
         delta[0][3] = f32::NAN;

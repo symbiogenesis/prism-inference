@@ -1,13 +1,12 @@
 //! Bounded layer attribution on the unmodified full-token graph path.
 
 use super::{
-    AdapterSelection, MultiRankAdapterSelection, Representation, evidence_backend,
-    load_graph_with_adapters, reject, request_timing, valid_tokens,
+    MultiRankAdapterSelection, Representation, evidence_backend, load_graph_with_adapters, reject,
+    request_timing, valid_tokens,
 };
 use bonsai_prism_runtime::{
     Decoder, Result,
     graph::{OperationTiming, TokenTimings},
-    model::lora::SWIFT_ADAPTER_SHA256,
 };
 use serde_json::{Value, json};
 use std::{
@@ -49,7 +48,6 @@ struct Selection<'a> {
     model: &'a Path,
     arguments: &'a [String],
     representation: Representation,
-    adapter: Option<&'a AdapterSelection>,
     multi_rank_adapter: Option<&'a MultiRankAdapterSelection>,
     row_workers: usize,
     deadline_unix_milliseconds: u64,
@@ -70,8 +68,6 @@ fn record(
         "inputSha256":observation.input_sha256,
         "modelSha256":selection.representation.model_sha256(),
         "weightRepresentation":selection.representation.name(),
-        "adapterSha256":selection.adapter.map(|_| SWIFT_ADAPTER_SHA256),
-        "adapterScaleBits":format!("{:08x}",selection.adapter.map_or(0.0, |adapter| adapter.scale).to_bits()),
         "multiRankAdapterSha256":observation.multi_rank_adapter_sha256,
         "multiRankAdapterMaxRank":observation.multi_rank_adapter_max_rank,
         "multiRankAdapterScaleBits":selection.multi_rank_adapter.map(|adapter| format!("{:08x}", adapter.scale.to_bits())),
@@ -105,18 +101,12 @@ fn execute(selection: &Selection<'_>, observation: &mut Observation) -> Result<(
     observation.executable_sha256 = Some(request_timing::executable_hash(selection.deadline)?);
     observation.stage = "model-loading";
     request_timing::check(selection.deadline)?;
-    if selection.representation.is_nariq() && selection.adapter.is_some() {
-        return Err(reject(
-            "NariQ representation does not support --rank-one-adapter",
-        ));
-    }
     let (_, backend) = evidence_backend(selection.arguments)?;
     let started = Instant::now();
     let (mut graph, multi_meta) = load_graph_with_adapters(
         selection.model,
         backend,
         selection.representation,
-        selection.adapter,
         selection.multi_rank_adapter,
         selection.row_workers,
     )?;
@@ -152,7 +142,6 @@ pub(super) fn run(
     model: &Path,
     arguments: &[String],
     representation: Representation,
-    adapter: Option<&AdapterSelection>,
     multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
@@ -176,7 +165,6 @@ pub(super) fn run(
         model,
         arguments,
         representation,
-        adapter,
         multi_rank_adapter,
         row_workers,
         deadline_unix_milliseconds,
@@ -240,8 +228,7 @@ mod tests {
         let selection = Selection {
             model: Path::new("private-model"),
             arguments: &arguments,
-            representation: Representation::Pq2,
-            adapter: None,
+            representation: Representation::Bonsai25Pq2,
             multi_rank_adapter: None,
             row_workers: 1,
             deadline_unix_milliseconds: 1,
@@ -280,7 +267,6 @@ mod tests {
             model: Path::new("private-model"),
             arguments: &arguments,
             representation: Representation::NariQ3_0Bpw,
-            adapter: None,
             multi_rank_adapter: Some(&multi_rank),
             row_workers: 1,
             deadline_unix_milliseconds: 1,

@@ -35,7 +35,7 @@ use bonsai_prism_runtime::{
     Decoder, Result,
     graph::{Qwen35, StateComponent},
     kernels::{MatvecBackend, Pq2ProjectionExecutor, RowParallelism},
-    model::{Model, lora::RankOneAdapter, swift},
+    model::{Model, swift},
 };
 use hexagon_native_rpc::{
     Driver, DriverLocation, Error, GuardedQ2Submitter, HmxQ2ProjectionLimits, HmxQ2Submitter,
@@ -329,7 +329,7 @@ impl Request {
                     .all(|&name| projection_dimensions(name, self.execution_backend).is_some())
                 && (1..=16).contains(&self.context_limit)
                 && self.context_limit >= tokens.len()
-                && (swift::TENSOR_PAYLOAD_BYTES..=MODEL_MEMORY_LIMIT)
+                && (swift::BONSAI_2_5_PQ2_TENSOR_PAYLOAD_BYTES..=MODEL_MEMORY_LIMIT)
                     .contains(&self.model_memory_limit_bytes)
                 && (1..=bonsai_prism_runtime::graph::MAX_STATE_BYTES)
                     .contains(&self.state_budget_bytes)
@@ -565,31 +565,13 @@ struct Control {
     evaluation_duration: Duration,
 }
 
-fn graph_for_arm(model: Model, request: &Request, cpu_baseline: bool) -> Result<Qwen35> {
-    // The loaded-zero case deliberately uses a bare CPU graph as the oracle:
-    // equal results prove identity with the original base, not just agreement
-    // between two copies of the same loaded adapter path.
-    let load_adapter = request.adapter_case.loaded()
-        && !(cpu_baseline && request.adapter_case == AdapterCase::LoadedZero);
-    let mut graph = if load_adapter {
-        let path = request.adapter_path.as_deref().ok_or_else(reject)?;
-        let adapter = RankOneAdapter::load_swift(path, &model)?;
-        Qwen35::with_rank_one_adapter(
-            model,
-            request.context_limit,
-            request.state_budget_bytes,
-            request.cpu_backend.backend(),
-            adapter,
-            request.adapter_case.scale(),
-        )?
-    } else {
-        Qwen35::with_state_budget(
-            model,
-            request.context_limit,
-            request.state_budget_bytes,
-            request.cpu_backend.backend(),
-        )?
-    };
+fn graph_for_arm(model: Model, request: &Request, _cpu_baseline: bool) -> Result<Qwen35> {
+    let mut graph = Qwen35::with_state_budget(
+        model,
+        request.context_limit,
+        request.state_budget_bytes,
+        request.cpu_backend.backend(),
+    )?;
     graph.set_row_parallelism(RowParallelism::new(request.row_workers)?);
     require(graph.row_workers() == request.row_workers)?;
     Ok(graph)
@@ -1373,8 +1355,8 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     parent.ensure_alive()?;
     emit(
         &json!({"event":"started", "schemaVersion":1, "requestSha256":request_sha256,
-        "processId":std::process::id(), "modelSha256":swift::MODEL_SHA256,
-        "modelBytes":swift::MODEL_BYTES, "projection":PROJECTION, "projections":projections}),
+        "processId":std::process::id(), "modelSha256":swift::BONSAI_2_5_PQ2_SHA256,
+        "modelBytes":swift::BONSAI_2_5_PQ2_BYTES, "projection":PROJECTION, "projections":projections}),
     )?;
     let (model, _) = swift::load(&request.model_path, request.model_memory_limit_bytes)?;
     let mut selected_tensors = BTreeMap::new();
@@ -1736,8 +1718,8 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
     value["schemaVersion"] = json!(1);
     value["completed"] = json!(true);
     value["requestSha256"] = json!(request_sha256);
-    value["modelSha256"] = json!(swift::MODEL_SHA256);
-    value["modelBytes"] = json!(swift::MODEL_BYTES);
+    value["modelSha256"] = json!(swift::BONSAI_2_5_PQ2_SHA256);
+    value["modelBytes"] = json!(swift::BONSAI_2_5_PQ2_BYTES);
     value["projection"] = json!(PROJECTION);
     value["projections"] = json!(projections);
     value["tokenId"] = json!(request.token_id);
@@ -1754,12 +1736,8 @@ fn run_request(request: &Request, request_sha256: &str) -> Result<()> {
         "all-returned-integers"
     });
     value["adapterCase"] = json!(request.adapter_case.name());
-    value["adapterLoaded"] = json!(request.adapter_case.loaded());
-    value["adapterSha256"] = if request.adapter_case.loaded() {
-        json!(bonsai_prism_runtime::model::lora::SWIFT_ADAPTER_SHA256)
-    } else {
-        Value::Null
-    };
+    value["adapterLoaded"] = json!(false);
+    value["adapterSha256"] = Value::Null;
     value["adapterScaleBits"] = json!(request.adapter_case.scale().to_bits());
     value["cpuBaselineAdapterLoaded"] = json!(request.adapter_case == AdapterCase::StandardScale13);
     value["cpuBaselineAdapterScaleBits"] = json!(request.adapter_case.scale().to_bits());

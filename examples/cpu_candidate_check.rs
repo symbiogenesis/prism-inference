@@ -41,8 +41,7 @@ fn parse_profile(arguments: &[String]) -> Result<Profile> {
 fn load_session(selection: &Selection) -> Result<SwiftSession> {
     SwiftSession::load_profile_with_prefill(
         &selection.model,
-        Representation::Pq2,
-        Some(&selection.adapter),
+        Representation::Bonsai25Pq2,
         MatvecBackend::ExperimentalNeon,
         42,
         RowParallelism::new(4)?,

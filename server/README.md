@@ -8,9 +8,10 @@ authenticated readiness and exclusive listener-PID checks. The crate is
 
 ## Startup profiles
 
-Original PQ2 without an adapter is the default. `--use-repacked-ptq1` selects the
-verified current-weight export; `--abliterate-lora <absolute-path>` loads the
-approved rank-one adapter. See [adapter semantics](../docs/rank-one-adapter.md).
+Ternary Bonsai 2.5 27B (`Bonsai-2.5-PQ2_0`) is the default. `--bonsai-2-5 ptq1`
+selects `Bonsai-2.5-PTQ1_0`, `--nariq <2.5bpw|3.0bpw|2.0bpw>` selects a NariQ
+trellis model, and `--daisyrose-lora <absolute-path>` (with byte length and
+SHA-256) loads the multi-rank DaisyRose adapter.
 
 K4/V4 `rsq4` is the source development KV default; `--kv-cache f16` selects the
 comparison/recovery profile and `rsq4k3v` is opt-in. Requests cannot select

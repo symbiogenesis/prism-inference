@@ -16,7 +16,7 @@ use std::time::Instant;
 use bonsai_native_hash::Hasher;
 use bonsai_prism_runtime::graph::{KvCachePolicy, Qwen35, StateComponent};
 use bonsai_prism_runtime::kernels::{MAX_ROW_WORKERS, MatvecBackend, RowParallelism};
-use bonsai_prism_runtime::model::lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter};
+use bonsai_prism_runtime::model::lora::{MultiRankAdapter, MultiRankPolicy};
 use bonsai_prism_runtime::model::swift::{self, Representation};
 use bonsai_prism_runtime::runtime::greedy;
 use bonsai_prism_runtime::token_input::read_tokens;
@@ -43,10 +43,9 @@ const USAGE: &str = concat!(
     "       swift_model_check rollback <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <id,id,...>\n",
     "       swift_model_check request-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-messages.json> <output-1..16> <absolute-deadline-unix-ms> <source-commit>\n",
     "       swift_model_check ffn-timing <absolute-model> <absolute-evidence-directory> <scalar|auto|neon> <absolute-token-ids.json> <absolute-deadline-unix-ms> <source-commit>\n",
-    "Prefix any mode with --use-repacked-ptq1 (verified current-weight PTQ1 export), --bonsai-2-5 <pq2|ptq1> (opt-in Ternary Bonsai 2.5 27B), or --nariq <2.5bpw|3.0bpw|2.0bpw> (opt-in NariQ trellis artifact; mutually exclusive prefixes; --nariq excludes --rank-one-adapter). Swift PQ2 remains the default.\n",
+    "Prefix any mode with --bonsai-2-5 <pq2|ptq1> (Ternary Bonsai 2.5 27B; pq2 is default) or --nariq <2.5bpw|3.0bpw|2.0bpw> (opt-in NariQ trellis artifact; mutually exclusive prefixes).\n",
     "For load/forward/trajectory/rollback/request-timing/ffn-timing, --row-workers <1..18> follows any representation prefix and precedes any adapter prefix. Default: 1; larger counts require a parallel-rows build.\n",
-    "For selected PQ2/PTQ1 load/forward/trajectory/rollback/request-timing/ffn-timing, prefix --rank-one-adapter <absolute-approved-adapter> <scale-0..2> after any representation/worker prefixes for explicit unqualified LoRA correctness evidence.\n",
-    "For load/forward/trajectory/rollback/request-timing/ffn-timing, optionally prefix --multi-rank-adapter <absolute-gguf>[:<scale-0..2>] (default scale 0.0; NpuFriendly policy) alongside or without --rank-one-adapter (NariQ forbids --rank-one-adapter).\n",
+    "For load/forward/trajectory/rollback/request-timing/ffn-timing, optionally prefix --multi-rank-adapter <absolute-gguf>[:<scale-0..2>] (default scale 0.0; NpuFriendly policy).\n",
     "forward permits 1..16 exact supplied token IDs and retains its per-token snapshots.\n",
     "trajectory reads a bounded JSON u32 array, reserving all 1..16 greedy steps in the 8192-token context.\n",
     "It snapshots the final prompt token and each fed-back greedy token, including special IDs; model stops do not end this fixed-step diagnostic.\n",
@@ -93,7 +92,6 @@ enum ParsedCommand {
         path: PathBuf,
         tail: Vec<String>,
         representation: Representation,
-        adapter: Option<AdapterSelection>,
         multi_rank_adapter: Option<MultiRankAdapterSelection>,
         row_workers: usize,
     },
@@ -102,16 +100,9 @@ enum ParsedCommand {
 fn parse_cli(mut arguments: Vec<String>) -> Result<ParsedCommand> {
     let representation = select_representation(&mut arguments)?;
     let row_workers = select_row_workers(&mut arguments)?;
-    let mut adapter = select_adapter(&mut arguments)?;
     let multi_rank_adapter = select_multi_rank_adapter(&mut arguments)?;
-    if adapter.is_none() {
-        adapter = select_adapter(&mut arguments)?;
-    }
     if arguments.len() == 1 && arguments[0] == "--help" {
         return Ok(ParsedCommand::Help);
-    }
-    if representation.is_nariq() && adapter.is_some() {
-        return Err(reject("--nariq cannot be combined with --rank-one-adapter"));
     }
     if !(2..=8).contains(&arguments.len()) {
         return Err(reject(USAGE));
@@ -135,11 +126,7 @@ fn parse_cli(mut arguments: Vec<String>) -> Result<ParsedCommand> {
         ));
     }
     if mode == "inspect" {
-        if arguments.len() != 2
-            || adapter.is_some()
-            || multi_rank_adapter.is_some()
-            || row_workers.is_some()
-        {
+        if arguments.len() != 2 || multi_rank_adapter.is_some() || row_workers.is_some() {
             return Err(reject("inspect takes only the model path"));
         }
         return Ok(ParsedCommand::Inspect {
@@ -154,7 +141,6 @@ fn parse_cli(mut arguments: Vec<String>) -> Result<ParsedCommand> {
         path,
         tail,
         representation,
-        adapter,
         multi_rank_adapter,
         row_workers: row_workers.unwrap_or(1),
     })
@@ -201,7 +187,6 @@ fn run() -> Result<()> {
             path,
             tail,
             representation,
-            adapter,
             multi_rank_adapter,
             row_workers,
         } => dispatch_mode(
@@ -209,7 +194,6 @@ fn run() -> Result<()> {
             &path,
             &tail,
             representation,
-            adapter.as_ref(),
             multi_rank_adapter.as_ref(),
             row_workers,
         ),
@@ -221,7 +205,6 @@ fn dispatch_mode(
     path: &Path,
     tail: &[String],
     representation: Representation,
-    adapter: Option<&AdapterSelection>,
     multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
@@ -233,7 +216,6 @@ fn dispatch_mode(
             path,
             MatvecBackend::Auto,
             representation,
-            adapter,
             multi_rank_adapter,
             row_workers,
         )?;
@@ -242,46 +224,15 @@ fn dispatch_mode(
         );
     }
     match mode {
-        "forward" => forward(
-            path,
-            tail,
-            representation,
-            adapter,
-            multi_rank_adapter,
-            row_workers,
-        ),
-        "trajectory" => trajectory(
-            path,
-            tail,
-            representation,
-            adapter,
-            multi_rank_adapter,
-            row_workers,
-        ),
-        "rollback" => rollback::run(
-            path,
-            tail,
-            representation,
-            adapter,
-            multi_rank_adapter,
-            row_workers,
-        ),
-        "request-timing" => request_timing::run(
-            path,
-            tail,
-            representation,
-            adapter,
-            multi_rank_adapter,
-            row_workers,
-        ),
-        "ffn-timing" => ffn_timing::run(
-            path,
-            tail,
-            representation,
-            adapter,
-            multi_rank_adapter,
-            row_workers,
-        ),
+        "forward" => forward(path, tail, representation, multi_rank_adapter, row_workers),
+        "trajectory" => trajectory(path, tail, representation, multi_rank_adapter, row_workers),
+        "rollback" => rollback::run(path, tail, representation, multi_rank_adapter, row_workers),
+        "request-timing" => {
+            request_timing::run(path, tail, representation, multi_rank_adapter, row_workers)
+        }
+        "ffn-timing" => {
+            ffn_timing::run(path, tail, representation, multi_rank_adapter, row_workers)
+        }
         _ => Err(reject("unsupported evaluation mode")),
     }
 }
@@ -311,44 +262,6 @@ fn select_row_workers(arguments: &mut Vec<String>) -> Result<Option<usize>> {
         return Err(reject("duplicate row worker selection"));
     }
     Ok(Some(workers))
-}
-
-struct AdapterSelection {
-    path: PathBuf,
-    scale: f32,
-}
-
-fn select_adapter(arguments: &mut Vec<String>) -> Result<Option<AdapterSelection>> {
-    if arguments
-        .first()
-        .is_none_or(|argument| argument != "--rank-one-adapter")
-    {
-        return Ok(None);
-    }
-    if arguments.len() < 3 {
-        return Err(reject(
-            "adapter capture requires an absolute path and scale",
-        ));
-    }
-    let path = PathBuf::from(&arguments[1]);
-    let scale = arguments[2].parse::<f32>()?;
-    if !path.is_absolute()
-        || arguments[1].contains(['%', '\0'])
-        || path.components().any(|part| {
-            matches!(
-                part,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-        || !scale.is_finite()
-        || !(0.0..=2.0).contains(&scale)
-    {
-        return Err(reject(
-            "adapter capture requires an expanded absolute path and finite scale in 0..2",
-        ));
-    }
-    arguments.drain(..3);
-    Ok(Some(AdapterSelection { path, scale }))
 }
 
 struct MultiRankAdapterSelection {
@@ -451,10 +364,6 @@ fn select_representation(arguments: &mut Vec<String>) -> Result<Representation> 
     let mut selected = None;
     while let Some(first) = arguments.first().map(String::as_str) {
         let next = match first {
-            "--use-repacked-ptq1" => {
-                arguments.remove(0);
-                Representation::CurrentRepackedPtq1
-            }
             "--nariq" => {
                 let value = arguments
                     .get(1)
@@ -499,7 +408,7 @@ fn select_representation(arguments: &mut Vec<String>) -> Result<Representation> 
         }
         selected = Some(next);
     }
-    Ok(selected.unwrap_or(Representation::Pq2))
+    Ok(selected.unwrap_or(Representation::Bonsai25Pq2))
 }
 
 fn evidence_backend(arguments: &[String]) -> Result<(&Path, MatvecBackend)> {
@@ -527,30 +436,14 @@ fn load_graph_with_adapters(
     path: &Path,
     backend: MatvecBackend,
     representation: Representation,
-    selection: Option<&AdapterSelection>,
     multi_rank: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<(Qwen35, Option<MultiRankMetadata>)> {
-    // Reject unavailable worker counts or incompatible adapter prefixes before model I/O.
-    if representation.is_nariq() && selection.is_some() {
-        return Err(reject(
-            "NariQ representation does not support --rank-one-adapter",
-        ));
-    }
+    // Reject unavailable worker counts before model I/O.
     let parallelism = RowParallelism::new(row_workers)?;
     let (model, receipt) =
         swift::load_representation(path, model_budget_for(representation), representation)?;
     report("weights-loaded", receipt, representation)?;
-    let rank_one = if let Some(selection) = selection {
-        let adapter =
-            RankOneAdapter::load_swift_representation(&selection.path, &model, representation)?;
-        emit(
-            &json!({"event":"rank-one-adapter-loaded", "weight_representation":representation.name(), "model_sha256":representation.model_sha256(), "adapter_sha256":adapter.identity(), "target_pairs":adapter.target_count(), "scale":selection.scale, "scale_bits":format!("{:08x}", selection.scale.to_bits()), "qualification":"unqualified-basis-logits-quality-resources-and-service; original activation basis; no adapter permutation"}),
-        )?;
-        Some((adapter, selection.scale))
-    } else {
-        None
-    };
     let (multi_adapter, multi_metadata) = if let Some(selection) = multi_rank {
         let (bytes, sha256) = hash_adapter_file(&selection.path)?;
         let loaded = MultiRankAdapter::load_verified(
@@ -586,7 +479,6 @@ fn load_graph_with_adapters(
         swift::CONTEXT_TOKENS,
         1024 * 1024 * 1024,
         backend,
-        rank_one,
         multi_adapter,
         KvCachePolicy::F16,
     )?;
@@ -598,7 +490,6 @@ fn forward(
     path: &Path,
     arguments: &[String],
     representation: Representation,
-    adapter: Option<&AdapterSelection>,
     multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
@@ -619,7 +510,6 @@ fn forward(
         path,
         backend,
         representation,
-        adapter,
         multi_rank_adapter,
         row_workers,
     )?;
@@ -666,7 +556,6 @@ fn trajectory(
     path: &Path,
     arguments: &[String],
     representation: Representation,
-    adapter: Option<&AdapterSelection>,
     multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
@@ -702,7 +591,6 @@ fn trajectory(
         path,
         backend,
         representation,
-        adapter,
         multi_rank_adapter,
         row_workers,
     )?;
@@ -807,11 +695,7 @@ fn dump_state(graph: &Qwen35, states: &Path, remaining: &mut usize) -> Result<()
 }
 
 fn report(event: &str, receipt: swift::LoadReceipt, representation: Representation) -> Result<()> {
-    let mut record = json!({"event":event,"weight_representation":representation.name(),"model_sha256":representation.model_sha256(),"model_bytes":representation.model_bytes(),"header_charge_bytes":receipt.header_charge_bytes,"tensor_payload_bytes":receipt.tensor_payload_bytes,"retained_storage_bytes":receipt.retained_storage_bytes,"largest_tensor_conversion_copy_bytes":receipt.largest_tensor_bytes,"tensor_counts_f32_bf16_packed":receipt.tensor_counts,"model_storage_budget_bytes":model_budget_for(representation),"memory_claim":"retained storage accounting; process working set and peak commit are separate"});
-    // Retain the original PQ2 evidence key without falsely naming PTQ1 counts PQ2.
-    if representation == Representation::Pq2 {
-        record["tensor_counts_f32_bf16_pq2"] = json!(receipt.tensor_counts);
-    }
+    let record = json!({"event":event,"weight_representation":representation.name(),"model_sha256":representation.model_sha256(),"model_bytes":representation.model_bytes(),"header_charge_bytes":receipt.header_charge_bytes,"tensor_payload_bytes":receipt.tensor_payload_bytes,"retained_storage_bytes":receipt.retained_storage_bytes,"largest_tensor_conversion_copy_bytes":receipt.largest_tensor_bytes,"tensor_counts_f32_bf16_packed":receipt.tensor_counts,"model_storage_budget_bytes":model_budget_for(representation),"memory_claim":"retained storage accounting; process working set and peak commit are separate"});
     emit(&record)
 }
 
@@ -819,8 +703,8 @@ fn report(event: &str, receipt: swift::LoadReceipt, representation: Representati
 mod tests {
     use super::{
         MultiRankMetadata, ParsedCommand, Representation, Result, attach_trajectory_multi_rank,
-        model_budget_for, parse_cli, select_adapter, select_multi_rank_adapter,
-        select_representation, select_row_workers, write_values,
+        model_budget_for, parse_cli, select_multi_rank_adapter, select_representation,
+        select_row_workers, write_values,
     };
 
     #[test]
@@ -828,31 +712,31 @@ mod tests {
         let mut default = vec!["forward".into(), "model.gguf".into()];
         assert_eq!(select_row_workers(&mut default)?, None);
         assert_eq!(default, ["forward", "model.gguf"]);
-        let path = std::env::temp_dir().join("approved-adapter.gguf");
-        for repacked in [false, true] {
+        let path = std::env::temp_dir().join("daisyrose.gguf");
+        for ptq1 in [false, true] {
             for workers in [1_usize, 2, 16, 18] {
                 let mut arguments = Vec::new();
-                if repacked {
-                    arguments.push("--use-repacked-ptq1".into());
+                if ptq1 {
+                    arguments.extend(["--bonsai-2-5".into(), "ptq1".into()]);
                 }
                 arguments.extend([
                     "--row-workers".into(),
                     workers.to_string(),
-                    "--rank-one-adapter".into(),
-                    path.to_string_lossy().into_owned(),
-                    "1.3".into(),
+                    "--multi-rank-adapter".into(),
+                    format!("{}:1.3", path.to_string_lossy()),
                     "forward".into(),
                 ]);
                 assert_eq!(
                     select_representation(&mut arguments)?,
-                    if repacked {
-                        Representation::CurrentRepackedPtq1
+                    if ptq1 {
+                        Representation::Bonsai25Ptq1
                     } else {
-                        Representation::Pq2
+                        Representation::Bonsai25Pq2
                     }
                 );
                 assert_eq!(select_row_workers(&mut arguments)?, Some(workers));
-                let adapter = select_adapter(&mut arguments)?.ok_or("missing explicit adapter")?;
+                let adapter =
+                    select_multi_rank_adapter(&mut arguments)?.ok_or("missing multi-rank")?;
                 assert_eq!(adapter.path, path);
                 assert_eq!(adapter.scale.to_bits(), 1.3_f32.to_bits());
                 assert_eq!(arguments, ["forward"]);
@@ -880,8 +764,7 @@ mod tests {
         let rejected = super::load_graph_with_adapters(
             std::path::Path::new("missing-relative-model.gguf"),
             super::MatvecBackend::Auto,
-            Representation::Pq2,
-            None,
+            Representation::Bonsai25Pq2,
             None,
             2,
         );
@@ -891,83 +774,36 @@ mod tests {
     }
 
     #[test]
-    fn rank_one_capture_requires_explicit_bounded_selection() -> Result<()> {
-        let absolute = std::env::temp_dir()
-            .join("approved-lora.gguf")
-            .to_string_lossy()
-            .into_owned();
-        let mut args = vec![
-            "--rank-one-adapter".to_owned(),
-            absolute.clone(),
-            "1.3".to_owned(),
-            "load".to_owned(),
-        ];
-        let adapter = select_adapter(&mut args)?.ok_or("missing explicit adapter")?;
-        assert_eq!(adapter.path, std::path::Path::new(&absolute));
-        assert_eq!(adapter.scale.to_bits(), 1.3_f32.to_bits());
-        assert_eq!(args, ["load"]);
-        for (path, scale) in [
-            ("relative.gguf", "1.3"),
-            (absolute.as_str(), "NaN"),
-            (absolute.as_str(), "2.1"),
-            (absolute.as_str(), "-0.1"),
-            ("%TEMP%/adapter.gguf", "1"),
-        ] {
-            let mut args = vec![
-                "--rank-one-adapter".to_owned(),
-                path.to_owned(),
-                scale.to_owned(),
-            ];
-            assert!(select_adapter(&mut args).is_err());
-        }
-        let mut args = vec!["load".to_owned(), "--rank-one-adapter".to_owned()];
-        assert!(select_adapter(&mut args)?.is_none());
-        Ok(())
-    }
-
-    #[test]
     fn ptq1_correctness_capture_requires_explicit_prefix_and_keeps_source_default() -> Result<()> {
         let mut source = vec!["inspect".to_owned(), "model.gguf".to_owned()];
-        assert_eq!(select_representation(&mut source)?, Representation::Pq2);
+        assert_eq!(
+            select_representation(&mut source)?,
+            Representation::Bonsai25Pq2
+        );
         assert_eq!(source, ["inspect", "model.gguf"]);
 
         let mut exported = vec![
-            "--use-repacked-ptq1".to_owned(),
+            "--bonsai-2-5".to_owned(),
+            "ptq1".to_owned(),
             "forward".to_owned(),
             "export.gguf".to_owned(),
         ];
         assert_eq!(
             select_representation(&mut exported)?,
-            Representation::CurrentRepackedPtq1
+            Representation::Bonsai25Ptq1
         );
         assert_eq!(exported, ["forward", "export.gguf"]);
 
-        let mut misplaced = vec!["inspect".to_owned(), "--use-repacked-ptq1".to_owned()];
-        assert_eq!(select_representation(&mut misplaced)?, Representation::Pq2);
-        assert_eq!(misplaced, ["inspect", "--use-repacked-ptq1"]);
-        Ok(())
-    }
-
-    #[test]
-    fn ptq1_rank_one_capture_composes_explicit_identity_and_signed_zero_selection() -> Result<()> {
-        let path = std::env::temp_dir().join("approved-adapter.gguf");
-        for scale in ["0", "-0", "1.3"] {
-            let mut args = vec![
-                "--use-repacked-ptq1".into(),
-                "--rank-one-adapter".into(),
-                path.to_string_lossy().into_owned(),
-                scale.into(),
-                "forward".into(),
-            ];
-            assert_eq!(
-                select_representation(&mut args)?,
-                Representation::CurrentRepackedPtq1
-            );
-            let adapter = select_adapter(&mut args)?.ok_or("missing explicit adapter")?;
-            assert_eq!(adapter.path, path);
-            assert_eq!(adapter.scale.to_bits(), scale.parse::<f32>()?.to_bits());
-            assert_eq!(args, ["forward"]);
-        }
+        let mut misplaced = vec![
+            "inspect".to_owned(),
+            "--bonsai-2-5".to_owned(),
+            "ptq1".to_owned(),
+        ];
+        assert_eq!(
+            select_representation(&mut misplaced)?,
+            Representation::Bonsai25Pq2
+        );
+        assert_eq!(misplaced, ["inspect", "--bonsai-2-5", "ptq1"]);
         Ok(())
     }
 
@@ -1075,13 +911,13 @@ mod tests {
     }
 
     #[test]
-    fn nariq_representation_parsing_and_budget_reject_ptq1_and_rank_one() -> Result<()> {
+    fn nariq_representation_parsing_and_budget() -> Result<()> {
         assert_eq!(
-            model_budget_for(Representation::Pq2),
+            model_budget_for(Representation::Bonsai25Pq2),
             8 * 1024 * 1024 * 1024
         );
         assert_eq!(
-            model_budget_for(Representation::CurrentRepackedPtq1),
+            model_budget_for(Representation::Bonsai25Ptq1),
             8 * 1024 * 1024 * 1024
         );
         for (flag, expected) in [
@@ -1101,10 +937,12 @@ mod tests {
             vec![
                 "--nariq".to_owned(),
                 "2.5bpw".to_owned(),
-                "--use-repacked-ptq1".to_owned(),
+                "--bonsai-2-5".to_owned(),
+                "ptq1".to_owned(),
             ],
             vec![
-                "--use-repacked-ptq1".to_owned(),
+                "--bonsai-2-5".to_owned(),
+                "ptq1".to_owned(),
                 "--nariq".to_owned(),
                 "3.0bpw".to_owned(),
             ],
@@ -1118,47 +956,6 @@ mod tests {
             let mut args = bad;
             assert!(select_representation(&mut args).is_err());
         }
-
-        let model = std::env::temp_dir()
-            .join("nariq-3.0bpw.gguf")
-            .to_string_lossy()
-            .into_owned();
-        let rank_one = std::env::temp_dir()
-            .join("orca.gguf")
-            .to_string_lossy()
-            .into_owned();
-        let multi_rank = std::env::temp_dir()
-            .join("daisyrose.gguf")
-            .to_string_lossy()
-            .into_owned();
-
-        // Reject --nariq + --rank-one-adapter (with or without --multi-rank-adapter).
-        assert!(
-            parse_cli(vec![
-                "--nariq".into(),
-                "2.5bpw".into(),
-                "--rank-one-adapter".into(),
-                rank_one.clone(),
-                "1.3".into(),
-                "load".into(),
-                model.clone(),
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_cli(vec![
-                "--nariq".into(),
-                "3.0bpw".into(),
-                "--multi-rank-adapter".into(),
-                format!("{multi_rank}:0.5"),
-                "--rank-one-adapter".into(),
-                rank_one,
-                "1.3".into(),
-                "load".into(),
-                model,
-            ])
-            .is_err()
-        );
         Ok(())
     }
 
@@ -1185,13 +982,11 @@ mod tests {
             ParsedCommand::Mode {
                 mode,
                 representation,
-                adapter,
                 multi_rank_adapter,
                 ..
             } => {
                 assert_eq!(mode, "load");
                 assert_eq!(representation, Representation::NariQ3_0Bpw);
-                assert!(adapter.is_none());
                 let mr = multi_rank_adapter.ok_or("missing multi-rank adapter")?;
                 assert_eq!(mr.scale.to_bits(), 0.5_f32.to_bits());
             }
@@ -1228,7 +1023,6 @@ mod tests {
                 mode,
                 tail,
                 representation,
-                adapter,
                 multi_rank_adapter,
                 row_workers,
                 ..
@@ -1236,7 +1030,6 @@ mod tests {
                 assert_eq!(mode, "trajectory");
                 assert_eq!(tail.len(), 4);
                 assert_eq!(representation, Representation::NariQ2_5Bpw);
-                assert!(adapter.is_none());
                 assert_eq!(row_workers, 4);
                 assert_eq!(
                     multi_rank_adapter.ok_or("missing mr")?.scale.to_bits(),
@@ -1265,14 +1058,12 @@ mod tests {
                 mode,
                 tail,
                 representation,
-                adapter,
                 multi_rank_adapter,
                 ..
             } => {
                 assert_eq!(mode, "request-timing");
                 assert_eq!(tail.len(), 6);
                 assert_eq!(representation, Representation::NariQ2_0Bpw);
-                assert!(adapter.is_none());
                 assert_eq!(
                     multi_rank_adapter.ok_or("missing mr")?.scale.to_bits(),
                     0.0_f32.to_bits()
@@ -1290,16 +1081,13 @@ mod tests {
         let evidence = base.join("evidence").to_string_lossy().into_owned();
         let input = base.join("input.json").to_string_lossy().into_owned();
         let mr = base.join("daisyrose.gguf").to_string_lossy().into_owned();
-        let r1 = base.join("orca.gguf").to_string_lossy().into_owned();
         let commit = "0".repeat(40);
 
         let ffn = parse_cli(vec![
-            "--use-repacked-ptq1".into(),
+            "--bonsai-2-5".into(),
+            "ptq1".into(),
             "--row-workers".into(),
             "2".into(),
-            "--rank-one-adapter".into(),
-            r1,
-            "1.3".into(),
             "--multi-rank-adapter".into(),
             format!("{mr}:1.0"),
             "ffn-timing".into(),
@@ -1315,19 +1103,14 @@ mod tests {
                 mode,
                 tail,
                 representation,
-                adapter,
                 multi_rank_adapter,
                 row_workers,
                 ..
             } => {
                 assert_eq!(mode, "ffn-timing");
                 assert_eq!(tail.len(), 5);
-                assert_eq!(representation, Representation::CurrentRepackedPtq1);
+                assert_eq!(representation, Representation::Bonsai25Ptq1);
                 assert_eq!(row_workers, 2);
-                assert_eq!(
-                    adapter.ok_or("missing r1")?.scale.to_bits(),
-                    1.3_f32.to_bits()
-                );
                 assert_eq!(
                     multi_rank_adapter.ok_or("missing mr")?.scale.to_bits(),
                     1.0_f32.to_bits()
@@ -1380,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn bonsai25_cli_supports_orca_multi_rank_and_rejects_conflicts() -> Result<()> {
+    fn bonsai25_cli_supports_multi_rank_and_rejects_conflicts() -> Result<()> {
         for (flag, expected_repr) in [
             ("pq2", Representation::Bonsai25Pq2),
             ("ptq1", Representation::Bonsai25Ptq1),
@@ -1394,10 +1177,6 @@ mod tests {
             assert_eq!(args, ["load"]);
             assert_eq!(model_budget_for(expected_repr), 8 * 1024 * 1024 * 1024);
 
-            let r1_path = std::env::temp_dir()
-                .join("orca.gguf")
-                .to_string_lossy()
-                .into_owned();
             let mr_path = std::env::temp_dir()
                 .join("daisyrose.gguf")
                 .to_string_lossy()
@@ -1405,9 +1184,6 @@ mod tests {
             let parsed = parse_cli(vec![
                 "--bonsai-2-5".into(),
                 flag.into(),
-                "--rank-one-adapter".into(),
-                r1_path,
-                "1.3".into(),
                 "--multi-rank-adapter".into(),
                 format!("{mr_path}:0.5"),
                 "load".into(),
@@ -1419,12 +1195,10 @@ mod tests {
             match parsed {
                 ParsedCommand::Mode {
                     representation,
-                    adapter,
                     multi_rank_adapter,
                     ..
                 } => {
                     assert_eq!(representation, expected_repr);
-                    assert!(adapter.is_some());
                     assert!(multi_rank_adapter.is_some());
                 }
                 _ => return Err(super::reject("expected Bonsai 2.5 parsed load command")),
@@ -1433,11 +1207,6 @@ mod tests {
         for bad in [
             vec!["--bonsai-2-5".to_owned()],
             vec!["--bonsai-2-5".to_owned(), "q4_0".to_owned()],
-            vec![
-                "--bonsai-2-5".to_owned(),
-                "pq2".to_owned(),
-                "--use-repacked-ptq1".to_owned(),
-            ],
             vec![
                 "--bonsai-2-5".to_owned(),
                 "pq2".to_owned(),

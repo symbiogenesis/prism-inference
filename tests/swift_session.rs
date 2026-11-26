@@ -24,10 +24,10 @@ fn actual_swift_session_stream_cancel_deadline_reset_and_context() -> Result<()>
         std::env::var_os("BONSAI_SWIFT_MODEL_PATH").ok_or("BONSAI_SWIFT_MODEL_PATH is required")?,
     );
     let mut session = SwiftSession::load(&path, MatvecBackend::Auto, 42)?;
-    assert_eq!(session.receipt().tensor_counts, [353, 96, 402]);
+    assert_eq!(session.receipt().tensor_counts, [449, 0, 402]);
     assert_eq!(
         session.receipt().tensor_payload_bytes,
-        swift::TENSOR_PAYLOAD_BYTES
+        swift::BONSAI_2_5_PQ2_TENSOR_PAYLOAD_BYTES
     );
     let messages = json!([{"role":"user","content":"Hi"}]);
     let prompt = session.prepare(&messages, 1)?;

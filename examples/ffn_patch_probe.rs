@@ -9,13 +9,12 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bonsai_native_hash::Hasher;
+use bonsai_prism_runtime::graph::Qwen35;
 use bonsai_prism_runtime::graph::weight_patch::{
     EXECUTION_PROFILE, FfnPatch, FfnProbe, GROUP_OMISSION_PROFILE, INPUT_BASIS,
     SURROGATE_INPUT_BASIS, SURROGATE_TARGET_BASIS,
 };
-use bonsai_prism_runtime::graph::{MAX_STATE_BYTES, Qwen35};
 use bonsai_prism_runtime::kernels::MatvecBackend;
-use bonsai_prism_runtime::model::lora::{RankOneAdapter, SWIFT_ADAPTER_SHA256};
 use bonsai_prism_runtime::model::swift::{self, Representation};
 use bonsai_prism_runtime::{Decoder, Result};
 use serde::Deserialize;
@@ -396,8 +395,6 @@ fn validate(request: &Request) -> Result<Representation> {
         ));
     }
     let representation = match request.weight_representation.as_str() {
-        "PQ2_0" => Representation::Pq2,
-        "current-repacked-PTQ1_0" => Representation::CurrentRepackedPtq1,
         "Bonsai-2.5-PQ2_0" => Representation::Bonsai25Pq2,
         "Bonsai-2.5-PTQ1_0" => Representation::Bonsai25Ptq1,
         _ => return Err(reject("unsupported current-weight representation")),
@@ -509,19 +506,8 @@ fn run() -> Result<Value> {
         .map(|sequence| sequence.token_ids.len())
         .max()
         .ok_or_else(|| reject("missing sequences"))?;
-    let graph = if let Some(path) = &request.adapter_path {
-        if !path.is_absolute() {
-            return Err(reject("adapter path must be absolute"));
-        }
-        let adapter = RankOneAdapter::load_swift_representation(path, &model, representation)?;
-        Qwen35::with_rank_one_adapter(
-            model,
-            context,
-            MAX_STATE_BYTES,
-            MatvecBackend::Scalar,
-            adapter,
-            scale,
-        )?
+    let graph = if request.adapter_path.is_some() {
+        return Err(reject("rank-1 adapter support has been removed"));
     } else {
         Qwen35::with_backend(model, context, MatvecBackend::Scalar)?
     };
@@ -543,7 +529,7 @@ fn run() -> Result<Value> {
     let mut source = json!({
         "modelSha256":representation.model_sha256(),
         "runtimeSha256":executable_sha256,
-        "adapterSha256":request.adapter_path.as_ref().map(|_| SWIFT_ADAPTER_SHA256),
+        "adapterSha256":Value::Null,
         "adapterScaleBits":format!("{:08x}", scale.to_bits()),
         "weightRepresentation":representation.name(),
         "executionProfile":EXECUTION_PROFILE,
@@ -798,7 +784,7 @@ mod tests {
         let directory = std::env::temp_dir();
         Ok(serde_json::from_value(json!({
             "schemaVersion":1,"modelPath":directory.join("ffn-probe-model.gguf"),
-            "adapterPath":null,"adapterScaleBits":"00000000","weightRepresentation":"PQ2_0",
+            "adapterPath":null,"adapterScaleBits":"00000000","weightRepresentation":"Bonsai-2.5-PQ2_0",
             "layer":0,"runtimeSourceCommit":"1".repeat(40),"absoluteDeadlineUnixMs":1,
             "capturePath":directory.join(format!("ffn-probe-control-{}.json",std::process::id())),
             "patchPath":null,"sequences":[

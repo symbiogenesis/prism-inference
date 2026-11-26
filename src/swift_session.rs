@@ -13,7 +13,7 @@ use crate::{
     invalid,
     kernels::{MatvecBackend, RowParallelism},
     model::{
-        lora::{AdapterStorage, EditedAdapter, MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
+        lora::{MultiRankAdapter, MultiRankPolicy},
         swift::{self, LoadReceipt, MmprojLoadReceipt, Representation},
     },
     runtime::{
@@ -53,10 +53,9 @@ pub const DEFAULT_KV_CACHE: KvCachePolicy = KvCachePolicy::Rotated4;
 pub const STATE_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 /// Maximum complete transactional rollback snapshot storage.
 pub const CHECKPOINT_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
+const BASE_NON_WEIGHT_MEMORY_BYTES: u64 = NON_CONTEXT_MEMORY_BYTES - 7_206_168_928;
 /// Conservative fixed model/runtime allowance, excluding context growth.
 pub const NON_CONTEXT_MEMORY_BYTES: u64 = 11 * 1024 * 1024 * 1024;
-/// Calibrated fixed model/runtime allowance for the repacked PTQ1 export (`PQ2 - PTQ1 = 1_259_520_000`).
-pub const PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES: u64 = NON_CONTEXT_MEMORY_BYTES - 1_259_520_000;
 /// Additional CPU scratch headroom budgeted for `NariQ` trellis transforms and banded heads.
 pub const NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -64,13 +63,11 @@ pub const NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 #[must_use]
 pub const fn calibrated_non_context_memory_bytes(representation: Representation) -> u64 {
     match representation {
-        Representation::Pq2 => NON_CONTEXT_MEMORY_BYTES,
-        Representation::CurrentRepackedPtq1 => PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES,
         Representation::Bonsai25Pq2 | Representation::Bonsai25Ptq1 => {
-            (NON_CONTEXT_MEMORY_BYTES - swift::MODEL_BYTES) + representation.model_bytes()
+            BASE_NON_WEIGHT_MEMORY_BYTES + representation.model_bytes()
         }
         Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw | Representation::NariQ2_0Bpw => {
-            (NON_CONTEXT_MEMORY_BYTES - swift::MODEL_BYTES)
+            BASE_NON_WEIGHT_MEMORY_BYTES
                 + representation.model_bytes()
                 + NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES
         }
@@ -836,8 +833,6 @@ pub struct SwiftRequestOptions {
     pub enable_thinking: bool,
     /// Prompt reasoning effort preset passed via `chat_template_kwargs` (default `XHigh`).
     pub reasoning_effort: ReasoningEffort,
-    /// Optional rank-one `LoRA` adapter correction scale.
-    pub adapter_scale: Option<f32>,
     /// Optional secondary multi-rank `LoRA` adapter correction scale.
     pub multi_rank_scale: Option<f32>,
     /// Per-request sampler, penalty, DRY, reasoning-budget, and logprob settings.
@@ -849,7 +844,6 @@ impl Default for SwiftRequestOptions {
         Self {
             enable_thinking: true,
             reasoning_effort: ReasoningEffort::XHigh,
-            adapter_scale: None,
             multi_rank_scale: None,
             sampler: SwiftSamplerConfig::default(),
         }
@@ -859,7 +853,6 @@ impl Default for SwiftRequestOptions {
 /// Exact rendered and counted input, sealed by its originating verified session.
 pub struct PreparedChat {
     owner: Arc<()>,
-    adapter_scale: Option<f32>,
     multi_rank_scale: Option<f32>,
     tokens: Vec<u32>,
     media_chunks: Vec<PreparedMediaChunk>,
@@ -870,13 +863,7 @@ pub struct PreparedChat {
 }
 
 impl PreparedChat {
-    /// Exact correction scale reserved by this request, when an adapter is loaded.
-    #[must_use]
-    pub const fn adapter_scale(&self) -> Option<f32> {
-        self.adapter_scale
-    }
-
-    /// Exact multi-rank correction scale reserved by this request, when a secondary adapter is loaded.
+    /// Exact multi-rank correction scale reserved by this request, when a multi-rank adapter is loaded.
     #[must_use]
     pub const fn multi_rank_scale(&self) -> Option<f32> {
         self.multi_rank_scale
@@ -975,8 +962,6 @@ pub struct SwiftSession {
     kv_cache: KvCachePolicy,
     cpu_prefill: Option<CpuPrefill>,
     cpu_speculation: Option<CpuSpeculation>,
-    adapter_identity: Option<String>,
-    adapter_storage: Option<AdapterStorage>,
     secondary_adapter_identity: Option<String>,
     secondary_adapter_max_rank: Option<usize>,
     secondary_adapter_storage_bytes: Option<usize>,
@@ -994,12 +979,6 @@ pub struct SwiftSession {
     mmproj_receipt: Option<MmprojLoadReceipt>,
     max_image_tokens: usize,
     receipt: LoadReceipt,
-}
-
-#[derive(Clone, Copy)]
-enum AdapterSelection<'a> {
-    Approved(Option<&'a Path>),
-    Edited(EditedAdapter<'a>),
 }
 
 impl SwiftSession {
@@ -1033,27 +1012,24 @@ impl SwiftSession {
     ) -> Result<Self> {
         Self::load_profile_with_row_parallelism(
             path,
-            Representation::Pq2,
-            None,
+            Representation::Bonsai25Pq2,
             backend,
             seed,
             parallelism,
         )
     }
 
-    /// Load one exact Swift representation and an optional approved rank-one adapter.
+    /// Load one exact Swift representation.
     ///
-    /// Selection is explicit and immutable for this session. Only the approved
-    /// adapter artifact is admitted. This executable path does not qualify model
+    /// Selection is explicit and immutable for this session. This executable path does not qualify model
     /// arithmetic, authoring basis, device resources, quality or release readiness.
     /// The attention cache uses [`DEFAULT_KV_CACHE`].
     ///
     /// # Errors
-    /// Rejects artifact, representation, adapter, graph and storage-budget drift.
+    /// Rejects artifact, representation, graph and storage-budget drift.
     pub fn load_profile_with_row_parallelism(
         path: &Path,
         representation: Representation,
-        adapter_path: Option<&Path>,
         backend: MatvecBackend,
         seed: u32,
         parallelism: RowParallelism,
@@ -1061,7 +1037,6 @@ impl SwiftSession {
         Self::load_profile_with_kv_cache(
             path,
             representation,
-            adapter_path,
             backend,
             seed,
             parallelism,
@@ -1069,7 +1044,7 @@ impl SwiftSession {
         )
     }
 
-    /// Load an explicit, immutable KV precision profile with optional approved `LoRA`.
+    /// Load an explicit, immutable KV precision profile.
     ///
     /// Rotated profiles change numerical cache semantics and remain experimental.
     /// Context, output, model, checkpoint and process-admission limits are unchanged.
@@ -1082,7 +1057,6 @@ impl SwiftSession {
     pub fn load_profile_with_kv_cache(
         path: &Path,
         representation: Representation,
-        adapter_path: Option<&Path>,
         backend: MatvecBackend,
         seed: u32,
         parallelism: RowParallelism,
@@ -1091,7 +1065,6 @@ impl SwiftSession {
         Self::load_profile_with_context(
             path,
             representation,
-            adapter_path,
             backend,
             seed,
             parallelism,
@@ -1110,15 +1083,10 @@ impl SwiftSession {
     ///
     /// # Errors
     /// Rejects a context beyond its selected cache/state capacity and the
-    /// artifact, adapter, cache and allocation errors of other loading methods.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The explicit context extends the established seven-argument immutable profile loader."
-    )]
+    /// artifact, cache and allocation errors of other loading methods.
     pub fn load_profile_with_context(
         path: &Path,
         representation: Representation,
-        adapter_path: Option<&Path>,
         backend: MatvecBackend,
         seed: u32,
         parallelism: RowParallelism,
@@ -1128,7 +1096,6 @@ impl SwiftSession {
         Self::load_profile_with_prefill(
             path,
             representation,
-            adapter_path,
             backend,
             seed,
             parallelism,
@@ -1157,7 +1124,6 @@ impl SwiftSession {
     pub fn load_profile_with_prefill(
         path: &Path,
         representation: Representation,
-        adapter_path: Option<&Path>,
         backend: MatvecBackend,
         seed: u32,
         parallelism: RowParallelism,
@@ -1168,7 +1134,6 @@ impl SwiftSession {
         Self::load_profile_with_execution(
             path,
             representation,
-            adapter_path,
             backend,
             seed,
             parallelism,
@@ -1196,7 +1161,6 @@ impl SwiftSession {
     pub fn load_profile_with_execution(
         path: &Path,
         representation: Representation,
-        adapter_path: Option<&Path>,
         backend: MatvecBackend,
         seed: u32,
         parallelism: RowParallelism,
@@ -1208,7 +1172,6 @@ impl SwiftSession {
         Self::load_profile_with_execution_and_reuse(
             path,
             representation,
-            adapter_path,
             backend,
             seed,
             parallelism,
@@ -1236,7 +1199,6 @@ impl SwiftSession {
     pub fn load_profile_with_execution_and_reuse(
         path: &Path,
         representation: Representation,
-        adapter_path: Option<&Path>,
         backend: MatvecBackend,
         seed: u32,
         parallelism: RowParallelism,
@@ -1250,7 +1212,6 @@ impl SwiftSession {
         Self::load_selected_profile(
             path,
             representation,
-            AdapterSelection::Approved(adapter_path),
             None,
             backend,
             seed,
@@ -1264,19 +1225,18 @@ impl SwiftSession {
         )
     }
 
-    /// Load an immutable profile with an optional stackable NPU-friendly multi-rank adapter.
+    /// Load an immutable profile with an optional NPU-friendly multi-rank adapter.
     ///
     /// # Errors
-    /// Rejects invalid secondary adapter identities/envelopes, representation
+    /// Rejects invalid multi-rank adapter identities/envelopes, representation
     /// mismatches, capacity errors, and standard loading failures.
     #[expect(
         clippy::too_many_arguments,
-        reason = "Stackable multi-rank adapter extends the immutable execution/reuse profile loader."
+        reason = "Multi-rank adapter extends the immutable execution/reuse profile loader."
     )]
     pub fn load_profile_with_adapters(
         path: &Path,
         representation: Representation,
-        adapter_path: Option<&Path>,
         multi_rank_adapter: Option<MultiRankAdapterSpec<'_>>,
         backend: MatvecBackend,
         seed: u32,
@@ -1291,7 +1251,6 @@ impl SwiftSession {
         Self::load_selected_profile(
             path,
             representation,
-            AdapterSelection::Approved(adapter_path),
             multi_rank_adapter,
             backend,
             seed,
@@ -1305,57 +1264,13 @@ impl SwiftSession {
         )
     }
 
-    /// Load one explicitly bound edited adapter with experimental sparse A dots.
-    ///
-    /// The model, tokenizer, context, KV cache and transaction contracts remain
-    /// those of the exact selected Swift artifact. Adapter authenticity is the
-    /// caller's candidate hash, not the released Orca approval. Sparse arithmetic
-    /// has its own graph identity. No HTTP or ordinary loading path calls this
-    /// research entry point; it selects no tiled prefill or speculation.
-    ///
-    /// # Errors
-    /// Rejects candidate identity/inventory, unprofitable sparse factors and the
-    /// model, context, allocation and execution errors of ordinary loading.
     #[expect(
         clippy::too_many_arguments,
-        reason = "The explicit candidate replaces the approved adapter in the established immutable context loader."
-    )]
-    pub fn load_edited_profile_with_context(
-        path: &Path,
-        representation: Representation,
-        adapter: EditedAdapter<'_>,
-        backend: MatvecBackend,
-        seed: u32,
-        parallelism: RowParallelism,
-        kv_cache: KvCachePolicy,
-        context_tokens: usize,
-    ) -> Result<Self> {
-        Self::load_selected_profile(
-            path,
-            representation,
-            AdapterSelection::Edited(adapter),
-            None,
-            backend,
-            seed,
-            parallelism,
-            kv_cache,
-            context_tokens,
-            None,
-            None,
-            PromptReuse::Disabled,
-            BranchCheckpoints::default(),
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "Both explicit adapter selections share one immutable execution loader."
+        reason = "All profile selections share one immutable execution loader."
     )]
     fn load_selected_profile(
         path: &Path,
         representation: Representation,
-        adapter_selection: AdapterSelection<'_>,
         multi_rank_adapter: Option<MultiRankAdapterSpec<'_>>,
         backend: MatvecBackend,
         seed: u32,
@@ -1367,19 +1282,6 @@ impl SwiftSession {
         prompt_reuse: PromptReuse,
         branch_checkpoints: BranchCheckpoints,
     ) -> Result<Self> {
-        if let AdapterSelection::Edited(candidate) = &adapter_selection {
-            candidate.validate_identity()?;
-        }
-        if representation.is_nariq()
-            && matches!(
-                adapter_selection,
-                AdapterSelection::Approved(Some(_)) | AdapterSelection::Edited(_)
-            )
-        {
-            return Err(invalid(
-                "NariQ representation does not support rank-one Orca adapters",
-            ));
-        }
         validate_execution_capacity_with_reuse(
             context_tokens,
             u64::MAX,
@@ -1406,20 +1308,6 @@ impl SwiftSession {
         let chat = SwiftChatSession::from_model_representation(&model, representation)?
             .with_context_tokens(context_tokens)?;
         let vocabulary = Vocabulary::from_metadata(&model.metadata, swift::VOCAB_SIZE)?;
-        let adapter = match adapter_selection {
-            AdapterSelection::Approved(path) => path
-                .map(|path| RankOneAdapter::load_swift_representation(path, &model, representation))
-                .transpose()?,
-            AdapterSelection::Edited(candidate) => Some(RankOneAdapter::load_edited_swift(
-                candidate,
-                &model,
-                representation,
-            )?),
-        };
-        let adapter_identity = adapter
-            .as_ref()
-            .map(|adapter| adapter.identity().to_owned());
-        let adapter_storage = adapter.as_ref().map(RankOneAdapter::storage);
         let secondary = load_secondary_adapter(&model, multi_rank_adapter)?;
         let secondary_adapter = secondary.adapter;
         let secondary_adapter_identity = secondary.identity;
@@ -1431,7 +1319,6 @@ impl SwiftSession {
             state_budget,
             backend,
             kv_cache,
-            adapter.map(|item| (item, 1.3)),
             secondary_adapter.map(|item| (item, 0.0)),
         )?;
         decoder.set_row_parallelism(parallelism);
@@ -1464,8 +1351,6 @@ impl SwiftSession {
             kv_cache,
             cpu_prefill,
             cpu_speculation,
-            adapter_identity,
-            adapter_storage,
             secondary_adapter_identity,
             secondary_adapter_max_rank,
             secondary_adapter_storage_bytes,
@@ -1537,18 +1422,6 @@ impl SwiftSession {
     #[must_use]
     pub fn decoder_identity(&self) -> &str {
         self.runtime.decoder().identity()
-    }
-
-    /// Exact verified adapter artifact SHA-256, when one was explicitly loaded.
-    #[must_use]
-    pub fn adapter_identity(&self) -> Option<&str> {
-        self.adapter_identity.as_deref()
-    }
-
-    /// Retained adapter factor payload; excludes process memory and overhead.
-    #[must_use]
-    pub const fn adapter_storage(&self) -> Option<AdapterStorage> {
-        self.adapter_storage
     }
 
     /// Exact verified secondary multi-rank adapter SHA-256, when explicitly loaded.
@@ -1835,43 +1708,14 @@ impl SwiftSession {
         output_tokens: usize,
         enable_thinking: bool,
     ) -> Result<PreparedChat> {
-        self.prepare_with_settings(
-            messages,
-            output_tokens,
-            enable_thinking,
-            self.adapter_identity.as_ref().map(|_| 1.3),
-        )
-    }
-
-    /// Seal exact prompt tokens, thinking mode and an explicit adapter scale.
-    ///
-    /// A loaded adapter requires `Some` finite scale in 0..2; an adapter-free
-    /// session requires `None`. The prompt belongs only to this session, across
-    /// explicit resets; it cannot be completed by another session or profile.
-    ///
-    /// # Errors
-    /// Rejects closed admission, mismatched settings and all normal prompt bounds.
-    pub fn prepare_with_settings(
-        &self,
-        messages: &Value,
-        output_tokens: usize,
-        enable_thinking: bool,
-        adapter_scale: Option<f32>,
-    ) -> Result<PreparedChat> {
         let multi_rank_scale = self.secondary_adapter_identity.as_ref().map(|_| 0.0);
-        self.prepare_with_adapter_scales(
-            messages,
-            output_tokens,
-            enable_thinking,
-            adapter_scale,
-            multi_rank_scale,
-        )
+        self.prepare_with_adapter_scales(messages, output_tokens, enable_thinking, multi_rank_scale)
     }
 
-    /// Seal exact prompt tokens, thinking mode, rank-one scale, and secondary multi-rank scale.
+    /// Seal exact prompt tokens, thinking mode, and optional multi-rank scale.
     ///
-    /// A loaded primary or secondary adapter requires `Some` finite scale in
-    /// `0..=2`; an omitted adapter requires `None`.
+    /// A loaded multi-rank adapter requires `Some` finite scale in `0..=2`;
+    /// an omitted adapter requires `None`.
     ///
     /// # Errors
     /// Rejects closed admission, mismatched settings, invalid scales, and prompt bounds.
@@ -1880,13 +1724,11 @@ impl SwiftSession {
         messages: &Value,
         output_tokens: usize,
         enable_thinking: bool,
-        adapter_scale: Option<f32>,
         multi_rank_scale: Option<f32>,
     ) -> Result<PreparedChat> {
         let options = SwiftRequestOptions {
             enable_thinking,
             reasoning_effort: ReasoningEffort::XHigh,
-            adapter_scale,
             multi_rank_scale,
             sampler: SwiftSamplerConfig::default(),
         };
@@ -1909,7 +1751,6 @@ impl SwiftSession {
         if messages_have_array_content(messages) {
             return self.prepare_multimodal_with_options(messages, output_tokens, options);
         }
-        validate_adapter_scale(self.adapter_identity.is_some(), options.adapter_scale)?;
         validate_multi_rank_scale(
             self.secondary_adapter_identity.is_some(),
             options.multi_rank_scale,
@@ -1925,7 +1766,6 @@ impl SwiftSession {
         )?;
         Ok(PreparedChat {
             owner: self.owner.clone(),
-            adapter_scale: options.adapter_scale,
             multi_rank_scale: options
                 .multi_rank_scale
                 .map(MultiRankAdapter::normalize_scale),
@@ -1938,29 +1778,7 @@ impl SwiftSession {
         })
     }
 
-    /// Encode image attachments, splice vision patch spans and seal exact prompt tokens.
-    ///
-    /// # Errors
-    /// Rejects closed admission, missing vision projector, malformed parts/URLs,
-    /// image decode errors, mismatched settings and context overflow.
-    pub fn prepare_multimodal_with_settings(
-        &self,
-        messages: &Value,
-        output_tokens: usize,
-        enable_thinking: bool,
-        adapter_scale: Option<f32>,
-    ) -> Result<PreparedChat> {
-        let multi_rank_scale = self.secondary_adapter_identity.as_ref().map(|_| 0.0);
-        self.prepare_multimodal_with_adapter_scales(
-            messages,
-            output_tokens,
-            enable_thinking,
-            adapter_scale,
-            multi_rank_scale,
-        )
-    }
-
-    /// Encode image attachments, splice vision patch spans, and seal dual-adapter scales.
+    /// Encode image attachments, splice vision patch spans, and seal multi-rank scale.
     ///
     /// # Errors
     /// Rejects closed admission, missing vision projector, malformed parts/URLs,
@@ -1970,13 +1788,11 @@ impl SwiftSession {
         messages: &Value,
         output_tokens: usize,
         enable_thinking: bool,
-        adapter_scale: Option<f32>,
         multi_rank_scale: Option<f32>,
     ) -> Result<PreparedChat> {
         let options = SwiftRequestOptions {
             enable_thinking,
             reasoning_effort: ReasoningEffort::XHigh,
-            adapter_scale,
             multi_rank_scale,
             sampler: SwiftSamplerConfig::default(),
         };
@@ -1990,7 +1806,6 @@ impl SwiftSession {
         options: &SwiftRequestOptions,
     ) -> Result<PreparedChat> {
         options.sampler.validate()?;
-        validate_adapter_scale(self.adapter_identity.is_some(), options.adapter_scale)?;
         validate_multi_rank_scale(
             self.secondary_adapter_identity.is_some(),
             options.multi_rank_scale,
@@ -2061,7 +1876,6 @@ impl SwiftSession {
             .collect();
         Ok(PreparedChat {
             owner: self.owner.clone(),
-            adapter_scale: options.adapter_scale,
             multi_rank_scale: options
                 .multi_rank_scale
                 .map(MultiRankAdapter::normalize_scale),
@@ -2231,7 +2045,6 @@ impl SwiftSession {
             return Err(invalid("Swift session requires reset"));
         }
         validate_prompt_owner(&self.owner, prompt)?;
-        validate_adapter_scale(self.adapter_identity.is_some(), prompt.adapter_scale)?;
         validate_multi_rank_scale(
             self.secondary_adapter_identity.is_some(),
             prompt.multi_rank_scale,
@@ -2239,11 +2052,8 @@ impl SwiftSession {
         check_request(cancellation, deadline)?;
         // Exact reuse is opt-in and never crosses a bitwise scale change.
         // The runtime recomputes unmatched histories under whole-request rollback.
-        self.runtime.prepare_profile_request_with_adapters(
-            prompt.adapter_scale,
-            prompt.multi_rank_scale,
-            self.prompt_reuse,
-        )
+        self.runtime
+            .prepare_profile_request_with_adapters(prompt.multi_rank_scale, self.prompt_reuse)
     }
 
     fn complete_observed(
@@ -2712,16 +2522,6 @@ fn validate_prompt_owner(owner: &Arc<()>, prompt: &PreparedChat) -> Result<()> {
     }
 }
 
-fn validate_adapter_scale(loaded: bool, scale: Option<f32>) -> Result<()> {
-    match (loaded, scale) {
-        (false, None) => Ok(()),
-        (true, Some(scale)) => RankOneAdapter::validate_scale(scale),
-        _ => Err(invalid(
-            "Swift adapter scale does not match the loaded profile",
-        )),
-    }
-}
-
 struct LoadedSecondaryAdapter {
     adapter: Option<MultiRankAdapter>,
     identity: Option<String>,
@@ -2797,9 +2597,9 @@ mod tests {
         NON_CONTEXT_MEMORY_BYTES, PreparedChat, STATE_MEMORY_BYTES, SwiftExecutionMemoryLedger,
         SwiftSession, TextEvent, context_token_memory_bytes, emit_decoded_token,
         kv_token_memory_bytes, max_context_tokens, selected_state_budget, state_limit_bytes,
-        validate_adapter_scale, validate_context_capacity, validate_context_capacity_with_kv,
-        validate_execution_capacity, validate_execution_capacity_with_kv,
-        validate_multi_rank_scale, validate_prefill_capacity, validate_prompt_owner,
+        validate_context_capacity, validate_context_capacity_with_kv, validate_execution_capacity,
+        validate_execution_capacity_with_kv, validate_multi_rank_scale, validate_prefill_capacity,
+        validate_prompt_owner,
     };
     use crate::{
         Result,
@@ -2883,8 +2683,7 @@ mod tests {
         for (prefill, speculation) in [(None, selected), (Some(tile), undersized)] {
             let error = SwiftSession::load_profile_with_execution(
                 Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
-                Representation::Pq2,
-                None,
+                Representation::Bonsai25Pq2,
                 MatvecBackend::Scalar,
                 42,
                 RowParallelism::default(),
@@ -3016,7 +2815,6 @@ mod tests {
         let owner = Arc::new(());
         let prompt = PreparedChat {
             owner: owner.clone(),
-            adapter_scale: Some(-0.0),
             multi_rank_scale: Some(0.5),
             tokens: vec![1, 2],
             media_chunks: Vec::new(),
@@ -3032,25 +2830,16 @@ mod tests {
         assert_eq!(prompt.output_tokens(), 3);
         assert!(!prompt.thinking_enabled());
         assert_eq!(
-            prompt.adapter_scale().map(f32::to_bits),
-            Some((-0.0_f32).to_bits())
-        );
-        assert_eq!(
             prompt.multi_rank_scale().map(f32::to_bits),
             Some(0.5_f32.to_bits())
         );
-        assert!(validate_adapter_scale(false, None).is_ok());
-        assert!(validate_adapter_scale(true, None).is_err());
         assert!(validate_multi_rank_scale(false, None).is_ok());
         assert!(validate_multi_rank_scale(true, None).is_err());
         for scale in [0.0, -0.0, 1.3, 2.0] {
-            validate_adapter_scale(true, Some(scale))?;
             validate_multi_rank_scale(true, Some(scale))?;
-            assert!(validate_adapter_scale(false, Some(scale)).is_err());
             assert!(validate_multi_rank_scale(false, Some(scale)).is_err());
         }
         for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 2.01] {
-            assert!(validate_adapter_scale(true, Some(scale)).is_err());
             assert!(validate_multi_rank_scale(true, Some(scale)).is_err());
         }
         Ok(())
@@ -3282,8 +3071,7 @@ mod tests {
             );
             let error = SwiftSession::load_profile_with_execution(
                 Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
-                Representation::Pq2,
-                None,
+                Representation::Bonsai25Pq2,
                 MatvecBackend::Scalar,
                 42,
                 RowParallelism::default(),
@@ -3355,8 +3143,7 @@ mod tests {
             assert!(
                 SwiftSession::load_profile_with_execution_and_reuse(
                     Path::new("THIS_MODEL_MUST_NOT_BE_OPENED.gguf"),
-                    Representation::Pq2,
-                    None,
+                    Representation::Bonsai25Pq2,
                     MatvecBackend::Scalar,
                     42,
                     RowParallelism::default(),
@@ -3478,8 +3265,8 @@ mod tests {
     #[test]
     fn calibrated_cow_execution_capacity_accounts_for_packing_and_shared_kv() -> Result<()> {
         use super::{
-            BranchCheckpoints, COW_UNSEALED_TAIL_TOKENS, PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES,
-            RECURRENT_MEMORY_BYTES, Representation, calibrated_cow_execution_memory_bytes,
+            BranchCheckpoints, COW_UNSEALED_TAIL_TOKENS, RECURRENT_MEMORY_BYTES, Representation,
+            calibrated_cow_execution_memory_bytes, calibrated_non_context_memory_bytes,
             validate_calibrated_cow_execution_capacity,
         };
         use crate::runtime::PromptReuse;
@@ -3490,7 +3277,7 @@ mod tests {
         let dflt = BranchCheckpoints::default();
         let pq2 = calibrated_cow_execution_memory_bytes(
             ctx,
-            Representation::Pq2,
+            Representation::Bonsai25Pq2,
             None,
             None,
             kv,
@@ -3499,7 +3286,7 @@ mod tests {
         )?;
         let ptq1 = calibrated_cow_execution_memory_bytes(
             ctx,
-            Representation::CurrentRepackedPtq1,
+            Representation::Bonsai25Ptq1,
             None,
             None,
             kv,
@@ -3507,19 +3294,16 @@ mod tests {
             dflt,
         )?;
         assert_eq!(pq2 - ptq1, 1_259_520_000);
-        let expected_pq2 = NON_CONTEXT_MEMORY_BYTES
+        let expected_pq2 = calibrated_non_context_memory_bytes(Representation::Bonsai25Pq2)
             + 3 * u64::try_from(RECURRENT_MEMORY_BYTES)?
             + u64::try_from(ctx)? * (kv_per_tok + 96 + 128)
             + u64::try_from(COW_UNSEALED_TAIL_TOKENS)? * kv_per_tok;
         assert_eq!(pq2, expected_pq2);
-        assert_eq!(
-            ptq1,
-            PTQ1_CALIBRATED_NON_CONTEXT_MEMORY_BYTES + (expected_pq2 - NON_CONTEXT_MEMORY_BYTES)
-        );
+        assert_eq!(ptq1, pq2 - 1_259_520_000);
         validate_calibrated_cow_execution_capacity(
             ctx,
             pq2,
-            Representation::Pq2,
+            Representation::Bonsai25Pq2,
             None,
             None,
             kv,
@@ -3530,7 +3314,7 @@ mod tests {
             validate_calibrated_cow_execution_capacity(
                 ctx,
                 pq2 - 1,
-                Representation::Pq2,
+                Representation::Bonsai25Pq2,
                 None,
                 None,
                 kv,
@@ -3555,7 +3339,7 @@ mod tests {
         let kv = KvCachePolicy::Rotated4;
         let ptq1 = calibrated_cow_execution_memory_bytes(
             ctx,
-            Representation::CurrentRepackedPtq1,
+            Representation::Bonsai25Ptq1,
             None,
             None,
             kv,
@@ -3568,7 +3352,7 @@ mod tests {
         let reuse = PromptReuse::PromptEndAndLatest;
         let spec_req = calibrated_cow_execution_memory_bytes(
             ctx,
-            Representation::CurrentRepackedPtq1,
+            Representation::Bonsai25Ptq1,
             Some(prefill),
             Some(spec),
             kv,
@@ -3582,7 +3366,7 @@ mod tests {
         validate_calibrated_cow_execution_capacity(
             ctx,
             spec_req,
-            Representation::CurrentRepackedPtq1,
+            Representation::Bonsai25Ptq1,
             Some(prefill),
             Some(spec),
             kv,
@@ -3593,7 +3377,7 @@ mod tests {
             validate_calibrated_cow_execution_capacity(
                 ctx,
                 spec_req - 1,
-                Representation::CurrentRepackedPtq1,
+                Representation::Bonsai25Ptq1,
                 Some(prefill),
                 Some(spec),
                 kv,
@@ -3608,24 +3392,25 @@ mod tests {
     #[test]
     fn swift_session_model_identity_exposes_64_char_representation_sha256() {
         use super::{Representation, SwiftSession};
-        use crate::model::swift::{MODEL_SHA256, REPACKED_PTQ1_SHA256};
+        use crate::model::swift::{BONSAI_2_5_PQ2_SHA256, BONSAI_2_5_PTQ1_SHA256};
 
         let method: fn(&SwiftSession) -> &'static str = SwiftSession::model_identity;
         let _ = method;
         let release_method: fn(&mut SwiftSession) -> Result<usize> =
             SwiftSession::release_executor_resident_host_weights;
         let _ = release_method;
-        assert_eq!(Representation::Pq2.model_sha256(), MODEL_SHA256);
         assert_eq!(
-            Representation::CurrentRepackedPtq1.model_sha256(),
-            REPACKED_PTQ1_SHA256
+            Representation::Bonsai25Pq2.model_sha256(),
+            BONSAI_2_5_PQ2_SHA256
         );
-        assert_ne!(MODEL_SHA256, REPACKED_PTQ1_SHA256);
+        assert_eq!(
+            Representation::Bonsai25Ptq1.model_sha256(),
+            BONSAI_2_5_PTQ1_SHA256
+        );
+        assert_ne!(BONSAI_2_5_PQ2_SHA256, BONSAI_2_5_PTQ1_SHA256);
         for sha in [
-            MODEL_SHA256,
-            REPACKED_PTQ1_SHA256,
-            crate::model::swift::BONSAI_2_5_PQ2_SHA256,
-            crate::model::swift::BONSAI_2_5_PTQ1_SHA256,
+            BONSAI_2_5_PQ2_SHA256,
+            BONSAI_2_5_PTQ1_SHA256,
             crate::model::swift::NARIQ_2_5BPW_SHA256,
             crate::model::swift::NARIQ_3_0BPW_SHA256,
             crate::model::swift::NARIQ_2_0BPW_SHA256,
@@ -3641,8 +3426,8 @@ mod tests {
     #[test]
     fn calibrated_cow_execution_capacity_accounts_for_bonsai25_and_nariq_sizes() -> Result<()> {
         use super::{
-            BranchCheckpoints, NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES, NON_CONTEXT_MEMORY_BYTES,
-            Representation, calibrated_cow_execution_memory_bytes,
+            BASE_NON_WEIGHT_MEMORY_BYTES, BranchCheckpoints, NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES,
+            NON_CONTEXT_MEMORY_BYTES, Representation, calibrated_cow_execution_memory_bytes,
             calibrated_non_context_memory_bytes,
         };
         use crate::runtime::PromptReuse;
@@ -3651,19 +3436,18 @@ mod tests {
         let kv = KvCachePolicy::Rotated4;
         let pq2 = calibrated_cow_execution_memory_bytes(
             ctx,
-            Representation::Pq2,
+            Representation::Bonsai25Pq2,
             None,
             None,
             kv,
             PromptReuse::Latest,
             BranchCheckpoints::default(),
         )?;
+        let pq2_fixed = calibrated_non_context_memory_bytes(Representation::Bonsai25Pq2);
+        assert_eq!(pq2_fixed - NON_CONTEXT_MEMORY_BYTES, 47_185_920);
         for repr in [Representation::Bonsai25Pq2, Representation::Bonsai25Ptq1] {
             let fixed = calibrated_non_context_memory_bytes(repr);
-            assert_eq!(
-                fixed,
-                (NON_CONTEXT_MEMORY_BYTES - crate::model::swift::MODEL_BYTES) + repr.model_bytes()
-            );
+            assert_eq!(fixed, BASE_NON_WEIGHT_MEMORY_BYTES + repr.model_bytes());
             let cow = calibrated_cow_execution_memory_bytes(
                 ctx,
                 repr,
@@ -3673,11 +3457,11 @@ mod tests {
                 PromptReuse::Latest,
                 BranchCheckpoints::default(),
             )?;
-            assert_eq!(cow, (pq2 - NON_CONTEXT_MEMORY_BYTES) + fixed);
+            assert_eq!(cow, (pq2 - pq2_fixed) + fixed);
         }
         assert_eq!(
-            calibrated_non_context_memory_bytes(Representation::Bonsai25Pq2)
-                - NON_CONTEXT_MEMORY_BYTES,
+            BASE_NON_WEIGHT_MEMORY_BYTES + crate::model::swift::BONSAI_2_5_PQ2_BYTES
+                - (11 * 1024 * 1024 * 1024),
             47_185_920
         );
         for repr in [
@@ -3688,7 +3472,7 @@ mod tests {
             let nariq_fixed = calibrated_non_context_memory_bytes(repr);
             assert_eq!(
                 nariq_fixed,
-                (NON_CONTEXT_MEMORY_BYTES - crate::model::swift::MODEL_BYTES)
+                BASE_NON_WEIGHT_MEMORY_BYTES
                     + repr.model_bytes()
                     + NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES
             );
@@ -3701,7 +3485,7 @@ mod tests {
                 PromptReuse::Latest,
                 BranchCheckpoints::default(),
             )?;
-            assert_eq!(nariq, pq2 + nariq_fixed - NON_CONTEXT_MEMORY_BYTES);
+            assert_eq!(nariq, (pq2 - pq2_fixed) + nariq_fixed);
         }
         Ok(())
     }

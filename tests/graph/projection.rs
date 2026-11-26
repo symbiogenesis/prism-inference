@@ -191,13 +191,12 @@ fn projection_scope_q8_opt_in_preserves_ptq1_odd_pq2_state_and_adapter() -> Resu
                 let build = || -> Result<Qwen35> {
                     let base = backend_fixture(recurrent, kind, width)?;
                     let target = if recurrent {
-                        "blk.0.ssm_out.weight"
+                        "blk.0.attn_gate.weight"
                     } else {
                         "blk.0.attn_output.weight"
                     };
-                    let factors =
-                        rank_one_factors(&base, &["blk.0.ffn_down.weight", target], 0.125);
-                    rank_one_graph(base, factors, adapter_scale)
+                    let factors = lora_factors(&base, &["blk.0.ffn_down.weight", target], 0.125);
+                    lora_graph(base, factors, adapter_scale)
                 };
                 let mut control = build()?;
                 let (mut executor, calls, fail) = executor();
@@ -240,16 +239,12 @@ fn projection_scope_preserves_logits_state_adapter_basis_checkpoint_and_reset() 
                     MetadataValue::from([-1_i64, 1].repeat(128)),
                 );
                 let target = if recurrent {
-                    "blk.0.ssm_out.weight"
+                    "blk.0.attn_gate.weight"
                 } else {
                     "blk.0.attn_output.weight"
                 };
-                let factors = rank_one_factors(
-                    &base,
-                    &["token_embd.weight", "blk.0.ffn_down.weight", target],
-                    0.125,
-                );
-                rank_one_graph(base, factors, adapter_scale)
+                let factors = lora_factors(&base, &["blk.0.ffn_down.weight", target], 0.125);
+                lora_graph(base, factors, adapter_scale)
             };
             let mut control = build()?;
             let (mut executor, calls, _) = executor();
@@ -291,8 +286,8 @@ fn lut_projection_scope_preserves_full_and_recurrent_state_with_adapter() -> Res
         for recurrent in [false, true] {
             let build = || -> Result<Qwen35> {
                 let base = backend_fixture(recurrent, 142, width)?;
-                let factors = rank_one_factors(&base, &["blk.0.ffn_down.weight"], 0.125);
-                rank_one_graph(base, factors, 1.3)
+                let factors = lora_factors(&base, &["blk.0.ffn_down.weight"], 0.125);
+                lora_graph(base, factors, 1.3)
             };
             let mut control = build()?;
             let mut executor = Pq2LutExecutor::new(256, RowParallelism::new(1)?)?;
@@ -390,8 +385,8 @@ fn tiled_prefill_projection_scope_dispatches_pq2_projections_and_preserves_state
         for f32_direct in [false, true] {
             let build = || -> Result<Qwen35> {
                 let model = backend_fixture(recurrent, 142, 256)?;
-                let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
-                rank_one_graph(model, factors, 1.3)
+                let factors = lora_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+                lora_graph(model, factors, 1.3)
             };
             let mut expected = build()?;
             for token in prompt {
@@ -499,12 +494,12 @@ fn cpu_sibling_projection_preserves_full_and_recurrent_state_with_adapter() -> R
             let build = || -> Result<Qwen35> {
                 let base = sibling_graph_fixture(recurrent)?;
                 let output = if recurrent {
-                    "blk.0.ssm_out.weight"
+                    "blk.0.attn_gate.weight"
                 } else {
                     "blk.0.attn_output.weight"
                 };
-                let factors = rank_one_factors(&base, &["blk.0.ffn_down.weight", output], 0.125);
-                rank_one_graph(base, factors, adapter_scale)
+                let factors = lora_factors(&base, &["blk.0.ffn_down.weight", output], 0.125);
+                lora_graph(base, factors, adapter_scale)
             };
             let mut control = build()?;
             let mut graph = build()?;
@@ -561,16 +556,16 @@ fn q8_sibling_projection_preserves_complete_state_and_targeted_adapters() -> Res
                 } else {
                     "blk.0.attn_q.weight"
                 };
-                let factors =
-                    rank_one_factors(&base, &["blk.0.ffn_gate.weight", projection], 0.125);
-                let adapter = RankOneAdapter::from_model(factors, &base)?;
-                Qwen35::with_rank_one_adapter(
+                let factors = lora_factors(&base, &["blk.0.ffn_gate.weight", projection], 0.125);
+                let adapter =
+                    MultiRankAdapter::from_model(&base, &factors, MultiRankPolicy::AnyLinear)?;
+                Qwen35::with_adapters_and_kv(
                     base,
                     16,
                     1024 * 1024,
                     backend,
-                    adapter,
-                    adapter_scale,
+                    Some((adapter, adapter_scale)),
+                    bonsai_prism_runtime::graph::KvCachePolicy::F16,
                 )
             };
             let mut control = build(MatvecBackend::Scalar)?;

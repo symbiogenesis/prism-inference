@@ -1294,9 +1294,9 @@ pub(crate) mod tests {
             (5, 68 * 16, 48, &[2, 1, 1, 2, 1, 1, 0], true),
             (6, 32, 12 * 16, &[2, 1, 1, 1, 16, 1, 0], false),
         ];
-        let parallel4 = RowParallelism::new(4)?;
-        let serial = RowParallelism::default();
-
+        let parallelisms = std::iter::once(Ok(RowParallelism::default()))
+            .chain(cfg!(feature = "parallel-rows").then(|| RowParallelism::new(4)))
+            .collect::<Result<Vec<_>>>()?;
         for (case_idx, &(bits, k, n, desc_raw, perms)) in cases.iter().enumerate() {
             let weight = build_synthetic_weight(
                 bits,
@@ -1332,7 +1332,7 @@ pub(crate) mod tests {
 
             let mut scratch = TrellisScratch::default();
             for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
-                for par in [&serial, &parallel4] {
+                for par in &parallelisms {
                     let mut actual = Vec::new();
                     trellis_matvec_into(
                         &weight,

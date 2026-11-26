@@ -2,7 +2,7 @@ use bonsai_native_hash::{Hasher, hash_bytes};
 use bonsai_prism_runtime::{
     Result,
     kernels::{MatvecBackend, RowParallelism},
-    model::{lora::SWIFT_ADAPTER_SHA256, swift::Representation},
+    model::swift::Representation,
     runtime::{Cancellation, Completion, Finish, GenerationPhase, GenerationTimings, PromptReuse},
     swift_session::{SwiftSession, TextEvent},
 };
@@ -24,6 +24,7 @@ const LEGACY_F16_SOURCE: &str = "055c7430cb4771dfddb24ddaa30494af6ad182da";
 
 struct Selection {
     model: PathBuf,
+    #[expect(dead_code, reason = "Retained for collector CLI signature parity.")]
     adapter: PathBuf,
     evidence: PathBuf,
     messages: PathBuf,
@@ -230,8 +231,12 @@ fn complete_request(
 ) -> Result<()> {
     observation.stage = "request-preparation";
     let started = Instant::now();
-    let prepared =
-        session.prepare_with_settings(messages, selection.output_tokens, false, Some(1.3));
+    let prepared = session.prepare_with_adapter_scales(
+        messages,
+        selection.output_tokens,
+        false,
+        None,
+    );
     observation.preparation_milliseconds = Some(started.elapsed().as_secs_f64() * 1000.0);
     let prepared = prepared?;
     observation.prompt_tokens = Some(prepared.prompt_tokens());
@@ -276,14 +281,13 @@ fn execute(selection: &Selection, observation: &mut Observation) -> Result<()> {
     let mut session = loaded?;
     observation.model_loaded = true;
     observation.effective_row_workers = Some(session.row_workers());
-    observation.observed_adapter_sha256 = session.adapter_identity().map(str::to_owned);
+    observation.observed_adapter_sha256 = None;
     // This direct source-bound session never installs a DSP/GPU executor.
     // Scalar fallback and optional NEON instructions are both CPU execution.
     session.set_projection_executor(None);
     if session.row_workers() != 4
         || session.requested_backend() != MatvecBackend::ExperimentalNeon
         || session.prompt_reuse() != PromptReuse::Disabled
-        || session.adapter_identity() != Some(SWIFT_ADAPTER_SHA256)
         || !profile_matches(selection, &session)
     {
         return Err(reject(
@@ -351,8 +355,8 @@ fn identity_record(selection: &Selection, observation: &Observation) -> Value {
         "source_commit_declaration":selection.source_commit,
         "source_binding":"requires independent hosted build/executable/collector-source receipt verification",
         "executable_sha256":observation.executable_sha256, "input_sha256":observation.input_sha256,
-        "model_sha256":Representation::Pq2.model_sha256(), "model_bytes":Representation::Pq2.model_bytes(),
-        "weight_representation":"PQ2_0", "adapter_sha256":SWIFT_ADAPTER_SHA256,
+        "model_sha256":Representation::Bonsai25Pq2.model_sha256(), "model_bytes":Representation::Bonsai25Pq2.model_bytes(),
+        "weight_representation":"Bonsai-2.5-PQ2_0", "adapter_sha256":Value::Null,
         "observed_adapter_sha256":observation.observed_adapter_sha256,
         "adapter_scale_bits":format!("{:08x}", 1.3_f32.to_bits()),
         "row_workers":4, "effective_row_workers":observation.effective_row_workers,

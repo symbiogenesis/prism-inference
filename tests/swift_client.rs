@@ -28,14 +28,14 @@ const fn expected() -> ExpectedSwiftWorker {
 }
 fn ready() -> Value {
     json!({
-        "type":"ready","protocol":"bonsai-swift-worker-v1","model_sha256":swift::MODEL_SHA256,
+        "type":"ready","protocol":"bonsai-swift-worker-v1","model_sha256":swift::BONSAI_2_5_PQ2_SHA256,
         "template_sha256":swift::TEMPLATE_SHA256,"vocab_size":248_320,"runtime":"bonsai-prism-runtime",
         "prism_commit":bonsai_gguf::CODEC_COMMIT,"seed":17,"backend":"scalar","max_frame_bytes":MAX_FRAME_BYTES,
         "max_output_bytes":MAX_OUTPUT_BYTES,"context_tokens":8192,"max_output_tokens":4096,
         "temperature":1,"top_p":0.95,"top_k":20,"min_p":0,"repeat_penalty":1,"presence_penalty":0,
         "frequency_penalty":0,"thinking":true,"reasoning_effort":"xhigh","preserve_thinking":true,
         "cache_reuse":false,"speculation":false,"adapters":false,"qualification":"pending-full-model-parity-and-device-evidence",
-        "kv_cache":"rsq4","startup_graph_identity":format!("{}:{}",swift::MODEL_SHA256,
+        "kv_cache":"rsq4","startup_graph_identity":format!("{}:{}",swift::BONSAI_2_5_PQ2_SHA256,
             SWIFT_GRAPH_CONTRACT.replace("kv-f16","kv-rsq4-d256-rht3-v1"))
     })
 }
@@ -178,7 +178,7 @@ fn fitted_scale_readiness_requires_exact_owner_profile_and_graph() -> Result<()>
     frame["kv_cache"] = json!("rsq4vf");
     frame["startup_graph_identity"] = json!(format!(
         "{}:{}",
-        swift::MODEL_SHA256,
+        swift::BONSAI_2_5_PQ2_SHA256,
         SWIFT_GRAPH_CONTRACT.replace("kv-f16", "kv-rsq4vf-d256-rht3-v1")
     ));
     let bytes = serde_json::to_string(&frame)? + "\n";

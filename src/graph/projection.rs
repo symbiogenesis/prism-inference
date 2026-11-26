@@ -557,8 +557,6 @@ mod tests {
             output: super::super::OutputHead::Plain(stub_tensor("output.weight")),
             output_norm: vec![1.0; 128],
             transforms: super::super::Transforms::default(),
-            adapter: None,
-            adapter_scale: 0.0,
             multi_rank_adapter: None,
             multi_rank_adapter_scale: 0.0,
             layers: vec![super::super::Layer {
@@ -648,7 +646,7 @@ mod tests {
         Ok(())
     }
 
-    fn adapter_targeting(target: &Tensor) -> Result<crate::model::lora::RankOneAdapter> {
+    fn adapter_targeting(target: &Tensor) -> Result<crate::model::lora::MultiRankAdapter> {
         use std::collections::BTreeMap;
         let base = crate::model::Model {
             identity: "projection-adapter-base".to_owned(),
@@ -686,6 +684,10 @@ mod tests {
                     bonsai_gguf::MetadataValue::from("lora"),
                 ),
                 (
+                    "adapter.lora.alpha".to_owned(),
+                    bonsai_gguf::MetadataValue::from(1.0_f32),
+                ),
+                (
                     "adapter.lora_alpha".to_owned(),
                     bonsai_gguf::MetadataValue::from(1.0_f32),
                 ),
@@ -701,7 +703,11 @@ mod tests {
                 ),
             ]),
         };
-        crate::model::lora::RankOneAdapter::from_model(factors, &base)
+        crate::model::lora::MultiRankAdapter::from_model(
+            &base,
+            &factors,
+            crate::model::lora::MultiRankPolicy::AnyLinear,
+        )
     }
 
     #[test]
@@ -714,24 +720,24 @@ mod tests {
         };
         let provenance = Arc::new(());
         let mut dec_zero = tiny_decoder(Arc::clone(&provenance))?;
-        dec_zero.adapter = Some(adapter_targeting(&dec_zero.layers[0].down)?);
-        dec_zero.adapter_scale = 0.0;
+        dec_zero.multi_rank_adapter = Some(adapter_targeting(&dec_zero.layers[0].down)?);
+        dec_zero.multi_rank_adapter_scale = 0.0;
         let zero_proj = dec_zero.with_projection_executor(&mut exec)?;
         assert_eq!(zero_proj.work.map(|w| w.hidden), Some(9));
 
         let mut dec_attn = tiny_decoder(Arc::clone(&provenance))?;
         if let Attention::Full(attn) = &dec_attn.layers[0].attention {
-            dec_attn.adapter = Some(adapter_targeting(&attn.output)?);
+            dec_attn.multi_rank_adapter = Some(adapter_targeting(&attn.output)?);
         }
-        dec_attn.adapter_scale = 1.3;
+        dec_attn.multi_rank_adapter_scale = 1.3;
         let attn_proj = dec_attn.with_projection_executor(&mut exec)?;
         assert_eq!(attn_proj.work.map(|w| w.hidden), Some(9));
         let attn_digest = attn_proj.plan_digest;
         drop(attn_proj);
 
         let mut dec_down = tiny_decoder(provenance)?;
-        dec_down.adapter = Some(adapter_targeting(&dec_down.layers[0].down)?);
-        dec_down.adapter_scale = 1.3;
+        dec_down.multi_rank_adapter = Some(adapter_targeting(&dec_down.layers[0].down)?);
+        dec_down.multi_rank_adapter_scale = 1.3;
         let down_proj = dec_down.with_projection_executor(&mut exec)?;
         assert_eq!(down_proj.work.map(|w| w.hidden), Some(8));
         assert_ne!(attn_digest, down_proj.plan_digest);

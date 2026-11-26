@@ -1,8 +1,7 @@
 //! Timed evaluation must preserve numerical ordering and transactional state.
 
 use super::{
-    Decoder, MatvecBackend, Qwen35, Result, fixture, graph_bits, rank_one_factors, rank_one_graph,
-    weight,
+    Decoder, MatvecBackend, Qwen35, Result, fixture, graph_bits, lora_factors, lora_graph, weight,
 };
 use bonsai_gguf::MetadataValue;
 use bonsai_prism_runtime::graph::TokenTimings;
@@ -26,8 +25,8 @@ fn layer_timing_preserves_adapter_logits_complete_state_and_checkpoint_replay() 
                     weight(target, &[2, 2], &[0.25, 0.0, 0.0, 0.5]),
                 );
             }
-            let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
-            rank_one_graph(model, factors, 1.3)
+            let factors = lora_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+            lora_graph(model, factors, 1.3)
         };
         let mut plain = graph()?;
         let mut timed = graph()?;

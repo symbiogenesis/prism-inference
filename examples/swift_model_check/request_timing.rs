@@ -1,15 +1,13 @@
 //! One bounded production-session request, with value-free core attribution.
 
 use super::{
-    AdapterSelection, MultiRankAdapterSelection, Representation, evidence_backend,
-    hash_adapter_file, reject,
+    MultiRankAdapterSelection, Representation, evidence_backend, hash_adapter_file, reject,
 };
 use bonsai_native_hash::{Hasher, hash_bytes};
 use bonsai_prism_runtime::{
     Result,
     graph::KvCachePolicy,
     kernels::{MatvecBackend, RowParallelism},
-    model::lora::SWIFT_ADAPTER_SHA256,
     model::swift,
     runtime::{Cancellation, Completion, GenerationPhase, GenerationTimings, PromptReuse},
     swift_session::{BranchCheckpoints, MultiRankAdapterSpec, SwiftSession},
@@ -31,7 +29,6 @@ struct Selection<'a> {
     messages: &'a Path,
     backend: MatvecBackend,
     representation: Representation,
-    adapter: Option<&'a AdapterSelection>,
     multi_rank_adapter: Option<&'a MultiRankAdapterSelection>,
     row_workers: usize,
     output_tokens: usize,
@@ -162,11 +159,6 @@ fn execute(selection: &Selection<'_>, observation: &mut Observation) -> Result<(
     observation.executable_sha256 = Some(executable_hash(selection.deadline)?);
     observation.stage = "session-loading";
     check(selection.deadline)?;
-    if selection.representation.is_nariq() && selection.adapter.is_some() {
-        return Err(reject(
-            "NariQ representation does not support --rank-one-adapter",
-        ));
-    }
     let multi_rank_identity = if let Some(multi_rank) = selection.multi_rank_adapter {
         let (bytes, sha256) = hash_adapter_file(&multi_rank.path)?;
         check(selection.deadline)?;
@@ -190,7 +182,6 @@ fn execute(selection: &Selection<'_>, observation: &mut Observation) -> Result<(
     let loaded = SwiftSession::load_profile_with_adapters(
         selection.model,
         selection.representation,
-        selection.adapter.map(|value| value.path.as_path()),
         multi_rank_spec,
         selection.backend,
         42,
@@ -214,7 +205,6 @@ fn execute(selection: &Selection<'_>, observation: &mut Observation) -> Result<(
         &messages,
         selection.output_tokens,
         false,
-        selection.adapter.map(|value| value.scale),
         selection.multi_rank_adapter.map(|value| value.scale),
     );
     observation.preparation_milliseconds = Some(started.elapsed().as_secs_f64() * 1000.0);
@@ -266,8 +256,6 @@ fn identity_record(selection: &Selection<'_>, observation: &Observation) -> Valu
         "source_binding":"declared commit must independently match the hosted build and executable artifact receipt",
         "package_version":env!("CARGO_PKG_VERSION"), "input_bytes_sha256":observation.input_sha256,
         "weight_representation":selection.representation.name(), "model_sha256":selection.representation.model_sha256(),
-        "selected_adapter_sha256":selection.adapter.map(|_| SWIFT_ADAPTER_SHA256),
-        "adapter_scale_bits":selection.adapter.map(|value| format!("{:08x}", value.scale.to_bits())),
         "multiRankAdapterSha256":observation.multi_rank_adapter_sha256,
         "multiRankAdapterMaxRank":observation.multi_rank_adapter_max_rank,
         "multiRankAdapterScaleBits":selection.multi_rank_adapter.map(|value| format!("{:08x}", value.scale.to_bits())),
@@ -335,7 +323,6 @@ pub(super) fn run(
     model: &Path,
     arguments: &[String],
     representation: Representation,
-    adapter: Option<&AdapterSelection>,
     multi_rank_adapter: Option<&MultiRankAdapterSelection>,
     row_workers: usize,
 ) -> Result<()> {
@@ -365,7 +352,6 @@ pub(super) fn run(
         messages,
         backend,
         representation,
-        adapter,
         multi_rank_adapter,
         row_workers,
         output_tokens,
@@ -427,8 +413,7 @@ mod tests {
             model: Path::new("private-model"),
             messages: Path::new("private-prompt"),
             backend: MatvecBackend::Scalar,
-            representation: Representation::CurrentRepackedPtq1,
-            adapter: None,
+            representation: Representation::Bonsai25Ptq1,
             multi_rank_adapter: None,
             row_workers: 4,
             output_tokens: 1,

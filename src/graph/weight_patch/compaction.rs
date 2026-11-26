@@ -275,7 +275,7 @@ mod tests {
     use crate::kernels::{MatvecBackend, PQ2, PTQ1};
     use crate::model::{
         Model, Tensor,
-        lora::{MultiRankAdapter, MultiRankPolicy, RankOneAdapter},
+        lora::{MultiRankAdapter, MultiRankPolicy},
     };
     use crate::{Decoder, Result};
 
@@ -570,7 +570,7 @@ mod tests {
         })
     }
 
-    fn down_rank_one_adapter(base: &Model, layer: usize) -> Result<RankOneAdapter> {
+    fn down_multi_rank_adapter(base: &Model, layer: usize) -> Result<MultiRankAdapter> {
         let target = format!("blk.{layer}.ffn_down.weight");
         let a_vals: Vec<f32> = (0..COMPACTED_FFN_ORIGINAL_INTERMEDIATE_WIDTH)
             .map(|i| [-0.0625_f32, 0.125, -0.03125, 0.0625][i % 4])
@@ -583,6 +583,7 @@ mod tests {
                 ("general.architecture".into(), MetadataValue::from("qwen35")),
                 ("general.type".into(), MetadataValue::from("adapter")),
                 ("adapter.type".into(), MetadataValue::from("lora")),
+                ("adapter.lora.alpha".into(), MetadataValue::from(1.0_f32)),
                 ("adapter.lora_alpha".into(), MetadataValue::from(1.0_f32)),
             ]),
             tensors: BTreeMap::from([
@@ -603,9 +604,9 @@ mod tests {
                     ),
                 ),
             ]),
-            identity: "swift-compaction-r1-adapter".into(),
+            identity: "swift-compaction-mr-adapter".into(),
         };
-        RankOneAdapter::from_model(factors, base)
+        MultiRankAdapter::from_model(base, &factors, MultiRankPolicy::NpuFriendly)
     }
 
     fn ffn_compensation() -> Result<FfnCompensation> {
@@ -792,14 +793,14 @@ mod tests {
         let comp_compact = with_compensation.then(ffn_compensation).transpose()?;
 
         let probe_model = swift_ffn_model_fixture(ffn_kind, 1)?;
-        let probe_adapter = down_rank_one_adapter(&probe_model, 0)?;
-        let probe_graph = Qwen35::with_rank_one_adapter(
+        let probe_adapter = down_multi_rank_adapter(&probe_model, 0)?;
+        let probe_graph = Qwen35::with_adapters_and_kv(
             probe_model,
             8,
             crate::graph::MAX_STATE_BYTES,
             MatvecBackend::Scalar,
-            probe_adapter,
-            1.3,
+            Some((probe_adapter, 1.3)),
+            KvCachePolicy::F16,
         )?;
         let mut probe =
             FfnProbe::new(probe_graph, 0, None)?.with_group_omission(omitted.clone())?;
@@ -808,14 +809,13 @@ mod tests {
         }
 
         let compact_model = swift_ffn_model_fixture(ffn_kind, 1)?;
-        let compact_adapter = down_rank_one_adapter(&compact_model, 0)?;
-        let compact_base = Qwen35::with_rank_one_adapter_and_kv(
+        let compact_adapter = down_multi_rank_adapter(&compact_model, 0)?;
+        let compact_base = Qwen35::with_adapters_and_kv(
             compact_model,
             8,
             crate::graph::MAX_STATE_BYTES,
             MatvecBackend::Scalar,
-            compact_adapter,
-            1.3,
+            Some((compact_adapter, 1.3)),
             KvCachePolicy::F16,
         )?;
         let pre_compact_ckpt = compact_base.checkpoint()?;
@@ -882,9 +882,9 @@ mod tests {
     #[test]
     fn compacted_ffn_rejects_cross_profile_checkpoints_multi_rank_and_rollback() -> Result<()> {
         let model_a = swift_ffn_model_fixture(PQ2, 2)?;
-        let adapter_a = down_rank_one_adapter(&model_a, 0)?;
+        let adapter_a = down_multi_rank_adapter(&model_a, 0)?;
         let model_b = swift_ffn_model_fixture(PQ2, 2)?;
-        let adapter_b = down_rank_one_adapter(&model_b, 0)?;
+        let adapter_b = down_multi_rank_adapter(&model_b, 0)?;
 
         // Fail-closed: MultiRankAdapter on ffn_gate of compacted layer 0 must reject.
         let gate_target = "blk.0.ffn_gate.weight";
@@ -928,7 +928,6 @@ mod tests {
                 8,
                 crate::graph::MAX_STATE_BYTES,
                 MatvecBackend::Scalar,
-                None,
                 Some((gate_mr, 1.0)),
                 KvCachePolicy::F16,
             )?
@@ -947,22 +946,22 @@ mod tests {
             compensation: None,
         }])?;
 
-        let mut graph_a = Qwen35::with_rank_one_adapter(
+        let mut graph_a = Qwen35::with_adapters_and_kv(
             model_a,
             8,
             crate::graph::MAX_STATE_BYTES,
             MatvecBackend::Scalar,
-            adapter_a,
-            1.3,
+            Some((adapter_a, 1.3)),
+            KvCachePolicy::F16,
         )?
         .with_compacted_ffn(plan_a)?;
-        let mut graph_b = Qwen35::with_rank_one_adapter(
+        let mut graph_b = Qwen35::with_adapters_and_kv(
             model_b,
             8,
             crate::graph::MAX_STATE_BYTES,
             MatvecBackend::Scalar,
-            adapter_b,
-            1.3,
+            Some((adapter_b, 1.3)),
+            KvCachePolicy::F16,
         )?
         .with_compacted_ffn(plan_b)?;
         assert_ne!(graph_a.identity(), graph_b.identity());
@@ -970,10 +969,10 @@ mod tests {
         let ckpt_empty = graph_a.checkpoint()?;
         assert!(graph_b.restore(&ckpt_empty).is_err());
         let original_id = graph_a.identity().to_owned();
-        graph_a.reset_with_adapter_scale(0.5)?;
+        graph_a.reset_with_adapter_scales(Some(0.5))?;
         assert!(graph_a.identity().contains(":w8-compacted-ffn-v1:"));
         assert!(graph_a.restore(&ckpt_empty).is_err());
-        graph_a.reset_with_adapter_scale(1.3)?;
+        graph_a.reset_with_adapter_scales(Some(1.3))?;
         assert_eq!(graph_a.identity(), original_id);
         assert!(graph_a.restore(&ckpt_empty).is_err());
         Ok(())

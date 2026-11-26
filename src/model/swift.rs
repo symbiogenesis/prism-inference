@@ -1,7 +1,7 @@
 //! Exact Swift model admission and retained-storage accounting.
 //!
-//! PQ2 remains the service MVP default. The explicit current-weight PTQ1 lane
-//! permits correctness captures; it does not qualify the service or adapters.
+//! `Ternary-Bonsai-2.5-27B-PQ2_0` is the default representation; opt-in lanes
+//! support `Ternary-Bonsai-2.5-27B-PTQ1_0` and `NariQ` trellis artifacts.
 //! Full-model numerical and process-memory qualification remain separate.
 
 use std::collections::{BTreeMap, HashSet};
@@ -16,15 +16,6 @@ use bonsai_native_hash::{Hasher, hash_bytes};
 use super::Model;
 use crate::{Result, invalid};
 
-/// Exact byte length from `config/swift-assessment.lock.json`.
-pub const MODEL_BYTES: u64 = 7_206_168_928;
-/// Immutable pinned Swift PQ2 artifact identity.
-pub const MODEL_SHA256: &str = "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5";
-/// Exact verified current-weight PTQ1 export length, not the older publisher model.
-pub const REPACKED_PTQ1_BYTES: u64 = 5_946_648_928;
-/// Immutable current-weight export identity from Runner's PTQ1 export receipt.
-pub const REPACKED_PTQ1_SHA256: &str =
-    "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5";
 /// Exact byte length of `Ternary-Bonsai-2.5-27B-PQ2_0.gguf`.
 pub const BONSAI_2_5_PQ2_BYTES: u64 = 7_253_354_848;
 /// Immutable pinned `Ternary-Bonsai-2.5-27B-PQ2_0.gguf` SHA-256 identity.
@@ -65,8 +56,6 @@ pub const CONTEXT_TOKENS: usize = 8_192;
 pub const TRAINING_CONTEXT_TOKENS: usize = 262_144;
 /// Maximum complete output allowance, including reasoning.
 pub const MAX_OUTPUT_TOKENS: usize = 4_096;
-/// Exact serialized tensor payload bytes, excluding header and alignment gaps.
-pub const TENSOR_PAYLOAD_BYTES: usize = 7_195_047_936;
 /// Maximum live FP16 KV and F32 recurrent/convolution payload at 8K context.
 pub const STATE_PAYLOAD_BYTES: usize = 693_764_096;
 /// Complete immutable multimodal projector GGUF byte length.
@@ -88,12 +77,8 @@ const EXPECTED_NARIQ_BANDED_TENSORS: usize = 2_771;
 /// quantizers differ, so this selection does not promise equal model outputs.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Representation {
-    /// Original pinned current-weight PQ2 artifact and service default.
+    /// Verified Ternary Bonsai 2.5 27B PQ2 artifact (`Ternary-Bonsai-2.5-27B-PQ2_0.gguf`) and default.
     #[default]
-    Pq2,
-    /// Verified lossless repack of the current PQ2 weights, not older PTQ weights.
-    CurrentRepackedPtq1,
-    /// Verified Ternary Bonsai 2.5 27B PQ2 artifact (`Ternary-Bonsai-2.5-27B-PQ2_0.gguf`).
     Bonsai25Pq2,
     /// Verified Ternary Bonsai 2.5 27B PTQ1 artifact (`Ternary-Bonsai-2.5-27B-PTQ1_0.gguf`).
     Bonsai25Ptq1,
@@ -106,12 +91,10 @@ pub enum Representation {
 }
 
 impl Representation {
-    /// Stable evidence identity distinguishing the source from its exact export or `NariQ` pack.
+    /// Stable evidence identity distinguishing the selected representation or `NariQ` pack.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Pq2 => "PQ2_0",
-            Self::CurrentRepackedPtq1 => "current-repacked-PTQ1_0",
             Self::Bonsai25Pq2 => "Bonsai-2.5-PQ2_0",
             Self::Bonsai25Ptq1 => "Bonsai-2.5-PTQ1_0",
             Self::NariQ2_5Bpw => "NariQ-2.5bpw",
@@ -124,8 +107,6 @@ impl Representation {
     #[must_use]
     pub const fn model_id(self) -> &'static str {
         match self {
-            Self::Pq2 => "Swift-Bonsai-2-PQ2_0",
-            Self::CurrentRepackedPtq1 => "Swift-Bonsai-2-current-repacked-PTQ1_0",
             Self::Bonsai25Pq2 => "Ternary-Bonsai-2.5-27B-PQ2_0",
             Self::Bonsai25Ptq1 => "Ternary-Bonsai-2.5-27B-PTQ1_0",
             Self::NariQ2_5Bpw => "Qwen3.8-27B-NariQ-2.5bpw",
@@ -138,8 +119,6 @@ impl Representation {
     #[must_use]
     pub const fn model_bytes(self) -> u64 {
         match self {
-            Self::Pq2 => MODEL_BYTES,
-            Self::CurrentRepackedPtq1 => REPACKED_PTQ1_BYTES,
             Self::Bonsai25Pq2 => BONSAI_2_5_PQ2_BYTES,
             Self::Bonsai25Ptq1 => BONSAI_2_5_PTQ1_BYTES,
             Self::NariQ2_5Bpw => NARIQ_2_5BPW_BYTES,
@@ -152,8 +131,6 @@ impl Representation {
     #[must_use]
     pub const fn model_sha256(self) -> &'static str {
         match self {
-            Self::Pq2 => MODEL_SHA256,
-            Self::CurrentRepackedPtq1 => REPACKED_PTQ1_SHA256,
             Self::Bonsai25Pq2 => BONSAI_2_5_PQ2_SHA256,
             Self::Bonsai25Ptq1 => BONSAI_2_5_PTQ1_SHA256,
             Self::NariQ2_5Bpw => NARIQ_2_5BPW_SHA256,
@@ -162,7 +139,7 @@ impl Representation {
         }
     }
 
-    /// Whether this representation selects an opt-in Ternary Bonsai 2.5 27B artifact.
+    /// Whether this representation selects a Ternary Bonsai 2.5 27B artifact.
     #[must_use]
     pub const fn is_bonsai_2_5(self) -> bool {
         matches!(self, Self::Bonsai25Pq2 | Self::Bonsai25Ptq1)
@@ -191,11 +168,7 @@ impl Representation {
     #[must_use]
     pub const fn model_memory_limit_bytes(self) -> usize {
         match self {
-            Self::Pq2
-            | Self::CurrentRepackedPtq1
-            | Self::Bonsai25Pq2
-            | Self::Bonsai25Ptq1
-            | Self::NariQ2_0Bpw => 8 * 1024 * 1024 * 1024,
+            Self::Bonsai25Pq2 | Self::Bonsai25Ptq1 | Self::NariQ2_0Bpw => 8 * 1024 * 1024 * 1024,
             Self::NariQ2_5Bpw => 9 * 1024 * 1024 * 1024,
             Self::NariQ3_0Bpw => 11 * 1024 * 1024 * 1024,
         }
@@ -203,8 +176,8 @@ impl Representation {
 
     const fn tensor_kind(self) -> u32 {
         match self {
-            Self::Pq2 | Self::Bonsai25Pq2 => 142,
-            Self::CurrentRepackedPtq1 | Self::Bonsai25Ptq1 => 143,
+            Self::Bonsai25Pq2 => 142,
+            Self::Bonsai25Ptq1 => 143,
             Self::NariQ2_5Bpw | Self::NariQ2_0Bpw => 45,
             Self::NariQ3_0Bpw => 46,
         }
@@ -212,16 +185,14 @@ impl Representation {
 
     const fn file_type(self) -> u64 {
         match self {
-            Self::Pq2 | Self::Bonsai25Pq2 => 141,
-            Self::CurrentRepackedPtq1 | Self::Bonsai25Ptq1 => 143,
+            Self::Bonsai25Pq2 => 141,
+            Self::Bonsai25Ptq1 => 143,
             Self::NariQ2_5Bpw | Self::NariQ3_0Bpw | Self::NariQ2_0Bpw => 32,
         }
     }
 
     const fn tensor_payload_bytes(self) -> usize {
         match self {
-            Self::Pq2 => TENSOR_PAYLOAD_BYTES,
-            Self::CurrentRepackedPtq1 => 5_935_527_936,
             Self::Bonsai25Pq2 => BONSAI_2_5_PQ2_TENSOR_PAYLOAD_BYTES,
             Self::Bonsai25Ptq1 => BONSAI_2_5_PTQ1_TENSOR_PAYLOAD_BYTES,
             Self::NariQ2_5Bpw | Self::NariQ3_0Bpw | Self::NariQ2_0Bpw => 0,
@@ -256,7 +227,7 @@ pub struct LoadReceipt {
 /// Rejects artifact drift, unsupported/malformed metadata, any extra or missing
 /// tensor, encoding/dimension drift, insufficient storage budgets and I/O errors.
 pub fn load(path: &Path, memory_limit: usize) -> Result<(Model, LoadReceipt)> {
-    load_representation(path, memory_limit, Representation::Pq2)
+    load_representation(path, memory_limit, Representation::Bonsai25Pq2)
 }
 
 /// Loads the exact selected current-weight representation for correctness checks.
@@ -292,7 +263,7 @@ pub fn load_representation(
 /// # Errors
 /// Rejects changed identity, declarations, inventory or the model storage budget.
 pub fn inspect(path: &Path, memory_limit: usize) -> Result<LoadReceipt> {
-    inspect_representation(path, memory_limit, Representation::Pq2)
+    inspect_representation(path, memory_limit, Representation::Bonsai25Pq2)
 }
 
 /// Verifies only the pinned artifact and strict header of an explicit representation.
@@ -703,10 +674,7 @@ fn validate_nariq_metadata(metadata: &Metadata, representation: Representation) 
                 ));
             }
         }
-        Representation::Pq2
-        | Representation::CurrentRepackedPtq1
-        | Representation::Bonsai25Pq2
-        | Representation::Bonsai25Ptq1 => {}
+        Representation::Bonsai25Pq2 | Representation::Bonsai25Ptq1 => {}
     }
     for (key, value) in [
         ("qwen35.rope.freq_base", 10_000_000.0_f32),
@@ -768,14 +736,13 @@ fn validate_nariq_metadata(metadata: &Metadata, representation: Representation) 
 /// Checks the pinned Swift metadata contract without executing or loading weights.
 ///
 /// This checks declarations, not artifact authenticity. Callers must obtain the
-/// metadata through a loader that verifies [`MODEL_BYTES`] and [`MODEL_SHA256`].
-/// That complete file hash also binds every tokenizer string/merge and metadata
-/// record to the raw-tokenizer digest recorded in `config/swift.metadata.json`.
+/// metadata through a loader that verifies [`BONSAI_2_5_PQ2_BYTES`] and [`BONSAI_2_5_PQ2_SHA256`]
+/// (or another admitted representation).
 ///
 /// # Errors
 /// Rejects missing, extra or changed pinned metadata declarations.
 pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
-    validate_metadata_for(metadata, Representation::Pq2)
+    validate_metadata_for(metadata, Representation::Bonsai25Pq2)
 }
 
 #[expect(
@@ -783,23 +750,16 @@ pub fn validate_metadata(metadata: &Metadata) -> Result<()> {
     reason = "Keep the exact shared metadata contract and representation discriminator together."
 )]
 fn validate_metadata_for(metadata: &Metadata, representation: Representation) -> Result<()> {
-    let expected_len = if representation.is_bonsai_2_5() {
-        48
-    } else {
-        49
-    };
-    if metadata.len() != expected_len {
+    if !representation.is_bonsai_2_5() {
+        return Err(invalid("expected Bonsai 2.5 representation"));
+    }
+    if metadata.len() != 48 {
         return Err(invalid("Swift metadata inventory mismatch"));
     }
-    let expected_name = if representation.is_bonsai_2_5() {
-        "Ternary-Bonsai-2.5-27B"
-    } else {
-        "Hf"
-    };
     for (key, value) in [
         ("general.architecture", "qwen35"),
         ("general.type", "model"),
-        ("general.name", expected_name),
+        ("general.name", "Ternary-Bonsai-2.5-27B"),
         ("general.size_label", "27B"),
         (
             "prism.hadamard.transform",
@@ -814,29 +774,18 @@ fn validate_metadata_for(metadata: &Metadata, representation: Representation) ->
             return Err(invalid(format!("Swift metadata mismatch: {key}")));
         }
     }
-    if representation.is_bonsai_2_5() {
-        if metadata.contains_key("general.version") || metadata.contains_key("general.basename") {
-            return Err(invalid(
-                "Bonsai 2.5 metadata forbids Swift version/basename keys",
-            ));
-        }
-        if metadata
-            .get("general.sampling.min_p")
-            .and_then(MetadataValue::as_f64)
-            .map(f64::to_bits)
-            != Some(f64::from(0.05_f32).to_bits())
-        {
-            return Err(invalid("Swift metadata mismatch: general.sampling.min_p"));
-        }
-    } else {
-        for (key, value) in [("general.version", "v5"), ("general.basename", "folded")] {
-            if metadata.get(key).and_then(MetadataValue::as_str) != Some(value) {
-                return Err(invalid(format!("Swift metadata mismatch: {key}")));
-            }
-        }
-        if metadata.contains_key("general.sampling.min_p") {
-            return Err(invalid("Swift metadata forbids general.sampling.min_p"));
-        }
+    if metadata.contains_key("general.version") || metadata.contains_key("general.basename") {
+        return Err(invalid(
+            "Bonsai 2.5 metadata forbids legacy version/basename keys",
+        ));
+    }
+    if metadata
+        .get("general.sampling.min_p")
+        .and_then(MetadataValue::as_f64)
+        .map(f64::to_bits)
+        != Some(f64::from(0.05_f32).to_bits())
+    {
+        return Err(invalid("Swift metadata mismatch: general.sampling.min_p"));
     }
     for (key, value) in [
         ("general.sampling.top_k", 20),
@@ -1021,14 +970,7 @@ fn expected_tensor_spec(
                     "attn_qkv.weight" => Some((packed, &[5_120, 10_240])),
                     "attn_gate.weight" => Some((packed, &[5_120, 6_144])),
                     "ssm_out.weight" => Some((packed, &[6_144, 5_120])),
-                    "ssm_alpha.weight" | "ssm_beta.weight" => Some((
-                        if representation.is_bonsai_2_5() {
-                            0
-                        } else {
-                            30
-                        },
-                        &[5_120, 48],
-                    )),
+                    "ssm_alpha.weight" | "ssm_beta.weight" => Some((0, &[5_120, 48])),
                     "ssm_conv1d.weight" => Some((0, &[4, 10_240])),
                     "ssm_norm.weight" => Some((0, &[128])),
                     "ssm_a" | "ssm_dt.bias" => Some((0, &[48])),
@@ -1043,11 +985,7 @@ fn expected_tensor_spec(
 fn expected_tensors(representation: Representation) -> BTreeMap<String, (u32, Vec<u64>)> {
     let mut tensors = BTreeMap::new();
     let packed = representation.tensor_kind();
-    let ssm_kind = if representation.is_bonsai_2_5() {
-        0
-    } else {
-        30
-    };
+    let ssm_kind = 0;
     for name in ["token_embd.weight", "output.weight"] {
         tensors.insert(name.to_owned(), (packed, vec![5_120, 248_320]));
     }
@@ -1112,10 +1050,7 @@ fn validate_nariq_inventory(
         Representation::NariQ2_5Bpw | Representation::NariQ3_0Bpw => {
             EXPECTED_NARIQ_UNBANDED_TENSORS
         }
-        Representation::Pq2
-        | Representation::CurrentRepackedPtq1
-        | Representation::Bonsai25Pq2
-        | Representation::Bonsai25Ptq1 => {
+        Representation::Bonsai25Pq2 | Representation::Bonsai25Ptq1 => {
             return Err(invalid(
                 "non-NariQ representation passed to NariQ inventory validator",
             ));
@@ -1295,10 +1230,7 @@ fn validate_nariq_inventory(
                 return Err(invalid("invalid unbanded NariQ embedding inventory"));
             }
         }
-        Representation::Pq2
-        | Representation::CurrentRepackedPtq1
-        | Representation::Bonsai25Pq2
-        | Representation::Bonsai25Ptq1 => {}
+        Representation::Bonsai25Pq2 | Representation::Bonsai25Ptq1 => {}
     }
     Ok((counts, bytes, largest))
 }
@@ -1357,12 +1289,7 @@ fn validate_layouts<'a>(
             .ok_or_else(|| invalid("Swift tensor accounting overflow"))?;
         largest = largest.max(length);
     }
-    let expected_counts = if representation.is_bonsai_2_5() {
-        [449, 0, 402]
-    } else {
-        [353, 96, 402]
-    };
-    if counts != expected_counts || bytes != representation.tensor_payload_bytes() {
+    if counts != [449, 0, 402] || bytes != representation.tensor_payload_bytes() {
         return Err(invalid("Swift tensor payload inventory mismatch"));
     }
     Ok((counts, bytes, largest))
@@ -1387,104 +1314,6 @@ mod tests {
                 (name, dimensions, type_id, bytes)
             })
             .collect()
-    }
-
-    #[test]
-    fn inventory_covers_every_hybrid_block_and_exact_payload() -> Result<()> {
-        let descriptors = descriptors(Representation::Pq2);
-        assert_eq!(
-            validate_layouts(
-                Representation::Pq2,
-                descriptors.len(),
-                descriptors.iter().map(|(name, dimensions, kind, bytes)| (
-                    name.as_str(),
-                    dimensions.as_slice(),
-                    *kind,
-                    *bytes
-                ))
-            )?,
-            ([353, 96, 402], TENSOR_PAYLOAD_BYTES, 337_715_200)
-        );
-        let mut descriptors = descriptors;
-        descriptors[0].1[0] += 1;
-        assert!(
-            validate_layouts(
-                Representation::Pq2,
-                descriptors.len(),
-                descriptors.iter().map(|(name, dimensions, kind, bytes)| (
-                    name.as_str(),
-                    dimensions.as_slice(),
-                    *kind,
-                    *bytes
-                ))
-            )
-            .is_err()
-        );
-        descriptors.pop();
-        assert!(
-            validate_layouts(
-                Representation::Pq2,
-                descriptors.len(),
-                descriptors.iter().map(|(name, dimensions, kind, bytes)| (
-                    name.as_str(),
-                    dimensions.as_slice(),
-                    *kind,
-                    *bytes
-                ))
-            )
-            .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn current_weight_ptq1_inventory_is_exact_and_never_substitutes_for_pq2() -> Result<()> {
-        let representation = Representation::CurrentRepackedPtq1;
-        let descriptors = descriptors(representation);
-        let layouts = || {
-            descriptors.iter().map(|(name, dimensions, kind, bytes)| {
-                (name.as_str(), dimensions.as_slice(), *kind, *bytes)
-            })
-        };
-        assert_eq!(
-            validate_layouts(representation, descriptors.len(), layouts())?,
-            ([353, 96, 402], 5_935_527_936, 278_118_400)
-        );
-        assert!(validate_layouts(Representation::Pq2, descriptors.len(), layouts()).is_err());
-        assert!(
-            validate_layouts(
-                representation,
-                descriptors.len(),
-                layouts().map(|(name, dimensions, kind, bytes)| {
-                    (
-                        name,
-                        dimensions,
-                        if kind == 143 { 142 } else { kind },
-                        bytes,
-                    )
-                })
-            )
-            .is_err()
-        );
-        assert!(
-            validate_layouts(
-                representation,
-                descriptors.len(),
-                layouts().map(|(name, dimensions, kind, bytes)| {
-                    (name, dimensions, kind, bytes + u64::from(kind == 143))
-                })
-            )
-            .is_err()
-        );
-        assert_eq!(Representation::default(), Representation::Pq2);
-        assert_eq!(representation.model_bytes(), 5_946_648_928);
-        assert_eq!(
-            representation.model_sha256(),
-            "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5"
-        );
-        assert_eq!(representation.name(), "current-repacked-PTQ1_0");
-        assert_eq!(representation.file_type(), 143);
-        Ok(())
     }
 
     #[test]
@@ -1583,7 +1412,7 @@ mod tests {
     #[test]
     fn zero_alloc_tensor_specs_match_full_inventories_and_reject_duplicates_and_bad_indices()
     -> Result<()> {
-        for representation in [Representation::Pq2, Representation::CurrentRepackedPtq1] {
+        for representation in [Representation::Bonsai25Pq2, Representation::Bonsai25Ptq1] {
             let map = expected_tensors(representation);
             assert_eq!(map.len(), EXPECTED_SWIFT_TENSORS);
             for (name, (kind, dims)) in &map {
@@ -1761,15 +1590,10 @@ mod tests {
 
     fn base_prism_metadata(representation: Representation) -> Metadata {
         let mut metadata = Metadata::new();
-        let name = if representation.is_bonsai_2_5() {
-            "Ternary-Bonsai-2.5-27B"
-        } else {
-            "Hf"
-        };
         for (key, value) in [
             ("general.architecture", "qwen35"),
             ("general.type", "model"),
-            ("general.name", name),
+            ("general.name", "Ternary-Bonsai-2.5-27B"),
             ("general.size_label", "27B"),
             (
                 "prism.hadamard.transform",
@@ -1783,15 +1607,10 @@ mod tests {
         ] {
             metadata.insert(key.to_owned(), MetadataValue::from(value));
         }
-        if representation.is_bonsai_2_5() {
-            metadata.insert(
-                "general.sampling.min_p".to_owned(),
-                MetadataValue::F32(0.05_f32),
-            );
-        } else {
-            metadata.insert("general.version".to_owned(), MetadataValue::from("v5"));
-            metadata.insert("general.basename".to_owned(), MetadataValue::from("folded"));
-        }
+        metadata.insert(
+            "general.sampling.min_p".to_owned(),
+            MetadataValue::F32(0.05_f32),
+        );
         for (key, value) in [
             ("general.sampling.top_k", 20),
             ("qwen35.block_count", 64),
@@ -1855,6 +1674,7 @@ mod tests {
 
     #[test]
     fn bonsai_2_5_representations_verify_identities_layouts_and_metadata_contract() -> Result<()> {
+        assert_eq!(Representation::default(), Representation::Bonsai25Pq2);
         for (
             repr,
             expected_name,
@@ -1916,17 +1736,12 @@ mod tests {
                 validate_layouts(repr, descriptors.len(), layouts())?,
                 ([449, 0, 402], expected_payload_bytes, expected_largest)
             );
-            for other in [
-                Representation::Pq2,
-                Representation::CurrentRepackedPtq1,
-                if repr == Representation::Bonsai25Pq2 {
-                    Representation::Bonsai25Ptq1
-                } else {
-                    Representation::Bonsai25Pq2
-                },
-            ] {
-                assert!(validate_layouts(other, descriptors.len(), layouts()).is_err());
-            }
+            let other = if repr == Representation::Bonsai25Pq2 {
+                Representation::Bonsai25Ptq1
+            } else {
+                Representation::Bonsai25Pq2
+            };
+            assert!(validate_layouts(other, descriptors.len(), layouts()).is_err());
 
             // Verify Bonsai 2.5 metadata reaches template check only after all 48 keys match.
             let b25_meta = base_prism_metadata(repr);
@@ -1939,17 +1754,6 @@ mod tests {
                     .contains("Swift embedded template identity mismatch"),
                 "unexpected error before template check: {err}"
             );
-
-            // Swift metadata (49 keys, general.name = "Hf") must be rejected by Bonsai 2.5 and vice versa.
-            let swift_equiv = if repr == Representation::Bonsai25Pq2 {
-                Representation::Pq2
-            } else {
-                Representation::CurrentRepackedPtq1
-            };
-            let swift_meta = base_prism_metadata(swift_equiv);
-            assert_eq!(swift_meta.len(), 49);
-            assert!(validate_metadata_for(&swift_meta, repr).is_err());
-            assert!(validate_metadata_for(&b25_meta, swift_equiv).is_err());
 
             let mut missing_min_p = b25_meta.clone();
             missing_min_p.remove("general.sampling.min_p");

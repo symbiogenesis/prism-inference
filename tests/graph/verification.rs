@@ -107,8 +107,8 @@ fn tiled_verification_shares_packed_output_head_and_adapter() -> Result<()> {
         for scale in [0.0, 1.3] {
             let build = || -> Result<Qwen35> {
                 let model = packed_output_fixture(recurrent);
-                let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
-                rank_one_graph(model, factors, scale)
+                let factors = lora_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+                lora_graph(model, factors, scale)
             };
             let mut expected = build()?;
             let graph = build()?;
@@ -141,7 +141,7 @@ fn tiled_verification_shares_packed_output_head_and_adapter() -> Result<()> {
             assert_eq!(stats.packed_projections, u64::try_from(projections.len())?);
             assert_eq!(stats.decoded_weight_blocks, u64::try_from(blocks)?);
             let old = actual.checkpoint()?;
-            actual.reset_with_adapter_scale(scale)?;
+            actual.reset_with_adapter_scales(Some(scale))?;
             assert!(actual.identity().contains(":cpu-tiled-verify-v1"));
             assert_eq!(actual.batched_evaluation_capacity(), 8);
             assert!(actual.restore(&old).is_err());
@@ -390,8 +390,8 @@ impl bonsai_prism_runtime::kernels::Pq2ProjectionExecutor for TileCapableExecuto
 fn tiled_verification_accepts_tile_capable_executor_and_restores_on_cancel() -> Result<()> {
     let build = || -> Result<Qwen35> {
         let model = packed_output_fixture(false);
-        let factors = rank_one_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
-        rank_one_graph(model, factors, 1.3)
+        let factors = lora_factors(&model, &["blk.0.ffn_down.weight"], 0.125);
+        lora_graph(model, factors, 1.3)
     };
     let mut expected = build()?;
     let mut graph = build()?;

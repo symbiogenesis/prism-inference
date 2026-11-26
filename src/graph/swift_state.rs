@@ -21,9 +21,7 @@ pub(super) fn ceiling(
 ) -> Result<usize> {
     if !matches!(
         identity,
-        swift::MODEL_SHA256
-            | swift::REPACKED_PTQ1_SHA256
-            | swift::BONSAI_2_5_PQ2_SHA256
+        swift::BONSAI_2_5_PQ2_SHA256
             | swift::BONSAI_2_5_PTQ1_SHA256
             | swift::NARIQ_2_5BPW_SHA256
             | swift::NARIQ_3_0BPW_SHA256
@@ -106,8 +104,6 @@ mod tests {
         assert_eq!(SWIFT_RSQ4_FULL_STATE_BYTES, 4_644_798_464);
         assert_eq!(super::super::MAX_STATE_BYTES, 4 * 1024 * 1024 * 1024);
         for identity in [
-            swift::MODEL_SHA256,
-            swift::REPACKED_PTQ1_SHA256,
             swift::BONSAI_2_5_PQ2_SHA256,
             swift::BONSAI_2_5_PTQ1_SHA256,
             swift::NARIQ_2_5BPW_SHA256,
@@ -138,7 +134,15 @@ mod tests {
             .is_err()
         );
         for cache in [KvCachePolicy::F16, KvCachePolicy::Rotated4Keys3Values] {
-            assert!(ceiling(swift::MODEL_SHA256, &metadata, CONTEXT_TOKENS, cache).is_err());
+            assert!(
+                ceiling(
+                    swift::BONSAI_2_5_PQ2_SHA256,
+                    &metadata,
+                    CONTEXT_TOKENS,
+                    cache
+                )
+                .is_err()
+            );
         }
         Ok(())
     }
@@ -151,7 +155,7 @@ mod tests {
             changed.insert(key.clone(), MetadataValue::U64(1));
             assert!(
                 ceiling(
-                    swift::MODEL_SHA256,
+                    swift::BONSAI_2_5_PQ2_SHA256,
                     &changed,
                     CONTEXT_TOKENS,
                     KvCachePolicy::Rotated4
@@ -163,7 +167,7 @@ mod tests {
         changed.insert("qwen35.nextn_predict_layers".into(), MetadataValue::U64(1));
         assert!(
             ceiling(
-                swift::MODEL_SHA256,
+                swift::BONSAI_2_5_PQ2_SHA256,
                 &changed,
                 CONTEXT_TOKENS,
                 KvCachePolicy::Rotated4
@@ -177,7 +181,7 @@ mod tests {
         );
         assert!(
             ceiling(
-                swift::MODEL_SHA256,
+                swift::BONSAI_2_5_PQ2_SHA256,
                 &changed,
                 CONTEXT_TOKENS,
                 KvCachePolicy::Rotated4
@@ -192,7 +196,7 @@ mod tests {
         use super::super::Qwen35;
         use crate::{kernels::MatvecBackend, model::Model};
         let model = || Model {
-            identity: swift::MODEL_SHA256.to_owned(),
+            identity: swift::BONSAI_2_5_PQ2_SHA256.to_owned(),
             metadata: metadata(),
             tensors: std::collections::BTreeMap::new(),
         };
@@ -215,7 +219,7 @@ mod tests {
                 "invalid native live-state payload budget"
             );
         }
-        let error = Qwen35::with_swift_state_budget_and_kv(
+        let error = Qwen35::with_state_budget_and_adapters_scope(
             model(),
             CONTEXT_TOKENS,
             SWIFT_RSQ4_FULL_STATE_BYTES + 1,

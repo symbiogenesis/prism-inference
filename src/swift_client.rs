@@ -515,7 +515,7 @@ struct Ready<'a> {
 impl Ready<'_> {
     fn matches(&self, expected: ExpectedSwiftWorker, kv_cache: KvCachePolicy) -> bool {
         self.protocol == "bonsai-swift-worker-v1"
-            && self.model_sha256 == swift::MODEL_SHA256
+            && self.model_sha256 == swift::BONSAI_2_5_PQ2_SHA256
             && self.template_sha256 == swift::TEMPLATE_SHA256
             && self.vocab_size == swift::VOCAB_SIZE
             && self.runtime == "bonsai-prism-runtime"
@@ -549,7 +549,7 @@ impl Ready<'_> {
         }
         let contract =
             SWIFT_GRAPH_CONTRACT.replace("kv-f16", &format!("kv-{}-d256-rht3-v1", policy.name()));
-        let identity = format!("{}:{contract}", swift::MODEL_SHA256);
+        let identity = format!("{}:{contract}", swift::BONSAI_2_5_PQ2_SHA256);
         self.kv_cache.as_deref() == Some(policy.name())
             && self.startup_graph_identity.as_deref() == Some(identity.as_str())
     }

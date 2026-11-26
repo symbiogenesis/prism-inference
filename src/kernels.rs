@@ -16,6 +16,7 @@ use bonsai_ternary::{decode_ptq_trits, half_to_float};
 use crate::model::Tensor;
 use crate::{Result, invalid};
 
+mod f32_siblings;
 mod fp4;
 mod iq1;
 mod iq2;
@@ -73,7 +74,7 @@ pub(crate) use rms_weights::RmsNormWeights;
 ))]
 mod neon;
 
-const F32: u32 = 0;
+pub(crate) const F32: u32 = 0;
 const F16: u32 = 1;
 const Q4_0: u32 = 2;
 const Q4_1: u32 = 3;
@@ -2097,15 +2098,20 @@ impl MatvecScratch {
     ) -> Result<PreparedMatvec<'a>> {
         self.reset_diagnostics();
         self.statistics.preparations = self.statistics.preparations.saturating_add(1);
-        let contract =
-            match self.prepare_input_with_quantization(tensor, input, quantized, allow_released) {
-                Ok(contract) => contract,
-                Err(error) => {
-                    self.statistics.preparation_failures =
-                        self.statistics.preparation_failures.saturating_add(1);
-                    return Err(error);
-                }
-            };
+        let contract = match self.prepare_input_with_quantization(
+            tensor,
+            input,
+            quantized,
+            allow_released,
+            false,
+        ) {
+            Ok(contract) => contract,
+            Err(error) => {
+                self.statistics.preparation_failures =
+                    self.statistics.preparation_failures.saturating_add(1);
+                return Err(error);
+            }
+        };
         Ok(PreparedMatvec {
             input,
             contract,
@@ -2115,7 +2121,7 @@ impl MatvecScratch {
     }
 
     fn prepare_input(&mut self, tensor: &Tensor, input: &[f32]) -> Result<ActivationContract> {
-        self.prepare_input_with_quantization(tensor, input, true, false)
+        self.prepare_input_with_quantization(tensor, input, true, false, true)
     }
 
     #[expect(
@@ -2128,6 +2134,7 @@ impl MatvecScratch {
         input: &[f32],
         quantized: bool,
         allow_released: bool,
+        retain_f32_activations: bool,
     ) -> Result<ActivationContract> {
         // A new scoped preparation invalidates every rearranged activation,
         // including a preparation which fails before dispatch. Capacity alone
@@ -2177,14 +2184,16 @@ impl MatvecScratch {
                 }
                 ActivationContract::Q8 => finite_input.q8::<false, false>(&mut self.q8)?,
                 ActivationContract::F32 => {
-                    if self.activations.len() == input.len() {
-                        self.activations.copy_from_slice(input);
-                    } else {
-                        fill_into(&mut self.activations, |activations| {
-                            activations.try_reserve_exact(input.len())?;
-                            activations.extend_from_slice(input);
-                            Ok(())
-                        })?;
+                    if retain_f32_activations {
+                        if self.activations.len() == input.len() {
+                            self.activations.copy_from_slice(input);
+                        } else {
+                            fill_into(&mut self.activations, |activations| {
+                                activations.try_reserve_exact(input.len())?;
+                                activations.extend_from_slice(input);
+                                Ok(())
+                            })?;
+                        }
                     }
                 }
                 ActivationContract::F16 => {
@@ -2571,8 +2580,11 @@ impl PreparedMatvec<'_> {
                 // columns, so it never applies to these one-column matrices.
                 for bytes in tensor.data.as_chunks::<4>().0 {
                     let weight = finite(f32::from_le_bytes(*bytes))?;
-                    output.push(finite(float_dot(&[weight], &scratch.activations))?);
+                    output.push(finite(float_dot(&[weight], self.input))?);
                 }
+            }
+            F32 => {
+                return self.multiply_f32(tensor, output);
             }
             BF16 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);
@@ -2770,6 +2782,11 @@ impl PreparedMatvec<'_> {
                 )?;
             }
             _ => {
+                let activations = if self.contract == ActivationContract::F32 {
+                    self.input
+                } else {
+                    &scratch.activations
+                };
                 scratch.diagnostics = scratch.diagnostics.select(false);
                 output.clear();
                 output.try_reserve_exact(rows)?;
@@ -2785,9 +2802,9 @@ impl PreparedMatvec<'_> {
                             && matches!(tensor.kind, F32 | F16)
                             && columns.is_multiple_of(16)
                         {
-                            pinned_gdn::dot(&scratch.row, &scratch.activations)?
+                            pinned_gdn::dot(&scratch.row, activations)?
                         } else {
-                            finite(float_dot(&scratch.row, &scratch.activations))?
+                            finite(float_dot(&scratch.row, activations))?
                         },
                     );
                 }
@@ -5651,11 +5668,11 @@ mod tests {
         let mut tensor = Tensor {
             name: "scratch".to_owned(),
             dimensions: vec![2, 2],
-            kind: super::F32,
+            kind: super::F16,
             data: Arc::<[u8]>::from(
                 [1.0_f32, 2.0, 3.0, 4.0]
                     .into_iter()
-                    .flat_map(f32::to_le_bytes)
+                    .flat_map(|v| super::half_bits(v).to_le_bytes())
                     .collect::<Vec<_>>(),
             )
             .into(),
@@ -5665,11 +5682,19 @@ mod tests {
         let activation_pointer = scratch.activations.as_ptr();
         let row_pointer = scratch.row.as_ptr();
         tensor.dimensions = vec![1];
+        tensor.data = Arc::<[u8]>::from(super::half_bits(2.0).to_le_bytes().as_slice()).into();
+        matvec_into(&tensor, &[3.0], &mut output, &mut scratch)?;
+        assert_eq!(scratch.activations.len(), 1);
+        assert_eq!(scratch.row.len(), 1);
+        assert_eq!(scratch.activations.as_ptr(), activation_pointer);
+        assert_eq!(scratch.row.as_ptr(), row_pointer);
+        assert_eq!(output, [6.0]);
+        // Direct and scalar-column F32 projections do not touch floating scratch.
+        tensor.kind = super::F32;
         tensor.data = Arc::<[u8]>::from(2.0_f32.to_le_bytes().as_slice()).into();
         matvec_into(&tensor, &[3.0], &mut output, &mut scratch)?;
         assert_eq!(scratch.activations.len(), 1);
-        // The scalar-column projection does not touch decoded-row scratch.
-        assert_eq!(scratch.row.len(), 2);
+        assert_eq!(scratch.row.len(), 1);
         assert_eq!(scratch.activations.as_ptr(), activation_pointer);
         assert_eq!(scratch.row.as_ptr(), row_pointer);
         assert_eq!(output, [6.0]);

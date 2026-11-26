@@ -2261,7 +2261,10 @@ impl Transforms {
                     && cpu_group_len >= 2
                     && matches!(
                         weights[index].kind,
-                        crate::kernels::PQ2 | crate::kernels::PTQ1 | crate::kernels::BF16
+                        crate::kernels::PQ2
+                            | crate::kernels::PTQ1
+                            | crate::kernels::BF16
+                            | crate::kernels::F32
                     )
                     && !weights[index..index + cpu_group_len]
                         .iter()
@@ -2282,7 +2285,9 @@ impl Transforms {
                 {
                     let tensors = &weights[index..index + cpu_group_len];
                     let outputs = &mut outputs[index..index + cpu_group_len];
-                    if weights[index].kind == crate::kernels::BF16 {
+                    if weights[index].kind == crate::kernels::F32 {
+                        prepared.matvec_f32_siblings_into(tensors, outputs)?;
+                    } else if weights[index].kind == crate::kernels::BF16 {
                         prepared.matvec_bf16_siblings_into(tensors, outputs)?;
                     } else if weights[index].kind == crate::kernels::PQ2
                         && weights[index].dimensions[0].is_multiple_of(256)

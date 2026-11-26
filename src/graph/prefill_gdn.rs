@@ -2477,6 +2477,10 @@ mod tests {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Chunkwise subchunk verification helper compares multiple state steps."
+    )]
     fn check_chunkwise_subchunks_case(count: usize, arithmetic: Arithmetic) -> Result<()> {
         let width = 16_usize;
         let state_len = width * width;

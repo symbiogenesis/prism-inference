@@ -7112,6 +7112,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Compares parallel and scalar rank-16 multi-token LoRA-A across token counts."
+    )]
     fn lora_multi_a_rank16_parallel_matches_scalar_zero_ulp() -> crate::Result<()> {
         #[cfg(feature = "parallel-rows")]
         let worker_counts = [1_usize, 4];
@@ -7216,7 +7220,7 @@ mod tests {
                     )
                     .is_err()
                 );
-                assert!(ranks_out.is_empty());
+                assert_eq!(ranks_out, [0.0_f32; 0]);
             }
         }
         Ok(())

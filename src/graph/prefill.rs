@@ -1379,6 +1379,10 @@ impl Qwen35 {
         clippy::too_many_arguments,
         reason = "Keep full causal layer attention execution explicit across leading and final tiles."
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep full causal layer attention execution unified across recurrent and full layers."
+    )]
     fn run_full_tile_attention(
         geometry: &Geometry,
         arithmetic: Arithmetic,
@@ -1598,6 +1602,10 @@ impl Qwen35 {
     #[expect(
         clippy::too_many_arguments,
         reason = "Keep causal output-head normalization, projection and finite verification explicit."
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep plain and banded output-head range evaluation in one explicit path."
     )]
     fn evaluate_tile_output_head_range(
         output_head: &super::OutputHead,
@@ -2183,6 +2191,10 @@ impl Qwen35 {
         check()
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep tiled prefill with fused last-token evaluation in a single linear pass."
+    )]
     fn ingest_cpu_tile_and_evaluate_last(
         &mut self,
         tokens: &[u32],
@@ -2300,6 +2312,10 @@ impl Qwen35 {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep tiled prefill with folded verification and logits capture in one pass."
+    )]
     fn ingest_cpu_tile_with_folded(
         &mut self,
         tokens: &[u32],
@@ -6960,6 +6976,10 @@ mod fused_last_token_tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Fixture setup and assertions for fused last-token decode executor."
+    )]
     fn fused_last_token_decode_executor_skips_multi_token_tiles_and_runs_last_token() -> Result<()>
     {
         let mut model = hybrid_two_layer_fixture(false);

@@ -1622,6 +1622,10 @@ fn write_lora_a_dots<const RANK_MAJOR: bool, const TOK: usize>(
     true
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep multi-token F16 LoRA-A NEON layout microkernel unified."
+)]
 fn lora_multi_a_tokens_f16_layout<const RANK_MAJOR: bool>(
     a_weights: &[u16],
     in_features: usize,
@@ -1738,6 +1742,10 @@ fn lora_multi_a_tokens_f16_layout<const RANK_MAJOR: bool>(
     Some(true)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep multi-token F32 LoRA-A NEON layout microkernel unified."
+)]
 fn lora_multi_a_tokens_f32_layout<const RANK_MAJOR: bool>(
     a_weights: &[f32],
     in_features: usize,

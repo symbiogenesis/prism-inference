@@ -788,11 +788,10 @@ fn six_head_prefill_24_head_gqa_2d_counts_match_oracle_across_workers() -> crate
 fn six_head_attend_tile_balanced_matches_oracle_0_ulp_across_tokens_and_workers()
 -> crate::Result<()> {
     #[cfg(feature = "parallel-rows")]
-    let worker_counts: Vec<usize> = (1..=12).collect();
+    let worker_counts = 1..=12;
     #[cfg(not(feature = "parallel-rows"))]
-    let worker_counts = vec![1_usize];
+    let worker_counts = std::iter::once(1_usize);
     let pools: Vec<(usize, RowParallelism)> = worker_counts
-        .into_iter()
         .map(|workers| Ok((workers, RowParallelism::new(workers)?)))
         .collect::<crate::Result<_>>()?;
     let width_base = [0_usize, 63, 255];

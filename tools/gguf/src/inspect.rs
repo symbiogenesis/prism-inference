@@ -46,6 +46,31 @@ pub struct TensorDescriptor {
     pub(crate) type_position: u64,
 }
 
+impl TensorDescriptor {
+    /// Constructs a validated tensor descriptor for callers and test fixtures
+    /// regardless of whether the `report` feature is enabled.
+    #[must_use]
+    pub const fn new(
+        name: String,
+        dimensions: Vec<u64>,
+        type_id: u32,
+        offset: u64,
+        bytes: u64,
+        elements: u64,
+    ) -> Self {
+        Self {
+            name,
+            dimensions,
+            type_id,
+            offset,
+            bytes,
+            elements,
+            #[cfg(feature = "report")]
+            type_position: 0,
+        }
+    }
+}
+
 pub(crate) struct Inspection {
     #[cfg(feature = "report")]
     pub report: Value,

@@ -610,11 +610,19 @@ impl<D: Decoder> Runtime<D> {
     }
 
     #[cfg(any(feature = "cli", test))]
+    #[cfg_attr(
+        all(test, not(feature = "cli")),
+        allow(dead_code, reason = "Exercised by cli-gated runtime and server tests.")
+    )]
     pub(crate) const fn decoder_mut(&mut self) -> &mut D {
         &mut self.decoder
     }
 
     #[cfg(any(feature = "cli", test))]
+    #[cfg_attr(
+        all(test, not(feature = "cli")),
+        allow(dead_code, reason = "Exercised by cli-gated runtime and server tests.")
+    )]
     pub(crate) const fn limits(&self) -> Limits {
         self.limits
     }
@@ -851,6 +859,10 @@ impl<D: Decoder> Runtime<D> {
     }
 
     #[cfg(any(feature = "cli", test))]
+    #[cfg_attr(
+        all(test, not(feature = "cli")),
+        allow(dead_code, reason = "Exercised by cli-gated runtime and server tests.")
+    )]
     pub(crate) fn prefill_with_prefix_boundary_until(
         &mut self,
         prefix: &[u32],
@@ -1119,6 +1131,10 @@ impl<D: Decoder> Runtime<D> {
         reason = "Unified Swift internal generation path forwards chunks, reset mode, timings and confidence."
     )]
     #[cfg(any(feature = "cli", test))]
+    #[cfg_attr(
+        all(test, not(feature = "cli")),
+        allow(dead_code, reason = "Exercised by cli-gated runtime and server tests.")
+    )]
     pub(crate) fn generate_swift_until<S: Sampler + Clone>(
         &mut self,
         prompt: &[u32],

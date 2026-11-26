@@ -1686,64 +1686,64 @@ mod tests {
             assert_eq!(repr.file_type(), 32);
 
             let mut descs = Vec::with_capacity(expected_count);
-            descs.push(TensorDescriptor {
-                name: "output.vocab_gather".to_owned(),
-                type_id: 26,
-                dimensions: vec![u64::try_from(VOCAB_SIZE)?],
-                elements: u64::try_from(VOCAB_SIZE)?,
-                offset: 0,
-                bytes: u64::try_from(VOCAB_SIZE)? * 4,
-            });
+            descs.push(TensorDescriptor::new(
+                "output.vocab_gather".to_owned(),
+                vec![u64::try_from(VOCAB_SIZE)?],
+                26,
+                0,
+                u64::try_from(VOCAB_SIZE)? * 4,
+                u64::try_from(VOCAB_SIZE)?,
+            ));
             let cols = [15_520_u64; 16];
             for (idx, &band_n) in cols.iter().enumerate() {
-                descs.push(TensorDescriptor {
-                    name: format!("output.band{idx:02}.weight"),
-                    type_id: 45,
-                    dimensions: vec![5_120, band_n],
-                    elements: 5_120 * band_n,
-                    offset: 0,
-                    bytes: (5_120 / 16) * (band_n / 16) * 32 * 2,
-                });
+                descs.push(TensorDescriptor::new(
+                    format!("output.band{idx:02}.weight"),
+                    vec![5_120, band_n],
+                    45,
+                    0,
+                    (5_120 / 16) * (band_n / 16) * 32 * 2,
+                    5_120 * band_n,
+                ));
             }
             if banded {
-                descs.push(TensorDescriptor {
-                    name: "token_embd.vocab_gather".to_owned(),
-                    type_id: 26,
-                    dimensions: vec![u64::try_from(VOCAB_SIZE)?],
-                    elements: u64::try_from(VOCAB_SIZE)?,
-                    offset: 0,
-                    bytes: u64::try_from(VOCAB_SIZE)? * 4,
-                });
+                descs.push(TensorDescriptor::new(
+                    "token_embd.vocab_gather".to_owned(),
+                    vec![u64::try_from(VOCAB_SIZE)?],
+                    26,
+                    0,
+                    u64::try_from(VOCAB_SIZE)? * 4,
+                    u64::try_from(VOCAB_SIZE)?,
+                ));
                 for (idx, &band_n) in cols.iter().enumerate() {
-                    descs.push(TensorDescriptor {
-                        name: format!("token_embd.band{idx:02}.weight"),
-                        type_id: 44,
-                        dimensions: vec![5_120, band_n],
-                        elements: 5_120 * band_n,
-                        offset: 0,
-                        bytes: (5_120 / 16) * (band_n / 16) * 32,
-                    });
+                    descs.push(TensorDescriptor::new(
+                        format!("token_embd.band{idx:02}.weight"),
+                        vec![5_120, band_n],
+                        44,
+                        0,
+                        (5_120 / 16) * (band_n / 16) * 32,
+                        5_120 * band_n,
+                    ));
                 }
             } else {
-                descs.push(TensorDescriptor {
-                    name: "token_embd.weight".to_owned(),
-                    type_id: 1,
-                    dimensions: vec![5_120, u64::try_from(VOCAB_SIZE)?],
-                    elements: 5_120 * u64::try_from(VOCAB_SIZE)?,
-                    offset: 0,
-                    bytes: 5_120 * u64::try_from(VOCAB_SIZE)? * 2,
-                });
+                descs.push(TensorDescriptor::new(
+                    "token_embd.weight".to_owned(),
+                    vec![5_120, u64::try_from(VOCAB_SIZE)?],
+                    1,
+                    0,
+                    5_120 * u64::try_from(VOCAB_SIZE)? * 2,
+                    5_120 * u64::try_from(VOCAB_SIZE)?,
+                ));
             }
             while descs.len() < expected_count {
                 let extra_idx = descs.len();
-                descs.push(TensorDescriptor {
-                    name: format!("blk.{extra_idx}.filler_norm.weight"),
-                    type_id: 0,
-                    dimensions: vec![5_120],
-                    elements: 5_120,
-                    offset: 0,
-                    bytes: 5_120 * 4,
-                });
+                descs.push(TensorDescriptor::new(
+                    format!("blk.{extra_idx}.filler_norm.weight"),
+                    vec![5_120],
+                    0,
+                    0,
+                    5_120 * 4,
+                    5_120,
+                ));
             }
             let (counts, total_bytes, _) = validate_nariq_inventory(&descs, repr)?;
             assert!(total_bytes > 0);

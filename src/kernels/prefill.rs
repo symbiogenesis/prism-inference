@@ -1775,6 +1775,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Tests signed-zero preservation, unaligned rows, and nonfinite rejection across shapes."
+    )]
     fn tiled_f32_preserves_signed_zero_unaligned_bytes_and_rejects_nonfinite() -> Result<()> {
         for columns in [1_usize, 3, 16, 19] {
             let row_bytes = columns * 4;

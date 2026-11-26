@@ -616,13 +616,6 @@ pub struct Q8Dotprod {
 
 impl Q8Dotprod {
     /// Detects `Q8_0` `SDOT` and/or `I8MM` capability once.
-    #[cfg_attr(
-        not(target_arch = "aarch64"),
-        expect(
-            clippy::missing_const_for_fn,
-            reason = "AArch64 builds inspect runtime CPU/OS feature flags."
-        )
-    )]
     #[inline]
     #[must_use]
     pub fn detect() -> Option<Self> {
@@ -2307,6 +2300,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Compares 64-token PTQ1 and Q8_0 chunks against single-chunk outputs across shapes."
+    )]
     fn ptq1_and_q8_64_token_chunks_match_single_chunk_bits() {
         const BLOCKS: usize = 3;
         let ptq1_rows: [[u8; 28 * BLOCKS]; 8] = std::array::from_fn(|r| {

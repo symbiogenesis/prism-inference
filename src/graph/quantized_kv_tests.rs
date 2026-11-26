@@ -2113,14 +2113,18 @@ fn clone_packed_kv(src: &KvCache, truncate_tokens: Option<usize>) -> Result<KvCa
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "Cross-policy parallel vs serial KV tile append test preserves explicit key/value expectations."
+)]
 fn prepare_tile_append_parallel_matches_serial_bytes_across_policies_tokens_and_workers()
 -> Result<()> {
     #[cfg(feature = "parallel-rows")]
-    let worker_counts: Vec<usize> = (1..=12).collect();
+    let worker_counts = 1..=12;
     #[cfg(not(feature = "parallel-rows"))]
-    let worker_counts = vec![1_usize];
+    let worker_counts = std::iter::once(1_usize);
     let pools: Vec<(usize, RowParallelism)> = worker_counts
-        .into_iter()
         .map(|workers| Ok((workers, RowParallelism::new(workers)?)))
         .collect::<Result<_>>()?;
 
@@ -2229,6 +2233,10 @@ fn prepare_tile_append_parallel_matches_serial_bytes_across_policies_tokens_and_
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Preserves explicit key and value cache byte comparisons."
+)]
 fn prepare_tile_append_parallel_preserves_cache_on_error() -> Result<()> {
     #[cfg(feature = "parallel-rows")]
     let worker_counts = [1_usize, 2, 4, 8, 12];
@@ -2271,14 +2279,17 @@ fn prepare_tile_append_parallel_preserves_cache_on_error() -> Result<()> {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Cross-policy 2D causal-balanced attention parity test."
+)]
 fn attend_tile_2d_causal_balanced_matches_serial_0_ulp_across_policies_tokens_and_workers()
 -> Result<()> {
     #[cfg(feature = "parallel-rows")]
-    let worker_counts: Vec<usize> = (1..=12).collect();
+    let worker_counts = 1..=12;
     #[cfg(not(feature = "parallel-rows"))]
-    let worker_counts = vec![1_usize];
+    let worker_counts = std::iter::once(1_usize);
     let pools: Vec<(usize, RowParallelism)> = worker_counts
-        .into_iter()
         .map(|workers| Ok((workers, RowParallelism::new(workers)?)))
         .collect::<Result<_>>()?;
 

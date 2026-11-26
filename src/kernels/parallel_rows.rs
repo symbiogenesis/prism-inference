@@ -234,6 +234,13 @@ impl RowParallelism {
 
     /// Returns true when `self` and `other` share the same underlying worker pool instance.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "parallel-rows"),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "Parallel builds compare Arc pointers at runtime."
+        )
+    )]
     pub(crate) fn shares_pool_with(&self, other: &Self) -> bool {
         #[cfg(feature = "parallel-rows")]
         match (&self.pool, &other.pool) {
@@ -760,65 +767,6 @@ pub(super) fn fill_batched_chunk(
     Ok(())
 }
 
-#[cfg(test)]
-mod pair_tests {
-    use super::super::MatvecScratch;
-    use super::{MAX_ROW_WORKERS, RowParallelism};
-    use crate::Result;
-
-    #[test]
-    fn row_parallelism_pair_and_matvec_scratch_prefill_defaults() -> Result<()> {
-        let (serial_decode, serial_prefill) = RowParallelism::new_pair(1, 1)?;
-        assert_eq!(serial_decode.workers(), 1);
-        assert_eq!(serial_prefill.workers(), 1);
-        assert!(serial_decode.shares_pool_with(&serial_prefill));
-        assert!(RowParallelism::new_pair(0, 1).is_err());
-        assert!(RowParallelism::new_pair(1, MAX_ROW_WORKERS + 1).is_err());
-        assert!(serial_decode.with_active_workers(0).is_err());
-        assert!(serial_decode.with_active_workers(2).is_err());
-
-        let mut scratch = MatvecScratch::default();
-        assert_eq!(scratch.row_workers(), 1);
-        assert_eq!(scratch.prefill_row_workers(), 1);
-        assert_eq!(scratch.prefill_row_parallelism().workers(), 1);
-
-        #[cfg(feature = "parallel-rows")]
-        {
-            let (decode, prefill) = RowParallelism::new_pair(8, 16)?;
-            assert_eq!(decode.workers(), 8);
-            assert_eq!(decode.pool_workers(), 16);
-            assert_eq!(prefill.workers(), 16);
-            assert_eq!(prefill.pool_workers(), 16);
-            assert!(decode.shares_pool_with(&prefill));
-            assert!(decode.with_active_workers(17).is_err());
-
-            let sub = decode.with_active_workers(12)?;
-            assert_eq!(sub.workers(), 12);
-            assert!(sub.shares_pool_with(&prefill));
-            assert_eq!(decode.with_active_workers(1)?.workers(), 1);
-
-            let (serial_dec, shared_pref) = RowParallelism::new_pair(1, 4)?;
-            assert_eq!(serial_dec.workers(), 1);
-            assert_eq!(shared_pref.workers(), 4);
-
-            scratch.set_row_parallelism(decode.clone());
-            assert_eq!(scratch.row_workers(), 8);
-            assert_eq!(scratch.prefill_row_workers(), 8);
-            assert_eq!(scratch.prefill_row_parallelism().workers(), 8);
-
-            scratch.set_prefill_row_parallelism(prefill.clone());
-            assert_eq!(scratch.row_workers(), 8);
-            assert_eq!(scratch.prefill_row_workers(), 16);
-            assert!(
-                scratch
-                    .clone_prefill_row_parallelism()
-                    .shares_pool_with(&prefill)
-            );
-        }
-        Ok(())
-    }
-}
-
 #[cfg(all(
     feature = "experimental-neon",
     target_arch = "aarch64",
@@ -854,4 +802,70 @@ pub(super) fn fill_sixteen_batched_chunk(
         dot_four,
         dot,
     )
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::super::MatvecScratch;
+    use super::{MAX_ROW_WORKERS, RowParallelism};
+    use crate::Result;
+
+    #[test]
+    fn row_parallelism_pair_and_matvec_scratch_prefill_defaults() -> Result<()> {
+        let (serial_decode, serial_prefill) = RowParallelism::new_pair(1, 1)?;
+        assert_eq!(serial_decode.workers(), 1);
+        assert_eq!(serial_prefill.workers(), 1);
+        assert!(serial_decode.shares_pool_with(&serial_prefill));
+        assert!(RowParallelism::new_pair(0, 1).is_err());
+        assert!(RowParallelism::new_pair(1, MAX_ROW_WORKERS + 1).is_err());
+        assert!(serial_decode.with_active_workers(0).is_err());
+        assert!(serial_decode.with_active_workers(2).is_err());
+
+        #[cfg_attr(
+            not(feature = "parallel-rows"),
+            allow(
+                unused_mut,
+                reason = "Mutated in the parallel-rows feature branch below."
+            )
+        )]
+        let mut scratch = MatvecScratch::default();
+        assert_eq!(scratch.row_workers(), 1);
+        assert_eq!(scratch.prefill_row_workers(), 1);
+        assert_eq!(scratch.prefill_row_parallelism().workers(), 1);
+
+        #[cfg(feature = "parallel-rows")]
+        {
+            let (decode, prefill) = RowParallelism::new_pair(8, 16)?;
+            assert_eq!(decode.workers(), 8);
+            assert_eq!(decode.pool_workers(), 16);
+            assert_eq!(prefill.workers(), 16);
+            assert_eq!(prefill.pool_workers(), 16);
+            assert!(decode.shares_pool_with(&prefill));
+            assert!(decode.with_active_workers(17).is_err());
+
+            let sub = decode.with_active_workers(12)?;
+            assert_eq!(sub.workers(), 12);
+            assert!(sub.shares_pool_with(&prefill));
+            assert_eq!(decode.with_active_workers(1)?.workers(), 1);
+
+            let (serial_dec, shared_pref) = RowParallelism::new_pair(1, 4)?;
+            assert_eq!(serial_dec.workers(), 1);
+            assert_eq!(shared_pref.workers(), 4);
+
+            scratch.set_row_parallelism(decode);
+            assert_eq!(scratch.row_workers(), 8);
+            assert_eq!(scratch.prefill_row_workers(), 8);
+            assert_eq!(scratch.prefill_row_parallelism().workers(), 8);
+
+            scratch.set_prefill_row_parallelism(prefill.clone());
+            assert_eq!(scratch.row_workers(), 8);
+            assert_eq!(scratch.prefill_row_workers(), 16);
+            assert!(
+                scratch
+                    .clone_prefill_row_parallelism()
+                    .shares_pool_with(&prefill)
+            );
+        }
+        Ok(())
+    }
 }

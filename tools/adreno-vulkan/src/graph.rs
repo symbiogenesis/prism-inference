@@ -281,6 +281,9 @@ pub struct VulkanLayerPipelines {
     attn_fused_f16prob: PipelineId,
     attn_fused_f16prob_f16kv: PipelineId,
     attn_fused_gqa_prefill_f16kv: PipelineId,
+    attn_flash_gqa6_prefill_f16kv: PipelineId,
+    attn_flash_gqa6_decode_splitk_f16kv: PipelineId,
+    attn_flash_decode_combine: PipelineId,
     rms_norm: PipelineId,
     add_rms_norm: PipelineId,
     rope: PipelineId,
@@ -289,11 +292,14 @@ pub struct VulkanLayerPipelines {
     conv1d_silu: PipelineId,
     conv1d_silu_offset: PipelineId,
     conv1d_silu_batched_inplace: PipelineId,
+    conv1d_silu_batched_inplace_k4: PipelineId,
     l2_norm: PipelineId,
     l2_norm_batched_strided: PipelineId,
     gdn_step: PipelineId,
     gdn_step_batched_token: PipelineId,
     gdn_scan_batched: PipelineId,
+    gdn_step_2row_vec4: PipelineId,
+    gdn_scan_batched_2row_vec4: PipelineId,
     gdn_gates: PipelineId,
     gdn_gates_batched: PipelineId,
     deinterleave_q_gate: PipelineId,
@@ -345,7 +351,7 @@ struct PreparedLayerShaders {
     use_sdot: bool,
     use_wave64: bool,
     proj: PreparedProjectionShaders,
-    modules: [PreparedShaderSpec; 56],
+    modules: [PreparedShaderSpec; 62],
     shader_digests_sha256: String,
 }
 
@@ -419,6 +425,24 @@ impl VulkanLayerPipelines {
                 8,
             )?,
             make_spec(
+                b"attn_flash_gqa6_prefill_f16kv",
+                spirv::attn_flash_gqa6_prefill_f16kv_with_subgroup(use_wave64_shuffle),
+                4,
+                8,
+            )?,
+            make_spec(
+                b"attn_flash_gqa6_decode_splitk_f16kv",
+                spirv::attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_wave64_shuffle),
+                4,
+                9,
+            )?,
+            make_spec(
+                b"attn_flash_decode_combine",
+                spirv::attn_flash_decode_combine_f32(),
+                2,
+                3,
+            )?,
+            make_spec(
                 b"rms_norm_f32",
                 spirv::rms_norm_f32_with_subgroup(use_wave64_shuffle),
                 3,
@@ -433,18 +457,29 @@ impl VulkanLayerPipelines {
             make_spec(b"rope_f32", spirv::rope_f32(), 2, 4)?,
             make_spec(b"rope_batched_f32", spirv::rope_batched_f32(), 2, 5)?,
             make_spec(b"mul_sigmoid_f32", spirv::mul_sigmoid_f32(), 2, 1)?,
-            make_spec(b"conv1d_silu_f32", spirv::conv1d_silu_f32(), 4, 2)?,
             make_spec(
-                b"conv1d_silu_offset_f32",
-                spirv::conv1d_silu_offset_f32(),
+                b"conv1d_silu_tap_major_f32",
+                spirv::conv1d_silu_tap_major_f32(),
+                4,
+                2,
+            )?,
+            make_spec(
+                b"conv1d_silu_offset_tap_major_f32",
+                spirv::conv1d_silu_offset_tap_major_f32(),
                 4,
                 3,
             )?,
             make_spec(
-                b"conv1d_silu_batched_inplace_f32",
-                spirv::conv1d_silu_batched_inplace_f32(),
+                b"conv1d_silu_batched_inplace_tap_major_f32",
+                spirv::conv1d_silu_batched_inplace_tap_major_f32(),
                 3,
                 3,
+            )?,
+            make_spec(
+                b"conv1d_silu_batched_inplace_tap_major_k4_f32",
+                spirv::conv1d_silu_batched_inplace_tap_major_k4_f32(),
+                3,
+                2,
             )?,
             make_spec(
                 b"l2_norm_f32",
@@ -473,6 +508,18 @@ impl VulkanLayerPipelines {
             make_spec(
                 b"gdn_scan_batched_f32",
                 spirv::gdn_scan_batched_f32_with_subgroup(use_wave64_shuffle),
+                5,
+                5,
+            )?,
+            make_spec(
+                b"gdn_step_2row_vec4_f32",
+                spirv::gdn_step_2row_vec4_f32_with_subgroup(use_wave64_shuffle),
+                5,
+                4,
+            )?,
+            make_spec(
+                b"gdn_scan_batched_2row_vec4_f32",
+                spirv::gdn_scan_batched_2row_vec4_f32_with_subgroup(use_wave64_shuffle),
                 5,
                 5,
             )?,
@@ -709,6 +756,9 @@ impl VulkanLayerPipelines {
             attn_fused_f16prob,
             attn_fused_f16prob_f16kv,
             attn_fused_gqa_prefill_f16kv,
+            attn_flash_gqa6_prefill_f16kv,
+            attn_flash_gqa6_decode_splitk_f16kv,
+            attn_flash_decode_combine,
             rms_norm,
             add_rms_norm,
             rope,
@@ -717,11 +767,14 @@ impl VulkanLayerPipelines {
             conv1d_silu,
             conv1d_silu_offset,
             conv1d_silu_batched_inplace,
+            conv1d_silu_batched_inplace_k4,
             l2_norm,
             l2_norm_batched_strided,
             gdn_step,
             gdn_step_batched_token,
             gdn_scan_batched,
+            gdn_step_2row_vec4,
+            gdn_scan_batched_2row_vec4,
             gdn_gates,
             gdn_gates_batched,
             deinterleave_q_gate,
@@ -757,7 +810,7 @@ impl VulkanLayerPipelines {
             permute_ssm_heads_batched,
             copy_slice,
             copy_slice_offset,
-        ]: [PipelineId; 56] = ids
+        ]: [PipelineId; 62] = ids
             .try_into()
             .map_err(|_| Error::InvalidInput("layer pipeline count mismatch".to_owned()))?;
 
@@ -771,6 +824,9 @@ impl VulkanLayerPipelines {
             attn_fused_f16prob,
             attn_fused_f16prob_f16kv,
             attn_fused_gqa_prefill_f16kv,
+            attn_flash_gqa6_prefill_f16kv,
+            attn_flash_gqa6_decode_splitk_f16kv,
+            attn_flash_decode_combine,
             rms_norm,
             add_rms_norm,
             rope,
@@ -779,11 +835,14 @@ impl VulkanLayerPipelines {
             conv1d_silu,
             conv1d_silu_offset,
             conv1d_silu_batched_inplace,
+            conv1d_silu_batched_inplace_k4,
             l2_norm,
             l2_norm_batched_strided,
             gdn_step,
             gdn_step_batched_token,
             gdn_scan_batched,
+            gdn_step_2row_vec4,
+            gdn_scan_batched_2row_vec4,
             gdn_gates,
             gdn_gates_batched,
             deinterleave_q_gate,
@@ -1261,6 +1320,7 @@ struct GpuGraphScratch {
     lora_ranks_staging: [BufferId; 3],
     attn_scores: BufferId,
     attn_probs: BufferId,
+    flash_decode_partials: BufferId,
     attn_score_bytes: u64,
     allocated_tile_tokens: usize,
     logits: BufferId,
@@ -1976,6 +2036,10 @@ impl VulkanBatchedGraphExecutor {
     ///
     /// # Errors
     /// Returns [`Error::DeviceFault`], [`Error::InvalidInput`], or [`Error::Vulkan`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Reads and validates recurrent conv_state/matrix_state and KV cache spans into reusable checkpoint storage."
+    )]
     pub fn checkpoint_into(&self, target: &mut VulkanBatchedCheckpoint) -> Result<(), Error> {
         if self.device.is_faulted() || !self.state_consistent {
             return Err(Error::DeviceFault(
@@ -2001,6 +2065,8 @@ impl VulkanBatchedGraphExecutor {
             target.layers.reserve(self.layers.len());
         }
 
+        let conv_hist = self.geometry.convolution.saturating_sub(1);
+        let mut conv_tap_scratch = Vec::new();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             match &layer.attention {
                 GpuLayerAttention::Recurrent {
@@ -2018,7 +2084,15 @@ impl VulkanBatchedGraphExecutor {
                     {
                         convolution.resize(*conv_state_elems, 0.0_f32);
                         if *conv_state_elems > 0 {
-                            self.device.read_buffer_f32(*conv_state, convolution)?;
+                            conv_tap_scratch.resize(*conv_state_elems, 0.0_f32);
+                            self.device
+                                .read_buffer_f32(*conv_state, &mut conv_tap_scratch)?;
+                            transpose_f32_matrix(
+                                &conv_tap_scratch,
+                                conv_hist,
+                                *conv_state_elems / conv_hist.max(1),
+                                convolution,
+                            );
                         }
                         matrix.resize(*matrix_state_elems, 0.0_f32);
                         if *matrix_state_elems > 0 {
@@ -2026,8 +2100,16 @@ impl VulkanBatchedGraphExecutor {
                         }
                     } else {
                         let convolution = if *conv_state_elems > 0 {
+                            conv_tap_scratch.resize(*conv_state_elems, 0.0_f32);
+                            self.device
+                                .read_buffer_f32(*conv_state, &mut conv_tap_scratch)?;
                             let mut buf = vec![0.0_f32; *conv_state_elems];
-                            self.device.read_buffer_f32(*conv_state, &mut buf)?;
+                            transpose_f32_matrix(
+                                &conv_tap_scratch,
+                                conv_hist,
+                                *conv_state_elems / conv_hist.max(1),
+                                &mut buf,
+                            );
                             buf
                         } else {
                             Vec::new()
@@ -2298,6 +2380,8 @@ impl VulkanBatchedGraphExecutor {
             checkpoint.position,
         );
 
+        let conv_hist = self.geometry.convolution.saturating_sub(1);
+        let mut conv_tap_scratch = Vec::new();
         for (layer, snap) in self.layers.iter().zip(&checkpoint.layers) {
             match (&layer.attention, snap) {
                 (
@@ -2314,7 +2398,15 @@ impl VulkanBatchedGraphExecutor {
                     },
                 ) => {
                     if *conv_state_elems > 0 {
-                        self.device.write_buffer_f32(*conv_state, convolution)?;
+                        conv_tap_scratch.resize(*conv_state_elems, 0.0_f32);
+                        transpose_f32_matrix(
+                            convolution,
+                            *conv_state_elems / conv_hist.max(1),
+                            conv_hist,
+                            &mut conv_tap_scratch,
+                        );
+                        self.device
+                            .write_buffer_f32(*conv_state, &conv_tap_scratch)?;
                     }
                     if *matrix_state_elems > 0 {
                         self.device.write_buffer_f32(*matrix_state, matrix)?;
@@ -3275,8 +3367,7 @@ impl VulkanBatchedGraphExecutor {
         };
 
         let (gdn_out_buf, gdn_normed_buf) = if self.geometry.convolution <= 8
-            && ((tokens == 1 && self.geometry.ssm_head <= 128)
-                || (tokens > 1 && self.geometry.ssm_head <= 256))
+            && self.geometry.ssm_head <= 256
         {
             let batched_out_buf = self.scratch.proj_e;
             let conv_grid = checked_grid(&self.device, [channels_u32.div_ceil(WORKGROUP_X), 1, 1])?;
@@ -3285,18 +3376,30 @@ impl VulkanBatchedGraphExecutor {
                 [v_heads_u32.div_ceil(WORKGROUP_X), tokens_u32, 1],
             )?;
             let l2_grid = checked_grid(&self.device, [1, qk_heads_u32, tokens_u32])?;
-            let gdn_grid = checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?;
 
-            self.batch_recorder.push_barrier(
-                self.pipelines.conv1d_silu_batched_inplace,
-                &[
-                    BufferSpan::whole(proj_qkv_buf),
-                    BufferSpan::whole(active_conv_state),
-                    BufferSpan::whole(convolution_w),
-                ],
-                &[channels_u32, kernel_u32, tokens_u32],
-                conv_grid,
-            );
+            if self.geometry.convolution == 4 {
+                self.batch_recorder.push_barrier(
+                    self.pipelines.conv1d_silu_batched_inplace_k4,
+                    &[
+                        BufferSpan::whole(proj_qkv_buf),
+                        BufferSpan::whole(active_conv_state),
+                        BufferSpan::whole(convolution_w),
+                    ],
+                    &[channels_u32, tokens_u32],
+                    conv_grid,
+                );
+            } else {
+                self.batch_recorder.push_barrier(
+                    self.pipelines.conv1d_silu_batched_inplace,
+                    &[
+                        BufferSpan::whole(proj_qkv_buf),
+                        BufferSpan::whole(active_conv_state),
+                        BufferSpan::whole(convolution_w),
+                    ],
+                    &[channels_u32, kernel_u32, tokens_u32],
+                    conv_grid,
+                );
+            }
             self.batch_recorder.push_concurrent(
                 self.pipelines.gdn_gates_batched,
                 &[
@@ -3320,24 +3423,63 @@ impl VulkanBatchedGraphExecutor {
                 ],
                 l2_grid,
             );
-            self.batch_recorder.push_barrier(
-                self.pipelines.gdn_scan_batched,
-                &[
-                    BufferSpan::whole(matrix_state),
-                    BufferSpan::whole(proj_qkv_buf),
-                    BufferSpan::whole(proj_alpha_buf),
-                    BufferSpan::whole(proj_beta_buf),
-                    BufferSpan::whole(batched_out_buf),
-                ],
-                &[
-                    v_heads_u32,
-                    k_heads_u32,
-                    ssm_head_u32,
-                    gdn_scale_bits,
-                    tokens_u32,
-                ],
-                gdn_grid,
-            );
+            if self.geometry.ssm_head >= 128 && self.geometry.ssm_head.is_multiple_of(4) {
+                let gdn_grid =
+                    checked_grid(&self.device, [ssm_head_u32.div_ceil(2), v_heads_u32, 1])?;
+                if tokens == 1 {
+                    self.batch_recorder.push_barrier(
+                        self.pipelines.gdn_step_2row_vec4,
+                        &[
+                            BufferSpan::whole(matrix_state),
+                            BufferSpan::whole(proj_qkv_buf),
+                            BufferSpan::whole(proj_alpha_buf),
+                            BufferSpan::whole(proj_beta_buf),
+                            BufferSpan::whole(batched_out_buf),
+                        ],
+                        &[v_heads_u32, k_heads_u32, ssm_head_u32, gdn_scale_bits],
+                        gdn_grid,
+                    );
+                } else {
+                    self.batch_recorder.push_barrier(
+                        self.pipelines.gdn_scan_batched_2row_vec4,
+                        &[
+                            BufferSpan::whole(matrix_state),
+                            BufferSpan::whole(proj_qkv_buf),
+                            BufferSpan::whole(proj_alpha_buf),
+                            BufferSpan::whole(proj_beta_buf),
+                            BufferSpan::whole(batched_out_buf),
+                        ],
+                        &[
+                            v_heads_u32,
+                            k_heads_u32,
+                            ssm_head_u32,
+                            gdn_scale_bits,
+                            tokens_u32,
+                        ],
+                        gdn_grid,
+                    );
+                }
+            } else {
+                let gdn_grid = checked_grid(&self.device, [ssm_head_u32, v_heads_u32, 1])?;
+                self.batch_recorder.push_barrier(
+                    self.pipelines.gdn_scan_batched,
+                    &[
+                        BufferSpan::whole(matrix_state),
+                        BufferSpan::whole(proj_qkv_buf),
+                        BufferSpan::whole(proj_alpha_buf),
+                        BufferSpan::whole(proj_beta_buf),
+                        BufferSpan::whole(batched_out_buf),
+                    ],
+                    &[
+                        v_heads_u32,
+                        k_heads_u32,
+                        ssm_head_u32,
+                        gdn_scale_bits,
+                        tokens_u32,
+                    ],
+                    gdn_grid,
+                );
+            }
             (batched_out_buf, self.scratch.perm_tmp)
         } else if tokens == 1 {
             let conv_out_buf = self.scratch.proj_e;
@@ -3844,7 +3986,8 @@ impl VulkanBatchedGraphExecutor {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "Dispatches #40 causal attention across full or sub-tiled query chunks within scratch and TDR MAC limits."
+        clippy::too_many_lines,
+        reason = "Dispatches GQA-6 FlashAttention/FlashDecoding or #40 sub-tiled causal attention within scratch and TDR limits."
     )]
     fn record_full_attention_causal(
         &mut self,
@@ -3857,6 +4000,98 @@ impl VulkanBatchedGraphExecutor {
         q_width: usize,
         min_align: usize,
     ) -> Result<(), Error> {
+        let can_use_flash_gqa6 = self.config.kv_precision == VulkanKvPrecision::Fp16
+            && self.config.attention_strategy != AttentionStrategy::ForceDecomposed
+            && self.geometry.kv_heads > 0
+            && self.geometry.heads == self.geometry.kv_heads * 6
+            && self.geometry.head > 0
+            && self.geometry.head <= 256
+            && self.geometry.head.is_multiple_of(2)
+            && self
+                .device
+                .capabilities()
+                .compute_limits
+                .max_compute_shared_memory_size
+                >= spirv::ATTN_FLASH_GQA6_SHARED_MEMORY_BYTES * 2;
+        if can_use_flash_gqa6 {
+            let past_len = self.position + past_token_offset;
+            let total_seq = past_len + tokens;
+            let query_len_u32 = u32::try_from(tokens)
+                .map_err(|_| Error::ResourceLimit("query_len exceeds u32".to_owned()))?;
+            let past_len_u32 = u32::try_from(past_len)
+                .map_err(|_| Error::ResourceLimit("past_len exceeds u32".to_owned()))?;
+            let total_seq_u32 = u32::try_from(total_seq)
+                .map_err(|_| Error::ResourceLimit("total_seq exceeds u32".to_owned()))?;
+            let num_heads_u32 = u32::try_from(self.geometry.heads)
+                .map_err(|_| Error::ResourceLimit("heads exceeds u32".to_owned()))?;
+            let kv_heads_u32 = u32::try_from(self.geometry.kv_heads)
+                .map_err(|_| Error::ResourceLimit("kv_heads exceeds u32".to_owned()))?;
+            let head_dim_u32 = u32::try_from(self.geometry.head)
+                .map_err(|_| Error::ResourceLimit("head exceeds u32".to_owned()))?;
+            let head_f32 = u16::try_from(self.geometry.head).map_or(1.0_f32, f32::from);
+            let scale_bits = (1.0_f32 / head_f32.sqrt()).to_bits();
+
+            if tokens == 1 && total_seq >= 128 {
+                let max_splits =
+                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(8);
+                let num_splits = total_seq.div_ceil(64).min(max_splits).max(2);
+                let num_splits_u32 = u32::try_from(num_splits)
+                    .map_err(|_| Error::ResourceLimit("num_splits exceeds u32".to_owned()))?;
+                self.batch_recorder.push_barrier(
+                    self.pipelines.attn_flash_gqa6_decode_splitk_f16kv,
+                    &[
+                        BufferSpan::whole(query_buf),
+                        BufferSpan::whole(k_cache),
+                        BufferSpan::whole(v_cache),
+                        BufferSpan::whole(self.scratch.flash_decode_partials),
+                    ],
+                    &[
+                        query_len_u32,
+                        total_seq_u32,
+                        past_len_u32,
+                        num_heads_u32,
+                        kv_heads_u32,
+                        head_dim_u32,
+                        scale_bits,
+                        1,
+                        num_splits_u32,
+                    ],
+                    checked_grid(&self.device, [num_splits_u32, kv_heads_u32, 1])?,
+                );
+                self.batch_recorder.push_barrier(
+                    self.pipelines.attn_flash_decode_combine,
+                    &[
+                        BufferSpan::whole(self.scratch.flash_decode_partials),
+                        BufferSpan::whole(attended_buf),
+                    ],
+                    &[num_heads_u32, head_dim_u32, num_splits_u32],
+                    checked_grid(&self.device, [num_heads_u32, 1, 1])?,
+                );
+            } else {
+                self.batch_recorder.push_barrier(
+                    self.pipelines.attn_flash_gqa6_prefill_f16kv,
+                    &[
+                        BufferSpan::whole(query_buf),
+                        BufferSpan::whole(k_cache),
+                        BufferSpan::whole(v_cache),
+                        BufferSpan::whole(attended_buf),
+                    ],
+                    &[
+                        query_len_u32,
+                        total_seq_u32,
+                        past_len_u32,
+                        num_heads_u32,
+                        kv_heads_u32,
+                        head_dim_u32,
+                        scale_bits,
+                        1,
+                    ],
+                    checked_grid(&self.device, [1, kv_heads_u32, query_len_u32])?,
+                );
+            }
+            return Ok(());
+        }
+
         let mut q_start = 0_usize;
         while q_start < tokens {
             let (chosen_sub_q, desc, plan) =
@@ -6315,12 +6550,14 @@ fn upload_recurrent_attention(
         &format!("{prefix}ssm_conv1d.weight"),
         &[geometry.convolution, channels],
     )?;
-    let mut conv_flat = Vec::with_capacity(geometry.convolution * channels);
+    let mut conv_flat = vec![0.0_f32; geometry.convolution * channels];
     for ch in 0..channels {
         row_into(&conv_tensor, ch, row_scratch)
             .map_err(|err| Error::InvalidInput(err.to_string()))?;
         ensure_finite_f32(row_scratch, "conv1d weight contains non-finite value")?;
-        conv_flat.extend_from_slice(row_scratch);
+        for (tap, &val) in row_scratch.iter().enumerate() {
+            conv_flat[tap * channels + ch] = val;
+        }
     }
     let convolution_w = guard.alloc_f32_buffer(&conv_flat)?;
 
@@ -6732,6 +6969,20 @@ fn allocate_scratch(
     )?;
     let sizes = plan.sizes;
 
+    let is_gqa6 = geometry.kv_heads > 0 && geometry.heads == geometry.kv_heads * 6;
+    let flash_partial_bytes = if is_gqa6 {
+        let elems = usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS)
+            .map_err(|_| Error::ResourceLimit("flash split count exceeds usize".to_owned()))?
+            .checked_mul(geometry.heads)
+            .and_then(|v| v.checked_mul(geometry.head + 2))
+            .ok_or_else(|| {
+                Error::ResourceLimit("flash decode partial buffer overflow".to_owned())
+            })?;
+        f32_slice_bytes(elems)?.max(MIN_SCRATCH_BYTES)
+    } else {
+        MIN_SCRATCH_BYTES
+    };
+
     Ok(GpuGraphScratch {
         hidden: guard.alloc_storage(sizes[0])?,
         hidden_staging: [
@@ -6765,6 +7016,7 @@ fn allocate_scratch(
         ],
         attn_scores: guard.alloc_storage(sizes[17])?,
         attn_probs: guard.alloc_storage(sizes[18])?,
+        flash_decode_partials: guard.alloc_storage(flash_partial_bytes)?,
         attn_score_bytes: plan.score_bytes,
         allocated_tile_tokens: plan.allocated_tile_tokens,
         logits: guard.alloc_readback_storage(sizes[19])?,
@@ -6929,6 +7181,15 @@ const fn select_fused_attention_dispatch(
         FusedAttentionDispatchChoice {
             kind: FusedAttentionKernelKind::PerHead,
             grid: [1, desc.num_heads, desc.query_len],
+        }
+    }
+}
+
+fn transpose_f32_matrix(src: &[f32], src_rows: usize, src_cols: usize, dst: &mut [f32]) {
+    for r in 0..src_rows {
+        let row_off = r * src_cols;
+        for c in 0..src_cols {
+            dst[c * src_rows + r] = src[row_off + c];
         }
     }
 }
@@ -7584,6 +7845,498 @@ mod tests {
         assert_eq!(
             explicit_one.layer_chunk_ranges_for_tokens(3, 1)?,
             vec![0..1, 1..2, 2..3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Compares 2-row vec4 GDN decode/scan against scalar GDN scan across live Adreno shapes."
+    )]
+    fn live_gdn_2row_vec4_matches_scalar_gdn_scan_within_1e5() -> Result<(), Error> {
+        let mut dev = AdrenoVulkanDevice::open()?;
+        let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
+        let scan_scalar = dev.create_compute_pipeline(
+            &spirv::gdn_scan_batched_f32_with_subgroup(use_subgroup),
+            5,
+            5,
+        )?;
+        let scan_2row = dev.create_compute_pipeline(
+            &spirv::gdn_scan_batched_2row_vec4_f32_with_subgroup(use_subgroup),
+            5,
+            5,
+        )?;
+        let step_2row = dev.create_compute_pipeline(
+            &spirv::gdn_step_2row_vec4_f32_with_subgroup(use_subgroup),
+            5,
+            4,
+        )?;
+
+        for &(v_heads, k_heads, head_dim, tokens) in &[
+            (4_usize, 2_usize, 64_usize, 16_usize),
+            (16, 4, 128, 16),
+            (16, 4, 256, 8),
+        ] {
+            let channels = 2 * k_heads * head_dim + v_heads * head_dim;
+            let state_elems = v_heads * head_dim * head_dim;
+            let val_width = v_heads * head_dim;
+            let pat = |len: usize, mul: usize, add: usize, m: usize, sub: i16, scale: f32| {
+                (0..len)
+                    .map(|i| {
+                        let rem = i16::try_from((i * mul + add) % m).unwrap_or(0) - sub;
+                        f32::from(rem) * scale
+                    })
+                    .collect::<Vec<f32>>()
+            };
+            let init_state = pat(state_elems, 17, 3, 29, 14, 0.01);
+            let qkv_in = pat(tokens * channels, 31, 7, 41, 20, 0.02);
+            let alpha_in: Vec<f32> = (0..tokens * v_heads)
+                .map(|i| {
+                    f32::mul_add(
+                        f32::from(u16::try_from((i * 13 + 5) % 11).unwrap_or(0)),
+                        0.025,
+                        0.7,
+                    )
+                })
+                .collect();
+            let beta_in: Vec<f32> = (0..tokens * v_heads)
+                .map(|i| {
+                    f32::mul_add(
+                        f32::from(u16::try_from((i * 19 + 1) % 17).unwrap_or(0)),
+                        0.02,
+                        0.1,
+                    )
+                })
+                .collect();
+
+            let st_buf0 = dev.create_storage_buffer(f32_slice_bytes(state_elems)?)?;
+            let st_buf1 = dev.create_storage_buffer(f32_slice_bytes(state_elems)?)?;
+            let st_buf2 = dev.create_storage_buffer(f32_slice_bytes(state_elems)?)?;
+            let qkv_buf = dev.create_storage_buffer(f32_slice_bytes(qkv_in.len())?)?;
+            let alpha_buf = dev.create_storage_buffer(f32_slice_bytes(alpha_in.len())?)?;
+            let beta_buf = dev.create_storage_buffer(f32_slice_bytes(beta_in.len())?)?;
+            let out_buf0 = dev.create_storage_buffer(f32_slice_bytes(tokens * val_width)?)?;
+            let out_buf1 = dev.create_storage_buffer(f32_slice_bytes(tokens * val_width)?)?;
+            let tok_qkv_buf = dev.create_storage_buffer(f32_slice_bytes(channels)?)?;
+            let tok_alpha_buf = dev.create_storage_buffer(f32_slice_bytes(v_heads)?)?;
+            let tok_beta_buf = dev.create_storage_buffer(f32_slice_bytes(v_heads)?)?;
+            let tok_out_buf = dev.create_storage_buffer(f32_slice_bytes(val_width)?)?;
+
+            dev.write_buffer_f32(st_buf0, &init_state)?;
+            dev.write_buffer_f32(st_buf1, &init_state)?;
+            dev.write_buffer_f32(st_buf2, &init_state)?;
+            dev.write_buffer_f32(qkv_buf, &qkv_in)?;
+            dev.write_buffer_f32(alpha_buf, &alpha_in)?;
+            dev.write_buffer_f32(beta_buf, &beta_in)?;
+
+            let vh_u = u32::try_from(v_heads).map_err(|_| Error::ResourceLimit("vh".to_owned()))?;
+            let kh_u = u32::try_from(k_heads).map_err(|_| Error::ResourceLimit("kh".to_owned()))?;
+            let hd_u =
+                u32::try_from(head_dim).map_err(|_| Error::ResourceLimit("hd".to_owned()))?;
+            let tok_u =
+                u32::try_from(tokens).map_err(|_| Error::ResourceLimit("tok".to_owned()))?;
+            let hd_f32 = f32::from(u16::try_from(head_dim).unwrap_or(1));
+            let scale_bits = (1.0_f32 / hd_f32.sqrt()).to_bits();
+
+            dev.submit_compute(
+                scan_scalar,
+                &[st_buf0, qkv_buf, alpha_buf, beta_buf, out_buf0],
+                &[vh_u, kh_u, hd_u, scale_bits, tok_u],
+                [hd_u, vh_u, 1],
+            )?;
+            dev.submit_compute(
+                scan_2row,
+                &[st_buf1, qkv_buf, alpha_buf, beta_buf, out_buf1],
+                &[vh_u, kh_u, hd_u, scale_bits, tok_u],
+                [hd_u.div_ceil(2), vh_u, 1],
+            )?;
+            let mut out2 = Vec::with_capacity(tokens * val_width);
+            let mut tmp_o = vec![0.0_f32; val_width];
+            for t in 0..tokens {
+                dev.write_buffer_f32(tok_qkv_buf, &qkv_in[t * channels..(t + 1) * channels])?;
+                dev.write_buffer_f32(tok_alpha_buf, &alpha_in[t * v_heads..(t + 1) * v_heads])?;
+                dev.write_buffer_f32(tok_beta_buf, &beta_in[t * v_heads..(t + 1) * v_heads])?;
+                dev.submit_compute(
+                    step_2row,
+                    &[
+                        st_buf2,
+                        tok_qkv_buf,
+                        tok_alpha_buf,
+                        tok_beta_buf,
+                        tok_out_buf,
+                    ],
+                    &[vh_u, kh_u, hd_u, scale_bits],
+                    [hd_u.div_ceil(2), vh_u, 1],
+                )?;
+                dev.read_buffer_f32(tok_out_buf, &mut tmp_o)?;
+                out2.extend_from_slice(&tmp_o);
+            }
+
+            let mut out0 = vec![0.0_f32; tokens * val_width];
+            let mut out1 = vec![0.0_f32; tokens * val_width];
+            let mut st0 = vec![0.0_f32; state_elems];
+            let mut st1 = vec![0.0_f32; state_elems];
+            let mut st2 = vec![0.0_f32; state_elems];
+            dev.read_buffer_f32(out_buf0, &mut out0)?;
+            dev.read_buffer_f32(out_buf1, &mut out1)?;
+            dev.read_buffer_f32(st_buf0, &mut st0)?;
+            dev.read_buffer_f32(st_buf1, &mut st1)?;
+            dev.read_buffer_f32(st_buf2, &mut st2)?;
+
+            let mut max_out_diff = 0.0_f32;
+            for (i, ((&a, &b), &c)) in out0.iter().zip(&out1).zip(&out2).enumerate() {
+                assert_eq!(
+                    b.to_bits(),
+                    c.to_bits(),
+                    "2row scan vs step mismatch at {i}"
+                );
+                max_out_diff = max_out_diff.max((a - b).abs());
+            }
+            let mut max_st_diff = 0.0_f32;
+            for (i, ((&a, &b), &c)) in st0.iter().zip(&st1).zip(&st2).enumerate() {
+                assert_eq!(
+                    b.to_bits(),
+                    c.to_bits(),
+                    "2row state scan vs step mismatch at {i}"
+                );
+                max_st_diff = max_st_diff.max((a - b).abs());
+            }
+            assert!(
+                max_out_diff <= 1e-4 && max_st_diff <= 1e-4,
+                "GDN 2row_vec4 ({v_heads},{k_heads},{head_dim},T={tokens}) max_out_diff={max_out_diff}, max_st_diff={max_st_diff}"
+            );
+        }
+
+        // Also test full recurrent batch chain: conv1d_k4 -> gdn_gates -> l2_norm -> gdn_scan inside CommandBatchRecorder
+        {
+            let v_heads = 4_usize;
+            let k_heads = 2_usize;
+            let head_dim = 64_usize;
+            let tokens = 16_usize;
+            let channels = 2 * k_heads * head_dim + v_heads * head_dim;
+            let qk_heads = 2 * k_heads;
+            let state_elems = v_heads * head_dim * head_dim;
+            let conv_elems = 3 * channels;
+            let val_width = v_heads * head_dim;
+
+            let conv_k4 = dev.create_compute_pipeline(
+                &spirv::conv1d_silu_batched_inplace_tap_major_k4_f32(),
+                3,
+                2,
+            )?;
+            let gates_p = dev.create_compute_pipeline(&spirv::gdn_gates_batched_f32(), 4, 2)?;
+            let l2_p = dev.create_compute_pipeline(
+                &spirv::l2_norm_batched_strided_f32_with_subgroup(use_subgroup),
+                1,
+                5,
+            )?;
+
+            let qkv_init: Vec<f32> = (0..tokens * channels)
+                .map(|i| f32::from(i16::try_from((i * 23 + 9) % 41).unwrap_or(0) - 20) * 0.25)
+                .collect();
+            let conv_w: Vec<f32> = (0..4 * channels)
+                .map(|i| f32::from(i16::try_from((i * 11 + 3) % 19).unwrap_or(0) - 9) * 0.1)
+                .collect();
+            let a_init: Vec<f32> = (0..tokens * v_heads)
+                .map(|i| f32::from(i16::try_from((i * 7 + 1) % 13).unwrap_or(0) - 6) * 0.3)
+                .collect();
+            let b_init: Vec<f32> = (0..tokens * v_heads)
+                .map(|i| f32::from(i16::try_from((i * 17 + 5) % 15).unwrap_or(0) - 7) * 0.3)
+                .collect();
+            let t_bias = vec![0.1_f32; v_heads];
+            let ssm_a = vec![-0.25_f32; v_heads];
+
+            let run_chain = |dev: &mut AdrenoVulkanDevice,
+                             use_2row: bool|
+             -> Result<(Vec<f32>, Vec<f32>), Error> {
+                let qkv_buf = dev.create_storage_buffer(f32_slice_bytes(qkv_init.len())?)?;
+                let conv_st_buf = dev.create_storage_buffer(f32_slice_bytes(conv_elems)?)?;
+                let conv_w_buf = dev.create_storage_buffer(f32_slice_bytes(conv_w.len())?)?;
+                let alpha_buf = dev.create_storage_buffer(f32_slice_bytes(a_init.len())?)?;
+                let beta_buf = dev.create_storage_buffer(f32_slice_bytes(b_init.len())?)?;
+                let bias_buf = dev.create_storage_buffer(f32_slice_bytes(t_bias.len())?)?;
+                let decay_a_buf = dev.create_storage_buffer(f32_slice_bytes(ssm_a.len())?)?;
+                let mat_st_buf = dev.create_storage_buffer(f32_slice_bytes(state_elems)?)?;
+                let out_buf = dev.create_storage_buffer(f32_slice_bytes(tokens * val_width)?)?;
+
+                dev.write_buffer_f32(qkv_buf, &qkv_init)?;
+                dev.write_buffer_f32(conv_st_buf, &vec![0.0_f32; conv_elems])?;
+                dev.write_buffer_f32(conv_w_buf, &conv_w)?;
+                dev.write_buffer_f32(alpha_buf, &a_init)?;
+                dev.write_buffer_f32(beta_buf, &b_init)?;
+                dev.write_buffer_f32(bias_buf, &t_bias)?;
+                dev.write_buffer_f32(decay_a_buf, &ssm_a)?;
+                dev.write_buffer_f32(mat_st_buf, &vec![0.0_f32; state_elems])?;
+
+                let ch_u = u32::try_from(channels).unwrap_or(0);
+                let tok_u = u32::try_from(tokens).unwrap_or(0);
+                let vh_u = u32::try_from(v_heads).unwrap_or(0);
+                let kh_u = u32::try_from(k_heads).unwrap_or(0);
+                let qkh_u = u32::try_from(qk_heads).unwrap_or(0);
+                let hd_u = u32::try_from(head_dim).unwrap_or(0);
+                let scale_bits = (1.0_f32 / 8.0_f32).to_bits();
+
+                let mut rec = CommandBatchRecorder::default();
+                rec.push_barrier(
+                    conv_k4,
+                    &[
+                        BufferSpan::whole(qkv_buf),
+                        BufferSpan::whole(conv_st_buf),
+                        BufferSpan::whole(conv_w_buf),
+                    ],
+                    &[ch_u, tok_u],
+                    [ch_u.div_ceil(WORKGROUP_X), 1, 1],
+                );
+                rec.push_concurrent(
+                    gates_p,
+                    &[
+                        BufferSpan::whole(alpha_buf),
+                        BufferSpan::whole(beta_buf),
+                        BufferSpan::whole(bias_buf),
+                        BufferSpan::whole(decay_a_buf),
+                    ],
+                    &[vh_u, tok_u],
+                    [vh_u.div_ceil(WORKGROUP_X), tok_u, 1],
+                );
+                rec.push_barrier(
+                    l2_p,
+                    &[BufferSpan::whole(qkv_buf)],
+                    &[qkh_u, hd_u, 1e-6_f32.to_bits(), ch_u, tok_u],
+                    [1, qkh_u, tok_u],
+                );
+                if use_2row {
+                    rec.push_barrier(
+                        scan_2row,
+                        &[
+                            BufferSpan::whole(mat_st_buf),
+                            BufferSpan::whole(qkv_buf),
+                            BufferSpan::whole(alpha_buf),
+                            BufferSpan::whole(beta_buf),
+                            BufferSpan::whole(out_buf),
+                        ],
+                        &[vh_u, kh_u, hd_u, scale_bits, tok_u],
+                        [hd_u.div_ceil(2), vh_u, 1],
+                    );
+                } else {
+                    rec.push_barrier(
+                        scan_scalar,
+                        &[
+                            BufferSpan::whole(mat_st_buf),
+                            BufferSpan::whole(qkv_buf),
+                            BufferSpan::whole(alpha_buf),
+                            BufferSpan::whole(beta_buf),
+                            BufferSpan::whole(out_buf),
+                        ],
+                        &[vh_u, kh_u, hd_u, scale_bits, tok_u],
+                        [hd_u, vh_u, 1],
+                    );
+                }
+                dev.submit_compute_batch(&rec)?;
+                let mut out = vec![0.0_f32; tokens * val_width];
+                let mut st = vec![0.0_f32; state_elems];
+                dev.read_buffer_f32(out_buf, &mut out)?;
+                dev.read_buffer_f32(mat_st_buf, &mut st)?;
+                Ok((out, st))
+            };
+
+            let (o_sc, s_sc) = run_chain(&mut dev, false)?;
+            let (o_2r, s_2r) = run_chain(&mut dev, true)?;
+            let d_o = o_sc
+                .iter()
+                .zip(&o_2r)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            let d_s = s_sc
+                .iter()
+                .zip(&s_2r)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                d_o <= 1e-6 && d_s <= 1e-6,
+                "chain diff d_o={d_o}, d_s={d_s}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Live GQA-6 FlashAttention-2 and FlashDecoding Split-K hardware parity check."
+    )]
+    fn live_flash_gqa6_prefill_and_decode_splitk_match_cpu_within_1e4() -> Result<(), Error> {
+        let mut dev = AdrenoVulkanDevice::open()?;
+        let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
+        let kv_pack = dev.create_compute_pipeline(&spirv::kv_append_batched_f16(), 4, 4)?;
+        let flash_prefill = dev.create_compute_pipeline(
+            &spirv::attn_flash_gqa6_prefill_f16kv_with_subgroup(use_subgroup),
+            4,
+            8,
+        )?;
+        let flash_splitk = dev.create_compute_pipeline(
+            &spirv::attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_subgroup),
+            4,
+            9,
+        )?;
+        let flash_combine =
+            dev.create_compute_pipeline(&spirv::attn_flash_decode_combine_f32(), 2, 3)?;
+
+        let num_kv_heads = 2_usize;
+        let num_heads = 12_usize;
+        let head_dim = 128_usize;
+        let total_seq = 640_usize; // > 512 cliff!
+        let query_len = 32_usize;
+        let past_len = total_seq - query_len;
+        let q_width = num_heads * head_dim;
+        let kv_width = num_kv_heads * head_dim;
+
+        let pat = |len: usize, mul: usize, add: usize, m: usize, sub: i16| -> Vec<f32> {
+            (0..len)
+                .map(|i| f32::from(i16::try_from((i * mul + add) % m).unwrap_or(0) - sub) * 0.03)
+                .collect()
+        };
+        let k_f32 = pat(total_seq * kv_width, 19, 7, 53, 26);
+        let v_f32 = pat(total_seq * kv_width, 23, 11, 47, 23);
+        let q_prefill = pat(query_len * q_width, 29, 5, 43, 21);
+        let q_decode = q_prefill[(query_len - 1) * q_width..].to_vec();
+
+        let key_f32_buf = dev.create_storage_buffer(f32_slice_bytes(k_f32.len())?)?;
+        let val_f32_buf = dev.create_storage_buffer(f32_slice_bytes(v_f32.len())?)?;
+        let key_cache_buf =
+            dev.create_storage_buffer(u32_slice_bytes(total_seq * kv_width / 2)?)?;
+        let val_cache_buf =
+            dev.create_storage_buffer(u32_slice_bytes(total_seq * kv_width / 2)?)?;
+        let q_pre_buf = dev.create_storage_buffer(f32_slice_bytes(q_prefill.len())?)?;
+        let o_pre_buf = dev.create_storage_buffer(f32_slice_bytes(q_prefill.len())?)?;
+        let q_dec_buf = dev.create_storage_buffer(f32_slice_bytes(q_decode.len())?)?;
+        let num_splits = 8_usize;
+        let partial_buf =
+            dev.create_storage_buffer(f32_slice_bytes(num_splits * num_heads * (head_dim + 2))?)?;
+        let o_dec_buf = dev.create_storage_buffer(f32_slice_bytes(q_decode.len())?)?;
+
+        dev.write_buffer_f32(key_f32_buf, &k_f32)?;
+        dev.write_buffer_f32(val_f32_buf, &v_f32)?;
+        dev.write_buffer_f32(q_pre_buf, &q_prefill)?;
+        dev.write_buffer_f32(q_dec_buf, &q_decode)?;
+
+        let kv_w_u = u32::try_from(kv_width).map_err(|_| Error::ResourceLimit("kv".to_owned()))?;
+        let total_u =
+            u32::try_from(total_seq).map_err(|_| Error::ResourceLimit("tot".to_owned()))?;
+        let q_len_u =
+            u32::try_from(query_len).map_err(|_| Error::ResourceLimit("qlen".to_owned()))?;
+        let past_u =
+            u32::try_from(past_len).map_err(|_| Error::ResourceLimit("past".to_owned()))?;
+        let heads_u = u32::try_from(num_heads).map_err(|_| Error::ResourceLimit("h".to_owned()))?;
+        let kvh_u =
+            u32::try_from(num_kv_heads).map_err(|_| Error::ResourceLimit("kvh".to_owned()))?;
+        let dim_u = u32::try_from(head_dim).map_err(|_| Error::ResourceLimit("hd".to_owned()))?;
+        let splits_u =
+            u32::try_from(num_splits).map_err(|_| Error::ResourceLimit("splits".to_owned()))?;
+        let scale = 1.0_f32 / f32::from(u16::try_from(head_dim).unwrap_or(1)).sqrt();
+        let scale_bits = scale.to_bits();
+
+        dev.submit_compute(
+            kv_pack,
+            &[key_f32_buf, val_f32_buf, key_cache_buf, val_cache_buf],
+            &[kv_w_u, 0, total_u, (kv_w_u / 2) * total_u],
+            [(kv_w_u / 2).div_ceil(WORKGROUP_X), total_u, 1],
+        )?;
+        dev.submit_compute(
+            flash_prefill,
+            &[q_pre_buf, key_cache_buf, val_cache_buf, o_pre_buf],
+            &[
+                q_len_u, total_u, past_u, heads_u, kvh_u, dim_u, scale_bits, 1,
+            ],
+            [1, kvh_u, q_len_u],
+        )?;
+        dev.submit_compute(
+            flash_splitk,
+            &[q_dec_buf, key_cache_buf, val_cache_buf, partial_buf],
+            &[
+                1,
+                total_u,
+                total_u - 1,
+                heads_u,
+                kvh_u,
+                dim_u,
+                scale_bits,
+                1,
+                splits_u,
+            ],
+            [splits_u, kvh_u, 1],
+        )?;
+        dev.submit_compute(
+            flash_combine,
+            &[partial_buf, o_dec_buf],
+            &[heads_u, dim_u, splits_u],
+            [heads_u, 1, 1],
+        )?;
+
+        let mut k_bytes = vec![0_u8; total_seq * kv_width * 2];
+        let mut v_bytes = vec![0_u8; total_seq * kv_width * 2];
+        dev.read_buffer_bytes(key_cache_buf, &mut k_bytes)?;
+        dev.read_buffer_bytes(val_cache_buf, &mut v_bytes)?;
+        let unpack = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half_to_float(u16::from_le_bytes(*c)))
+                .collect()
+        };
+        let k_ref = unpack(&k_bytes);
+        let v_ref = unpack(&v_bytes);
+
+        let mut o_pre = vec![0.0_f32; q_prefill.len()];
+        let mut o_dec = vec![0.0_f32; q_decode.len()];
+        dev.read_buffer_f32(o_pre_buf, &mut o_pre)?;
+        dev.read_buffer_f32(o_dec_buf, &mut o_dec)?;
+
+        let mut max_pre_diff = 0.0_f32;
+        let mut max_dec_diff = 0.0_f32;
+        for qi in 0..query_len {
+            let valid = (past_len + qi + 1).min(total_seq);
+            for h in 0..num_heads {
+                let kvh = h / 6;
+                let q_off = qi * q_width + h * head_dim;
+                let mut scores = vec![0.0_f32; valid];
+                let mut m = f32::NEG_INFINITY;
+                for (tk, score_slot) in scores.iter_mut().enumerate() {
+                    let k_off = tk * kv_width + kvh * head_dim;
+                    let mut dot = 0.0_f32;
+                    for d in 0..head_dim {
+                        dot = f32::mul_add(q_prefill[q_off + d], k_ref[k_off + d], dot);
+                    }
+                    let s = dot * scale;
+                    *score_slot = s;
+                    m = m.max(s);
+                }
+                let mut denom = 0.0_f32;
+                for s in &mut scores {
+                    *s = (*s - m).exp();
+                    denom += *s;
+                }
+                for d in 0..head_dim {
+                    let mut acc = 0.0_f32;
+                    for (tk, &p) in scores.iter().enumerate() {
+                        acc = f32::mul_add(p, v_ref[tk * kv_width + kvh * head_dim + d], acc);
+                    }
+                    let expected = acc / denom;
+                    let actual_pre = o_pre[q_off + d];
+                    max_pre_diff = max_pre_diff.max((actual_pre - expected).abs());
+                    if qi + 1 == query_len {
+                        let actual_dec = o_dec[h * head_dim + d];
+                        max_dec_diff = max_dec_diff.max((actual_dec - expected).abs());
+                    }
+                }
+            }
+        }
+        assert!(
+            max_pre_diff <= 1e-4 && max_dec_diff <= 1e-4,
+            "Flash GQA-6 max_pre_diff={max_pre_diff}, max_dec_diff={max_dec_diff}"
         );
         Ok(())
     }

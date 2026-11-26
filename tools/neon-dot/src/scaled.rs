@@ -10,6 +10,7 @@
 /// Byte planes follow two 64-column halves, each with four 16-byte digit
 /// planes. `sum` is the sum of all signed bytes used for the unsigned-code
 /// correction. The runtime retains its existing 136-byte block layout.
+#[repr(C)]
 pub struct Pq2Activation {
     /// Original `Q8_K` scale, shared by both halves of its quantizer block.
     pub scale: f32,
@@ -18,6 +19,11 @@ pub struct Pq2Activation {
     /// Exact signed-byte sum subtracted from each unsigned-code dot.
     pub sum: i32,
 }
+
+const _: () = assert!(size_of::<Pq2Activation>() <= 136);
+const _: () = assert!(core::mem::offset_of!(Pq2Activation, scale) == 0);
+const _: () = assert!(core::mem::offset_of!(Pq2Activation, values) == 4);
+const _: () = assert!(core::mem::offset_of!(Pq2Activation, sum) == 132);
 
 /// One 32-element quantized `Q8_0` activation group with its original finite scale.
 #[derive(Clone, Copy, Debug)]

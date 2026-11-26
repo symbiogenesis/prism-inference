@@ -8,8 +8,7 @@ use core::arch::aarch64::{
     vcltq_u8, vcombine_s8, vcombine_s32, vcombine_u8, vdotq_s32, vdupq_n_s32, vdupq_n_u8,
     vget_high_s8, vget_high_s32, vget_low_s8, vget_low_s32, vld1_u8, vld1q_s8, vld1q_s32, vld1q_u8,
     vmulq_u8, vnegq_s32, vpaddlq_s8, vpaddlq_s16, vreinterpret_u8_u16, vreinterpretq_s8_u8,
-    vshrq_n_u8, vst1q_s8, vst1q_s32, vsubq_s8, vsubq_s32, vuzp1q_s8, vuzp1q_s32, vuzp2q_s8,
-    vuzp2q_s32,
+    vshrq_n_u8, vst1q_s8, vst1q_s32, vsubq_s8, vsubq_s32, vuzp1q_s8, vuzp2q_s8,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -396,7 +395,7 @@ fn dot_ptq1_block_groups_dotprod(packed: &[u8; 28], activations: [&[i8; 32]; 4])
     let g2 = sdot32_vec(t4, t5, load_s8x16(&a2[0]), load_s8x16(&a2[1]));
     let g3 = sdot32_vec(t6, t7, load_s8x16(&a3[0]), load_s8x16(&a3[1]));
     let mut out = [0_i32; 4];
-    store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out);
+    store_s32x4(reduce4_s32x4_addp(g0, g1, g2, g3), &mut out);
     out
 }
 
@@ -449,7 +448,7 @@ fn dot_ptq1_rows_groups_dotprod<const ROWS: usize>(
         let g1 = sdot32_vec(t2, t3, act_pairs[1].0, act_pairs[1].1);
         let g2 = sdot32_vec(t4, t5, act_pairs[2].0, act_pairs[2].1);
         let g3 = sdot32_vec(t6, t7, act_pairs[3].0, act_pairs[3].1);
-        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[row]);
+        store_s32x4(reduce4_s32x4_addp(g0, g1, g2, g3), &mut out[row]);
     }
     out
 }
@@ -529,7 +528,7 @@ fn dot_ptq1_four_rows_groups_dotprod(
         let g1 = sdot32_vec(t2, t3, act10, act11);
         let g2 = sdot32_vec(t4, t5, act20, act21);
         let g3 = sdot32_vec(t6, t7, act30, act31);
-        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[row]);
+        store_s32x4(reduce4_s32x4_addp(g0, g1, g2, g3), &mut out[row]);
     }
     out
 }
@@ -585,7 +584,7 @@ fn dot_ptq1_eight_rows_groups_dotprod(
         let g1 = sdot32_vec(t2, t3, act10, act11);
         let g2 = sdot32_vec(t4, t5, act20, act21);
         let g3 = sdot32_vec(t6, t7, act30, act31);
-        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[row]);
+        store_s32x4(reduce4_s32x4_addp(g0, g1, g2, g3), &mut out[row]);
     }
     out
 }
@@ -720,11 +719,10 @@ fn dot_pq2_consumption_dotprod(packed: &[u8; 32], planes: &[i8; 128], activation
 }
 
 #[inline]
-#[target_feature(enable = "neon,dotprod")]
-fn reduce4_s32x4(v0: int32x4_t, v1: int32x4_t, v2: int32x4_t, v3: int32x4_t) -> int32x4_t {
-    let p01 = vaddq_s32(vuzp1q_s32(v0, v1), vuzp2q_s32(v0, v1));
-    let p23 = vaddq_s32(vuzp1q_s32(v2, v3), vuzp2q_s32(v2, v3));
-    vaddq_s32(vuzp1q_s32(p01, p23), vuzp2q_s32(p01, p23))
+#[target_feature(enable = "neon")]
+fn reduce4_s32x4_addp(v0: int32x4_t, v1: int32x4_t, v2: int32x4_t, v3: int32x4_t) -> int32x4_t {
+    use core::arch::aarch64::vpaddq_s32;
+    vpaddq_s32(vpaddq_s32(v0, v1), vpaddq_s32(v2, v3))
 }
 
 #[target_feature(enable = "neon,dotprod")]
@@ -745,7 +743,7 @@ fn dot_pq2_four_consumption_dotprod(
             acc[row] = pq2_half_unsigned_sdot(acc[row], load_u8x16(bytes), p0, p1, p2, p3);
         }
     }
-    let reduced = reduce4_s32x4(acc[0], acc[1], acc[2], acc[3]);
+    let reduced = reduce4_s32x4_addp(acc[0], acc[1], acc[2], acc[3]);
     let mut out = [0_i32; 4];
     store_s32x4(reduced, &mut out);
     out.map(|v| v - activation_sum)
@@ -806,8 +804,8 @@ fn dot_pq2_eight_consumption_dotprod(
         }
     }
     let sum_vec = vdupq_n_s32(activation_sum);
-    let reduced_lo = vsubq_s32(reduce4_s32x4(acc[0], acc[1], acc[2], acc[3]), sum_vec);
-    let reduced_hi = vsubq_s32(reduce4_s32x4(acc[4], acc[5], acc[6], acc[7]), sum_vec);
+    let reduced_lo = vsubq_s32(reduce4_s32x4_addp(acc[0], acc[1], acc[2], acc[3]), sum_vec);
+    let reduced_hi = vsubq_s32(reduce4_s32x4_addp(acc[4], acc[5], acc[6], acc[7]), sum_vec);
     let mut out_lo = [0_i32; 4];
     let mut out_hi = [0_i32; 4];
     store_s32x4(reduced_lo, &mut out_lo);
@@ -817,123 +815,759 @@ fn dot_pq2_eight_consumption_dotprod(
     ]
 }
 
-/// All extents and activation scales were checked by the safe parent boundary.
+macro_rules! pq2_scale_accum_asm {
+    ($sum:literal, $scale:literal, $dot:literal, fused) => {
+        concat!("fmla ", $sum, ".4s, ", $scale, ".4s, ", $dot, ".4s\n")
+    };
+    ($sum:literal, $scale:literal, $dot:literal, nonfused) => {
+        concat!(
+            "fmul ", $dot, ".4s, ", $scale, ".4s, ", $dot, ".4s\n", "fadd ", $sum, ".4s, ", $sum,
+            ".4s, ", $dot, ".4s\n",
+        )
+    };
+}
+
+macro_rules! pq2_load_act_asm {
+    () => {
+        concat!(
+            "ldr s6, [{act}], #4\n",
+            "ldp q8, q9, [{act}]\n",
+            "ldp q10, q11, [{act}, #32]\n",
+            "ldp q12, q13, [{act}, #64]\n",
+            "ldp q14, q15, [{act}, #96]\n",
+            "ldr s7, [{act}, #128]\n",
+            "add {act}, {act}, #132\n",
+        )
+    };
+}
+
+macro_rules! pq2_row_sdot_asm {
+    ($p:literal, $acc:literal) => {
+        concat!(
+            "ldp q24, q25, [{",
+            $p,
+            "}], #32\n",
+            "movi ",
+            $acc,
+            ".2d, #0\n",
+            "and v26.16b, v24.16b, v5.16b\n",
+            "ushr v27.16b, v24.16b, #2\n",
+            "ushr v28.16b, v24.16b, #4\n",
+            "ushr v29.16b, v24.16b, #6\n",
+            "and v27.16b, v27.16b, v5.16b\n",
+            "and v28.16b, v28.16b, v5.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v26.16b, v8.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v27.16b, v9.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v28.16b, v10.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v29.16b, v11.16b\n",
+            "and v26.16b, v25.16b, v5.16b\n",
+            "ushr v27.16b, v25.16b, #2\n",
+            "ushr v28.16b, v25.16b, #4\n",
+            "ushr v29.16b, v25.16b, #6\n",
+            "and v27.16b, v27.16b, v5.16b\n",
+            "and v28.16b, v28.16b, v5.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v26.16b, v12.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v27.16b, v13.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v28.16b, v14.16b\n",
+            "sdot ",
+            $acc,
+            ".4s, v29.16b, v15.16b\n",
+        )
+    };
+}
+
+macro_rules! pq2_octet_block_asm {
+    (
+        $p0:literal,
+        $p1:literal,
+        $p2:literal,
+        $p3:literal,
+        $p4:literal,
+        $p5:literal,
+        $p6:literal,
+        $p7:literal,
+        $sum0:literal,
+        $sum1:literal,
+        $fused:ident
+    ) => {
+        concat!(
+            "ldrh {t0:w}, [{",
+            $p0,
+            "}], #2\n",
+            "ldrh {t1:w}, [{",
+            $p1,
+            "}], #2\n",
+            "fmov s30, {t0:w}\n",
+            "ldrh {t0:w}, [{",
+            $p2,
+            "}], #2\n",
+            "ins v30.h[1], {t1:w}\n",
+            "ldrh {t1:w}, [{",
+            $p3,
+            "}], #2\n",
+            "ins v30.h[2], {t0:w}\n",
+            "ldrh {t0:w}, [{",
+            $p4,
+            "}], #2\n",
+            "ins v30.h[3], {t1:w}\n",
+            "ldrh {t1:w}, [{",
+            $p5,
+            "}], #2\n",
+            "ins v30.h[4], {t0:w}\n",
+            "ldrh {t0:w}, [{",
+            $p6,
+            "}], #2\n",
+            "ins v30.h[5], {t1:w}\n",
+            "ldrh {t1:w}, [{",
+            $p7,
+            "}], #2\n",
+            "ins v30.h[6], {t0:w}\n",
+            "ins v30.h[7], {t1:w}\n",
+            "mov v31.16b, v30.16b\n",
+            "bic v31.8h, #0x80, lsl #8\n",
+            "umax v4.8h, v4.8h, v31.8h\n",
+            pq2_row_sdot_asm!($p0, "v16"),
+            pq2_row_sdot_asm!($p1, "v17"),
+            pq2_row_sdot_asm!($p2, "v18"),
+            pq2_row_sdot_asm!($p3, "v19"),
+            pq2_row_sdot_asm!($p4, "v20"),
+            pq2_row_sdot_asm!($p5, "v21"),
+            pq2_row_sdot_asm!($p6, "v22"),
+            pq2_row_sdot_asm!($p7, "v23"),
+            "addp v16.4s, v16.4s, v17.4s\n",
+            "addp v18.4s, v18.4s, v19.4s\n",
+            "addp v16.4s, v16.4s, v18.4s\n",
+            "sub v16.4s, v16.4s, v7.4s\n",
+            "scvtf v16.4s, v16.4s\n",
+            "fcvtl v31.4s, v30.4h\n",
+            "fmul v31.4s, v31.4s, v6.s[0]\n",
+            pq2_scale_accum_asm!($sum0, "v31", "v16", $fused),
+            "addp v20.4s, v20.4s, v21.4s\n",
+            "addp v22.4s, v22.4s, v23.4s\n",
+            "addp v20.4s, v20.4s, v22.4s\n",
+            "sub v20.4s, v20.4s, v7.4s\n",
+            "scvtf v20.4s, v20.4s\n",
+            "fcvtl2 v30.4s, v30.8h\n",
+            "fmul v30.4s, v30.4s, v6.s[0]\n",
+            pq2_scale_accum_asm!($sum1, "v30", "v20", $fused),
+        )
+    };
+}
+
+macro_rules! pq2_1row_block_asm {
+    (fused) => {
+        concat!(
+            "ldrh {t0:w}, [{p0}], #2\n",
+            "fmov s30, {t0:w}\n",
+            "mov v31.8b, v30.8b\n",
+            "bic v31.4h, #0x80, lsl #8\n",
+            "umax v4.4h, v4.4h, v31.4h\n",
+            pq2_load_act_asm!(),
+            pq2_row_sdot_asm!("p0", "v16"),
+            "addv s16, v16.4s\n",
+            "sub v16.2s, v16.2s, v7.2s\n",
+            "scvtf s16, s16\n",
+            "fcvt s30, h30\n",
+            "fmul s30, s30, s6\n",
+            "fmadd s0, s30, s16, s0\n",
+        )
+    };
+    (nonfused) => {
+        concat!(
+            "ldrh {t0:w}, [{p0}], #2\n",
+            "fmov s30, {t0:w}\n",
+            "mov v31.8b, v30.8b\n",
+            "bic v31.4h, #0x80, lsl #8\n",
+            "umax v4.4h, v4.4h, v31.4h\n",
+            pq2_load_act_asm!(),
+            pq2_row_sdot_asm!("p0", "v16"),
+            "addv s16, v16.4s\n",
+            "sub v16.2s, v16.2s, v7.2s\n",
+            "scvtf s16, s16\n",
+            "fcvt s30, h30\n",
+            "fmul s30, s30, s6\n",
+            "fmul s16, s30, s16\n",
+            "fadd s0, s0, s16\n",
+        )
+    };
+}
+
+macro_rules! pq2_4rows_block_asm {
+    ($fused:ident) => {
+        concat!(
+            "ldrh {t0:w}, [{p0}], #2\n",
+            "ldrh {t1:w}, [{p1}], #2\n",
+            "fmov s30, {t0:w}\n",
+            "ldrh {t0:w}, [{p2}], #2\n",
+            "ins v30.h[1], {t1:w}\n",
+            "ldrh {t1:w}, [{p3}], #2\n",
+            "ins v30.h[2], {t0:w}\n",
+            "ins v30.h[3], {t1:w}\n",
+            "mov v31.8b, v30.8b\n",
+            "bic v31.4h, #0x80, lsl #8\n",
+            "umax v4.4h, v4.4h, v31.4h\n",
+            pq2_load_act_asm!(),
+            "dup v7.4s, v7.s[0]\n",
+            pq2_row_sdot_asm!("p0", "v16"),
+            pq2_row_sdot_asm!("p1", "v17"),
+            pq2_row_sdot_asm!("p2", "v18"),
+            pq2_row_sdot_asm!("p3", "v19"),
+            "addp v16.4s, v16.4s, v17.4s\n",
+            "addp v18.4s, v18.4s, v19.4s\n",
+            "addp v16.4s, v16.4s, v18.4s\n",
+            "sub v16.4s, v16.4s, v7.4s\n",
+            "scvtf v16.4s, v16.4s\n",
+            "fcvtl v30.4s, v30.4h\n",
+            "fmul v30.4s, v30.4s, v6.s[0]\n",
+            pq2_scale_accum_asm!("v0", "v30", "v16", $fused),
+        )
+    };
+}
+
+macro_rules! pq2_8rows_block_asm {
+    ($fused:ident) => {
+        concat!(
+            pq2_load_act_asm!(),
+            "dup v7.4s, v7.s[0]\n",
+            pq2_octet_block_asm!(
+                "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "v0", "v1", $fused
+            ),
+        )
+    };
+}
+
+macro_rules! pq2_16rows_block_asm {
+    ($fused:ident) => {
+        concat!(
+            pq2_load_act_asm!(),
+            "dup v7.4s, v7.s[0]\n",
+            pq2_octet_block_asm!(
+                "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "v0", "v1", $fused
+            ),
+            pq2_octet_block_asm!(
+                "p8", "p9", "p10", "p11", "p12", "p13", "p14", "p15", "v2", "v3", $fused
+            ),
+        )
+    };
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn pq2_scaled_1row_asm<const FUSED: bool>(
+    row: &[u8],
+    activation: &[super::Pq2Activation],
+) -> Option<[f32; 1]> {
+    use core::arch::aarch64::{vdupq_n_f32, vgetq_lane_f32};
+    let block_count = activation.len();
+    if block_count == 0 || row.len() != block_count * 34 {
+        return None;
+    }
+    let mut sum0 = vdupq_n_f32(0.0);
+    let p0 = row.as_ptr();
+    let act = activation.as_ptr();
+    let cnt = block_count;
+    let ok: usize;
+    macro_rules! run_1row_asm {
+        ($fused:ident) => {
+            // SAFETY: Caller verified `row` covers `block_count * 34` bytes and
+            // `activation` covers `block_count` `Pq2Activation` elements.
+            unsafe {
+                core::arch::asm!(
+                    "movi v4.2d, #0",
+                    "movi v5.16b, #3",
+                    "tst {cnt}, #1",
+                    "b.eq 1f",
+                    pq2_1row_block_asm!($fused),
+                    "sub {cnt}, {cnt}, #1",
+                    "cbz {cnt}, 2f",
+                    "1:",
+                    "prfm pldl1keep, [{p0}, #136]",
+                    "prfm pldl1keep, [{act}, #272]",
+                    "prfm pldl1keep, [{act}, #336]",
+                    pq2_1row_block_asm!($fused),
+                    pq2_1row_block_asm!($fused),
+                    "subs {cnt}, {cnt}, #2",
+                    "b.ne 1b",
+                    "2:",
+                    "umaxv h28, v4.4h",
+                    "fmov {t0:w}, s28",
+                    "lsr {t0:w}, {t0:w}, #10",
+                    "cmp {t0:w}, #30",
+                    "cset {ok}, ls",
+                    p0 = inout(reg) p0 => _,
+                    act = inout(reg) act => _,
+                    cnt = inout(reg) cnt => _,
+                    t0 = out(reg) _,
+                    ok = out(reg) ok,
+                    inout("v0") sum0,
+                    out("v4") _,
+                    out("v5") _,
+                    out("v6") _,
+                    out("v7") _,
+                    out("v8") _,
+                    out("v9") _,
+                    out("v10") _,
+                    out("v11") _,
+                    out("v12") _,
+                    out("v13") _,
+                    out("v14") _,
+                    out("v15") _,
+                    out("v16") _,
+                    out("v24") _,
+                    out("v25") _,
+                    out("v26") _,
+                    out("v27") _,
+                    out("v28") _,
+                    out("v29") _,
+                    out("v30") _,
+                    out("v31") _,
+                    options(nostack, readonly),
+                );
+            }
+        };
+    }
+    if FUSED {
+        run_1row_asm!(fused);
+    } else {
+        run_1row_asm!(nonfused);
+    }
+    if ok == 0 {
+        return None;
+    }
+    let out = vgetq_lane_f32::<0>(sum0);
+    out.is_finite().then_some([out])
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn pq2_scaled_4rows_asm<const FUSED: bool>(
+    rows: [&[u8]; 4],
+    activation: &[super::Pq2Activation],
+) -> Option<[f32; 4]> {
+    use core::arch::aarch64::vdupq_n_f32;
+    let block_count = activation.len();
+    let expected = block_count.checked_mul(34)?;
+    if block_count == 0 || rows.iter().any(|r| r.len() != expected) {
+        return None;
+    }
+    let mut sum0 = vdupq_n_f32(0.0);
+    let p0 = rows[0].as_ptr();
+    let p1 = rows[1].as_ptr();
+    let p2 = rows[2].as_ptr();
+    let p3 = rows[3].as_ptr();
+    let act = activation.as_ptr();
+    let cnt = block_count;
+    let ok: usize;
+    macro_rules! run_4rows_asm {
+        ($fused:ident) => {
+            // SAFETY: Caller verified every row covers `block_count * 34` bytes and
+            // `activation` covers `block_count` `Pq2Activation` elements.
+            unsafe {
+                core::arch::asm!(
+                    "movi v4.2d, #0",
+                    "movi v5.16b, #3",
+                    "tst {cnt}, #1",
+                    "b.eq 1f",
+                    pq2_4rows_block_asm!($fused),
+                    "sub {cnt}, {cnt}, #1",
+                    "cbz {cnt}, 2f",
+                    "1:",
+                    "prfm pldl1keep, [{p0}, #136]",
+                    "prfm pldl1keep, [{p1}, #136]",
+                    "prfm pldl1keep, [{p2}, #136]",
+                    "prfm pldl1keep, [{p3}, #136]",
+                    "prfm pldl1keep, [{act}, #272]",
+                    "prfm pldl1keep, [{act}, #336]",
+                    pq2_4rows_block_asm!($fused),
+                    pq2_4rows_block_asm!($fused),
+                    "subs {cnt}, {cnt}, #2",
+                    "b.ne 1b",
+                    "2:",
+                    "umaxv h28, v4.4h",
+                    "fmov {t0:w}, s28",
+                    "lsr {t0:w}, {t0:w}, #10",
+                    "cmp {t0:w}, #30",
+                    "cset {ok}, ls",
+                    p0 = inout(reg) p0 => _,
+                    p1 = inout(reg) p1 => _,
+                    p2 = inout(reg) p2 => _,
+                    p3 = inout(reg) p3 => _,
+                    act = inout(reg) act => _,
+                    cnt = inout(reg) cnt => _,
+                    t0 = out(reg) _,
+                    t1 = out(reg) _,
+                    ok = out(reg) ok,
+                    inout("v0") sum0,
+                    out("v4") _,
+                    out("v5") _,
+                    out("v6") _,
+                    out("v7") _,
+                    out("v8") _,
+                    out("v9") _,
+                    out("v10") _,
+                    out("v11") _,
+                    out("v12") _,
+                    out("v13") _,
+                    out("v14") _,
+                    out("v15") _,
+                    out("v16") _,
+                    out("v17") _,
+                    out("v18") _,
+                    out("v19") _,
+                    out("v24") _,
+                    out("v25") _,
+                    out("v26") _,
+                    out("v27") _,
+                    out("v28") _,
+                    out("v29") _,
+                    out("v30") _,
+                    out("v31") _,
+                    options(nostack, readonly),
+                );
+            }
+        };
+    }
+    if FUSED {
+        run_4rows_asm!(fused);
+    } else {
+        run_4rows_asm!(nonfused);
+    }
+    if ok == 0 {
+        return None;
+    }
+    let mut output = [0.0_f32; 4];
+    store_f32x4_neon(sum0, &mut output);
+    output.iter().all(|v| v.is_finite()).then_some(output)
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "Keeps octet scale validation and register-resident accumulation together."
+    reason = "Zero-spill 8-row PQ2 inline-asm decode kernel keeps activation.values in v8..v15 across 2x K-unroll."
 )]
+#[target_feature(enable = "neon,dotprod")]
+fn pq2_scaled_8rows_asm<const FUSED: bool>(
+    rows: [&[u8]; 8],
+    activation: &[super::Pq2Activation],
+) -> Option<[f32; 8]> {
+    use core::arch::aarch64::vdupq_n_f32;
+    let block_count = activation.len();
+    let expected = block_count.checked_mul(34)?;
+    if block_count == 0 || rows.iter().any(|r| r.len() != expected) {
+        return None;
+    }
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let p0 = rows[0].as_ptr();
+    let p1 = rows[1].as_ptr();
+    let p2 = rows[2].as_ptr();
+    let p3 = rows[3].as_ptr();
+    let p4 = rows[4].as_ptr();
+    let p5 = rows[5].as_ptr();
+    let p6 = rows[6].as_ptr();
+    let p7 = rows[7].as_ptr();
+    let act = activation.as_ptr();
+    let cnt = block_count;
+    let ok: usize;
+    macro_rules! run_8rows_asm {
+        ($fused:ident) => {
+            // SAFETY: Caller verified every row covers `block_count * 34` bytes and
+            // `activation` covers `block_count` `Pq2Activation` elements.
+            unsafe {
+                core::arch::asm!(
+                    "movi v4.2d, #0",
+                    "movi v5.16b, #3",
+                    "tst {cnt}, #1",
+                    "b.eq 1f",
+                    pq2_8rows_block_asm!($fused),
+                    "sub {cnt}, {cnt}, #1",
+                    "cbz {cnt}, 2f",
+                    "1:",
+                    "prfm pldl1keep, [{p0}, #136]",
+                    "prfm pldl1keep, [{p1}, #136]",
+                    "prfm pldl1keep, [{p2}, #136]",
+                    "prfm pldl1keep, [{p3}, #136]",
+                    "prfm pldl1keep, [{p4}, #136]",
+                    "prfm pldl1keep, [{p5}, #136]",
+                    "prfm pldl1keep, [{p6}, #136]",
+                    "prfm pldl1keep, [{p7}, #136]",
+                    "prfm pldl1keep, [{act}, #272]",
+                    "prfm pldl1keep, [{act}, #336]",
+                    pq2_8rows_block_asm!($fused),
+                    pq2_8rows_block_asm!($fused),
+                    "subs {cnt}, {cnt}, #2",
+                    "b.ne 1b",
+                    "2:",
+                    "umaxv h28, v4.8h",
+                    "fmov {t0:w}, s28",
+                    "lsr {t0:w}, {t0:w}, #10",
+                    "cmp {t0:w}, #30",
+                    "cset {ok}, ls",
+                    p0 = inout(reg) p0 => _,
+                    p1 = inout(reg) p1 => _,
+                    p2 = inout(reg) p2 => _,
+                    p3 = inout(reg) p3 => _,
+                    p4 = inout(reg) p4 => _,
+                    p5 = inout(reg) p5 => _,
+                    p6 = inout(reg) p6 => _,
+                    p7 = inout(reg) p7 => _,
+                    act = inout(reg) act => _,
+                    cnt = inout(reg) cnt => _,
+                    t0 = out(reg) _,
+                    t1 = out(reg) _,
+                    ok = out(reg) ok,
+                    inout("v0") sum0,
+                    inout("v1") sum1,
+                    out("v4") _,
+                    out("v5") _,
+                    out("v6") _,
+                    out("v7") _,
+                    out("v8") _,
+                    out("v9") _,
+                    out("v10") _,
+                    out("v11") _,
+                    out("v12") _,
+                    out("v13") _,
+                    out("v14") _,
+                    out("v15") _,
+                    out("v16") _,
+                    out("v17") _,
+                    out("v18") _,
+                    out("v19") _,
+                    out("v20") _,
+                    out("v21") _,
+                    out("v22") _,
+                    out("v23") _,
+                    out("v24") _,
+                    out("v25") _,
+                    out("v26") _,
+                    out("v27") _,
+                    out("v28") _,
+                    out("v29") _,
+                    out("v30") _,
+                    out("v31") _,
+                    options(nostack, readonly),
+                );
+            }
+        };
+    }
+    if FUSED {
+        run_8rows_asm!(fused);
+    } else {
+        run_8rows_asm!(nonfused);
+    }
+    if ok == 0 {
+        return None;
+    }
+    let mut lo = [0.0_f32; 4];
+    let mut hi = [0.0_f32; 4];
+    store_f32x4_neon(sum0, &mut lo);
+    store_f32x4_neon(sum1, &mut hi);
+    let output = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
+    output.iter().all(|v| v.is_finite()).then_some(output)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Zero-spill 16-row PQ2 inline-asm decode kernel keeps activation.values in v8..v15 across both octets and 2x K-unroll."
+)]
+#[target_feature(enable = "neon,dotprod")]
+fn pq2_scaled_16rows_asm<const FUSED: bool>(
+    rows: [&[u8]; 16],
+    activation: &[super::Pq2Activation],
+) -> Option<[f32; 16]> {
+    use core::arch::aarch64::vdupq_n_f32;
+    let block_count = activation.len();
+    let expected = block_count.checked_mul(34)?;
+    if block_count == 0 || rows.iter().any(|r| r.len() != expected) {
+        return None;
+    }
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut sum2 = vdupq_n_f32(0.0);
+    let mut sum3 = vdupq_n_f32(0.0);
+    let p0 = rows[0].as_ptr();
+    let p1 = rows[1].as_ptr();
+    let p2 = rows[2].as_ptr();
+    let p3 = rows[3].as_ptr();
+    let p4 = rows[4].as_ptr();
+    let p5 = rows[5].as_ptr();
+    let p6 = rows[6].as_ptr();
+    let p7 = rows[7].as_ptr();
+    let p8 = rows[8].as_ptr();
+    let p9 = rows[9].as_ptr();
+    let p10 = rows[10].as_ptr();
+    let p11 = rows[11].as_ptr();
+    let p12 = rows[12].as_ptr();
+    let p13 = rows[13].as_ptr();
+    let p14 = rows[14].as_ptr();
+    let p15 = rows[15].as_ptr();
+    let act = activation.as_ptr();
+    let cnt = block_count;
+    let ok: usize;
+    macro_rules! run_16rows_asm {
+        ($fused:ident) => {
+            // SAFETY: Caller verified every row covers `block_count * 34` bytes and
+            // `activation` covers `block_count` `Pq2Activation` elements.
+            unsafe {
+                core::arch::asm!(
+                    "movi v4.2d, #0",
+                    "movi v5.16b, #3",
+                    "tst {cnt}, #1",
+                    "b.eq 1f",
+                    pq2_16rows_block_asm!($fused),
+                    "sub {cnt}, {cnt}, #1",
+                    "cbz {cnt}, 2f",
+                    "1:",
+                    "prfm pldl1keep, [{p0}, #136]",
+                    "prfm pldl1keep, [{p1}, #136]",
+                    "prfm pldl1keep, [{p2}, #136]",
+                    "prfm pldl1keep, [{p3}, #136]",
+                    "prfm pldl1keep, [{p4}, #136]",
+                    "prfm pldl1keep, [{p5}, #136]",
+                    "prfm pldl1keep, [{p6}, #136]",
+                    "prfm pldl1keep, [{p7}, #136]",
+                    "prfm pldl1keep, [{p8}, #136]",
+                    "prfm pldl1keep, [{p9}, #136]",
+                    "prfm pldl1keep, [{p10}, #136]",
+                    "prfm pldl1keep, [{p11}, #136]",
+                    "prfm pldl1keep, [{p12}, #136]",
+                    "prfm pldl1keep, [{p13}, #136]",
+                    "prfm pldl1keep, [{p14}, #136]",
+                    "prfm pldl1keep, [{p15}, #136]",
+                    "prfm pldl1keep, [{act}, #272]",
+                    "prfm pldl1keep, [{act}, #336]",
+                    pq2_16rows_block_asm!($fused),
+                    pq2_16rows_block_asm!($fused),
+                    "subs {cnt}, {cnt}, #2",
+                    "b.ne 1b",
+                    "2:",
+                    "umaxv h28, v4.8h",
+                    "fmov {t0:w}, s28",
+                    "lsr {t0:w}, {t0:w}, #10",
+                    "cmp {t0:w}, #30",
+                    "cset {ok}, ls",
+                    p0 = inout(reg) p0 => _,
+                    p1 = inout(reg) p1 => _,
+                    p2 = inout(reg) p2 => _,
+                    p3 = inout(reg) p3 => _,
+                    p4 = inout(reg) p4 => _,
+                    p5 = inout(reg) p5 => _,
+                    p6 = inout(reg) p6 => _,
+                    p7 = inout(reg) p7 => _,
+                    p8 = inout(reg) p8 => _,
+                    p9 = inout(reg) p9 => _,
+                    p10 = inout(reg) p10 => _,
+                    p11 = inout(reg) p11 => _,
+                    p12 = inout(reg) p12 => _,
+                    p13 = inout(reg) p13 => _,
+                    p14 = inout(reg) p14 => _,
+                    p15 = inout(reg) p15 => _,
+                    act = inout(reg) act => _,
+                    cnt = inout(reg) cnt => _,
+                    t0 = out(reg) _,
+                    t1 = out(reg) _,
+                    ok = out(reg) ok,
+                    inout("v0") sum0,
+                    inout("v1") sum1,
+                    inout("v2") sum2,
+                    inout("v3") sum3,
+                    out("v4") _,
+                    out("v5") _,
+                    out("v6") _,
+                    out("v7") _,
+                    out("v8") _,
+                    out("v9") _,
+                    out("v10") _,
+                    out("v11") _,
+                    out("v12") _,
+                    out("v13") _,
+                    out("v14") _,
+                    out("v15") _,
+                    out("v16") _,
+                    out("v17") _,
+                    out("v18") _,
+                    out("v19") _,
+                    out("v20") _,
+                    out("v21") _,
+                    out("v22") _,
+                    out("v23") _,
+                    out("v24") _,
+                    out("v25") _,
+                    out("v26") _,
+                    out("v27") _,
+                    out("v28") _,
+                    out("v29") _,
+                    out("v30") _,
+                    out("v31") _,
+                    options(nostack, readonly),
+                );
+            }
+        };
+    }
+    if FUSED {
+        run_16rows_asm!(fused);
+    } else {
+        run_16rows_asm!(nonfused);
+    }
+    if ok == 0 {
+        return None;
+    }
+    let mut q0 = [0.0_f32; 4];
+    let mut q1 = [0.0_f32; 4];
+    let mut q2 = [0.0_f32; 4];
+    let mut q3 = [0.0_f32; 4];
+    store_f32x4_neon(sum0, &mut q0);
+    store_f32x4_neon(sum1, &mut q1);
+    store_f32x4_neon(sum2, &mut q2);
+    store_f32x4_neon(sum3, &mut q3);
+    let output = [
+        q0[0], q0[1], q0[2], q0[3], q1[0], q1[1], q1[2], q1[3], q2[0], q2[1], q2[2], q2[3], q3[0],
+        q3[1], q3[2], q3[3],
+    ];
+    output.iter().all(|v| v.is_finite()).then_some(output)
+}
+
+/// All extents and activation scales were checked by the safe parent boundary.
 #[target_feature(enable = "neon,dotprod")]
 fn pq2_scaled_rows<const ROWS: usize, const FUSED: bool>(
     rows: [&[u8]; ROWS],
     activation: &[super::Pq2Activation],
 ) -> Option<[f32; ROWS]> {
-    use core::arch::aarch64::{
-        vaddq_f32, vandq_u16, vcvt_f32_f16, vcvt_high_f32_f16, vcvtq_f32_s32, vdupq_n_f32,
-        vdupq_n_u16, vfmaq_f32, vget_low_f16, vld1q_u16, vmaxvq_u16, vmulq_f32,
-        vreinterpretq_f16_u16, vst1q_f32,
-    };
-    let quads = ROWS.div_ceil(4);
-    let octets = ROWS.div_ceil(8);
-    let block_count = activation.len();
-    let row_chunks: [&[[u8; 34]]; ROWS] = rows.map(|row| row.as_chunks::<34>().0);
-    let zero = vdupq_n_s32(0);
-    let zero_f = vdupq_n_f32(0.0);
-    let mask = vdupq_n_u8(3);
-    let mut sums = [zero_f; 4];
-    for (index, activation) in activation.iter().enumerate() {
-        if ROWS >= 8 {
-            prefetch_row_blocks(&row_chunks, index, block_count);
+    match ROWS {
+        1 => {
+            let r1: [&[u8]; 1] = rows.as_slice().try_into().ok()?;
+            let res = pq2_scaled_1row_asm::<FUSED>(r1[0], activation)?;
+            res.as_slice().try_into().ok()
         }
-        let blocks: [&[u8; 34]; ROWS] = std::array::from_fn(|row| &row_chunks[row][index]);
-        let mut raw_octets = [vdupq_n_u16(0); 2];
-        for (octet, dst) in raw_octets.iter_mut().take(octets).enumerate() {
-            let base = octet * 8;
-            let scales: [u16; 8] = std::array::from_fn(|lane| {
-                blocks
-                    .get(base + lane)
-                    .map_or(0, |block| u16::from_le_bytes([block[0], block[1]]))
-            });
-            // SAFETY: `scales` is an initialized eight-element array; NEON permits
-            // unaligned loads and the detected capability includes baseline NEON.
-            let raw = unsafe { vld1q_u16(scales.as_ptr()) };
-            if vmaxvq_u16(vandq_u16(raw, vdupq_n_u16(0x7fff))) >= 0x7c00 {
-                return None;
-            }
-            *dst = raw;
+        4 => {
+            let r4: [&[u8]; 4] = rows.as_slice().try_into().ok()?;
+            let res = pq2_scaled_4rows_asm::<FUSED>(r4, activation)?;
+            res.as_slice().try_into().ok()
         }
-        let act_scale = vdupq_n_f32(activation.scale);
-        let correction = vdupq_n_s32(activation.sum);
-        for (octet_idx, (sum, raw)) in sums
-            .as_chunks_mut::<2>()
-            .0
-            .iter_mut()
-            .zip(raw_octets)
-            .take(octets)
-            .enumerate()
-        {
-            let row_base = octet_idx * 8;
-            // Accumulate at most 8 rows per pass so 16-row calls fit comfortably in
-            // AArch64 NEON registers without spilling accumulators to stack.
-            let mut acc = [zero; 8];
-            for (half, values) in activation.values.as_chunks::<64>().0.iter().enumerate() {
-                let planes = values.as_chunks::<16>().0;
-                let p0 = load_s8x16(&planes[0]);
-                let p1 = load_s8x16(&planes[1]);
-                let p2 = load_s8x16(&planes[2]);
-                let p3 = load_s8x16(&planes[3]);
-                for (r, acc_slot) in acc.iter_mut().enumerate() {
-                    let row = row_base + r;
-                    if row >= ROWS {
-                        break;
-                    }
-                    let [_, _, ref packed @ ..] = *blocks[row];
-                    let bytes = &packed.as_chunks::<16>().0[half];
-                    *acc_slot = pq2_half_unsigned_sdot_masked(
-                        *acc_slot,
-                        load_u8x16(bytes),
-                        p0,
-                        p1,
-                        p2,
-                        p3,
-                        mask,
-                    );
-                }
-            }
-            let half = vreinterpretq_f16_u16(raw);
-            let scale_low = vmulq_f32(vcvt_f32_f16(vget_low_f16(half)), act_scale);
-            let scale_high = vmulq_f32(vcvt_high_f32_f16(half), act_scale);
-            for (sub, scale_vec) in [scale_low, scale_high].into_iter().enumerate() {
-                let quad = octet_idx * 2 + sub;
-                if quad >= quads {
-                    break;
-                }
-                let local_base = sub * 4;
-                let [a0, a1, a2, a3] = [
-                    acc[local_base],
-                    acc[local_base + 1],
-                    acc[local_base + 2],
-                    acc[local_base + 3],
-                ];
-                let dot = vcvtq_f32_s32(vsubq_s32(reduce4_s32x4(a0, a1, a2, a3), correction));
-                if FUSED {
-                    sum[sub] = vfmaq_f32(sum[sub], scale_vec, dot);
-                } else {
-                    sum[sub] = vaddq_f32(sum[sub], vmulq_f32(scale_vec, dot));
-                }
-            }
+        8 => {
+            let r8: [&[u8]; 8] = rows.as_slice().try_into().ok()?;
+            let res = pq2_scaled_8rows_asm::<FUSED>(r8, activation)?;
+            res.as_slice().try_into().ok()
         }
+        16 => {
+            let r16: [&[u8]; 16] = rows.as_slice().try_into().ok()?;
+            let res = pq2_scaled_16rows_asm::<FUSED>(r16, activation)?;
+            res.as_slice().try_into().ok()
+        }
+        _ => None,
     }
-    let mut quad_outputs = [[0.0_f32; 4]; 4];
-    for (dst, sum) in quad_outputs.iter_mut().zip(sums).take(quads) {
-        // SAFETY: `dst` is a unique valid four-element `f32` array; stores
-        // are unaligned-safe and occur only after complete row accumulation.
-        unsafe { vst1q_f32(dst.as_mut_ptr(), sum) };
-    }
-    let output: [f32; ROWS] = std::array::from_fn(|row| quad_outputs[row / 4][row % 4]);
-    output
-        .iter()
-        .all(|value| value.is_finite())
-        .then_some(output)
 }
 
 #[inline]
@@ -1251,7 +1885,7 @@ fn smmla_q8_0_4x4_dotprod(rows: [&[u8; 32]; 4], cols: [&[i8; 32]; 4]) -> [[i32; 
         let l1 = sdot32_vec(w0, w1, acts[1].0, acts[1].1);
         let l2 = sdot32_vec(w0, w1, acts[2].0, acts[2].1);
         let l3 = sdot32_vec(w0, w1, acts[3].0, acts[3].1);
-        store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut out[r]);
+        store_s32x4(reduce4_s32x4_addp(l0, l1, l2, l3), &mut out[r]);
     }
     out
 }
@@ -1426,7 +2060,7 @@ fn smmla_q8_0_8x4_dotprod(rows: [&[u8; 32]; 8], cols: [&[i8; 32]; 4]) -> [[i32; 
         let l1 = sdot32_vec(w0, w1, acts[1].0, acts[1].1);
         let l2 = sdot32_vec(w0, w1, acts[2].0, acts[2].1);
         let l3 = sdot32_vec(w0, w1, acts[3].0, acts[3].1);
-        store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut out[r]);
+        store_s32x4(reduce4_s32x4_addp(l0, l1, l2, l3), &mut out[r]);
     }
     out
 }
@@ -1565,7 +2199,7 @@ fn dot_pq2_four_rows_one_token_dotprod(
         }
     }
     let reduced = vsubq_s32(
-        reduce4_s32x4(acc[0], acc[1], acc[2], acc[3]),
+        reduce4_s32x4_addp(acc[0], acc[1], acc[2], acc[3]),
         vdupq_n_s32(activation_sum),
     );
     let mut out = [0_i32; 4];
@@ -1657,7 +2291,7 @@ fn dot_pq2_4x4_tile_dotprod(
     let mut out = [[0_i32; 4]; 4];
     for r in 0..4 {
         let reduced = vsubq_s32(
-            reduce4_s32x4(acc[r][0], acc[r][1], acc[r][2], acc[r][3]),
+            reduce4_s32x4_addp(acc[r][0], acc[r][1], acc[r][2], acc[r][3]),
             sums_vec,
         );
         store_s32x4(reduced, &mut out[r]);
@@ -1779,14 +2413,14 @@ fn dot_pq2_4x2_planes_dotprod(
     let mut tile23 = [0_i32; 4];
     store_s32x4(
         vsubq_s32(
-            reduce4_s32x4(acc[0][0], acc[0][1], acc[1][0], acc[1][1]),
+            reduce4_s32x4_addp(acc[0][0], acc[0][1], acc[1][0], acc[1][1]),
             sums_vec,
         ),
         &mut tile01,
     );
     store_s32x4(
         vsubq_s32(
-            reduce4_s32x4(acc[2][0], acc[2][1], acc[3][0], acc[3][1]),
+            reduce4_s32x4_addp(acc[2][0], acc[2][1], acc[3][0], acc[3][1]),
             sums_vec,
         ),
         &mut tile23,
@@ -2291,7 +2925,7 @@ fn dot_pq2_4x4_stream_dotprod(
     let mut out = [[0_i32; 4]; 4];
     for r in 0..4 {
         let reduced = vsubq_s32(
-            reduce4_s32x4(acc[r][0], acc[r][1], acc[r][2], acc[r][3]),
+            reduce4_s32x4_addp(acc[r][0], acc[r][1], acc[r][2], acc[r][3]),
             sums_vec,
         );
         store_s32x4(reduced, &mut out[r]);
@@ -2898,7 +3532,7 @@ fn dot_scaled_8x8_chunks_dotprod<const FUSED: bool>(
                     let act_scales = unsafe { vld1q_f32(scales_arr.as_ptr()) };
                     for r in 0..4 {
                         let reduced = vsubq_s32(
-                            reduce4_s32x4(acc[r][0], acc[r][1], acc[r][2], acc[r][3]),
+                            reduce4_s32x4_addp(acc[r][0], acc[r][1], acc[r][2], acc[r][3]),
                             sums_vec,
                         );
                         let row_quads = out_halves[row_half][r].as_chunks_mut::<4>().0;
@@ -3034,7 +3668,7 @@ fn pq2_4x_odd_scale_update<const FUSED: bool>(
     use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vmulq_f32};
     let d_odd = vmulq_f32(rs_vec, vdupq_n_f32(t_odd.scale));
     let reduced = vsubq_s32(
-        reduce4_s32x4(acc_odd[0], acc_odd[1], acc_odd[2], acc_odd[3]),
+        reduce4_s32x4_addp(acc_odd[0], acc_odd[1], acc_odd[2], acc_odd[3]),
         vdupq_n_s32(t_odd.sum),
     );
     let dots_odd = vcvtq_f32_s32(reduced);
@@ -3266,11 +3900,11 @@ fn dot_scaled_8x_1_dotprod<const FUSED: bool>(
         }
         let correction = vdupq_n_s32(act.sum);
         let dot_lo = vcvtq_f32_s32(vsubq_s32(
-            reduce4_s32x4(acc[0], acc[1], acc[2], acc[3]),
+            reduce4_s32x4_addp(acc[0], acc[1], acc[2], acc[3]),
             correction,
         ));
         let dot_hi = vcvtq_f32_s32(vsubq_s32(
-            reduce4_s32x4(acc[4], acc[5], acc[6], acc[7]),
+            reduce4_s32x4_addp(acc[4], acc[5], acc[6], acc[7]),
             correction,
         ));
         if FUSED {
@@ -3331,7 +3965,7 @@ fn pq2_4x_n_block_dotprod<const N: usize>(
         let v1 = acc[r].get(1).copied().unwrap_or(zero);
         let v2 = acc[r].get(2).copied().unwrap_or(zero);
         let v3 = acc[r].get(3).copied().unwrap_or(zero);
-        vsubq_s32(reduce4_s32x4(v0, v1, v2, v3), sums_vec)
+        vsubq_s32(reduce4_s32x4_addp(v0, v1, v2, v3), sums_vec)
     })
 }
 
@@ -3720,7 +4354,7 @@ fn dot_ptq1_4x4_groups_dotprod(
             let l2 = sdot32_vec(w0[r], w1[r], acts[2].0, acts[2].1);
             let l3 = sdot32_vec(w0[r], w1[r], acts[3].0, acts[3].1);
             let mut sums = [0_i32; 4];
-            store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut sums);
+            store_s32x4(reduce4_s32x4_addp(l0, l1, l2, l3), &mut sums);
             for t in 0..4 {
                 out[r][t][group] = sums[t];
             }
@@ -3802,7 +4436,7 @@ fn dot_ptq1_4x1_groups_dotprod(
             act30,
             act31,
         );
-        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[r]);
+        store_s32x4(reduce4_s32x4_addp(g0, g1, g2, g3), &mut out[r]);
     }
     out
 }
@@ -3880,7 +4514,7 @@ fn dot_ptq1_8x1_groups_dotprod(
             act30,
             act31,
         );
-        store_s32x4(reduce4_s32x4(g0, g1, g2, g3), &mut out[r]);
+        store_s32x4(reduce4_s32x4_addp(g0, g1, g2, g3), &mut out[r]);
     }
     out
 }
@@ -4012,7 +4646,7 @@ fn dot_ptq1_8x4_groups_dotprod(
             let l2 = sdot32_vec(w0, w1, acts[2].0, acts[2].1);
             let l3 = sdot32_vec(w0, w1, acts[3].0, acts[3].1);
             let mut sums = [0_i32; 4];
-            store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut sums);
+            store_s32x4(reduce4_s32x4_addp(l0, l1, l2, l3), &mut sums);
             for t in 0..4 {
                 out[r][t][group] = sums[t];
             }
@@ -4191,8 +4825,8 @@ fn dot_ptq1_8x8_groups_dotprod(
             let l7 = sdot32_vec(w0, w1, acts[7].0, acts[7].1);
             let mut sums_lo = [0_i32; 4];
             let mut sums_hi = [0_i32; 4];
-            store_s32x4(reduce4_s32x4(l0, l1, l2, l3), &mut sums_lo);
-            store_s32x4(reduce4_s32x4(l4, l5, l6, l7), &mut sums_hi);
+            store_s32x4(reduce4_s32x4_addp(l0, l1, l2, l3), &mut sums_lo);
+            store_s32x4(reduce4_s32x4_addp(l4, l5, l6, l7), &mut sums_hi);
             for t in 0..4 {
                 out[r][t][group] = sums_lo[t];
                 out[r][t + 4][group] = sums_hi[t];
@@ -6338,7 +6972,7 @@ fn ptq1_scaled_8x_pairs_source_i8mm<
                     let ao1 = load_s8x16(&ao_h[1]);
                     let s0 = sdot32_vec(t_r0[group * 2], t_r0[group * 2 + 1], ao0, ao1);
                     let s1 = sdot32_vec(t_r1[group * 2], t_r1[group * 2 + 1], ao0, ao1);
-                    let dots_01 = reduce4_s32x4(s0, s1, zero_s32, zero_s32);
+                    let dots_01 = reduce4_s32x4_addp(s0, s1, zero_s32, zero_s32);
                     dot_sum_odd = vaddq_f32(
                         dot_sum_odd,
                         vmulq_f32(vcvtq_f32_s32(dots_01), vdupq_n_f32(act_odd.scale())),
@@ -6433,7 +7067,7 @@ fn ptq1_scaled_8x_n_source_dotprod<const N_TOK: usize, A: super::Q8ActivationVie
                 } else {
                     zero_s32
                 };
-                let d_lo = vcvtq_f32_s32(reduce4_s32x4(l0, l1, l2, l3));
+                let d_lo = vcvtq_f32_s32(reduce4_s32x4_addp(l0, l1, l2, l3));
                 dot_sum_lo[r] = vaddq_f32(dot_sum_lo[r], vmulq_f32(d_lo, as_lo));
                 if N_TOK > 4 {
                     let l4 = sdot32_vec(w0, w1, acts[4].0, acts[4].1);
@@ -6452,7 +7086,7 @@ fn ptq1_scaled_8x_n_source_dotprod<const N_TOK: usize, A: super::Q8ActivationVie
                     } else {
                         zero_s32
                     };
-                    let d_hi = vcvtq_f32_s32(reduce4_s32x4(l4, l5, l6, l7));
+                    let d_hi = vcvtq_f32_s32(reduce4_s32x4_addp(l4, l5, l6, l7));
                     dot_sum_hi[r] = vaddq_f32(dot_sum_hi[r], vmulq_f32(d_hi, as_hi));
                 }
             }
@@ -6921,14 +7555,14 @@ fn ptq1_scaled_8x8_chunks_source_dotprod<const CHUNKS: usize, A: super::Q8Activa
                     let l1 = sdot32_vec(w0, w1, a_pairs[1].0, a_pairs[1].1);
                     let l2 = sdot32_vec(w0, w1, a_pairs[2].0, a_pairs[2].1);
                     let l3 = sdot32_vec(w0, w1, a_pairs[3].0, a_pairs[3].1);
-                    let d_lo = vcvtq_f32_s32(reduce4_s32x4(l0, l1, l2, l3));
+                    let d_lo = vcvtq_f32_s32(reduce4_s32x4_addp(l0, l1, l2, l3));
                     dot_sum_lo = vaddq_f32(dot_sum_lo, vmulq_f32(d_lo, as_lo));
 
                     let l4 = sdot32_vec(w0, w1, a_pairs[4].0, a_pairs[4].1);
                     let l5 = sdot32_vec(w0, w1, a_pairs[5].0, a_pairs[5].1);
                     let l6 = sdot32_vec(w0, w1, a_pairs[6].0, a_pairs[6].1);
                     let l7 = sdot32_vec(w0, w1, a_pairs[7].0, a_pairs[7].1);
-                    let d_hi = vcvtq_f32_s32(reduce4_s32x4(l4, l5, l6, l7));
+                    let d_hi = vcvtq_f32_s32(reduce4_s32x4_addp(l4, l5, l6, l7));
                     dot_sum_hi = vaddq_f32(dot_sum_hi, vmulq_f32(d_hi, as_hi));
                 }
                 let quads = sums[c][r].as_chunks_mut::<4>().0;
@@ -7260,7 +7894,7 @@ fn q8_0_4rows_sdot<const TOKENS: usize, A: super::Q8ActivationView>(
         let d1 = sdot32_vec(w1_0, w1_1, a0, a1);
         let d2 = sdot32_vec(w2_0, w2_1, a0, a1);
         let d3 = sdot32_vec(w3_0, w3_1, a0, a1);
-        let dots = vcvtq_f32_s32(reduce4_s32x4(d0, d1, d2, d3));
+        let dots = vcvtq_f32_s32(reduce4_s32x4_addp(d0, d1, d2, d3));
         let d = vmulq_f32(rs_vec, vdupq_n_f32(act.scale()));
         acc[t] = f32x4_scale_step::<false>(acc[t], d, dots);
     }
@@ -7331,13 +7965,6 @@ fn q8_0_scaled_8x_tokens_dotprod<A: super::Q8ActivationView>(
         8 => q8_0_scaled_8x_n_dotprod::<8, A>(rows, tokens, out),
         _ => None,
     }
-}
-
-#[inline]
-#[target_feature(enable = "neon,dotprod")]
-fn reduce4_s32x4_addp(v0: int32x4_t, v1: int32x4_t, v2: int32x4_t, v3: int32x4_t) -> int32x4_t {
-    use core::arch::aarch64::vpaddq_s32;
-    vpaddq_s32(vpaddq_s32(v0, v1), vpaddq_s32(v2, v3))
 }
 
 #[inline]
@@ -7829,7 +8456,7 @@ fn q8_0_scaled_8x8_chunks_dotprod<const CHUNKS: usize, A: super::Q8ActivationVie
                     let d1 = sdot32_vec(w_pairs[1].0, w_pairs[1].1, a0, a1);
                     let d2 = sdot32_vec(w_pairs[2].0, w_pairs[2].1, a0, a1);
                     let d3 = sdot32_vec(w_pairs[3].0, w_pairs[3].1, a0, a1);
-                    let dots = vcvtq_f32_s32(reduce4_s32x4(d0, d1, d2, d3));
+                    let dots = vcvtq_f32_s32(reduce4_s32x4_addp(d0, d1, d2, d3));
                     let d = vmulq_f32(rs_vec, vdupq_n_f32(act.scale()));
                     let cur = load_f32x4_neon(&acc_buf[c][row_half][t]);
                     let next = f32x4_scale_step::<false>(cur, d, dots);

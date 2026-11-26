@@ -30,7 +30,12 @@ pub(crate) struct ColHalfSchedule {
     pub(crate) mask1: u32,
 }
 
-pub(crate) fn build_schedule(bits: usize) -> [ColHalfSchedule; 32] {
+const U5_TO_I32: [i32; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31,
+];
+
+pub(crate) const fn build_schedule(bits: usize) -> [ColHalfSchedule; 32] {
     let empty = ColHalfSchedule {
         w0_q: 0,
         w0_rem: 0,
@@ -59,7 +64,7 @@ pub(crate) fn build_schedule(bits: usize) -> [ColHalfSchedule; 32] {
             } else {
                 ((w0_q + 1) & 7, 0)
             };
-            let o_i32 = i32::try_from(o).unwrap_or(0);
+            let o_i32 = U5_TO_I32[o];
             let shift0 = o_i32 - 16;
             let (shift1, mask1) = if o > 16 {
                 (o_i32 - 48, 0xffff_u32)
@@ -80,6 +85,21 @@ pub(crate) fn build_schedule(bits: usize) -> [ColHalfSchedule; 32] {
         c += 1;
     }
     out
+}
+
+pub(crate) const SCHEDULES: [[ColHalfSchedule; 32]; 6] = [
+    build_schedule(1),
+    build_schedule(2),
+    build_schedule(3),
+    build_schedule(4),
+    build_schedule(5),
+    build_schedule(6),
+];
+
+#[inline]
+pub(crate) const fn schedule_for(bits: usize) -> &'static [ColHalfSchedule; 32] {
+    let idx = if bits >= 1 && bits <= 6 { bits - 1 } else { 0 };
+    &SCHEDULES[idx]
 }
 
 #[inline]
@@ -160,7 +180,7 @@ pub fn tile_row_matvec_scalar(
     out: &mut [f32; TILE_DIM],
 ) -> Result<(), &'static str> {
     let per_tile = validate_tile_strip(row_tiles, bits, x_scaled.len())?;
-    let schedule = build_schedule(bits);
+    let schedule = schedule_for(bits);
     let mut acc = [0.0_f32; TILE_DIM];
     let mut planar = [[0_u32; 16]; 6];
     let tile_cols = x_scaled.len() / TILE_DIM;
@@ -251,31 +271,9 @@ pub fn tile_row_matmul_tokens(
 
     #[cfg(target_arch = "aarch64")]
     {
-        let mut token_idx = 0_usize;
-        while token_idx + 4 <= x_tokens.len() {
-            let x4 = [
-                x_tokens[token_idx],
-                x_tokens[token_idx + 1],
-                x_tokens[token_idx + 2],
-                x_tokens[token_idx + 3],
-            ];
-            let mut o4 = [[0.0_f32; TILE_DIM]; 4];
-            aarch64::trellis_tile_row_matmul4(row_tiles, bits, per_tile, cols, x4, &mut o4);
-            for lane in 0..4 {
-                *out_tokens[token_idx + lane] = o4[lane];
-            }
-            token_idx += 4;
-        }
-        while token_idx < x_tokens.len() {
-            aarch64::trellis_tile_row_matvec(
-                row_tiles,
-                bits,
-                per_tile,
-                x_tokens[token_idx],
-                out_tokens[token_idx],
-            );
-            token_idx += 1;
-        }
+        aarch64::trellis_tile_row_matmul_tokens(
+            row_tiles, bits, per_tile, cols, x_tokens, out_tokens,
+        );
         Ok(())
     }
 
@@ -352,6 +350,11 @@ mod tests {
                 let mut neon = [0.0_f32; TILE_DIM];
                 tile_row_matvec_scalar(&weights, bits, token, &mut scalar)?;
                 tile_row_matvec(&weights, bits, token, &mut neon)?;
+                assert_eq!(
+                    neon.map(f32::to_bits),
+                    scalar.map(f32::to_bits),
+                    "0 ULP matvec mismatch bits={bits}"
+                );
                 for row in 0..TILE_DIM {
                     assert!(
                         (scalar[row] - reference[row]).abs() <= 1e-3,
@@ -373,13 +376,13 @@ mod tests {
             let mut out_refs: Vec<&mut [f32; TILE_DIM]> = batch_bufs.iter_mut().collect();
             tile_row_matmul_tokens(&weights, bits, &refs, &mut out_refs)?;
             for (t, token) in x_data.iter().enumerate() {
-                let expected = naive_reference(&weights, bits, token).ok_or("ref failed")?;
-                for row in 0..TILE_DIM {
-                    assert!(
-                        (batch_bufs[t][row] - expected[row]).abs() <= 1e-3,
-                        "batch mismatch bits={bits} token={t} row={row}"
-                    );
-                }
+                let mut expected_scalar = [0.0_f32; TILE_DIM];
+                tile_row_matvec_scalar(&weights, bits, token, &mut expected_scalar)?;
+                assert_eq!(
+                    batch_bufs[t].map(f32::to_bits),
+                    expected_scalar.map(f32::to_bits),
+                    "0 ULP batch mismatch bits={bits} token={t}"
+                );
             }
         }
         Ok(())

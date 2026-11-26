@@ -10470,6 +10470,49 @@ const fn trellis_quad(planar: &[u32; 16], offset: usize) -> [u32; 4] {
 }
 
 #[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn trellis_decode_half_column_dotprod(
+    planar: &[[u32; 16]; 6],
+    sched: &super::trellis::ColHalfSchedule,
+) -> (
+    core::arch::aarch64::float32x4_t,
+    core::arch::aarch64::float32x4_t,
+) {
+    use core::arch::aarch64::{
+        vandq_u32, vcvtq_f32_s32, vdupq_n_s8, vdupq_n_u32, vmulq_u32, vorrq_u32,
+        vreinterpretq_u8_u32, vshlq_u32,
+    };
+
+    let s0 = vdupq_n_s32(sched.shift0);
+    let s1 = vdupq_n_s32(sched.shift1);
+    let m1 = vdupq_n_u32(sched.mask1);
+    let low16 = vdupq_n_u32(0xffff);
+    let lcg = vdupq_n_u32(super::trellis::LCG_MULTIPLIER);
+    let bias_neg126 = vdupq_n_s32(-126);
+    let ones = vdupq_n_s8(1);
+
+    let decode_four = |row_offset: usize| {
+        let w0 = load_u32x4(&trellis_quad(
+            &planar[sched.w0_rem],
+            sched.w0_q + row_offset,
+        ));
+        let w1 = load_u32x4(&trellis_quad(
+            &planar[sched.w1_rem],
+            sched.w1_q + row_offset,
+        ));
+        let part0 = vshlq_u32(w0, s0);
+        let part1 = vandq_u32(vshlq_u32(w1, s1), m1);
+        let state = vandq_u32(vorrq_u32(part0, part1), low16);
+        let x = vmulq_u32(state, lcg);
+        let bytes = vreinterpretq_s8_u8(vshrq_n_u8::<2>(vreinterpretq_u8_u32(x)));
+        let signed = vdotq_s32(bias_neg126, bytes, ones);
+        vcvtq_f32_s32(signed)
+    };
+
+    (decode_four(0), decode_four(4))
+}
+
+#[inline]
 #[target_feature(enable = "neon")]
 fn trellis_decode_half_column(
     planar: &[[u32; 16]; 6],
@@ -10516,6 +10559,121 @@ fn trellis_decode_half_column(
     (decode_four(0), decode_four(4))
 }
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn trellis_decode_tile_neon(
+    planar: &[[u32; 16]; 6],
+    schedule: &[super::trellis::ColHalfSchedule; 32],
+) -> [[core::arch::aarch64::float32x4_t; 4]; 16] {
+    std::array::from_fn(|c| {
+        let (w0, w1) = trellis_decode_half_column(planar, &schedule[c * 2]);
+        let (w2, w3) = trellis_decode_half_column(planar, &schedule[c * 2 + 1]);
+        [w0, w1, w2, w3]
+    })
+}
+
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn trellis_decode_tile_dotprod(
+    planar: &[[u32; 16]; 6],
+    schedule: &[super::trellis::ColHalfSchedule; 32],
+) -> [[core::arch::aarch64::float32x4_t; 4]; 16] {
+    std::array::from_fn(|c| {
+        let (w0, w1) = trellis_decode_half_column_dotprod(planar, &schedule[c * 2]);
+        let (w2, w3) = trellis_decode_half_column_dotprod(planar, &schedule[c * 2 + 1]);
+        [w0, w1, w2, w3]
+    })
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn trellis_accumulate_tile_tokens(
+    w_cols: &[[core::arch::aarch64::float32x4_t; 4]; 16],
+    x_base: usize,
+    x_tokens: &[&[f32]],
+    out_tokens: &mut [&mut [f32; 16]],
+) {
+    use core::arch::aarch64::{vdupq_n_f32, vfmaq_f32};
+
+    let mut t = 0_usize;
+    while t + 4 <= x_tokens.len() {
+        let [o0, o1, o2, o3] = &mut out_tokens[t..t + 4] else {
+            break;
+        };
+        let q0 = o0.as_chunks_mut::<4>().0;
+        let q1 = o1.as_chunks_mut::<4>().0;
+        let q2 = o2.as_chunks_mut::<4>().0;
+        let q3 = o3.as_chunks_mut::<4>().0;
+        let mut a0 = [
+            load_f32x4_neon(&q0[0]),
+            load_f32x4_neon(&q0[1]),
+            load_f32x4_neon(&q0[2]),
+            load_f32x4_neon(&q0[3]),
+        ];
+        let mut a1 = [
+            load_f32x4_neon(&q1[0]),
+            load_f32x4_neon(&q1[1]),
+            load_f32x4_neon(&q1[2]),
+            load_f32x4_neon(&q1[3]),
+        ];
+        let mut a2 = [
+            load_f32x4_neon(&q2[0]),
+            load_f32x4_neon(&q2[1]),
+            load_f32x4_neon(&q2[2]),
+            load_f32x4_neon(&q2[3]),
+        ];
+        let mut a3 = [
+            load_f32x4_neon(&q3[0]),
+            load_f32x4_neon(&q3[1]),
+            load_f32x4_neon(&q3[2]),
+            load_f32x4_neon(&q3[3]),
+        ];
+        let x0 = &x_tokens[t][x_base..x_base + 16];
+        let x1 = &x_tokens[t + 1][x_base..x_base + 16];
+        let x2 = &x_tokens[t + 2][x_base..x_base + 16];
+        let x3 = &x_tokens[t + 3][x_base..x_base + 16];
+        for (c, w) in w_cols.iter().enumerate() {
+            let xt0 = vdupq_n_f32(x0[c]);
+            let xt1 = vdupq_n_f32(x1[c]);
+            let xt2 = vdupq_n_f32(x2[c]);
+            let xt3 = vdupq_n_f32(x3[c]);
+            for q in 0..4 {
+                a0[q] = vfmaq_f32(a0[q], w[q], xt0);
+                a1[q] = vfmaq_f32(a1[q], w[q], xt1);
+                a2[q] = vfmaq_f32(a2[q], w[q], xt2);
+                a3[q] = vfmaq_f32(a3[q], w[q], xt3);
+            }
+        }
+        for q in 0..4 {
+            store_f32x4_neon(a0[q], &mut q0[q]);
+            store_f32x4_neon(a1[q], &mut q1[q]);
+            store_f32x4_neon(a2[q], &mut q2[q]);
+            store_f32x4_neon(a3[q], &mut q3[q]);
+        }
+        t += 4;
+    }
+    while t < x_tokens.len() {
+        let q_out = out_tokens[t].as_chunks_mut::<4>().0;
+        let mut acc = [
+            load_f32x4_neon(&q_out[0]),
+            load_f32x4_neon(&q_out[1]),
+            load_f32x4_neon(&q_out[2]),
+            load_f32x4_neon(&q_out[3]),
+        ];
+        let x = &x_tokens[t][x_base..x_base + 16];
+        for (c, w) in w_cols.iter().enumerate() {
+            let xt = vdupq_n_f32(x[c]);
+            for q in 0..4 {
+                acc[q] = vfmaq_f32(acc[q], w[q], xt);
+            }
+        }
+        for q in 0..4 {
+            store_f32x4_neon(acc[q], &mut q_out[q]);
+        }
+        t += 1;
+    }
+}
+
 /// Evaluates one `16`-row `NariQ` trellis strip against a single `s16`-scaled activation vector.
 pub(crate) fn trellis_tile_row_matvec(
     row_tiles: &[u8],
@@ -10525,7 +10683,7 @@ pub(crate) fn trellis_tile_row_matvec(
     out: &mut [f32; 16],
 ) {
     #[target_feature(enable = "neon")]
-    fn inner(
+    fn inner_neon(
         row_tiles: &[u8],
         bits: usize,
         per_tile: usize,
@@ -10534,7 +10692,7 @@ pub(crate) fn trellis_tile_row_matvec(
     ) {
         use core::arch::aarch64::{vdupq_n_f32, vfmaq_f32};
 
-        let schedule = super::trellis::build_schedule(bits);
+        let schedule = super::trellis::schedule_for(bits);
         let mut planar = [[0_u32; 16]; 6];
         let mut acc0 = vdupq_n_f32(0.0);
         let mut acc1 = vdupq_n_f32(0.0);
@@ -10557,86 +10715,123 @@ pub(crate) fn trellis_tile_row_matvec(
             }
         }
 
-        let mut f0 = [0.0_f32; 4];
-        let mut f1 = [0.0_f32; 4];
-        let mut f2 = [0.0_f32; 4];
-        let mut f3 = [0.0_f32; 4];
-        store_f32x4_neon(acc0, &mut f0);
-        store_f32x4_neon(acc1, &mut f1);
-        store_f32x4_neon(acc2, &mut f2);
-        store_f32x4_neon(acc3, &mut f3);
-        out[0..4].copy_from_slice(&f0);
-        out[4..8].copy_from_slice(&f1);
-        out[8..12].copy_from_slice(&f2);
-        out[12..16].copy_from_slice(&f3);
+        let quads = out.as_chunks_mut::<4>().0;
+        store_f32x4_neon(acc0, &mut quads[0]);
+        store_f32x4_neon(acc1, &mut quads[1]);
+        store_f32x4_neon(acc2, &mut quads[2]);
+        store_f32x4_neon(acc3, &mut quads[3]);
     }
 
-    // SAFETY: ARMv8-A always provides baseline NEON instructions on `aarch64` targets.
-    unsafe { inner(row_tiles, bits, per_tile, x_scaled, out) };
-}
-
-/// Evaluates one `16`-row `NariQ` trellis strip simultaneously across four `s16`-scaled tokens.
-pub(crate) fn trellis_tile_row_matmul4(
-    row_tiles: &[u8],
-    bits: usize,
-    per_tile: usize,
-    cols: usize,
-    x_tokens: [&[f32]; 4],
-    out_tokens: &mut [[f32; 16]; 4],
-) {
-    #[target_feature(enable = "neon")]
-    fn inner(
+    #[target_feature(enable = "neon,dotprod")]
+    fn inner_dotprod(
         row_tiles: &[u8],
         bits: usize,
         per_tile: usize,
-        cols: usize,
-        x_tokens: [&[f32]; 4],
-        out_tokens: &mut [[f32; 16]; 4],
+        x_scaled: &[f32],
+        out: &mut [f32; 16],
     ) {
         use core::arch::aarch64::{vdupq_n_f32, vfmaq_f32};
 
-        let schedule = super::trellis::build_schedule(bits);
+        let schedule = super::trellis::schedule_for(bits);
         let mut planar = [[0_u32; 16]; 6];
-        let zero = vdupq_n_f32(0.0);
-        let mut acc0 = [zero; 4];
-        let mut acc1 = [zero; 4];
-        let mut acc2 = [zero; 4];
-        let mut acc3 = [zero; 4];
-        let tile_cols = cols / 16;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let tile_cols = x_scaled.len() / 16;
 
         for tile_idx in 0..tile_cols {
             let tile = &row_tiles[tile_idx * per_tile..(tile_idx + 1) * per_tile];
             super::trellis::scatter_tile_planar(tile, bits, &mut planar);
             let x_base = tile_idx * 16;
             for c in 0..16 {
-                let (w0, w1) = trellis_decode_half_column(&planar, &schedule[c * 2]);
-                let (w2, w3) = trellis_decode_half_column(&planar, &schedule[c * 2 + 1]);
-                for lane in 0..4 {
-                    let xt = vdupq_n_f32(x_tokens[lane][x_base + c]);
-                    acc0[lane] = vfmaq_f32(acc0[lane], w0, xt);
-                    acc1[lane] = vfmaq_f32(acc1[lane], w1, xt);
-                    acc2[lane] = vfmaq_f32(acc2[lane], w2, xt);
-                    acc3[lane] = vfmaq_f32(acc3[lane], w3, xt);
-                }
+                let xc = vdupq_n_f32(x_scaled[x_base + c]);
+                let (w0, w1) = trellis_decode_half_column_dotprod(&planar, &schedule[c * 2]);
+                let (w2, w3) = trellis_decode_half_column_dotprod(&planar, &schedule[c * 2 + 1]);
+                acc0 = vfmaq_f32(acc0, w0, xc);
+                acc1 = vfmaq_f32(acc1, w1, xc);
+                acc2 = vfmaq_f32(acc2, w2, xc);
+                acc3 = vfmaq_f32(acc3, w3, xc);
             }
         }
 
-        for lane in 0..4 {
-            let mut f0 = [0.0_f32; 4];
-            let mut f1 = [0.0_f32; 4];
-            let mut f2 = [0.0_f32; 4];
-            let mut f3 = [0.0_f32; 4];
-            store_f32x4_neon(acc0[lane], &mut f0);
-            store_f32x4_neon(acc1[lane], &mut f1);
-            store_f32x4_neon(acc2[lane], &mut f2);
-            store_f32x4_neon(acc3[lane], &mut f3);
-            out_tokens[lane][0..4].copy_from_slice(&f0);
-            out_tokens[lane][4..8].copy_from_slice(&f1);
-            out_tokens[lane][8..12].copy_from_slice(&f2);
-            out_tokens[lane][12..16].copy_from_slice(&f3);
+        let quads = out.as_chunks_mut::<4>().0;
+        store_f32x4_neon(acc0, &mut quads[0]);
+        store_f32x4_neon(acc1, &mut quads[1]);
+        store_f32x4_neon(acc2, &mut quads[2]);
+        store_f32x4_neon(acc3, &mut quads[3]);
+    }
+
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified CPU/OS `dotprod` and baseline `neon`.
+        unsafe { inner_dotprod(row_tiles, bits, per_tile, x_scaled, out) };
+    } else {
+        // SAFETY: ARMv8-A always provides baseline NEON instructions on `aarch64` targets.
+        unsafe { inner_neon(row_tiles, bits, per_tile, x_scaled, out) };
+    }
+}
+
+/// Evaluates one `16`-row `NariQ` trellis strip across all `s16`-scaled tokens,
+/// decoding each `16 × 16` tile once and reusing it across every token.
+pub(crate) fn trellis_tile_row_matmul_tokens(
+    row_tiles: &[u8],
+    bits: usize,
+    per_tile: usize,
+    cols: usize,
+    x_tokens: &[&[f32]],
+    out_tokens: &mut [&mut [f32; 16]],
+) {
+    #[target_feature(enable = "neon")]
+    fn inner_neon(
+        row_tiles: &[u8],
+        bits: usize,
+        per_tile: usize,
+        cols: usize,
+        x_tokens: &[&[f32]],
+        out_tokens: &mut [&mut [f32; 16]],
+    ) {
+        let schedule = super::trellis::schedule_for(bits);
+        let mut planar = [[0_u32; 16]; 6];
+        for out in out_tokens.iter_mut() {
+            **out = [0.0_f32; 16];
+        }
+        let tile_cols = cols / 16;
+        for tile_idx in 0..tile_cols {
+            let tile = &row_tiles[tile_idx * per_tile..(tile_idx + 1) * per_tile];
+            super::trellis::scatter_tile_planar(tile, bits, &mut planar);
+            let w_cols = trellis_decode_tile_neon(&planar, schedule);
+            trellis_accumulate_tile_tokens(&w_cols, tile_idx * 16, x_tokens, out_tokens);
         }
     }
 
-    // SAFETY: ARMv8-A always provides baseline NEON instructions on `aarch64` targets.
-    unsafe { inner(row_tiles, bits, per_tile, cols, x_tokens, out_tokens) };
+    #[target_feature(enable = "neon,dotprod")]
+    fn inner_dotprod(
+        row_tiles: &[u8],
+        bits: usize,
+        per_tile: usize,
+        cols: usize,
+        x_tokens: &[&[f32]],
+        out_tokens: &mut [&mut [f32; 16]],
+    ) {
+        let schedule = super::trellis::schedule_for(bits);
+        let mut planar = [[0_u32; 16]; 6];
+        for out in out_tokens.iter_mut() {
+            **out = [0.0_f32; 16];
+        }
+        let tile_cols = cols / 16;
+        for tile_idx in 0..tile_cols {
+            let tile = &row_tiles[tile_idx * per_tile..(tile_idx + 1) * per_tile];
+            super::trellis::scatter_tile_planar(tile, bits, &mut planar);
+            let w_cols = trellis_decode_tile_dotprod(&planar, schedule);
+            trellis_accumulate_tile_tokens(&w_cols, tile_idx * 16, x_tokens, out_tokens);
+        }
+    }
+
+    if has_dotprod() {
+        // SAFETY: `has_dotprod()` verified CPU/OS `dotprod` and baseline `neon`.
+        unsafe { inner_dotprod(row_tiles, bits, per_tile, cols, x_tokens, out_tokens) };
+    } else {
+        // SAFETY: ARMv8-A always provides baseline NEON instructions on `aarch64` targets.
+        unsafe { inner_neon(row_tiles, bits, per_tile, cols, x_tokens, out_tokens) };
+    }
 }

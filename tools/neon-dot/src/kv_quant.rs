@@ -1201,6 +1201,7 @@ mod native {
         ]
     }
 
+    #[cfg(test)]
     #[inline]
     #[target_feature(enable = "neon")]
     fn decode_row<const BITS: u8>(
@@ -1375,35 +1376,12 @@ mod native {
     }
 
     #[target_feature(enable = "neon")]
-    fn dot_decoded_group<const G: usize>(
-        decoded: &[f32; DIMENSION],
-        queries: &[&[f32; DIMENSION]; G],
-    ) -> [f64; G] {
-        let mut low_sums: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
-        let mut high_sums: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
-        for (tile_idx, quad) in decoded.as_chunks::<4>().0.iter().enumerate() {
-            // SAFETY: quad is a four-element array slice of decoded coordinates.
-            let values = unsafe { vld1q_f32(quad.as_ptr()) };
-            dot_tile_group(values, tile_idx * 4, queries, &mut low_sums, &mut high_sums);
-        }
-        finish_dot_group(&low_sums, &high_sums)
-    }
-
-    #[target_feature(enable = "neon")]
     fn dot_group_pair_neon<const BITS: u8, const G: usize>(
         packed: &[u8],
         centroids: &[f32; 16],
         first_queries: &[&[f32; DIMENSION]; G],
         second_queries: &[&[f32; DIMENSION]; G],
     ) -> ([f64; G], [f64; G]) {
-        if G > 4 {
-            let mut decoded = [0.0_f32; DIMENSION];
-            decode_row::<BITS>(packed, centroids, &mut decoded);
-            return (
-                dot_decoded_group(&decoded, first_queries),
-                dot_decoded_group(&decoded, second_queries),
-            );
-        }
         let mut low0: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
         let mut high0: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
         let mut low1: [_; G] = std::array::from_fn(|_| vdupq_n_f64(0.0));
@@ -1679,34 +1657,6 @@ mod native {
     }
 
     #[target_feature(enable = "neon")]
-    fn accumulate_decoded_group<const G: usize>(
-        decoded: &[f32; DIMENSION],
-        scales: [f32; G],
-        active: [bool; G],
-        outputs: &mut [[f32; DIMENSION]; G],
-    ) -> [bool; G] {
-        let mut scale_vecs = [vdupq_n_f32(0.0); G];
-        for (dst, &scale) in scale_vecs.iter_mut().zip(&scales) {
-            *dst = vdupq_n_f32(scale);
-        }
-        let mut finite: [_; G] = std::array::from_fn(|_| vdupq_n_u32(u32::MAX));
-        let active_flags = (!active.iter().all(|&flag| flag)).then_some(&active);
-        for (tile_idx, quad) in decoded.as_chunks::<4>().0.iter().enumerate() {
-            // SAFETY: quad is a four-element slice of decoded coordinates.
-            let values = unsafe { vld1q_f32(quad.as_ptr()) };
-            accumulate_tile_group(
-                values,
-                tile_idx * 4,
-                active_flags,
-                &scale_vecs,
-                &mut finite,
-                outputs,
-            );
-        }
-        std::array::from_fn(|head| active[head] && vminvq_u32(finite[head]) != 0)
-    }
-
-    #[target_feature(enable = "neon")]
     fn accumulate_group_pair_neon<const BITS: u8, const G: usize>(
         packed: &[u8],
         centroids: &[f32; 16],
@@ -1714,13 +1664,6 @@ mod native {
         active: [[bool; G]; 2],
         outputs: &mut [[[f32; DIMENSION]; G]; 2],
     ) -> ([bool; G], [bool; G]) {
-        if G > 4 {
-            let mut decoded = [0.0_f32; DIMENSION];
-            decode_row::<BITS>(packed, centroids, &mut decoded);
-            let ok0 = accumulate_decoded_group(&decoded, scales[0], active[0], &mut outputs[0]);
-            let ok1 = accumulate_decoded_group(&decoded, scales[1], active[1], &mut outputs[1]);
-            return (ok0, ok1);
-        }
         let mut first_scale_vecs = [vdupq_n_f32(0.0); G];
         let mut second_scale_vecs = [vdupq_n_f32(0.0); G];
         for (dst, &scale) in first_scale_vecs.iter_mut().zip(&scales[0]) {

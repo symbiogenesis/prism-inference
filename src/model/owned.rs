@@ -188,9 +188,13 @@ impl Model {
                 },
             );
         }
-        let mut output = HashWriter(Hasher::new()?);
+        let mut output = std::io::BufWriter::with_capacity(64 * 1024, HashWriter(Hasher::new()?));
         model.write_to(&mut output)?;
-        model.identity = hex::encode(output.0.finish()?);
+        output.flush()?;
+        let hasher = output
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
+        model.identity = hex::encode(hasher.0.finish()?);
         Ok(model)
     }
 

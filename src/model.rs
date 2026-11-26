@@ -4,7 +4,7 @@ use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use bonsai_gguf::{
@@ -486,6 +486,7 @@ impl Model {
         const VALIDATION_BATCH_BYTES: usize = 64 * 1024 * 1024;
         const PARALLEL_THRESHOLD_BYTES: usize = 512 * 1024;
         const LARGE_TENSOR_SPLIT_BYTES: usize = 16 * 1024 * 1024;
+        const LARGE_TENSOR_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
         let count = reader.tensors().len();
         let mut entries = Vec::new();
@@ -512,48 +513,56 @@ impl Model {
 
         let workers = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
-            .clamp(1, 8);
+            .max(1);
 
-        let mut completed = 0_usize;
-        let mut start = 0_usize;
-        while start < entries.len() {
-            let mut end = start;
-            let mut batch_bytes = 0_usize;
-            while end < entries.len() {
-                let len = entries[end].3.len();
-                if end > start && batch_bytes.saturating_add(len) > VALIDATION_BATCH_BYTES {
-                    break;
-                }
-                batch_bytes = batch_bytes.saturating_add(len);
-                end += 1;
-                if batch_bytes >= VALIDATION_BATCH_BYTES {
-                    break;
-                }
-            }
-
-            if end - start == 1 && workers > 1 && entries[start].3.len() >= LARGE_TENSOR_SPLIT_BYTES
+        let mut chunks = Vec::new();
+        for (_, _, kind, slice) in &entries {
+            let bytes = slice.as_slice();
+            if workers > 1
+                && bytes.len() >= LARGE_TENSOR_SPLIT_BYTES
+                && let Ok(block_bytes) = payload_block_bytes(*kind)
+                && block_bytes > 0
+                && bytes.len().is_multiple_of(block_bytes)
             {
-                validate_payload_parallel(entries[start].2, entries[start].3.as_slice(), workers)?;
-            } else if workers == 1 || end - start == 1 || batch_bytes < PARALLEL_THRESHOLD_BYTES {
-                for (_, _, kind, slice) in &entries[start..end] {
-                    validate_payload(*kind, slice.as_slice())?;
+                let blocks_per_chunk = (LARGE_TENSOR_CHUNK_BYTES / block_bytes).max(1);
+                let chunk_bytes = blocks_per_chunk.saturating_mul(block_bytes);
+                let chunk_count = bytes.len().div_ceil(chunk_bytes);
+                chunks.try_reserve(chunk_count)?;
+                for part in bytes.chunks(chunk_bytes) {
+                    chunks.push((*kind, part));
                 }
             } else {
-                validate_mapped_batch_parallel(&entries[start..end], workers)?;
+                chunks.try_reserve(1)?;
+                chunks.push((*kind, bytes));
             }
+        }
 
-            completed = completed.saturating_add(batch_bytes);
-            if end < entries.len() {
-                let fraction = if required == 0 {
-                    0.0
-                } else {
-                    completed as f32 / required as f32
-                };
-                if !progress(fraction)? {
-                    return Err(invalid("model loading cancelled"));
+        if workers == 1 || chunks.len() <= 1 || required < PARALLEL_THRESHOLD_BYTES {
+            let mut completed = 0_usize;
+            let mut next_report = VALIDATION_BATCH_BYTES;
+            for &(kind, bytes) in &chunks {
+                validate_payload(kind, bytes)?;
+                completed = completed.saturating_add(bytes.len());
+                if completed >= next_report && completed < required {
+                    let fraction = if required == 0 {
+                        0.0
+                    } else {
+                        completed as f32 / required as f32
+                    };
+                    if !progress(fraction)? {
+                        return Err(invalid("model loading cancelled"));
+                    }
+                    next_report = completed.saturating_add(VALIDATION_BATCH_BYTES);
                 }
             }
-            start = end;
+        } else {
+            validate_mapped_chunks_parallel(
+                &chunks,
+                workers,
+                required,
+                VALIDATION_BATCH_BYTES,
+                progress,
+            )?;
         }
 
         if !progress(1.0)? {
@@ -656,6 +665,7 @@ fn payload_block_bytes(kind: u32) -> Result<usize> {
     }
 }
 
+#[cfg(test)]
 fn validate_payload_parallel(kind: u32, bytes: &[u8], workers: usize) -> Result<()> {
     let block_bytes = payload_block_bytes(kind)?;
     if !bytes.len().is_multiple_of(block_bytes) {
@@ -683,43 +693,119 @@ fn validate_payload_parallel(kind: u32, bytes: &[u8], workers: usize) -> Result<
     Ok(())
 }
 
-fn validate_mapped_batch_parallel(
-    entries: &[(String, Vec<usize>, u32, MappedSlice)],
-    workers: usize,
-) -> Result<()> {
-    let active = workers.min(entries.len());
-    if active <= 1 {
-        for (_, _, kind, slice) in entries {
-            validate_payload(*kind, slice.as_slice())?;
+fn run_validation_worker(
+    chunks: &[(u32, &[u8])],
+    next: &AtomicUsize,
+    completed: &AtomicUsize,
+    earliest_err_idx: &AtomicUsize,
+    cancelled: &AtomicBool,
+    mut on_completed: impl FnMut(usize) -> Result<()>,
+) -> (Option<(usize, Error)>, Option<Error>) {
+    let mut earliest: Option<(usize, Error)> = None;
+    let mut control_error = None;
+    while !cancelled.load(Ordering::Relaxed) {
+        let index = next.fetch_add(1, Ordering::Relaxed);
+        if index >= earliest_err_idx.load(Ordering::Relaxed) {
+            break;
         }
-        return Ok(());
+        let Some(&(kind, bytes)) = chunks.get(index) else {
+            break;
+        };
+        if let Err(err) = validate_payload(kind, bytes) {
+            earliest_err_idx.fetch_min(index, Ordering::Relaxed);
+            if earliest
+                .as_ref()
+                .is_none_or(|(best_idx, _)| index < *best_idx)
+            {
+                earliest = Some((index, err));
+            }
+        }
+        let done = completed
+            .fetch_add(bytes.len(), Ordering::Relaxed)
+            .saturating_add(bytes.len());
+        if let Err(err) = on_completed(done) {
+            control_error = Some(err);
+            cancelled.store(true, Ordering::Release);
+            break;
+        }
     }
+    (earliest, control_error)
+}
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "The pinned loader reports byte-weighted progress as binary32."
+)]
+fn validate_mapped_chunks_parallel(
+    chunks: &[(u32, &[u8])],
+    workers: usize,
+    required: usize,
+    report_step: usize,
+    progress: &mut impl FnMut(f32) -> Result<bool>,
+) -> Result<()> {
+    let active = workers.min(chunks.len());
     let next = AtomicUsize::new(0);
-    let mut failures: Vec<Option<(usize, Error)>> = (0..active).map(|_| None).collect();
+    let completed = AtomicUsize::new(0);
+    let earliest_err_idx = AtomicUsize::new(usize::MAX);
+    let cancelled = AtomicBool::new(false);
+    let mut failures: Vec<Option<(usize, Error)>> = Vec::new();
+    failures.try_reserve_exact(active)?;
+    failures.resize_with(active, || None);
+
+    let (caller_slot, bg_slots) = failures
+        .split_first_mut()
+        .ok_or_else(|| invalid("missing mapped validation worker slot"))?;
+    let mut caller_error: Option<Error> = None;
+
     std::thread::scope(|scope| {
-        for failure in &mut failures {
+        for slot in bg_slots {
             let next_ref = &next;
+            let completed_ref = &completed;
+            let earliest_ref = &earliest_err_idx;
+            let cancelled_ref = &cancelled;
             scope.spawn(move || {
-                let mut earliest: Option<(usize, Error)> = None;
-                loop {
-                    let index = next_ref.fetch_add(1, Ordering::Relaxed);
-                    if index >= entries.len() {
-                        break;
-                    }
-                    let (_, _, kind, slice) = &entries[index];
-                    if let Err(err) = validate_payload(*kind, slice.as_slice()) {
-                        let replace = earliest
-                            .as_ref()
-                            .is_none_or(|(best_idx, _)| index < *best_idx);
-                        if replace {
-                            earliest = Some((index, err));
-                        }
-                    }
-                }
-                *failure = earliest;
+                *slot = run_validation_worker(
+                    chunks,
+                    next_ref,
+                    completed_ref,
+                    earliest_ref,
+                    cancelled_ref,
+                    |_| Ok(()),
+                )
+                .0;
             });
         }
+
+        let mut next_report = report_step;
+        let (earliest, control_err) = run_validation_worker(
+            chunks,
+            &next,
+            &completed,
+            &earliest_err_idx,
+            &cancelled,
+            |done| {
+                if done >= next_report && done < required {
+                    let fraction = if required == 0 {
+                        0.0
+                    } else {
+                        done as f32 / required as f32
+                    };
+                    if !progress(fraction)? {
+                        return Err(invalid("model loading cancelled"));
+                    }
+                    next_report = done.saturating_add(report_step);
+                }
+                Ok(())
+            },
+        );
+        *caller_slot = earliest;
+        caller_error = control_err;
     });
+
+    if let Some(err) = caller_error {
+        return Err(err);
+    }
     let mut best: Option<(usize, Error)> = None;
     for candidate in failures.into_iter().flatten() {
         let replace = best

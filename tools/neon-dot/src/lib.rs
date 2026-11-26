@@ -10,7 +10,7 @@
 #![deny(unsafe_code)]
 
 mod scaled;
-pub use scaled::{Pq2Activation, Q8ActivationBlock, Q8ActivationView};
+pub use scaled::{Pq2Activation, Ptq1Activation, Q8ActivationBlock, Q8ActivationView};
 
 pub use bonsai_ternary::{
     checked_float_to_half, float_to_half, half_to_float, unpack_q4_k_scale_min,
@@ -435,6 +435,8 @@ pub struct Ptq1Dotprod {
     _detected: (),
     #[cfg(target_arch = "aarch64")]
     i8mm: bool,
+    #[cfg(target_arch = "aarch64")]
+    sve: bool,
 }
 
 /// A borrowed, finite-scale `PTQ1_0` activation scope for complete-row execution.
@@ -487,6 +489,48 @@ impl<A: Q8ActivationView> Ptq1Prepared<'_, A> {
     }
 }
 
+/// A borrowed, finite-scale packed `PTQ1_0` activation scope for complete-row execution.
+///
+/// Construction checks every activation scale once. The immutable borrow
+/// prevents changes or replacement while row workers share this scope.
+#[derive(Clone, Copy)]
+pub struct Ptq1PackedPrepared<'a> {
+    detected: Ptq1Dotprod,
+    activation: &'a [Ptq1Activation],
+}
+
+impl Ptq1PackedPrepared<'_> {
+    /// Consumes `1`, `4`, `8`, or `16` complete 28-byte `PTQ1_0` rows using the packed scope.
+    ///
+    /// Row extents, packed weight scales and final results remain checked on every call.
+    /// Preserves exact `0 ULP` parity for both `PINNED = true` (4-lane FMA reduction)
+    /// and `PINNED = false` (`SOURCE` non-FMA group reduction).
+    /// Returns `None` for unsupported geometry or nonfinite weights/results.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_rows<const ROWS: usize, const PINNED: bool>(
+        self,
+        rows: [&[u8]; ROWS],
+    ) -> Option<[f32; ROWS]> {
+        if !scaled::valid_ptq1_row_extents(rows, self.activation.len()) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::ptq1_detected_dot_packed_rows::<ROWS, PINNED>(
+                self.detected,
+                rows,
+                self.activation,
+            )
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self.detected;
+            scaled::portable_ptq1_packed_rows_validated::<ROWS, PINNED>(rows, self.activation)
+        }
+    }
+}
+
 impl Ptq1Dotprod {
     /// Detects `PTQ1_0` `SDOT` and optional `I8MM` capability once.
     #[inline]
@@ -495,10 +539,14 @@ impl Ptq1Dotprod {
         let detected = has_dotprod();
         #[cfg(target_arch = "aarch64")]
         let i8mm = detected && has_i8mm();
+        #[cfg(target_arch = "aarch64")]
+        let sve = detected && aarch64::has_sve();
         detected.then_some(Self {
             _detected: (),
             #[cfg(target_arch = "aarch64")]
             i8mm,
+            #[cfg(target_arch = "aarch64")]
+            sve,
         })
     }
 
@@ -512,6 +560,19 @@ impl Ptq1Dotprod {
         activation: &[Q8ActivationBlock],
     ) -> Option<Ptq1Prepared<'_, Q8ActivationBlock>> {
         self.prepare_scaled_view(activation)
+    }
+
+    /// Validates packed [`Ptq1Activation`] scales once for any number of `PTQ1_0` row groups.
+    ///
+    /// Returns `None` for empty inputs, overflowing extents, or nonfinite scales.
+    #[inline]
+    #[must_use]
+    pub fn prepare_packed(self, activation: &[Ptq1Activation]) -> Option<Ptq1PackedPrepared<'_>> {
+        scaled::valid_ptq1_packed_activation(activation)?;
+        Some(Ptq1PackedPrepared {
+            detected: self,
+            activation,
+        })
     }
 
     /// Validates any [`Q8ActivationView`] slice once for `PTQ1_0` row groups.

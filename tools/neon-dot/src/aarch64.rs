@@ -7,8 +7,9 @@ use core::arch::aarch64::{
     int8x16_t, int32x4_t, uint8x8_t, uint8x16_t, vaddq_s32, vaddvq_s32, vandq_u8, vcgeq_u8,
     vcltq_u8, vcombine_s8, vcombine_s32, vcombine_u8, vdotq_s32, vdupq_n_s32, vdupq_n_u8,
     vget_high_s8, vget_high_s32, vget_low_s8, vget_low_s32, vld1_u8, vld1q_s8, vld1q_s32, vld1q_u8,
-    vmulq_u8, vpaddlq_s8, vpaddlq_s16, vreinterpret_u8_u16, vreinterpretq_s8_u8, vshrq_n_u8,
-    vst1q_s8, vst1q_s32, vsubq_s8, vsubq_s32, vuzp1q_s8, vuzp1q_s32, vuzp2q_s8, vuzp2q_s32,
+    vmulq_u8, vnegq_s32, vpaddlq_s8, vpaddlq_s16, vreinterpret_u8_u16, vreinterpretq_s8_u8,
+    vshrq_n_u8, vst1q_s8, vst1q_s32, vsubq_s8, vsubq_s32, vuzp1q_s8, vuzp1q_s32, vuzp2q_s8,
+    vuzp2q_s32,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -18,6 +19,7 @@ const PRESENT: u8 = 2;
 
 static DOTPROD_STATE: AtomicU8 = AtomicU8::new(UNINIT);
 static I8MM_STATE: AtomicU8 = AtomicU8::new(UNINIT);
+static SVE_STATE: AtomicU8 = AtomicU8::new(UNINIT);
 
 // FCVTL is part of baseline AArch64 NEON, independently of the optional FP16
 // arithmetic extension. Its exact finite widening ignores FZ16. Sanitizing via
@@ -113,6 +115,38 @@ pub(super) fn has_i8mm() -> bool {
         _ => {
             let detected = std::arch::is_aarch64_feature_detected!("i8mm");
             I8MM_STATE.store(if detected { PRESENT } else { ABSENT }, Ordering::Relaxed);
+            detected
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn probe_sve() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn IsProcessorFeaturePresent(processor_feature: u32) -> i32;
+    }
+    const PF_ARM_SVE_INSTRUCTIONS_AVAILABLE: u32 = 46;
+    // SAFETY: `IsProcessorFeaturePresent` is a read-only Windows OS query.
+    unsafe { IsProcessorFeaturePresent(PF_ARM_SVE_INSTRUCTIONS_AVAILABLE) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn probe_sve() -> bool {
+    std::arch::is_aarch64_feature_detected!("sve")
+}
+
+#[inline]
+pub(super) fn has_sve() -> bool {
+    if cfg!(target_feature = "sve") {
+        return true;
+    }
+    match SVE_STATE.load(Ordering::Relaxed) {
+        PRESENT => true,
+        ABSENT => false,
+        _ => {
+            let detected = probe_sve();
+            SVE_STATE.store(if detected { PRESENT } else { ABSENT }, Ordering::Relaxed);
             detected
         }
     }
@@ -4401,397 +4435,1721 @@ fn unpack_ptq1_group(packed: &[u8; 28], group: usize) -> (int8x16_t, int8x16_t) 
     }
 }
 
+const PTQ1_POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
+const PTQ1_POW3_MID_23: [u8; 16] = [9, 9, 9, 9, 9, 9, 9, 9, 27, 27, 27, 27, 27, 27, 27, 27];
+const PTQ1_POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
+
+macro_rules! ptq1_row_pinned_asm {
+    ($p:literal, $lane:literal, $rs_reg:literal, $rs_lane:literal, $step4:literal) => {
+        concat!(
+            "ldr q26, [{",
+            $p,
+            "}], #16\n",
+            "fmul v25.4s, v16.4s, ",
+            $rs_reg,
+            ".s[",
+            $rs_lane,
+            "]\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v30.16b, v26.16b, v21.16b\n",
+            "movi v27.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "cmhi v29.16b, v19.16b, v30.16b\n",
+            "cmhi v31.16b, v30.16b, v20.16b\n",
+            "sdot v27.4s, v28.16b, v8.16b\n",
+            "mul v26.16b, v30.16b, v21.16b\n",
+            "sub v29.16b, v29.16b, v31.16b\n",
+            "sdot v27.4s, v29.16b, v9.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[0]\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v30.16b, v26.16b, v21.16b\n",
+            "movi v27.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "cmhi v29.16b, v19.16b, v30.16b\n",
+            "cmhi v31.16b, v30.16b, v20.16b\n",
+            "sdot v27.4s, v28.16b, v10.16b\n",
+            "mul v26.16b, v30.16b, v21.16b\n",
+            "sub v29.16b, v29.16b, v31.16b\n",
+            "sdot v27.4s, v29.16b, v11.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[1]\n",
+            "ld1r {{v30.2d}}, [{",
+            $p,
+            "}], #8\n",
+            "ld1r {{v31.4h}}, [{",
+            $p,
+            "}], {",
+            $step4,
+            "}\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v26.16b, v30.16b, v22.16b\n",
+            "movi v27.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "cmhi v29.16b, v19.16b, v26.16b\n",
+            "sdot v27.4s, v28.16b, v12.16b\n",
+            "cmhi v28.16b, v26.16b, v20.16b\n",
+            "mul v26.16b, v30.16b, v23.16b\n",
+            "mov v30.d[1], v31.d[0]\n",
+            "sub v29.16b, v29.16b, v28.16b\n",
+            "sdot v27.4s, v29.16b, v13.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[2]\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v30.16b, v30.16b, v24.16b\n",
+            "movi v27.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "cmhi v29.16b, v19.16b, v30.16b\n",
+            "cmhi v31.16b, v30.16b, v20.16b\n",
+            "sdot v27.4s, v28.16b, v14.16b\n",
+            "sub v29.16b, v29.16b, v31.16b\n",
+            "sdot v27.4s, v29.16b, v15.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[3]\n",
+        )
+    };
+}
+
+macro_rules! ptq1_row_source_asm {
+    ($p:literal, $dst_vec:literal, $dst_lane:literal, $step4:literal) => {
+        concat!(
+            "ldr q26, [{", $p, "}], #16\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v30.16b, v26.16b, v21.16b\n",
+            "movi v2.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "cmhi v29.16b, v19.16b, v30.16b\n",
+            "cmhi v31.16b, v30.16b, v20.16b\n",
+            "sdot v2.4s, v28.16b, v8.16b\n",
+            "mul v26.16b, v30.16b, v21.16b\n",
+            "sub v29.16b, v29.16b, v31.16b\n",
+            "sdot v2.4s, v29.16b, v9.16b\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v30.16b, v26.16b, v21.16b\n",
+            "movi v3.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "cmhi v29.16b, v19.16b, v30.16b\n",
+            "cmhi v31.16b, v30.16b, v20.16b\n",
+            "sdot v3.4s, v28.16b, v10.16b\n",
+            "mul v26.16b, v30.16b, v21.16b\n",
+            "sub v29.16b, v29.16b, v31.16b\n",
+            "sdot v3.4s, v29.16b, v11.16b\n",
+            "ld1r {{v30.2d}}, [{", $p, "}], #8\n",
+            "ld1r {{v31.4h}}, [{", $p, "}], {", $step4, "}\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v26.16b, v30.16b, v22.16b\n",
+            "movi v4.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "cmhi v29.16b, v19.16b, v26.16b\n",
+            "sdot v4.4s, v28.16b, v12.16b\n",
+            "cmhi v28.16b, v26.16b, v20.16b\n",
+            "mul v26.16b, v30.16b, v23.16b\n",
+            "mov v30.d[1], v31.d[0]\n",
+            "sub v29.16b, v29.16b, v28.16b\n",
+            "sdot v4.4s, v29.16b, v13.16b\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v30.16b, v30.16b, v24.16b\n",
+            "movi v5.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "cmhi v29.16b, v19.16b, v30.16b\n",
+            "cmhi v31.16b, v30.16b, v20.16b\n",
+            "sdot v5.4s, v28.16b, v14.16b\n",
+            "sub v29.16b, v29.16b, v31.16b\n",
+            "sdot v5.4s, v29.16b, v15.16b\n",
+            "uzp1 v27.4s, v2.4s, v3.4s\n",
+            "uzp2 v28.4s, v2.4s, v3.4s\n",
+            "uzp1 v29.4s, v4.4s, v5.4s\n",
+            "uzp2 v30.4s, v4.4s, v5.4s\n",
+            "add v27.4s, v27.4s, v28.4s\n",
+            "add v29.4s, v29.4s, v30.4s\n",
+            "uzp1 v2.4s, v27.4s, v29.4s\n",
+            "uzp2 v28.4s, v27.4s, v29.4s\n",
+            "add v2.4s, v2.4s, v28.4s\n",
+            "scvtf v2.4s, v2.4s\n",
+            "fmul v2.4s, v2.4s, v16.4s\n",
+            "movi d28, #0\n",
+            "fadd s28, s28, s2\n",
+            "dup s29, v2.s[1]\n",
+            "fadd s28, s28, s29\n",
+            "dup s29, v2.s[2]\n",
+            "fadd s28, s28, s29\n",
+            "dup s29, v2.s[3]\n",
+            "fadd s28, s28, s29\n",
+            "mov ", $dst_vec, ".s[", $dst_lane, "], v28.s[0]\n",
+        )
+    };
+}
+
+#[inline]
+pub(super) fn ptq1_neg_lane_sums(values: &[i8; 128]) -> [[i32; 4]; 4] {
+    // SAFETY: Baseline NEON is always available on `aarch64`.
+    unsafe { ptq1_neg_lane_sums_neon(values) }
+}
+
 #[inline]
 #[target_feature(enable = "neon")]
-fn ptq1_validate_four_scales_vec(
-    blocks: [&[u8; 28]; 4],
-) -> Option<core::arch::aarch64::float32x4_t> {
-    use core::arch::aarch64::{
-        vand_u16, vcvt_f32_f16, vdup_n_u16, vld1_u16, vmaxv_u16, vreinterpret_f16_u16,
-    };
-    let bits = [
-        ptq1_scale_u16(blocks[0]),
-        ptq1_scale_u16(blocks[1]),
-        ptq1_scale_u16(blocks[2]),
-        ptq1_scale_u16(blocks[3]),
-    ];
-    // SAFETY: `bits` is an initialized 4-element `u16` array; `vld1_u16` requires no alignment.
-    let raw = unsafe { vld1_u16(bits.as_ptr()) };
-    if vmaxv_u16(vand_u16(raw, vdup_n_u16(0x7fff))) >= 0x7c00 {
-        return None;
+fn ptq1_neg_lane_sums_neon(values: &[i8; 128]) -> [[i32; 4]; 4] {
+    let halves = values.as_chunks::<16>().0;
+    let mut out = [[0_i32; 4]; 4];
+    for (g, dst) in out.iter_mut().enumerate() {
+        let s_lo = vpaddlq_s16(vpaddlq_s8(load_s8x16(&halves[2 * g])));
+        let s_hi = vpaddlq_s16(vpaddlq_s8(load_s8x16(&halves[2 * g + 1])));
+        store_s32x4(vnegq_s32(vaddq_s32(s_lo, s_hi)), dst);
     }
-    Some(vcvt_f32_f16(vreinterpret_f16_u16(raw)))
+    out
+}
+
+/// Caller must guarantee `block_count > 0`, every `row_ptrs[r]` covers
+/// `block_count * 28` readable bytes, and `act_ptr` covers `block_count`
+/// `Ptq1Activation` elements.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Register-resident 8-row PTQ1 pinned asm kernel avoids stack spills."
+)]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn ptq1_packed_8rows_pinned_accum(
+    row_ptrs: [*const u8; 8],
+    act_ptr: *const super::Ptq1Activation,
+    block_count: usize,
+    lanes: &mut [[f32; 4]; 8],
+) -> bool {
+    if block_count == 0 {
+        return true;
+    }
+    let pow_mid01 = load_u8x16(&PTQ1_POW3_MID_01);
+    let pow_mid23 = load_u8x16(&PTQ1_POW3_MID_23);
+    let pow_tail = load_u8x16(&PTQ1_POW3_TAIL);
+    let mut l0 = load_f32x4_neon(&lanes[0]);
+    let mut l1 = load_f32x4_neon(&lanes[1]);
+    let mut l2 = load_f32x4_neon(&lanes[2]);
+    let mut l3 = load_f32x4_neon(&lanes[3]);
+    let mut l4 = load_f32x4_neon(&lanes[4]);
+    let mut l5 = load_f32x4_neon(&lanes[5]);
+    let mut l6 = load_f32x4_neon(&lanes[6]);
+    let mut l7 = load_f32x4_neon(&lanes[7]);
+    let p0 = row_ptrs[0];
+    let p1 = row_ptrs[1];
+    let p2 = row_ptrs[2];
+    let p3 = row_ptrs[3];
+    let p4 = row_ptrs[4];
+    let p5 = row_ptrs[5];
+    let p6 = row_ptrs[6];
+    let p7 = row_ptrs[7];
+    let act = act_ptr;
+    let cnt = block_count;
+    let ok: usize;
+
+    // SAFETY: Caller guarantees `row_ptrs[0..8]` and `act_ptr` remain valid for
+    // `block_count` blocks; all clobbered SIMD registers are listed in operands.
+    unsafe {
+        core::arch::asm!(
+            "movi v19.16b, #86",
+            "movi v20.16b, #170",
+            "movi v21.16b, #3",
+            "1:",
+            "ldrh {t0:w}, [{p0}, #26]",
+            "ldrh {t1:w}, [{p1}, #26]",
+            "fmov s17, {t0:w}",
+            "ldrh {t0:w}, [{p4}, #26]",
+            "ins v17.h[1], {t1:w}",
+            "ldrh {t1:w}, [{p5}, #26]",
+            "fmov s18, {t0:w}",
+            "ldrh {t0:w}, [{p2}, #26]",
+            "ins v18.h[1], {t1:w}",
+            "ldrh {t1:w}, [{p3}, #26]",
+            "ins v17.h[2], {t0:w}",
+            "ldrh {t0:w}, [{p6}, #26]",
+            "ins v17.h[3], {t1:w}",
+            "ldrh {t1:w}, [{p7}, #26]",
+            "ins v18.h[2], {t0:w}",
+            "ins v18.h[3], {t1:w}",
+            "mov v28.16b, v17.16b",
+            "mov v28.d[1], v18.d[0]",
+            "bic v28.8h, #0x80, lsl #8",
+            "umaxv h28, v28.8h",
+            "fmov {t0:w}, s28",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "b.hi 2f",
+            "fcvtl v17.4s, v17.4h",
+            "fcvtl v18.4s, v18.4h",
+            "ldr q16, [{act}]",
+            "ldp q8, q9, [{act}, #16]",
+            "ldp q10, q11, [{act}, #48]",
+            "ldp q12, q13, [{act}, #80]",
+            "ldp q14, q15, [{act}, #112]",
+            "add {act}, {act}, #208",
+            ptq1_row_pinned_asm!("p0", "v0", "v17", "0", "step4"),
+            ptq1_row_pinned_asm!("p1", "v1", "v17", "1", "step4"),
+            ptq1_row_pinned_asm!("p2", "v2", "v17", "2", "step4"),
+            ptq1_row_pinned_asm!("p3", "v3", "v17", "3", "step4"),
+            ptq1_row_pinned_asm!("p4", "v4", "v18", "0", "step4"),
+            ptq1_row_pinned_asm!("p5", "v5", "v18", "1", "step4"),
+            ptq1_row_pinned_asm!("p6", "v6", "v18", "2", "step4"),
+            ptq1_row_pinned_asm!("p7", "v7", "v18", "3", "step4"),
+            "subs {cnt}, {cnt}, #1",
+            "b.ne 1b",
+            "mov {ok}, #1",
+            "b 3f",
+            "2:",
+            "mov {ok}, #0",
+            "3:",
+            p0 = inout(reg) p0 => _,
+            p1 = inout(reg) p1 => _,
+            p2 = inout(reg) p2 => _,
+            p3 = inout(reg) p3 => _,
+            p4 = inout(reg) p4 => _,
+            p5 = inout(reg) p5 => _,
+            p6 = inout(reg) p6 => _,
+            p7 = inout(reg) p7 => _,
+            act = inout(reg) act => _,
+            cnt = inout(reg) cnt => _,
+            step4 = in(reg) 4_usize,
+            t0 = out(reg) _,
+            t1 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") l0,
+            inout("v1") l1,
+            inout("v2") l2,
+            inout("v3") l3,
+            inout("v4") l4,
+            inout("v5") l5,
+            inout("v6") l6,
+            inout("v7") l7,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            in("v22") pow_mid01,
+            in("v23") pow_mid23,
+            in("v24") pow_tail,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return false;
+    }
+    store_f32x4_neon(l0, &mut lanes[0]);
+    store_f32x4_neon(l1, &mut lanes[1]);
+    store_f32x4_neon(l2, &mut lanes[2]);
+    store_f32x4_neon(l3, &mut lanes[3]);
+    store_f32x4_neon(l4, &mut lanes[4]);
+    store_f32x4_neon(l5, &mut lanes[5]);
+    store_f32x4_neon(l6, &mut lanes[6]);
+    store_f32x4_neon(l7, &mut lanes[7]);
+    true
+}
+
+macro_rules! ptq1_row_pinned_fast_asm {
+    ($p:literal, $lane:literal, $rs_lane:literal, $qh_lane:literal) => {
+        concat!(
+            "ldr q26, [{",
+            $p,
+            "}]\n",
+            "ldr d30, [{",
+            $p,
+            "}, #16]\n",
+            "fmul v25.4s, v16.4s, v17.s[",
+            $rs_lane,
+            "]\n",
+            "add {",
+            $p,
+            "}, {",
+            $p,
+            "}, #28\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "mul v27.16b, v26.16b, v21.16b\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "mul v29.16b, v26.16b, v4.16b\n",
+            "movi v31.2d, #0\n",
+            "sdot v31.4s, v28.16b, v8.16b\n",
+            "cmhi v28.16b, v19.16b, v27.16b\n",
+            "cmhi v27.16b, v27.16b, v20.16b\n",
+            "sub v28.16b, v28.16b, v27.16b\n",
+            "mul v27.16b, v26.16b, v5.16b\n",
+            "mul v26.16b, v26.16b, v6.16b\n",
+            "sdot v31.4s, v28.16b, v9.16b\n",
+            "scvtf v31.4s, v31.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v31.4s, v25.s[0]\n",
+            "cmhi v28.16b, v19.16b, v29.16b\n",
+            "cmhi v29.16b, v29.16b, v20.16b\n",
+            "movi v31.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "sdot v31.4s, v28.16b, v10.16b\n",
+            "cmhi v28.16b, v19.16b, v27.16b\n",
+            "cmhi v29.16b, v27.16b, v20.16b\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "dup v30.2d, v30.d[0]\n",
+            "sdot v31.4s, v28.16b, v11.16b\n",
+            "scvtf v31.4s, v31.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v31.4s, v25.s[1]\n",
+            "mul v27.16b, v30.16b, v22.16b\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "movi v31.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "mul v26.16b, v30.16b, v23.16b\n",
+            "sdot v31.4s, v28.16b, v12.16b\n",
+            "cmhi v28.16b, v19.16b, v27.16b\n",
+            "cmhi v29.16b, v27.16b, v20.16b\n",
+            "dup v27.4h, v18.h[",
+            $qh_lane,
+            "]\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "mov v30.d[1], v27.d[0]\n",
+            "sdot v31.4s, v28.16b, v13.16b\n",
+            "scvtf v31.4s, v31.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v31.4s, v25.s[2]\n",
+            "mul v30.16b, v30.16b, v24.16b\n",
+            "cmhi v28.16b, v19.16b, v26.16b\n",
+            "cmhi v29.16b, v26.16b, v20.16b\n",
+            "movi v31.2d, #0\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "sdot v31.4s, v28.16b, v14.16b\n",
+            "cmhi v28.16b, v19.16b, v30.16b\n",
+            "cmhi v29.16b, v30.16b, v20.16b\n",
+            "sub v28.16b, v28.16b, v29.16b\n",
+            "sdot v31.4s, v28.16b, v15.16b\n",
+            "scvtf v31.4s, v31.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v31.4s, v25.s[3]\n",
+        )
+    };
+}
+
+/// Caller must guarantee `block_count > 0`, every `row_ptrs[r]` covers
+/// `block_count * 28` readable bytes, and `act_ptr` covers `block_count`
+/// `Ptq1Activation` elements.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Register-resident 4-row PTQ1 pinned asm kernel avoids stack spills."
+)]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn ptq1_packed_4rows_pinned_accum(
+    row_ptrs: [*const u8; 4],
+    act_ptr: *const super::Ptq1Activation,
+    block_count: usize,
+    lanes: &mut [[f32; 4]; 4],
+) -> bool {
+    if block_count == 0 {
+        return true;
+    }
+    let pow_mid01 = load_u8x16(&PTQ1_POW3_MID_01);
+    let pow_mid23 = load_u8x16(&PTQ1_POW3_MID_23);
+    let pow_tail = load_u8x16(&PTQ1_POW3_TAIL);
+    let mut l0 = load_f32x4_neon(&lanes[0]);
+    let mut l1 = load_f32x4_neon(&lanes[1]);
+    let mut l2 = load_f32x4_neon(&lanes[2]);
+    let mut l3 = load_f32x4_neon(&lanes[3]);
+    let p0 = row_ptrs[0];
+    let p1 = row_ptrs[1];
+    let p2 = row_ptrs[2];
+    let p3 = row_ptrs[3];
+    let act = act_ptr;
+    let cnt = block_count;
+    let ok: usize;
+
+    // SAFETY: Caller guarantees `row_ptrs[0..4]` and `act_ptr` remain valid for
+    // `block_count` blocks; all clobbered SIMD registers are listed in operands.
+    unsafe {
+        core::arch::asm!(
+            "movi v4.16b, #9",
+            "movi v5.16b, #27",
+            "movi v6.16b, #81",
+            "movi v7.2d, #0",
+            "movi v19.16b, #86",
+            "movi v20.16b, #170",
+            "movi v21.16b, #3",
+            "1:",
+            "ldr s28, [{p0}, #24]",
+            "ldr s29, [{p1}, #24]",
+            "ldr s30, [{p2}, #24]",
+            "ldr s31, [{p3}, #24]",
+            "trn1 v28.2s, v28.2s, v29.2s",
+            "trn1 v30.2s, v30.2s, v31.2s",
+            "uzp1 v18.4h, v28.4h, v30.4h",
+            "uzp2 v17.4h, v28.4h, v30.4h",
+            "fmov d28, d17",
+            "bic v28.4h, #0x80, lsl #8",
+            "umax v7.4h, v7.4h, v28.4h",
+            "fcvtl v17.4s, v17.4h",
+            "ldr q16, [{act}]",
+            "ldp q8, q9, [{act}, #16]",
+            "ldp q10, q11, [{act}, #48]",
+            "ldp q12, q13, [{act}, #80]",
+            "ldp q14, q15, [{act}, #112]",
+            "add {act}, {act}, #208",
+            ptq1_row_pinned_fast_asm!("p0", "v0", "0", "0"),
+            ptq1_row_pinned_fast_asm!("p1", "v1", "1", "1"),
+            ptq1_row_pinned_fast_asm!("p2", "v2", "2", "2"),
+            ptq1_row_pinned_fast_asm!("p3", "v3", "3", "3"),
+            "subs {cnt}, {cnt}, #1",
+            "b.ne 1b",
+            "umaxv h28, v7.4h",
+            "fmov {t0:w}, s28",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "cset {ok}, ls",
+            p0 = inout(reg) p0 => _,
+            p1 = inout(reg) p1 => _,
+            p2 = inout(reg) p2 => _,
+            p3 = inout(reg) p3 => _,
+            act = inout(reg) act => _,
+            cnt = inout(reg) cnt => _,
+            t0 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") l0,
+            inout("v1") l1,
+            inout("v2") l2,
+            inout("v3") l3,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v7") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            in("v22") pow_mid01,
+            in("v23") pow_mid23,
+            in("v24") pow_tail,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return false;
+    }
+    store_f32x4_neon(l0, &mut lanes[0]);
+    store_f32x4_neon(l1, &mut lanes[1]);
+    store_f32x4_neon(l2, &mut lanes[2]);
+    store_f32x4_neon(l3, &mut lanes[3]);
+    true
+}
+
+/// Caller must guarantee `block_count > 0`, `row_ptr` covers `block_count * 28`
+/// readable bytes, and `act_ptr` covers `block_count` `Ptq1Activation` elements.
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn ptq1_packed_1row_pinned_accum(
+    row_ptr: *const u8,
+    act_ptr: *const super::Ptq1Activation,
+    block_count: usize,
+    lanes: &mut [f32; 4],
+) -> bool {
+    if block_count == 0 {
+        return true;
+    }
+    let pow_mid01 = load_u8x16(&PTQ1_POW3_MID_01);
+    let pow_mid23 = load_u8x16(&PTQ1_POW3_MID_23);
+    let pow_tail = load_u8x16(&PTQ1_POW3_TAIL);
+    let mut l0 = load_f32x4_neon(lanes);
+    let p0 = row_ptr;
+    let act = act_ptr;
+    let cnt = block_count;
+    let ok: usize;
+
+    // SAFETY: Caller guarantees `row_ptr` and `act_ptr` remain valid for
+    // `block_count` blocks; all clobbered SIMD registers are listed in operands.
+    unsafe {
+        core::arch::asm!(
+            "movi v19.16b, #86",
+            "movi v20.16b, #170",
+            "movi v21.16b, #3",
+            "1:",
+            "add {t0}, {p0}, #26",
+            "ldr h17, [{t0}]",
+            "umov {t0:w}, v17.h[0]",
+            "and {t0:w}, {t0:w}, #0x7fff",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "b.hi 2f",
+            "fcvtl v17.4s, v17.4h",
+            "ldr q16, [{act}]",
+            "ldp q8, q9, [{act}, #16]",
+            "ldp q10, q11, [{act}, #48]",
+            "ldp q12, q13, [{act}, #80]",
+            "ldp q14, q15, [{act}, #112]",
+            "add {act}, {act}, #208",
+            ptq1_row_pinned_asm!("p0", "v0", "v17", "0", "step4"),
+            "subs {cnt}, {cnt}, #1",
+            "b.ne 1b",
+            "mov {ok}, #1",
+            "b 3f",
+            "2:",
+            "mov {ok}, #0",
+            "3:",
+            p0 = inout(reg) p0 => _,
+            act = inout(reg) act => _,
+            cnt = inout(reg) cnt => _,
+            step4 = in(reg) 4_usize,
+            t0 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") l0,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            in("v22") pow_mid01,
+            in("v23") pow_mid23,
+            in("v24") pow_tail,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return false;
+    }
+    store_f32x4_neon(l0, lanes);
+    true
+}
+
+/// Caller must guarantee `block_count > 0`, every `row_ptrs[r]` covers
+/// `block_count * 28` readable bytes, and `act_ptr` covers `block_count`
+/// `Ptq1Activation` elements.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Register-resident 8-row PTQ1 source asm kernel avoids stack spills."
+)]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn ptq1_packed_8rows_source_accum(
+    row_ptrs: [*const u8; 8],
+    act_ptr: *const super::Ptq1Activation,
+    block_count: usize,
+    sums: &mut [f32; 8],
+) -> bool {
+    if block_count == 0 {
+        return true;
+    }
+    let pow_mid01 = load_u8x16(&PTQ1_POW3_MID_01);
+    let pow_mid23 = load_u8x16(&PTQ1_POW3_MID_23);
+    let pow_tail = load_u8x16(&PTQ1_POW3_TAIL);
+    let [sum_lo_arr, sum_hi_arr] = sums.as_chunks::<4>().0 else {
+        return false;
+    };
+    let mut sum_lo = load_f32x4_neon(sum_lo_arr);
+    let mut sum_hi = load_f32x4_neon(sum_hi_arr);
+    let p0 = row_ptrs[0];
+    let p1 = row_ptrs[1];
+    let p2 = row_ptrs[2];
+    let p3 = row_ptrs[3];
+    let p4 = row_ptrs[4];
+    let p5 = row_ptrs[5];
+    let p6 = row_ptrs[6];
+    let p7 = row_ptrs[7];
+    let act = act_ptr;
+    let cnt = block_count;
+    let ok: usize;
+
+    // SAFETY: Caller guarantees `row_ptrs[0..8]` and `act_ptr` remain valid for
+    // `block_count` blocks; all clobbered SIMD registers are listed in operands.
+    unsafe {
+        core::arch::asm!(
+            "movi v19.16b, #86",
+            "movi v20.16b, #170",
+            "movi v21.16b, #3",
+            "1:",
+            "ldrh {t0:w}, [{p0}, #26]",
+            "ldrh {t1:w}, [{p1}, #26]",
+            "fmov s17, {t0:w}",
+            "ldrh {t0:w}, [{p4}, #26]",
+            "ins v17.h[1], {t1:w}",
+            "ldrh {t1:w}, [{p5}, #26]",
+            "fmov s18, {t0:w}",
+            "ldrh {t0:w}, [{p2}, #26]",
+            "ins v18.h[1], {t1:w}",
+            "ldrh {t1:w}, [{p3}, #26]",
+            "ins v17.h[2], {t0:w}",
+            "ldrh {t0:w}, [{p6}, #26]",
+            "ins v17.h[3], {t1:w}",
+            "ldrh {t1:w}, [{p7}, #26]",
+            "ins v18.h[2], {t0:w}",
+            "ins v18.h[3], {t1:w}",
+            "mov v28.16b, v17.16b",
+            "mov v28.d[1], v18.d[0]",
+            "bic v28.8h, #0x80, lsl #8",
+            "umaxv h28, v28.8h",
+            "fmov {t0:w}, s28",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "b.hi 2f",
+            "fcvtl v17.4s, v17.4h",
+            "fcvtl v18.4s, v18.4h",
+            "ldr q16, [{act}]",
+            "ldp q8, q9, [{act}, #16]",
+            "ldp q10, q11, [{act}, #48]",
+            "ldp q12, q13, [{act}, #80]",
+            "ldp q14, q15, [{act}, #112]",
+            "add {act}, {act}, #208",
+            ptq1_row_source_asm!("p0", "v6", "0", "step4"),
+            ptq1_row_source_asm!("p1", "v6", "1", "step4"),
+            ptq1_row_source_asm!("p2", "v6", "2", "step4"),
+            ptq1_row_source_asm!("p3", "v6", "3", "step4"),
+            "fmul v6.4s, v6.4s, v17.4s",
+            "fadd v0.4s, v0.4s, v6.4s",
+            ptq1_row_source_asm!("p4", "v6", "0", "step4"),
+            ptq1_row_source_asm!("p5", "v6", "1", "step4"),
+            ptq1_row_source_asm!("p6", "v6", "2", "step4"),
+            ptq1_row_source_asm!("p7", "v6", "3", "step4"),
+            "fmul v6.4s, v6.4s, v18.4s",
+            "fadd v1.4s, v1.4s, v6.4s",
+            "subs {cnt}, {cnt}, #1",
+            "b.ne 1b",
+            "mov {ok}, #1",
+            "b 3f",
+            "2:",
+            "mov {ok}, #0",
+            "3:",
+            p0 = inout(reg) p0 => _,
+            p1 = inout(reg) p1 => _,
+            p2 = inout(reg) p2 => _,
+            p3 = inout(reg) p3 => _,
+            p4 = inout(reg) p4 => _,
+            p5 = inout(reg) p5 => _,
+            p6 = inout(reg) p6 => _,
+            p7 = inout(reg) p7 => _,
+            act = inout(reg) act => _,
+            cnt = inout(reg) cnt => _,
+            step4 = in(reg) 4_usize,
+            t0 = out(reg) _,
+            t1 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") sum_lo,
+            inout("v1") sum_hi,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            in("v22") pow_mid01,
+            in("v23") pow_mid23,
+            in("v24") pow_tail,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return false;
+    }
+    let out_halves = sums.as_chunks_mut::<4>().0;
+    store_f32x4_neon(sum_lo, &mut out_halves[0]);
+    store_f32x4_neon(sum_hi, &mut out_halves[1]);
+    true
+}
+
+/// Caller must guarantee `block_count > 0`, every `row_ptrs[r]` covers
+/// `block_count * 28` readable bytes, and `act_ptr` covers `block_count`
+/// `Ptq1Activation` elements.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Register-resident 4-row PTQ1 source asm kernel avoids stack spills."
+)]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn ptq1_packed_4rows_source_accum(
+    row_ptrs: [*const u8; 4],
+    act_ptr: *const super::Ptq1Activation,
+    block_count: usize,
+    sums: &mut [f32; 4],
+) -> bool {
+    if block_count == 0 {
+        return true;
+    }
+    let pow_mid01 = load_u8x16(&PTQ1_POW3_MID_01);
+    let pow_mid23 = load_u8x16(&PTQ1_POW3_MID_23);
+    let pow_tail = load_u8x16(&PTQ1_POW3_TAIL);
+    let mut sum_v = load_f32x4_neon(sums);
+    let p0 = row_ptrs[0];
+    let p1 = row_ptrs[1];
+    let p2 = row_ptrs[2];
+    let p3 = row_ptrs[3];
+    let act = act_ptr;
+    let cnt = block_count;
+    let ok: usize;
+
+    // SAFETY: Caller guarantees `row_ptrs[0..4]` and `act_ptr` remain valid for
+    // `block_count` blocks; all clobbered SIMD registers are listed in operands.
+    unsafe {
+        core::arch::asm!(
+            "movi v19.16b, #86",
+            "movi v20.16b, #170",
+            "movi v21.16b, #3",
+            "1:",
+            "ldrh {t0:w}, [{p0}, #26]",
+            "ldrh {t1:w}, [{p1}, #26]",
+            "fmov s17, {t0:w}",
+            "ldrh {t0:w}, [{p2}, #26]",
+            "ins v17.h[1], {t1:w}",
+            "ldrh {t1:w}, [{p3}, #26]",
+            "ins v17.h[2], {t0:w}",
+            "ins v17.h[3], {t1:w}",
+            "fmov d28, d17",
+            "bic v28.4h, #0x80, lsl #8",
+            "umaxv h28, v28.4h",
+            "fmov {t0:w}, s28",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "b.hi 2f",
+            "fcvtl v17.4s, v17.4h",
+            "ldr q16, [{act}]",
+            "ldp q8, q9, [{act}, #16]",
+            "ldp q10, q11, [{act}, #48]",
+            "ldp q12, q13, [{act}, #80]",
+            "ldp q14, q15, [{act}, #112]",
+            "add {act}, {act}, #208",
+            ptq1_row_source_asm!("p0", "v6", "0", "step4"),
+            ptq1_row_source_asm!("p1", "v6", "1", "step4"),
+            ptq1_row_source_asm!("p2", "v6", "2", "step4"),
+            ptq1_row_source_asm!("p3", "v6", "3", "step4"),
+            "fmul v6.4s, v6.4s, v17.4s",
+            "fadd v0.4s, v0.4s, v6.4s",
+            "subs {cnt}, {cnt}, #1",
+            "b.ne 1b",
+            "mov {ok}, #1",
+            "b 3f",
+            "2:",
+            "mov {ok}, #0",
+            "3:",
+            p0 = inout(reg) p0 => _,
+            p1 = inout(reg) p1 => _,
+            p2 = inout(reg) p2 => _,
+            p3 = inout(reg) p3 => _,
+            act = inout(reg) act => _,
+            cnt = inout(reg) cnt => _,
+            step4 = in(reg) 4_usize,
+            t0 = out(reg) _,
+            t1 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") sum_v,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            in("v22") pow_mid01,
+            in("v23") pow_mid23,
+            in("v24") pow_tail,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return false;
+    }
+    store_f32x4_neon(sum_v, sums);
+    true
+}
+
+/// Caller must guarantee `block_count > 0`, `row_ptr` covers `block_count * 28`
+/// readable bytes, and `act_ptr` covers `block_count` `Ptq1Activation` elements.
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn ptq1_packed_1row_source_accum(
+    row_ptr: *const u8,
+    act_ptr: *const super::Ptq1Activation,
+    block_count: usize,
+    sum: &mut f32,
+) -> bool {
+    if block_count == 0 {
+        return true;
+    }
+    let pow_mid01 = load_u8x16(&PTQ1_POW3_MID_01);
+    let pow_mid23 = load_u8x16(&PTQ1_POW3_MID_23);
+    let pow_tail = load_u8x16(&PTQ1_POW3_TAIL);
+    let mut sum_buf = [*sum, 0.0, 0.0, 0.0];
+    let mut sum_v = load_f32x4_neon(&sum_buf);
+    let p0 = row_ptr;
+    let act = act_ptr;
+    let cnt = block_count;
+    let ok: usize;
+
+    // SAFETY: Caller guarantees `row_ptr` and `act_ptr` remain valid for
+    // `block_count` blocks; all clobbered SIMD registers are listed in operands.
+    unsafe {
+        core::arch::asm!(
+            "movi v19.16b, #86",
+            "movi v20.16b, #170",
+            "movi v21.16b, #3",
+            "1:",
+            "add {t0}, {p0}, #26",
+            "ldr h17, [{t0}]",
+            "umov {t0:w}, v17.h[0]",
+            "and {t0:w}, {t0:w}, #0x7fff",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "b.hi 2f",
+            "fcvtl v17.4s, v17.4h",
+            "ldr q16, [{act}]",
+            "ldp q8, q9, [{act}, #16]",
+            "ldp q10, q11, [{act}, #48]",
+            "ldp q12, q13, [{act}, #80]",
+            "ldp q14, q15, [{act}, #112]",
+            "add {act}, {act}, #208",
+            ptq1_row_source_asm!("p0", "v6", "0", "step4"),
+            "fmul s6, s6, s17",
+            "fadd s0, s0, s6",
+            "subs {cnt}, {cnt}, #1",
+            "b.ne 1b",
+            "mov {ok}, #1",
+            "b 3f",
+            "2:",
+            "mov {ok}, #0",
+            "3:",
+            p0 = inout(reg) p0 => _,
+            act = inout(reg) act => _,
+            cnt = inout(reg) cnt => _,
+            step4 = in(reg) 4_usize,
+            t0 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") sum_v,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            in("v22") pow_mid01,
+            in("v23") pow_mid23,
+            in("v24") pow_tail,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return false;
+    }
+    store_f32x4_neon(sum_v, &mut sum_buf);
+    *sum = sum_buf[0];
+    true
+}
+
+macro_rules! ptq1_row_pinned_sve_asm {
+    ($p:literal, $lane:literal, $rs_reg:literal, $rs_lane:literal, $row_idx:literal) => {
+        concat!(
+            "ldr q26, [{",
+            $p,
+            "}], #16\n",
+            "fmul v25.4s, v16.4s, ",
+            $rs_reg,
+            ".s[",
+            $rs_lane,
+            "]\n",
+            "shl v28.16b, v26.16b, #1\n",
+            "shl v29.16b, v26.16b, #3\n",
+            "add v28.16b, v28.16b, v26.16b\n",
+            "add v29.16b, v29.16b, v26.16b\n",
+            "mov v27.16b, v30.16b\n",
+            "umulh z26.b, p0/m, z26.b, z21.b\n",
+            "umulh z28.b, p0/m, z28.b, z21.b\n",
+            "sdot v27.4s, v26.16b, v8.16b\n",
+            "sdot v27.4s, v28.16b, v9.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[0]\n",
+            "shl v28.16b, v29.16b, #1\n",
+            "shl v26.16b, v29.16b, #3\n",
+            "add v28.16b, v28.16b, v29.16b\n",
+            "add v26.16b, v26.16b, v29.16b\n",
+            "mov v27.16b, v31.16b\n",
+            "umulh z29.b, p0/m, z29.b, z21.b\n",
+            "umulh z28.b, p0/m, z28.b, z21.b\n",
+            "sdot v27.4s, v29.16b, v10.16b\n",
+            "sdot v27.4s, v28.16b, v11.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[1]\n",
+            "ldr d28, [{",
+            $p,
+            "}], #12\n",
+            "dup v28.2d, v28.d[0]\n",
+            "mul v29.16b, v28.16b, v22.16b\n",
+            "ldr q27, [{act}, #176]\n",
+            "umulh z26.b, p0/m, z26.b, z21.b\n",
+            "umulh z29.b, p0/m, z29.b, z21.b\n",
+            "sdot v27.4s, v26.16b, v12.16b\n",
+            "sdot v27.4s, v29.16b, v13.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[2]\n",
+            "mul v26.16b, v28.16b, v23.16b\n",
+            "dup v29.4h, v20.h[",
+            $row_idx,
+            "]\n",
+            "mov v28.d[1], v29.d[0]\n",
+            "mul v28.16b, v28.16b, v24.16b\n",
+            "ldr q27, [{act}, #192]\n",
+            "umulh z26.b, p0/m, z26.b, z21.b\n",
+            "umulh z28.b, p0/m, z28.b, z21.b\n",
+            "sdot v27.4s, v26.16b, v14.16b\n",
+            "sdot v27.4s, v28.16b, v15.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[3]\n",
+        )
+    };
+}
+
+macro_rules! ptq1_8rows_pinned_sve_block_asm {
+    () => {
+        concat!(
+            "ldr q16, [{act}]\n",
+            "ldp q8, q9, [{act}, #16]\n",
+            "ldp q10, q11, [{act}, #48]\n",
+            "ldp q12, q13, [{act}, #80]\n",
+            "ldp q14, q15, [{act}, #112]\n",
+            "ldp q30, q31, [{act}, #144]\n",
+            "ldr s25, [{p0}, #24]\n",
+            "ldr s26, [{p1}, #24]\n",
+            "ldr s27, [{p2}, #24]\n",
+            "ldr s28, [{p3}, #24]\n",
+            "trn1 v25.4s, v25.4s, v26.4s\n",
+            "trn1 v27.4s, v27.4s, v28.4s\n",
+            "trn1 v25.2d, v25.2d, v27.2d\n",
+            "ldr s26, [{p4}, #24]\n",
+            "ldr s27, [{p5}, #24]\n",
+            "ldr s28, [{p6}, #24]\n",
+            "ldr s29, [{p7}, #24]\n",
+            "trn1 v26.4s, v26.4s, v27.4s\n",
+            "trn1 v28.4s, v28.4s, v29.4s\n",
+            "trn1 v26.2d, v26.2d, v28.2d\n",
+            "uzp1 v20.8h, v25.8h, v26.8h\n",
+            "uzp2 v28.8h, v25.8h, v26.8h\n",
+            "fcvtl v17.4s, v28.4h\n",
+            "fcvtl2 v18.4s, v28.8h\n",
+            "bic v28.8h, #0x80, lsl #8\n",
+            "umax v19.8h, v19.8h, v28.8h\n",
+            ptq1_row_pinned_sve_asm!("p0", "v0", "v17", "0", "0"),
+            ptq1_row_pinned_sve_asm!("p1", "v1", "v17", "1", "1"),
+            ptq1_row_pinned_sve_asm!("p2", "v2", "v17", "2", "2"),
+            ptq1_row_pinned_sve_asm!("p3", "v3", "v17", "3", "3"),
+            ptq1_row_pinned_sve_asm!("p4", "v4", "v18", "0", "4"),
+            ptq1_row_pinned_sve_asm!("p5", "v5", "v18", "1", "5"),
+            ptq1_row_pinned_sve_asm!("p6", "v6", "v18", "2", "6"),
+            ptq1_row_pinned_sve_asm!("p7", "v7", "v18", "3", "7"),
+            "add {act}, {act}, #208\n",
+        )
+    };
+}
+
+macro_rules! ptq1_row_pinned_4sve_asm {
+    ($p:literal, $lane:literal, $row_idx:literal) => {
+        concat!(
+            "ldr q26, [{",
+            $p,
+            "}], #16\n",
+            "fmul v25.4s, v16.4s, v17.s[",
+            $row_idx,
+            "]\n",
+            "shl v28.16b, v26.16b, #1\n",
+            "shl v29.16b, v26.16b, #3\n",
+            "add v28.16b, v28.16b, v26.16b\n",
+            "add v29.16b, v29.16b, v26.16b\n",
+            "mov v27.16b, v4.16b\n",
+            "umulh z26.b, p0/m, z26.b, z21.b\n",
+            "umulh z28.b, p0/m, z28.b, z21.b\n",
+            "sdot v27.4s, v26.16b, v8.16b\n",
+            "sdot v27.4s, v28.16b, v9.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[0]\n",
+            "shl v28.16b, v29.16b, #1\n",
+            "shl v26.16b, v29.16b, #3\n",
+            "add v28.16b, v28.16b, v29.16b\n",
+            "add v26.16b, v26.16b, v29.16b\n",
+            "mov v27.16b, v5.16b\n",
+            "umulh z29.b, p0/m, z29.b, z21.b\n",
+            "umulh z28.b, p0/m, z28.b, z21.b\n",
+            "sdot v27.4s, v29.16b, v10.16b\n",
+            "sdot v27.4s, v28.16b, v11.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[1]\n",
+            "ldr d28, [{",
+            $p,
+            "}], #12\n",
+            "dup v28.2d, v28.d[0]\n",
+            "mul v29.16b, v28.16b, v22.16b\n",
+            "mov v27.16b, v6.16b\n",
+            "umulh z26.b, p0/m, z26.b, z21.b\n",
+            "umulh z29.b, p0/m, z29.b, z21.b\n",
+            "sdot v27.4s, v26.16b, v12.16b\n",
+            "sdot v27.4s, v29.16b, v13.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[2]\n",
+            "mul v26.16b, v28.16b, v23.16b\n",
+            "dup v29.4h, v20.h[",
+            $row_idx,
+            "]\n",
+            "mov v28.d[1], v29.d[0]\n",
+            "mul v28.16b, v28.16b, v24.16b\n",
+            "mov v27.16b, v7.16b\n",
+            "umulh z26.b, p0/m, z26.b, z21.b\n",
+            "umulh z28.b, p0/m, z28.b, z21.b\n",
+            "sdot v27.4s, v26.16b, v14.16b\n",
+            "sdot v27.4s, v28.16b, v15.16b\n",
+            "scvtf v27.4s, v27.4s\n",
+            "fmla ",
+            $lane,
+            ".4s, v27.4s, v25.s[3]\n",
+        )
+    };
+}
+
+macro_rules! ptq1_4rows_pinned_sve_block_asm {
+    () => {
+        concat!(
+            "ldr q16, [{act}]\n",
+            "ldp q8, q9, [{act}, #16]\n",
+            "ldp q10, q11, [{act}, #48]\n",
+            "ldp q12, q13, [{act}, #80]\n",
+            "ldp q14, q15, [{act}, #112]\n",
+            "ldp q4, q5, [{act}, #144]\n",
+            "ldp q6, q7, [{act}, #176]\n",
+            "add {act}, {act}, #208\n",
+            "ldr s25, [{p0}, #24]\n",
+            "ldr s26, [{p1}, #24]\n",
+            "ldr s27, [{p2}, #24]\n",
+            "ldr s28, [{p3}, #24]\n",
+            "trn1 v25.2s, v25.2s, v26.2s\n",
+            "trn1 v27.2s, v27.2s, v28.2s\n",
+            "uzp1 v20.4h, v25.4h, v27.4h\n",
+            "uzp2 v28.4h, v25.4h, v27.4h\n",
+            "fcvtl v17.4s, v28.4h\n",
+            "bic v28.4h, #0x80, lsl #8\n",
+            "umax v19.4h, v19.4h, v28.4h\n",
+            ptq1_row_pinned_4sve_asm!("p0", "v0", "0"),
+            ptq1_row_pinned_4sve_asm!("p1", "v1", "1"),
+            ptq1_row_pinned_4sve_asm!("p2", "v2", "2"),
+            ptq1_row_pinned_4sve_asm!("p3", "v3", "3"),
+        )
+    };
+}
+
+/// Caller must guarantee `has_sve()` and `dotprod`, `block_count > 0`, every
+/// `row_ptrs[r]` covers `block_count * 28` readable bytes, and `act_ptr` covers
+/// `block_count` `Ptq1Activation` elements.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Non-streaming SVE+NEON 8-row PTQ1 pinned asm kernel avoids stack spills."
+)]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn ptq1_packed_8rows_pinned_sve(
+    row_ptrs: [*const u8; 8],
+    act_ptr: *const super::Ptq1Activation,
+    block_count: usize,
+    lanes: &mut [[f32; 4]; 8],
+) -> bool {
+    if block_count == 0 {
+        return true;
+    }
+    let pow_mid01 = load_u8x16(&PTQ1_POW3_MID_01);
+    let pow_mid23 = load_u8x16(&PTQ1_POW3_MID_23);
+    let pow_tail = load_u8x16(&PTQ1_POW3_TAIL);
+    let mut l0 = load_f32x4_neon(&lanes[0]);
+    let mut l1 = load_f32x4_neon(&lanes[1]);
+    let mut l2 = load_f32x4_neon(&lanes[2]);
+    let mut l3 = load_f32x4_neon(&lanes[3]);
+    let mut l4 = load_f32x4_neon(&lanes[4]);
+    let mut l5 = load_f32x4_neon(&lanes[5]);
+    let mut l6 = load_f32x4_neon(&lanes[6]);
+    let mut l7 = load_f32x4_neon(&lanes[7]);
+    let p0 = row_ptrs[0];
+    let p1 = row_ptrs[1];
+    let p2 = row_ptrs[2];
+    let p3 = row_ptrs[3];
+    let p4 = row_ptrs[4];
+    let p5 = row_ptrs[5];
+    let p6 = row_ptrs[6];
+    let p7 = row_ptrs[7];
+    let act = act_ptr;
+    let cnt = block_count;
+    let ok: usize;
+
+    // SAFETY: Caller verified non-streaming SVE + dotprod and valid extents
+    // for all 8 rows and activations.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sve",
+            "mov {t0}, #16",
+            "whilelt p0.b, xzr, {t0}",
+            "movi v19.2d, #0",
+            "movi v21.16b, #3",
+            "tst {cnt}, #1",
+            "b.eq 1f",
+            ptq1_8rows_pinned_sve_block_asm!(),
+            "sub {cnt}, {cnt}, #1",
+            "cbz {cnt}, 2f",
+            "1:",
+            "prfm pldl1keep, [{p0}, #112]",
+            "prfm pldl1keep, [{p1}, #112]",
+            "prfm pldl1keep, [{p2}, #112]",
+            "prfm pldl1keep, [{p3}, #112]",
+            "prfm pldl1keep, [{p4}, #112]",
+            "prfm pldl1keep, [{p5}, #112]",
+            "prfm pldl1keep, [{p6}, #112]",
+            "prfm pldl1keep, [{p7}, #112]",
+            ptq1_8rows_pinned_sve_block_asm!(),
+            ptq1_8rows_pinned_sve_block_asm!(),
+            "subs {cnt}, {cnt}, #2",
+            "b.ne 1b",
+            "2:",
+            "umaxv h28, v19.8h",
+            "fmov {t0:w}, s28",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "cset {ok}, ls",
+            p0 = inout(reg) p0 => _,
+            p1 = inout(reg) p1 => _,
+            p2 = inout(reg) p2 => _,
+            p3 = inout(reg) p3 => _,
+            p4 = inout(reg) p4 => _,
+            p5 = inout(reg) p5 => _,
+            p6 = inout(reg) p6 => _,
+            p7 = inout(reg) p7 => _,
+            act = inout(reg) act => _,
+            cnt = inout(reg) cnt => _,
+            t0 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") l0,
+            inout("v1") l1,
+            inout("v2") l2,
+            inout("v3") l3,
+            inout("v4") l4,
+            inout("v5") l5,
+            inout("v6") l6,
+            inout("v7") l7,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            in("v22") pow_mid01,
+            in("v23") pow_mid23,
+            in("v24") pow_tail,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            out("p0") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return false;
+    }
+    store_f32x4_neon(l0, &mut lanes[0]);
+    store_f32x4_neon(l1, &mut lanes[1]);
+    store_f32x4_neon(l2, &mut lanes[2]);
+    store_f32x4_neon(l3, &mut lanes[3]);
+    store_f32x4_neon(l4, &mut lanes[4]);
+    store_f32x4_neon(l5, &mut lanes[5]);
+    store_f32x4_neon(l6, &mut lanes[6]);
+    store_f32x4_neon(l7, &mut lanes[7]);
+    true
+}
+
+/// Caller must guarantee `has_sve()` and `dotprod`, `block_count > 0`, every
+/// `row_ptrs[r]` covers `block_count * 28` readable bytes, and `act_ptr` covers
+/// `block_count` `Ptq1Activation` elements.
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn ptq1_packed_4rows_pinned_sve(
+    row_ptrs: [*const u8; 4],
+    act_ptr: *const super::Ptq1Activation,
+    block_count: usize,
+    lanes: &mut [[f32; 4]; 4],
+) -> bool {
+    if block_count == 0 {
+        return true;
+    }
+    let pow_mid01 = load_u8x16(&PTQ1_POW3_MID_01);
+    let pow_mid23 = load_u8x16(&PTQ1_POW3_MID_23);
+    let pow_tail = load_u8x16(&PTQ1_POW3_TAIL);
+    let mut l0 = load_f32x4_neon(&lanes[0]);
+    let mut l1 = load_f32x4_neon(&lanes[1]);
+    let mut l2 = load_f32x4_neon(&lanes[2]);
+    let mut l3 = load_f32x4_neon(&lanes[3]);
+    let p0 = row_ptrs[0];
+    let p1 = row_ptrs[1];
+    let p2 = row_ptrs[2];
+    let p3 = row_ptrs[3];
+    let act = act_ptr;
+    let cnt = block_count;
+    let ok: usize;
+
+    // SAFETY: Caller verified non-streaming SVE + dotprod and valid extents
+    // for all 4 rows and activations.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sve",
+            "mov {t0}, #16",
+            "whilelt p0.b, xzr, {t0}",
+            "movi v19.2d, #0",
+            "movi v21.16b, #3",
+            "tst {cnt}, #1",
+            "b.eq 1f",
+            ptq1_4rows_pinned_sve_block_asm!(),
+            "sub {cnt}, {cnt}, #1",
+            "cbz {cnt}, 2f",
+            "1:",
+            "prfm pldl1keep, [{p0}, #112]",
+            "prfm pldl1keep, [{p1}, #112]",
+            "prfm pldl1keep, [{p2}, #112]",
+            "prfm pldl1keep, [{p3}, #112]",
+            ptq1_4rows_pinned_sve_block_asm!(),
+            ptq1_4rows_pinned_sve_block_asm!(),
+            "subs {cnt}, {cnt}, #2",
+            "b.ne 1b",
+            "2:",
+            "umaxv h28, v19.4h",
+            "fmov {t0:w}, s28",
+            "lsr {t0:w}, {t0:w}, #10",
+            "cmp {t0:w}, #30",
+            "cset {ok}, ls",
+            p0 = inout(reg) p0 => _,
+            p1 = inout(reg) p1 => _,
+            p2 = inout(reg) p2 => _,
+            p3 = inout(reg) p3 => _,
+            act = inout(reg) act => _,
+            cnt = inout(reg) cnt => _,
+            t0 = out(reg) _,
+            ok = out(reg) ok,
+            inout("v0") l0,
+            inout("v1") l1,
+            inout("v2") l2,
+            inout("v3") l3,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v7") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            in("v22") pow_mid01,
+            in("v23") pow_mid23,
+            in("v24") pow_tail,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            out("p0") _,
+            options(nostack, readonly),
+        );
+    }
+    if ok == 0 {
+        return false;
+    }
+    store_f32x4_neon(l0, &mut lanes[0]);
+    store_f32x4_neon(l1, &mut lanes[1]);
+    store_f32x4_neon(l2, &mut lanes[2]);
+    store_f32x4_neon(l3, &mut lanes[3]);
+    true
 }
 
 #[target_feature(enable = "neon,dotprod")]
-fn ptq1_scaled_1row_pinned_dotprod<A: super::Q8ActivationView>(
-    row_chunks: &[[u8; 28]],
-    activation: &[A],
-) -> Option<f32> {
-    use core::arch::aarch64::{
-        vcvtq_f32_s32, vdup_n_u16, vdupq_n_f32, vfmaq_laneq_f32, vget_low_u8, vmulq_f32,
-    };
-    const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
-    const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
-
-    let c86 = vdupq_n_u8(86);
-    let c171 = vdupq_n_u8(171);
-    let c3 = vdupq_n_u8(3);
-    let c9 = vdupq_n_u8(9);
-    let pow3_mid_01 = load_u8x16(&POW3_MID_01);
-    let pow3_tail = load_u8x16(&POW3_TAIL);
-    let mut lane = vdupq_n_f32(0.0);
-
-    for (block_idx, block) in row_chunks.iter().enumerate() {
-        let rs = ptq1_validate_row_scales(&[block])?[0];
-        let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
-        let a_scales_v = load_f32x4_neon(&[
-            act_groups[0].scale(),
-            act_groups[1].scale(),
-            act_groups[2].scale(),
-            act_groups[3].scale(),
-        ]);
-        let rs_a = vmulq_f32(vdupq_n_f32(rs), a_scales_v);
-
-        let mut q = load_u8x16(&block[..16].as_chunks::<16>().0[0]);
-        let t0 = extract_trit_s8x16_consts(q, c86, c171);
-        q = vmulq_u8(q, c3);
-        let t1 = extract_trit_s8x16_consts(q, c86, c171);
-        let ah0 = act_groups[0].values().as_chunks::<16>().0;
-        let s0 = sdot32_vec(t0, t1, load_s8x16(&ah0[0]), load_s8x16(&ah0[1]));
-        lane = vfmaq_laneq_f32::<0>(lane, vcvtq_f32_s32(s0), rs_a);
-
-        q = vmulq_u8(q, c3);
-        let t2 = extract_trit_s8x16_consts(q, c86, c171);
-        q = vmulq_u8(q, c3);
-        let t3 = extract_trit_s8x16_consts(q, c86, c171);
-        let ah1 = act_groups[1].values().as_chunks::<16>().0;
-        let s1 = sdot32_vec(t2, t3, load_s8x16(&ah1[0]), load_s8x16(&ah1[1]));
-        lane = vfmaq_laneq_f32::<1>(lane, vcvtq_f32_s32(s1), rs_a);
-
-        let t4 = extract_trit_s8x16_consts(vmulq_u8(q, c3), c86, c171);
-        let q_mid_half = load_u8x8(&block[16..24].as_chunks::<8>().0[0]);
-        let qm = vmulq_u8(vcombine_u8(q_mid_half, q_mid_half), pow3_mid_01);
-        let t5 = extract_trit_s8x16_consts(qm, c86, c171);
-        let ah2 = act_groups[2].values().as_chunks::<16>().0;
-        let s2 = sdot32_vec(t4, t5, load_s8x16(&ah2[0]), load_s8x16(&ah2[1]));
-        lane = vfmaq_laneq_f32::<2>(lane, vcvtq_f32_s32(s2), rs_a);
-
-        let t6 = extract_trit_s8x16_consts(vmulq_u8(qm, c9), c86, c171);
-        let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([block[24], block[25]])));
-        let q_tail = vcombine_u8(vget_low_u8(qm), tail_half);
-        let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, pow3_tail), c86, c171);
-        let ah3 = act_groups[3].values().as_chunks::<16>().0;
-        let s3 = sdot32_vec(t6, t7, load_s8x16(&ah3[0]), load_s8x16(&ah3[1]));
-        lane = vfmaq_laneq_f32::<3>(lane, vcvtq_f32_s32(s3), rs_a);
+fn ptq1_packed_rows_pinned_dotprod<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    activation: &[super::Ptq1Activation],
+    sve: bool,
+) -> Option<[f32; ROWS]> {
+    let block_count = activation.len();
+    let act_ptr = activation.as_ptr();
+    let mut out = [0.0_f32; ROWS];
+    if ROWS == 1 {
+        let mut lanes = [0.0_f32; 4];
+        // SAFETY: Safe parent checked `rows[0].len() == block_count * 28`.
+        let ok = unsafe {
+            ptq1_packed_1row_pinned_accum(rows[0].as_ptr(), act_ptr, block_count, &mut lanes)
+        };
+        if !ok {
+            return None;
+        }
+        let val = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        out[0] = val;
+        return val.is_finite().then_some(out);
     }
-
-    let mut l = [0.0_f32; 4];
-    store_f32x4_neon(lane, &mut l);
-    let out = (l[0] + l[1]) + (l[2] + l[3]);
-    out.is_finite().then_some(out)
-}
-
-#[target_feature(enable = "neon,dotprod")]
-fn ptq1_scaled_4rows_pinned_dotprod<A: super::Q8ActivationView>(
-    row_chunks: [&[[u8; 28]]; 4],
-    activation: &[A],
-) -> Option<[f32; 4]> {
-    use core::arch::aarch64::{
-        vcvtq_f32_s32, vdup_n_u16, vdupq_n_f32, vfmaq_laneq_f32, vget_low_u8, vmulq_laneq_f32,
-    };
-    const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
-    const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
-
-    let block_count = row_chunks[0].len();
-    let c86 = vdupq_n_u8(86);
-    let c171 = vdupq_n_u8(171);
-    let c3 = vdupq_n_u8(3);
-    let c9 = vdupq_n_u8(9);
-    let pow3_mid_01 = load_u8x16(&POW3_MID_01);
-    let pow3_tail = load_u8x16(&POW3_TAIL);
-    let mut lanes = [vdupq_n_f32(0.0); 4];
-
-    for block_idx in 0..block_count {
-        prefetch_row_blocks(&row_chunks, block_idx, block_count);
-        let blocks: [&[u8; 28]; 4] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
-        let rs_v = ptq1_validate_four_scales_vec(blocks)?;
-        let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
-        let a_scales_v = load_f32x4_neon(&[
-            act_groups[0].scale(),
-            act_groups[1].scale(),
-            act_groups[2].scale(),
-            act_groups[3].scale(),
-        ]);
-        let rs_a = [
-            vmulq_laneq_f32::<0>(a_scales_v, rs_v),
-            vmulq_laneq_f32::<1>(a_scales_v, rs_v),
-            vmulq_laneq_f32::<2>(a_scales_v, rs_v),
-            vmulq_laneq_f32::<3>(a_scales_v, rs_v),
+    if ROWS == 4 {
+        let mut lanes = [[0.0_f32; 4]; 4];
+        let ptrs = [
+            rows[0].as_ptr(),
+            rows[1].as_ptr(),
+            rows[2].as_ptr(),
+            rows[3].as_ptr(),
         ];
-
-        let mut q = [
-            load_u8x16(&blocks[0][..16].as_chunks::<16>().0[0]),
-            load_u8x16(&blocks[1][..16].as_chunks::<16>().0[0]),
-            load_u8x16(&blocks[2][..16].as_chunks::<16>().0[0]),
-            load_u8x16(&blocks[3][..16].as_chunks::<16>().0[0]),
-        ];
-
-        {
-            let ah = act_groups[0].values().as_chunks::<16>().0;
-            let a0 = load_s8x16(&ah[0]);
-            let a1 = load_s8x16(&ah[1]);
-            for r in 0..4 {
-                let t0 = extract_trit_s8x16_consts(q[r], c86, c171);
-                q[r] = vmulq_u8(q[r], c3);
-                let t1 = extract_trit_s8x16_consts(q[r], c86, c171);
-                let s = sdot32_vec(t0, t1, a0, a1);
-                lanes[r] = vfmaq_laneq_f32::<0>(lanes[r], vcvtq_f32_s32(s), rs_a[r]);
-            }
+        let ok = if sve {
+            // SAFETY: Safe parent checked `rows[0..4]` extents; `sve` was runtime-verified.
+            unsafe { ptq1_packed_4rows_pinned_sve(ptrs, act_ptr, block_count, &mut lanes) }
+        } else {
+            // SAFETY: Safe parent checked `rows[0..4]` each have `block_count * 28` bytes.
+            unsafe { ptq1_packed_4rows_pinned_accum(ptrs, act_ptr, block_count, &mut lanes) }
+        };
+        if !ok {
+            return None;
         }
-
-        {
-            let ah = act_groups[1].values().as_chunks::<16>().0;
-            let a0 = load_s8x16(&ah[0]);
-            let a1 = load_s8x16(&ah[1]);
-            for r in 0..4 {
-                q[r] = vmulq_u8(q[r], c3);
-                let t2 = extract_trit_s8x16_consts(q[r], c86, c171);
-                q[r] = vmulq_u8(q[r], c3);
-                let t3 = extract_trit_s8x16_consts(q[r], c86, c171);
-                let s = sdot32_vec(t2, t3, a0, a1);
-                lanes[r] = vfmaq_laneq_f32::<1>(lanes[r], vcvtq_f32_s32(s), rs_a[r]);
-            }
+        for (dst, l) in out.iter_mut().zip(lanes) {
+            *dst = (l[0] + l[1]) + (l[2] + l[3]);
         }
-
-        let mut qm = [vdupq_n_u8(0); 4];
-        {
-            let ah = act_groups[2].values().as_chunks::<16>().0;
-            let a0 = load_s8x16(&ah[0]);
-            let a1 = load_s8x16(&ah[1]);
-            for r in 0..4 {
-                let t4 = extract_trit_s8x16_consts(vmulq_u8(q[r], c3), c86, c171);
-                let q_mid_half = load_u8x8(&blocks[r][16..24].as_chunks::<8>().0[0]);
-                qm[r] = vmulq_u8(vcombine_u8(q_mid_half, q_mid_half), pow3_mid_01);
-                let t5 = extract_trit_s8x16_consts(qm[r], c86, c171);
-                let s = sdot32_vec(t4, t5, a0, a1);
-                lanes[r] = vfmaq_laneq_f32::<2>(lanes[r], vcvtq_f32_s32(s), rs_a[r]);
-            }
-        }
-
-        {
-            let ah = act_groups[3].values().as_chunks::<16>().0;
-            let a0 = load_s8x16(&ah[0]);
-            let a1 = load_s8x16(&ah[1]);
-            for r in 0..4 {
-                let t6 = extract_trit_s8x16_consts(vmulq_u8(qm[r], c9), c86, c171);
-                let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([
-                    blocks[r][24],
-                    blocks[r][25],
-                ])));
-                let q_tail = vcombine_u8(vget_low_u8(qm[r]), tail_half);
-                let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, pow3_tail), c86, c171);
-                let s = sdot32_vec(t6, t7, a0, a1);
-                lanes[r] = vfmaq_laneq_f32::<3>(lanes[r], vcvtq_f32_s32(s), rs_a[r]);
-            }
-        }
+        return out.iter().all(|v| v.is_finite()).then_some(out);
     }
-
-    let mut out = [0.0_f32; 4];
-    for (dst, lane) in out.iter_mut().zip(lanes) {
-        let mut l = [0.0_f32; 4];
-        store_f32x4_neon(lane, &mut l);
-        *dst = (l[0] + l[1]) + (l[2] + l[3]);
+    for (rows8, dst8) in rows
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<8>().0)
+    {
+        let mut lanes = [[0.0_f32; 4]; 8];
+        let ptrs: [*const u8; 8] = std::array::from_fn(|r| rows8[r].as_ptr());
+        let ok = if sve {
+            // SAFETY: Safe parent checked every row in `rows8` extents; `sve` was runtime-verified.
+            unsafe { ptq1_packed_8rows_pinned_sve(ptrs, act_ptr, block_count, &mut lanes) }
+        } else {
+            // SAFETY: Safe parent checked every row in `rows8` has `block_count * 28` bytes.
+            unsafe { ptq1_packed_8rows_pinned_accum(ptrs, act_ptr, block_count, &mut lanes) }
+        };
+        if !ok {
+            return None;
+        }
+        for (dst, l) in dst8.iter_mut().zip(lanes) {
+            *dst = (l[0] + l[1]) + (l[2] + l[3]);
+        }
     }
     out.iter().all(|v| v.is_finite()).then_some(out)
 }
 
 #[target_feature(enable = "neon,dotprod")]
-fn ptq1_scaled_1row_source_dotprod<A: super::Q8ActivationView>(
-    row_chunks: &[[u8; 28]],
-    activation: &[A],
-) -> Option<f32> {
-    use core::arch::aarch64::{vcvtq_f32_s32, vdup_n_u16, vget_low_u8, vmulq_f32};
-    const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
-    const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
-
-    let c86 = vdupq_n_u8(86);
-    let c171 = vdupq_n_u8(171);
-    let c3 = vdupq_n_u8(3);
-    let c9 = vdupq_n_u8(9);
-    let pow3_mid_01 = load_u8x16(&POW3_MID_01);
-    let pow3_tail = load_u8x16(&POW3_TAIL);
-    let mut output = 0.0_f32;
-
-    for (block_idx, block) in row_chunks.iter().enumerate() {
-        let rs = ptq1_validate_row_scales(&[block])?[0];
-        let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
-        let act_scales = load_f32x4_neon(&[
-            act_groups[0].scale(),
-            act_groups[1].scale(),
-            act_groups[2].scale(),
-            act_groups[3].scale(),
-        ]);
-
-        let mut q = load_u8x16(&block[..16].as_chunks::<16>().0[0]);
-        let t0 = extract_trit_s8x16_consts(q, c86, c171);
-        q = vmulq_u8(q, c3);
-        let t1 = extract_trit_s8x16_consts(q, c86, c171);
-        let ah0 = act_groups[0].values().as_chunks::<16>().0;
-        let g0 = sdot32_vec(t0, t1, load_s8x16(&ah0[0]), load_s8x16(&ah0[1]));
-
-        q = vmulq_u8(q, c3);
-        let t2 = extract_trit_s8x16_consts(q, c86, c171);
-        q = vmulq_u8(q, c3);
-        let t3 = extract_trit_s8x16_consts(q, c86, c171);
-        let ah1 = act_groups[1].values().as_chunks::<16>().0;
-        let g1 = sdot32_vec(t2, t3, load_s8x16(&ah1[0]), load_s8x16(&ah1[1]));
-
-        let t4 = extract_trit_s8x16_consts(vmulq_u8(q, c3), c86, c171);
-        let q_mid_half = load_u8x8(&block[16..24].as_chunks::<8>().0[0]);
-        let qm = vmulq_u8(vcombine_u8(q_mid_half, q_mid_half), pow3_mid_01);
-        let t5 = extract_trit_s8x16_consts(qm, c86, c171);
-        let ah2 = act_groups[2].values().as_chunks::<16>().0;
-        let g2 = sdot32_vec(t4, t5, load_s8x16(&ah2[0]), load_s8x16(&ah2[1]));
-
-        let t6 = extract_trit_s8x16_consts(vmulq_u8(qm, c9), c86, c171);
-        let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([block[24], block[25]])));
-        let q_tail = vcombine_u8(vget_low_u8(qm), tail_half);
-        let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, pow3_tail), c86, c171);
-        let ah3 = act_groups[3].values().as_chunks::<16>().0;
-        let g3 = sdot32_vec(t6, t7, load_s8x16(&ah3[0]), load_s8x16(&ah3[1]));
-
-        let dots = vcvtq_f32_s32(reduce4_s32x4(g0, g1, g2, g3));
-        let mut prod = [0.0_f32; 4];
-        store_f32x4_neon(vmulq_f32(dots, act_scales), &mut prod);
-        let dot_sum = (((0.0_f32 + prod[0]) + prod[1]) + prod[2]) + prod[3];
-        #[expect(
-            clippy::suboptimal_flops,
-            reason = "Preserve PTQ1 SOURCE non-FMA block rounding order."
-        )]
-        {
-            output += rs * dot_sum;
+fn ptq1_packed_rows_source_dotprod<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    activation: &[super::Ptq1Activation],
+) -> Option<[f32; ROWS]> {
+    let block_count = activation.len();
+    let act_ptr = activation.as_ptr();
+    let mut out = [0.0_f32; ROWS];
+    if ROWS == 1 {
+        let mut sum = 0.0_f32;
+        // SAFETY: Safe parent checked `rows[0].len() == block_count * 28`.
+        let ok = unsafe {
+            ptq1_packed_1row_source_accum(rows[0].as_ptr(), act_ptr, block_count, &mut sum)
+        };
+        if !ok {
+            return None;
         }
+        out[0] = sum;
+        return sum.is_finite().then_some(out);
     }
-
-    output.is_finite().then_some(output)
+    if ROWS == 4 {
+        let ptrs = [
+            rows[0].as_ptr(),
+            rows[1].as_ptr(),
+            rows[2].as_ptr(),
+            rows[3].as_ptr(),
+        ];
+        let mut sums = [0.0_f32; 4];
+        // SAFETY: Safe parent checked `rows[0..4]` each have `block_count * 28` bytes.
+        let ok = unsafe { ptq1_packed_4rows_source_accum(ptrs, act_ptr, block_count, &mut sums) };
+        if !ok {
+            return None;
+        }
+        out.copy_from_slice(&sums);
+        return out.iter().all(|v| v.is_finite()).then_some(out);
+    }
+    for (rows8, dst8) in rows
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<8>().0)
+    {
+        let ptrs: [*const u8; 8] = std::array::from_fn(|r| rows8[r].as_ptr());
+        let mut sums = [0.0_f32; 8];
+        // SAFETY: Safe parent checked every row in `rows8` has `block_count * 28` bytes.
+        let ok = unsafe { ptq1_packed_8rows_source_accum(ptrs, act_ptr, block_count, &mut sums) };
+        if !ok {
+            return None;
+        }
+        dst8.copy_from_slice(&sums);
+    }
+    out.iter().all(|v| v.is_finite()).then_some(out)
 }
 
 #[target_feature(enable = "neon,dotprod")]
-fn ptq1_scaled_4rows_source_dotprod<A: super::Q8ActivationView>(
-    row_chunks: [&[[u8; 28]]; 4],
-    activation: &[A],
-) -> Option<[f32; 4]> {
-    use core::arch::aarch64::{
-        vaddq_f32, vcvtq_f32_s32, vdup_n_u16, vdupq_n_f32, vget_low_u8, vmulq_f32, vmulq_laneq_f32,
-    };
-    const POW3_MID_01: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3];
-    const POW3_TAIL: [u8; 16] = [81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27];
-
-    let block_count = row_chunks[0].len();
-    let c86 = vdupq_n_u8(86);
-    let c171 = vdupq_n_u8(171);
-    let c3 = vdupq_n_u8(3);
-    let c9 = vdupq_n_u8(9);
-    let pow3_mid_01 = load_u8x16(&POW3_MID_01);
-    let pow3_tail = load_u8x16(&POW3_TAIL);
-    let zero_f = vdupq_n_f32(0.0);
-    let mut outputs = zero_f;
-
-    for block_idx in 0..block_count {
-        prefetch_row_blocks(&row_chunks, block_idx, block_count);
-        let blocks: [&[u8; 28]; 4] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
-        let rs_v = ptq1_validate_four_scales_vec(blocks)?;
-        let act_groups = &activation[block_idx * 4..block_idx * 4 + 4];
-        let act_scales = load_f32x4_neon(&[
-            act_groups[0].scale(),
-            act_groups[1].scale(),
-            act_groups[2].scale(),
-            act_groups[3].scale(),
-        ]);
-
-        let mut q = [
-            load_u8x16(&blocks[0][..16].as_chunks::<16>().0[0]),
-            load_u8x16(&blocks[1][..16].as_chunks::<16>().0[0]),
-            load_u8x16(&blocks[2][..16].as_chunks::<16>().0[0]),
-            load_u8x16(&blocks[3][..16].as_chunks::<16>().0[0]),
-        ];
-
-        let rg0 = {
-            let ah = act_groups[0].values().as_chunks::<16>().0;
-            let a0 = load_s8x16(&ah[0]);
-            let a1 = load_s8x16(&ah[1]);
-            let mut s = [vdupq_n_s32(0); 4];
-            for r in 0..4 {
-                let t0 = extract_trit_s8x16_consts(q[r], c86, c171);
-                q[r] = vmulq_u8(q[r], c3);
-                let t1 = extract_trit_s8x16_consts(q[r], c86, c171);
-                s[r] = sdot32_vec(t0, t1, a0, a1);
-            }
-            reduce4_s32x4(s[0], s[1], s[2], s[3])
-        };
-
-        let rg1 = {
-            let ah = act_groups[1].values().as_chunks::<16>().0;
-            let a0 = load_s8x16(&ah[0]);
-            let a1 = load_s8x16(&ah[1]);
-            let mut s = [vdupq_n_s32(0); 4];
-            for r in 0..4 {
-                q[r] = vmulq_u8(q[r], c3);
-                let t2 = extract_trit_s8x16_consts(q[r], c86, c171);
-                q[r] = vmulq_u8(q[r], c3);
-                let t3 = extract_trit_s8x16_consts(q[r], c86, c171);
-                s[r] = sdot32_vec(t2, t3, a0, a1);
-            }
-            reduce4_s32x4(s[0], s[1], s[2], s[3])
-        };
-
-        let mut qm = [vdupq_n_u8(0); 4];
-        let rg2 = {
-            let ah = act_groups[2].values().as_chunks::<16>().0;
-            let a0 = load_s8x16(&ah[0]);
-            let a1 = load_s8x16(&ah[1]);
-            let mut s = [vdupq_n_s32(0); 4];
-            for r in 0..4 {
-                let t4 = extract_trit_s8x16_consts(vmulq_u8(q[r], c3), c86, c171);
-                let q_mid_half = load_u8x8(&blocks[r][16..24].as_chunks::<8>().0[0]);
-                qm[r] = vmulq_u8(vcombine_u8(q_mid_half, q_mid_half), pow3_mid_01);
-                let t5 = extract_trit_s8x16_consts(qm[r], c86, c171);
-                s[r] = sdot32_vec(t4, t5, a0, a1);
-            }
-            reduce4_s32x4(s[0], s[1], s[2], s[3])
-        };
-
-        let rg3 = {
-            let ah = act_groups[3].values().as_chunks::<16>().0;
-            let a0 = load_s8x16(&ah[0]);
-            let a1 = load_s8x16(&ah[1]);
-            let mut s = [vdupq_n_s32(0); 4];
-            for r in 0..4 {
-                let t6 = extract_trit_s8x16_consts(vmulq_u8(qm[r], c9), c86, c171);
-                let tail_half = vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([
-                    blocks[r][24],
-                    blocks[r][25],
-                ])));
-                let q_tail = vcombine_u8(vget_low_u8(qm[r]), tail_half);
-                let t7 = extract_trit_s8x16_consts(vmulq_u8(q_tail, pow3_tail), c86, c171);
-                s[r] = sdot32_vec(t6, t7, a0, a1);
-            }
-            reduce4_s32x4(s[0], s[1], s[2], s[3])
-        };
-
-        let p0 = vmulq_laneq_f32::<0>(vcvtq_f32_s32(rg0), act_scales);
-        let p1 = vmulq_laneq_f32::<1>(vcvtq_f32_s32(rg1), act_scales);
-        let p2 = vmulq_laneq_f32::<2>(vcvtq_f32_s32(rg2), act_scales);
-        let p3 = vmulq_laneq_f32::<3>(vcvtq_f32_s32(rg3), act_scales);
-        let dot_sum = vaddq_f32(vaddq_f32(vaddq_f32(vaddq_f32(zero_f, p0), p1), p2), p3);
-        // Preserve PTQ1 SOURCE non-FMA block rounding order (`outputs + rs * dot_sum`).
-        outputs = vaddq_f32(outputs, vmulq_f32(rs_v, dot_sum));
+fn ptq1_packed_rows_dotprod<const ROWS: usize, const PINNED: bool>(
+    rows: [&[u8]; ROWS],
+    activation: &[super::Ptq1Activation],
+    sve: bool,
+) -> Option<[f32; ROWS]> {
+    if PINNED {
+        ptq1_packed_rows_pinned_dotprod(rows, activation, sve)
+    } else {
+        ptq1_packed_rows_source_dotprod(rows, activation)
     }
+}
 
-    let mut out = [0.0_f32; 4];
-    store_f32x4_neon(outputs, &mut out);
-    out.iter().all(|v| v.is_finite()).then_some(out)
+fn ptq1_pack_chunk_activations<A: super::Q8ActivationView>(
+    activation: &[A],
+    chunk_start: usize,
+    dst: &mut [super::Ptq1Activation],
+) {
+    for (k, slot) in dst.iter_mut().enumerate() {
+        let g_base = (chunk_start + k) * 4;
+        let g0 = &activation[g_base];
+        let g1 = &activation[g_base + 1];
+        let g2 = &activation[g_base + 2];
+        let g3 = &activation[g_base + 3];
+        *slot = super::Ptq1Activation::from_groups(
+            [g0.scale(), g1.scale(), g2.scale(), g3.scale()],
+            [g0.values(), g1.values(), g2.values(), g3.values()],
+        );
+    }
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn ptq1_scaled_pinned_chunk<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    byte_off: usize,
+    act_ptr: *const super::Ptq1Activation,
+    chunk_blocks: usize,
+    lanes: &mut [[f32; 4]; ROWS],
+) -> bool {
+    if ROWS == 1 {
+        let mut l1 = lanes[0];
+        let p0 = rows[0][byte_off..].as_ptr();
+        // SAFETY: `rows[0][byte_off..]` has at least `chunk_blocks * 28` readable bytes.
+        let ok = unsafe { ptq1_packed_1row_pinned_accum(p0, act_ptr, chunk_blocks, &mut l1) };
+        if !ok {
+            return false;
+        }
+        lanes[0] = l1;
+        return true;
+    }
+    if ROWS == 4 {
+        let mut l4: [[f32; 4]; 4] = [lanes[0], lanes[1], lanes[2], lanes[3]];
+        let ptrs: [*const u8; 4] = std::array::from_fn(|r| rows[r][byte_off..].as_ptr());
+        // SAFETY: Each `rows[r][byte_off..]` has at least `chunk_blocks * 28` readable bytes.
+        let ok = unsafe { ptq1_packed_4rows_pinned_accum(ptrs, act_ptr, chunk_blocks, &mut l4) };
+        if !ok {
+            return false;
+        }
+        lanes[..4].copy_from_slice(&l4);
+        return true;
+    }
+    for (rows8, lanes8) in rows
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(lanes.as_chunks_mut::<8>().0)
+    {
+        let mut l8 = *lanes8;
+        let ptrs: [*const u8; 8] = std::array::from_fn(|r| rows8[r][byte_off..].as_ptr());
+        // SAFETY: Each `rows8[r][byte_off..]` has at least `chunk_blocks * 28` readable bytes.
+        let ok = unsafe { ptq1_packed_8rows_pinned_accum(ptrs, act_ptr, chunk_blocks, &mut l8) };
+        if !ok {
+            return false;
+        }
+        lanes8.copy_from_slice(&l8);
+    }
+    true
+}
+
+#[target_feature(enable = "neon,dotprod")]
+fn ptq1_scaled_source_chunk<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    byte_off: usize,
+    act_ptr: *const super::Ptq1Activation,
+    chunk_blocks: usize,
+    out: &mut [f32; ROWS],
+) -> bool {
+    if ROWS == 1 {
+        let mut s1 = out[0];
+        let p0 = rows[0][byte_off..].as_ptr();
+        // SAFETY: `rows[0][byte_off..]` has at least `chunk_blocks * 28` readable bytes.
+        let ok = unsafe { ptq1_packed_1row_source_accum(p0, act_ptr, chunk_blocks, &mut s1) };
+        if !ok {
+            return false;
+        }
+        out[0] = s1;
+        return true;
+    }
+    if ROWS == 4 {
+        let mut s4 = [out[0], out[1], out[2], out[3]];
+        let ptrs: [*const u8; 4] = std::array::from_fn(|r| rows[r][byte_off..].as_ptr());
+        // SAFETY: Each `rows[r][byte_off..]` has at least `chunk_blocks * 28` readable bytes.
+        let ok = unsafe { ptq1_packed_4rows_source_accum(ptrs, act_ptr, chunk_blocks, &mut s4) };
+        if !ok {
+            return false;
+        }
+        out[..4].copy_from_slice(&s4);
+        return true;
+    }
+    for (rows8, out8) in rows
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<8>().0)
+    {
+        let mut s8 = *out8;
+        let ptrs: [*const u8; 8] = std::array::from_fn(|r| rows8[r][byte_off..].as_ptr());
+        // SAFETY: Each `rows8[r][byte_off..]` has at least `chunk_blocks * 28` readable bytes.
+        let ok = unsafe { ptq1_packed_8rows_source_accum(ptrs, act_ptr, chunk_blocks, &mut s8) };
+        if !ok {
+            return false;
+        }
+        out8.copy_from_slice(&s8);
+    }
+    true
 }
 
 #[target_feature(enable = "neon,dotprod")]
@@ -4799,31 +6157,35 @@ fn ptq1_scaled_rows_dotprod<const ROWS: usize, const PINNED: bool, A: super::Q8A
     rows: [&[u8]; ROWS],
     activation: &[A],
 ) -> Option<[f32; ROWS]> {
-    let row_chunks: [&[[u8; 28]]; ROWS] = rows.map(|row| row.as_chunks::<28>().0);
+    const CHUNK_BLOCKS: usize = 16;
+    let total_blocks = rows[0].len() / 28;
+    if total_blocks == 0 {
+        return None;
+    }
+    let mut act_buf = [super::Ptq1Activation::zeroed(); CHUNK_BLOCKS];
     let mut out = [0.0_f32; ROWS];
-    if ROWS == 1 {
-        let val = if PINNED {
-            ptq1_scaled_1row_pinned_dotprod(row_chunks[0], activation)?
+    let mut lanes = [[0.0_f32; 4]; ROWS];
+
+    for chunk_start in (0..total_blocks).step_by(CHUNK_BLOCKS) {
+        let chunk_blocks = (total_blocks - chunk_start).min(CHUNK_BLOCKS);
+        ptq1_pack_chunk_activations(activation, chunk_start, &mut act_buf[..chunk_blocks]);
+        let byte_off = chunk_start * 28;
+        let act_ptr = act_buf.as_ptr();
+        let ok = if PINNED {
+            ptq1_scaled_pinned_chunk(rows, byte_off, act_ptr, chunk_blocks, &mut lanes)
         } else {
-            ptq1_scaled_1row_source_dotprod(row_chunks[0], activation)?
+            ptq1_scaled_source_chunk(rows, byte_off, act_ptr, chunk_blocks, &mut out)
         };
-        out[0] = val;
-        return Some(out);
+        if !ok {
+            return None;
+        }
     }
-    for (&chunks4, dst4) in row_chunks
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(out.as_chunks_mut::<4>().0)
-    {
-        let res = if PINNED {
-            ptq1_scaled_4rows_pinned_dotprod(chunks4, activation)?
-        } else {
-            ptq1_scaled_4rows_source_dotprod(chunks4, activation)?
-        };
-        dst4.copy_from_slice(&res);
+    if PINNED {
+        for (dst, l) in out.iter_mut().zip(lanes) {
+            *dst = (l[0] + l[1]) + (l[2] + l[3]);
+        }
     }
-    Some(out)
+    out.iter().all(|v| v.is_finite()).then_some(out)
 }
 
 #[target_feature(enable = "neon,dotprod")]
@@ -5196,6 +6558,17 @@ pub(super) fn ptq1_detected_dot_scaled_rows<
     // SAFETY: constructing `Ptq1Dotprod` verified CPU/OS `dotprod` and baseline `neon`;
     // the safe parent checked row extents, group count, and finite activation scales.
     unsafe { ptq1_scaled_rows_dotprod::<ROWS, PINNED, A>(rows, activation) }
+}
+
+#[inline]
+pub(super) fn ptq1_detected_dot_packed_rows<const ROWS: usize, const PINNED: bool>(
+    detected: super::Ptq1Dotprod,
+    rows: [&[u8]; ROWS],
+    activation: &[super::Ptq1Activation],
+) -> Option<[f32; ROWS]> {
+    // SAFETY: constructing `Ptq1Dotprod` verified CPU/OS `dotprod` and baseline `neon`;
+    // the safe parent checked row extents, block count, and finite activation scales.
+    unsafe { ptq1_packed_rows_dotprod::<ROWS, PINNED>(rows, activation, detected.sve) }
 }
 
 #[inline]

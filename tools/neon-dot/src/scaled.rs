@@ -28,6 +28,95 @@ pub struct Q8ActivationBlock {
     pub values: [i8; 32],
 }
 
+/// Packed 128-element `Q8_0` activation block for four consecutive `PTQ1_0` groups.
+///
+/// Layout matches one 28-byte `PTQ1_0` block (4 groups of 32 activations):
+/// `scales` holds the four original `f32` activation scales, `values` holds the
+/// 128 signed quantization codes contiguously, and `neg_lane_sums` holds the
+/// precomputed negated 8-element lane sums `[-(sum_k0..3 + sum_k16..19); 4]`
+/// for each of the four groups.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug)]
+pub struct Ptq1Activation {
+    /// Original `f32` scales for groups `0..4`.
+    pub(crate) scales: [f32; 4],
+    /// Contiguous signed 8-bit activation codes for groups `0..4`.
+    pub(crate) values: [i8; 128],
+    /// Precomputed negated 8-lane sums per group for unsigned ternary SVE decoding.
+    pub(crate) neg_lane_sums: [[i32; 4]; 4],
+}
+
+const _: () = assert!(size_of::<Ptq1Activation>() == 208);
+const _: () = assert!(core::mem::offset_of!(Ptq1Activation, values) == 16);
+const _: () = assert!(core::mem::offset_of!(Ptq1Activation, neg_lane_sums) == 144);
+
+impl Ptq1Activation {
+    /// Returns a zeroed [`Ptq1Activation`] block.
+    #[inline]
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self {
+            scales: [0.0; 4],
+            values: [0; 128],
+            neg_lane_sums: [[0; 4]; 4],
+        }
+    }
+
+    /// Constructs a [`Ptq1Activation`] from contiguous group scales and codes,
+    /// precomputing the negated lane sums once for all row tiles.
+    #[inline]
+    #[must_use]
+    pub fn new(scales: [f32; 4], values: [i8; 128]) -> Self {
+        #[cfg(target_arch = "aarch64")]
+        let neg_lane_sums = crate::aarch64::ptq1_neg_lane_sums(&values);
+        #[cfg(not(target_arch = "aarch64"))]
+        let neg_lane_sums = core::array::from_fn(|group| {
+            let base = group * 32;
+            core::array::from_fn(|lane| {
+                let off = lane * 4;
+                let mut sum = 0_i32;
+                for k in 0..4 {
+                    sum +=
+                        i32::from(values[base + off + k]) + i32::from(values[base + 16 + off + k]);
+                }
+                -sum
+            })
+        });
+        Self {
+            scales,
+            values,
+            neg_lane_sums,
+        }
+    }
+
+    /// Constructs a [`Ptq1Activation`] from four 32-element group slices.
+    #[inline]
+    #[must_use]
+    pub fn from_groups(scales: [f32; 4], groups: [&[i8; 32]; 4]) -> Self {
+        let mut values = [0_i8; 128];
+        let chunks = values.as_chunks_mut::<32>().0;
+        chunks[0].copy_from_slice(groups[0]);
+        chunks[1].copy_from_slice(groups[1]);
+        chunks[2].copy_from_slice(groups[2]);
+        chunks[3].copy_from_slice(groups[3]);
+        Self::new(scales, values)
+    }
+
+    /// Returns the original `f32` activation scales for groups `0..4`.
+    #[inline]
+    #[must_use]
+    pub const fn scales(&self) -> &[f32; 4] {
+        &self.scales
+    }
+
+    /// Returns the contiguous 128 signed 8-bit activation codes.
+    #[inline]
+    #[must_use]
+    pub const fn values(&self) -> &[i8; 128] {
+        &self.values
+    }
+}
+
 /// Safe read-only view of one 32-element `Q8_0` activation group (`scale` and `32` `i8` codes).
 pub trait Q8ActivationView {
     /// Returns the group's original `f32` scale.
@@ -161,6 +250,18 @@ pub(super) fn valid_ptq1_activation<A: Q8ActivationView>(activation: &[A]) -> Op
         .then_some(block_count)
 }
 
+pub(super) fn valid_ptq1_packed_activation(activation: &[Ptq1Activation]) -> Option<usize> {
+    let block_count = activation.len();
+    if block_count == 0 {
+        return None;
+    }
+    block_count.checked_mul(28)?;
+    activation
+        .iter()
+        .all(|block| block.scales.iter().all(|scale| scale.is_finite()))
+        .then_some(block_count)
+}
+
 pub(super) fn valid_ptq1_row_extents<const ROWS: usize>(
     rows: [&[u8]; ROWS],
     block_count: usize,
@@ -268,13 +369,9 @@ pub(super) fn valid_q8_0_8x8_chunks<A: Q8ActivationView>(
     clippy::suboptimal_flops,
     reason = "PTQ1 SOURCE mode requires separate multiply and addition rounding."
 )]
-pub(super) fn portable_ptq1_rows_validated<
-    const ROWS: usize,
-    const PINNED: bool,
-    A: Q8ActivationView,
->(
+fn portable_ptq1_rows_with_groups<'a, const ROWS: usize, const PINNED: bool>(
     rows: [&[u8]; ROWS],
-    activation: &[A],
+    group_at: impl Fn(usize, usize) -> (f32, &'a [i8; 32]),
 ) -> Option<[f32; ROWS]> {
     let mut output = [0.0_f32; ROWS];
     for (row, dst) in rows.into_iter().zip(&mut output) {
@@ -289,11 +386,10 @@ pub(super) fn portable_ptq1_rows_validated<
             let trits = crate::decode_ptq1_trits_i8(block);
             if PINNED {
                 for group in 0..4 {
-                    let act = &activation[block_idx * 4 + group];
-                    let act_vals = act.values();
+                    let (act_scale, act_vals) = group_at(block_idx, group);
                     let w0 = &trits[group * 2];
                     let w1 = &trits[group * 2 + 1];
-                    let d = weight_scale * act.scale();
+                    let d = weight_scale * act_scale;
                     for (lane, lane_acc) in lanes.iter_mut().enumerate() {
                         let base = lane * 4;
                         let integer: i32 = (0..4)
@@ -309,8 +405,7 @@ pub(super) fn portable_ptq1_rows_validated<
             } else {
                 let mut dot_sum = 0.0_f32;
                 for group in 0..4 {
-                    let act = &activation[block_idx * 4 + group];
-                    let act_vals = act.values();
+                    let (act_scale, act_vals) = group_at(block_idx, group);
                     let w0 = &trits[group * 2];
                     let w1 = &trits[group * 2 + 1];
                     let integer: i32 = (0..16)
@@ -319,7 +414,7 @@ pub(super) fn portable_ptq1_rows_validated<
                                 + i32::from(w1[k]) * i32::from(act_vals[16 + k])
                         })
                         .sum();
-                    let prod = f32::from(i16::try_from(integer).ok()?) * act.scale();
+                    let prod = f32::from(i16::try_from(integer).ok()?) * act_scale;
                     dot_sum += prod;
                 }
                 sum += weight_scale * dot_sum;
@@ -336,6 +431,33 @@ pub(super) fn portable_ptq1_rows_validated<
         *dst = value;
     }
     Some(output)
+}
+
+#[cfg(any(test, not(target_arch = "aarch64")))]
+pub(super) fn portable_ptq1_rows_validated<
+    const ROWS: usize,
+    const PINNED: bool,
+    A: Q8ActivationView,
+>(
+    rows: [&[u8]; ROWS],
+    activation: &[A],
+) -> Option<[f32; ROWS]> {
+    portable_ptq1_rows_with_groups::<ROWS, PINNED>(rows, |block_idx, group| {
+        let act = &activation[block_idx * 4 + group];
+        (act.scale(), act.values())
+    })
+}
+
+#[cfg(any(test, not(target_arch = "aarch64")))]
+pub(super) fn portable_ptq1_packed_rows_validated<const ROWS: usize, const PINNED: bool>(
+    rows: [&[u8]; ROWS],
+    activation: &[Ptq1Activation],
+) -> Option<[f32; ROWS]> {
+    portable_ptq1_rows_with_groups::<ROWS, PINNED>(rows, |block_idx, group| {
+        let act = &activation[block_idx];
+        let groups = act.values.as_chunks::<32>().0;
+        (act.scales[group], &groups[group])
+    })
 }
 
 #[cfg(any(test, not(target_arch = "aarch64")))]
@@ -1440,6 +1562,189 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Covers pinned/source modes across row counts, extremes, and error recovery."
+    )]
+    #[test]
+    fn x1_ptq1_packed_prepared_matches_portable_across_pinned_and_source() {
+        use super::portable_ptq1_packed_rows_validated;
+
+        #[cfg(target_arch = "aarch64")]
+        let Some(detected) = crate::Ptq1Dotprod::detect() else {
+            return;
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let detected = crate::Ptq1Dotprod { _detected: () };
+
+        let to_packed = |acts: &[super::Q8ActivationBlock]| -> Vec<super::Ptq1Activation> {
+            acts.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|g| {
+                    super::Ptq1Activation::from_groups(
+                        [g[0].scale, g[1].scale, g[2].scale, g[3].scale],
+                        [&g[0].values, &g[1].values, &g[2].values, &g[3].values],
+                    )
+                })
+                .collect()
+        };
+
+        for (seed, block_count) in [1_usize, 2, 3, 4, 5, 7, 8, 9, 16, 17, 24, 32]
+            .into_iter()
+            .enumerate()
+        {
+            let (rows, acts) = sample_ptq1_fixture_blocks(block_count, seed);
+            let packed = to_packed(&acts[0]);
+            let Some(prepared) = detected.prepare_packed(&packed) else {
+                assert!(detected.prepare_packed(&packed).is_some());
+                return;
+            };
+            let r1 = [rows[0].as_slice()];
+            let r4: [&[u8]; 4] = std::array::from_fn(|r| rows[r].as_slice());
+            let r8: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+            let r16: [&[u8]; 16] = std::array::from_fn(|r| rows[r].as_slice());
+
+            assert_eq!(
+                prepared
+                    .dot_scaled_rows::<1, true>(r1)
+                    .map(|v| v.map(f32::to_bits)),
+                portable_ptq1_packed_rows_validated::<1, true>(r1, &packed)
+                    .map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prepared
+                    .dot_scaled_rows::<1, false>(r1)
+                    .map(|v| v.map(f32::to_bits)),
+                portable_ptq1_packed_rows_validated::<1, false>(r1, &packed)
+                    .map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prepared
+                    .dot_scaled_rows::<4, true>(r4)
+                    .map(|v| v.map(f32::to_bits)),
+                portable_ptq1_packed_rows_validated::<4, true>(r4, &packed)
+                    .map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prepared
+                    .dot_scaled_rows::<4, false>(r4)
+                    .map(|v| v.map(f32::to_bits)),
+                portable_ptq1_packed_rows_validated::<4, false>(r4, &packed)
+                    .map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prepared
+                    .dot_scaled_rows::<8, true>(r8)
+                    .map(|v| v.map(f32::to_bits)),
+                portable_ptq1_packed_rows_validated::<8, true>(r8, &packed)
+                    .map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prepared
+                    .dot_scaled_rows::<8, false>(r8)
+                    .map(|v| v.map(f32::to_bits)),
+                portable_ptq1_packed_rows_validated::<8, false>(r8, &packed)
+                    .map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prepared
+                    .dot_scaled_rows::<16, true>(r16)
+                    .map(|v| v.map(f32::to_bits)),
+                portable_ptq1_packed_rows_validated::<16, true>(r16, &packed)
+                    .map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                prepared
+                    .dot_scaled_rows::<16, false>(r16)
+                    .map(|v| v.map(f32::to_bits)),
+                portable_ptq1_packed_rows_validated::<16, false>(r16, &packed)
+                    .map(|v| v.map(f32::to_bits))
+            );
+        }
+
+        assert!(detected.prepare_packed(&[]).is_none());
+        let (rows, acts) = sample_ptq1_fixture_blocks(2, 55);
+        let mut packed = to_packed(&acts[0]);
+        for bad_f16 in [0x7e00_u16, 0x7c00, 0xfc00] {
+            for bad_row in [0_usize, 3, 7, 13] {
+                let mut bad_rows = rows.clone();
+                bad_rows[bad_row][28 + 26..28 + 28].copy_from_slice(&bad_f16.to_le_bytes());
+                let bad16: [&[u8]; 16] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                let Some(prepared) = detected.prepare_packed(&packed) else {
+                    assert!(detected.prepare_packed(&packed).is_some());
+                    return;
+                };
+                assert!(prepared.dot_scaled_rows::<16, true>(bad16).is_none());
+                assert!(prepared.dot_scaled_rows::<16, false>(bad16).is_none());
+                if bad_row < 8 {
+                    let bad8: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                    assert!(prepared.dot_scaled_rows::<8, true>(bad8).is_none());
+                    assert!(prepared.dot_scaled_rows::<8, false>(bad8).is_none());
+                }
+                if bad_row < 4 {
+                    let bad4: [&[u8]; 4] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                    assert!(prepared.dot_scaled_rows::<4, true>(bad4).is_none());
+                    assert!(prepared.dot_scaled_rows::<4, false>(bad4).is_none());
+                }
+                if bad_row == 0 {
+                    assert!(prepared.dot_scaled_rows::<1, true>([bad16[0]]).is_none());
+                    assert!(prepared.dot_scaled_rows::<1, false>([bad16[0]]).is_none());
+                }
+            }
+        }
+        packed[1].scales[2] = f32::NAN;
+        assert!(detected.prepare_packed(&packed).is_none());
+
+        let mut ovf_row = vec![0xff_u8; 28];
+        ovf_row[26..28].copy_from_slice(&0x7bff_u16.to_le_bytes());
+        let ovf_act = [super::Ptq1Activation::new([f32::MAX; 4], [127; 128])];
+        let Some(ovf_prep) = detected.prepare_packed(&ovf_act) else {
+            assert!(detected.prepare_packed(&ovf_act).is_some());
+            return;
+        };
+        assert!(
+            ovf_prep
+                .dot_scaled_rows::<1, true>([ovf_row.as_slice()])
+                .is_none()
+        );
+        assert!(
+            ovf_prep
+                .dot_scaled_rows::<4, true>([ovf_row.as_slice(); 4])
+                .is_none()
+        );
+        assert!(
+            ovf_prep
+                .dot_scaled_rows::<8, true>([ovf_row.as_slice(); 8])
+                .is_none()
+        );
+        assert!(
+            ovf_prep
+                .dot_scaled_rows::<16, true>([ovf_row.as_slice(); 16])
+                .is_none()
+        );
+        assert!(
+            ovf_prep
+                .dot_scaled_rows::<1, false>([ovf_row.as_slice()])
+                .is_none()
+        );
+        assert!(
+            ovf_prep
+                .dot_scaled_rows::<4, false>([ovf_row.as_slice(); 4])
+                .is_none()
+        );
+        assert!(
+            ovf_prep
+                .dot_scaled_rows::<8, false>([ovf_row.as_slice(); 8])
+                .is_none()
+        );
+        assert!(
+            ovf_prep
+                .dot_scaled_rows::<16, false>([ovf_row.as_slice(); 16])
+                .is_none()
+        );
+    }
+
     #[test]
     fn x1_ptq1_scaled_8x_tokens_matches_portable_and_rejects_bad_inputs() {
         use super::portable_ptq1_8x_tokens_validated;
@@ -2089,13 +2394,23 @@ mod tests {
     fn ptq1_test_caps() -> Option<Vec<crate::Ptq1Dotprod>> {
         let detected = crate::Ptq1Dotprod::detect()?;
         #[cfg(target_arch = "aarch64")]
-        return Some(vec![
-            detected,
-            crate::Ptq1Dotprod {
-                i8mm: false,
-                ..detected
-            },
-        ]);
+        {
+            let mut caps = vec![
+                detected,
+                crate::Ptq1Dotprod {
+                    i8mm: false,
+                    sve: false,
+                    ..detected
+                },
+            ];
+            if detected.sve {
+                caps.push(crate::Ptq1Dotprod {
+                    sve: false,
+                    ..detected
+                });
+            }
+            Some(caps)
+        }
         #[cfg(not(target_arch = "aarch64"))]
         Some(vec![detected])
     }

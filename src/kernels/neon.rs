@@ -3930,18 +3930,22 @@ impl bonsai_neon_dot::Q8ActivationView for super::Q8Block {
 
 pub(super) struct Ptq1Consumer<'a, const PINNED: bool> {
     input: &'a [super::Q8Block],
-    prepared: Option<bonsai_neon_dot::Ptq1Prepared<'a, super::Q8Block>>,
+    prepared: Option<bonsai_neon_dot::Ptq1PackedPrepared<'a>>,
 }
 
 impl<'a, const PINNED: bool> Ptq1Consumer<'a, PINNED> {
     #[inline]
-    pub(super) fn new(input: &'a [super::Q8Block], row_bytes: usize) -> Self {
+    pub(super) fn new(
+        input: &'a [super::Q8Block],
+        packed: &'a [bonsai_neon_dot::Ptq1Activation],
+        row_bytes: usize,
+    ) -> Self {
         let block_count = row_bytes / 28;
         let prepared =
-            (block_count != 0 && row_bytes.is_multiple_of(28) && input.len() >= block_count * 4)
+            (block_count != 0 && row_bytes.is_multiple_of(28) && packed.len() >= block_count)
                 .then(|| {
                     bonsai_neon_dot::Ptq1Dotprod::detect()
-                        .and_then(|d| d.prepare_scaled_view(&input[..block_count * 4]))
+                        .and_then(|d| d.prepare_packed(&packed[..block_count]))
                 })
                 .flatten();
         Self { input, prepared }

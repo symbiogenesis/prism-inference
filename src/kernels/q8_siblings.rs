@@ -92,9 +92,13 @@ impl PreparedMatvec<'_> {
                 super::super::MatvecBackend::ExperimentalNeon
             )
         {
+            scratch.prepare_ptq1_consumption()?;
             if scratch.pinned_accumulation {
-                let consumer =
-                    super::super::neon::Ptq1Consumer::<true>::new(&scratch.q8, row_bytes);
+                let consumer = super::super::neon::Ptq1Consumer::<true>::new(
+                    &scratch.q8,
+                    &scratch.ptq1_consumption,
+                    row_bytes,
+                );
                 return scratch.row_parallelism.fill_siblings(
                     &data[..tensors.len()],
                     row_bytes,
@@ -112,7 +116,11 @@ impl PreparedMatvec<'_> {
                     },
                 );
             }
-            let consumer = super::super::neon::Ptq1Consumer::<false>::new(&scratch.q8, row_bytes);
+            let consumer = super::super::neon::Ptq1Consumer::<false>::new(
+                &scratch.q8,
+                &scratch.ptq1_consumption,
+                row_bytes,
+            );
             return scratch.row_parallelism.fill_siblings(
                 &data[..tensors.len()],
                 row_bytes,

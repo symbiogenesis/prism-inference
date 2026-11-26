@@ -1679,6 +1679,14 @@ pub struct MatvecScratch {
         )
     ))]
     pq2_consumption: packed_pq2::Activations,
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    ptq1_consumption: Vec<bonsai_neon_dot::Ptq1Activation>,
     q8: Vec<Q8Block>,
     activations: Vec<f32>,
     row: Vec<f32>,
@@ -1925,6 +1933,14 @@ impl Default for MatvecScratch {
                 )
             ))]
             pq2_consumption: packed_pq2::Activations::default(),
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc",
+                target_feature = "neon"
+            ))]
+            ptq1_consumption: Vec::new(),
             q8: Vec::new(),
             activations: Vec::new(),
             row: Vec::new(),
@@ -2127,6 +2143,14 @@ impl MatvecScratch {
             )
         ))]
         self.pq2_consumption.clear();
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        self.ptq1_consumption.clear();
         let (columns, _, _) = if allow_released {
             dimensions_geometry(tensor)?
         } else {
@@ -2386,6 +2410,42 @@ impl MatvecScratch {
         )
     }
 
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    pub(super) fn prepare_ptq1_consumption(&mut self) -> Result<()> {
+        if !self.ptq1_consumption.is_empty()
+            || self.q8.is_empty()
+            || !self.q8.len().is_multiple_of(4)
+        {
+            return Ok(());
+        }
+        let block_count = self.q8.len() / 4;
+        self.ptq1_consumption.try_reserve_exact(block_count)?;
+        for group4 in self.q8.as_chunks::<4>().0 {
+            self.ptq1_consumption
+                .push(bonsai_neon_dot::Ptq1Activation::from_groups(
+                    [
+                        group4[0].scale,
+                        group4[1].scale,
+                        group4[2].scale,
+                        group4[3].scale,
+                    ],
+                    [
+                        &group4[0].values,
+                        &group4[1].values,
+                        &group4[2].values,
+                        &group4[3].values,
+                    ],
+                ));
+        }
+        Ok(())
+    }
+
     const fn select_q8_groups(&mut self) -> Q8GroupRowKernel {
         self.diagnostics = self.diagnostics.select(true);
         #[cfg(all(
@@ -2624,8 +2684,13 @@ impl PreparedMatvec<'_> {
                 if tensor.kind == PTQ1
                     && matches!(scratch.selected_backend(), MatvecBackend::ExperimentalNeon)
                 {
+                    scratch.prepare_ptq1_consumption()?;
                     if scratch.pinned_accumulation {
-                        let consumer = neon::Ptq1Consumer::<true>::new(&scratch.q8, row_bytes);
+                        let consumer = neon::Ptq1Consumer::<true>::new(
+                            &scratch.q8,
+                            &scratch.ptq1_consumption,
+                            row_bytes,
+                        );
                         return scratch.row_parallelism.fill_sixteen_rows(
                             &tensor.data,
                             row_bytes,
@@ -2637,7 +2702,11 @@ impl PreparedMatvec<'_> {
                             |bytes| consumer.dot_row(bytes),
                         );
                     }
-                    let consumer = neon::Ptq1Consumer::<false>::new(&scratch.q8, row_bytes);
+                    let consumer = neon::Ptq1Consumer::<false>::new(
+                        &scratch.q8,
+                        &scratch.ptq1_consumption,
+                        row_bytes,
+                    );
                     return scratch.row_parallelism.fill_sixteen_rows(
                         &tensor.data,
                         row_bytes,

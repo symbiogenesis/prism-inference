@@ -2791,11 +2791,11 @@ pub fn gdn_step_two_rows_pinned_neon(
             let mut sums = [[0.0_f32; 4]; 4];
             for (prev_blk, key_blk) in prev.as_chunks::<16>().0.iter().zip(key.as_chunks::<16>().0)
             {
-                for reg in 0..4 {
-                    for lane in 0..4 {
+                for (reg, sum_reg) in sums.iter_mut().enumerate() {
+                    for (lane, sum) in sum_reg.iter_mut().enumerate() {
                         let idx = reg * 4 + lane;
                         let d = prev_blk[idx] * decay;
-                        sums[reg][lane] = d.mul_add(key_blk[idx], sums[reg][lane]);
+                        *sum = d.mul_add(key_blk[idx], *sum);
                     }
                 }
             }
@@ -2827,13 +2827,13 @@ pub fn gdn_step_two_rows_pinned_neon(
                         .zip(query.as_chunks::<16>().0),
                 )
             {
-                for reg in 0..4 {
-                    for lane in 0..4 {
+                for (reg, sum_reg) in sums.iter_mut().enumerate() {
+                    for (lane, sum) in sum_reg.iter_mut().enumerate() {
                         let idx = reg * 4 + lane;
                         let d = prev_blk[idx] * decay;
                         let u = scale.mul_add(key_blk[idx], d);
                         st_blk[idx] = u;
-                        sums[reg][lane] = u.mul_add(query_blk[idx], sums[reg][lane]);
+                        *sum = u.mul_add(query_blk[idx], *sum);
                     }
                 }
             }
@@ -3674,11 +3674,11 @@ mod tests {
                     .iter()
                     .zip(key.as_chunks::<16>().0)
                 {
-                    for reg in 0..4 {
-                        for lane in 0..4 {
+                    for (reg, sum_reg) in sums.iter_mut().enumerate() {
+                        for (lane, sum) in sum_reg.iter_mut().enumerate() {
                             let idx = reg * 4 + lane;
                             let d = pb[idx] * decay;
-                            sums[reg][lane] = d.mul_add(kb[idx], sums[reg][lane]);
+                            *sum = d.mul_add(kb[idx], *sum);
                         }
                     }
                 }
@@ -3705,13 +3705,13 @@ mod tests {
                             .zip(query.as_chunks::<16>().0),
                     )
                 {
-                    for reg in 0..4 {
-                        for lane in 0..4 {
+                    for (reg, qsum_reg) in qsums.iter_mut().enumerate() {
+                        for (lane, qsum) in qsum_reg.iter_mut().enumerate() {
                             let idx = reg * 4 + lane;
                             let d = pb[idx] * decay;
                             let u = scale.mul_add(kb[idx], d);
                             sb[idx] = u;
-                            qsums[reg][lane] = u.mul_add(qb[idx], qsums[reg][lane]);
+                            *qsum = u.mul_add(qb[idx], *qsum);
                         }
                     }
                 }

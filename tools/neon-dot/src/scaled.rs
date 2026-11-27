@@ -2285,7 +2285,7 @@ mod tests {
             .map(|idx| {
                 // Map 5-trit index 0..243 into canonical PTQ1 byte (round-up base-3 encoding).
                 let v = u32::from(idx);
-                u8::try_from((v * 256 + 242) / 243).unwrap_or(0)
+                u8::try_from((v * 256).div_ceil(243)).unwrap_or(0)
             })
             .collect();
 

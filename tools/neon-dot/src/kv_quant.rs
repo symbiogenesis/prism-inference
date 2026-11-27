@@ -4011,9 +4011,7 @@ mod tests {
     }
 
     fn verify_batched_group_and_pair<const G: usize>(bits: u8) -> Result<(), &'static str> {
-        use super::{
-            PreparedQueryGroup, PreparedQueryPair, ValueGroupAccumulator, ValueGroupPairAccumulator,
-        };
+        use super::{PreparedQueryGroup, PreparedQueryPair};
 
         let centroids = codebook();
         let row_bytes = DIMENSION * usize::from(bits) / 8;
@@ -4028,8 +4026,8 @@ mod tests {
 
         for len in [0_usize, 1, 2, 3, 7, 16, 63, 64, 65] {
             let mut packed_rows = Vec::with_capacity(len * row_bytes);
-            let mut scales0 = Vec::with_capacity(len);
-            let mut scales1 = Vec::with_capacity(len);
+            let mut scales0: Vec<[f32; G]> = Vec::with_capacity(len);
+            let mut scales1: Vec<[f32; G]> = Vec::with_capacity(len);
             for row_idx in 0..len {
                 let offset = u8::try_from((row_idx * 5 + 1) & 0xff).unwrap_or(0);
                 packed_rows.extend_from_slice(&packed(&codes(bits, offset), bits));
@@ -4088,49 +4086,77 @@ mod tests {
                 assert_eq!(a1.map(f32::to_bits), e1.map(f32::to_bits));
             }
 
-            let mut group_acc =
-                ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite group acc")?;
-            assert!(group_acc.accumulate_rows(&packed_rows, &scales0));
-            let mut oracle_group_out = [[0.0_f32; DIMENSION]; G];
-            assert!(super::portable_accumulate_rows_group(
-                &packed_rows,
-                bits,
-                &centroids,
-                &scales0,
-                &mut oracle_group_out,
-            ));
-            let actual_group_out = group_acc.finish();
-            for head in 0..G {
-                assert_eq!(
-                    actual_group_out[head].map(|row| row.map(f32::to_bits)),
-                    Some(oracle_group_out[head].map(f32::to_bits)),
-                );
-            }
-
-            let mut pair_acc =
-                ValueGroupPairAccumulator::<G>::new(bits, &centroids).ok_or("finite pair acc")?;
-            assert!(pair_acc.accumulate_rows(&packed_rows, &scales0, &scales1));
-            let mut oracle_pair_out = [[[0.0_f32; DIMENSION]; G]; 2];
-            assert!(super::portable_accumulate_rows_group_pair(
-                &packed_rows,
-                bits,
-                &centroids,
-                &scales0,
-                &scales1,
-                &mut oracle_pair_out,
-            ));
-            let [actual_out0, actual_out1] = pair_acc.finish();
-            for head in 0..G {
-                assert_eq!(
-                    actual_out0[head].map(|row| row.map(f32::to_bits)),
-                    Some(oracle_pair_out[0][head].map(f32::to_bits)),
-                );
-                assert_eq!(
-                    actual_out1[head].map(|row| row.map(f32::to_bits)),
-                    Some(oracle_pair_out[1][head].map(f32::to_bits)),
-                );
-            }
+            verify_batched_value_accumulators(bits, &centroids, &packed_rows, &scales0, &scales1)?;
         }
+
+        verify_batched_group_and_pair_errors(bits, &centroids, &group_query, &pair_query)
+    }
+
+    fn verify_batched_value_accumulators<const G: usize>(
+        bits: u8,
+        centroids: &[f32; 16],
+        packed_rows: &[u8],
+        scales0: &[[f32; G]],
+        scales1: &[[f32; G]],
+    ) -> Result<(), &'static str> {
+        use super::{ValueGroupAccumulator, ValueGroupPairAccumulator};
+
+        let mut group_acc =
+            ValueGroupAccumulator::<G>::new(bits, centroids).ok_or("finite group acc")?;
+        assert!(group_acc.accumulate_rows(packed_rows, scales0));
+        let mut oracle_group_out = [[0.0_f32; DIMENSION]; G];
+        assert!(super::portable_accumulate_rows_group(
+            packed_rows,
+            bits,
+            centroids,
+            scales0,
+            &mut oracle_group_out,
+        ));
+        let actual_group_out = group_acc.finish();
+        for head in 0..G {
+            assert_eq!(
+                actual_group_out[head].map(|row| row.map(f32::to_bits)),
+                Some(oracle_group_out[head].map(f32::to_bits)),
+            );
+        }
+
+        let mut pair_acc =
+            ValueGroupPairAccumulator::<G>::new(bits, centroids).ok_or("finite pair acc")?;
+        assert!(pair_acc.accumulate_rows(packed_rows, scales0, scales1));
+        let mut oracle_pair_out = [[[0.0_f32; DIMENSION]; G]; 2];
+        assert!(super::portable_accumulate_rows_group_pair(
+            packed_rows,
+            bits,
+            centroids,
+            scales0,
+            scales1,
+            &mut oracle_pair_out,
+        ));
+        let [actual_out0, actual_out1] = pair_acc.finish();
+        for head in 0..G {
+            assert_eq!(
+                actual_out0[head].map(|row| row.map(f32::to_bits)),
+                Some(oracle_pair_out[0][head].map(f32::to_bits)),
+            );
+            assert_eq!(
+                actual_out1[head].map(|row| row.map(f32::to_bits)),
+                Some(oracle_pair_out[1][head].map(f32::to_bits)),
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_batched_group_and_pair_errors<const G: usize>(
+        bits: u8,
+        centroids: &[f32; 16],
+        group_query: &super::PreparedQueryGroup<'_, G>,
+        pair_query: &super::PreparedQueryPair<'_, G>,
+    ) -> Result<(), &'static str> {
+        use super::{
+            PreparedQueryGroup, PreparedQueryPair, ValueGroupAccumulator, ValueGroupPairAccumulator,
+        };
+
+        let row_bytes = DIMENSION * usize::from(bits) / 8;
 
         // Mismatching slice lengths.
         let one_row = packed(&codes(bits, 0), bits);
@@ -4146,19 +4172,19 @@ mod tests {
         ));
 
         let mut acc_bad =
-            ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite group acc")?;
+            ValueGroupAccumulator::<G>::new(bits, centroids).ok_or("finite group acc")?;
         assert!(!acc_bad.accumulate_rows(&one_row, &[[1.0; G]; 2]));
         assert!(acc_bad.finish().iter().all(Option::is_none));
 
         let mut pair_bad =
-            ValueGroupPairAccumulator::<G>::new(bits, &centroids).ok_or("finite pair acc")?;
+            ValueGroupPairAccumulator::<G>::new(bits, centroids).ok_or("finite pair acc")?;
         assert!(!pair_bad.accumulate_rows(&one_row, &[[1.0; G]; 1], &[[1.0; G]; 2]));
         assert!(pair_bad.finish().iter().flatten().all(Option::is_none));
 
         // Non-finite scales rejected upfront and poison accumulator.
         for bad_scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut acc =
-                ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite group acc")?;
+                ValueGroupAccumulator::<G>::new(bits, centroids).ok_or("finite group acc")?;
             assert!(acc.accumulate_rows(&one_row, &[[0.25; G]]));
             let mut bad_scales = [0.25; G];
             bad_scales[G - 1] = bad_scale;
@@ -4167,7 +4193,7 @@ mod tests {
             assert!(acc.finish().iter().all(Option::is_none));
 
             let mut pacc =
-                ValueGroupPairAccumulator::<G>::new(bits, &centroids).ok_or("finite pair acc")?;
+                ValueGroupPairAccumulator::<G>::new(bits, centroids).ok_or("finite pair acc")?;
             assert!(pacc.accumulate_rows(&one_row, &[[0.25; G]], &[[0.25; G]]));
             assert!(!pacc.accumulate_rows(&one_row, &[[0.25; G]], &[bad_scales]));
             assert!(!pacc.accumulate_rows(&one_row, &[[0.25; G]], &[[0.25; G]]));
@@ -4177,15 +4203,16 @@ mod tests {
         // Overflow to +/-Inf in scoring and accumulation.
         let huge_q = [f32::MAX; DIMENSION];
         let huge_book = [f32::MAX; 16];
-        let huge_gq =
+        let overflow_group_query =
             PreparedQueryGroup::new(bits, &huge_book, [(&huge_q); G]).ok_or("huge group query")?;
-        let huge_pq = PreparedQueryPair::new(bits, &huge_book, [(&huge_q); G], [(&huge_q); G])
-            .ok_or("huge pair query")?;
+        let overflow_pair_query =
+            PreparedQueryPair::new(bits, &huge_book, [(&huge_q); G], [(&huge_q); G])
+                .ok_or("huge pair query")?;
         let mut score_overflow = [[0.0_f32; G]; 1];
-        assert!(!huge_gq.score_rows(&one_row, &mut score_overflow));
+        assert!(!overflow_group_query.score_rows(&one_row, &mut score_overflow));
         let mut p0_overflow = [[0.0_f32; G]; 1];
         let mut p1_overflow = [[0.0_f32; G]; 1];
-        assert!(!huge_pq.score_rows(&one_row, &mut p0_overflow, &mut p1_overflow));
+        assert!(!overflow_pair_query.score_rows(&one_row, &mut p0_overflow, &mut p1_overflow));
 
         for extreme in [f32::MAX, -f32::MAX] {
             let mut extreme_book = [1.0_f32; 16];

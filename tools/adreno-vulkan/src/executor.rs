@@ -316,6 +316,14 @@ impl BatchTokenPath {
         }
     }
 
+    pub(crate) const fn gemm_grid(self, row_tiles: u32, tokens_u32: u32) -> [u32; 3] {
+        let tok_tiles = self.grid_y(tokens_u32);
+        match self {
+            Self::ThirtyTwo => [tok_tiles, row_tiles, 1],
+            Self::Single | Self::Four | Self::Sixteen => [row_tiles, tok_tiles, 1],
+        }
+    }
+
     pub(crate) const fn grid_y_four_tok_cap(self, tokens_u32: u32) -> u32 {
         match self {
             Self::Single => tokens_u32,
@@ -337,7 +345,7 @@ pub(crate) const fn supports_32tok_gemm(device: &AdrenoVulkanDevice) -> bool {
     limits.max_compute_work_group_invocations >= 512
         && limits.max_compute_work_group_size[0] >= 64
         && limits.max_compute_work_group_size[1] >= 8
-        && limits.max_compute_shared_memory_size >= 15_872
+        && limits.max_compute_shared_memory_size >= 16_640
 }
 
 pub(crate) const fn supports_splitk_gemv(device: &AdrenoVulkanDevice) -> bool {
@@ -1245,16 +1253,19 @@ impl VulkanPq2Executor {
             .ok_or_else(|| Error::ResourceLimit("projection output count overflow".to_owned()))?;
         let act_bytes = u32_slice_bytes(act_words.len())?;
         let out_bytes = f32_slice_bytes(total_outputs)?;
-        let grid_y = if is_32tok_pipeline(&self.pipes, pipeline) {
-            tokens_u32.div_ceil(32)
-        } else if is_16tok_pipeline(&self.pipes, pipeline) {
-            tokens_u32.div_ceil(16)
-        } else if is_4tok_pipeline(&self.pipes, pipeline) {
-            tokens_u32.div_ceil(4)
+        let raw_grid = if is_32tok_pipeline(&self.pipes, pipeline) {
+            [tokens_u32.div_ceil(32), rows_u32.div_ceil(64), 1]
         } else {
-            tokens_u32
+            let grid_y = if is_16tok_pipeline(&self.pipes, pipeline) {
+                tokens_u32.div_ceil(16)
+            } else if is_4tok_pipeline(&self.pipes, pipeline) {
+                tokens_u32.div_ceil(4)
+            } else {
+                tokens_u32
+            };
+            [rows_u32.div_ceil(64), grid_y, 1]
         };
-        let grid = checked_grid(&self.device, [rows_u32.div_ceil(64), grid_y, 1])?;
+        let grid = checked_grid(&self.device, raw_grid)?;
 
         let act_buf = ensure_scratch(&mut self.device, &mut self.scratch.act_u32, act_bytes)?;
         let out_buf = ensure_scratch(&mut self.device, &mut self.scratch.out_a, out_bytes)?;
@@ -1565,7 +1576,6 @@ impl VulkanPq2Executor {
             let mut gemm_pipes = [quant_pipe; 3];
             let path = BatchTokenPath::for_tokens(&self.device, tokens);
             let gemm_pipe = self.pipes.select_pq2_q8k(pinned, path, false);
-            let grid_y = path.grid_y(t_u32);
 
             for (idx, &tensor) in tensors.iter().enumerate() {
                 let rows = tensor.dimensions[1];
@@ -1577,7 +1587,8 @@ impl VulkanPq2Executor {
                 gemm_pipes[idx] = gemm_pipe;
                 gemm_bufs[idx] = [lease.span(), BufferSpan::whole(q8k_buf), out_bufs[idx]];
                 gemm_pushes[idx] = [rows_u32, blocks_u32, t_u32, act_words_per_token];
-                gemm_grids[idx] = checked_grid(&self.device, [rows_u32.div_ceil(64), grid_y, 1])?;
+                gemm_grids[idx] =
+                    checked_grid(&self.device, path.gemm_grid(rows_u32.div_ceil(64), t_u32))?;
             }
 
             let mut stages = [ComputeSpanStage {
@@ -1690,7 +1701,6 @@ impl VulkanPq2Executor {
             };
             let path = BatchTokenPath::for_tokens(&self.device, tokens);
             let gemm_pipe = self.pipes.select_pq2_q8k(pinned, path, false);
-            let grid_y = path.grid_y(t_u32);
             let quant_spans = [BufferSpan::whole(f32_in_buf), BufferSpan::whole(q8k_buf)];
             let gate_spans = [
                 w_gate.span(),
@@ -1708,7 +1718,8 @@ impl VulkanPq2Executor {
                 BufferSpan::whole(mid_buf),
             ];
             let gemm_push = [rows_u32, blocks_u32, t_u32, act_words_per_token];
-            let gemm_grid = checked_grid(&self.device, [rows_u32.div_ceil(64), grid_y, 1])?;
+            let gemm_grid =
+                checked_grid(&self.device, path.gemm_grid(rows_u32.div_ceil(64), t_u32))?;
             let quant_push = [cols_u32, t_u32];
             let swiglu_push = [mid_elems_u32];
             let stages = [
@@ -1962,14 +1973,13 @@ impl VulkanPq2Executor {
         } else {
             self.pipes.select_pq2_q8k(pinned, path, res_buf.is_some())
         };
-        let grid_y = path.grid_y(t_u32);
 
         let quant_in_spans = [f32_in_span, q8k_in_span];
         let quant_in_push = [in_cols_u32, t_u32];
         let gate_spans = [w_gate.span(), q8k_in_span, gate_out_span];
         let up_spans = [w_up.span(), q8k_in_span, up_out_span];
         let up_push = [inter_u32, in_blocks_u32, t_u32, in_act_words];
-        let up_grid = checked_grid(&self.device, [inter_u32.div_ceil(64), grid_y, 1])?;
+        let up_grid = checked_grid(&self.device, path.gemm_grid(inter_u32.div_ceil(64), t_u32))?;
         let swiglu_spans = [gate_out_span, up_out_span, mid_span];
         let swiglu_push = [mid_total_u32];
 
@@ -2006,7 +2016,10 @@ impl VulkanPq2Executor {
             &down_spans_4
         });
         let down_push = [in_cols_u32, mid_blocks_u32, t_u32, mid_act_words];
-        let down_grid = checked_grid(&self.device, [in_cols_u32.div_ceil(64), grid_y, 1])?;
+        let down_grid = checked_grid(
+            &self.device,
+            path.gemm_grid(in_cols_u32.div_ceil(64), t_u32),
+        )?;
 
         let mut stages: Vec<ComputeSpanStage<'_>> = Vec::with_capacity(8);
         stages.push(ComputeSpanStage {
@@ -3062,6 +3075,7 @@ fn is_32tok_pipeline(pipes: &ProjectionPipelines, pipe: PipelineId) -> bool {
         || pipe == pipes.pq2_q8k_32tok_unfused
         || pipe == pipes.pq2_q8k_32tok_fused_res
         || pipe == pipes.pq2_q8k_32tok_unfused_res
+        || pipe == pipes.pq2_q8_0_32tok
         || pipe == pipes.ptq1_q8_0_32tok
         || pipe == pipes.ptq1_q8_0_32tok_pinned
         || pipe == pipes.q8_0_q8_0_32tok
@@ -3787,7 +3801,7 @@ mod tests {
                 &push_k,
                 [tile_x, tokens_u32, 1],
             )?;
-            dev.submit_compute(p_32, &[b_w544, buf_act_q8k, b_32], &push_k, [tile_x, 1, 1])?;
+            dev.submit_compute(p_32, &[b_w544, buf_act_q8k, b_32], &push_k, [1, tile_x, 1])?;
             dev.read_buffer_f32(b_ref, &mut out_ref)?;
             dev.read_buffer_f32(b_32, &mut out_32)?;
             for (i, (&a, &b)) in out_32.iter().zip(&out_ref).enumerate() {
@@ -3818,7 +3832,7 @@ mod tests {
                 &push_8,
                 [tile_x, tokens_u32, 1],
             )?;
-            dev.submit_compute(q_32, &[b_w544, buf_act_q8_0, b_32], &push_8, [tile_x, 1, 1])?;
+            dev.submit_compute(q_32, &[b_w544, buf_act_q8_0, b_32], &push_8, [1, tile_x, 1])?;
             dev.read_buffer_f32(b_ref, &mut out_ref)?;
             dev.read_buffer_f32(b_32, &mut out_32)?;
             for (i, (&a, &b)) in out_32.iter().zip(&out_ref).enumerate() {
@@ -3853,7 +3867,7 @@ mod tests {
                     &push_t,
                     [tile_x, tokens_u32, 1],
                 )?;
-                dev.submit_compute(t_32, &[b_ptq1, buf_act_q8_0, b_32], &push_t, [tile_x, 1, 1])?;
+                dev.submit_compute(t_32, &[b_ptq1, buf_act_q8_0, b_32], &push_t, [1, tile_x, 1])?;
                 dev.read_buffer_f32(b_ref, &mut out_ref)?;
                 dev.read_buffer_f32(b_32, &mut out_32)?;
                 for (i, (&a, &b)) in out_32.iter().zip(&out_ref).enumerate() {
@@ -3886,7 +3900,7 @@ mod tests {
                 pq_q8_32,
                 &[b_w544, buf_act_q8_0, b_32],
                 &push_pq8,
-                [tile_x, 1, 1],
+                [1, tile_x, 1],
             )?;
             dev.read_buffer_f32(b_ref, &mut out_ref)?;
             dev.read_buffer_f32(b_32, &mut out_32)?;

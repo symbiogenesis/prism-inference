@@ -235,7 +235,7 @@ pub struct VulkanBatchedConfig {
     /// Optional explicit override for Prism `PinnedSwift` vs `Source` integer rounding/FMA contract.
     /// When `None`, auto-detects from verified Swift model SHA-256 identities.
     pub pinned_arithmetic: Option<bool>,
-    /// Maximum prompt tokens evaluated together per batched GPU prefill tile (`1..=256`, default `32`).
+    /// Maximum prompt tokens evaluated together per batched GPU prefill tile (`1..=256`, default `64`).
     ///
     /// Setting `1` forces single-token evaluation inside [`Decoder::ingest_block`]. Larger values
     /// amortize weight reads across tokens while remaining bounded by `scratch_budget_bytes` and
@@ -259,7 +259,7 @@ impl Default for VulkanBatchedConfig {
             max_layer_count: None,
             scratch_budget_bytes: 256 * 1024 * 1024,
             pinned_arithmetic: None,
-            prefill_tile_tokens: 32,
+            prefill_tile_tokens: 64,
             pipeline_cache_path: None,
         }
     }
@@ -1806,6 +1806,10 @@ impl VulkanBatchedGraphExecutor {
             .capabilities()
             .compute_limits
             .max_compute_work_group_count;
+        let max_shared_mem = device
+            .capabilities()
+            .compute_limits
+            .max_compute_shared_memory_size;
 
         let mut guard = BufferCleanupGuard::new(&mut device);
         let transforms = parse_and_upload_transforms(model, &geometry, &mut guard)?;
@@ -1941,6 +1945,12 @@ impl VulkanBatchedGraphExecutor {
             config.scratch_budget_bytes,
             max_storage_range,
             max_wg,
+            can_use_flash_gqa6_for(
+                &geometry,
+                config.kv_precision,
+                config.attention_strategy,
+                max_shared_mem,
+            ),
             &mut guard,
         )?;
 
@@ -4513,20 +4523,16 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
-    fn can_use_flash_gqa6(&self) -> bool {
-        self.config.kv_precision == VulkanKvPrecision::Fp16
-            && self.config.attention_strategy != AttentionStrategy::ForceDecomposed
-            && self.geometry.kv_heads > 0
-            && self.geometry.heads == self.geometry.kv_heads * 6
-            && self.geometry.head > 0
-            && self.geometry.head <= 256
-            && self.geometry.head.is_multiple_of(2)
-            && self
-                .device
+    const fn can_use_flash_gqa6(&self) -> bool {
+        can_use_flash_gqa6_for(
+            &self.geometry,
+            self.config.kv_precision,
+            self.config.attention_strategy,
+            self.device
                 .capabilities()
                 .compute_limits
-                .max_compute_shared_memory_size
-                >= spirv::ATTN_FLASH_GQA6_SHARED_MEMORY_BYTES * 2
+                .max_compute_shared_memory_size,
+        )
     }
 
     #[expect(
@@ -5372,8 +5378,9 @@ impl VulkanBatchedGraphExecutor {
             .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
 
         // `src_buf` holds unrotated original activations across the whole projection group.
-        let use_f32_vec4 =
-            !lora.is_f16 && lora.in_features.is_multiple_of(4) && lora.a_span.offset.is_multiple_of(16);
+        let use_f32_vec4 = !lora.is_f16
+            && lora.in_features.is_multiple_of(4)
+            && lora.a_span.offset.is_multiple_of(16);
         if tokens == 1 {
             let pipe = if lora.is_f16 {
                 self.pipelines.f16_matvec
@@ -6006,6 +6013,11 @@ impl VulkanBatchedGraphExecutor {
                             false,
                         )
                     };
+                    let pq2_grid = if batch_path == BatchTokenPath::ThirtyTwo {
+                        [tok_tiles_16y, rows_u32.div_ceil(WORKGROUP_X), 1]
+                    } else {
+                        [rows_u32.div_ceil(WORKGROUP_X), tok_tiles_16y, 1]
+                    };
                     self.batch_recorder.push(
                         pipe,
                         &[
@@ -6014,10 +6026,7 @@ impl VulkanBatchedGraphExecutor {
                             BufferSpan::whole(*out_buf),
                         ],
                         &[rows_u32, blocks_u32, tokens_u32, act_words],
-                        checked_grid(
-                            &self.device,
-                            [rows_u32.div_ceil(WORKGROUP_X), tok_tiles_16y, 1],
-                        )?,
+                        checked_grid(&self.device, pq2_grid)?,
                         barrier_before,
                     );
                 }
@@ -6073,6 +6082,11 @@ impl VulkanBatchedGraphExecutor {
                         }
                     };
                     let tile_rows = rows_u32.div_ceil(WORKGROUP_X);
+                    let proj_grid = if batch_path == BatchTokenPath::ThirtyTwo {
+                        [tok_tiles_y, tile_rows, 1]
+                    } else {
+                        [tile_rows, tok_tiles_y, 1]
+                    };
                     self.batch_recorder.push(
                         pipe,
                         &[
@@ -6081,12 +6095,13 @@ impl VulkanBatchedGraphExecutor {
                             BufferSpan::whole(*out_buf),
                         ],
                         &[rows_u32, blocks_u32, tokens_u32, act_words],
-                        checked_grid(&self.device, [tile_rows, tok_tiles_y, 1])?,
+                        checked_grid(&self.device, proj_grid)?,
                         barrier_before,
                     );
                 }
                 WeightEncoding::F32 => {
-                    let use_vec4 = cols_u32.is_multiple_of(4) && weight.span.offset.is_multiple_of(16);
+                    let use_vec4 =
+                        cols_u32.is_multiple_of(4) && weight.span.offset.is_multiple_of(16);
                     if multi_token {
                         let pipe = if use_vec4 {
                             self.pipelines.f32_gemm_batched_vec4
@@ -7606,6 +7621,22 @@ fn compute_max_wg_tile_tokens(
     requested.min(cap_y).min(wg_z).min(cap_1d).max(1)
 }
 
+const fn can_use_flash_gqa6_for(
+    geometry: &GraphGeometry,
+    kv_precision: VulkanKvPrecision,
+    attention_strategy: AttentionStrategy,
+    max_compute_shared_memory_size: u32,
+) -> bool {
+    matches!(kv_precision, VulkanKvPrecision::Fp16)
+        && !matches!(attention_strategy, AttentionStrategy::ForceDecomposed)
+        && geometry.kv_heads > 0
+        && geometry.heads == geometry.kv_heads * 6
+        && geometry.head > 0
+        && geometry.head <= 256
+        && geometry.head.is_multiple_of(2)
+        && max_compute_shared_memory_size >= spirv::ATTN_FLASH_GQA6_SHARED_MEMORY_BYTES * 2
+}
+
 struct TileScratchInputs {
     embedding: usize,
     max_f32_work: usize,
@@ -7614,6 +7645,7 @@ struct TileScratchInputs {
     rank_per_tok: usize,
     rope: usize,
     score_per_tok: usize,
+    use_flash_gqa6: bool,
     key_scratch_bytes: u64,
     val_scratch_bytes: u64,
     logits_bytes: u64,
@@ -7633,10 +7665,14 @@ fn build_tile_scratch_plan(
     let lora_ranks_bytes =
         f32_slice_bytes(tile_tokens * inputs.rank_per_tok)?.max(MIN_SCRATCH_BYTES);
     let rope_bytes = f32_slice_bytes(tile_tokens * inputs.rope)?.max(MIN_SCRATCH_BYTES);
-    let score_elems = score_tokens
-        .checked_mul(inputs.score_per_tok)
-        .ok_or_else(|| Error::ResourceLimit("attention score buffer overflow".to_owned()))?;
-    let score_bytes = f32_slice_bytes(score_elems)?.max(MIN_SCRATCH_BYTES);
+    let score_bytes = if inputs.use_flash_gqa6 {
+        MIN_SCRATCH_BYTES
+    } else {
+        let score_elems = score_tokens
+            .checked_mul(inputs.score_per_tok)
+            .ok_or_else(|| Error::ResourceLimit("attention score buffer overflow".to_owned()))?;
+        f32_slice_bytes(score_elems)?.max(MIN_SCRATCH_BYTES)
+    };
 
     let sizes = [
         hidden_bytes,
@@ -7704,6 +7740,7 @@ fn plan_tile_scratch(
     scratch_budget_bytes: u64,
     max_storage_range: u32,
     max_wg: [u32; 3],
+    use_flash_gqa6: bool,
 ) -> Result<TileScratchPlan, Error> {
     let max_proj_in = [
         geometry.embedding,
@@ -7741,6 +7778,7 @@ fn plan_tile_scratch(
         rank_per_tok: max_adapter_rank.max(1),
         rope: geometry.rope,
         score_per_tok,
+        use_flash_gqa6,
         key_scratch_bytes: f32_slice_bytes(geometry.key_width())?.max(MIN_SCRATCH_BYTES),
         val_scratch_bytes: f32_slice_bytes(geometry.value_width())?.max(MIN_SCRATCH_BYTES),
         logits_bytes: f32_slice_bytes(geometry.vocabulary)?.max(MIN_SCRATCH_BYTES),
@@ -7758,7 +7796,7 @@ fn plan_tile_scratch(
         }
     }
 
-    let mut score_tokens = tile_cap;
+    let mut score_tokens = if use_flash_gqa6 { 1 } else { tile_cap };
     let chosen = loop {
         if let Ok(candidate) = build_tile_scratch_plan(&inputs, tile_cap, score_tokens)
             && check_tile_scratch_limits(&candidate, scratch_budget_bytes, max_storage_range)
@@ -7771,6 +7809,10 @@ fn plan_tile_scratch(
     Ok(chosen)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Allocates all graph scratch buffers sized for the resolved tile capacity and attention path."
+)]
 fn allocate_scratch(
     geometry: &GraphGeometry,
     max_adapter_rank: usize,
@@ -7778,6 +7820,7 @@ fn allocate_scratch(
     scratch_budget_bytes: u64,
     max_storage_range: u32,
     max_wg: [u32; 3],
+    use_flash_gqa6: bool,
     guard: &mut BufferCleanupGuard<'_>,
 ) -> Result<GpuGraphScratch, Error> {
     let plan = plan_tile_scratch(
@@ -7787,6 +7830,7 @@ fn allocate_scratch(
         scratch_budget_bytes,
         max_storage_range,
         max_wg,
+        use_flash_gqa6,
     )?;
     let sizes = plan.sizes;
 
@@ -8279,7 +8323,7 @@ mod tests {
             context_limit: 2048,
         };
         let wg = [65_535, 65_535, 65_535];
-        let full = plan_tile_scratch(&geometry, 8, 16, 64 * 1024 * 1024, u32::MAX, wg)?;
+        let full = plan_tile_scratch(&geometry, 8, 16, 64 * 1024 * 1024, u32::MAX, wg, false)?;
         assert_eq!(full.allocated_tile_tokens, 16);
         assert_eq!(full.score_bytes, 16 * 2048 * 16 * 4);
 
@@ -8294,16 +8338,16 @@ mod tests {
             .map(|(_, &sz)| sz)
             .sum();
         let tight_budget = non_score_16 + 4 * one_tok_scores;
-        let sub_score = plan_tile_scratch(&geometry, 8, 16, tight_budget, u32::MAX, wg)?;
+        let sub_score = plan_tile_scratch(&geometry, 8, 16, tight_budget, u32::MAX, wg, false)?;
         assert_eq!(sub_score.allocated_tile_tokens, 16);
         assert_eq!(sub_score.score_bytes, 2 * one_tok_scores);
 
         // Extremely tight budget shrinks tile_cap toward 1 cleanly.
-        let plan_1tok = plan_tile_scratch(&geometry, 8, 1, 0, u32::MAX, wg)?;
+        let plan_1tok = plan_tile_scratch(&geometry, 8, 1, 0, u32::MAX, wg, false)?;
         let min_needed: u64 = plan_1tok.sizes.iter().sum();
-        let shrunk = plan_tile_scratch(&geometry, 8, 16, min_needed, u32::MAX, wg)?;
+        let shrunk = plan_tile_scratch(&geometry, 8, 16, min_needed, u32::MAX, wg, false)?;
         assert_eq!(shrunk.allocated_tile_tokens, 1);
-        assert!(plan_tile_scratch(&geometry, 8, 16, min_needed - 1, u32::MAX, wg).is_err());
+        assert!(plan_tile_scratch(&geometry, 8, 16, min_needed - 1, u32::MAX, wg, false).is_err());
         Ok(())
     }
 
@@ -8494,6 +8538,7 @@ mod tests {
             64 * 1024 * 1024,
             u32::MAX,
             [65_535, 65_535, 65_535],
+            false,
         )?;
         assert_eq!(plan_small.sizes[16], MIN_SCRATCH_BYTES);
         let plan_large = plan_tile_scratch(
@@ -8503,6 +8548,7 @@ mod tests {
             64 * 1024 * 1024,
             u32::MAX,
             [65_535, 65_535, 65_535],
+            false,
         )?;
         assert_eq!(plan_large.allocated_tile_tokens, 256);
         assert_eq!(plan_large.sizes[16], 256 * 6 * 4);
@@ -8518,6 +8564,7 @@ mod tests {
             64 * 1024 * 1024,
             u32::MAX,
             [65_535, 65_535, 65_535],
+            false,
         )?;
         assert_eq!(plan_alt.sizes[16], (256 * 4 * 4).max(MIN_SCRATCH_BYTES));
         Ok(())
@@ -8526,7 +8573,7 @@ mod tests {
     #[test]
     fn default_prefill_tile32_and_double_buffered_staging_plan() -> Result<(), Error> {
         let cfg = VulkanBatchedConfig::default();
-        assert_eq!(cfg.prefill_tile_tokens, 32);
+        assert_eq!(cfg.prefill_tile_tokens, 64);
 
         let geometry = GraphGeometry {
             embedding: 512,
@@ -8552,11 +8599,12 @@ mod tests {
             64 * 1024 * 1024,
             u32::MAX,
             [65_535, 65_535, 65_535],
+            false,
         )?;
-        assert_eq!(plan.allocated_tile_tokens, 32);
-        let expected_hidden = (32_u64 * 512 * 4).max(MIN_SCRATCH_BYTES);
-        let expected_rope = (32_u64 * 64 * 4).max(MIN_SCRATCH_BYTES);
-        let expected_lora = (32_u64 * 8 * 4).max(MIN_SCRATCH_BYTES);
+        assert_eq!(plan.allocated_tile_tokens, 64);
+        let expected_hidden = (64_u64 * 512 * 4).max(MIN_SCRATCH_BYTES);
+        let expected_rope = (64_u64 * 64 * 4).max(MIN_SCRATCH_BYTES);
+        let expected_lora = (64_u64 * 8 * 4).max(MIN_SCRATCH_BYTES);
         assert_eq!(plan.sizes[0], expected_hidden);
         assert_eq!(plan.sizes[21], expected_hidden);
         assert_eq!(plan.sizes[22], expected_hidden);
@@ -8564,6 +8612,20 @@ mod tests {
         assert_eq!(plan.sizes[24], expected_rope);
         assert_eq!(plan.sizes[25], expected_lora);
         assert_eq!(plan.sizes[26], expected_lora);
+
+        let flash_plan = plan_tile_scratch(
+            &geometry,
+            8,
+            cfg.prefill_tile_tokens,
+            64 * 1024 * 1024,
+            u32::MAX,
+            [65_535, 65_535, 65_535],
+            true,
+        )?;
+        assert_eq!(flash_plan.allocated_tile_tokens, 64);
+        assert_eq!(flash_plan.score_bytes, MIN_SCRATCH_BYTES);
+        assert_eq!(flash_plan.sizes[17], MIN_SCRATCH_BYTES);
+        assert_eq!(flash_plan.sizes[18], MIN_SCRATCH_BYTES);
         Ok(())
     }
 
@@ -8861,10 +8923,7 @@ mod tests {
                 let mut out4 = Vec::with_capacity(tokens * val_width);
                 for t in 0..tokens {
                     dev.write_buffer_f32(tok_qkv_buf, &qkv_in[t * channels..(t + 1) * channels])?;
-                    dev.write_buffer_f32(
-                        tok_alpha_buf,
-                        &alpha_in[t * v_heads..(t + 1) * v_heads],
-                    )?;
+                    dev.write_buffer_f32(tok_alpha_buf, &alpha_in[t * v_heads..(t + 1) * v_heads])?;
                     dev.write_buffer_f32(tok_beta_buf, &beta_in[t * v_heads..(t + 1) * v_heads])?;
                     dev.submit_compute(
                         step_4row_d128,
@@ -9266,6 +9325,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires live Vulkan compute hardware (Adreno)"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Live Adreno parity check for vec4 rms_norm and add_rms_norm kernels."
+    )]
     fn live_vec4_rms_norms_match_scalar_within_1e5() -> Result<(), Error> {
         let mut dev = AdrenoVulkanDevice::open()?;
         let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
@@ -9316,23 +9379,58 @@ mod tests {
             let dim_u = u32::try_from(dim).map_err(|_| Error::ResourceLimit("dim".to_owned()))?;
             let rows_u =
                 u32::try_from(rows).map_err(|_| Error::ResourceLimit("rows".to_owned()))?;
-            dev.submit_compute(rms_scalar, &[in_buf, w_buf, scalar_out_buf], &[dim_u, eps_bits], [1, rows_u, 1])?;
-            dev.submit_compute(rms_vec4, &[in_buf, w_buf, vec4_out_buf], &[dim_u, eps_bits], [1, rows_u, 1])?;
+            dev.submit_compute(
+                rms_scalar,
+                &[in_buf, w_buf, scalar_out_buf],
+                &[dim_u, eps_bits],
+                [1, rows_u, 1],
+            )?;
+            dev.submit_compute(
+                rms_vec4,
+                &[in_buf, w_buf, vec4_out_buf],
+                &[dim_u, eps_bits],
+                [1, rows_u, 1],
+            )?;
             let (mut out_s, mut out_v) = (vec![0.0_f32; total], vec![0.0_f32; total]);
             dev.read_buffer_f32(scalar_out_buf, &mut out_s)?;
             dev.read_buffer_f32(vec4_out_buf, &mut out_v)?;
-            let rms_max_diff = out_s.iter().zip(&out_v).map(|(&a, &b)| (a - b).abs()).fold(0.0_f32, f32::max);
-            assert!(rms_max_diff <= 1e-5, "rms_norm_vec4 dim={dim} rms_max_diff={rms_max_diff}");
+            let rms_max_diff = out_s
+                .iter()
+                .zip(&out_v)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                rms_max_diff <= 1e-5,
+                "rms_norm_vec4 dim={dim} rms_max_diff={rms_max_diff}"
+            );
 
-            dev.submit_compute(add_rms_scalar, &[scalar_res_buf, delta_buf, w_buf, scalar_out_buf], &[dim_u, eps_bits], [1, rows_u, 1])?;
-            dev.submit_compute(add_rms_vec4, &[vec4_res_buf, delta_buf, w_buf, vec4_out_buf], &[dim_u, eps_bits], [1, rows_u, 1])?;
+            dev.submit_compute(
+                add_rms_scalar,
+                &[scalar_res_buf, delta_buf, w_buf, scalar_out_buf],
+                &[dim_u, eps_bits],
+                [1, rows_u, 1],
+            )?;
+            dev.submit_compute(
+                add_rms_vec4,
+                &[vec4_res_buf, delta_buf, w_buf, vec4_out_buf],
+                &[dim_u, eps_bits],
+                [1, rows_u, 1],
+            )?;
             let (mut res_s, mut res_v) = (vec![0.0_f32; total], vec![0.0_f32; total]);
             dev.read_buffer_f32(scalar_res_buf, &mut res_s)?;
             dev.read_buffer_f32(vec4_res_buf, &mut res_v)?;
             dev.read_buffer_f32(scalar_out_buf, &mut out_s)?;
             dev.read_buffer_f32(vec4_out_buf, &mut out_v)?;
-            let residual_diff = res_s.iter().zip(&res_v).map(|(&a, &b)| (a - b).abs()).fold(0.0_f32, f32::max);
-            let add_norm_diff = out_s.iter().zip(&out_v).map(|(&a, &b)| (a - b).abs()).fold(0.0_f32, f32::max);
+            let residual_diff = res_s
+                .iter()
+                .zip(&res_v)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            let add_norm_diff = out_s
+                .iter()
+                .zip(&out_v)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
             assert!(
                 residual_diff == 0.0 && add_norm_diff <= 1e-5,
                 "add_rms_norm_vec4 dim={dim} residual_diff={residual_diff}, add_norm_diff={add_norm_diff}"
@@ -9348,11 +9446,8 @@ mod tests {
         let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
         let matvec_scalar =
             dev.create_compute_pipeline(&spirv::f32_matvec_with_subgroup(use_subgroup), 3, 2)?;
-        let matvec_vec4 = dev.create_compute_pipeline(
-            &spirv::f32_matvec_vec4_with_subgroup(use_subgroup),
-            3,
-            2,
-        )?;
+        let matvec_vec4 =
+            dev.create_compute_pipeline(&spirv::f32_matvec_vec4_with_subgroup(use_subgroup), 3, 2)?;
         let gemm_scalar = dev.create_compute_pipeline(
             &spirv::f32_gemm_batched_with_subgroup(use_subgroup),
             3,
@@ -9458,7 +9553,10 @@ mod tests {
             VulkanLayerPipelines::prepare(true, true, true)?.shader_digests_sha256
         );
         assert_ne!(p_base.shader_digests_sha256, p_sdot.shader_digests_sha256);
-        assert_ne!(p_sdot.shader_digests_sha256, p_acc_sat.shader_digests_sha256);
+        assert_ne!(
+            p_sdot.shader_digests_sha256,
+            p_acc_sat.shader_digests_sha256
+        );
         assert_ne!(p_base.shader_digests_sha256, p_wave.shader_digests_sha256);
         assert_ne!(p_base.shader_digests_sha256, p_both.shader_digests_sha256);
 

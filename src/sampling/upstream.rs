@@ -9,7 +9,7 @@
 )]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hasher};
 
 use crate::{Result, invalid};
@@ -403,6 +403,58 @@ impl State {
         Ok(())
     }
 
+    /// Collects sorted `(token_id, dry_penalty)` pairs for touched history tokens in `O(|history|)`.
+    pub(super) fn collect_dry_penalties(&self, out: &mut Vec<(i32, f32)>) {
+        out.clear();
+        if let Config::Dry {
+            multiplier,
+            base,
+            allowed_length,
+            last_n,
+            sequence_breakers,
+        } = &self.config
+            && *last_n > 0
+            && *multiplier != 0.0
+            && *base >= 1.0
+        {
+            collect_dry_penalties_from_history(
+                &self.history,
+                *multiplier,
+                *base,
+                *allowed_length,
+                sequence_breakers,
+                out,
+            );
+        }
+    }
+
+    /// Collects sorted `(token_id, count)` pairs and penalty parameters in `O(|history|)`.
+    #[expect(
+        clippy::float_cmp,
+        reason = "Native penalty identity values disable exactly, without an epsilon domain change."
+    )]
+    pub(super) fn collect_repetition_penalties(
+        &self,
+        out: &mut Vec<(i32, usize)>,
+    ) -> Option<(f32, f32, f32)> {
+        out.clear();
+        if let Config::Penalties {
+            last_n,
+            repeat,
+            frequency,
+            presence,
+            ..
+        } = self.config
+            && last_n > 0
+            && (repeat != 1.0 || frequency != 0.0 || presence != 0.0)
+            && !self.history.is_empty()
+        {
+            collect_repetition_counts(&self.history, out);
+            return Some((repeat, frequency, presence));
+        }
+        None
+    }
+
     /// Validates configuration and initializes independent random/history state.
     ///
     /// # Errors
@@ -564,7 +616,7 @@ pub(super) fn top_k_logits(
     keep: usize,
     backing: &mut Vec<Candidate>,
 ) -> Result<()> {
-    top_k_logits_inner::<true>(logits, keep, backing)
+    top_k_logits_inner::<true>(logits, keep, &[], backing)
 }
 
 pub(super) fn top_k_finite_logits(
@@ -572,26 +624,44 @@ pub(super) fn top_k_finite_logits(
     keep: usize,
     backing: &mut Vec<Candidate>,
 ) -> Result<()> {
-    top_k_logits_inner::<false>(logits.as_slice(), keep, backing)
+    top_k_logits_inner::<false>(logits.as_slice(), keep, &[], backing)
 }
 
-fn top_k_logits_inner<const VALIDATE: bool>(
+pub(super) fn top_k_adjusted_logits<const VALIDATE: bool>(
     logits: &[f32],
     keep: usize,
+    adjusted: &[(usize, f32)],
     backing: &mut Vec<Candidate>,
 ) -> Result<()> {
-    if keep == 0 || keep > 128 || keep > logits.len() || logits.len() > MAX_CANDIDATES {
-        return Err(invalid("bounded logit top-k extent is invalid"));
-    }
+    top_k_logits_inner::<VALIDATE>(logits, keep, adjusted, backing)
+}
+
+fn init_top_k_heap<const VALIDATE: bool>(
+    logits: &[f32],
+    keep: usize,
+    adjusted: &[(usize, f32)],
+    backing: &mut Vec<Candidate>,
+) -> Result<usize> {
     backing.clear();
     backing.try_reserve_exact(keep)?;
-    for (index, &logit) in logits[..keep].iter().enumerate() {
-        if VALIDATE && !logit.is_finite() {
+    let mut t_cursor = 0_usize;
+    for (index, &raw_logit) in logits[..keep].iter().enumerate() {
+        if VALIDATE && !raw_logit.is_finite() {
             backing.clear();
             return Err(invalid(
                 "Swift sampling requires the complete finite pinned vocabulary",
             ));
         }
+        while t_cursor < adjusted.len() && adjusted[t_cursor].0 < index {
+            t_cursor += 1;
+        }
+        let logit = if t_cursor < adjusted.len() && adjusted[t_cursor].0 == index {
+            let adj = adjusted[t_cursor].1;
+            t_cursor += 1;
+            adj
+        } else {
+            raw_logit
+        };
         backing.push(Candidate {
             id: i32::try_from(index)?,
             logit,
@@ -599,24 +669,52 @@ fn top_k_logits_inner<const VALIDATE: bool>(
         });
     }
     make_top_k_heap(backing);
+    Ok(t_cursor)
+}
+
+fn top_k_logits_inner<const VALIDATE: bool>(
+    logits: &[f32],
+    keep: usize,
+    adjusted: &[(usize, f32)],
+    backing: &mut Vec<Candidate>,
+) -> Result<()> {
+    if keep == 0 || keep > 128 || keep > logits.len() || logits.len() > MAX_CANDIDATES {
+        return Err(invalid("bounded logit top-k extent is invalid"));
+    }
+    let mut t_cursor = init_top_k_heap::<VALIDATE>(logits, keep, adjusted, backing)?;
     let tail = &logits[keep..];
     let (blocks, remainder) = tail.as_chunks::<16>();
     for (block_index, block) in blocks.iter().enumerate() {
-        let mut lanes = super::selection::candidate_lanes::<VALIDATE>(block, backing[0].logit);
         let base = keep + block_index * 16;
+        let mut lanes = super::selection::candidate_lanes::<VALIDATE>(block, backing[0].logit);
+        let t_block_start = t_cursor;
+        while t_cursor < adjusted.len() && adjusted[t_cursor].0 < base + 16 {
+            lanes |= 1_u64 << (adjusted[t_cursor].0 - base);
+            t_cursor += 1;
+        }
+        let touched_in_block = &adjusted[t_block_start..t_cursor];
         while lanes != 0 {
             let offset = usize::try_from(lanes.trailing_zeros())?;
             lanes &= lanes - 1;
-            let logit = block[offset];
-            if VALIDATE && !logit.is_finite() {
+            let raw_logit = block[offset];
+            if VALIDATE && !raw_logit.is_finite() {
                 backing.clear();
                 return Err(invalid(
                     "Swift sampling requires the complete finite pinned vocabulary",
                 ));
             }
+            let token_idx = base + offset;
+            let logit = if touched_in_block.is_empty() {
+                raw_logit
+            } else {
+                touched_in_block
+                    .iter()
+                    .find(|&&(id, _)| id == token_idx)
+                    .map_or(raw_logit, |&(_, adj)| adj)
+            };
             if logit > backing[0].logit {
                 let value = Candidate {
-                    id: i32::try_from(base + offset)?,
+                    id: i32::try_from(token_idx)?,
                     logit,
                     probability: 0.0,
                 };
@@ -625,16 +723,27 @@ fn top_k_logits_inner<const VALIDATE: bool>(
         }
     }
     let base = keep + blocks.len() * 16;
-    for (offset, &logit) in remainder.iter().enumerate() {
-        if VALIDATE && !logit.is_finite() {
+    for (offset, &raw_logit) in remainder.iter().enumerate() {
+        if VALIDATE && !raw_logit.is_finite() {
             backing.clear();
             return Err(invalid(
                 "Swift sampling requires the complete finite pinned vocabulary",
             ));
         }
+        let token_idx = base + offset;
+        while t_cursor < adjusted.len() && adjusted[t_cursor].0 < token_idx {
+            t_cursor += 1;
+        }
+        let logit = if t_cursor < adjusted.len() && adjusted[t_cursor].0 == token_idx {
+            let adj = adjusted[t_cursor].1;
+            t_cursor += 1;
+            adj
+        } else {
+            raw_logit
+        };
         if logit > backing[0].logit {
             let value = Candidate {
-                id: i32::try_from(base + offset)?,
+                id: i32::try_from(token_idx)?,
                 logit,
                 probability: 0.0,
             };
@@ -976,6 +1085,44 @@ fn xtc(
     }
 }
 
+fn build_token_bloom<T>(entries: &[(i32, T)]) -> [u64; 32] {
+    let mut bloom = [0_u64; 32];
+    for &(id, _) in entries {
+        let bits = u32::from_ne_bytes(id.to_ne_bytes());
+        let word = usize::from(u8::try_from((bits >> 6) & 31).unwrap_or(0));
+        bloom[word] |= 1_u64 << (bits & 63);
+    }
+    bloom
+}
+
+#[inline]
+fn bloom_contains(bloom: &[u64; 32], id: i32) -> bool {
+    let bits = u32::from_ne_bytes(id.to_ne_bytes());
+    let word = usize::from(u8::try_from((bits >> 6) & 31).unwrap_or(0));
+    (bloom[word] & (1_u64 << (bits & 63))) != 0
+}
+
+fn collect_repetition_counts(history: &VecDeque<i32>, out: &mut Vec<(i32, usize)>) {
+    out.clear();
+    if history.is_empty() {
+        return;
+    }
+    let mut tokens: Vec<i32> = history.iter().copied().collect();
+    tokens.sort_unstable();
+    let mut prev = tokens[0];
+    let mut count = 1_usize;
+    for &tok in &tokens[1..] {
+        if tok == prev {
+            count += 1;
+        } else {
+            out.push((prev, count));
+            prev = tok;
+            count = 1;
+        }
+    }
+    out.push((prev, count));
+}
+
 #[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
@@ -988,12 +1135,18 @@ fn penalties(
     frequency: f32,
     presence: f32,
 ) {
-    let mut counts = BTreeMap::<i32, usize>::new();
-    for &token in history {
-        *counts.entry(token).or_default() += 1;
+    let mut counts = Vec::new();
+    collect_repetition_counts(history, &mut counts);
+    if counts.is_empty() {
+        candidates.sorted = false;
+        return;
     }
+    let bloom = build_token_bloom(&counts);
     for entry in candidates.data_mut() {
-        if let Some(&count) = counts.get(&entry.id) {
+        if bloom_contains(&bloom, entry.id)
+            && let Ok(pos) = counts.binary_search_by_key(&entry.id, |&(id, _)| id)
+        {
+            let count = counts[pos].1;
             if entry.logit <= 0.0 {
                 entry.logit *= repeat;
             } else {
@@ -1108,14 +1261,15 @@ fn repeat_lengths(reversed: &[i32], limit: usize) -> Vec<usize> {
     clippy::cast_sign_loss,
     reason = "Native DRY bounds its finite logarithmic exponent before int truncation and float pow."
 )]
-fn dry(
-    candidates: &mut Candidates,
+fn collect_dry_penalties_from_history(
     history: &VecDeque<i32>,
     multiplier: f32,
     base: f32,
     allowed: usize,
     breakers: &[Vec<i32>],
+    out: &mut Vec<(i32, f32)>,
 ) {
+    out.clear();
     if history.len() <= allowed {
         return;
     }
@@ -1125,35 +1279,87 @@ fn dry(
         return;
     }
     let lengths = repeat_lengths(&reversed, limit);
-    let mut counts = BTreeMap::<i32, usize>::new();
+    let mut raw_hits: Vec<(i32, usize)> = Vec::new();
     for (index, &length) in lengths[..lengths.len() - 1].iter().enumerate() {
         if length >= allowed {
             let token = reversed[lengths.len() - 2 - index];
-            let maximum = counts.entry(token).or_default();
-            *maximum = (*maximum).max(length);
+            raw_hits.push((token, length));
         }
     }
+    if raw_hits.is_empty() {
+        return;
+    }
+    raw_hits.sort_unstable_by_key(|&(id, _)| id);
+
+    let mut single_breakers: Vec<i32> = breakers
+        .iter()
+        .filter(|b| b.len() == 1)
+        .map(|b| b[0])
+        .collect();
+    single_breakers.sort_unstable();
+    single_breakers.dedup();
+
     let max_exponent = if base > 1.000_001 {
         (88.722_84_f32 / base.ln()) as usize
     } else {
         0
     };
+    let mut idx = 0_usize;
+    while idx < raw_hits.len() {
+        let token = raw_hits[idx].0;
+        let mut max_len = raw_hits[idx].1;
+        idx += 1;
+        while idx < raw_hits.len() && raw_hits[idx].0 == token {
+            max_len = max_len.max(raw_hits[idx].1);
+            idx += 1;
+        }
+        if single_breakers.binary_search(&token).is_ok() {
+            continue;
+        }
+        let mut exponent = max_len - allowed;
+        if max_exponent > 0 {
+            exponent = exponent.min(max_exponent);
+        }
+        let penalty = (f64::from(multiplier)
+            * f64::from(base).powi(i32::try_from(exponent).unwrap_or(i32::MAX)))
+            as f32;
+        out.push((token, penalty));
+    }
+}
+
+fn dry(
+    candidates: &mut Candidates,
+    history: &VecDeque<i32>,
+    multiplier: f32,
+    base: f32,
+    allowed: usize,
+    breakers: &[Vec<i32>],
+) {
+    let mut penalties = Vec::new();
+    collect_dry_penalties_from_history(
+        history,
+        multiplier,
+        base,
+        allowed,
+        breakers,
+        &mut penalties,
+    );
+    if history.len() <= allowed {
+        return;
+    }
+    if penalties.is_empty() {
+        let reversed = history.iter().rev().copied().collect::<Vec<_>>();
+        if repetition_limit(&reversed, breakers) >= allowed {
+            candidates.sorted = false;
+        }
+        return;
+    }
+    let bloom = build_token_bloom(&penalties);
     for entry in candidates.data_mut() {
-        if let Some(&repeat) = counts.get(&entry.id) {
-            if breakers
-                .iter()
-                .any(|breaker| breaker.len() == 1 && breaker[0] == entry.id)
-            {
-                continue;
-            }
-            let mut exponent = repeat - allowed;
-            if max_exponent > 0 {
-                exponent = exponent.min(max_exponent);
-            }
-            let penalty = (f64::from(multiplier)
-                * f64::from(base).powi(i32::try_from(exponent).unwrap_or(i32::MAX)))
-                as f32;
-            entry.logit -= penalty;
+        if bloom_contains(&bloom, entry.id)
+            && let Ok(pos) = penalties.binary_search_by_key(&entry.id, |&(id, _)| id)
+        {
+            entry.logit -= penalties[pos].1;
         }
     }
     candidates.sorted = false;

@@ -3,9 +3,20 @@
 use super::{
     FiniteLogits, Sampler,
     reasoning_budget::{ReasoningBudget, State as BudgetState},
-    upstream::{Candidate, Candidates, Config, State, top_k_finite_logits, top_k_logits},
+    upstream::{
+        Candidate, Candidates, Config, State, top_k_adjusted_logits, top_k_finite_logits,
+        top_k_logits,
+    },
 };
 use crate::{Result, invalid};
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+use fearless_simd::{Neon, f32x4, prelude::*, u32x4};
 use std::collections::BTreeSet;
 
 /// Delimiter sequences resolved from the verified Swift vocabulary for [`ReasoningBudget`].
@@ -155,36 +166,135 @@ const fn f64_to_f32(value: f64) -> f32 {
     value as f32
 }
 
-fn compute_token_confidence(logits: &[f32], chosen: u32, top_k: usize) -> Result<TokenConfidence> {
-    let mut max_logit = f32::NEG_INFINITY;
-    for &logit in logits {
-        if !logit.is_finite() {
-            return Err(invalid(
-                "Swift sampling requires the complete finite pinned vocabulary",
-            ));
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+fn vector_exp_neg_x4(neon: Neon, neg_abs: f32x4<Neon>) -> f32x4<Neon> {
+    let min_arg = f32x4::splat(neon, -87.0);
+    let clamped = neg_abs.simd_lt(min_arg).select(min_arg, neg_abs);
+    let magic = f32x4::splat(neon, 12_582_912.0);
+    let z = clamped.mul_add(f32x4::splat(neon, f32::from_bits(0x3fb8_aa3b)), magic);
+    let n = z - magic;
+    let neg_n = -n;
+    let remainder = neg_n.mul_add(f32x4::splat(neon, f32::from_bits(0x3f31_7200)), clamped);
+    let remainder = neg_n.mul_add(f32x4::splat(neon, f32::from_bits(0x35bf_be8e)), remainder);
+    let exponent = z.bitcast::<u32x4<Neon>>() << 23;
+    let k = (exponent + u32x4::splat(neon, 1.0_f32.to_bits())).bitcast::<f32x4<Neon>>();
+    let square = remainder * remainder;
+    let inner = f32x4::splat(neon, f32::from_bits(0x3c07_2010))
+        .mul_add(remainder, f32x4::splat(neon, f32::from_bits(0x3d2b_9f17)))
+        .mul_add(
+            square,
+            f32x4::splat(neon, f32::from_bits(0x3e2a_af33))
+                .mul_add(remainder, f32x4::splat(neon, f32::from_bits(0x3eff_fedb))),
+        );
+    let polynomial = inner.mul_add(
+        square,
+        f32x4::splat(neon, f32::from_bits(0x3f7f_fff6)) * remainder,
+    );
+    let exp_val = polynomial.mul_add(k, k);
+    neg_abs
+        .simd_lt(min_arg)
+        .select(f32x4::splat(neon, 0.0), exp_val)
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn log_sum_exp_neon(neon: Neon, logits: &[f32], max_logit: f32) -> f64 {
+    let max_vec = f32x4::splat(neon, max_logit);
+    let max_f64 = f64::from(max_logit);
+    let (chunks4, tail) = logits.as_chunks::<4>();
+    let mut sum_exp = 0.0_f64;
+    // Flush 4-lane f32 accumulators every 256 chunks (1024 logits) to keep
+    // floating-point summation drift well below 1e-6 while avoiding f64 exp.
+    for block in chunks4.chunks(256) {
+        let (pairs, rem) = block.as_chunks::<2>();
+        let mut s0 = f32x4::splat(neon, 0.0);
+        let mut s1 = f32x4::splat(neon, 0.0);
+        for [a, b] in pairs {
+            s0 += vector_exp_neg_x4(neon, f32x4::from_slice(neon, a) - max_vec);
+            s1 += vector_exp_neg_x4(neon, f32x4::from_slice(neon, b) - max_vec);
         }
-        if logit > max_logit {
-            max_logit = logit;
+        for a in rem {
+            s0 += vector_exp_neg_x4(neon, f32x4::from_slice(neon, a) - max_vec);
         }
+        let arr = (s0 + s1).to_array();
+        sum_exp += f64::from(arr[0]) + f64::from(arr[1]) + f64::from(arr[2]) + f64::from(arr[3]);
     }
+    for &logit in tail {
+        sum_exp += (f64::from(logit) - max_f64).exp();
+    }
+    max_f64 + sum_exp.ln()
+}
+
+fn log_sum_exp(logits: &[f32], max_logit: f32) -> f64 {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return log_sum_exp_neon(neon, logits, max_logit);
+    }
+
     let max_f64 = f64::from(max_logit);
     let mut sum_exp = 0.0_f64;
     for &logit in logits {
         sum_exp += (f64::from(logit) - max_f64).exp();
     }
-    let log_z = max_f64 + sum_exp.ln();
+    max_f64 + sum_exp.ln()
+}
+
+fn compute_token_confidence<const VALIDATE: bool>(
+    logits: &[f32],
+    chosen: u32,
+    top_k: usize,
+    top_buf: &mut Vec<Candidate>,
+) -> Result<TokenConfidence> {
+    let max_logit = if top_k > 0 {
+        if VALIDATE {
+            top_k_logits(logits, top_k, top_buf)?;
+        } else {
+            top_k_finite_logits(FiniteLogits::from_validated(logits)?, top_k, top_buf)?;
+        }
+        top_buf.first().map_or(f32::NEG_INFINITY, |c| c.logit)
+    } else {
+        top_buf.clear();
+        let mut max_val = f32::NEG_INFINITY;
+        for &logit in logits {
+            if VALIDATE && !logit.is_finite() {
+                return Err(invalid(
+                    "Swift sampling requires the complete finite pinned vocabulary",
+                ));
+            }
+            if logit > max_val {
+                max_val = logit;
+            }
+        }
+        max_val
+    };
+
+    let log_z = log_sum_exp(logits, max_logit);
     let chosen_idx = usize::try_from(chosen)?;
     let chosen_logit = *logits
         .get(chosen_idx)
         .ok_or_else(|| invalid("Swift sampler selected out-of-range token"))?;
     let logprob = f64_to_f32(f64::from(chosen_logit) - log_z);
 
-    let mut top_buf = Vec::new();
-    if top_k > 0 {
-        top_k_logits(logits, top_k, &mut top_buf)?;
-    }
     let top_logprobs = top_buf
-        .into_iter()
+        .iter()
         .filter_map(|candidate| {
             u32::try_from(candidate.id)
                 .ok()
@@ -218,6 +328,10 @@ pub struct SwiftSampler {
     temperature_stage: Option<State>,
     backing: Vec<Candidate>,
     all_backing: Vec<Candidate>,
+    confidence_backing: Vec<Candidate>,
+    dry_scratch: Vec<(i32, f32)>,
+    rep_scratch: Vec<(i32, usize)>,
+    adjusted_scratch: Vec<(usize, f32)>,
     last_confidence: Option<TokenConfidence>,
 }
 
@@ -235,6 +349,10 @@ impl Clone for SwiftSampler {
             temperature_stage: self.temperature_stage.clone(),
             backing: Vec::new(),
             all_backing: Vec::new(),
+            confidence_backing: Vec::new(),
+            dry_scratch: Vec::new(),
+            rep_scratch: Vec::new(),
+            adjusted_scratch: Vec::new(),
             last_confidence: None,
         }
     }
@@ -272,6 +390,10 @@ impl SwiftSampler {
             temperature_stage: None,
             backing: Vec::new(),
             all_backing: Vec::new(),
+            confidence_backing: Vec::new(),
+            dry_scratch: Vec::new(),
+            rep_scratch: Vec::new(),
+            adjusted_scratch: Vec::new(),
             last_confidence: None,
         })
     }
@@ -518,27 +640,106 @@ impl SwiftSampler {
             self.sample_custom::<VALIDATE>(logits)?
         };
         if let Some(top_k_logprobs) = self.config.top_logprobs {
-            self.last_confidence = Some(compute_token_confidence(
+            let mut top_buf = std::mem::take(&mut self.confidence_backing);
+            let res = compute_token_confidence::<false>(
                 logits,
                 token,
                 usize::from(top_k_logprobs),
-            )?);
+                &mut top_buf,
+            );
+            self.confidence_backing = top_buf;
+            self.last_confidence = Some(res?);
         }
         self.accept_sampled_token(token)?;
         Ok(token)
     }
 
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        reason = "Bounded native integer token counts convert to binary32 with upstream separate multiply-add rounding."
+    )]
+    fn build_sparse_adjusted_logits(&mut self, logits: &[f32]) {
+        self.adjusted_scratch.clear();
+        if let Some(dry) = &self.dry {
+            dry.collect_dry_penalties(&mut self.dry_scratch);
+        } else {
+            self.dry_scratch.clear();
+        }
+        let rep_params = self
+            .penalties
+            .as_ref()
+            .and_then(|p| p.collect_repetition_penalties(&mut self.rep_scratch));
+        let dry_slice = &self.dry_scratch;
+        let rep_slice = if rep_params.is_some() {
+            &self.rep_scratch[..]
+        } else {
+            &[]
+        };
+        let mut d_idx = 0_usize;
+        let mut r_idx = 0_usize;
+        while d_idx < dry_slice.len() || r_idx < rep_slice.len() {
+            let next_id = match (dry_slice.get(d_idx), rep_slice.get(r_idx)) {
+                (Some(&(d_id, _)), Some(&(r_id, _))) => d_id.min(r_id),
+                (Some(&(d_id, _)), None) => d_id,
+                (None, Some(&(r_id, _))) => r_id,
+                (None, None) => break,
+            };
+            let dry_pen = if dry_slice.get(d_idx).is_some_and(|&(id, _)| id == next_id) {
+                let pen = dry_slice[d_idx].1;
+                d_idx += 1;
+                Some(pen)
+            } else {
+                None
+            };
+            let rep_count = if rep_slice.get(r_idx).is_some_and(|&(id, _)| id == next_id) {
+                let count = rep_slice[r_idx].1;
+                r_idx += 1;
+                Some(count)
+            } else {
+                None
+            };
+            let Ok(idx) = usize::try_from(next_id) else {
+                continue;
+            };
+            let Some(&raw_logit) = logits.get(idx) else {
+                continue;
+            };
+            let mut logit = raw_logit;
+            if let Some(pen) = dry_pen {
+                logit -= pen;
+            }
+            if let (Some(count), Some((repeat, frequency, presence))) = (rep_count, rep_params) {
+                if logit <= 0.0 {
+                    logit *= repeat;
+                } else {
+                    logit /= repeat;
+                }
+                logit -= count as f32 * frequency + presence;
+            }
+            self.adjusted_scratch.push((idx, logit));
+        }
+    }
+
     fn sample_custom<const VALIDATE: bool>(&mut self, logits: &[f32]) -> Result<u32> {
-        // Fast bounded path when no full-vocabulary history stage (penalties/DRY) is active
-        // and top_k <= 128. Preserves SIMD selection speed for typical calibrated presets.
-        if self.penalties.is_none()
-            && self.dry.is_none()
-            && self.config.top_k > 0
-            && self.config.top_k <= 128
-        {
+        // Fast bounded path when top_k is in 1..=128: compute DRY/repetition
+        // penalties sparsely in O(|history|) and select top-k with NEON lane pruning.
+        if self.config.top_k > 0 && self.config.top_k <= 128 {
             let keep = self.config.top_k;
+            let has_history_stages = self.penalties.is_some() || self.dry.is_some();
+            if has_history_stages {
+                self.build_sparse_adjusted_logits(logits);
+            }
             let mut backing = std::mem::take(&mut self.backing);
-            let res = if VALIDATE {
+            let res = if has_history_stages {
+                top_k_adjusted_logits::<VALIDATE>(
+                    logits,
+                    keep,
+                    &self.adjusted_scratch,
+                    &mut backing,
+                )
+            } else if VALIDATE {
                 top_k_logits(logits, keep, &mut backing)
             } else {
                 top_k_finite_logits(FiniteLogits::from_validated(logits)?, keep, &mut backing)
@@ -1327,6 +1528,447 @@ mod tests {
         // Clone rollback restores exact forcing cursor.
         let mut restored = saved;
         assert_eq!(restored.sample(&logits)?, 52);
+        Ok(())
+    }
+
+    struct FullVocabRefChain {
+        dry: Option<State>,
+        penalties: Option<State>,
+        top_k: Option<State>,
+        min_p: Option<State>,
+        top_p: State,
+        temperature: Option<State>,
+        distribution: State,
+    }
+
+    impl FullVocabRefChain {
+        fn new(
+            seed: u32,
+            config: &super::SwiftSamplerConfig,
+            dry_breakers: &[Vec<i32>],
+            history: &[u32],
+        ) -> crate::Result<Self> {
+            let mut dry = if config.dry_multiplier > 0.0 && config.dry_penalty_last_n > 0 {
+                Some(State::new(Config::Dry {
+                    multiplier: config.dry_multiplier,
+                    base: config.dry_base,
+                    allowed_length: config.dry_allowed_length,
+                    last_n: i32::try_from(config.dry_penalty_last_n)?,
+                    sequence_breakers: super::unique_sorted_dry_breakers(dry_breakers.to_vec()),
+                })?)
+            } else {
+                None
+            };
+            let mut penalties = if config.repeat_last_n > 0
+                && (config.repeat_penalty.to_bits() != 1.0_f32.to_bits()
+                    || config.frequency_penalty.to_bits() != 0.0_f32.to_bits()
+                    || config.presence_penalty.to_bits() != 0.0_f32.to_bits())
+            {
+                Some(State::new(Config::Penalties {
+                    vocabulary_size: SwiftSampler::VOCABULARY,
+                    last_n: i32::try_from(config.repeat_last_n)?,
+                    repeat: config.repeat_penalty,
+                    frequency: config.frequency_penalty,
+                    presence: config.presence_penalty,
+                })?)
+            } else {
+                None
+            };
+            for &tok in history {
+                let t = i32::try_from(tok)?;
+                if let Some(d) = &mut dry {
+                    d.accept(t);
+                }
+                if let Some(p) = &mut penalties {
+                    p.accept(t);
+                }
+            }
+            Ok(Self {
+                dry,
+                penalties,
+                top_k: (config.top_k > 0)
+                    .then(|| State::new(Config::TopK(i32::try_from(config.top_k).unwrap_or(1))))
+                    .transpose()?,
+                min_p: (config.min_p > 0.0)
+                    .then(|| {
+                        State::new(Config::MinP {
+                            probability: config.min_p,
+                            min_keep: 1,
+                        })
+                    })
+                    .transpose()?,
+                top_p: State::new(Config::TopP {
+                    probability: config.top_p,
+                    min_keep: 1,
+                })?,
+                temperature: (config.temperature.to_bits() != 1.0_f32.to_bits())
+                    .then(|| State::new(Config::Temperature(config.temperature)))
+                    .transpose()?,
+                distribution: State::new(Config::Distribution(seed))?,
+            })
+        }
+
+        fn step(&mut self, logits: &[f32]) -> crate::Result<(u32, Vec<Candidate>)> {
+            let backing = logits
+                .iter()
+                .enumerate()
+                .map(|(index, &logit)| {
+                    Ok(Candidate {
+                        id: i32::try_from(index)?,
+                        logit,
+                        probability: 0.0,
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            let mut candidates = Candidates::new(backing, -1, false)?;
+            for stage in [
+                &mut self.dry,
+                &mut self.penalties,
+                &mut self.top_k,
+                &mut self.min_p,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                stage.apply(&mut candidates)?;
+            }
+            self.top_p.apply(&mut candidates)?;
+            if let Some(temp) = &mut self.temperature {
+                temp.apply(&mut candidates)?;
+            }
+            self.distribution.apply(&mut candidates)?;
+            let selected = usize::try_from(candidates.selected())?;
+            let token = u32::try_from(candidates.data()[selected].id)?;
+            let t_i32 = i32::try_from(token)?;
+            if let Some(d) = &mut self.dry {
+                d.accept(t_i32);
+            }
+            if let Some(p) = &mut self.penalties {
+                p.accept(t_i32);
+            }
+            Ok((token, candidates.into_backing()))
+        }
+    }
+
+    fn verify_sparse_vs_full_vocab(
+        seed: u32,
+        config: &super::SwiftSamplerConfig,
+        breakers: &[Vec<i32>],
+        history: &[u32],
+        logits: &[f32],
+        steps: usize,
+    ) -> crate::Result<()> {
+        let mut sparse = SwiftSampler::with_config(seed, config.clone(), None, breakers)?;
+        sparse.seed_history(history);
+        let mut finite_sampler = sparse.clone();
+        let mut reference = FullVocabRefChain::new(seed, config, breakers, history)?;
+
+        for _ in 0..steps {
+            let (ref_tok, ref_backing) = reference.step(logits)?;
+            let sparse_tok = sparse.sample(logits)?;
+            let finite_tok = finite_sampler.sample_finite(super::FiniteLogits::new(logits)?)?;
+            assert_eq!(sparse_tok, ref_tok);
+            assert_eq!(finite_tok, ref_tok);
+            if config.top_k > 0 && config.top_k <= 128 {
+                assert_eq!(sparse.backing.len(), config.top_k);
+                assert_eq!(finite_sampler.backing.len(), config.top_k);
+                for (a, e) in sparse.backing.iter().zip(&ref_backing[..config.top_k]) {
+                    assert_eq!(a.id, e.id);
+                    assert_eq!(a.logit.to_bits(), e.logit.to_bits());
+                    assert_eq!(a.probability.to_bits(), e.probability.to_bits());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mixed_vocab_logits(vocab: usize) -> Vec<f32> {
+        let mut mixed_logits: Vec<f32> = (0..vocab)
+            .map(|i| {
+                let rem = i16::try_from((i.wrapping_mul(37) + 13) % 41).unwrap_or(0) - 25;
+                f32::from(rem) * 0.25
+            })
+            .collect();
+        mixed_logits[0] = -1.5;
+        mixed_logits[5] = 6.0;
+        mixed_logits[19] = -0.0;
+        mixed_logits[20] = 0.0;
+        mixed_logits[vocab - 1] = 5.5;
+        mixed_logits
+    }
+
+    #[test]
+    fn sparse_penalty_dry_top_k_matches_full_vocab_across_edge_cases() -> crate::Result<()> {
+        let vocab = SwiftSampler::VOCABULARY;
+        let mixed_logits = mixed_vocab_logits(vocab);
+        let all_neg_logits: Vec<f32> = (0..vocab)
+            .map(|i| f32::from(u8::try_from(i % 19).unwrap_or(0)).mul_add(-0.5, -1.0))
+            .collect();
+
+        let mut long_history = Vec::new();
+        for rep in 0..12_u32 {
+            long_history.extend([5, 12, 33, 5, 12, 33, 100, 101 + rep]);
+        }
+        let short_history = [5_u32, 12, 5, 19, 20, 200, 5, 12];
+        let breakers = vec![vec![100], vec![5, 999]];
+
+        let cases = [
+            (
+                super::SwiftSamplerConfig {
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    top_k: 5,
+                    min_p: 0.05,
+                    presence_penalty: 0.4,
+                    frequency_penalty: 0.25,
+                    repeat_penalty: 1.25,
+                    repeat_last_n: 128,
+                    dry_multiplier: 1.2,
+                    dry_base: 1.75,
+                    dry_allowed_length: 2,
+                    dry_penalty_last_n: 256,
+                    ..super::SwiftSamplerConfig::default()
+                },
+                &long_history[..],
+                &mixed_logits[..],
+            ),
+            (
+                super::SwiftSamplerConfig {
+                    temperature: 0.85,
+                    top_p: 0.95,
+                    top_k: 40,
+                    min_p: 0.02,
+                    presence_penalty: -0.8,
+                    frequency_penalty: -0.15,
+                    repeat_penalty: 0.75,
+                    repeat_last_n: 64,
+                    dry_multiplier: 0.5,
+                    dry_base: 1.5,
+                    dry_allowed_length: 2,
+                    dry_penalty_last_n: 128,
+                    ..super::SwiftSamplerConfig::default()
+                },
+                &short_history[..],
+                &all_neg_logits[..],
+            ),
+        ];
+
+        for (idx, (cfg, hist, logits)) in cases.into_iter().enumerate() {
+            verify_sparse_vs_full_vocab(
+                100 + u32::try_from(idx)?,
+                &cfg,
+                &breakers,
+                hist,
+                logits,
+                4,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_penalty_dry_ties_and_fallback_top_k_match_full_vocab() -> crate::Result<()> {
+        let vocab = SwiftSampler::VOCABULARY;
+        let tied_logits = vec![0.0_f32; vocab];
+        let mixed_logits = mixed_vocab_logits(vocab);
+        let mut long_history = Vec::new();
+        for rep in 0..12_u32 {
+            long_history.extend([5, 12, 33, 5, 12, 33, 100, 101 + rep]);
+        }
+        let short_history = [5_u32, 12, 5, 19, 20, 200, 5, 12];
+        let breakers = vec![vec![100], vec![5, 999]];
+
+        let cases = [
+            (
+                super::SwiftSamplerConfig {
+                    top_k: 1,
+                    presence_penalty: 0.5,
+                    repeat_penalty: 1.2,
+                    repeat_last_n: 64,
+                    dry_multiplier: 0.8,
+                    dry_penalty_last_n: 128,
+                    ..super::SwiftSamplerConfig::default()
+                },
+                &short_history[..],
+                &tied_logits[..],
+            ),
+            (
+                super::SwiftSamplerConfig {
+                    top_k: 128,
+                    presence_penalty: -0.5,
+                    frequency_penalty: 0.2,
+                    repeat_penalty: 1.1,
+                    repeat_last_n: 64,
+                    dry_multiplier: 0.8,
+                    dry_penalty_last_n: 128,
+                    ..super::SwiftSamplerConfig::default()
+                },
+                &long_history[..],
+                &tied_logits[..],
+            ),
+            (
+                super::SwiftSamplerConfig {
+                    top_k: 0,
+                    presence_penalty: 0.3,
+                    repeat_penalty: 1.15,
+                    repeat_last_n: 64,
+                    dry_multiplier: 0.6,
+                    dry_penalty_last_n: 128,
+                    ..super::SwiftSamplerConfig::default()
+                },
+                &short_history[..],
+                &mixed_logits[..],
+            ),
+            (
+                super::SwiftSamplerConfig {
+                    top_k: 200,
+                    presence_penalty: 0.3,
+                    repeat_penalty: 1.15,
+                    repeat_last_n: 64,
+                    dry_multiplier: 0.6,
+                    dry_penalty_last_n: 128,
+                    ..super::SwiftSamplerConfig::default()
+                },
+                &short_history[..],
+                &mixed_logits[..],
+            ),
+        ];
+
+        for (idx, (cfg, hist, logits)) in cases.into_iter().enumerate() {
+            verify_sparse_vs_full_vocab(
+                200 + u32::try_from(idx)?,
+                &cfg,
+                &breakers,
+                hist,
+                logits,
+                4,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_penalty_dry_rejects_nonfinite_and_preserves_rng_rollback() -> crate::Result<()> {
+        let cfg = super::SwiftSamplerConfig {
+            temperature: 0.8,
+            top_p: 0.9,
+            top_k: 20,
+            min_p: 0.05,
+            presence_penalty: 0.4,
+            frequency_penalty: 0.1,
+            repeat_penalty: 1.2,
+            repeat_last_n: 64,
+            dry_multiplier: 0.8,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 128,
+            ..super::SwiftSamplerConfig::default()
+        };
+        let mut sampler = SwiftSampler::with_config(555, cfg.clone(), None, &[])?;
+        let history = [5_u32, 12, 33, 5, 12, 33];
+        sampler.seed_history(&history);
+        let mut control = sampler.clone();
+
+        let mut logits = vec![-1.0_f32; SwiftSampler::VOCABULARY];
+        logits[5] = 3.0;
+        logits[33] = 2.5;
+        let first_tok = sampler.sample(&logits)?;
+        assert_eq!(first_tok, control.sample(&logits)?);
+        let saved = sampler.clone();
+
+        let alloc = sampler.backing.as_ptr();
+        let cap = sampler.backing.capacity();
+        for bad_idx in [0, 5, 19, 20, 32, 33, SwiftSampler::VOCABULARY - 1] {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                logits[bad_idx] = bad;
+                assert!(sampler.sample(&logits).is_err());
+                assert_eq!(sampler.backing.len(), 0);
+                assert_eq!(sampler.backing.as_ptr(), alloc);
+                assert_eq!(sampler.backing.capacity(), cap);
+                logits[bad_idx] = -1.0;
+            }
+        }
+        logits[5] = 3.0;
+        logits[33] = 2.5;
+        assert_eq!(sampler.sample(&logits)?, control.sample(&logits)?);
+        let mut restored = saved;
+        let mut expected_next = SwiftSampler::with_config(555, cfg, None, &[])?;
+        expected_next.seed_history(&history);
+        assert_eq!(expected_next.sample(&logits)?, first_tok);
+        assert_eq!(restored.sample(&logits)?, expected_next.sample(&logits)?);
+        Ok(())
+    }
+
+    #[test]
+    fn compute_token_confidence_neon_matches_scalar_f64_reference() -> crate::Result<()> {
+        let vocab = SwiftSampler::VOCABULARY;
+        let scalar_ref =
+            |logits: &[f32], chosen: u32, top_k: usize| -> crate::Result<(f32, Vec<(u32, f32)>)> {
+                let max_f64 = f64::from(logits.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+                let sum_exp: f64 = logits.iter().map(|&v| (f64::from(v) - max_f64).exp()).sum();
+                let log_z = max_f64 + sum_exp.ln();
+                let logprob =
+                    super::f64_to_f32(f64::from(logits[usize::try_from(chosen)?]) - log_z);
+                let mut top = Vec::new();
+                if top_k > 0 {
+                    top_k_logits(logits, top_k, &mut top)?;
+                }
+                let top_lps = top
+                    .into_iter()
+                    .map(|c| {
+                        Ok((
+                            u32::try_from(c.id)?,
+                            super::f64_to_f32(f64::from(c.logit) - log_z),
+                        ))
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                Ok((logprob, top_lps))
+            };
+
+        let varied: Vec<f32> = (0..vocab)
+            .map(|i| {
+                let s = i16::try_from((i.wrapping_mul(17) + 3) % 59).unwrap_or(0) - 29;
+                f32::from(s) * 0.25
+            })
+            .collect();
+        let mut peaked = vec![-20.0_f32; vocab];
+        peaked[42] = 10.0;
+        peaked[1000] = 9.5;
+        let mut extreme = vec![-1.0e38_f32; vocab];
+        extreme[7] = 1.0e38;
+        let uniform = vec![0.0_f32; vocab];
+
+        let mut buf = Vec::new();
+        for (logits, chosen) in [
+            (&varied, 17_u32),
+            (&peaked, 42_u32),
+            (&extreme, 7_u32),
+            (&uniform, 0_u32),
+        ] {
+            for top_k in [0_usize, 1, 5, 20] {
+                let (ref_lp, ref_top) = scalar_ref(logits, chosen, top_k)?;
+                let got = super::compute_token_confidence::<true>(logits, chosen, top_k, &mut buf)?;
+                assert!(
+                    (got.logprob - ref_lp).abs() <= 1e-5,
+                    "logprob diff={} for top_k={top_k}",
+                    (got.logprob - ref_lp).abs()
+                );
+                assert_eq!(got.top_logprobs.len(), ref_top.len());
+                for ((gid, glp), (eid, elp)) in got.top_logprobs.iter().zip(&ref_top) {
+                    assert_eq!(gid, eid);
+                    assert!(
+                        (glp - elp).abs() <= 1e-5,
+                        "top_logprob diff={} for id={gid}",
+                        (glp - elp).abs()
+                    );
+                }
+            }
+        }
+
+        let mut bad = uniform;
+        bad[vocab - 1] = f32::NAN;
+        assert!(super::compute_token_confidence::<true>(&bad, 0, 0, &mut buf).is_err());
+        assert!(super::compute_token_confidence::<true>(&bad, 0, 5, &mut buf).is_err());
         Ok(())
     }
 }

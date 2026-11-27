@@ -409,7 +409,11 @@ impl<R: BufRead, W: Write> SwiftClient<R, W> {
     fn read_response(&mut self) -> Result<Response<'_>, ClientError> {
         self.response.clear();
         loop {
-            let available = self.input.fill_buf().map_err(|_| ClientError::Transport)?;
+            let available = match self.input.fill_buf() {
+                Ok(available) => available,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(ClientError::Transport),
+            };
             if available.is_empty() {
                 return Err(ClientError::InvalidResponse);
             }
@@ -608,5 +612,76 @@ impl Write for BoundedWriter<'_> {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_FRAME_BYTES, Response, SwiftClient};
+    use std::io::{self, BufRead, Read, Write};
+
+    struct InterruptingBuf<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+        interrupted_once: bool,
+    }
+
+    impl Read for InterruptingBuf<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let avail = &self.bytes[self.pos..];
+            let count = out.len().min(avail.len());
+            out[..count].copy_from_slice(&avail[..count]);
+            self.pos += count;
+            Ok(count)
+        }
+    }
+
+    impl BufRead for InterruptingBuf<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if !self.interrupted_once {
+                self.interrupted_once = true;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"));
+            }
+            Ok(&self.bytes[self.pos..])
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.pos += amt;
+        }
+    }
+
+    struct Sink;
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn swift_client_read_response_retries_eintr() {
+        let mut client = SwiftClient {
+            input: InterruptingBuf {
+                bytes: b"{\"type\":\"reset\",\"id\":2,\"ready\":true}\n",
+                pos: 0,
+                interrupted_once: false,
+            },
+            output: Sink,
+            response_limit: MAX_FRAME_BYTES,
+            healthy: true,
+            reset_required: false,
+            next_id: Some(3),
+            request: Vec::new(),
+            response: Vec::new(),
+        };
+        let response = client.read_response();
+        assert!(matches!(
+            response,
+            Ok(Response::Reset { id: 2, ready: true })
+        ));
     }
 }

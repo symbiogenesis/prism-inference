@@ -24,7 +24,7 @@
 //! flushed, allowing clients to wait for readiness before sending any request.
 
 use std::borrow::Cow;
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -231,7 +231,11 @@ enum Frame {
 fn read_frame(input: &mut impl BufRead, frame: &mut Vec<u8>, limit: usize) -> Result<Frame> {
     frame.clear();
     loop {
-        let available = input.fill_buf()?;
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        };
         if available.is_empty() {
             return Ok(if frame.is_empty() {
                 Frame::Eof
@@ -271,8 +275,53 @@ fn write_record(output: &mut impl Write, response: &Response<'_>) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{Cow, Request};
+    use super::{Cow, Frame, Request, read_frame};
     use crate::{Result, invalid};
+    use std::io::{self, BufRead, Read};
+
+    struct InterruptingReader<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+        interrupted_once: bool,
+    }
+
+    impl Read for InterruptingReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let avail = &self.bytes[self.pos..];
+            let count = out.len().min(avail.len());
+            out[..count].copy_from_slice(&avail[..count]);
+            self.pos += count;
+            Ok(count)
+        }
+    }
+
+    impl BufRead for InterruptingReader<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if !self.interrupted_once {
+                self.interrupted_once = true;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"));
+            }
+            Ok(&self.bytes[self.pos..])
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.pos += amt;
+        }
+    }
+
+    #[test]
+    fn read_frame_retries_eintr_before_completing_frame() -> Result<()> {
+        let mut reader = InterruptingReader {
+            bytes: br#"{"id":1,"op":"count","text":"hi"}
+"#,
+            pos: 0,
+            interrupted_once: false,
+        };
+        let mut frame = Vec::new();
+        assert!(matches!(read_frame(&mut reader, &mut frame, 128)?, Frame::Complete));
+        assert_eq!(frame, br#"{"id":1,"op":"count","text":"hi"}"#);
+        Ok(())
+    }
 
     #[test]
     fn text_requests_borrow_plain_frames_and_decode_escaped_frames() -> Result<()> {

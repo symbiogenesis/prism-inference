@@ -336,7 +336,11 @@ fn read_response<'a>(
 ) -> Result<Response<'a>, ClientError> {
     response.clear();
     loop {
-        let available = input.fill_buf().map_err(|_| ClientError::Transport)?;
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(ClientError::Transport),
+        };
         if available.is_empty() {
             return Err(ClientError::InvalidResponse);
         }
@@ -444,5 +448,59 @@ impl Write for BoundedWriter<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Response, read_response};
+    use std::io::{self, BufRead, Read};
+
+    struct InterruptingBuf<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+        interrupted_once: bool,
+    }
+
+    impl Read for InterruptingBuf<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let avail = &self.bytes[self.pos..];
+            let count = out.len().min(avail.len());
+            out[..count].copy_from_slice(&avail[..count]);
+            self.pos += count;
+            Ok(count)
+        }
+    }
+
+    impl BufRead for InterruptingBuf<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if !self.interrupted_once {
+                self.interrupted_once = true;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"));
+            }
+            Ok(&self.bytes[self.pos..])
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.pos += amt;
+        }
+    }
+
+    #[test]
+    fn read_response_retries_eintr() {
+        let mut reader = InterruptingBuf {
+            bytes: b"{\"type\":\"count\",\"id\":1,\"prompt_token_count\":4}\n",
+            pos: 0,
+            interrupted_once: false,
+        };
+        let mut buf = Vec::new();
+        let response = read_response(&mut reader, &mut buf, 1024);
+        assert!(matches!(
+            response,
+            Ok(Response::Count {
+                id: 1,
+                prompt_token_count: 4
+            })
+        ));
     }
 }

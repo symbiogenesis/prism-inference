@@ -83,7 +83,11 @@ fn load() -> Result<SwiftSession> {
 fn frame(input: &mut impl BufRead, bytes: &mut Vec<u8>) -> Result<bool> {
     bytes.clear();
     loop {
-        let available = input.fill_buf()?;
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        };
         if available.is_empty() {
             return if bytes.is_empty() {
                 Ok(false)

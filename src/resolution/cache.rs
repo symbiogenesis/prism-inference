@@ -67,21 +67,54 @@ fn path_text(path: &Path) -> Result<String> {
         .map(str::to_owned)
         .ok_or_else(|| invalid("cache path is not UTF-8"))
 }
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn for_target(path: &Path) -> Self {
+        let suffix = format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        );
+        let tmp = match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) => path.with_extension(format!("{ext}.{suffix}")),
+            None => path.with_extension(suffix),
+        };
+        Self {
+            path: tmp,
+            armed: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&tmp, bytes)?;
-    let outcome = fs::rename(&tmp, path);
-    if outcome.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    Ok(outcome?)
+    let mut guard = TempFileGuard::for_target(path);
+    fs::write(guard.path(), bytes)?;
+    fs::rename(guard.path(), path)?;
+    guard.disarm();
+    Ok(())
 }
 fn decode_response(bytes: &[u8], max_body: usize) -> Result<(u16, Vec<u8>)> {
     let end = bytes
@@ -547,7 +580,10 @@ impl Resolver {
                 fs::create_dir_all(parent)?;
             }
             if fs::hard_link(&file.local_path, &file.final_path).is_err() {
-                fs::copy(&file.local_path, &file.final_path)?;
+                let mut guard = TempFileGuard::for_target(&file.final_path);
+                fs::copy(&file.local_path, guard.path())?;
+                fs::rename(guard.path(), &file.final_path)?;
+                guard.disarm();
             }
         }
         path_text(&file.final_path)
@@ -708,6 +744,44 @@ mod tests {
             },
         )?;
         assert!(!cache.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn temp_file_guard_and_atomic_write_clean_up_temp_files_on_failure_and_success() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-cache-guard-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir)?;
+
+        let staged_path = {
+            let guard = TempFileGuard::for_target(&dir.join("model.gguf"));
+            fs::write(guard.path(), b"partial")?;
+            assert!(guard.path().exists());
+            guard.path().to_path_buf()
+        };
+        assert!(!staged_path.exists());
+
+        let target = dir.join("artifact.bin");
+        atomic_write(&target, b"hello")?;
+        assert_eq!(fs::read(&target)?, b"hello");
+
+        let dir_target = dir.join("occupied-dir");
+        fs::create_dir_all(&dir_target)?;
+        assert!(atomic_write(&dir_target, b"wont-rename").is_err());
+
+        let leftover = fs::read_dir(&dir)?
+            .filter_map(std::result::Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains("tmp-"))
+            });
+        assert!(!leftover);
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }

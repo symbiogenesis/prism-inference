@@ -155,6 +155,7 @@ impl ChannelReader {
                                 break;
                             }
                         }
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                         Err(err) => {
                             let _ = tx.send(Err(err));
                             break;

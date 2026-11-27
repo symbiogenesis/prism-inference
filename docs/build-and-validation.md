@@ -164,7 +164,7 @@ Full suites and benchmarks run only in CI. Local checks should name the affected
 regression, for example:
 
 ```powershell
-cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --locked --offline --release `
+cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --locked --offline `
     --target aarch64-pc-windows-msvc `
     --manifest-path <repo>/Cargo.toml --target-dir <temp>/build `
     --test runtime edited_turns_restore_complete_recurrent_prefix_and_failed_stream_rolls_back -- --exact

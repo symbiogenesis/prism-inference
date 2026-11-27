@@ -219,10 +219,10 @@ rolled-back work.
 Focused commands, subject to [local-check policy](build-and-validation.md):
 
 ```text
-cargo test --release --locked --features parallel-rows --lib tiled_
-cargo test --release --locked --features parallel-rows --lib chunkwise_gdn_
-cargo test --release --locked --features parallel-rows --test graph tiled_prefill_
-cargo test --release --locked --features parallel-rows --test graph chunkwise_gdn_prefill_
+cargo test --locked --features parallel-rows --lib tiled_
+cargo test --locked --features parallel-rows --lib chunkwise_gdn_
+cargo test --locked --features parallel-rows --test graph tiled_prefill_
+cargo test --locked --features parallel-rows --test graph chunkwise_gdn_prefill_
 ```
 
 Controls cover scalar/NEON and quantizer bits, packed extremes, awkward rows,

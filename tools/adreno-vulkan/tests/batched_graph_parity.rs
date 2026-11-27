@@ -882,7 +882,7 @@ fn synthetic_hybrid_model_builds_and_config_defaults_are_well_formed() -> TestRe
     let cfg = VulkanBatchedConfig::default();
     assert_eq!(cfg.kv_precision, VulkanKvPrecision::Fp16);
     assert_eq!(cfg.tdr_policy.layers_per_submit, 8);
-    assert_eq!(cfg.prefill_tile_tokens, 32);
+    assert_eq!(cfg.prefill_tile_tokens, 64);
     assert_eq!(cfg.kv_precision.name(), "fp16");
     assert_eq!(VulkanKvPrecision::Fp32.name(), "fp32");
 
@@ -1875,10 +1875,17 @@ fn repack_test_32b_coalesced(raw: &[u8], cols: usize, rows: usize, block_cols: u
                     continue;
                 }
                 let block = &raw[r * row_bytes + blk_off..][..34];
-                for word_j in 0..8 {
-                    let c = 2 + word_j * 4;
-                    dst[tile_off + 32 + word_j * 64 + lane] =
-                        u32::from_le_bytes([block[c], block[c + 1], block[c + 2], block[c + 3]]);
+                for half_j in 0..2 {
+                    for c in 0..4 {
+                        let word_j = half_j * 4 + c;
+                        let c_off = 2 + word_j * 4;
+                        dst[tile_off + 32 + (half_j * 64 + lane) * 4 + c] = u32::from_le_bytes([
+                            block[c_off],
+                            block[c_off + 1],
+                            block[c_off + 2],
+                            block[c_off + 3],
+                        ]);
+                    }
                 }
             }
         }

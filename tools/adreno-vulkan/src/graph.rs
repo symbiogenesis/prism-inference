@@ -285,7 +285,9 @@ pub struct VulkanLayerPipelines {
     attn_flash_gqa6_decode_splitk_f16kv: PipelineId,
     attn_flash_decode_combine: PipelineId,
     rms_norm: PipelineId,
+    rms_norm_vec4: PipelineId,
     add_rms_norm: PipelineId,
+    add_rms_norm_vec4: PipelineId,
     gated_rms_norm_pinned: PipelineId,
     gated_rms_norm_unpinned: PipelineId,
     rope: PipelineId,
@@ -302,6 +304,8 @@ pub struct VulkanLayerPipelines {
     gdn_scan_batched: PipelineId,
     gdn_step_2row_vec4: PipelineId,
     gdn_scan_batched_2row_vec4: PipelineId,
+    gdn_step_4row_d128_vec4: PipelineId,
+    gdn_scan_batched_4row_d128_vec4: PipelineId,
     gdn_gates: PipelineId,
     gdn_gates_batched: PipelineId,
     deinterleave_q_gate: PipelineId,
@@ -331,7 +335,9 @@ pub struct VulkanLayerPipelines {
     fused_hadamard1024_q8_0_pinned_native: PipelineId,
     hadamard_batched: PipelineId,
     f32_matvec: PipelineId,
+    f32_matvec_vec4: PipelineId,
     f32_gemm_batched: PipelineId,
+    f32_gemm_batched_vec4: PipelineId,
     f16_matvec: PipelineId,
     f16_gemm_batched: PipelineId,
     lora_b_accum: PipelineId,
@@ -364,7 +370,7 @@ struct PreparedLayerShaders {
     use_sdot_acc_sat: bool,
     use_wave64: bool,
     proj: PreparedProjectionShaders,
-    modules: [PreparedShaderSpec; 73],
+    modules: [PreparedShaderSpec; 79],
     shader_digests_sha256: String,
 }
 
@@ -394,7 +400,7 @@ impl VulkanLayerPipelines {
             use_wave64_shuffle,
         )?;
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v8:")?;
+        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v9:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
         hash_u32(&mut hasher, u32::from(use_sdot_acc_sat))?;
         hash_u32(&mut hasher, u32::from(use_wave64_shuffle))?;
@@ -472,8 +478,20 @@ impl VulkanLayerPipelines {
                 2,
             )?,
             make_spec(
+                b"rms_norm_vec4_f32",
+                spirv::rms_norm_vec4_f32_with_subgroup(use_wave64_shuffle),
+                3,
+                2,
+            )?,
+            make_spec(
                 b"add_rms_norm_f32",
                 spirv::add_rms_norm_f32_with_subgroup(use_wave64_shuffle),
+                4,
+                2,
+            )?,
+            make_spec(
+                b"add_rms_norm_vec4_f32",
+                spirv::add_rms_norm_vec4_f32_with_subgroup(use_wave64_shuffle),
                 4,
                 2,
             )?,
@@ -555,6 +573,18 @@ impl VulkanLayerPipelines {
             make_spec(
                 b"gdn_scan_batched_2row_vec4_f32",
                 spirv::gdn_scan_batched_2row_vec4_f32_with_subgroup(use_wave64_shuffle),
+                5,
+                5,
+            )?,
+            make_spec(
+                b"gdn_step_4row_d128_vec4_f32",
+                spirv::gdn_step_4row_d128_vec4_f32_with_subgroup(use_wave64_shuffle),
+                5,
+                4,
+            )?,
+            make_spec(
+                b"gdn_scan_batched_4row_d128_vec4_f32",
+                spirv::gdn_scan_batched_4row_d128_vec4_f32_with_subgroup(use_wave64_shuffle),
                 5,
                 5,
             )?,
@@ -717,8 +747,20 @@ impl VulkanLayerPipelines {
                 2,
             )?,
             make_spec(
+                b"f32_matvec_vec4",
+                spirv::f32_matvec_vec4_with_subgroup(use_wave64_shuffle),
+                3,
+                2,
+            )?,
+            make_spec(
                 b"f32_gemm_batched",
                 spirv::f32_gemm_batched_with_subgroup(use_wave64_shuffle),
+                3,
+                3,
+            )?,
+            make_spec(
+                b"f32_gemm_batched_vec4",
+                spirv::f32_gemm_batched_vec4_with_subgroup(use_wave64_shuffle),
                 3,
                 3,
             )?,
@@ -850,7 +892,9 @@ impl VulkanLayerPipelines {
             attn_flash_gqa6_decode_splitk_f16kv,
             attn_flash_decode_combine,
             rms_norm,
+            rms_norm_vec4,
             add_rms_norm,
+            add_rms_norm_vec4,
             gated_rms_norm_pinned,
             gated_rms_norm_unpinned,
             rope,
@@ -867,6 +911,8 @@ impl VulkanLayerPipelines {
             gdn_scan_batched,
             gdn_step_2row_vec4,
             gdn_scan_batched_2row_vec4,
+            gdn_step_4row_d128_vec4,
+            gdn_scan_batched_4row_d128_vec4,
             gdn_gates,
             gdn_gates_batched,
             deinterleave_q_gate,
@@ -896,7 +942,9 @@ impl VulkanLayerPipelines {
             fused_hadamard1024_q8_0_pinned_native,
             hadamard_batched,
             f32_matvec,
+            f32_matvec_vec4,
             f32_gemm_batched,
+            f32_gemm_batched_vec4,
             f16_matvec,
             f16_gemm_batched,
             lora_b_accum,
@@ -911,7 +959,7 @@ impl VulkanLayerPipelines {
             copy_slice_offset,
             vocab_argmax_stage1,
             vocab_argmax_stage2,
-        ]: [PipelineId; 73] = ids
+        ]: [PipelineId; 79] = ids
             .try_into()
             .map_err(|_| Error::InvalidInput("layer pipeline count mismatch".to_owned()))?;
 
@@ -929,7 +977,9 @@ impl VulkanLayerPipelines {
             attn_flash_gqa6_decode_splitk_f16kv,
             attn_flash_decode_combine,
             rms_norm,
+            rms_norm_vec4,
             add_rms_norm,
+            add_rms_norm_vec4,
             gated_rms_norm_pinned,
             gated_rms_norm_unpinned,
             rope,
@@ -946,6 +996,8 @@ impl VulkanLayerPipelines {
             gdn_scan_batched,
             gdn_step_2row_vec4,
             gdn_scan_batched_2row_vec4,
+            gdn_step_4row_d128_vec4,
+            gdn_scan_batched_4row_d128_vec4,
             gdn_gates,
             gdn_gates_batched,
             deinterleave_q_gate,
@@ -975,7 +1027,9 @@ impl VulkanLayerPipelines {
             fused_hadamard1024_q8_0_pinned_native,
             hadamard_batched,
             f32_matvec,
+            f32_matvec_vec4,
             f32_gemm_batched,
+            f32_gemm_batched_vec4,
             f16_matvec,
             f16_gemm_batched,
             lora_b_accum,
@@ -3625,8 +3679,6 @@ impl VulkanBatchedGraphExecutor {
         mode: FinalLayerMode,
         min_align: usize,
     ) -> Result<(), Error> {
-        let embed_u32 = u32::try_from(self.geometry.embedding)
-            .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
         let tokens_u32 = u32::try_from(tokens)
             .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
         let eps_bits = self.geometry.epsilon.to_bits();
@@ -3634,28 +3686,24 @@ impl VulkanBatchedGraphExecutor {
         let post_norm_w = self.layers[layer_idx].post_norm_w;
 
         if layer_idx == 0 {
-            self.batch_recorder.push_barrier(
-                self.pipelines.rms_norm,
-                &[
-                    BufferSpan::whole(self.scratch.hidden),
-                    BufferSpan::whole(attn_norm_w),
-                    BufferSpan::whole(self.scratch.norm),
-                ],
-                &[embed_u32, eps_bits],
-                checked_grid(&self.device, [1, tokens_u32, 1])?,
-            );
+            self.push_rms_norm_barrier(
+                BufferSpan::whole(self.scratch.hidden),
+                BufferSpan::whole(attn_norm_w),
+                BufferSpan::whole(self.scratch.norm),
+                self.geometry.embedding,
+                tokens_u32,
+                eps_bits,
+            )?;
         } else {
-            self.batch_recorder.push_barrier(
-                self.pipelines.add_rms_norm,
-                &[
-                    BufferSpan::whole(self.scratch.hidden),
-                    BufferSpan::whole(self.scratch.delta),
-                    BufferSpan::whole(attn_norm_w),
-                    BufferSpan::whole(self.scratch.norm),
-                ],
-                &[embed_u32, eps_bits],
-                checked_grid(&self.device, [1, tokens_u32, 1])?,
-            );
+            self.push_add_rms_norm_barrier(
+                BufferSpan::whole(self.scratch.hidden),
+                BufferSpan::whole(self.scratch.delta),
+                BufferSpan::whole(attn_norm_w),
+                BufferSpan::whole(self.scratch.norm),
+                self.geometry.embedding,
+                tokens_u32,
+                eps_bits,
+            )?;
         }
 
         let is_recurrent = matches!(
@@ -3679,17 +3727,15 @@ impl VulkanBatchedGraphExecutor {
         };
         let post_tokens_u32 = u32::try_from(post_tokens)
             .map_err(|_| Error::ResourceLimit("post_tokens exceed u32".to_owned()))?;
-        self.batch_recorder.push_barrier(
-            self.pipelines.add_rms_norm,
-            &[
-                BufferSpan::whole(self.scratch.hidden),
-                BufferSpan::whole(self.scratch.delta),
-                BufferSpan::whole(post_norm_w),
-                BufferSpan::whole(self.scratch.norm),
-            ],
-            &[embed_u32, eps_bits],
-            checked_grid(&self.device, [1, post_tokens_u32, 1])?,
-        );
+        self.push_add_rms_norm_barrier(
+            BufferSpan::whole(self.scratch.hidden),
+            BufferSpan::whole(self.scratch.delta),
+            BufferSpan::whole(post_norm_w),
+            BufferSpan::whole(self.scratch.norm),
+            self.geometry.embedding,
+            post_tokens_u32,
+            eps_bits,
+        )?;
 
         self.record_ffn_tokens(layer_idx, post_tokens)
     }
@@ -3862,11 +3908,22 @@ impl VulkanBatchedGraphExecutor {
                 l2_grid,
             );
             if self.geometry.ssm_head >= 128 && self.geometry.ssm_head.is_multiple_of(4) {
-                let gdn_grid =
-                    checked_grid(&self.device, [ssm_head_u32.div_ceil(2), v_heads_u32, 1])?;
+                let (gdn_grid, gdn_step_pipe, gdn_scan_pipe) = if self.geometry.ssm_head == 128 {
+                    (
+                        checked_grid(&self.device, [ssm_head_u32 / 4, v_heads_u32, 1])?,
+                        self.pipelines.gdn_step_4row_d128_vec4,
+                        self.pipelines.gdn_scan_batched_4row_d128_vec4,
+                    )
+                } else {
+                    (
+                        checked_grid(&self.device, [ssm_head_u32.div_ceil(2), v_heads_u32, 1])?,
+                        self.pipelines.gdn_step_2row_vec4,
+                        self.pipelines.gdn_scan_batched_2row_vec4,
+                    )
+                };
                 if tokens == 1 {
                     self.batch_recorder.push_barrier(
-                        self.pipelines.gdn_step_2row_vec4,
+                        gdn_step_pipe,
                         &[
                             BufferSpan::whole(matrix_state),
                             BufferSpan::whole(proj_qkv_buf),
@@ -3879,7 +3936,7 @@ impl VulkanBatchedGraphExecutor {
                     );
                 } else {
                     self.batch_recorder.push_barrier(
-                        self.pipelines.gdn_scan_batched_2row_vec4,
+                        gdn_scan_pipe,
                         &[
                             BufferSpan::whole(matrix_state),
                             BufferSpan::whole(proj_qkv_buf),
@@ -4268,16 +4325,16 @@ impl VulkanBatchedGraphExecutor {
                 );
             }
 
-            self.batch_recorder.push_barrier(
-                self.pipelines.rms_norm,
-                &[
-                    BufferSpan::whole(query_buf),
-                    BufferSpan::whole(query_norm_w),
-                    BufferSpan::whole(query_buf),
-                ],
-                &[head_dim_u32, eps_bits],
-                checked_grid(&self.device, [1, q_tokens_u32 * num_heads_u32, 1])?,
-            );
+            let head_dim = usize::try_from(head_dim_u32)
+                .map_err(|_| Error::ResourceLimit("head_dim exceeds usize".to_owned()))?;
+            self.push_rms_norm_barrier(
+                BufferSpan::whole(query_buf),
+                BufferSpan::whole(query_norm_w),
+                BufferSpan::whole(query_buf),
+                head_dim,
+                q_tokens_u32 * num_heads_u32,
+                eps_bits,
+            )?;
 
             self.record_rope_tokens(
                 query_buf,
@@ -4378,16 +4435,16 @@ impl VulkanBatchedGraphExecutor {
 
         let total_kv_u32 = u32::try_from(tokens * kv_width)
             .map_err(|_| Error::ResourceLimit("batched kv_width exceeds u32".to_owned()))?;
-        self.batch_recorder.push_barrier(
-            self.pipelines.rms_norm,
-            &[
-                BufferSpan::whole(key_buf),
-                BufferSpan::whole(key_norm_w),
-                BufferSpan::whole(key_buf),
-            ],
-            &[head_dim_u32, eps_bits],
-            checked_grid(&self.device, [1, tokens_u32 * kv_heads_u32, 1])?,
-        );
+        let head_dim = usize::try_from(head_dim_u32)
+            .map_err(|_| Error::ResourceLimit("head_dim exceeds usize".to_owned()))?;
+        self.push_rms_norm_barrier(
+            BufferSpan::whole(key_buf),
+            BufferSpan::whole(key_norm_w),
+            BufferSpan::whole(key_buf),
+            head_dim,
+            tokens_u32 * kv_heads_u32,
+            eps_bits,
+        )?;
         if self.config.kv_precision == VulkanKvPrecision::Fp32 {
             self.batch_recorder.push_concurrent(
                 self.pipelines.round_f16,
@@ -5103,28 +5160,24 @@ impl VulkanBatchedGraphExecutor {
             } else {
                 self.scratch.hidden
             };
-            self.batch_recorder.push_barrier(
-                self.pipelines.rms_norm,
-                &[
-                    BufferSpan::whole(hidden_src),
-                    BufferSpan::whole(self.output_norm_w),
-                    BufferSpan::whole(self.scratch.norm),
-                ],
-                &[embed_u32, self.geometry.epsilon.to_bits()],
-                checked_grid(&self.device, [1, 1, 1])?,
-            );
+            self.push_rms_norm_barrier(
+                BufferSpan::whole(hidden_src),
+                BufferSpan::whole(self.output_norm_w),
+                BufferSpan::whole(self.scratch.norm),
+                self.geometry.embedding,
+                1,
+                self.geometry.epsilon.to_bits(),
+            )?;
         } else {
-            self.batch_recorder.push_barrier(
-                self.pipelines.add_rms_norm,
-                &[
-                    BufferSpan::whole(self.scratch.hidden),
-                    BufferSpan::whole(self.scratch.delta),
-                    BufferSpan::whole(self.output_norm_w),
-                    BufferSpan::whole(self.scratch.norm),
-                ],
-                &[embed_u32, self.geometry.epsilon.to_bits()],
-                checked_grid(&self.device, [1, 1, 1])?,
-            );
+            self.push_add_rms_norm_barrier(
+                BufferSpan::whole(self.scratch.hidden),
+                BufferSpan::whole(self.scratch.delta),
+                BufferSpan::whole(self.output_norm_w),
+                BufferSpan::whole(self.scratch.norm),
+                self.geometry.embedding,
+                1,
+                self.geometry.epsilon.to_bits(),
+            )?;
         }
         self.record_projection_group_tokens(
             self.scratch.norm,
@@ -5319,9 +5372,13 @@ impl VulkanBatchedGraphExecutor {
             .map_err(|_| Error::ResourceLimit("tokens exceed u32".to_owned()))?;
 
         // `src_buf` holds unrotated original activations across the whole projection group.
+        let use_f32_vec4 =
+            !lora.is_f16 && lora.in_features.is_multiple_of(4) && lora.a_span.offset.is_multiple_of(16);
         if tokens == 1 {
             let pipe = if lora.is_f16 {
                 self.pipelines.f16_matvec
+            } else if use_f32_vec4 {
+                self.pipelines.f32_matvec_vec4
             } else {
                 self.pipelines.f32_matvec
             };
@@ -5340,6 +5397,8 @@ impl VulkanBatchedGraphExecutor {
             let tok_tiles = tokens_u32.div_ceil(4);
             let pipe = if lora.is_f16 {
                 self.pipelines.f16_gemm_batched
+            } else if use_f32_vec4 {
+                self.pipelines.f32_gemm_batched_vec4
             } else {
                 self.pipelines.f32_gemm_batched
             };
@@ -6027,9 +6086,15 @@ impl VulkanBatchedGraphExecutor {
                     );
                 }
                 WeightEncoding::F32 => {
+                    let use_vec4 = cols_u32.is_multiple_of(4) && weight.span.offset.is_multiple_of(16);
                     if multi_token {
+                        let pipe = if use_vec4 {
+                            self.pipelines.f32_gemm_batched_vec4
+                        } else {
+                            self.pipelines.f32_gemm_batched
+                        };
                         self.batch_recorder.push(
-                            self.pipelines.f32_gemm_batched,
+                            pipe,
                             &[
                                 weight.span,
                                 BufferSpan::whole(f32_act_buf),
@@ -6040,8 +6105,13 @@ impl VulkanBatchedGraphExecutor {
                             barrier_before,
                         );
                     } else {
+                        let pipe = if use_vec4 {
+                            self.pipelines.f32_matvec_vec4
+                        } else {
+                            self.pipelines.f32_matvec
+                        };
                         self.batch_recorder.push(
-                            self.pipelines.f32_matvec,
+                            pipe,
                             &[
                                 weight.span,
                                 BufferSpan::whole(f32_act_buf),
@@ -6055,6 +6125,74 @@ impl VulkanBatchedGraphExecutor {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn push_rms_norm_barrier(
+        &mut self,
+        in_span: BufferSpan,
+        w_span: BufferSpan,
+        out_span: BufferSpan,
+        dim: usize,
+        rows_u32: u32,
+        eps_bits: u32,
+    ) -> Result<(), Error> {
+        let dim_u32 = u32::try_from(dim)
+            .map_err(|_| Error::ResourceLimit("rms_norm dim exceeds u32".to_owned()))?;
+        let use_vec4 = dim > 256
+            && dim.is_multiple_of(4)
+            && dim <= spirv::MAX_RMS_NORM_VEC4_DIM
+            && in_span.offset.is_multiple_of(16)
+            && w_span.offset.is_multiple_of(16)
+            && out_span.offset.is_multiple_of(16);
+        let pipe = if use_vec4 {
+            self.pipelines.rms_norm_vec4
+        } else {
+            self.pipelines.rms_norm
+        };
+        self.batch_recorder.push_barrier(
+            pipe,
+            &[in_span, w_span, out_span],
+            &[dim_u32, eps_bits],
+            checked_grid(&self.device, [1, rows_u32, 1])?,
+        );
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Dispatches fused add+RMSNorm across vec4 multi-wave and scalar fallback pipelines."
+    )]
+    fn push_add_rms_norm_barrier(
+        &mut self,
+        res_span: BufferSpan,
+        delta_span: BufferSpan,
+        w_span: BufferSpan,
+        out_span: BufferSpan,
+        dim: usize,
+        rows_u32: u32,
+        eps_bits: u32,
+    ) -> Result<(), Error> {
+        let dim_u32 = u32::try_from(dim)
+            .map_err(|_| Error::ResourceLimit("add_rms_norm dim exceeds u32".to_owned()))?;
+        let use_vec4 = dim > 256
+            && dim.is_multiple_of(4)
+            && dim <= spirv::MAX_RMS_NORM_VEC4_DIM
+            && res_span.offset.is_multiple_of(16)
+            && delta_span.offset.is_multiple_of(16)
+            && w_span.offset.is_multiple_of(16)
+            && out_span.offset.is_multiple_of(16);
+        let pipe = if use_vec4 {
+            self.pipelines.add_rms_norm_vec4
+        } else {
+            self.pipelines.add_rms_norm
+        };
+        self.batch_recorder.push_barrier(
+            pipe,
+            &[res_span, delta_span, w_span, out_span],
+            &[dim_u32, eps_bits],
+            checked_grid(&self.device, [1, rows_u32, 1])?,
+        );
         Ok(())
     }
 }
@@ -8561,6 +8699,16 @@ mod tests {
             5,
             4,
         )?;
+        let scan_4row_d128 = dev.create_compute_pipeline(
+            &spirv::gdn_scan_batched_4row_d128_vec4_f32_with_subgroup(use_subgroup),
+            5,
+            5,
+        )?;
+        let step_4row_d128 = dev.create_compute_pipeline(
+            &spirv::gdn_step_4row_d128_vec4_f32_with_subgroup(use_subgroup),
+            5,
+            4,
+        )?;
 
         for &(v_heads, k_heads, head_dim, tokens) in &[
             (4_usize, 2_usize, 64_usize, 16_usize),
@@ -8695,6 +8843,75 @@ mod tests {
                 max_out_diff <= 1e-4 && max_st_diff <= 1e-4,
                 "GDN 2row_vec4 ({v_heads},{k_heads},{head_dim},T={tokens}) max_out_diff={max_out_diff}, max_st_diff={max_st_diff}"
             );
+
+            if head_dim == 128 {
+                let st_buf3 = dev.create_storage_buffer(f32_slice_bytes(state_elems)?)?;
+                let st_buf4 = dev.create_storage_buffer(f32_slice_bytes(state_elems)?)?;
+                let out_buf3 = dev.create_storage_buffer(f32_slice_bytes(tokens * val_width)?)?;
+                dev.write_buffer_f32(st_buf3, &init_state)?;
+                dev.write_buffer_f32(st_buf4, &init_state)?;
+
+                dev.submit_compute(
+                    scan_4row_d128,
+                    &[st_buf3, qkv_buf, alpha_buf, beta_buf, out_buf3],
+                    &[vh_u, kh_u, hd_u, scale_bits, tok_u],
+                    [hd_u / 4, vh_u, 1],
+                )?;
+
+                let mut out4 = Vec::with_capacity(tokens * val_width);
+                for t in 0..tokens {
+                    dev.write_buffer_f32(tok_qkv_buf, &qkv_in[t * channels..(t + 1) * channels])?;
+                    dev.write_buffer_f32(
+                        tok_alpha_buf,
+                        &alpha_in[t * v_heads..(t + 1) * v_heads],
+                    )?;
+                    dev.write_buffer_f32(tok_beta_buf, &beta_in[t * v_heads..(t + 1) * v_heads])?;
+                    dev.submit_compute(
+                        step_4row_d128,
+                        &[
+                            st_buf4,
+                            tok_qkv_buf,
+                            tok_alpha_buf,
+                            tok_beta_buf,
+                            tok_out_buf,
+                        ],
+                        &[vh_u, kh_u, hd_u, scale_bits],
+                        [hd_u / 4, vh_u, 1],
+                    )?;
+                    dev.read_buffer_f32(tok_out_buf, &mut tmp_o)?;
+                    out4.extend_from_slice(&tmp_o);
+                }
+
+                let mut out3 = vec![0.0_f32; tokens * val_width];
+                let mut st3 = vec![0.0_f32; state_elems];
+                let mut st4 = vec![0.0_f32; state_elems];
+                dev.read_buffer_f32(out_buf3, &mut out3)?;
+                dev.read_buffer_f32(st_buf3, &mut st3)?;
+                dev.read_buffer_f32(st_buf4, &mut st4)?;
+
+                let mut max_4row_out_diff = 0.0_f32;
+                for (i, ((&a, &b), &c)) in out0.iter().zip(&out3).zip(&out4).enumerate() {
+                    assert_eq!(
+                        b.to_bits(),
+                        c.to_bits(),
+                        "4row_d128 scan vs step mismatch at {i}"
+                    );
+                    max_4row_out_diff = max_4row_out_diff.max((a - b).abs());
+                }
+                let mut max_4row_st_diff = 0.0_f32;
+                for (i, ((&a, &b), &c)) in st0.iter().zip(&st3).zip(&st4).enumerate() {
+                    assert_eq!(
+                        b.to_bits(),
+                        c.to_bits(),
+                        "4row_d128 state scan vs step mismatch at {i}"
+                    );
+                    max_4row_st_diff = max_4row_st_diff.max((a - b).abs());
+                }
+                assert!(
+                    max_4row_out_diff <= 1e-4 && max_4row_st_diff <= 1e-4,
+                    "GDN 4row_d128_vec4 ({v_heads},{k_heads},{head_dim},T={tokens}) max_out_diff={max_4row_out_diff}, max_st_diff={max_4row_st_diff}"
+                );
+            }
         }
 
         // Also test full recurrent batch chain: conv1d_k4 -> gdn_gates -> l2_norm -> gdn_scan inside CommandBatchRecorder
@@ -9048,7 +9265,185 @@ mod tests {
     }
 
     #[test]
-    fn prepared_layer_pipelines_v8_includes_fused_kernels_and_distinct_digests() -> Result<(), Error>
+    #[ignore = "requires live Vulkan compute hardware (Adreno)"]
+    fn live_vec4_rms_norms_match_scalar_within_1e5() -> Result<(), Error> {
+        let mut dev = AdrenoVulkanDevice::open()?;
+        let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
+        let rms_scalar =
+            dev.create_compute_pipeline(&spirv::rms_norm_f32_with_subgroup(use_subgroup), 3, 2)?;
+        let rms_vec4 = dev.create_compute_pipeline(
+            &spirv::rms_norm_vec4_f32_with_subgroup(use_subgroup),
+            3,
+            2,
+        )?;
+        let add_rms_scalar = dev.create_compute_pipeline(
+            &spirv::add_rms_norm_f32_with_subgroup(use_subgroup),
+            4,
+            2,
+        )?;
+        let add_rms_vec4 = dev.create_compute_pipeline(
+            &spirv::add_rms_norm_vec4_f32_with_subgroup(use_subgroup),
+            4,
+            2,
+        )?;
+
+        let eps_bits = 1e-6_f32.to_bits();
+        for &(dim, rows) in &[(256_usize, 5_usize), (5120_usize, 3_usize)] {
+            let total = dim * rows;
+            let pat = |len: usize, mul: usize, add: usize, m: usize, sub: i16, scale: f32| {
+                (0..len)
+                    .map(|i| {
+                        f32::from(i16::try_from((i * mul + add) % m).unwrap_or(0) - sub) * scale
+                    })
+                    .collect::<Vec<f32>>()
+            };
+            let res_init = pat(total, 17, 5, 31, 15, 0.05);
+            let delta = pat(total, 23, 3, 29, 14, 0.03);
+            let weight = pat(dim, 11, 7, 19, 9, 0.1);
+            let in_buf = dev.create_storage_buffer(f32_slice_bytes(total)?)?;
+            let w_buf = dev.create_storage_buffer(f32_slice_bytes(dim)?)?;
+            let scalar_out_buf = dev.create_storage_buffer(f32_slice_bytes(total)?)?;
+            let vec4_out_buf = dev.create_storage_buffer(f32_slice_bytes(total)?)?;
+            let scalar_res_buf = dev.create_storage_buffer(f32_slice_bytes(total)?)?;
+            let vec4_res_buf = dev.create_storage_buffer(f32_slice_bytes(total)?)?;
+            let delta_buf = dev.create_storage_buffer(f32_slice_bytes(total)?)?;
+            dev.write_buffer_f32(in_buf, &res_init)?;
+            dev.write_buffer_f32(w_buf, &weight)?;
+            dev.write_buffer_f32(scalar_res_buf, &res_init)?;
+            dev.write_buffer_f32(vec4_res_buf, &res_init)?;
+            dev.write_buffer_f32(delta_buf, &delta)?;
+
+            let dim_u = u32::try_from(dim).map_err(|_| Error::ResourceLimit("dim".to_owned()))?;
+            let rows_u =
+                u32::try_from(rows).map_err(|_| Error::ResourceLimit("rows".to_owned()))?;
+            dev.submit_compute(rms_scalar, &[in_buf, w_buf, scalar_out_buf], &[dim_u, eps_bits], [1, rows_u, 1])?;
+            dev.submit_compute(rms_vec4, &[in_buf, w_buf, vec4_out_buf], &[dim_u, eps_bits], [1, rows_u, 1])?;
+            let (mut out_s, mut out_v) = (vec![0.0_f32; total], vec![0.0_f32; total]);
+            dev.read_buffer_f32(scalar_out_buf, &mut out_s)?;
+            dev.read_buffer_f32(vec4_out_buf, &mut out_v)?;
+            let rms_max_diff = out_s.iter().zip(&out_v).map(|(&a, &b)| (a - b).abs()).fold(0.0_f32, f32::max);
+            assert!(rms_max_diff <= 1e-5, "rms_norm_vec4 dim={dim} rms_max_diff={rms_max_diff}");
+
+            dev.submit_compute(add_rms_scalar, &[scalar_res_buf, delta_buf, w_buf, scalar_out_buf], &[dim_u, eps_bits], [1, rows_u, 1])?;
+            dev.submit_compute(add_rms_vec4, &[vec4_res_buf, delta_buf, w_buf, vec4_out_buf], &[dim_u, eps_bits], [1, rows_u, 1])?;
+            let (mut res_s, mut res_v) = (vec![0.0_f32; total], vec![0.0_f32; total]);
+            dev.read_buffer_f32(scalar_res_buf, &mut res_s)?;
+            dev.read_buffer_f32(vec4_res_buf, &mut res_v)?;
+            dev.read_buffer_f32(scalar_out_buf, &mut out_s)?;
+            dev.read_buffer_f32(vec4_out_buf, &mut out_v)?;
+            let residual_diff = res_s.iter().zip(&res_v).map(|(&a, &b)| (a - b).abs()).fold(0.0_f32, f32::max);
+            let add_norm_diff = out_s.iter().zip(&out_v).map(|(&a, &b)| (a - b).abs()).fold(0.0_f32, f32::max);
+            assert!(
+                residual_diff == 0.0 && add_norm_diff <= 1e-5,
+                "add_rms_norm_vec4 dim={dim} residual_diff={residual_diff}, add_norm_diff={add_norm_diff}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires live Vulkan compute hardware (Adreno)"]
+    fn live_f32_vec4_matvec_and_gemm_match_scalar_within_1e4() -> Result<(), Error> {
+        let mut dev = AdrenoVulkanDevice::open()?;
+        let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
+        let matvec_scalar =
+            dev.create_compute_pipeline(&spirv::f32_matvec_with_subgroup(use_subgroup), 3, 2)?;
+        let matvec_vec4 = dev.create_compute_pipeline(
+            &spirv::f32_matvec_vec4_with_subgroup(use_subgroup),
+            3,
+            2,
+        )?;
+        let gemm_scalar = dev.create_compute_pipeline(
+            &spirv::f32_gemm_batched_with_subgroup(use_subgroup),
+            3,
+            3,
+        )?;
+        let gemm_vec4 = dev.create_compute_pipeline(
+            &spirv::f32_gemm_batched_vec4_with_subgroup(use_subgroup),
+            3,
+            3,
+        )?;
+
+        let cols = 5120_usize;
+        let rows = 96_usize;
+        let tokens = 6_usize;
+        let weights: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let rem = i16::try_from((i * 19 + 3) % 37).unwrap_or(0) - 18;
+                f32::from(rem) * 0.01
+            })
+            .collect();
+        let inputs: Vec<f32> = (0..tokens * cols)
+            .map(|i| {
+                let rem = i16::try_from((i * 29 + 11) % 43).unwrap_or(0) - 21;
+                f32::from(rem) * 0.02
+            })
+            .collect();
+        let w_buf = dev.create_storage_buffer(f32_slice_bytes(weights.len())?)?;
+        let x_buf = dev.create_storage_buffer(f32_slice_bytes(inputs.len())?)?;
+        let matvec_scalar_buf = dev.create_storage_buffer(f32_slice_bytes(rows)?)?;
+        let matvec_vec4_buf = dev.create_storage_buffer(f32_slice_bytes(rows)?)?;
+        let gemm_scalar_buf = dev.create_storage_buffer(f32_slice_bytes(tokens * rows)?)?;
+        let gemm_vec4_buf = dev.create_storage_buffer(f32_slice_bytes(tokens * rows)?)?;
+        dev.write_buffer_f32(w_buf, &weights)?;
+        dev.write_buffer_f32(x_buf, &inputs)?;
+
+        let cols_u = u32::try_from(cols).map_err(|_| Error::ResourceLimit("cols".to_owned()))?;
+        let rows_u = u32::try_from(rows).map_err(|_| Error::ResourceLimit("rows".to_owned()))?;
+        let tok_u = u32::try_from(tokens).map_err(|_| Error::ResourceLimit("tok".to_owned()))?;
+
+        dev.submit_compute(
+            matvec_scalar,
+            &[w_buf, x_buf, matvec_scalar_buf],
+            &[cols_u, rows_u],
+            [rows_u, 1, 1],
+        )?;
+        dev.submit_compute(
+            matvec_vec4,
+            &[w_buf, x_buf, matvec_vec4_buf],
+            &[cols_u, rows_u],
+            [rows_u, 1, 1],
+        )?;
+        dev.submit_compute(
+            gemm_scalar,
+            &[w_buf, x_buf, gemm_scalar_buf],
+            &[cols_u, rows_u, tok_u],
+            [rows_u, tok_u.div_ceil(4), 1],
+        )?;
+        dev.submit_compute(
+            gemm_vec4,
+            &[w_buf, x_buf, gemm_vec4_buf],
+            &[cols_u, rows_u, tok_u],
+            [rows_u, tok_u.div_ceil(4), 1],
+        )?;
+
+        let mut ms = vec![0.0_f32; rows];
+        let mut mv = vec![0.0_f32; rows];
+        let mut gs = vec![0.0_f32; tokens * rows];
+        let mut gv = vec![0.0_f32; tokens * rows];
+        dev.read_buffer_f32(matvec_scalar_buf, &mut ms)?;
+        dev.read_buffer_f32(matvec_vec4_buf, &mut mv)?;
+        dev.read_buffer_f32(gemm_scalar_buf, &mut gs)?;
+        dev.read_buffer_f32(gemm_vec4_buf, &mut gv)?;
+        let max_matvec_diff = ms
+            .iter()
+            .zip(&mv)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let max_gemm_diff = gs
+            .iter()
+            .zip(&gv)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_matvec_diff <= 1e-4 && max_gemm_diff <= 1e-4,
+            "f32_vec4 max_matvec_diff={max_matvec_diff}, max_gemm_diff={max_gemm_diff}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_layer_pipelines_v9_includes_fused_kernels_and_distinct_digests() -> Result<(), Error>
     {
         let p_base = VulkanLayerPipelines::prepare(false, false, false)?;
         let p_sdot = VulkanLayerPipelines::prepare(true, false, false)?;
@@ -9056,8 +9451,8 @@ mod tests {
         let p_wave = VulkanLayerPipelines::prepare(false, false, true)?;
         let p_both = VulkanLayerPipelines::prepare(true, true, true)?;
 
-        assert_eq!(p_base.modules.len(), 73);
-        assert_eq!(p_both.modules.len(), 73);
+        assert_eq!(p_base.modules.len(), 79);
+        assert_eq!(p_both.modules.len(), 79);
         assert_eq!(
             p_both.shader_digests_sha256,
             VulkanLayerPipelines::prepare(true, true, true)?.shader_digests_sha256
@@ -9069,6 +9464,12 @@ mod tests {
 
         let tags: Vec<&[u8]> = p_both.modules.iter().map(|m| m.tag).collect();
         for expected in [
+            b"rms_norm_vec4_f32".as_slice(),
+            b"add_rms_norm_vec4_f32".as_slice(),
+            b"gdn_step_4row_d128_vec4_f32".as_slice(),
+            b"gdn_scan_batched_4row_d128_vec4_f32".as_slice(),
+            b"f32_matvec_vec4".as_slice(),
+            b"f32_gemm_batched_vec4".as_slice(),
             b"gated_rms_norm_pinned_f32".as_slice(),
             b"gated_rms_norm_unpinned_f32".as_slice(),
             b"rms_norm_rope_kv_append_f16".as_slice(),

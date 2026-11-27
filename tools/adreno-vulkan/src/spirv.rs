@@ -15,6 +15,12 @@ use crate::{Error, ProjectionKernelPath};
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const SPIRV_VERSION_1_6: u32 = 0x0001_0600;
 const WORKGROUP_X: u32 = 64;
+const RMS_NORM_VEC4_WG_X: u32 = 256;
+const MAX_RMS_NORM_VEC4_CHUNKS: usize = 8;
+
+/// Maximum hidden dimension cached in local `vec4` registers by [`rms_norm_vec4_f32_with_subgroup`]
+/// and [`add_rms_norm_vec4_f32_with_subgroup`] (`256` threads * `4` lanes * `8` chunks = `8192`).
+pub const MAX_RMS_NORM_VEC4_DIM: usize = 8192;
 
 const OP_EXTENSION: u16 = 10;
 const OP_EXT_INST_IMPORT: u16 = 11;
@@ -178,6 +184,7 @@ struct ShaderBuilder {
     ptr_fn_f32_t: Option<u32>,
     ptr_fn_u32_t: Option<u32>,
     ptr_fn_i32_t: Option<u32>,
+    ptr_fn_vec4f32_t: Option<u32>,
     ptr_push_u32_t: Option<u32>,
     ptr_sb_u32_t: Option<u32>,
     ptr_sb_f32_t: Option<u32>,
@@ -185,6 +192,7 @@ struct ShaderBuilder {
     ptr_sb_vec4f32_t: Option<u32>,
     ptr_wg_f32_t: Option<u32>,
     ptr_wg_u32_t: Option<u32>,
+    ptr_wg_vec4f32_t: Option<u32>,
 
     rt_u32_t: Option<u32>,
     rt_f32_t: Option<u32>,
@@ -270,6 +278,7 @@ impl ShaderBuilder {
             ptr_fn_f32_t: None,
             ptr_fn_u32_t: None,
             ptr_fn_i32_t: None,
+            ptr_fn_vec4f32_t: None,
             ptr_push_u32_t: None,
             ptr_sb_u32_t: None,
             ptr_sb_f32_t: None,
@@ -277,6 +286,7 @@ impl ShaderBuilder {
             ptr_sb_vec4f32_t: None,
             ptr_wg_f32_t: None,
             ptr_wg_u32_t: None,
+            ptr_wg_vec4f32_t: None,
             rt_u32_t: None,
             rt_f32_t: None,
             rt_uvec4_t: None,
@@ -887,6 +897,30 @@ impl ShaderBuilder {
         var
     }
 
+    fn workgroup_vec4_array(&mut self, len: u32) -> u32 {
+        let len_c = self.const_u32(len);
+        let arr_t = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_ARRAY,
+            &[arr_t, self.vec4f32_t, len_c],
+        );
+        let ptr_arr = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_POINTER,
+            &[ptr_arr, STORAGE_WORKGROUP, arr_t],
+        );
+        let var = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_VARIABLE,
+            &[ptr_arr, var, STORAGE_WORKGROUP],
+        );
+        self.record_entry_interface(var);
+        var
+    }
+
     fn workgroup_u32_array(&mut self, len: u32) -> u32 {
         let len_c = self.const_u32(len);
         let arr_t = self.alloc_id();
@@ -1031,6 +1065,20 @@ impl ShaderBuilder {
         id
     }
 
+    fn ptr_wg_vec4f32(&mut self) -> u32 {
+        if let Some(id) = self.ptr_wg_vec4f32_t {
+            return id;
+        }
+        let id = self.alloc_id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_POINTER,
+            &[id, STORAGE_WORKGROUP, self.vec4f32_t],
+        );
+        self.ptr_wg_vec4f32_t = Some(id);
+        id
+    }
+
     fn local_f32_var(&mut self) -> u32 {
         let ptr_t = if let Some(id) = self.ptr_fn_f32_t {
             id
@@ -1056,6 +1104,34 @@ impl ShaderBuilder {
     fn load_var_f32(&mut self, var: u32) -> u32 {
         let val = self.alloc_id();
         push_inst(&mut self.fn_body, OP_LOAD, &[self.f32_t, val, var]);
+        val
+    }
+
+    fn local_vec4_var(&mut self) -> u32 {
+        let ptr_t = if let Some(id) = self.ptr_fn_vec4f32_t {
+            id
+        } else {
+            let id = self.alloc_id();
+            push_inst(
+                &mut self.types_consts_globals,
+                OP_TYPE_POINTER,
+                &[id, STORAGE_FUNCTION, self.vec4f32_t],
+            );
+            self.ptr_fn_vec4f32_t = Some(id);
+            id
+        };
+        let var = self.alloc_id();
+        push_inst(
+            &mut self.fn_header,
+            OP_VARIABLE,
+            &[ptr_t, var, STORAGE_FUNCTION],
+        );
+        var
+    }
+
+    fn load_var_vec4(&mut self, var: u32) -> u32 {
+        let val = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_LOAD, &[self.vec4f32_t, val, var]);
         val
     }
 
@@ -1192,6 +1268,30 @@ impl ShaderBuilder {
 
     fn store_wg_f32(&mut self, arr_var: u32, idx: u32, val: u32) {
         let ptr_t = self.ptr_wg_f32();
+        let ptr = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_ACCESS_CHAIN,
+            &[ptr_t, ptr, arr_var, idx],
+        );
+        push_inst(&mut self.fn_body, OP_STORE, &[ptr, val]);
+    }
+
+    fn load_wg_vec4(&mut self, arr_var: u32, idx: u32) -> u32 {
+        let ptr_t = self.ptr_wg_vec4f32();
+        let ptr = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_ACCESS_CHAIN,
+            &[ptr_t, ptr, arr_var, idx],
+        );
+        let val = self.alloc_id();
+        push_inst(&mut self.fn_body, OP_LOAD, &[self.vec4f32_t, val, ptr]);
+        val
+    }
+
+    fn store_wg_vec4(&mut self, arr_var: u32, idx: u32, val: u32) {
+        let ptr_t = self.ptr_wg_vec4f32();
         let ptr = self.alloc_id();
         push_inst(
             &mut self.fn_body,
@@ -1359,6 +1459,26 @@ impl ShaderBuilder {
 
     fn fmul_nc(&mut self, a: u32, b: u32) -> u32 {
         let id = self.binop(OP_F_MUL, self.f32_t, a, b);
+        push_inst(
+            &mut self.annotations,
+            OP_DECORATE,
+            &[id, DECORATION_NO_CONTRACTION],
+        );
+        id
+    }
+
+    fn fadd_vec4_nc(&mut self, a: u32, b: u32) -> u32 {
+        let id = self.binop(OP_F_ADD, self.vec4f32_t, a, b);
+        push_inst(
+            &mut self.annotations,
+            OP_DECORATE,
+            &[id, DECORATION_NO_CONTRACTION],
+        );
+        id
+    }
+
+    fn fmul_vec4_nc(&mut self, a: u32, b: u32) -> u32 {
+        let id = self.binop(OP_F_MUL, self.vec4f32_t, a, b);
         push_inst(
             &mut self.annotations,
             OP_DECORATE,
@@ -9498,6 +9618,241 @@ pub fn add_rms_norm_batched_f32() -> Vec<u32> {
     add_rms_norm_f32()
 }
 
+fn sum_vec4_components(b: &mut ShaderBuilder, v: u32) -> u32 {
+    let c0 = b.composite_extract(b.f32_t, v, 0);
+    let c1 = b.composite_extract(b.f32_t, v, 1);
+    let c2 = b.composite_extract(b.f32_t, v, 2);
+    let c3 = b.composite_extract(b.f32_t, v, 3);
+    let s01 = b.fadd_nc(c0, c1);
+    let s23 = b.fadd_nc(c2, c3);
+    b.fadd_nc(s01, s23)
+}
+
+fn emit_wg_reduce_256_sum(b: &mut ShaderBuilder, wg_reduce: u32, lid: u32, val: u32) -> u32 {
+    if b.uses_subgroup_shuffle() {
+        let c0 = b.const_u32(0);
+        let c6 = b.const_u32(6);
+        let c63 = b.const_u32(63);
+        let wave_id = b.ushr(lid, c6);
+        let sub_lane = b.uand(lid, c63);
+        let mut cur = val;
+        for mask in [32_u32, 16, 8, 4, 2, 1] {
+            let other = b.subgroup_shuffle_xor(b.f32_t, cur, mask);
+            cur = b.fadd_nc(cur, other);
+        }
+        let is_lane0 = b.u_eq(sub_lane, c0);
+        b.emit_if(is_lane0, |b| {
+            b.store_wg_f32(wg_reduce, wave_id, cur);
+        });
+        b.workgroup_barrier();
+        let c1 = b.const_u32(1);
+        let c2 = b.const_u32(2);
+        let c3 = b.const_u32(3);
+        let w0 = b.load_wg_f32(wg_reduce, c0);
+        let w1 = b.load_wg_f32(wg_reduce, c1);
+        let w2 = b.load_wg_f32(wg_reduce, c2);
+        let w3 = b.load_wg_f32(wg_reduce, c3);
+        let s01 = b.fadd_nc(w0, w1);
+        let s23 = b.fadd_nc(w2, w3);
+        return b.fadd_nc(s01, s23);
+    }
+
+    b.store_wg_f32(wg_reduce, lid, val);
+    b.workgroup_barrier();
+    for stride in [128_u32, 64, 32, 16, 8, 4, 2, 1] {
+        let sc = b.const_u32(stride);
+        let active = b.u_lt(lid, sc);
+        b.emit_if(active, |b| {
+            let other_idx = b.uadd(lid, sc);
+            let other = b.load_wg_f32(wg_reduce, other_idx);
+            let cur = b.load_wg_f32(wg_reduce, lid);
+            let sum = b.fadd_nc(cur, other);
+            b.store_wg_f32(wg_reduce, lid, sum);
+        });
+        b.workgroup_barrier();
+    }
+    let c0 = b.const_u32(0);
+    b.load_wg_f32(wg_reduce, c0)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shares multi-wave vec4 RMSNorm emission across standalone and fused residual kernels."
+)]
+fn emit_rms_norm_vec4_workgroup_body(
+    b: &mut ShaderBuilder,
+    in_buf: u32,
+    res_update: Option<(u32, u32)>,
+    w_buf: u32,
+    out_buf: u32,
+    wg_reduce: u32,
+    dim: u32,
+    eps_bits: u32,
+) {
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let row = b.load_input_component(wid_vec, 1);
+
+    let c0 = b.const_u32(0);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let max_dim_c = b.const_u32(u32::try_from(MAX_RMS_NORM_VEC4_DIM).unwrap_or(8192));
+    let f_zero = b.const_f32(0.0);
+    let f_one = b.const_f32(1.0);
+    let eps = b.bitcast(b.f32_t, eps_bits);
+
+    let dim_nz = b.u_ne(dim, c0);
+    let dim_mod4 = b.uand(dim, c3);
+    let dim_aligned = b.u_eq(dim_mod4, c0);
+    let dim_bounded = b.u_ge(max_dim_c, dim);
+    let dim_ok0 = b.logical_and(dim_nz, dim_aligned);
+    let dim_ok = b.logical_and(dim_ok0, dim_bounded);
+
+    b.emit_if(dim_ok, |b| {
+        let vec_dim = b.ushr(dim, c2);
+        let row_vec_base = b.umul(row, vec_dim);
+        let cached_vars: [u32; MAX_RMS_NORM_VEC4_CHUNKS] =
+            std::array::from_fn(|_| b.local_vec4_var());
+        let acc_var = b.local_f32_var();
+        b.store_var(acc_var, f_zero);
+
+        for (chunk, &cache_var) in cached_vars.iter().enumerate() {
+            let chunk_off = u32::try_from(chunk).unwrap_or(0) * RMS_NORM_VEC4_WG_X;
+            let vi = if chunk_off == 0 {
+                lid
+            } else {
+                let off_c = b.const_u32(chunk_off);
+                b.uadd(lid, off_c)
+            };
+            let in_range = b.u_lt(vi, vec_dim);
+            b.emit_if(in_range, |b| {
+                let idx = b.uadd(row_vec_base, vi);
+                let val_vec = if let Some((res_buf, delta_buf)) = res_update {
+                    let r = b.load_sb_vec4(res_buf, idx);
+                    let d = b.load_sb_vec4(delta_buf, idx);
+                    let updated = b.fadd_vec4_nc(r, d);
+                    b.store_sb_vec4(res_buf, idx, updated);
+                    updated
+                } else {
+                    b.load_sb_vec4(in_buf, idx)
+                };
+                b.store_var(cache_var, val_vec);
+                let sq_vec = b.fmul_vec4_nc(val_vec, val_vec);
+                let sq_sum = sum_vec4_components(b, sq_vec);
+                let prev = b.load_var_f32(acc_var);
+                let next = b.fadd_nc(prev, sq_sum);
+                b.store_var(acc_var, next);
+            });
+        }
+
+        let partial = b.load_var_f32(acc_var);
+        let sum_sq = emit_wg_reduce_256_sum(b, wg_reduce, lid, partial);
+
+        let dim_f = b.u32_to_f32(dim);
+        let mean = b.fdiv(sum_sq, dim_f);
+        let mean_eps = b.fadd_nc(mean, eps);
+        let denom = b.f_sqrt(mean_eps);
+        let scale = b.fdiv(f_one, denom);
+        let scale_vec = b.composite_construct(b.vec4f32_t, &[scale, scale, scale, scale]);
+
+        for (chunk, &cache_var) in cached_vars.iter().enumerate() {
+            let chunk_off = u32::try_from(chunk).unwrap_or(0) * RMS_NORM_VEC4_WG_X;
+            let vi = if chunk_off == 0 {
+                lid
+            } else {
+                let off_c = b.const_u32(chunk_off);
+                b.uadd(lid, off_c)
+            };
+            let in_range = b.u_lt(vi, vec_dim);
+            b.emit_if(in_range, |b| {
+                let v_vec = b.load_var_vec4(cache_var);
+                let w_vec = b.load_sb_vec4(w_buf, vi);
+                let scaled = b.fmul_vec4_nc(v_vec, scale_vec);
+                let normed = b.fmul_vec4_nc(scaled, w_vec);
+                let idx = b.uadd(row_vec_base, vi);
+                b.store_sb_vec4(out_buf, idx, normed);
+            });
+        }
+    });
+}
+
+/// Emits multi-wave `vec4` GPU `RMSNorm` SPIR-V 1.6 words (`256` threads = 4 wave64s).
+///
+/// Requires `dim > 0`, `dim % 4 == 0`, and `dim <= MAX_RMS_NORM_VEC4_DIM`.
+/// Bindings: `0` read-only `input` (`vec4`), `1` read-only `weight` (`vec4`), `2` writable `out` (`vec4`).
+/// Push constants (`2 × u32`): `[dim, eps_bits]`. Dispatch: `(1, rows, 1)`.
+#[must_use]
+pub fn rms_norm_vec4_f32() -> Vec<u32> {
+    rms_norm_vec4_f32_with_subgroup(false)
+}
+
+/// Emits multi-wave `vec4` GPU `RMSNorm` SPIR-V 1.6 words with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn rms_norm_vec4_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::Vec4, AccessMode::ReadOnly);
+    let w_buf = b.storage_buffer(1, ElemType::Vec4, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::Vec4, AccessMode::ReadWrite);
+    let wg_reduce = if use_subgroup_shuffle {
+        b.workgroup_f32_array(4)
+    } else {
+        b.workgroup_f32_array(RMS_NORM_VEC4_WG_X)
+    };
+
+    let dim = b.load_push(push_var, 0);
+    let eps_bits = b.load_push(push_var, 1);
+    emit_rms_norm_vec4_workgroup_body(
+        &mut b, in_buf, None, w_buf, out_buf, wg_reduce, dim, eps_bits,
+    );
+
+    b.finish_with_local_size([RMS_NORM_VEC4_WG_X, 1, 1])
+}
+
+/// Emits multi-wave `vec4` fused in-place residual update + `RMSNorm` SPIR-V 1.6 words (`256` threads = 4 wave64s).
+///
+/// Caches updated `vec4` values in registers so `norm_out` avoids a second global read of `residual_inout`.
+/// Requires `dim > 0`, `dim % 4 == 0`, and `dim <= MAX_RMS_NORM_VEC4_DIM`.
+/// Bindings: `0` read-write `residual_inout` (`vec4`), `1` read-only `delta` (`vec4`),
+/// `2` read-only `weight` (`vec4`), `3` writable `norm_out` (`vec4`).
+/// Push constants (`2 × u32`): `[dim, eps_bits]`. Dispatch: `(1, rows, 1)`.
+#[must_use]
+pub fn add_rms_norm_vec4_f32() -> Vec<u32> {
+    add_rms_norm_vec4_f32_with_subgroup(false)
+}
+
+/// Emits multi-wave `vec4` fused residual update + `RMSNorm` SPIR-V 1.6 words with optional wave64 subgroup reduction.
+#[must_use]
+pub fn add_rms_norm_vec4_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
+    let push_var = push_var.unwrap_or(0);
+    let res_buf = b.storage_buffer(0, ElemType::Vec4, AccessMode::ReadWrite);
+    let delta_buf = b.storage_buffer(1, ElemType::Vec4, AccessMode::ReadOnly);
+    let w_buf = b.storage_buffer(2, ElemType::Vec4, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(3, ElemType::Vec4, AccessMode::ReadWrite);
+    let wg_reduce = if use_subgroup_shuffle {
+        b.workgroup_f32_array(4)
+    } else {
+        b.workgroup_f32_array(RMS_NORM_VEC4_WG_X)
+    };
+
+    let dim = b.load_push(push_var, 0);
+    let eps_bits = b.load_push(push_var, 1);
+    emit_rms_norm_vec4_workgroup_body(
+        &mut b,
+        res_buf,
+        Some((res_buf, delta_buf)),
+        w_buf,
+        out_buf,
+        wg_reduce,
+        dim,
+        eps_bits,
+    );
+
+    b.finish_with_local_size([RMS_NORM_VEC4_WG_X, 1, 1])
+}
+
 /// Emits elementwise in-place residual addition SPIR-V 1.6 words (`residual_inout[i] += delta[i]`).
 ///
 /// Bindings: `0` read-write `residual_inout` (`f32`), `1` read-only `delta` (`f32`).
@@ -11676,6 +12031,359 @@ pub fn gdn_scan_batched_2row_vec4_f32_with_subgroup(use_subgroup_shuffle: bool) 
     b.finish()
 }
 
+/// Emits specialized `head_dim == 128` 4-row/workgroup (`[32, 4, 1]`) `vec4` F32 GDN single-token decode step.
+///
+/// Eliminates the `p = 0..2` loop, halves per-lane `s`/`k` registers (`8 -> 4`), and maps each 32-lane
+/// row slice directly to `vec_cols = 32` (`[16, 8, 4, 2, 1]` subgroup XOR reduce, `0` barriers).
+///
+/// Bindings: `0` read-write `matrix_state` (`vec4`), `1` read-only `qkv` (`vec4`),
+/// `2` read-only `alpha_decay` (`f32`), `3` read-only `beta` (`f32`), `4` writable `out` (`f32`).
+/// Push constants (`4 × u32`): `[v_heads, k_heads, head_dim, scale_bits]`.
+/// Dispatch: `(head_dim / 4, v_heads, 1)` (`(32, v_heads, 1)`).
+#[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Specialized head_dim == 128 4-row/workgroup vec4 GDN single-token decode kernel."
+)]
+pub fn gdn_step_4row_d128_vec4_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 4);
+    let push_var = push_var.unwrap_or(0);
+    let state_buf = b.storage_buffer(0, ElemType::Vec4, AccessMode::ReadWrite);
+    let qkv_buf = b.storage_buffer(1, ElemType::Vec4, AccessMode::ReadOnly);
+    let alpha_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let beta_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(128));
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let sub_lane = b.load_input_component(lid_vec, 0);
+    let wy = b.load_input_component(lid_vec, 1);
+    let row_tile = b.load_input_component(wid_vec, 0);
+    let vh = b.load_input_component(wid_vec, 1);
+
+    let v_heads = b.load_push(push_var, 0);
+    let k_heads = b.load_push(push_var, 1);
+    let head_dim = b.load_push(push_var, 2);
+    let scale_bits = b.load_push(push_var, 3);
+    let scale = b.bitcast(b.f32_t, scale_bits);
+
+    let c0 = b.const_u32(0);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let c4 = b.const_u32(4);
+    let c32 = b.const_u32(32);
+    let c128 = b.const_u32(128);
+
+    let row_base = b.umul(row_tile, c4);
+    let wg_row_ok = b.u_lt(row_base, head_dim);
+    let vh_ok = b.u_lt(vh, v_heads);
+    let k_ok = b.u_ne(k_heads, c0);
+    let dim_ok = b.u_eq(head_dim, c128);
+    let wg0 = b.logical_and(wg_row_ok, vh_ok);
+    let wg1 = b.logical_and(k_ok, dim_ok);
+    let wg_ok = b.logical_and(wg0, wg1);
+
+    b.emit_if(wg_ok, |b| {
+        let f_zero = b.const_f32(0.0);
+        let row_reduce_base = b.umul(wy, c32);
+        let tid = b.uadd(row_reduce_base, sub_lane);
+        let row = b.uadd(row_base, wy);
+
+        let q_div = b.udiv(vh, k_heads);
+        let q_mul = b.umul(q_div, k_heads);
+        let kh = b.usub(vh, q_mul);
+
+        let vec_cols = c32;
+        let key_vec_width = b.umul(k_heads, vec_cols);
+        let two_key_vec_width = b.umul(c2, key_vec_width);
+        let kh_vec = b.umul(kh, vec_cols);
+        let q_vec_base = kh_vec;
+        let k_vec_base = b.uadd(key_vec_width, kh_vec);
+        let v_head_vec_base = b.umul(vh, vec_cols);
+        let v_vec_base = b.uadd(two_key_vec_width, v_head_vec_base);
+
+        let head_state_vecs = b.umul(head_dim, vec_cols);
+        let state_head_vecs = b.umul(vh, head_state_vecs);
+        let state_row_vecs = b.umul(row, vec_cols);
+        let state_row_vec_base = b.uadd(state_head_vecs, state_row_vecs);
+
+        let decay = b.load_sb_f32(alpha_buf, vh);
+        let beta_val = b.load_sb_f32(beta_buf, vh);
+        let v_vec_off = b.ushr(row, c2);
+        let v_comp = b.uand(row, c3);
+        let v_vec_idx = b.uadd(v_vec_base, v_vec_off);
+        let v_vec = b.load_sb_vec4(qkv_buf, v_vec_idx);
+        let v_comps = [0_u32, 1, 2, 3].map(|c| b.composite_extract(b.f32_t, v_vec, c));
+        let v_val = select_four_f32(b, v_comp, v_comps);
+
+        let s_dec_vars: [u32; 4] = std::array::from_fn(|_| b.local_f32_var());
+        let k_vars: [u32; 4] = std::array::from_fn(|_| b.local_f32_var());
+        let k_dot_var = b.local_f32_var();
+        b.store_var(k_dot_var, f_zero);
+
+        let s_vidx = b.uadd(state_row_vec_base, sub_lane);
+        let k_vidx = b.uadd(k_vec_base, sub_lane);
+        let state_v = b.load_sb_vec4(state_buf, s_vidx);
+        let key_v = b.load_sb_vec4(qkv_buf, k_vidx);
+        for c in 0_u32..4 {
+            let ci = usize::try_from(c).unwrap_or(0);
+            let s_c = b.composite_extract(b.f32_t, state_v, c);
+            let k_c = b.composite_extract(b.f32_t, key_v, c);
+            let decayed_s = b.fmul_nc(s_c, decay);
+            b.store_var(s_dec_vars[ci], decayed_s);
+            b.store_var(k_vars[ci], k_c);
+            let prod = b.fmul_nc(decayed_s, k_c);
+            let prev = b.load_var_f32(k_dot_var);
+            let sum = b.fadd_nc(prev, prod);
+            b.store_var(k_dot_var, sum);
+        }
+
+        let k_dot_partial = b.load_var_f32(k_dot_var);
+        let dot_k =
+            emit_gdn_2row_reduce_32(b, wg_reduce, tid, sub_lane, row_reduce_base, k_dot_partial);
+        let err = b.fsub_nc(v_val, dot_k);
+        let delta = b.fmul_nc(err, beta_val);
+
+        let q_dot_var = b.local_f32_var();
+        b.store_var(q_dot_var, f_zero);
+        let q_vidx = b.uadd(q_vec_base, sub_lane);
+        let q_vec = b.load_sb_vec4(qkv_buf, q_vidx);
+        let mut new_comps = [f_zero; 4];
+        for c in 0_u32..4 {
+            let ci = usize::try_from(c).unwrap_or(0);
+            let s_dec = b.load_var_f32(s_dec_vars[ci]);
+            let k_c = b.load_var_f32(k_vars[ci]);
+            let q_c = b.composite_extract(b.f32_t, q_vec, c);
+            let upd = b.fmul_nc(delta, k_c);
+            let s_new = b.fadd_nc(s_dec, upd);
+            new_comps[ci] = s_new;
+            let q_prod = b.fmul_nc(s_new, q_c);
+            let prev = b.load_var_f32(q_dot_var);
+            let sum = b.fadd_nc(prev, q_prod);
+            b.store_var(q_dot_var, sum);
+        }
+        let s_new_vec = b.composite_construct(b.vec4f32_t, &new_comps);
+        b.store_sb_vec4(state_buf, s_vidx, s_new_vec);
+
+        let q_dot_partial = b.load_var_f32(q_dot_var);
+        let dot_q =
+            emit_gdn_2row_reduce_32(b, wg_reduce, tid, sub_lane, row_reduce_base, q_dot_partial);
+        let is_sub0 = b.u_eq(sub_lane, c0);
+        b.emit_if(is_sub0, |b| {
+            let v_head_base = b.umul(vh, head_dim);
+            let out_idx = b.uadd(v_head_base, row);
+            let out_val = b.fmul_nc(dot_q, scale);
+            b.store_sb_f32(out_buf, out_idx, out_val);
+        });
+    });
+
+    b.finish_with_local_size([32, 4, 1])
+}
+
+/// Emits specialized `head_dim == 128` 4-row/workgroup (`[32, 4, 1]`) `vec4` batched F32 GDN scan
+/// with `1 KiB` cooperative `Q`/`K` workgroup staging (`4x` fewer `Q`/`K` global reads across 4 rows).
+///
+/// Bindings: `0` read-write `matrix_state` (`vec4`), `1` read-only `qkv_in` (`vec4`),
+/// `2` read-only `alpha_decay` (`f32`), `3` read-only `beta` (`f32`), `4` writable `out` (`f32`).
+/// Push constants (`5 × u32`): `[v_heads, k_heads, ssm_head, gdn_scale_bits, tokens]`.
+/// Dispatch: `(ssm_head / 4, v_heads, 1)` (`(32, v_heads, 1)`).
+#[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Specialized head_dim == 128 4-row/workgroup vec4 batched GDN scan with 1 KiB Q/K shared staging."
+)]
+pub fn gdn_scan_batched_4row_d128_vec4_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 5);
+    let push_var = push_var.unwrap_or(0);
+    let state_buf = b.storage_buffer(0, ElemType::Vec4, AccessMode::ReadWrite);
+    let qkv_buf = b.storage_buffer(1, ElemType::Vec4, AccessMode::ReadOnly);
+    let alpha_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let beta_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(128));
+    let smem_qk = b.workgroup_vec4_array(64);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let sub_lane = b.load_input_component(lid_vec, 0);
+    let wy = b.load_input_component(lid_vec, 1);
+    let row_tile = b.load_input_component(wid_vec, 0);
+    let vh = b.load_input_component(wid_vec, 1);
+
+    let v_heads = b.load_push(push_var, 0);
+    let k_heads = b.load_push(push_var, 1);
+    let head_dim = b.load_push(push_var, 2);
+    let scale_bits = b.load_push(push_var, 3);
+    let tokens = b.load_push(push_var, 4);
+    let scale = b.bitcast(b.f32_t, scale_bits);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let c4 = b.const_u32(4);
+    let c32 = b.const_u32(32);
+    let c128 = b.const_u32(128);
+
+    let row_base = b.umul(row_tile, c4);
+    let wg_row_ok = b.u_lt(row_base, head_dim);
+    let vh_ok = b.u_lt(vh, v_heads);
+    let k_ok = b.u_ne(k_heads, c0);
+    let dim_ok = b.u_eq(head_dim, c128);
+    let wg0 = b.logical_and(wg_row_ok, vh_ok);
+    let wg1 = b.logical_and(k_ok, dim_ok);
+    let wg_ok = b.logical_and(wg0, wg1);
+
+    b.emit_if(wg_ok, |b| {
+        let f_zero = b.const_f32(0.0);
+        let row_reduce_base = b.umul(wy, c32);
+        let tid = b.uadd(row_reduce_base, sub_lane);
+        let row = b.uadd(row_base, wy);
+
+        let q_div = b.udiv(vh, k_heads);
+        let q_mul = b.umul(q_div, k_heads);
+        let kh = b.usub(vh, q_mul);
+
+        let vec_cols = c32;
+        let key_vec_width = b.umul(k_heads, vec_cols);
+        let two_key_vec_width = b.umul(c2, key_vec_width);
+        let val_vec_width = b.umul(v_heads, vec_cols);
+        let channel_vecs = b.uadd(two_key_vec_width, val_vec_width);
+        let kh_vec = b.umul(kh, vec_cols);
+        let v_head_vec_base = b.umul(vh, vec_cols);
+        let val_width = b.umul(v_heads, head_dim);
+        let v_head_base = b.umul(vh, head_dim);
+        let v_rel = b.uadd(v_head_base, row);
+        let v_vec_off = b.ushr(row, c2);
+        let v_comp = b.uand(row, c3);
+
+        let head_state_vecs = b.umul(head_dim, vec_cols);
+        let state_head_vecs = b.umul(vh, head_state_vecs);
+        let state_row_vecs = b.umul(row, vec_cols);
+        let state_row_vec_base = b.uadd(state_head_vecs, state_row_vecs);
+
+        let s_vars: [u32; 4] = std::array::from_fn(|_| b.local_f32_var());
+        let k_regs: [u32; 4] = std::array::from_fn(|_| b.local_f32_var());
+        let k_dot_var = b.local_f32_var();
+        let q_dot_var = b.local_f32_var();
+
+        let s_vidx_init = b.uadd(state_row_vec_base, sub_lane);
+        let state_v_init = b.load_sb_vec4(state_buf, s_vidx_init);
+        for c in 0_u32..4 {
+            let ci = usize::try_from(c).unwrap_or(0);
+            let sv = b.composite_extract(b.f32_t, state_v_init, c);
+            b.store_var(s_vars[ci], sv);
+            b.store_var(k_regs[ci], f_zero);
+        }
+
+        let is_wy0 = b.u_eq(wy, c0);
+        let is_wy1 = b.u_eq(wy, c1);
+        let is_sub0 = b.u_eq(sub_lane, c0);
+        let k_smem_idx = b.uadd(c32, sub_lane);
+
+        b.emit_for_range(c0, tokens, c1, |b, tok| {
+            let tok_qkv_vec_base = b.umul(tok, channel_vecs);
+            let q_vec_base = b.uadd(tok_qkv_vec_base, kh_vec);
+            let k_vec_base = b.uadd(q_vec_base, key_vec_width);
+            let v_tok_base = b.uadd(tok_qkv_vec_base, two_key_vec_width);
+            let v_head_tok = b.uadd(v_tok_base, v_head_vec_base);
+            let v_vec_idx = b.uadd(v_head_tok, v_vec_off);
+            let head_tok_base = b.umul(tok, v_heads);
+            let gate_idx = b.uadd(head_tok_base, vh);
+            let tok_val_base = b.umul(tok, val_width);
+            let out_idx = b.uadd(tok_val_base, v_rel);
+
+            let decay = b.load_sb_f32(alpha_buf, gate_idx);
+            let beta_val = b.load_sb_f32(beta_buf, gate_idx);
+            let v_vec = b.load_sb_vec4(qkv_buf, v_vec_idx);
+            let v_comps = [0_u32, 1, 2, 3].map(|c| b.composite_extract(b.f32_t, v_vec, c));
+            let v_val = select_four_f32(b, v_comp, v_comps);
+
+            b.emit_if(is_wy0, |b| {
+                let q_vidx = b.uadd(q_vec_base, sub_lane);
+                let qv = b.load_sb_vec4(qkv_buf, q_vidx);
+                b.store_wg_vec4(smem_qk, sub_lane, qv);
+            });
+            b.emit_if(is_wy1, |b| {
+                let k_vidx = b.uadd(k_vec_base, sub_lane);
+                let kv = b.load_sb_vec4(qkv_buf, k_vidx);
+                b.store_wg_vec4(smem_qk, k_smem_idx, kv);
+            });
+            b.workgroup_barrier();
+
+            b.store_var(k_dot_var, f_zero);
+            let key_v = b.load_wg_vec4(smem_qk, k_smem_idx);
+            for c in 0_u32..4 {
+                let ci = usize::try_from(c).unwrap_or(0);
+                let s_old = b.load_var_f32(s_vars[ci]);
+                let decayed_s = b.fmul_nc(s_old, decay);
+                b.store_var(s_vars[ci], decayed_s);
+                let k_c = b.composite_extract(b.f32_t, key_v, c);
+                b.store_var(k_regs[ci], k_c);
+                let prod = b.fmul_nc(decayed_s, k_c);
+                let prev = b.load_var_f32(k_dot_var);
+                let sum = b.fadd_nc(prev, prod);
+                b.store_var(k_dot_var, sum);
+            }
+
+            let k_dot_partial = b.load_var_f32(k_dot_var);
+            let dot_k = emit_gdn_2row_reduce_32(
+                b,
+                wg_reduce,
+                tid,
+                sub_lane,
+                row_reduce_base,
+                k_dot_partial,
+            );
+            let err = b.fsub_nc(v_val, dot_k);
+            let delta = b.fmul_nc(err, beta_val);
+
+            b.store_var(q_dot_var, f_zero);
+            let q_vec = b.load_wg_vec4(smem_qk, sub_lane);
+            for c in 0_u32..4 {
+                let ci = usize::try_from(c).unwrap_or(0);
+                let s_dec = b.load_var_f32(s_vars[ci]);
+                let k_c = b.load_var_f32(k_regs[ci]);
+                let q_c = b.composite_extract(b.f32_t, q_vec, c);
+                let upd = b.fmul_nc(delta, k_c);
+                let s_new = b.fadd_nc(s_dec, upd);
+                b.store_var(s_vars[ci], s_new);
+                let q_prod = b.fmul_nc(s_new, q_c);
+                let prev = b.load_var_f32(q_dot_var);
+                let sum = b.fadd_nc(prev, q_prod);
+                b.store_var(q_dot_var, sum);
+            }
+
+            let q_dot_partial = b.load_var_f32(q_dot_var);
+            let dot_q = emit_gdn_2row_reduce_32(
+                b,
+                wg_reduce,
+                tid,
+                sub_lane,
+                row_reduce_base,
+                q_dot_partial,
+            );
+            b.emit_if(is_sub0, |b| {
+                let out_val = b.fmul_nc(dot_q, scale);
+                b.store_sb_f32(out_buf, out_idx, out_val);
+            });
+            b.workgroup_barrier();
+        });
+
+        let vec_vals = [
+            b.load_var_f32(s_vars[0]),
+            b.load_var_f32(s_vars[1]),
+            b.load_var_f32(s_vars[2]),
+            b.load_var_f32(s_vars[3]),
+        ];
+        let s_vec = b.composite_construct(b.vec4f32_t, &vec_vals);
+        b.store_sb_vec4(state_buf, s_vidx_init, s_vec);
+    });
+
+    b.finish_with_local_size([32, 4, 1])
+}
+
 fn emit_gdn_gates_body(
     b: &mut ShaderBuilder,
     alpha_buf: u32,
@@ -12642,6 +13350,166 @@ pub fn f32_gemm_batched_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
                 let prod = b.fmul_nc(wv, xv);
                 let prev = b.load_var_f32(acc_var);
                 let next = b.fadd_nc(prev, prod);
+                b.store_var(acc_var, next);
+            }
+        });
+
+        for (k, (&tk, &acc_var)) in tok_clamped.iter().zip(&acc_vars).enumerate() {
+            if k > 0 && !b.uses_subgroup_shuffle() {
+                b.workgroup_barrier();
+            }
+            let partial = b.load_var_f32(acc_var);
+            let sum = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
+
+            let is_t0 = b.u_eq(lid, c0);
+            let valid = b.u_lt(tk, tokens);
+            let write_ok = b.logical_and(is_t0, valid);
+            b.emit_if(write_ok, |b| {
+                let tok_out = b.umul(tk, rows);
+                let out_idx = b.uadd(tok_out, row);
+                b.store_sb_f32(out_buf, out_idx, sum);
+            });
+        }
+    });
+
+    b.finish()
+}
+
+/// Emits dense `F32` `vec4` matrix-vector multiplication SPIR-V 1.6 words (`cols % 4 == 0`).
+///
+/// Uses 128-bit `vec4` global loads for 4x fewer load instructions when weights and activations are
+/// 16-byte aligned and `cols % 4 == 0`.
+/// Bindings: `0` read-only `weights` (`vec4`), `1` read-only `input` (`vec4`), `2` writable `output` (`f32`).
+/// Push constants (`2 × u32`): `[cols, rows]`. Dispatch: `(rows, 1, 1)`.
+#[must_use]
+pub fn f32_matvec_vec4() -> Vec<u32> {
+    f32_matvec_vec4_with_subgroup(false)
+}
+
+/// Emits dense `F32` `vec4` matrix-vector multiplication with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn f32_matvec_vec4_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
+    let push_var = push_var.unwrap_or(0);
+    let w_buf = b.storage_buffer(0, ElemType::Vec4, AccessMode::ReadOnly);
+    let in_buf = b.storage_buffer(1, ElemType::Vec4, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let row = b.load_input_component(wid_vec, 0);
+    let cols = b.load_push(push_var, 0);
+    let rows = b.load_push(push_var, 1);
+
+    let c0 = b.const_u32(0);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let row_ok = b.u_lt(row, rows);
+    let cols_mod4 = b.uand(cols, c3);
+    let cols_ok = b.u_eq(cols_mod4, c0);
+    let in_bounds = b.logical_and(row_ok, cols_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let c64 = b.const_u32(WORKGROUP_X);
+        let f_zero = b.const_f32(0.0);
+        let vec_cols = b.ushr(cols, c2);
+        let row_vec_base = b.umul(row, vec_cols);
+
+        let acc_var = b.local_f32_var();
+        b.store_var(acc_var, f_zero);
+        b.emit_for_range(lid, vec_cols, c64, |b, vc| {
+            let w_idx = b.uadd(row_vec_base, vc);
+            let wv = b.load_sb_vec4(w_buf, w_idx);
+            let xv = b.load_sb_vec4(in_buf, vc);
+            let prod = b.fmul_vec4_nc(wv, xv);
+            let sum4 = sum_vec4_components(b, prod);
+            let prev = b.load_var_f32(acc_var);
+            let next = b.fadd_nc(prev, sum4);
+            b.store_var(acc_var, next);
+        });
+
+        let partial = b.load_var_f32(acc_var);
+        let sum = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
+
+        let is_t0 = b.u_eq(lid, c0);
+        b.emit_if(is_t0, |b| {
+            b.store_sb_f32(out_buf, row, sum);
+        });
+    });
+
+    b.finish()
+}
+
+/// Emits batched 4-token `F32` `vec4` GEMM SPIR-V 1.6 words (`cols % 4 == 0`).
+///
+/// Bindings: `0` read-only `weights` (`vec4`), `1` read-only `input` (`vec4`), `2` writable `output` (`f32`).
+/// Push constants (`3 × u32`): `[cols, rows, tokens]`. Dispatch: `(rows, tokens.div_ceil(4), 1)`.
+#[must_use]
+pub fn f32_gemm_batched_vec4() -> Vec<u32> {
+    f32_gemm_batched_vec4_with_subgroup(false)
+}
+
+/// Emits batched 4-token `F32` `vec4` GEMM SPIR-V 1.6 words with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn f32_gemm_batched_vec4_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 3);
+    let push_var = push_var.unwrap_or(0);
+    let w_buf = b.storage_buffer(0, ElemType::Vec4, AccessMode::ReadOnly);
+    let in_buf = b.storage_buffer(1, ElemType::Vec4, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let row = b.load_input_component(wid_vec, 0);
+    let tok_tile = b.load_input_component(wid_vec, 1);
+
+    let cols = b.load_push(push_var, 0);
+    let rows = b.load_push(push_var, 1);
+    let tokens = b.load_push(push_var, 2);
+
+    let c0 = b.const_u32(0);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let c4 = b.const_u32(4);
+    let tok_base = b.umul(tok_tile, c4);
+    let row_ok = b.u_lt(row, rows);
+    let tok_ok = b.u_lt(tok_base, tokens);
+    let cols_mod4 = b.uand(cols, c3);
+    let cols_ok = b.u_eq(cols_mod4, c0);
+    let bounds0 = b.logical_and(row_ok, tok_ok);
+    let in_bounds = b.logical_and(bounds0, cols_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let c64 = b.const_u32(WORKGROUP_X);
+        let f_zero = b.const_f32(0.0);
+        let vec_cols = b.ushr(cols, c2);
+        let row_vec_base = b.umul(row, vec_cols);
+        let (tok_clamped, tok_in_bases) = clamp_four_token_act_bases(b, tok_base, tokens, vec_cols);
+
+        let acc_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        for v in acc_vars {
+            b.store_var(v, f_zero);
+        }
+
+        b.emit_for_range(lid, vec_cols, c64, |b, vc| {
+            let w_idx = b.uadd(row_vec_base, vc);
+            let wv = b.load_sb_vec4(w_buf, w_idx);
+            for (&in_base, &acc_var) in tok_in_bases.iter().zip(&acc_vars) {
+                let x_idx = b.uadd(in_base, vc);
+                let xv = b.load_sb_vec4(in_buf, x_idx);
+                let prod = b.fmul_vec4_nc(wv, xv);
+                let sum4 = sum_vec4_components(b, prod);
+                let prev = b.load_var_f32(acc_var);
+                let next = b.fadd_nc(prev, sum4);
                 b.store_var(acc_var, next);
             }
         });
@@ -14405,23 +15273,23 @@ mod tests {
         Ok(())
     }
 
+    fn count_spirv_barriers(words: &[u32]) -> usize {
+        let mut barriers = 0_usize;
+        let mut offset = 5_usize;
+        while offset < words.len() {
+            let header = words[offset];
+            let wc = usize::try_from(header >> 16).unwrap_or(0);
+            let op = u16::try_from(header & 0xFFFF).unwrap_or(0);
+            if op == OP_CONTROL_BARRIER {
+                barriers += 1;
+            }
+            offset += wc;
+        }
+        barriers
+    }
+
     #[test]
     fn fused_layer_kernels_are_valid_spirv_and_match_barrier_contracts() -> Result<(), Error> {
-        let count_barriers = |words: &[u32]| -> usize {
-            let mut barriers = 0_usize;
-            let mut offset = 5_usize;
-            while offset < words.len() {
-                let header = words[offset];
-                let wc = usize::try_from(header >> 16).unwrap_or(0);
-                let op = u16::try_from(header & 0xFFFF).unwrap_or(0);
-                if op == OP_CONTROL_BARRIER {
-                    barriers += 1;
-                }
-                offset += wc;
-            }
-            barriers
-        };
-
         for module in [
             gated_rms_norm_f32(false),
             gated_rms_norm_f32(true),
@@ -14461,19 +15329,19 @@ mod tests {
         );
 
         assert_eq!(
-            count_barriers(&gated_rms_norm_f32_with_subgroup(true, true)),
+            count_spirv_barriers(&gated_rms_norm_f32_with_subgroup(true, true)),
             0
         );
         assert_eq!(
-            count_barriers(&rms_norm_rope_kv_append_f16_with_subgroup(true)),
+            count_spirv_barriers(&rms_norm_rope_kv_append_f16_with_subgroup(true)),
             2
         );
         assert_eq!(
-            count_barriers(&deinterleave_q_gate_rms_norm_rope_with_subgroup(true)),
+            count_spirv_barriers(&deinterleave_q_gate_rms_norm_rope_with_subgroup(true)),
             1
         );
         assert_eq!(
-            count_barriers(&swiglu_hadamard1024_q8k_4plane_with_subgroup(true, true)),
+            count_spirv_barriers(&swiglu_hadamard1024_q8k_4plane_with_subgroup(true, true)),
             2
         );
 
@@ -14492,6 +15360,76 @@ mod tests {
         assert_ne!(
             shader_digest(&deinterleave_q_gate_rms_norm_rope_with_subgroup(true))?,
             shader_digest(&deinterleave_q_gate_rms_norm_rope_with_subgroup(false))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vec4_and_4row_gdn_kernels_are_valid_spirv_and_match_barrier_contracts() -> Result<(), Error>
+    {
+        for module in [
+            rms_norm_vec4_f32(),
+            rms_norm_vec4_f32_with_subgroup(true),
+            add_rms_norm_vec4_f32(),
+            add_rms_norm_vec4_f32_with_subgroup(true),
+            gdn_step_4row_d128_vec4_f32_with_subgroup(false),
+            gdn_step_4row_d128_vec4_f32_with_subgroup(true),
+            gdn_scan_batched_4row_d128_vec4_f32_with_subgroup(false),
+            gdn_scan_batched_4row_d128_vec4_f32_with_subgroup(true),
+            f32_matvec_vec4(),
+            f32_matvec_vec4_with_subgroup(true),
+            f32_gemm_batched_vec4(),
+            f32_gemm_batched_vec4_with_subgroup(true),
+        ] {
+            assert_valid_spirv_structure(&module, Some(false));
+            assert_eq!(shader_digest(&module)?.len(), 64);
+        }
+
+        assert_eq!(
+            extract_local_size(&rms_norm_vec4_f32_with_subgroup(true))?,
+            [256, 1, 1]
+        );
+        assert_eq!(
+            extract_local_size(&add_rms_norm_vec4_f32_with_subgroup(true))?,
+            [256, 1, 1]
+        );
+        assert_eq!(
+            extract_local_size(&gdn_step_4row_d128_vec4_f32_with_subgroup(true))?,
+            [32, 4, 1]
+        );
+        assert_eq!(
+            extract_local_size(&gdn_scan_batched_4row_d128_vec4_f32_with_subgroup(true))?,
+            [32, 4, 1]
+        );
+        assert_eq!(
+            extract_local_size(&f32_matvec_vec4_with_subgroup(true))?,
+            [64, 1, 1]
+        );
+        assert_eq!(
+            extract_local_size(&f32_gemm_batched_vec4_with_subgroup(true))?,
+            [64, 1, 1]
+        );
+
+        assert_eq!(count_spirv_barriers(&rms_norm_vec4_f32_with_subgroup(true)), 1);
+        assert_eq!(
+            count_spirv_barriers(&add_rms_norm_vec4_f32_with_subgroup(true)),
+            1
+        );
+        assert_eq!(
+            count_spirv_barriers(&gdn_step_4row_d128_vec4_f32_with_subgroup(true)),
+            0
+        );
+        assert_eq!(
+            count_spirv_barriers(&gdn_scan_batched_4row_d128_vec4_f32_with_subgroup(true)),
+            2
+        );
+        assert_eq!(
+            count_spirv_barriers(&f32_matvec_vec4_with_subgroup(true)),
+            0
+        );
+        assert_eq!(
+            count_spirv_barriers(&f32_gemm_batched_vec4_with_subgroup(true)),
+            0
         );
         Ok(())
     }

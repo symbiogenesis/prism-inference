@@ -1,0 +1,5 @@
+# Parallel rustc frontend (-Z threads=8) speeds up large single-crate and
+# cold-workspace builds on pinned 1.102-nightly; remove or migrate to
+# --jobs-frontend when moving to beta/stable.
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-Z", "threads=8"]

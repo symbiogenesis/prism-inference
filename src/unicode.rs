@@ -1,6 +1,6 @@
 //! Bounded UTF-8 regular-expression splitting and GPT byte encoding.
 
-use regex::RegexBuilder;
+use fancy_regex::RegexBuilder;
 
 use crate::{Result, invalid};
 
@@ -81,7 +81,7 @@ pub fn codepoints_from_utf8(bytes: &[u8]) -> Result<Vec<u32>> {
 
 /// Splits text sequentially with each expression, retaining unmatched spans.
 ///
-/// Expressions use the linear-time Rust regex syntax, including Unicode
+/// Expressions use bounded `fancy_regex` syntax, including Unicode
 /// categories. Each later expression subdivides the existing pieces without
 /// recombining them. Optional GPT byte encoding maps every original UTF-8 byte
 /// to its reversible vocabulary character. No normalization is performed.
@@ -103,16 +103,17 @@ pub fn regex_split(text: &str, expressions: &[&str], byte_encoding: bool) -> Res
     };
     for expression in expressions {
         let regex = RegexBuilder::new(expression)
-            .size_limit(8 * 1024 * 1024)
+            .delegate_size_limit(8 * 1024 * 1024)
             .build()?;
         let mut next = Vec::new();
         for piece in pieces {
             let mut end = 0;
             for matched in regex.find_iter(piece) {
+                let matched = matched?;
                 if matched.start() > end {
                     next.push(&piece[end..matched.start()]);
                 }
-                if !matched.is_empty() {
+                if !matched.as_str().is_empty() {
                     next.push(matched.as_str());
                 }
                 end = matched.end();

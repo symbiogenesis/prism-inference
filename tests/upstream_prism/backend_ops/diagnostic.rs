@@ -163,7 +163,7 @@ pub(super) fn benchmark(engine: &Engine) -> Result<Json> {
 /// Boolean searches in this explicitly checked ASCII regular-language core have the same language
 /// as default ECMAScript `regex_search`. Captures are never observed; backreferences/lookaround and
 /// syntax with differing class/Unicode semantics are rejected before executing a case.
-fn pattern(pattern: &str) -> Result<regex::Regex> {
+fn pattern(pattern: &str) -> Result<fancy_regex::Regex> {
     if !pattern.is_ascii()
         || pattern.len() > 64 * 1024
         || pattern.contains("(?")
@@ -235,10 +235,10 @@ fn pattern(pattern: &str) -> Result<regex::Regex> {
     if escaped {
         return Err(invalid("invalid diagnostic regex: final escape"));
     }
-    regex::RegexBuilder::new(pattern)
-        .unicode(false)
-        .size_limit(8 * 1024 * 1024)
-        .dfa_size_limit(8 * 1024 * 1024)
+    fancy_regex::RegexBuilder::new(pattern)
+        .unicode_mode(false)
+        .delegate_size_limit(8 * 1024 * 1024)
+        .delegate_dfa_size_limit(8 * 1024 * 1024)
         .build()
         .map_err(|error| invalid(format!("invalid or unsupported diagnostic regex: {error}")))
 }
@@ -322,7 +322,7 @@ fn options(engine: &Engine, request: &Json) -> Result<Json> {
                         json!({"Index":case_index,"Status":"unsupported-diagnostic","Reason":"non-ASCII/line-containing vars() is outside shared regex semantics"}),
                     );
                 }
-                if !matcher.is_match(&variables) {
+                if !matcher.is_match(&variables)? {
                     return Ok(
                         json!({"Index":case_index,"Status":"skip","Reason":"original parameter regex filter skip","CrtDraws":0}),
                     );

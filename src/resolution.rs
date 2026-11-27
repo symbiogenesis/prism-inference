@@ -10,7 +10,7 @@
 )]
 
 use crate::{Result, invalid};
-use regex::RegexBuilder;
+use fancy_regex::RegexBuilder;
 use std::path::PathBuf;
 
 /// One remote file and its independent cache destinations.
@@ -181,7 +181,7 @@ fn find_model(files: &[File], tag: &str) -> Result<File> {
         for file in files {
             let info = split(&file.path);
             if is_model(&file.path)
-                && pattern.is_match(&file.path)
+                && pattern.is_match(&file.path)?
                 && (info.count <= 1 || info.index == 1)
             {
                 return Ok(file.clone());

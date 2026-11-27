@@ -46,7 +46,6 @@ bonsai-gguf = { version = "=0.1.10", path = "tools/gguf", default-features = fal
 bonsai-prism = { version = "=0.1.9", path = "tools/prism" }
 serde_json = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
-regex = "=1.13.1"
 fancy-regex = "=0.20.2"
 unicode-normalization-alignments = "=0.1.12"
 bonsai-native-hash = { version = "=0.1.7", path = "tools/native-hash" }

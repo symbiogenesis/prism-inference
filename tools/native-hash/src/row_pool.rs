@@ -107,12 +107,15 @@ impl Drop for WorkerDoneGuard<'_> {
 
 struct ScopeGuard<'a, 'env, F> {
     shared: &'a Shared,
+    joined: bool,
     _closure: PhantomData<&'env F>,
 }
 
 impl<F> Drop for ScopeGuard<'_, '_, F> {
     fn drop(&mut self) {
-        wait_for_workers(self.shared, || {}, false);
+        if !self.joined {
+            wait_for_workers(self.shared, || {}, false);
+        }
         // SAFETY: All background workers for the current generation have exited
         // `Job::invoke` (`pending_workers == 0`), and no new generation can start
         // while `dispatch_lock` remains held by the caller.
@@ -164,6 +167,9 @@ fn wait_for_workers<W: FnMut()>(shared: &Shared, mut on_wait: W, use_timeout: bo
 }
 
 fn take_worker_panic(shared: &Shared) -> Option<Box<dyn Any + Send + 'static>> {
+    if !shared.panicked.load(Ordering::Relaxed) {
+        return None;
+    }
     if shared.panicked.swap(false, Ordering::AcqRel) {
         let mut panic_slot = shared
             .worker_panic
@@ -317,6 +323,7 @@ impl NativeRowPool {
             return;
         }
 
+        let worker_count = self.worker_count();
         let bg_workers = self.workers.len();
         let needed_bg = bg_workers.min(task_count.saturating_sub(1));
         if needed_bg == 0 {
@@ -345,7 +352,9 @@ impl NativeRowPool {
             // completely (`pending_workers == 0`), so no worker reads `job` until
             // `dispatch_state` advances below with `SeqCst` release semantics.
             unsafe { *self.shared.job.0.0.get() = Some(job) };
-            self.shared.next_task.store(0, Ordering::Release);
+            if task_count > worker_count {
+                self.shared.next_task.store(0, Ordering::Release);
+            }
             self.shared
                 .pending_workers
                 .store(needed_bg, Ordering::Release);
@@ -365,29 +374,33 @@ impl NativeRowPool {
 
         let mut caller_panic = None;
         {
-            let _scope_guard = ScopeGuard::<F> {
+            let mut scope_guard = ScopeGuard::<F> {
                 shared: &self.shared,
+                joined: false,
                 _closure: PhantomData,
             };
 
-            on_wait();
-            loop {
-                let index = self.shared.next_task.fetch_add(1, Ordering::Relaxed);
-                if index >= task_count {
-                    break;
-                }
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    task(index);
-                }));
-                if let Err(payload) = result {
-                    caller_panic = Some(payload);
-                    break;
-                }
+            let result = catch_unwind(AssertUnwindSafe(|| {
                 on_wait();
-            }
-
-            if caller_panic.is_none() {
+                if task_count <= worker_count {
+                    task(task_count - 1);
+                    on_wait();
+                } else {
+                    loop {
+                        let index = self.shared.next_task.fetch_add(1, Ordering::Relaxed);
+                        if index >= task_count {
+                            break;
+                        }
+                        task(index);
+                        on_wait();
+                    }
+                }
+            }));
+            if let Err(payload) = result {
+                caller_panic = Some(payload);
+            } else {
                 wait_for_workers(&self.shared, on_wait, true);
+                scope_guard.joined = true;
             }
         }
 
@@ -529,28 +542,36 @@ fn worker_loop(shared: &Shared, worker_id: usize) {
         // `_done` to decrement `pending_workers` before modifying `job`.
         let maybe_job = unsafe { *shared.job.0.0.get() };
         if let Some(job) = maybe_job {
-            loop {
-                let index = shared.next_task.fetch_add(1, Ordering::Relaxed);
-                if index >= job.task_count {
-                    break;
-                }
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    // SAFETY: `index < job.task_count`, `job.ctx` outlives this call,
-                    // and `job.invoke` matches `job.ctx`'s monomorphized closure type.
-                    unsafe { (job.invoke)(job.ctx, index) };
-                }));
-                if let Err(payload) = result {
-                    let mut panic_slot = shared
-                        .worker_panic
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    if panic_slot.is_none() {
-                        *panic_slot = Some(payload);
+            let worker_count = shared.worker_sleeps.len() + 1;
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                if job.task_count <= worker_count {
+                    if worker_id < job.task_count - 1 {
+                        // SAFETY: `worker_id < job.task_count - 1 < job.task_count`, `job.ctx`
+                        // outlives this call, and `job.invoke` matches `job.ctx`'s closure type.
+                        unsafe { (job.invoke)(job.ctx, worker_id) };
                     }
-                    drop(panic_slot);
-                    shared.panicked.store(true, Ordering::Release);
-                    break;
+                } else {
+                    loop {
+                        let index = shared.next_task.fetch_add(1, Ordering::Relaxed);
+                        if index >= job.task_count {
+                            break;
+                        }
+                        // SAFETY: `index < job.task_count`, `job.ctx` outlives this call,
+                        // and `job.invoke` matches `job.ctx`'s monomorphized closure type.
+                        unsafe { (job.invoke)(job.ctx, index) };
+                    }
                 }
+            }));
+            if let Err(payload) = result {
+                let mut panic_slot = shared
+                    .worker_panic
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if panic_slot.is_none() {
+                    *panic_slot = Some(payload);
+                }
+                drop(panic_slot);
+                shared.panicked.store(true, Ordering::Release);
             }
         }
     }

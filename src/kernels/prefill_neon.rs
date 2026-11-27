@@ -2343,7 +2343,7 @@ fn dot_bf16_row_pairs<const PAIRS: usize, const ROWS: usize, const TOKENS: usize
     rows: [&[u8]; ROWS],
     preparations: &[crate::kernels::MatvecScratch],
 ) -> crate::Result<[[f32; TOKENS]; ROWS]> {
-    const K_TILE: usize = 32;
+    const K_TILE: usize = 16;
     let token_count = preparations.len();
     if token_count == 0
         || token_count > TOKENS
@@ -2365,82 +2365,64 @@ fn dot_bf16_row_pairs<const PAIRS: usize, const ROWS: usize, const TOKENS: usize
     let (tok_quads, tok_rem) = preparations.as_chunks::<4>();
 
     for k_base in (0..chunk_count).step_by(K_TILE) {
-        let k_end = (k_base + K_TILE).min(chunk_count);
-        for (quad_idx, quad) in tok_quads.iter().enumerate() {
-            let base_t = quad_idx * 4;
-            let mut acc: [[f64x2<Neon>; 4]; PAIRS] = std::array::from_fn(|p| {
-                [
-                    sums[p][base_t],
-                    sums[p][base_t + 1],
-                    sums[p][base_t + 2],
-                    sums[p][base_t + 3],
-                ]
-            });
-            for idx in k_base..k_end {
-                let col = idx * 8;
-                let a_lo: [f32x4<Neon>; 4] = std::array::from_fn(|t| {
-                    f32x4::from_slice(neon, &quad[t].activations[col..col + 4])
-                });
-                let a_hi: [f32x4<Neon>; 4] = std::array::from_fn(|t| {
-                    f32x4::from_slice(neon, &quad[t].activations[col + 4..col + 8])
-                });
-                for (p, acc_pair) in acc.iter_mut().enumerate() {
-                    let (we0, we1) = decode_bf16_pair(neon, zero, &b_chunks[p * 2][idx]);
-                    let (wo0, wo1) = decode_bf16_pair(neon, zero, &b_chunks[p * 2 + 1][idx]);
-                    if quad_idx == 0 {
-                        finite_mask = finite_mask
-                            & we0.is_finite()
-                            & we1.is_finite()
-                            & wo0.is_finite()
-                            & wo1.is_finite();
-                    }
-                    for t in 0..4 {
-                        let s = add_f32_columns(acc_pair[t], we0 * a_lo[t], wo0 * a_lo[t]);
-                        acc_pair[t] = add_f32_columns(s, we1 * a_hi[t], wo1 * a_hi[t]);
-                    }
-                }
+        let tile_len = (chunk_count - k_base).min(K_TILE);
+        for (p, pair_sums) in sums.iter_mut().enumerate() {
+            let r_even = &b_chunks[p * 2];
+            let r_odd = &b_chunks[p * 2 + 1];
+            let mut even_tile = [[f32x4::splat(neon, 0.0); 2]; K_TILE];
+            let mut odd_tile = [[f32x4::splat(neon, 0.0); 2]; K_TILE];
+            for k_off in 0..tile_len {
+                let idx = k_base + k_off;
+                let (we0, we1) = decode_bf16_pair(neon, zero, &r_even[idx]);
+                let (wo0, wo1) = decode_bf16_pair(neon, zero, &r_odd[idx]);
+                finite_mask = finite_mask
+                    & we0.is_finite()
+                    & we1.is_finite()
+                    & wo0.is_finite()
+                    & wo1.is_finite();
+                even_tile[k_off] = [we0, we1];
+                odd_tile[k_off] = [wo0, wo1];
             }
-            for (p, acc_pair) in acc.iter().enumerate() {
-                sums[p][base_t..base_t + 4].copy_from_slice(acc_pair);
-            }
-        }
-        if !tok_rem.is_empty() {
-            let rem_base = tok_quads.len() * 4;
-            let check_weights = tok_quads.is_empty();
-            let mut acc = [[f64x2::splat(neon, -0.0); 3]; PAIRS];
-            for (p, acc_pair) in acc.iter_mut().enumerate() {
-                acc_pair[..tok_rem.len()]
-                    .copy_from_slice(&sums[p][rem_base..rem_base + tok_rem.len()]);
-            }
-            for idx in k_base..k_end {
-                let col = idx * 8;
-                let mut acts = [(f32x4::splat(neon, 0.0), f32x4::splat(neon, 0.0)); 3];
-                for (t_off, scratch) in tok_rem.iter().enumerate() {
-                    acts[t_off] = (
-                        f32x4::from_slice(neon, &scratch.activations[col..col + 4]),
-                        f32x4::from_slice(neon, &scratch.activations[col + 4..col + 8]),
-                    );
-                }
-                for (p, acc_pair) in acc.iter_mut().enumerate() {
-                    let (we0, we1) = decode_bf16_pair(neon, zero, &b_chunks[p * 2][idx]);
-                    let (wo0, wo1) = decode_bf16_pair(neon, zero, &b_chunks[p * 2 + 1][idx]);
-                    if check_weights {
-                        finite_mask = finite_mask
-                            & we0.is_finite()
-                            & we1.is_finite()
-                            & wo0.is_finite()
-                            & wo1.is_finite();
-                    }
-                    for (acc_tok, &(a_lo, a_hi)) in acc_pair[..tok_rem.len()].iter_mut().zip(&acts)
-                    {
-                        let s = add_f32_columns(*acc_tok, we0 * a_lo, wo0 * a_lo);
-                        *acc_tok = add_f32_columns(s, we1 * a_hi, wo1 * a_hi);
+
+            for (quad_idx, quad) in tok_quads.iter().enumerate() {
+                let base_t = quad_idx * 4;
+                let mut acc = [
+                    pair_sums[base_t],
+                    pair_sums[base_t + 1],
+                    pair_sums[base_t + 2],
+                    pair_sums[base_t + 3],
+                ];
+                for k_off in 0..tile_len {
+                    let col = (k_base + k_off) * 8;
+                    let [we0, we1] = even_tile[k_off];
+                    let [wo0, wo1] = odd_tile[k_off];
+                    for (t, acc_t) in acc.iter_mut().enumerate() {
+                        let a_lo = f32x4::from_slice(neon, &quad[t].activations[col..col + 4]);
+                        let a_hi = f32x4::from_slice(neon, &quad[t].activations[col + 4..col + 8]);
+                        let s = add_f32_columns(*acc_t, we0 * a_lo, wo0 * a_lo);
+                        *acc_t = add_f32_columns(s, we1 * a_hi, wo1 * a_hi);
                     }
                 }
+                pair_sums[base_t..base_t + 4].copy_from_slice(&acc);
             }
-            for (p, acc_pair) in acc.iter().enumerate() {
-                sums[p][rem_base..rem_base + tok_rem.len()]
-                    .copy_from_slice(&acc_pair[..tok_rem.len()]);
+            if !tok_rem.is_empty() {
+                let rem_base = tok_quads.len() * 4;
+                let mut acc = [f64x2::splat(neon, -0.0); 3];
+                acc[..tok_rem.len()]
+                    .copy_from_slice(&pair_sums[rem_base..rem_base + tok_rem.len()]);
+                for k_off in 0..tile_len {
+                    let col = (k_base + k_off) * 8;
+                    let [we0, we1] = even_tile[k_off];
+                    let [wo0, wo1] = odd_tile[k_off];
+                    for (t_off, scratch) in tok_rem.iter().enumerate() {
+                        let a_lo = f32x4::from_slice(neon, &scratch.activations[col..col + 4]);
+                        let a_hi = f32x4::from_slice(neon, &scratch.activations[col + 4..col + 8]);
+                        let s = add_f32_columns(acc[t_off], we0 * a_lo, wo0 * a_lo);
+                        acc[t_off] = add_f32_columns(s, we1 * a_hi, wo1 * a_hi);
+                    }
+                }
+                pair_sums[rem_base..rem_base + tok_rem.len()]
+                    .copy_from_slice(&acc[..tok_rem.len()]);
             }
         }
     }

@@ -2747,6 +2747,109 @@ pub fn dot_pq2_eight_rows_eight_tokens(
     })
 }
 
+/// Steps two GDN state rows using the exact 4-accumulator 16-wide pinned reduction
+/// `((s0 + s2) + (s1 + s3)).reduce_sum()` (`0 ULP` parity).
+///
+/// Validates `width >= 16 && width <= 256 && width.is_multiple_of(16)` and all slice extents.
+/// Returns `false` before modifying `states` if Pass 1 detects non-finite `dot_k` or update scale,
+/// or `false` if Pass 2 output is non-finite.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Safe checked GDN 2-row step keeps immutable source, mutable state, key, query, scalars, and outputs explicit."
+)]
+#[inline]
+#[must_use]
+pub fn gdn_step_two_rows_pinned_neon(
+    previous: [&[f32]; 2],
+    states: [&mut [f32]; 2],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    values: [f32; 2],
+    beta: f32,
+    outputs: &mut [f32; 2],
+) -> bool {
+    let width = key.len();
+    if !(16..=256).contains(&width)
+        || !width.is_multiple_of(16)
+        || query.len() != width
+        || previous.iter().any(|row| row.len() != width)
+        || states.iter().any(|row| row.len() != width)
+    {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::gdn_step_two_rows_pinned_neon(
+            previous, states, key, query, decay, values, beta, outputs,
+        )
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut scales = [0.0_f32; 2];
+        for (r, prev) in previous.iter().enumerate() {
+            let mut sums = [[0.0_f32; 4]; 4];
+            for (prev_blk, key_blk) in prev.as_chunks::<16>().0.iter().zip(key.as_chunks::<16>().0)
+            {
+                for reg in 0..4 {
+                    for lane in 0..4 {
+                        let idx = reg * 4 + lane;
+                        let d = prev_blk[idx] * decay;
+                        sums[reg][lane] = d.mul_add(key_blk[idx], sums[reg][lane]);
+                    }
+                }
+            }
+            let lanes: [f32; 4] =
+                std::array::from_fn(|l| (sums[0][l] + sums[2][l]) + (sums[1][l] + sums[3][l]));
+            let dot_k = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            if !dot_k.is_finite() {
+                return false;
+            }
+            let scale = (values[r] - dot_k) * beta;
+            if !scale.is_finite() {
+                return false;
+            }
+            scales[r] = scale;
+        }
+        let mut out_local = [0.0_f32; 2];
+        for (r, (prev, state)) in previous.iter().zip(states).enumerate() {
+            let mut sums = [[0.0_f32; 4]; 4];
+            let scale = scales[r];
+            for ((prev_blk, st_blk), (key_blk, query_blk)) in prev
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .zip(state.as_chunks_mut::<16>().0)
+                .zip(
+                    key.as_chunks::<16>()
+                        .0
+                        .iter()
+                        .zip(query.as_chunks::<16>().0),
+                )
+            {
+                for reg in 0..4 {
+                    for lane in 0..4 {
+                        let idx = reg * 4 + lane;
+                        let d = prev_blk[idx] * decay;
+                        let u = scale.mul_add(key_blk[idx], d);
+                        st_blk[idx] = u;
+                        sums[reg][lane] = u.mul_add(query_blk[idx], sums[reg][lane]);
+                    }
+                }
+            }
+            let lanes: [f32; 4] =
+                std::array::from_fn(|l| (sums[0][l] + sums[2][l]) + (sums[1][l] + sums[3][l]));
+            let out = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            if !out.is_finite() {
+                return false;
+            }
+            out_local[r] = out;
+        }
+        *outputs = out_local;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3545,6 +3648,307 @@ mod tests {
                 out_p.map(|r| r.map(f32::to_bits)),
                 sentinel.map(|r| r.map(f32::to_bits))
             );
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verifies 0-ULP GDN 2-row step across widths 16..=256, 4-byte unaligned pointers, subnormals, signed zeros, and NaN/Inf inputs."
+    )]
+    #[test]
+    fn gdn_step_two_rows_pinned_matches_scalar_zero_ulp_and_rejects_nonfinite() {
+        let ref_two_rows = |prev: [&[f32]; 2],
+                            st: &mut [Vec<f32>; 2],
+                            key: &[f32],
+                            query: &[f32],
+                            decay: f32,
+                            values: [f32; 2],
+                            beta: f32|
+         -> Option<[f32; 2]> {
+            let mut out = [0.0_f32; 2];
+            for r in 0..2 {
+                let mut sums = [[0.0_f32; 4]; 4];
+                for (pb, kb) in prev[r]
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .zip(key.as_chunks::<16>().0)
+                {
+                    for reg in 0..4 {
+                        for lane in 0..4 {
+                            let idx = reg * 4 + lane;
+                            let d = pb[idx] * decay;
+                            sums[reg][lane] = d.mul_add(kb[idx], sums[reg][lane]);
+                        }
+                    }
+                }
+                let lanes: [f32; 4] =
+                    std::array::from_fn(|l| (sums[0][l] + sums[2][l]) + (sums[1][l] + sums[3][l]));
+                let dot_k = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+                if !dot_k.is_finite() {
+                    return None;
+                }
+                let scale = (values[r] - dot_k) * beta;
+                if !scale.is_finite() {
+                    return None;
+                }
+                let mut qsums = [[0.0_f32; 4]; 4];
+                for ((pb, sb), (kb, qb)) in prev[r]
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .zip(st[r].as_chunks_mut::<16>().0)
+                    .zip(
+                        key.as_chunks::<16>()
+                            .0
+                            .iter()
+                            .zip(query.as_chunks::<16>().0),
+                    )
+                {
+                    for reg in 0..4 {
+                        for lane in 0..4 {
+                            let idx = reg * 4 + lane;
+                            let d = pb[idx] * decay;
+                            let u = scale.mul_add(kb[idx], d);
+                            sb[idx] = u;
+                            qsums[reg][lane] = u.mul_add(qb[idx], qsums[reg][lane]);
+                        }
+                    }
+                }
+                let qlanes: [f32; 4] = std::array::from_fn(|l| {
+                    (qsums[0][l] + qsums[2][l]) + (qsums[1][l] + qsums[3][l])
+                });
+                let qdot = (qlanes[0] + qlanes[1]) + (qlanes[2] + qlanes[3]);
+                if !qdot.is_finite() {
+                    return None;
+                }
+                out[r] = qdot;
+            }
+            Some(out)
+        };
+
+        let pool = [
+            0.0_f32,
+            -0.0_f32,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            0.375,
+            -0.625,
+            1.25,
+            -0.125,
+        ];
+
+        for width in [16_usize, 32, 64, 128, 256] {
+            for offset in [0_usize, 1] {
+                let mut prev0_buf = vec![0.0_f32; width + 4];
+                let mut prev1_buf = vec![0.0_f32; width + 4];
+                let mut key_buf = vec![0.0_f32; width + 4];
+                let mut query_buf = vec![0.0_f32; width + 4];
+                let mut st0_buf = vec![-7.5_f32; width + 4];
+                let mut st1_buf = vec![-7.5_f32; width + 4];
+                for i in 0..width {
+                    prev0_buf[offset + i] = pool[(i * 3 + width) % pool.len()];
+                    prev1_buf[offset + i] = pool[(i * 7 + 1 + width) % pool.len()];
+                    key_buf[offset + i] = pool[(i * 5 + 2) % pool.len()];
+                    query_buf[offset + i] = pool[(i * 11 + 3) % pool.len()];
+                }
+                if offset == 1 {
+                    assert_eq!(prev0_buf[1..].as_ptr().addr() % 8, 4);
+                    assert_eq!(st0_buf[1..].as_ptr().addr() % 8, 4);
+                    assert_eq!(key_buf[1..].as_ptr().addr() % 8, 4);
+                    assert_eq!(query_buf[1..].as_ptr().addr() % 8, 4);
+                }
+                let prev0 = &prev0_buf[offset..offset + width];
+                let prev1 = &prev1_buf[offset..offset + width];
+                let key = &key_buf[offset..offset + width];
+                let query = &query_buf[offset..offset + width];
+
+                for &(decay, values, beta) in &[
+                    (0.875_f32, [0.125_f32, -0.375_f32], 0.625_f32),
+                    (-0.0_f32, [0.0_f32, -0.0_f32], -0.0_f32),
+                    (f32::from_bits(1), [-0.25_f32, f32::from_bits(1)], 1.0_f32),
+                ] {
+                    let mut exp_states = [vec![-7.5_f32; width], vec![-7.5_f32; width]];
+                    let exp_out = ref_two_rows(
+                        [prev0, prev1],
+                        &mut exp_states,
+                        key,
+                        query,
+                        decay,
+                        values,
+                        beta,
+                    );
+                    let mut act_out = [f32::NAN; 2];
+                    let ok = gdn_step_two_rows_pinned_neon(
+                        [prev0, prev1],
+                        [
+                            &mut st0_buf[offset..offset + width],
+                            &mut st1_buf[offset..offset + width],
+                        ],
+                        key,
+                        query,
+                        decay,
+                        values,
+                        beta,
+                        &mut act_out,
+                    );
+                    assert!(ok, "width={width} offset={offset}");
+                    let exp_out = exp_out.unwrap_or([0.0; 2]);
+                    assert_eq!(act_out.map(f32::to_bits), exp_out.map(f32::to_bits));
+                    assert_eq!(
+                        st0_buf[offset..offset + width]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        exp_states[0]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        st1_buf[offset..offset + width]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        exp_states[1]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                }
+
+                // Inject NaN/Inf across all inputs. Pass-1 failures must preserve sentinel states.
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    let sentinel_st = vec![42.25_f32; width];
+                    let mut s0 = sentinel_st.clone();
+                    let mut s1 = sentinel_st.clone();
+                    let mut out = [99.5_f32; 2];
+
+                    // 1) bad previous
+                    let mut bad_prev = prev1.to_vec();
+                    bad_prev[width - 1] = bad;
+                    assert!(!gdn_step_two_rows_pinned_neon(
+                        [prev0, &bad_prev],
+                        [&mut s0, &mut s1],
+                        key,
+                        query,
+                        0.875,
+                        [0.5, -0.5],
+                        0.25,
+                        &mut out,
+                    ));
+                    assert_eq!(
+                        s0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        sentinel_st.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        s1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        sentinel_st.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+
+                    // 2) bad key
+                    let mut bad_key = key.to_vec();
+                    bad_key[0] = bad;
+                    assert!(!gdn_step_two_rows_pinned_neon(
+                        [prev0, prev1],
+                        [&mut s0, &mut s1],
+                        &bad_key,
+                        query,
+                        0.875,
+                        [0.5, -0.5],
+                        0.25,
+                        &mut out,
+                    ));
+                    assert_eq!(
+                        s0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        sentinel_st.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+
+                    // 3) bad decay
+                    assert!(!gdn_step_two_rows_pinned_neon(
+                        [prev0, prev1],
+                        [&mut s0, &mut s1],
+                        key,
+                        query,
+                        bad,
+                        [0.5, -0.5],
+                        0.25,
+                        &mut out,
+                    ));
+                    assert_eq!(
+                        s0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        sentinel_st.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+
+                    // 4) bad values
+                    assert!(!gdn_step_two_rows_pinned_neon(
+                        [prev0, prev1],
+                        [&mut s0, &mut s1],
+                        key,
+                        query,
+                        0.875,
+                        [0.5, bad],
+                        0.25,
+                        &mut out,
+                    ));
+                    assert_eq!(
+                        s0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        sentinel_st.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+
+                    // 5) bad beta
+                    assert!(!gdn_step_two_rows_pinned_neon(
+                        [prev0, prev1],
+                        [&mut s0, &mut s1],
+                        key,
+                        query,
+                        0.875,
+                        [0.5, -0.5],
+                        bad,
+                        &mut out,
+                    ));
+                    assert_eq!(
+                        s0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        sentinel_st.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+
+                    // 6) bad query
+                    let mut bad_query = query.to_vec();
+                    bad_query[width / 2] = bad;
+                    assert!(!gdn_step_two_rows_pinned_neon(
+                        [prev0, prev1],
+                        [&mut s0, &mut s1],
+                        key,
+                        &bad_query,
+                        0.875,
+                        [0.5, -0.5],
+                        0.25,
+                        &mut out,
+                    ));
+                    assert_eq!(out.map(f32::to_bits), [99.5_f32.to_bits(); 2]);
+                }
+            }
+        }
+
+        // Reject unsupported/mismatched geometries without mutating outputs.
+        for bad_w in [0_usize, 15, 24, 272] {
+            let p = vec![0.0_f32; bad_w];
+            let mut s0 = vec![1.0_f32; bad_w];
+            let mut s1 = vec![1.0_f32; bad_w];
+            let mut out = [7.0_f32; 2];
+            assert!(!gdn_step_two_rows_pinned_neon(
+                [&p, &p],
+                [&mut s0, &mut s1],
+                &p,
+                &p,
+                0.5,
+                [1.0, 2.0],
+                0.5,
+                &mut out,
+            ));
+            assert_eq!(out.map(f32::to_bits), [7.0_f32.to_bits(); 2]);
         }
     }
 }

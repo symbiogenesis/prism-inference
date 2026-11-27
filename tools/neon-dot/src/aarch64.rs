@@ -11356,3 +11356,318 @@ pub(crate) fn trellis_tile_row_matmul_tokens(
         unsafe { inner_neon(row_tiles, bits, per_tile, cols, x_tokens, out_tokens) };
     }
 }
+
+macro_rules! gdn_pass2_asm {
+    ($store:literal) => {
+        concat!(
+            "movi v0.2d, #0\n",
+            "movi v1.2d, #0\n",
+            "movi v2.2d, #0\n",
+            "movi v3.2d, #0\n",
+            "movi v4.2d, #0\n",
+            "movi v5.2d, #0\n",
+            "movi v6.2d, #0\n",
+            "movi v7.2d, #0\n",
+            "1:\n",
+            "ldp q11, q12, [{k}]\n",
+            "ldp q13, q14, [{k}, #32]\n",
+            "add {k}, {k}, #64\n",
+            "ldp q19, q20, [{q}]\n",
+            "ldp q21, q22, [{q}, #32]\n",
+            "add {q}, {q}, #64\n",
+            "ldp q15, q16, [{p0}]\n",
+            "ldp q17, q18, [{p0}, #32]\n",
+            "add {p0}, {p0}, #64\n",
+            "fmul v15.4s, v15.4s, v8.4s\n",
+            "fmul v16.4s, v16.4s, v8.4s\n",
+            "fmul v17.4s, v17.4s, v8.4s\n",
+            "fmul v18.4s, v18.4s, v8.4s\n",
+            "fmla v15.4s, v11.4s, v9.4s\n",
+            "fmla v16.4s, v12.4s, v9.4s\n",
+            "fmla v17.4s, v13.4s, v9.4s\n",
+            "fmla v18.4s, v14.4s, v9.4s\n",
+            $store,
+            " q15, q16, [{s0}]\n",
+            $store,
+            " q17, q18, [{s0}, #32]\n",
+            "add {s0}, {s0}, #64\n",
+            "fmla v0.4s, v15.4s, v19.4s\n",
+            "fmla v1.4s, v16.4s, v20.4s\n",
+            "fmla v2.4s, v17.4s, v21.4s\n",
+            "fmla v3.4s, v18.4s, v22.4s\n",
+            "ldp q15, q16, [{p1}]\n",
+            "ldp q17, q18, [{p1}, #32]\n",
+            "add {p1}, {p1}, #64\n",
+            "fmul v15.4s, v15.4s, v8.4s\n",
+            "fmul v16.4s, v16.4s, v8.4s\n",
+            "fmul v17.4s, v17.4s, v8.4s\n",
+            "fmul v18.4s, v18.4s, v8.4s\n",
+            "fmla v15.4s, v11.4s, v10.4s\n",
+            "fmla v16.4s, v12.4s, v10.4s\n",
+            "fmla v17.4s, v13.4s, v10.4s\n",
+            "fmla v18.4s, v14.4s, v10.4s\n",
+            $store,
+            " q15, q16, [{s1}]\n",
+            $store,
+            " q17, q18, [{s1}, #32]\n",
+            "add {s1}, {s1}, #64\n",
+            "fmla v4.4s, v15.4s, v19.4s\n",
+            "fmla v5.4s, v16.4s, v20.4s\n",
+            "fmla v6.4s, v17.4s, v21.4s\n",
+            "fmla v7.4s, v18.4s, v22.4s\n",
+            "subs {cnt}, {cnt}, #1\n",
+            "b.ne 1b\n",
+        )
+    };
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Zero-spill two-pass NEON GDN step keeps Pass 1 (17 regs) and Pass 2 (23 regs) in separate asm blocks."
+)]
+#[target_feature(enable = "neon")]
+fn gdn_step_two_rows_pinned_neon_impl(
+    previous: [&[f32]; 2],
+    states: [&mut [f32]; 2],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    values: [f32; 2],
+    beta: f32,
+    outputs: &mut [f32; 2],
+) -> bool {
+    use core::arch::aarch64::{float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32};
+
+    let width = key.len();
+    if !(16..=256).contains(&width)
+        || !width.is_multiple_of(16)
+        || query.len() != width
+        || previous.iter().any(|row| row.len() != width)
+        || states.iter().any(|row| row.len() != width)
+    {
+        return false;
+    }
+
+    let blocks = width / 16;
+    let stride2 = width * 2 * size_of::<f32>();
+    let decays = vdupq_n_f32(decay);
+    let p0_orig = previous[0].as_ptr();
+    let p1_orig = previous[1].as_ptr();
+    let k_orig = key.as_ptr();
+
+    let s0_r0: float32x4_t;
+    let s1_r0: float32x4_t;
+    let s2_r0: float32x4_t;
+    let s3_r0: float32x4_t;
+    let s0_r1: float32x4_t;
+    let s1_r1: float32x4_t;
+    let s2_r1: float32x4_t;
+    let s3_r1: float32x4_t;
+
+    // SAFETY: Validated `previous[0..2]` and `key` cover `blocks * 16` `f32` elements;
+    // `prfm` is architecturally non-faulting; all clobbered SIMD registers are listed.
+    unsafe {
+        core::arch::asm!(
+            "movi v0.2d, #0",
+            "movi v1.2d, #0",
+            "movi v2.2d, #0",
+            "movi v3.2d, #0",
+            "movi v4.2d, #0",
+            "movi v5.2d, #0",
+            "movi v6.2d, #0",
+            "movi v7.2d, #0",
+            "1:",
+            "prfm pldl1keep, [{p0}, {stride2}]",
+            "prfm pldl1keep, [{p1}, {stride2}]",
+            "ldp q9, q10, [{k}]",
+            "ldp q11, q12, [{k}, #32]",
+            "add {k}, {k}, #64",
+            "ldp q13, q14, [{p0}]",
+            "ldp q15, q16, [{p0}, #32]",
+            "add {p0}, {p0}, #64",
+            "fmul v13.4s, v13.4s, v8.4s",
+            "fmul v14.4s, v14.4s, v8.4s",
+            "fmul v15.4s, v15.4s, v8.4s",
+            "fmul v16.4s, v16.4s, v8.4s",
+            "fmla v0.4s, v13.4s, v9.4s",
+            "fmla v1.4s, v14.4s, v10.4s",
+            "fmla v2.4s, v15.4s, v11.4s",
+            "fmla v3.4s, v16.4s, v12.4s",
+            "ldp q13, q14, [{p1}]",
+            "ldp q15, q16, [{p1}, #32]",
+            "add {p1}, {p1}, #64",
+            "fmul v13.4s, v13.4s, v8.4s",
+            "fmul v14.4s, v14.4s, v8.4s",
+            "fmul v15.4s, v15.4s, v8.4s",
+            "fmul v16.4s, v16.4s, v8.4s",
+            "fmla v4.4s, v13.4s, v9.4s",
+            "fmla v5.4s, v14.4s, v10.4s",
+            "fmla v6.4s, v15.4s, v11.4s",
+            "fmla v7.4s, v16.4s, v12.4s",
+            "subs {cnt}, {cnt}, #1",
+            "b.ne 1b",
+            p0 = inout(reg) p0_orig => _,
+            p1 = inout(reg) p1_orig => _,
+            k = inout(reg) k_orig => _,
+            cnt = inout(reg) blocks => _,
+            stride2 = in(reg) stride2,
+            in("v8") decays,
+            out("v0") s0_r0,
+            out("v1") s1_r0,
+            out("v2") s2_r0,
+            out("v3") s3_r0,
+            out("v4") s0_r1,
+            out("v5") s1_r1,
+            out("v6") s2_r1,
+            out("v7") s3_r1,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            options(nostack, readonly),
+        );
+    }
+
+    let dot_k0 = vaddvq_f32(vaddq_f32(vaddq_f32(s0_r0, s2_r0), vaddq_f32(s1_r0, s3_r0)));
+    let dot_k1 = vaddvq_f32(vaddq_f32(vaddq_f32(s0_r1, s2_r1), vaddq_f32(s1_r1, s3_r1)));
+    if !dot_k0.is_finite() || !dot_k1.is_finite() {
+        return false;
+    }
+    let scale0 = (values[0] - dot_k0) * beta;
+    let scale1 = (values[1] - dot_k1) * beta;
+    if !scale0.is_finite() || !scale1.is_finite() {
+        return false;
+    }
+
+    let sc0 = vdupq_n_f32(scale0);
+    let sc1 = vdupq_n_f32(scale1);
+    let [st0, st1] = states;
+    let s0_ptr = st0.as_mut_ptr();
+    let s1_ptr = st1.as_mut_ptr();
+    let q_ptr = query.as_ptr();
+    let q0_r0: float32x4_t;
+    let q1_r0: float32x4_t;
+    let q2_r0: float32x4_t;
+    let q3_r0: float32x4_t;
+    let q0_r1: float32x4_t;
+    let q1_r1: float32x4_t;
+    let q2_r1: float32x4_t;
+    let q3_r1: float32x4_t;
+
+    if width >= 64 {
+        // SAFETY: Validated `previous`, `states`, `key`, and `query` each cover `blocks * 16` `f32`
+        // elements; `states[0]` and `states[1]` are distinct mutable borrows.
+        unsafe {
+            core::arch::asm!(
+                gdn_pass2_asm!("stnp"),
+                p0 = inout(reg) p0_orig => _,
+                p1 = inout(reg) p1_orig => _,
+                s0 = inout(reg) s0_ptr => _,
+                s1 = inout(reg) s1_ptr => _,
+                k = inout(reg) k_orig => _,
+                q = inout(reg) q_ptr => _,
+                cnt = inout(reg) blocks => _,
+                in("v8") decays,
+                in("v9") sc0,
+                in("v10") sc1,
+                out("v0") q0_r0,
+                out("v1") q1_r0,
+                out("v2") q2_r0,
+                out("v3") q3_r0,
+                out("v4") q0_r1,
+                out("v5") q1_r1,
+                out("v6") q2_r1,
+                out("v7") q3_r1,
+                out("v11") _,
+                out("v12") _,
+                out("v13") _,
+                out("v14") _,
+                out("v15") _,
+                out("v16") _,
+                out("v17") _,
+                out("v18") _,
+                out("v19") _,
+                out("v20") _,
+                out("v21") _,
+                out("v22") _,
+                options(nostack),
+            );
+        }
+    } else {
+        // SAFETY: Validated `previous`, `states`, `key`, and `query` each cover `blocks * 16` `f32`
+        // elements; `states[0]` and `states[1]` are distinct mutable borrows.
+        unsafe {
+            core::arch::asm!(
+                gdn_pass2_asm!("stp"),
+                p0 = inout(reg) p0_orig => _,
+                p1 = inout(reg) p1_orig => _,
+                s0 = inout(reg) s0_ptr => _,
+                s1 = inout(reg) s1_ptr => _,
+                k = inout(reg) k_orig => _,
+                q = inout(reg) q_ptr => _,
+                cnt = inout(reg) blocks => _,
+                in("v8") decays,
+                in("v9") sc0,
+                in("v10") sc1,
+                out("v0") q0_r0,
+                out("v1") q1_r0,
+                out("v2") q2_r0,
+                out("v3") q3_r0,
+                out("v4") q0_r1,
+                out("v5") q1_r1,
+                out("v6") q2_r1,
+                out("v7") q3_r1,
+                out("v11") _,
+                out("v12") _,
+                out("v13") _,
+                out("v14") _,
+                out("v15") _,
+                out("v16") _,
+                out("v17") _,
+                out("v18") _,
+                out("v19") _,
+                out("v20") _,
+                out("v21") _,
+                out("v22") _,
+                options(nostack),
+            );
+        }
+    }
+
+    let out0 = vaddvq_f32(vaddq_f32(vaddq_f32(q0_r0, q2_r0), vaddq_f32(q1_r0, q3_r0)));
+    let out1 = vaddvq_f32(vaddq_f32(vaddq_f32(q0_r1, q2_r1), vaddq_f32(q1_r1, q3_r1)));
+    if !out0.is_finite() || !out1.is_finite() {
+        return false;
+    }
+    outputs[0] = out0;
+    outputs[1] = out1;
+    true
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Checked 2-row GDN step keeps immutable source, mutable state, key, query, scalars, and outputs explicit."
+)]
+#[inline]
+pub(super) fn gdn_step_two_rows_pinned_neon(
+    previous: [&[f32]; 2],
+    states: [&mut [f32]; 2],
+    key: &[f32],
+    query: &[f32],
+    decay: f32,
+    values: [f32; 2],
+    beta: f32,
+    outputs: &mut [f32; 2],
+) -> bool {
+    // SAFETY: ARMv8-A always provides baseline NEON instructions on `aarch64` targets.
+    unsafe {
+        gdn_step_two_rows_pinned_neon_impl(
+            previous, states, key, query, decay, values, beta, outputs,
+        )
+    }
+}

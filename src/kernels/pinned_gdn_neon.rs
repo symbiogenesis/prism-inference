@@ -1482,18 +1482,21 @@ pub(super) fn try_step_head_provisional(
         let (s4, s5) = s45.split_at_mut(width);
         let (s6, s7) = s67.split_at_mut(width);
         let mut states = [s0, s1, s2, s3, s4, s5, s6, s7];
-        let values = match step_eight_rows_into(
-            neon,
-            previous,
-            &mut states,
-            input.key,
-            input.query,
-            input.decay,
-            *values,
-            input.beta,
-        ) {
-            Some(values) => values,
-            None => match super::step_eight_rows_from(
+        let values = if (16..=256).contains(&width)
+            && width.is_multiple_of(16)
+            && let Some(values) = step_eight_rows_into(
+                neon,
+                previous,
+                &mut states,
+                input.key,
+                input.query,
+                input.decay,
+                *values,
+                input.beta,
+            ) {
+            values
+        } else {
+            match super::step_eight_rows_from(
                 previous,
                 states,
                 input.key,
@@ -1504,7 +1507,7 @@ pub(super) fn try_step_head_provisional(
             ) {
                 Ok(values) => values,
                 Err(error) => return Some(Err(error)),
-            },
+            }
         };
         for (output, value) in output.iter_mut().zip(values) {
             *output = value * scale;
@@ -1545,7 +1548,7 @@ pub(super) fn step_eight_rows_provisional(
     reason = "Keep immutable source and disposable eight-row work ownership explicit."
 )]
 fn step_eight_rows_into(
-    neon: Neon,
+    _neon: Neon,
     previous: [&[f32]; 8],
     states: &mut [&mut [f32]; 8],
     key: &[f32],
@@ -1554,141 +1557,31 @@ fn step_eight_rows_into(
     values: [f32; 8],
     beta: f32,
 ) -> Option<[f32; 8]> {
-    let mut scales = [0.0; 8];
-    for (group, (previous, values)) in previous
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(values.as_chunks::<4>().0)
-        .enumerate()
-    {
-        let deltas = decay_four_rows_scales(neon, *previous, key, decay, *values, beta)?;
-        scales[group * 4..group * 4 + 4].copy_from_slice(&deltas);
-    }
-    // Every key dot precedes updates, as in the existing eight-row helper.
-    // Re-read L1-resident `previous` in pass 2 so `states` is written only once.
     let mut outputs = [0.0; 8];
-    for (group, ((previous, states), scales)) in previous
-        .as_chunks::<4>()
+    for (pair_idx, ((prev_pair, state_pair), val_pair)) in previous
+        .as_chunks::<2>()
         .0
         .iter()
-        .zip(states.as_chunks_mut::<4>().0)
-        .zip(scales.as_chunks::<4>().0)
+        .zip(states.as_chunks_mut::<2>().0)
+        .zip(values.as_chunks::<2>().0)
         .enumerate()
     {
-        let values = update_four_rows_from(neon, *previous, states, key, query, decay, *scales)?;
-        outputs[group * 4..group * 4 + 4].copy_from_slice(&values);
-    }
-    Some(outputs)
-}
-
-fn decay_four_rows_scales(
-    neon: Neon,
-    previous: [&[f32]; 4],
-    key: &[f32],
-    decay: f32,
-    values: [f32; 4],
-    beta: f32,
-) -> Option<[f32; 4]> {
-    let decays = f32x4::splat(neon, decay);
-    let mut s0 = [f32x4::splat(neon, 0.0); 4];
-    let mut s1 = [f32x4::splat(neon, 0.0); 4];
-    let mut s2 = [f32x4::splat(neon, 0.0); 4];
-    let mut s3 = [f32x4::splat(neon, 0.0); 4];
-    for (b, key_block) in key.as_chunks::<16>().0.iter().enumerate() {
-        let k0 = f32x4::from_slice(neon, &key_block[0..4]);
-        let k1 = f32x4::from_slice(neon, &key_block[4..8]);
-        let k2 = f32x4::from_slice(neon, &key_block[8..12]);
-        let k3 = f32x4::from_slice(neon, &key_block[12..16]);
-        let offset = b * 16;
-        for r in 0..4 {
-            let prev_block = &previous[r][offset..offset + 16];
-            let d0 = f32x4::from_slice(neon, &prev_block[0..4]) * decays;
-            let d1 = f32x4::from_slice(neon, &prev_block[4..8]) * decays;
-            let d2 = f32x4::from_slice(neon, &prev_block[8..12]) * decays;
-            let d3 = f32x4::from_slice(neon, &prev_block[12..16]) * decays;
-            s0[r] = d0.mul_add_precise(k0, s0[r]);
-            s1[r] = d1.mul_add_precise(k1, s1[r]);
-            s2[r] = d2.mul_add_precise(k2, s2[r]);
-            s3[r] = d3.mul_add_precise(k3, s3[r]);
-        }
-    }
-    let mut scales = [0.0; 4];
-    for r in 0..4 {
-        let dot_k = ((s0[r] + s2[r]) + (s1[r] + s3[r])).reduce_sum();
-        if !dot_k.is_finite() {
+        let (s0, s1) = state_pair.split_at_mut(1);
+        let mut out_pair = [0.0_f32; 2];
+        if !bonsai_neon_dot::gdn_step_two_rows_pinned_neon(
+            [prev_pair[0], prev_pair[1]],
+            [&mut *s0[0], &mut *s1[0]],
+            key,
+            query,
+            decay,
+            [val_pair[0], val_pair[1]],
+            beta,
+            &mut out_pair,
+        ) {
             return None;
         }
-        scales[r] = (values[r] - dot_k) * beta;
-    }
-    Some(scales)
-}
-
-fn update_four_rows_from(
-    neon: Neon,
-    previous: [&[f32]; 4],
-    states: &mut [&mut [f32]; 4],
-    key: &[f32],
-    query: &[f32],
-    decay: f32,
-    scales: [f32; 4],
-) -> Option<[f32; 4]> {
-    let decays = f32x4::splat(neon, decay);
-    let scales = scales.map(|scale| f32x4::splat(neon, scale));
-    let mut q0 = [f32x4::splat(neon, 0.0); 4];
-    let mut q1 = [f32x4::splat(neon, 0.0); 4];
-    let mut q2 = [f32x4::splat(neon, 0.0); 4];
-    let mut q3 = [f32x4::splat(neon, 0.0); 4];
-    for (b, (key_block, query_block)) in key
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .zip(query.as_chunks::<16>().0)
-        .enumerate()
-    {
-        let k0 = f32x4::from_slice(neon, &key_block[0..4]);
-        let k1 = f32x4::from_slice(neon, &key_block[4..8]);
-        let k2 = f32x4::from_slice(neon, &key_block[8..12]);
-        let k3 = f32x4::from_slice(neon, &key_block[12..16]);
-        let qv0 = f32x4::from_slice(neon, &query_block[0..4]);
-        let qv1 = f32x4::from_slice(neon, &query_block[4..8]);
-        let qv2 = f32x4::from_slice(neon, &query_block[8..12]);
-        let qv3 = f32x4::from_slice(neon, &query_block[12..16]);
-        let offset = b * 16;
-        for r in 0..4 {
-            let prev_block = &previous[r][offset..offset + 16];
-            let state = &mut states[r][offset..offset + 16];
-            let scale = scales[r];
-            let d0 = f32x4::from_slice(neon, &prev_block[0..4]) * decays;
-            let d1 = f32x4::from_slice(neon, &prev_block[4..8]) * decays;
-            let d2 = f32x4::from_slice(neon, &prev_block[8..12]) * decays;
-            let d3 = f32x4::from_slice(neon, &prev_block[12..16]) * decays;
-            let u0 = scale.mul_add_precise(k0, d0);
-            let u1 = scale.mul_add_precise(k1, d1);
-            let u2 = scale.mul_add_precise(k2, d2);
-            let u3 = scale.mul_add_precise(k3, d3);
-            u0.store_slice(&mut state[0..4]);
-            u1.store_slice(&mut state[4..8]);
-            u2.store_slice(&mut state[8..12]);
-            u3.store_slice(&mut state[12..16]);
-            q0[r] = u0.mul_add_precise(qv0, q0[r]);
-            q1[r] = u1.mul_add_precise(qv1, q1[r]);
-            q2[r] = u2.mul_add_precise(qv2, q2[r]);
-            q3[r] = u3.mul_add_precise(qv3, q3[r]);
-        }
-    }
-    let mut outputs = [0.0; 4];
-    for r in 0..4 {
-        // Every updated element contributes to this complete pinned dot. An
-        // infinity or NaN remains nonfinite through its query FMA and the
-        // reduction, including a signed-zero query. A finite output therefore
-        // also proves finite state without a second set of element predicates.
-        // This is private disposable state; rejection replays immutable source.
-        let out = ((q0[r] + q2[r]) + (q1[r] + q3[r])).reduce_sum();
-        if !out.is_finite() {
-            return None;
-        }
-        outputs[r] = out;
+        outputs[pair_idx * 2] = out_pair[0];
+        outputs[pair_idx * 2 + 1] = out_pair[1];
     }
     Some(outputs)
 }
@@ -2471,4 +2364,105 @@ pub(super) fn gdn_wy_update_eight_rows_token_major(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod two_row_provisional_tests {
+    use super::super::ChunkInput;
+    use super::{step_eight_rows_provisional, try_step_head_provisional};
+    use crate::Result;
+
+    #[test]
+    fn provisional_two_row_path_matches_scalar_across_widths_and_replays_errors() -> Result<()> {
+        for width in [16_usize, 32, 64, 128, 256] {
+            let previous: Vec<f32> = (0..8 * width)
+                .map(|i| f32::from(u8::try_from(i % 13).unwrap_or(0)) * 0.125 - 0.5)
+                .collect();
+            let key: Vec<f32> = (0..width)
+                .map(|i| f32::from(u8::try_from((i * 3) % 11).unwrap_or(0)) * 0.0625)
+                .collect();
+            let query: Vec<f32> = (0..width)
+                .map(|i| f32::from(u8::try_from((i * 5) % 9).unwrap_or(0)) * -0.0625)
+                .collect();
+            let values = [0.25_f32, -0.5, 0.75, -1.0, 0.125, -0.375, 0.5, -0.25];
+            let prev_refs: [&[f32]; 8] =
+                std::array::from_fn(|r| &previous[r * width..(r + 1) * width]);
+
+            let mut expected_state = vec![0.0_f32; 8 * width];
+            let exp_refs: [&mut [f32]; 8] = expected_state
+                .chunks_exact_mut(width)
+                .collect::<Vec<_>>()
+                .try_into()
+                .map_err(|_| crate::invalid("bad test state"))?;
+            let exp_vals = super::super::step_eight_rows_from(
+                prev_refs, exp_refs, &key, &query, 0.875, values, 0.625,
+            )?;
+
+            let mut actual_state = vec![f32::NAN; 8 * width];
+            let act_refs: [&mut [f32]; 8] = actual_state
+                .chunks_exact_mut(width)
+                .collect::<Vec<_>>()
+                .try_into()
+                .map_err(|_| crate::invalid("bad test state"))?;
+            let act_vals = step_eight_rows_provisional(
+                prev_refs, act_refs, &key, &query, 0.875, values, 0.625,
+            )?;
+            assert_eq!(act_vals.map(f32::to_bits), exp_vals.map(f32::to_bits));
+            assert_eq!(
+                actual_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected_state
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+
+            let mut head_state = vec![f32::NAN; 8 * width];
+            let mut head_out = [0.0_f32; 8];
+            let input = ChunkInput {
+                key: &key,
+                query: &query,
+                value: &values,
+                decay: 0.875,
+                beta: 0.625,
+            };
+            if let Some(res) =
+                try_step_head_provisional(&previous, &mut head_state, input, 0.125, &mut head_out)
+            {
+                res?;
+                for r in 0..8 {
+                    assert_eq!(head_out[r].to_bits(), (exp_vals[r] * 0.125).to_bits());
+                }
+                assert_eq!(
+                    head_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected_state
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+
+            // Defensive replay must preserve exact error precedence on non-finite row 5.
+            let mut bad_vals = values;
+            bad_vals[5] = f32::NAN;
+            let mut replay_state = vec![f32::NAN; 8 * width];
+            let mut replay_out = [0.0_f32; 8];
+            let bad_input = ChunkInput {
+                key: &key,
+                query: &query,
+                value: &bad_vals,
+                decay: 0.875,
+                beta: 0.625,
+            };
+            let res = try_step_head_provisional(
+                &previous,
+                &mut replay_state,
+                bad_input,
+                0.125,
+                &mut replay_out,
+            )
+            .ok_or_else(|| crate::invalid("expected provisional path"))?;
+            assert!(res.is_err());
+        }
+        Ok(())
+    }
 }

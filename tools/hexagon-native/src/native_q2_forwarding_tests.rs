@@ -41,6 +41,10 @@ impl NativeQ2Submitter for RecordingSubmitter {
         self.registry.remaining_bytes()
     }
 
+    fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+        self.registry.can_reserve_chunks(chunk_byte_sizes)
+    }
+
     fn supports_in_place_weight_preparation(&self) -> bool {
         !self.fail
     }

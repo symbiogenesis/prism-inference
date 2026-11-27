@@ -802,6 +802,10 @@ macro_rules! impl_native_q2_session_forwarding {
                 $dispatch!(self, residency_capacity_bytes())
             }
 
+            fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+                $dispatch!(self, can_reserve_chunks(chunk_byte_sizes))
+            }
+
             fn supports_in_place_weight_preparation(&self) -> bool {
                 $dispatch!(self, supports_in_place_weight_preparation())
             }

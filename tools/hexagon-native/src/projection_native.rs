@@ -2446,6 +2446,15 @@ impl<P: ProgressSink> NativeQ2Submitter for Session<'_, P> {
         }
     }
 
+    fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+        if self.failed || !self.mode.is_native_q2() {
+            false
+        } else {
+            self.native_resident_weights
+                .can_reserve_chunks(chunk_byte_sizes)
+        }
+    }
+
     fn prepare_weights(
         &mut self,
         columns: usize,
@@ -2726,6 +2735,95 @@ pub(crate) struct NativeQ2Session {
     failed: bool,
 }
 
+struct NativeQ2OpenRollback {
+    handle: u64,
+    domain: i32,
+    calls: Option<super::Calls>,
+    primary: Option<(*mut c_void, i32, usize)>,
+    extra_arenas: [ExtraWeightArena; MAX_EXTRA_WEIGHT_ARENAS],
+    extra_arena_count: usize,
+    queue: *mut c_void,
+    cdsp_started: bool,
+}
+
+impl NativeQ2OpenRollback {
+    const fn new(handle: u64, domain: i32, calls: super::Calls) -> Self {
+        Self {
+            handle,
+            domain,
+            calls: Some(calls),
+            primary: None,
+            extra_arenas: [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS],
+            extra_arena_count: 0,
+            queue: null_mut(),
+            cdsp_started: false,
+        }
+    }
+
+    fn disarm(
+        mut self,
+    ) -> Result<(super::Calls, [ExtraWeightArena; MAX_EXTRA_WEIGHT_ARENAS], usize), Error> {
+        let calls = self.calls.take().ok_or(Error::Contract)?;
+        Ok((calls, self.extra_arenas, self.extra_arena_count))
+    }
+}
+
+impl Drop for NativeQ2OpenRollback {
+    fn drop(&mut self) {
+        let Some(calls) = self.calls.take() else {
+            return;
+        };
+        if self.cdsp_started {
+            // SAFETY: Rollback after CDSP start; stop remote thread before closing queue or unmapping.
+            let stop = unsafe { (calls.invoke)(self.handle, compute::STOP_SCALARS, null_mut()) };
+            if stop != 0 {
+                return;
+            }
+        }
+        if !self.queue.is_null() {
+            // SAFETY: Queue was created on `self.domain` and CDSP thread is stopped or never started.
+            let qclose = unsafe { (calls.queue_close)(self.queue) };
+            if qclose != 0 {
+                return;
+            }
+        }
+        for idx in (0..self.extra_arena_count).rev() {
+            let arena = self.extra_arenas[idx];
+            // SAFETY: Secondary arena was mapped in `self.domain` and queue is closed or never created.
+            let unmap = unsafe {
+                (calls.unmap)(self.domain, arena.fd, arena.memory, arena.allocation_bytes)
+            };
+            if unmap != 0 {
+                return;
+            }
+        }
+        if let Some((memory, fd, allocation_bytes)) = self.primary {
+            // SAFETY: Primary arena was mapped in `self.domain` and queue is closed or never created.
+            let unmap = unsafe { (calls.unmap)(self.domain, fd, memory, allocation_bytes) };
+            if unmap != 0 {
+                return;
+            }
+        }
+        // SAFETY: Queue is closed and all mapped extents in `self.domain` are unmapped.
+        let close = unsafe { (calls.close)(self.handle) };
+        if close != 0 {
+            return;
+        }
+        for idx in (0..self.extra_arena_count).rev() {
+            // SAFETY: Module closed and all domain mappings unmapped; no consumer remains.
+            unsafe {
+                (calls.free)(self.extra_arenas[idx].memory);
+            }
+        }
+        if let Some((memory, _, _)) = self.primary {
+            // SAFETY: Module closed and all domain mappings unmapped; no consumer remains.
+            unsafe {
+                (calls.free)(memory);
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "Keep module open, FastRPC mapping, queue startup and session construction auditable together"
@@ -2757,9 +2855,22 @@ pub(super) fn open_native_q2(
     )?;
     report.queue = queue_report;
     let (handle, domain, calls, arch_profile) = opened.ok_or(Error::Contract)?;
+    let mut rollback = NativeQ2OpenRollback::new(handle, domain, calls);
+    let Some(calls_ref) = rollback.calls.as_ref() else {
+        return Err(Error::Contract);
+    };
+    let alloc_fn = calls_ref.alloc;
+    let free_fn = calls_ref.free;
+    let to_fd_fn = calls_ref.to_fd;
+    let map_fn = calls_ref.map;
+    let queue_create_fn = calls_ref.queue_create;
+    let queue_export_fn = calls_ref.queue_export;
+    let invoke_fn = calls_ref.invoke;
+
     if !limits.common.persistent && Instant::now() >= work_deadline {
         return Err(Error::Contract);
     }
+    let resident_weights = HmxQ2WeightRegistry::new(0)?;
     let (arena_allocations, arena_count) = native_q2::arena_allocation_bytes(
         limits.columns,
         limits.common.rows,
@@ -2774,12 +2885,12 @@ pub(super) fn open_native_q2(
     let allocator_request = i32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
     let descriptor_size = u32::try_from(allocation_bytes).map_err(|_| Error::Contract)?;
     // SAFETY: one explicitly bounded cached system-heap allocation, under i32 limits.
-    let memory = unsafe { (calls.alloc)(25, 1, allocator_request) };
+    let memory = unsafe { alloc_fn(25, 1, allocator_request) };
     if memory.is_null() || !memory.addr().is_multiple_of(4096) {
         if !memory.is_null() {
-            // SAFETY: unaligned pointer came directly from calls.alloc above and is unmapped.
+            // SAFETY: unaligned pointer came directly from alloc_fn above and is unmapped.
             unsafe {
-                (calls.free)(memory);
+                free_fn(memory);
             }
         }
         return Err(Error::Contract);
@@ -2789,39 +2900,38 @@ pub(super) fn open_native_q2(
         std::ptr::write_bytes(memory.cast::<u8>(), 0, allocation_bytes);
     }
     // SAFETY: only this driver's fresh allocator-owned pointer is passed back.
-    let fd = unsafe { (calls.to_fd)(memory) };
+    let fd = unsafe { to_fd_fn(memory) };
     let Ok(fd_u32) = u32::try_from(fd) else {
         // SAFETY: primary pointer failed FD conversion before mapping.
         unsafe {
-            (calls.free)(memory);
+            free_fn(memory);
         }
         return Err(Error::Contract);
     };
     // SAFETY: exact aligned pointer/FD/length and original validated effective domain.
-    let result = unsafe { (calls.map)(domain, fd, memory, 0, allocation_bytes, 2) };
+    let result = unsafe { map_fn(domain, fd, memory, 0, allocation_bytes, 2) };
     report.queue.mapping_result = Some(result);
     if result != 0 {
         // SAFETY: primary pointer failed DSP mapping before session ownership.
         unsafe {
-            (calls.free)(memory);
+            free_fn(memory);
         }
         return Err(Error::Contract);
     }
-    let mut extra_arenas = [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS];
+    rollback.primary = Some((memory, fd, allocation_bytes));
     let mut mapped_capacities = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
     mapped_capacities[0] = arena_capacities[0];
     let mut total_mapped_bytes = allocation_bytes;
-    let mut actual_extra_count = 0_usize;
     let allow_partial = limits.allows_partial_secondary_arenas();
     for (extra_idx, &extra_bytes) in arena_allocations[1..arena_count].iter().enumerate() {
         let extra_req = i32::try_from(extra_bytes).map_err(|_| Error::Contract)?;
         // SAFETY: each secondary weight arena is bounded by 480 MiB (< i32::MAX).
-        let extra_mem = unsafe { (calls.alloc)(25, 1, extra_req) };
+        let extra_mem = unsafe { alloc_fn(25, 1, extra_req) };
         if extra_mem.is_null() || !extra_mem.addr().is_multiple_of(4096) {
             if !extra_mem.is_null() {
                 // SAFETY: unaligned secondary pointer is unmapped and not retained.
                 unsafe {
-                    (calls.free)(extra_mem);
+                    free_fn(extra_mem);
                 }
             }
             if allow_partial {
@@ -2834,11 +2944,11 @@ pub(super) fn open_native_q2(
             std::ptr::write_bytes(extra_mem.cast::<u8>(), 0, extra_bytes);
         }
         // SAFETY: only this driver's fresh allocator-owned pointer is passed back.
-        let extra_fd = unsafe { (calls.to_fd)(extra_mem) };
+        let extra_fd = unsafe { to_fd_fn(extra_mem) };
         let Ok(extra_fd_u32) = u32::try_from(extra_fd) else {
             // SAFETY: fresh secondary pointer failed FD conversion before mapping.
             unsafe {
-                (calls.free)(extra_mem);
+                free_fn(extra_mem);
             }
             if allow_partial {
                 break;
@@ -2846,18 +2956,18 @@ pub(super) fn open_native_q2(
             return Err(Error::Contract);
         };
         // SAFETY: exact aligned pointer/FD/length for each secondary weight arena.
-        let map_status = unsafe { (calls.map)(domain, extra_fd, extra_mem, 0, extra_bytes, 2) };
+        let map_status = unsafe { map_fn(domain, extra_fd, extra_mem, 0, extra_bytes, 2) };
         if map_status != 0 {
             // SAFETY: fresh secondary pointer failed DSP mapping and is not retained.
             unsafe {
-                (calls.free)(extra_mem);
+                free_fn(extra_mem);
             }
             if allow_partial {
                 break;
             }
             return Err(Error::Contract);
         }
-        extra_arenas[extra_idx] = ExtraWeightArena {
+        rollback.extra_arenas[extra_idx] = ExtraWeightArena {
             memory: extra_mem,
             fd: extra_fd,
             fd_u32: extra_fd_u32,
@@ -2867,14 +2977,19 @@ pub(super) fn open_native_q2(
         };
         mapped_capacities[1 + extra_idx] = arena_capacities[1 + extra_idx];
         total_mapped_bytes += extra_bytes;
-        actual_extra_count = extra_idx + 1;
+        rollback.extra_arena_count = extra_idx + 1;
     }
     report.queue.allocation_succeeded = true;
     report.mapped_allocation_bytes = total_mapped_bytes;
+    let native_resident_weights = NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+        mapped_capacities,
+        1 + rollback.extra_arena_count,
+        arch_profile,
+    )?;
     let mut queue = null_mut();
     // SAFETY: fixed bounded queues, no callbacks/context; exact checked public ABI.
     let result = unsafe {
-        (calls.queue_create)(
+        queue_create_fn(
             domain,
             0,
             4096,
@@ -2889,9 +3004,10 @@ pub(super) fn open_native_q2(
     if result != 0 || queue.is_null() {
         return Err(Error::Contract);
     }
+    rollback.queue = queue;
     let mut queue_id = u64::MAX;
     // SAFETY: one live driver-owned queue and poisoned writable u64 export ID.
-    let result = unsafe { (calls.queue_export)(queue, &raw mut queue_id) };
+    let result = unsafe { queue_export_fn(queue, &raw mut queue_id) };
     report.queue.queue_export_result = Some(result);
     if result != 0 || queue_id == u64::MAX {
         return Err(Error::Contract);
@@ -2902,11 +3018,12 @@ pub(super) fn open_native_q2(
         bytes: start.len(),
     };
     // SAFETY: same independently checked 48-byte seven-argument start frame.
-    let result = unsafe { (calls.invoke)(handle, compute::START_SCALARS, &raw mut argument) };
+    let result = unsafe { invoke_fn(handle, compute::START_SCALARS, &raw mut argument) };
     report.queue.queue_start_result = Some(result);
     if result != 0 {
         return Err(Error::Contract);
     }
+    rollback.cdsp_started = true;
     let expected = QueueBuffer {
         fd: fd_u32,
         size: descriptor_size,
@@ -2914,6 +3031,7 @@ pub(super) fn open_native_q2(
         flags: 0x90,
         pointer: memory,
     };
+    let (calls, extra_arenas, extra_arena_count) = rollback.disarm()?;
     Ok(NativeQ2Session {
         handle,
         domain,
@@ -2921,24 +3039,33 @@ pub(super) fn open_native_q2(
         fd,
         allocation_bytes,
         extra_arenas,
-        extra_arena_count: actual_extra_count,
+        extra_arena_count,
         queue,
         memory,
         expected,
         limits: limits.common,
         columns: limits.columns,
         arch_profile,
-        resident_weights: HmxQ2WeightRegistry::new(0)?,
-        native_resident_weights: NativeQ2WeightRegistry::from_arena_capacities_for_profile(
-            mapped_capacities,
-            1 + actual_extra_count,
-            arch_profile,
-        )?,
+        resident_weights,
+        native_resident_weights,
         dirty_resident_weights: false,
         work_deadline,
         report,
         failed: false,
     })
+}
+
+struct SessionUnwindLatch<'a> {
+    failed: &'a mut bool,
+    disarmed: bool,
+}
+
+impl Drop for SessionUnwindLatch<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            *self.failed = true;
+        }
+    }
 }
 
 impl NativeQ2Session {
@@ -2949,6 +3076,10 @@ impl NativeQ2Session {
             map: self.calls.map,
             unmap: self.calls.unmap,
         });
+        let mut unwind_latch = SessionUnwindLatch {
+            failed: &mut self.failed,
+            disarmed: false,
+        };
         let mut session = Session {
             report: &mut self.report,
             queue_write: &self.calls.queue_write,
@@ -2969,13 +3100,14 @@ impl NativeQ2Session {
             dirty_resident_weights: self.dirty_resident_weights,
             work_deadline: self.work_deadline,
             progress: &mut progress,
-            failed: self.failed,
+            failed: *unwind_latch.failed,
         };
         let out = f(&mut session);
         self.extra_arenas = session.extra_arenas;
         self.native_resident_weights = session.native_resident_weights;
         self.dirty_resident_weights = session.dirty_resident_weights;
-        self.failed = session.failed;
+        *unwind_latch.failed = session.failed;
+        unwind_latch.disarmed = true;
         out
     }
 }
@@ -3004,6 +3136,15 @@ impl NativeQ2Submitter for NativeQ2Session {
             0
         } else {
             self.native_resident_weights.remaining_bytes()
+        }
+    }
+
+    fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+        if self.failed {
+            false
+        } else {
+            self.native_resident_weights
+                .can_reserve_chunks(chunk_byte_sizes)
         }
     }
 
@@ -5384,6 +5525,163 @@ mod tests {
             assert!(session.failed);
             assert!(!NativeQ2Submitter::supports_ffn_chain_lora(&session));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn session_unwind_latch_marks_failed_on_panic_and_preserves_false_when_disarmed() {
+        let mut failed_ok = false;
+        {
+            let mut latch = SessionUnwindLatch {
+                failed: &mut failed_ok,
+                disarmed: false,
+            };
+            latch.disarmed = true;
+        }
+        assert!(!failed_ok);
+
+        let mut failed_unwind = false;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _latch = SessionUnwindLatch {
+                failed: &mut failed_unwind,
+                disarmed: false,
+            };
+            let trigger = std::hint::black_box(true);
+            assert!(!trigger, "simulated callback unwind");
+        }));
+        assert!(caught.is_err());
+        assert!(failed_unwind);
+    }
+
+    static ROLLBACK_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    fn push_rollback_event(event: &'static str) {
+        if let Ok(mut log) = ROLLBACK_LOG.lock() {
+            log.push(event);
+        }
+    }
+
+    unsafe extern "C" fn rollback_mock_open(_: *const std::ffi::c_char, _: *mut u64) -> i32 {
+        0
+    }
+    unsafe extern "C" fn rollback_mock_close(_: u64) -> i32 {
+        push_rollback_event("close");
+        0
+    }
+    unsafe extern "C" fn rollback_mock_invoke(_: u64, _: u32, _: *mut RemoteBuffer) -> i32 {
+        push_rollback_event("stop");
+        0
+    }
+    unsafe extern "C" fn rollback_mock_alloc(_: i32, _: u32, _: i32) -> *mut c_void {
+        null_mut()
+    }
+    unsafe extern "C" fn rollback_mock_free(ptr: *mut c_void) {
+        match ptr.addr() {
+            0x1000 => push_rollback_event("free-primary"),
+            0x2000 => push_rollback_event("free-extra0"),
+            0x3000 => push_rollback_event("free-extra1"),
+            _ => {}
+        }
+    }
+    unsafe extern "C" fn rollback_mock_to_fd(_: *mut c_void) -> i32 {
+        0
+    }
+    unsafe extern "C" fn rollback_mock_map(
+        _: i32,
+        _: i32,
+        _: *mut c_void,
+        _: i32,
+        _: usize,
+        _: i32,
+    ) -> i32 {
+        0
+    }
+    unsafe extern "C" fn rollback_mock_unmap(_: i32, _: i32, ptr: *mut c_void, _: usize) -> i32 {
+        match ptr.addr() {
+            0x1000 => push_rollback_event("unmap-primary"),
+            0x2000 => push_rollback_event("unmap-extra0"),
+            0x3000 => push_rollback_event("unmap-extra1"),
+            _ => {}
+        }
+        0
+    }
+    unsafe extern "C" fn rollback_mock_qcreate(
+        _: i32,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: super::super::Callback,
+        _: super::super::Callback,
+        _: *mut c_void,
+        _: *mut *mut c_void,
+    ) -> i32 {
+        0
+    }
+    unsafe extern "C" fn rollback_mock_qexport(_: *mut c_void, _: *mut u64) -> i32 {
+        0
+    }
+    unsafe extern "C" fn rollback_mock_qclose(_: *mut c_void) -> i32 {
+        push_rollback_event("qclose");
+        0
+    }
+
+    #[test]
+    fn open_rollback_guard_unwinds_acquired_resources_in_reverse_order() -> Result<(), Error> {
+        let _serial = SERIAL.lock().map_err(|_| Error::Contract)?;
+        ROLLBACK_LOG.lock().map_err(|_| Error::Contract)?.clear();
+        let calls = super::super::Calls {
+            open: rollback_mock_open,
+            close: rollback_mock_close,
+            invoke: rollback_mock_invoke,
+            alloc: rollback_mock_alloc,
+            free: rollback_mock_free,
+            to_fd: rollback_mock_to_fd,
+            map: rollback_mock_map,
+            unmap: rollback_mock_unmap,
+            queue_create: rollback_mock_qcreate,
+            queue_export: rollback_mock_qexport,
+            queue_close: rollback_mock_qclose,
+            queue_write: WriteCall::Nonblocking(write),
+            queue_read: read,
+        };
+        {
+            let mut guard = NativeQ2OpenRollback::new(42, 3, calls);
+            guard.primary = Some((std::ptr::without_provenance_mut(0x1000), 10, 4096));
+            guard.extra_arenas[0] = ExtraWeightArena {
+                memory: std::ptr::without_provenance_mut(0x2000),
+                fd: 11,
+                fd_u32: 11,
+                allocation_bytes: 4096,
+                dirty: false,
+                dsp_mapped: false,
+            };
+            guard.extra_arenas[1] = ExtraWeightArena {
+                memory: std::ptr::without_provenance_mut(0x3000),
+                fd: 12,
+                fd_u32: 12,
+                allocation_bytes: 4096,
+                dirty: false,
+                dsp_mapped: false,
+            };
+            guard.extra_arena_count = 2;
+            guard.queue = std::ptr::without_provenance_mut(0x4000);
+            guard.cdsp_started = true;
+        }
+        let observed = ROLLBACK_LOG.lock().map_err(|_| Error::Contract)?.clone();
+        assert_eq!(
+            observed,
+            vec![
+                "stop",
+                "qclose",
+                "unmap-extra1",
+                "unmap-extra0",
+                "unmap-primary",
+                "close",
+                "free-extra1",
+                "free-extra0",
+                "free-primary",
+            ]
+        );
         Ok(())
     }
 }

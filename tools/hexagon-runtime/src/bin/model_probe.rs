@@ -1106,6 +1106,14 @@ impl NativeQ2Submitter for TimedNativeQ2Submitter<'_> {
         }
     }
 
+    fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+        if self.failed || !self.resident_only {
+            false
+        } else {
+            self.native.can_reserve_chunks(chunk_byte_sizes)
+        }
+    }
+
     fn prepare_weights(
         &mut self,
         columns: usize,

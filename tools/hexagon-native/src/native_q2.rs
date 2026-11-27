@@ -392,6 +392,33 @@ impl NativeQ2WeightRegistry {
         remaining
     }
 
+    /// Returns `true` iff every chunk in `chunk_byte_sizes` (in reservation order)
+    /// fits across the remaining arenas with 128-byte alignment padding.
+    #[must_use]
+    pub fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+        let mut arena_idx = self.active_arena;
+        let mut used = self.used;
+        for &weight_bytes in chunk_byte_sizes {
+            let mut placed = false;
+            while arena_idx < self.arena_count {
+                let start = used[arena_idx].next_multiple_of(128);
+                let Some(end) = start.checked_add(weight_bytes) else {
+                    return false;
+                };
+                if end <= self.capacities[arena_idx] {
+                    used[arena_idx] = end;
+                    placed = true;
+                    break;
+                }
+                arena_idx += 1;
+            }
+            if !placed {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Validate and reserve one immutable, 128-byte-aligned packed-weight extent.
     ///
     /// # Errors
@@ -493,6 +520,16 @@ pub trait NativeQ2Submitter {
     /// Remaining optional immutable host-mapped weight capacity, including padding.
     fn residency_capacity_bytes(&self) -> usize {
         0
+    }
+
+    /// Whether every chunk in `chunk_byte_sizes` (in reservation order) fits across
+    /// the remaining resident weight arenas including alignment padding.
+    fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+        chunk_byte_sizes
+            .iter()
+            .copied()
+            .try_fold(0_usize, usize::checked_add)
+            .is_some_and(|total| total <= self.residency_capacity_bytes())
     }
 
     /// Copy immutable tiled `Q2_0` weights into an optional session-owned arena once.
@@ -897,6 +934,10 @@ impl<S: NativeQ2Submitter + ?Sized> NativeQ2Submitter for &mut S {
 
     fn residency_capacity_bytes(&self) -> usize {
         (**self).residency_capacity_bytes()
+    }
+
+    fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+        (**self).can_reserve_chunks(chunk_byte_sizes)
     }
 
     fn prepare_weights(
@@ -4686,6 +4727,32 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_registry_can_reserve_chunks_checks_per_arena_fit_across_boundaries() -> Result<(), Error> {
+        let mut caps = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+        caps[0] = 2048;
+        caps[1] = 2048;
+        let mut reg = NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+            caps,
+            2,
+            crate::HtpArchProfile::v81(),
+        )?;
+        // Total remaining is 4096, and 1536 + 1536 = 3072 <= 4096,
+        // so chunk 0 fits in arena 0 and chunk 1 fits in arena 1.
+        assert!(reg.can_reserve_chunks(&[1536, 1536]));
+        // 1536 + 1536 + 1024 = 4096, but chunk 1 leaves only 512 in arena 1 so chunk 2 cannot fit.
+        assert!(!reg.can_reserve_chunks(&[1536, 1536, 1024]));
+        // Alignment padding can push a chunk past an arena boundary: 1280 + 1152 = 2432 > 2048,
+        // leaving 768 unused in arena 0 and putting chunk 1 in arena 1 (leaving 896 in arena 1).
+        assert!(reg.can_reserve_chunks(&[1280, 1152]));
+        assert!(!reg.can_reserve_chunks(&[1280, 1152, 1024]));
+        // Verify reservation matches simulation.
+        assert!(reg.prepare_validated(128, 32, 1280)?.is_some());
+        assert!(reg.prepare_validated(128, 32, 1152)?.is_some());
+        assert!(reg.prepare_validated(128, 32, 1024)?.is_none());
         Ok(())
     }
 }

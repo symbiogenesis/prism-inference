@@ -622,13 +622,39 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             })
     }
 
+    fn resident_chunk_byte_sizes(
+        &self,
+        columns: usize,
+        rows: usize,
+        operations: usize,
+    ) -> Result<Vec<usize>> {
+        let mut chunk_sizes = Vec::new();
+        chunk_sizes
+            .try_reserve_exact(operations)
+            .map_err(|_| invalid("native Q2 resident chunk scratch allocation failed"))?;
+        for row_start in (0..rows).step_by(self.maximum_rows) {
+            let active_rows = (rows - row_start).min(self.maximum_rows);
+            let mapped_rows = active_rows.next_multiple_of(32);
+            for col_start in (0..columns).step_by(self.maximum_columns) {
+                let active_cols = (columns - col_start).min(self.maximum_columns);
+                let chunk_blocks = active_cols / 128;
+                let chunk_bytes = mapped_rows
+                    .checked_mul(36)
+                    .and_then(|bytes| bytes.checked_mul(chunk_blocks))
+                    .ok_or_else(|| invalid("native Q2 resident chunk extent overflow"))?;
+                chunk_sizes.push(chunk_bytes);
+            }
+        }
+        Ok(chunk_sizes)
+    }
+
     fn prepare_resident(
         &mut self,
         tensor: &Tensor,
         weights: &mut Vec<u8>,
         evaluated: bool,
     ) -> Result<Option<usize>> {
-        let Some(cache) = &mut self.residency else {
+        let Some(cache) = &self.residency else {
             return Ok(None);
         };
         if let Some(index) = cache.find(tensor) {
@@ -646,11 +672,16 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
             .checked_mul(36)
             .and_then(|bytes| bytes.checked_mul(total_blocks))
             .ok_or_else(|| invalid("native Q2 resident packed extent overflow"))?;
+        let chunk_sizes = self.resident_chunk_byte_sizes(columns, rows, operations)?;
         if !cache.has_metadata_capacity(operations)
             || packed_bytes > self.submitter.residency_capacity_bytes()
+            || !self.submitter.can_reserve_chunks(&chunk_sizes)
         {
             return Ok(None);
         }
+        let Some(cache) = &mut self.residency else {
+            return Ok(None);
+        };
         let first_handle = cache.handles.len();
         for row_start in (0..rows).step_by(self.maximum_rows) {
             let active_rows = (rows - row_start).min(self.maximum_rows);
@@ -1075,6 +1106,7 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
         let mut uncached_ops = 0_usize;
         let mut rows_per_member = [0_usize; 3];
         let mut cached_indices = [None; 3];
+        let mut uncached_sizes = [0_usize; 3];
         for (member, &tensor) in tensors.iter().enumerate() {
             if !self.supports_f32(tensor) {
                 return None;
@@ -1093,12 +1125,16 @@ impl<S: NativeQ2Submitter> NativeQ2Executor<S> {
                     .checked_mul(36)
                     .and_then(|b| b.checked_mul(columns / 128))?;
                 uncached_packed_bytes = uncached_packed_bytes.checked_add(packed)?;
+                uncached_sizes[uncached_ops] = packed;
                 uncached_ops += 1;
             }
         }
         if uncached_ops > 0
             && (!cache.has_metadata_capacity(uncached_ops)
-                || uncached_packed_bytes > self.submitter.residency_capacity_bytes())
+                || uncached_packed_bytes > self.submitter.residency_capacity_bytes()
+                || !self
+                    .submitter
+                    .can_reserve_chunks(&uncached_sizes[..uncached_ops]))
         {
             return None;
         }
@@ -4675,6 +4711,10 @@ mod tests {
             self.registry.remaining_bytes()
         }
 
+        fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+            self.registry.can_reserve_chunks(chunk_byte_sizes)
+        }
+
         fn supports_in_place_weight_preparation(&self) -> bool {
             self.direct
         }
@@ -4748,6 +4788,42 @@ mod tests {
             kind: 142,
             data: Arc::<[u8]>::from(vec![0x55; columns / 128 * rows * 34]).into(),
         }
+    }
+
+    #[test]
+    fn native_q2_prepare_resident_checks_chunk_fit_across_multi_arena_boundary() -> Result<()> {
+        let mut caps = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
+        caps[0] = 2048;
+        caps[1] = 2048;
+        let registry =
+            hexagon_native_rpc::NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+                caps,
+                2,
+                HtpArchProfile::v81(),
+            )
+            .map_err(|_| invalid("registry"))?;
+        let submitter = ArenaSubmitter {
+            registry,
+            memory: vec![0xa5; 4096],
+            direct: false,
+            copies: 0,
+            initializations: 0,
+        };
+        let limits = NativeQ2ProjectionLimits::new(128, 32, 100, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?;
+        let mut executor =
+            NativeQ2Executor::new(submitter, limits, 1024 * 1024).with_resident_weights(4096)?;
+        // Remaining bytes = 4096 >= 3456 (3 * 1152), yet each 2048 B arena fits only 1 chunk of
+        // 1152 B so 3 chunks cannot fit across 2 arenas. Must return Ok(false) cleanly without
+        // mutating the arena or faulting the executor.
+        let tensor = lazy_tensor("blk.0.boundary.weight", 384, 32);
+        let mut scratch = Vec::new();
+        let res = executor.prewarm_tensor_with_scratch(&tensor, &mut scratch)?;
+        assert!(!res);
+        assert!(!executor.is_faulted());
+        assert_eq!(executor.submitter.copies, 0);
+        assert_eq!(executor.submitter.registry.used_bytes(), 0);
+        Ok(())
     }
 
     #[test]
@@ -5642,6 +5718,10 @@ mod tests {
     impl NativeQ2Submitter for UnrelatedOutputEvidence {
         fn residency_capacity_bytes(&self) -> usize {
             self.inner.residency_capacity_bytes()
+        }
+
+        fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+            self.inner.can_reserve_chunks(chunk_byte_sizes)
         }
 
         fn prepare_weights(
@@ -6974,6 +7054,10 @@ mod tests {
             self.inner.residency_capacity_bytes()
         }
 
+        fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+            self.inner.can_reserve_chunks(chunk_byte_sizes)
+        }
+
         fn supports_in_place_weight_preparation(&self) -> bool {
             self.inner.supports_in_place_weight_preparation()
         }
@@ -7217,6 +7301,10 @@ mod tests {
     impl NativeQ2Submitter for TamperingArenaSubmitter {
         fn residency_capacity_bytes(&self) -> usize {
             self.inner.residency_capacity_bytes()
+        }
+
+        fn can_reserve_chunks(&self, chunk_byte_sizes: &[usize]) -> bool {
+            self.inner.can_reserve_chunks(chunk_byte_sizes)
         }
 
         fn supports_in_place_weight_preparation(&self) -> bool {

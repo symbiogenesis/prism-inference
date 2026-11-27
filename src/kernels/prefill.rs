@@ -14,9 +14,9 @@
 use std::sync::Arc;
 
 use super::{
-    ActivationContract, BF16, F32, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0, Q5_1,
-    Q8_0, RowParallelism, bf16_dot, dimensions, dot_additional, dot_legacy, finite, integer_float,
-    kquants, matvec_into, scale,
+    ActivationContract, BF16, F16, F32, MatvecBackend, MatvecScratch, PQ2, PTQ1, Q4_0, Q4_1, Q5_0,
+    Q5_1, Q8_0, RowParallelism, bf16_dot, dimensions, dot_additional, dot_legacy,
+    f16_f64_dot_scalar, f16_pinned_dot_scalar, finite, integer_float, kquants, matvec_into, scale,
 };
 use crate::{Result, invalid, model::Tensor};
 
@@ -31,6 +31,7 @@ const fn supports_tiled_rows(kind: u32) -> bool {
         kind,
         PQ2 | PTQ1
             | F32
+            | F16
             | BF16
             | Q4_0
             | Q4_1
@@ -661,6 +662,122 @@ impl ProjectionTile {
                     dot_eight,
                     dot_four,
                     dot_bf16_one,
+                );
+            }
+            if tensor.kind == F16 {
+                let backend = self.backend;
+                let preparations = &self.preparations[..inputs.len()];
+                let use_pinned = pinned && columns.is_multiple_of(16);
+                let mut act_refs: [&[f32]; MAX_TILE_TOKENS] = [&[]; MAX_TILE_TOKENS];
+                for (slot, scratch) in act_refs.iter_mut().zip(preparations) {
+                    *slot = &scratch.activations;
+                }
+                let active_acts = &act_refs[..preparations.len()];
+                let mut unused_blocks = 0_u64;
+                let dot_f16_one_scalar = |row: &[u8]| -> Result<[f32; MAX_TILE_TOKENS]> {
+                    let mut sums = [0.0_f32; MAX_TILE_TOKENS];
+                    for (sum, &acts) in sums.iter_mut().zip(active_acts) {
+                        *sum = if use_pinned {
+                            f16_pinned_dot_scalar(row, acts)?
+                        } else {
+                            f16_f64_dot_scalar(row, acts)?
+                        };
+                    }
+                    Ok(sums)
+                };
+                let dot_f16_one = |row: &[u8], _: &mut u64| -> Result<[f32; MAX_TILE_TOKENS]> {
+                    #[cfg(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    ))]
+                    if backend != MatvecBackend::Scalar {
+                        let mut sums = [0.0_f32; MAX_TILE_TOKENS];
+                        let ok = if use_pinned {
+                            bonsai_neon_dot::dot_f16_tile_row_pinned(row, active_acts, &mut sums)
+                        } else {
+                            bonsai_neon_dot::dot_f16_tile_row(row, active_acts, &mut sums)
+                        };
+                        return ok
+                            .map(|()| sums)
+                            .ok_or_else(|| invalid("nonfinite tensor or activation value"));
+                    }
+                    let _ = backend;
+                    dot_f16_one_scalar(row)
+                };
+                let dot_eight = |rows8: [&[u8]; 8],
+                                 _: &mut u64|
+                 -> Result<[[f32; MAX_TILE_TOKENS]; 8]> {
+                    #[cfg(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    ))]
+                    if backend != MatvecBackend::Scalar {
+                        let mut sums = [[0.0_f32; MAX_TILE_TOKENS]; 8];
+                        let ok = if use_pinned {
+                            bonsai_neon_dot::dot_f16_tile_rows_pinned(rows8, active_acts, &mut sums)
+                        } else {
+                            bonsai_neon_dot::dot_f16_tile_rows(rows8, active_acts, &mut sums)
+                        };
+                        return ok
+                            .map(|()| sums)
+                            .ok_or_else(|| invalid("nonfinite tensor or activation value"));
+                    }
+                    let _ = backend;
+                    Ok([
+                        dot_f16_one_scalar(rows8[0])?,
+                        dot_f16_one_scalar(rows8[1])?,
+                        dot_f16_one_scalar(rows8[2])?,
+                        dot_f16_one_scalar(rows8[3])?,
+                        dot_f16_one_scalar(rows8[4])?,
+                        dot_f16_one_scalar(rows8[5])?,
+                        dot_f16_one_scalar(rows8[6])?,
+                        dot_f16_one_scalar(rows8[7])?,
+                    ])
+                };
+                let dot_four = |rows4: [&[u8]; 4],
+                                _: &mut u64|
+                 -> Result<[[f32; MAX_TILE_TOKENS]; 4]> {
+                    #[cfg(all(
+                        feature = "experimental-neon",
+                        target_arch = "aarch64",
+                        target_os = "windows",
+                        target_env = "msvc",
+                        target_feature = "neon"
+                    ))]
+                    if backend != MatvecBackend::Scalar {
+                        let mut sums = [[0.0_f32; MAX_TILE_TOKENS]; 4];
+                        let ok = if use_pinned {
+                            bonsai_neon_dot::dot_f16_tile_rows_pinned(rows4, active_acts, &mut sums)
+                        } else {
+                            bonsai_neon_dot::dot_f16_tile_rows(rows4, active_acts, &mut sums)
+                        };
+                        return ok
+                            .map(|()| sums)
+                            .ok_or_else(|| invalid("nonfinite tensor or activation value"));
+                    }
+                    let _ = backend;
+                    Ok([
+                        dot_f16_one_scalar(rows4[0])?,
+                        dot_f16_one_scalar(rows4[1])?,
+                        dot_f16_one_scalar(rows4[2])?,
+                        dot_f16_one_scalar(rows4[3])?,
+                    ])
+                };
+                return self.row_parallelism.fill_tile_four_rows(
+                    &tensor.data,
+                    block_bytes,
+                    all_outputs[0],
+                    &mut unused_blocks,
+                    check,
+                    dot_eight,
+                    dot_four,
+                    dot_f16_one,
                 );
             }
             if matches!(
@@ -2569,6 +2686,194 @@ mod tests {
                     .map(|r| r.iter().copied().map(f32::to_bits).collect())
                     .collect();
                 assert_eq!(actual_bits, expected, "kind={kind} 64-tok pinned={pinned}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verify F16 matvec and 64-token tiled GEMM across unpinned float_dot, pinned_gdn::dot, odd/tail columns, and NaN/Inf recovery."
+    )]
+    fn tiled_f16_gemm_matches_scalar_zero_ulp_and_pinned_contract() -> Result<()> {
+        let make_f16_tensor = |columns: usize, rows: usize| -> Result<Tensor> {
+            let bits = [
+                0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3c00, 0xbc00, 0x3e00, 0x4200,
+            ];
+            let mut data = Vec::with_capacity(columns * rows * 2);
+            for row in 0..rows {
+                for col in 0..columns {
+                    data.extend_from_slice(&bits[(row * 5 + col * 3) % bits.len()].to_le_bytes());
+                }
+            }
+            Ok(Tensor {
+                name: format!("tile-f16-{columns}x{rows}"),
+                dimensions: vec![columns, rows],
+                kind: F16,
+                data: Arc::<[u8]>::from(data).into(),
+            })
+        };
+        let make_inputs = |count: usize, columns: usize| -> Vec<Vec<f32>> {
+            let vals = [0.0_f32, -0.0, 1.25, -3.5, 0.125, 7.125, -0.375, -0.0625];
+            (0..count)
+                .map(|tok| {
+                    (0..columns)
+                        .map(|idx| vals[(idx + tok * 3) % vals.len()])
+                        .collect()
+                })
+                .collect()
+        };
+
+        for &(columns, rows) in &[
+            (1_usize, 5_usize),
+            (7, 1),
+            (15, 4),
+            (16, 13),
+            (17, 9),
+            (20, 13),
+            (67, 17),
+            (256, 13),
+        ] {
+            let tensor = make_f16_tensor(columns, rows)?;
+            let max_tokens = if columns >= 16 { MAX_TILE_TOKENS } else { 17 };
+            let all_inputs = make_inputs(max_tokens, columns);
+            for pinned in [false, true] {
+                let mut ref_row = Vec::new();
+                for count in [1_usize, 5, 17, max_tokens] {
+                    let inputs = &all_inputs[..count];
+                    let expected: Vec<Vec<u32>> = inputs
+                        .iter()
+                        .map(|input| {
+                            let mut s = if pinned {
+                                MatvecScratch::with_pinned_backend(MatvecBackend::Scalar)
+                            } else {
+                                MatvecScratch::with_backend(MatvecBackend::Scalar)
+                            };
+                            let mut out = Vec::new();
+                            matvec_into(&tensor, input, &mut out, &mut s)?;
+                            // Also verify explicit contract against float_dot vs pinned_gdn::dot.
+                            let rounded_act: Vec<f32> =
+                                input.iter().map(|&v| super::super::round_f16(v)).collect();
+                            for r in 0..rows {
+                                super::super::row_into(&tensor, r, &mut ref_row)?;
+                                let ref_val = if pinned && columns.is_multiple_of(16) {
+                                    super::super::pinned_gdn::dot(&ref_row, &rounded_act)?
+                                } else {
+                                    finite(super::super::float_dot(&ref_row, &rounded_act))?
+                                };
+                                assert_eq!(
+                                    out[r].to_bits(),
+                                    ref_val.to_bits(),
+                                    "scalar matvec contract cols={columns} rows={rows} r={r} pinned={pinned}"
+                                );
+                            }
+                            Ok(out.into_iter().map(f32::to_bits).collect())
+                        })
+                        .collect::<Result<_>>()?;
+
+                    for backend in [
+                        MatvecBackend::Scalar,
+                        MatvecBackend::Auto,
+                        MatvecBackend::ExperimentalNeon,
+                    ] {
+                        for input_idx in [0_usize, count - 1] {
+                            let mut scratch = if pinned {
+                                MatvecScratch::with_pinned_backend(backend)
+                            } else {
+                                MatvecScratch::with_backend(backend)
+                            };
+                            #[cfg(feature = "parallel-rows")]
+                            scratch.set_row_parallelism(RowParallelism::new(2)?);
+                            let mut mv_out = Vec::new();
+                            matvec_into(&tensor, &inputs[input_idx], &mut mv_out, &mut scratch)?;
+                            assert_eq!(
+                                mv_out.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                                expected[input_idx],
+                                "matvec mismatch cols={columns} rows={rows} pinned={pinned} backend={backend:?}"
+                            );
+                        }
+
+                        let mut tile = ProjectionTile::with_backend(backend);
+                        #[cfg(feature = "parallel-rows")]
+                        tile.set_row_parallelism(RowParallelism::new(4)?);
+                        let mut actual = vec![Vec::new(); count];
+                        tile.project(&tensor, inputs, &mut actual, pinned, &|| Ok(()))?;
+                        let actual_bits: Vec<Vec<u32>> = actual
+                            .iter()
+                            .map(|row| row.iter().copied().map(f32::to_bits).collect())
+                            .collect();
+                        assert_eq!(
+                            actual_bits, expected,
+                            "tiled f16 mismatch cols={columns} rows={rows} count={count} pinned={pinned} backend={backend:?}"
+                        );
+                        let preps_before: Vec<usize> = tile
+                            .preparations
+                            .iter()
+                            .take(count)
+                            .map(MatvecScratch::preparation_count)
+                            .collect();
+                        tile.project_with_previous(
+                            Some(&tensor),
+                            &tensor,
+                            inputs,
+                            &mut actual,
+                            pinned,
+                            &|| Ok(()),
+                        )?;
+                        let preps_after: Vec<usize> = tile
+                            .preparations
+                            .iter()
+                            .take(count)
+                            .map(MatvecScratch::preparation_count)
+                            .collect();
+                        assert_eq!(preps_after, preps_before);
+                    }
+                }
+            }
+        }
+
+        // NaN/Inf weight rejection (even with zero activations) must clear outputs and recover.
+        let valid_tensor = make_f16_tensor(32, 13)?;
+        let zero_inputs = vec![vec![0.0_f32; 32]; 9];
+        for bad_f16 in [0x7c00_u16, 0x7e00, 0xfc00] {
+            let mut bad_bytes = valid_tensor.data.to_vec();
+            let corrupt_off = bad_bytes.len() - 2;
+            bad_bytes[corrupt_off..].copy_from_slice(&bad_f16.to_le_bytes());
+            let bad_tensor = Tensor {
+                name: "bad-f16".into(),
+                dimensions: vec![32, 13],
+                kind: F16,
+                data: Arc::<[u8]>::from(bad_bytes).into(),
+            };
+            for pinned in [false, true] {
+                for backend in [MatvecBackend::Scalar, MatvecBackend::ExperimentalNeon] {
+                    let mut scratch = if pinned {
+                        MatvecScratch::with_pinned_backend(backend)
+                    } else {
+                        MatvecScratch::with_backend(backend)
+                    };
+                    let mut mv_out = vec![1.0_f32];
+                    assert!(
+                        matvec_into(&bad_tensor, &zero_inputs[0], &mut mv_out, &mut scratch)
+                            .is_err()
+                    );
+                    assert!(mv_out.is_empty());
+                    matvec_into(&valid_tensor, &zero_inputs[0], &mut mv_out, &mut scratch)?;
+                    assert_eq!(mv_out.len(), 13);
+
+                    let mut tile = ProjectionTile::with_backend(backend);
+                    #[cfg(feature = "parallel-rows")]
+                    tile.set_row_parallelism(RowParallelism::new(2)?);
+                    let mut outs = vec![vec![1.0_f32]; 9];
+                    assert!(
+                        tile.project(&bad_tensor, &zero_inputs, &mut outs, pinned, &|| Ok(()))
+                            .is_err()
+                    );
+                    assert!(outs.iter().all(Vec::is_empty));
+                    tile.project(&valid_tensor, &zero_inputs, &mut outs, pinned, &|| Ok(()))?;
+                    assert!(outs.iter().all(|out| out.len() == 13));
+                }
             }
         }
         Ok(())

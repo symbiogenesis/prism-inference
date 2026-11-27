@@ -76,7 +76,7 @@ pub(crate) use rms_weights::RmsNormWeights;
 mod neon;
 
 pub(crate) const F32: u32 = 0;
-const F16: u32 = 1;
+pub(crate) const F16: u32 = 1;
 const Q4_0: u32 = 2;
 const Q4_1: u32 = 3;
 const Q5_0: u32 = 6;
@@ -1565,6 +1565,60 @@ fn bf16_dot(bytes: &[u8], input: &[f32]) -> Result<f32> {
     finite(sum as f32)
 }
 
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain float_dot's left-to-right binary64 sum of rounded F32 products and final F32 rounding."
+)]
+pub(crate) fn f16_f64_dot_scalar(bytes: &[u8], input: &[f32]) -> Result<f32> {
+    // Match `float_dot`: NEON `float_dot` seeds `-0.0_f64`, while the non-NEON `.sum::<f64>()` seeds `0.0_f64`.
+    let mut sum = if cfg!(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    )) {
+        -0.0_f64
+    } else {
+        0.0_f64
+    };
+    for (chunk, &activation) in bytes.as_chunks::<2>().0.iter().zip(input) {
+        let weight = finite(half_to_float(u16::from_le_bytes(*chunk)))?;
+        sum += f64::from(weight * activation);
+    }
+    finite(sum as f32)
+}
+
+pub(crate) fn f16_pinned_dot_scalar(bytes: &[u8], input: &[f32]) -> Result<f32> {
+    let mut sums = [[0.0_f32; 4]; 4];
+    for (w_blk, a_blk) in bytes
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(input.as_chunks::<16>().0)
+    {
+        for (reg, (w_quad, a_quad)) in w_blk
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(a_blk.as_chunks::<4>().0)
+            .enumerate()
+        {
+            for (lane, (w_bytes, &act)) in w_quad.as_chunks::<2>().0.iter().zip(a_quad).enumerate()
+            {
+                let w = finite(half_to_float(u16::from_le_bytes(*w_bytes)))?;
+                sums[reg][lane] = w.mul_add(act, sums[reg][lane]);
+            }
+        }
+    }
+    let mut lanes = [0.0_f32; 4];
+    for (lane, dst) in lanes.iter_mut().enumerate() {
+        *dst = (sums[0][lane] + sums[2][lane]) + (sums[1][lane] + sums[3][lane]);
+    }
+    finite((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+}
+
 /// Computes a scalar dot directly from native packed weight and activation bytes.
 ///
 /// Activations use `Q8_K` for PQ2, `Q8_0` for PTQ1/`Q1_0`/`Q2_0`/`Q4_0`/`Q8_0`,
@@ -2587,6 +2641,63 @@ impl PreparedMatvec<'_> {
             }
             F32 => {
                 return self.multiply_f32(tensor, output);
+            }
+            F16 => {
+                scratch.diagnostics = scratch.diagnostics.select(false);
+                let activations = &scratch.activations;
+                let pinned = scratch.pinned_accumulation && columns.is_multiple_of(16);
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_feature = "neon"
+                ))]
+                if !matches!(scratch.requested_backend(), MatvecBackend::Scalar) {
+                    return scratch.row_parallelism.fill_four_rows(
+                        &tensor.data,
+                        row_bytes,
+                        output,
+                        &mut scratch.row_errors,
+                        |rows| {
+                            if pinned {
+                                bonsai_neon_dot::dot_f16_rows_pinned::<8>(rows, activations)
+                            } else {
+                                bonsai_neon_dot::dot_f16_rows::<8>(rows, activations)
+                            }
+                            .ok_or_else(|| invalid("nonfinite tensor or activation value"))
+                        },
+                        |rows| {
+                            if pinned {
+                                bonsai_neon_dot::dot_f16_rows_pinned::<4>(rows, activations)
+                            } else {
+                                bonsai_neon_dot::dot_f16_rows::<4>(rows, activations)
+                            }
+                            .ok_or_else(|| invalid("nonfinite tensor or activation value"))
+                        },
+                        |bytes| {
+                            if pinned {
+                                bonsai_neon_dot::dot_f16_row_pinned(bytes, activations)
+                            } else {
+                                bonsai_neon_dot::dot_f16_row(bytes, activations)
+                            }
+                            .ok_or_else(|| invalid("nonfinite tensor or activation value"))
+                        },
+                    );
+                }
+                scratch.row_parallelism.fill(
+                    &tensor.data,
+                    row_bytes,
+                    output,
+                    &mut scratch.row_errors,
+                    |bytes| {
+                        if pinned {
+                            f16_pinned_dot_scalar(bytes, activations)
+                        } else {
+                            f16_f64_dot_scalar(bytes, activations)
+                        }
+                    },
+                )?;
             }
             BF16 => {
                 scratch.diagnostics = scratch.diagnostics.select(false);

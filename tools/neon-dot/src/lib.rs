@@ -31,6 +31,393 @@ pub mod kquants;
 mod bf16;
 pub use bf16::dot_bf16_rows;
 
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    target_endian = "little"
+))]
+#[allow(
+    unsafe_code,
+    reason = "Baseline-NEON F16 widening and ordered binary64/pinned FMA arithmetic stay behind checked slice boundaries."
+)]
+mod f16_aarch64;
+
+/// Multiplies one `F16` row by one binary32 activation vector using ordered binary64 summation.
+///
+/// Matches left-to-right `float_dot` rounding (`-0.0_f64` seed, per-product `f32` rounding,
+/// binary64 addition, single final `f32` cast). Rejects empty/mismatched extents, nonfinite
+/// `F16` weights (even when multiplied by zero activations), or nonfinite results.
+#[inline]
+#[must_use]
+pub fn dot_f16_row(row: &[u8], input: &[f32]) -> Option<f32> {
+    if input.is_empty() || input.len().checked_mul(2) != Some(row.len()) {
+        return None;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        f16_aarch64::dot_row(row, input)
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )))]
+    {
+        portable_f16_f64_row(row, input)
+    }
+}
+
+/// Multiplies four or eight `F16` rows by one shared binary32 activation vector.
+///
+/// Preserves exact `0 ULP` left-to-right binary64 summation per row and rejects empty/mismatched
+/// extents, unsupported row counts, nonfinite weights, or nonfinite results.
+#[inline]
+#[must_use]
+pub fn dot_f16_rows<const ROWS: usize>(rows: [&[u8]; ROWS], input: &[f32]) -> Option<[f32; ROWS]> {
+    if !matches!(ROWS, 4 | 8)
+        || input.is_empty()
+        || input
+            .len()
+            .checked_mul(2)
+            .is_none_or(|bytes| rows.iter().any(|row| row.len() != bytes))
+    {
+        return None;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        f16_aarch64::dot_rows(rows, input)
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )))]
+    {
+        let mut out = [0.0_f32; ROWS];
+        for (dst, row) in out.iter_mut().zip(rows) {
+            *dst = portable_f16_f64_row(row, input)?;
+        }
+        Some(out)
+    }
+}
+
+/// Multiplies one 16-aligned `F16` row by one binary32 activation vector using the
+/// pinned four-register FMA reduction tree matching `pinned_gdn::dot`.
+///
+/// Rejects empty/unaligned/mismatched extents, nonfinite weights, or nonfinite results.
+#[inline]
+#[must_use]
+pub fn dot_f16_row_pinned(row: &[u8], input: &[f32]) -> Option<f32> {
+    if input.is_empty()
+        || !input.len().is_multiple_of(16)
+        || input.len().checked_mul(2) != Some(row.len())
+    {
+        return None;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        f16_aarch64::dot_row_pinned(row, input)
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )))]
+    {
+        portable_f16_pinned_row(row, input)
+    }
+}
+
+/// Multiplies four or eight 16-aligned `F16` rows by one binary32 activation vector using
+/// the pinned four-register FMA reduction tree matching `pinned_gdn::dot`.
+#[inline]
+#[must_use]
+pub fn dot_f16_rows_pinned<const ROWS: usize>(
+    rows: [&[u8]; ROWS],
+    input: &[f32],
+) -> Option<[f32; ROWS]> {
+    if !matches!(ROWS, 4 | 8)
+        || input.is_empty()
+        || !input.len().is_multiple_of(16)
+        || input
+            .len()
+            .checked_mul(2)
+            .is_none_or(|bytes| rows.iter().any(|row| row.len() != bytes))
+    {
+        return None;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        f16_aarch64::dot_rows_pinned(rows, input)
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )))]
+    {
+        let mut out = [0.0_f32; ROWS];
+        for (dst, row) in out.iter_mut().zip(rows) {
+            *dst = portable_f16_pinned_row(row, input)?;
+        }
+        Some(out)
+    }
+}
+
+fn valid_f16_tile_inputs<const ROWS: usize, const TOKENS: usize>(
+    rows: [&[u8]; ROWS],
+    inputs: &[&[f32]],
+) -> bool {
+    if inputs.is_empty() || inputs.len() > TOKENS {
+        return false;
+    }
+    let columns = inputs[0].len();
+    columns != 0
+        && columns
+            .checked_mul(2)
+            .is_some_and(|bytes| rows.iter().all(|row| row.len() == bytes))
+        && inputs.iter().all(|input| input.len() == columns)
+}
+
+/// Multiplies one `F16` row across `1..=TOKENS` activations using ordered binary64 summation,
+/// reusing widened `F16` weights across tokens. Leaves `out` unchanged on failure.
+#[inline]
+#[must_use]
+pub fn dot_f16_tile_row<const TOKENS: usize>(
+    row: &[u8],
+    inputs: &[&[f32]],
+    out: &mut [f32; TOKENS],
+) -> Option<()> {
+    if !valid_f16_tile_inputs::<1, TOKENS>([row], inputs) {
+        return None;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        f16_aarch64::dot_tile_row(row, inputs, out)
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )))]
+    {
+        let mut tmp = [0.0_f32; TOKENS];
+        for (dst, input) in tmp.iter_mut().zip(inputs) {
+            *dst = portable_f16_f64_row(row, input)?;
+        }
+        *out = tmp;
+        Some(())
+    }
+}
+
+/// Multiplies four or eight `F16` rows across `1..=TOKENS` activations using ordered binary64
+/// summation, reusing widened `F16` weight pairs across tokens. Leaves `out` unchanged on failure.
+#[inline]
+#[must_use]
+pub fn dot_f16_tile_rows<const ROWS: usize, const TOKENS: usize>(
+    rows: [&[u8]; ROWS],
+    inputs: &[&[f32]],
+    out: &mut [[f32; TOKENS]; ROWS],
+) -> Option<()> {
+    if !matches!(ROWS, 4 | 8) || !valid_f16_tile_inputs::<ROWS, TOKENS>(rows, inputs) {
+        return None;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        match ROWS {
+            4 => f16_aarch64::dot_tile_rows::<2, ROWS, TOKENS>(rows, inputs, out),
+            8 => f16_aarch64::dot_tile_rows::<4, ROWS, TOKENS>(rows, inputs, out),
+            _ => None,
+        }
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )))]
+    {
+        let mut tmp = [[0.0_f32; TOKENS]; ROWS];
+        for (dst_row, row) in tmp.iter_mut().zip(rows) {
+            for (dst, input) in dst_row.iter_mut().zip(inputs) {
+                *dst = portable_f16_f64_row(row, input)?;
+            }
+        }
+        *out = tmp;
+        Some(())
+    }
+}
+
+/// Multiplies one 16-aligned `F16` row across `1..=TOKENS` activations using the pinned four-FMA
+/// reduction tree, reusing widened `F16` weights across tokens. Leaves `out` unchanged on failure.
+#[inline]
+#[must_use]
+pub fn dot_f16_tile_row_pinned<const TOKENS: usize>(
+    row: &[u8],
+    inputs: &[&[f32]],
+    out: &mut [f32; TOKENS],
+) -> Option<()> {
+    if !valid_f16_tile_inputs::<1, TOKENS>([row], inputs) || !inputs[0].len().is_multiple_of(16) {
+        return None;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        f16_aarch64::dot_tile_row_pinned(row, inputs, out)
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )))]
+    {
+        let mut tmp = [0.0_f32; TOKENS];
+        for (dst, input) in tmp.iter_mut().zip(inputs) {
+            *dst = portable_f16_pinned_row(row, input)?;
+        }
+        *out = tmp;
+        Some(())
+    }
+}
+
+/// Multiplies four or eight 16-aligned `F16` rows across `1..=TOKENS` activations using the
+/// pinned four-FMA reduction tree, reusing widened `F16` weights across tokens. Leaves `out`
+/// unchanged on failure.
+#[inline]
+#[must_use]
+pub fn dot_f16_tile_rows_pinned<const ROWS: usize, const TOKENS: usize>(
+    rows: [&[u8]; ROWS],
+    inputs: &[&[f32]],
+    out: &mut [[f32; TOKENS]; ROWS],
+) -> Option<()> {
+    if !matches!(ROWS, 4 | 8)
+        || !valid_f16_tile_inputs::<ROWS, TOKENS>(rows, inputs)
+        || !inputs[0].len().is_multiple_of(16)
+    {
+        return None;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        match ROWS {
+            4 => f16_aarch64::dot_tile_rows_pinned::<2, ROWS, TOKENS>(rows, inputs, out),
+            8 => f16_aarch64::dot_tile_rows_pinned::<4, ROWS, TOKENS>(rows, inputs, out),
+            _ => None,
+        }
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )))]
+    {
+        let mut tmp = [[0.0_f32; TOKENS]; ROWS];
+        for (dst_row, row) in tmp.iter_mut().zip(rows) {
+            for (dst, input) in dst_row.iter_mut().zip(inputs) {
+                *dst = portable_f16_pinned_row(row, input)?;
+            }
+        }
+        *out = tmp;
+        Some(())
+    }
+}
+
+#[cfg(any(
+    test,
+    not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))
+))]
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Retain left-to-right ordered binary64 sum of rounded binary32 products."
+)]
+fn portable_f16_f64_row(row: &[u8], input: &[f32]) -> Option<f32> {
+    let mut sum = -0.0_f64;
+    for (bytes, &act) in row.as_chunks::<2>().0.iter().zip(input) {
+        let w = half_to_float(u16::from_le_bytes(*bytes));
+        if !w.is_finite() {
+            return None;
+        }
+        sum += f64::from(w * act);
+    }
+    let val = sum as f32;
+    val.is_finite().then_some(val)
+}
+
+#[cfg(any(
+    test,
+    not(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))
+))]
+fn portable_f16_pinned_row(row: &[u8], input: &[f32]) -> Option<f32> {
+    let mut sums = [[0.0_f32; 4]; 4];
+    for (w_blk, a_blk) in row
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(input.as_chunks::<16>().0)
+    {
+        for (reg, (w_quad, a_quad)) in w_blk
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(a_blk.as_chunks::<4>().0)
+            .enumerate()
+        {
+            for (lane, (w_bytes, &act)) in w_quad.as_chunks::<2>().0.iter().zip(a_quad).enumerate()
+            {
+                let w = half_to_float(u16::from_le_bytes(*w_bytes));
+                if !w.is_finite() {
+                    return None;
+                }
+                sums[reg][lane] = w.mul_add(act, sums[reg][lane]);
+            }
+        }
+    }
+    let mut lanes = [0.0_f32; 4];
+    for (lane, dst) in lanes.iter_mut().enumerate() {
+        *dst = (sums[0][lane] + sums[2][lane]) + (sums[1][lane] + sums[3][lane]);
+    }
+    let val = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    val.is_finite().then_some(val)
+}
+
 /// Packed rotated scalar KV consumption with portable and baseline-NEON paths.
 pub mod kv_quant;
 pub mod trellis;
@@ -2963,6 +3350,124 @@ mod tests {
             assert!(
                 q8.dot_scaled_8x8_chunks_up_to_8(q8_row_refs, &q8_chunks_9, &mut too_many)
                     .is_none()
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verify single-row, multi-row, and 64-token tiled F16 kernels across unpinned, pinned, and error paths."
+    )]
+    fn f16_single_and_tiled_kernels_match_portable_and_reject_nonfinite() {
+        let make_rows = |rows_n: usize, cols: usize| -> Vec<Vec<u8>> {
+            let bits = [
+                0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3c00, 0xbc00, 0x3e00, 0x4200,
+            ];
+            (0..rows_n)
+                .map(|r| {
+                    (0..cols)
+                        .flat_map(|c| bits[(r * 5 + c * 3) % bits.len()].to_le_bytes())
+                        .collect()
+                })
+                .collect()
+        };
+        let make_inputs = |tokens_n: usize, cols: usize| -> Vec<Vec<f32>> {
+            let vals = [0.0_f32, -0.0, 1.5, -2.25, 0.125, -0.375, 4.5, -0.0625];
+            (0..tokens_n)
+                .map(|t| (0..cols).map(|c| vals[(t * 7 + c) % vals.len()]).collect())
+                .collect()
+        };
+
+        for cols in [1_usize, 7, 15, 16, 17, 32, 67, 144] {
+            let rows = make_rows(8, cols);
+            let inputs = make_inputs(64, cols);
+            let row_refs8: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+            let row_refs4: [&[u8]; 4] = std::array::from_fn(|r| rows[r].as_slice());
+
+            for tok_count in [1_usize, 3, 5, 16, 64] {
+                let in_refs: Vec<&[f32]> = inputs[..tok_count].iter().map(Vec::as_slice).collect();
+                let mut out1 = [f32::NAN; 64];
+                let mut out4 = [[f32::NAN; 64]; 4];
+                let mut out8 = [[f32::NAN; 64]; 8];
+                assert!(dot_f16_tile_row(row_refs8[0], &in_refs, &mut out1).is_some());
+                assert!(dot_f16_tile_rows(row_refs4, &in_refs, &mut out4).is_some());
+                assert!(dot_f16_tile_rows(row_refs8, &in_refs, &mut out8).is_some());
+                for (t, &inp) in in_refs.iter().enumerate() {
+                    let s1 = dot_f16_row(row_refs8[0], inp).map(f32::to_bits);
+                    let s4 = dot_f16_rows(row_refs4, inp).map(|v| v.map(f32::to_bits));
+                    let s8 = dot_f16_rows(row_refs8, inp).map(|v| v.map(f32::to_bits));
+                    let exp: [u32; 8] = std::array::from_fn(|r| {
+                        portable_f16_f64_row(row_refs8[r], inp).map_or(u32::MAX, f32::to_bits)
+                    });
+                    assert_eq!(s1, Some(exp[0]));
+                    assert_eq!(s4, Some([exp[0], exp[1], exp[2], exp[3]]));
+                    assert_eq!(s8, Some(exp));
+                    assert_eq!(out1[t].to_bits(), exp[0]);
+                    for r in 0..4 {
+                        assert_eq!(out4[r][t].to_bits(), exp[r]);
+                    }
+                    for r in 0..8 {
+                        assert_eq!(out8[r][t].to_bits(), exp[r]);
+                    }
+                }
+
+                if cols.is_multiple_of(16) {
+                    let mut p_out1 = [f32::NAN; 64];
+                    let mut p_out4 = [[f32::NAN; 64]; 4];
+                    let mut p_out8 = [[f32::NAN; 64]; 8];
+                    assert!(dot_f16_tile_row_pinned(row_refs8[0], &in_refs, &mut p_out1).is_some());
+                    assert!(dot_f16_tile_rows_pinned(row_refs4, &in_refs, &mut p_out4).is_some());
+                    assert!(dot_f16_tile_rows_pinned(row_refs8, &in_refs, &mut p_out8).is_some());
+                    for (t, &inp) in in_refs.iter().enumerate() {
+                        let s1 = dot_f16_row_pinned(row_refs8[0], inp).map(f32::to_bits);
+                        let s4 = dot_f16_rows_pinned(row_refs4, inp).map(|v| v.map(f32::to_bits));
+                        let s8 = dot_f16_rows_pinned(row_refs8, inp).map(|v| v.map(f32::to_bits));
+                        let exp: [u32; 8] = std::array::from_fn(|r| {
+                            portable_f16_pinned_row(row_refs8[r], inp)
+                                .map_or(u32::MAX, f32::to_bits)
+                        });
+                        assert_eq!(s1, Some(exp[0]));
+                        assert_eq!(s4, Some([exp[0], exp[1], exp[2], exp[3]]));
+                        assert_eq!(s8, Some(exp));
+                        assert_eq!(p_out1[t].to_bits(), exp[0]);
+                        for r in 0..4 {
+                            assert_eq!(p_out4[r][t].to_bits(), exp[r]);
+                        }
+                        for r in 0..8 {
+                            assert_eq!(p_out8[r][t].to_bits(), exp[r]);
+                        }
+                    }
+                } else {
+                    assert!(dot_f16_row_pinned(row_refs8[0], in_refs[0]).is_none());
+                    assert!(dot_f16_rows_pinned(row_refs4, in_refs[0]).is_none());
+                }
+            }
+        }
+
+        // Reject NaN/Inf weights even when all activations are zero, preserving sentinel `out`.
+        for bad_f16 in [0x7c00_u16, 0x7e00, 0xfc00] {
+            let mut bad_rows = make_rows(8, 32);
+            bad_rows[7][62..64].copy_from_slice(&bad_f16.to_le_bytes());
+            let bad_refs8: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
+            let zeros = [0.0_f32; 32];
+            let zero_refs = [zeros.as_slice(); 4];
+            let sentinel = [[42.5_f32; 4]; 8];
+            let mut out_u = sentinel;
+            let mut out_p = sentinel;
+            assert!(dot_f16_row(bad_refs8[7], &zeros).is_none());
+            assert!(dot_f16_row_pinned(bad_refs8[7], &zeros).is_none());
+            assert!(dot_f16_rows(bad_refs8, &zeros).is_none());
+            assert!(dot_f16_rows_pinned(bad_refs8, &zeros).is_none());
+            assert!(dot_f16_tile_rows(bad_refs8, &zero_refs, &mut out_u).is_none());
+            assert!(dot_f16_tile_rows_pinned(bad_refs8, &zero_refs, &mut out_p).is_none());
+            assert_eq!(
+                out_u.map(|r| r.map(f32::to_bits)),
+                sentinel.map(|r| r.map(f32::to_bits))
+            );
+            assert_eq!(
+                out_p.map(|r| r.map(f32::to_bits)),
+                sentinel.map(|r| r.map(f32::to_bits))
             );
         }
     }

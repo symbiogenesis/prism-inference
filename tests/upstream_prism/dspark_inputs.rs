@@ -2,7 +2,6 @@
 //! Frozen bytes contain only generator-produced tensor inputs, never SUT output.
 use super::{Result, invalid};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 const DATA: &[u8] = include_bytes!("dspark-inputs.bin");
@@ -62,7 +61,7 @@ pub(super) struct Corpus {
 impl Corpus {
     pub(super) fn load() -> Result<Self> {
         check(
-            DATA.len() == 1_236_480 && hex(&Sha256::digest(DATA)) == SHA,
+            DATA.len() == 1_236_480 && hex(&bonsai_native_hash::hash_bytes(DATA)?) == SHA,
             "DSpark frozen tensor corpus hash/length differs",
         )?;
         let manifest: Value = serde_json::from_str(include_str!("dspark-inputs.json"))?;
@@ -188,7 +187,8 @@ impl Corpus {
                 .get(offset..end)
                 .ok_or_else(|| invalid("DSpark corpus range outside bytes"))?;
             check(
-                tensor["SHA256"].as_str() == Some(hex(&Sha256::digest(data)).as_str()),
+                tensor["SHA256"].as_str()
+                    == Some(hex(&bonsai_native_hash::hash_bytes(data)?).as_str()),
                 "DSpark tensor input digest differs",
             )?;
             aligned(&mut tensor_data)?;

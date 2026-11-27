@@ -5,7 +5,6 @@
 )]
 
 use bonsai_prism_runtime::Result;
-use sha2::{Digest, Sha256};
 
 pub(crate) fn model_bytes(vocab_size: u64, eos: u32, pre: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -87,8 +86,8 @@ pub(crate) fn model_bytes(vocab_size: u64, eos: u32, pre: &str) -> Result<Vec<u8
     Ok(bytes)
 }
 
-pub(crate) fn sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+pub(crate) fn sha256(bytes: &[u8]) -> Result<String> {
+    Ok(hex::encode(bonsai_native_hash::hash_bytes(bytes)?))
 }
 
 fn u32_bytes(bytes: &mut Vec<u8>, value: u32) {

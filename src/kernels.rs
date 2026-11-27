@@ -5432,8 +5432,6 @@ pub(crate) fn lora_multi_b_scale_and_finish_tokens_f32(
 mod tests {
     use std::sync::Arc;
 
-    use sha2::{Digest, Sha256};
-
     use super::{
         MatvecScratch, Tensor, matvec_into, q8_into, q8k_into, rms_norm, rms_norm_pinned_into,
     };
@@ -5453,7 +5451,7 @@ mod tests {
         let fixture = include_bytes!("../tests/fixtures/swift-q8-parity.bin");
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/swift-q8-parity.json"))?;
-        let hash = hex::encode(Sha256::digest(fixture));
+        let hash = hex::encode(bonsai_native_hash::hash_bytes(fixture)?);
         assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
         assert_eq!(fixture.len(), 420);
         assert_eq!(
@@ -5529,7 +5527,7 @@ mod tests {
         let fixture = include_bytes!("../tests/fixtures/swift-q8k-parity.bin");
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/swift-q8k-parity.json"))?;
-        let hash = hex::encode(Sha256::digest(fixture));
+        let hash = hex::encode(bonsai_native_hash::hash_bytes(fixture)?);
         assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
         assert_eq!(fixture.len(), 584);
         assert_eq!(
@@ -5626,7 +5624,7 @@ mod tests {
         let fixture = include_bytes!("../tests/fixtures/swift-ptq1-dot-parity.bin");
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/swift-ptq1-dot-parity.json"))?;
-        let hash = hex::encode(Sha256::digest(fixture));
+        let hash = hex::encode(bonsai_native_hash::hash_bytes(fixture)?);
         assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
         assert_eq!(fixture.len(), 508);
         assert_eq!(

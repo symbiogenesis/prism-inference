@@ -5,7 +5,6 @@ use super::tokenizer_reference::Reference;
 use super::tokenizer_session::VocabularySession;
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -161,7 +160,6 @@ fn source_decode_matches(
     }
     input == production
 }
-#[derive(Default)]
 struct Comparison {
     compared: usize,
     prefetched: usize,
@@ -169,7 +167,7 @@ struct Comparison {
     decode_errors: usize,
     encode_differences: usize,
     decode_differences: usize,
-    input_hash: Sha256,
+    input_hash: bonsai_native_hash::Hasher,
     diagnostics: Vec<Value>,
     reference_encode_ns: u128,
     production_encode_ns: u128,
@@ -177,6 +175,23 @@ struct Comparison {
     production_decode_ns: u128,
 }
 impl Comparison {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            compared: 0,
+            prefetched: 0,
+            encode_errors: 0,
+            decode_errors: 0,
+            encode_differences: 0,
+            decode_differences: 0,
+            input_hash: bonsai_native_hash::Hasher::new()?,
+            diagnostics: Vec::new(),
+            reference_encode_ns: 0,
+            production_encode_ns: 0,
+            reference_decode_ns: 0,
+            production_decode_ns: 0,
+        })
+    }
+
     const fn stopped(&self) -> bool {
         self.encode_errors >= MAX_ERRORS && self.decode_errors >= MAX_ERRORS
     }
@@ -222,8 +237,8 @@ impl Comparison {
             let decoded_actual = String::from_utf8_lossy(&decoded_bytes);
             self.compared += 1;
             self.input_hash
-                .update(u64::try_from(input.len())?.to_le_bytes());
-            self.input_hash.update(input.as_bytes());
+                .update(&u64::try_from(input.len())?.to_le_bytes())?;
+            self.input_hash.update(input.as_bytes())?;
             let encode_differs = expected != actual;
             let decode_differs = decoded != decoded_actual;
             self.encode_differences += usize::from(encode_differs);
@@ -243,7 +258,7 @@ impl Comparison {
                 let start = first_token.saturating_sub(2);
                 let end_expected = (first_token + 6).min(expected.len());
                 let end_actual = (first_token + 6).min(actual.len());
-                self.diagnostics.push(json!({"ComparedIndex":self.compared-1,"EncodeError":record_encode,"DecodeError":record_decode,"ExpectedTokenWindow":expected.get(start..end_expected).unwrap_or(&[]),"ActualTokenWindow":actual.get(start..end_actual).unwrap_or(&[]),"InputSha256":super::lora_inputs::hash_bytes(input.as_bytes()),"ExpectedTextPrefix":decoded.chars().take(32).collect::<String>(),"ActualTextPrefix":decoded_actual.chars().take(32).collect::<String>()}));
+                self.diagnostics.push(json!({"ComparedIndex":self.compared-1,"EncodeError":record_encode,"DecodeError":record_decode,"ExpectedTokenWindow":expected.get(start..end_expected).unwrap_or(&[]),"ActualTokenWindow":actual.get(start..end_actual).unwrap_or(&[]),"InputSha256":super::lora_inputs::hash_bytes(input.as_bytes())?,"ExpectedTextPrefix":decoded.chars().take(32).collect::<String>(),"ActualTextPrefix":decoded_actual.chars().take(32).collect::<String>()}));
             }
             if self.stopped() {
                 break;
@@ -251,8 +266,10 @@ impl Comparison {
         }
         Ok(!self.stopped())
     }
-    fn report(&self, kind: Kind, elapsed_ns: u128) -> Value {
-        json!({"Generator":generator_name(kind),"Compared":self.compared,"Prefetched":self.prefetched,"UncomparedPrefetch":self.prefetched-self.compared,"SourceEarlyStop":self.stopped(),"GeneratorExhausted":!self.stopped(),"SourceAssertions":0,"SourceEncodeErrors":self.encode_errors,"SourceDecodeErrors":self.decode_errors,"EncodeDifferences":self.encode_differences,"StrictDecodeDifferences":self.decode_differences,"StrictReferenceMatch":self.encode_differences==0&&self.decode_differences==0,"ComparedInputSha256":hex(&self.input_hash.clone().finalize()),"DiagnosticTimingsNs":{"ReferenceEncode":self.reference_encode_ns.to_string(),"ProductionEncode":self.production_encode_ns.to_string(),"ReferenceDecode":self.reference_decode_ns.to_string(),"ProductionDecode":self.production_decode_ns.to_string(),"Total":elapsed_ns.to_string()},"Diagnostics":self.diagnostics})
+    fn report(self, kind: Kind, elapsed_ns: u128) -> Result<Value> {
+        Ok(
+            json!({"Generator":generator_name(kind),"Compared":self.compared,"Prefetched":self.prefetched,"UncomparedPrefetch":self.prefetched-self.compared,"SourceEarlyStop":self.stopped(),"GeneratorExhausted":!self.stopped(),"SourceAssertions":0,"SourceEncodeErrors":self.encode_errors,"SourceDecodeErrors":self.decode_errors,"EncodeDifferences":self.encode_differences,"StrictDecodeDifferences":self.decode_differences,"StrictReferenceMatch":self.encode_differences==0&&self.decode_differences==0,"ComparedInputSha256":hex(&self.input_hash.finish()?),"DiagnosticTimingsNs":{"ReferenceEncode":self.reference_encode_ns.to_string(),"ProductionEncode":self.production_encode_ns.to_string(),"ReferenceDecode":self.reference_decode_ns.to_string(),"ProductionDecode":self.production_decode_ns.to_string(),"Total":elapsed_ns.to_string()},"Diagnostics":self.diagnostics}),
+        )
     }
 }
 fn compare(
@@ -263,7 +280,7 @@ fn compare(
     iterations: usize,
 ) -> Result<Value> {
     let start = Instant::now();
-    let mut comparison = Comparison::default();
+    let mut comparison = Comparison::new()?;
     let mut pending = Vec::with_capacity(BATCH);
     generators::visit(kind, vocab, iterations, |input| {
         pending.push(input);
@@ -277,7 +294,7 @@ fn compare(
     if !pending.is_empty() {
         comparison.batch(session, reference, vocab, &pending)?;
     }
-    Ok(comparison.report(kind, start.elapsed().as_nanos()))
+    comparison.report(kind, start.elapsed().as_nanos())
 }
 pub(super) fn run_case(
     engine: &Engine,

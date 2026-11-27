@@ -219,7 +219,7 @@ fn generate(
             invoke(&client, json!({"Op":"release","Kind":kind,"Handle":id}))?;
         }
         let output = String::from_utf8(output)?;
-        let receipt = json!({"PromptTokens":tokens,"GeneratedTokens":generated,"DecodeCalls":decode_count,"StoppedEog":stopped_eog,"Seed":42,"Temperature":0,"Predict":50,"CompletionExample":true,"ProductionCommonInitialization":true,"OutputBytes":output.len(),"OutputSha256":hash_bytes(output.as_bytes())});
+        let receipt = json!({"PromptTokens":tokens,"GeneratedTokens":generated,"DecodeCalls":decode_count,"StoppedEog":stopped_eog,"Seed":42,"Temperature":0,"Predict":50,"CompletionExample":true,"ProductionCommonInitialization":true,"OutputBytes":output.len(),"OutputSha256":hash_bytes(output.as_bytes())?});
         Ok((normalized(&output).into(), receipt))
     })();
     let finish = session.finish();

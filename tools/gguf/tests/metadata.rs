@@ -5,7 +5,6 @@ use std::fs;
 use std::path::PathBuf;
 
 use bonsai_gguf::{MetadataArray, MetadataValue, Result, VerifiedModel};
-use sha2::{Digest, Sha256};
 
 mod support;
 use support::ScratchDirectory;
@@ -47,7 +46,7 @@ impl Artifact {
             bytes.extend(value);
         }
         fs::write(&path, &bytes)?;
-        let hash = hex::encode(Sha256::digest(&bytes));
+        let hash = hex::encode(bonsai_native_hash::hash_bytes(&bytes)?);
         Ok(Self {
             directory: Some(directory),
             path,

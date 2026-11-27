@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::{
     MatvecBackend, MatvecScratch, PQ2, PTQ1, Q8_0, Q8Block, half_bits, q8_with_contract,
@@ -46,7 +45,7 @@ fn packed(block: &Q8Block) -> Vec<u8> {
 fn pinned_ptq1_scale_and_inverse_match_native_halfway_and_zero_controls() -> Result<()> {
     let capture = capture()?;
     let fixture = include_bytes!("../../tests/fixtures/swift-ptq1-q8-scale-parity.bin");
-    let hash = hex::encode(Sha256::digest(fixture));
+    let hash = hex::encode(bonsai_native_hash::hash_bytes(fixture)?);
     assert_eq!(
         capture.runtime_commit,
         "73bfe6cc485554822f80c473a3c0c4f25e80f41b"

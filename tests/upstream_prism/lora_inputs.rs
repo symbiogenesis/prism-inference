@@ -2,7 +2,6 @@
 use super::engine::Engine;
 use super::{Result, invalid};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -11,15 +10,15 @@ pub(super) struct Inputs {
     paths: BTreeMap<String, PathBuf>,
     pub(super) receipt: Value,
 }
-pub(super) fn hash_bytes(data: &[u8]) -> String {
-    encoded_hash(&Sha256::digest(data))
+pub(super) fn hash_bytes(data: &[u8]) -> Result<String> {
+    Ok(encoded_hash(&bonsai_native_hash::hash_bytes(data)?))
 }
 fn encoded_hash(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }
 pub(super) fn digest(path: &Path) -> Result<(u64, String)> {
     let mut input = File::open(path)?;
-    let mut sha = Sha256::new();
+    let mut sha = bonsai_native_hash::Hasher::new()?;
     let mut length = 0_u64;
     let mut buffer = vec![0_u8; 65536];
     loop {
@@ -33,9 +32,9 @@ pub(super) fn digest(path: &Path) -> Result<(u64, String)> {
         if length > 256 * 1024 * 1024 {
             return Err(invalid("LoRA file exceeds256MiB"));
         }
-        sha.update(&buffer[..count]);
+        sha.update(&buffer[..count])?;
     }
-    Ok((length, encoded_hash(&sha.finalize())))
+    Ok((length, encoded_hash(&sha.finish()?)))
 }
 impl Inputs {
     pub(super) fn verify(engine: &Engine) -> Result<Self> {

@@ -15,7 +15,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::engine::Engine;
 use super::{Result, invalid, result};
@@ -132,16 +131,16 @@ fn verify_file(path: &Path, identity: &Value) -> Result<()> {
         )));
     }
     let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
+    let mut hash = bonsai_native_hash::Hasher::new()?;
     let mut buffer = [0; 16 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        hash.update(&buffer[..count]);
+        hash.update(&buffer[..count])?;
     }
-    let digest = hex::encode(hash.finalize());
+    let digest = hex::encode(hash.finish()?);
     if digest != text(identity, "Sha256")? {
         return Err(invalid(format!(
             "tokenizer asset digest mismatch: {}",

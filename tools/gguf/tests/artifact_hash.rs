@@ -4,13 +4,12 @@
 use std::fs;
 
 use bonsai_gguf::{Result, VerifiedModel};
-use sha2::{Digest, Sha256};
 
 mod support;
 use support::ScratchDirectory;
 
-fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn digest(bytes: &[u8]) -> Result<String> {
+    Ok(hex::encode(bonsai_native_hash::hash_bytes(bytes)?))
 }
 
 #[test]
@@ -29,7 +28,7 @@ fn verification_hashes_the_complete_file_before_header_parsing() -> Result<()> {
     bytes.resize(131_073, 0xa5); // Include multiple hash buffers and a final tail.
     fs::write(&path, &bytes)?;
     let size = u64::try_from(bytes.len())?;
-    let hash = digest(&bytes);
+    let hash = digest(&bytes)?;
     let model = VerifiedModel::open(&path, "Stock", size, &hash.to_uppercase(), 16_384)?;
     assert!(model.tensors().is_empty());
     drop(model);
@@ -41,9 +40,9 @@ fn verification_hashes_the_complete_file_before_header_parsing() -> Result<()> {
     fs::write(&path, &bytes)?;
     let error = VerifiedModel::open(&path, "Stock", size, &hash, 16_384).err();
     assert!(error.is_some_and(|error| error.to_string().contains("SHA-256 mismatch")));
-    assert!(VerifiedModel::open(&path, "Stock", size + 1, &digest(&bytes), 16_384).is_err());
-    assert!(VerifiedModel::open(&path, "Stock", size - 1, &digest(&bytes), 16_384).is_err());
-    assert!(VerifiedModel::open(&path, "Stock", 0, &digest(&bytes), 16_384).is_err());
+    assert!(VerifiedModel::open(&path, "Stock", size + 1, &digest(&bytes)?, 16_384).is_err());
+    assert!(VerifiedModel::open(&path, "Stock", size - 1, &digest(&bytes)?, 16_384).is_err());
+    assert!(VerifiedModel::open(&path, "Stock", 0, &digest(&bytes)?, 16_384).is_err());
     scratch.close()?;
     Ok(())
 }
@@ -89,7 +88,7 @@ fn read_tensor_into_reuses_staging_and_clears_stale_bytes_on_error() -> Result<(
     bytes.resize(1_200_000, 0x5a);
     fs::write(&path, &bytes)?;
     let size = u64::try_from(bytes.len())?;
-    let hash = digest(&bytes);
+    let hash = digest(&bytes)?;
 
     let mut model = VerifiedModel::open(&path, "Stock", size, &hash, 16_384)?;
     let mut staging = Vec::new();

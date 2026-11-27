@@ -391,6 +391,6 @@ fn options(engine: &Engine, request: &Json) -> Result<Json> {
         items.push(observed);
     }
     Ok(
-        json!({"SchemaVersion":1,"Status":if passed{"pass"}else{"fail"},"Diagnostic":true,"CorrectnessSourceCount":0,"SourceSha256":program::SOURCE_SHA256,"Mode":mode.name(),"CpuSelection":"explicit CPU","OperationFilter":operation_filter,"ParametersFilter":parameter_filter,"PatternLanguage":"checked ASCII ECMAScript regular-language core; unsupported syntax reported explicitly","TestFileSha256":text.map(|text|planner::hash(text.as_bytes())),"InputGeometries":geometries.len(),"TotalCrtDraws":offset,"Items":items}),
+        json!({"SchemaVersion":1,"Status":if passed{"pass"}else{"fail"},"Diagnostic":true,"CorrectnessSourceCount":0,"SourceSha256":program::SOURCE_SHA256,"Mode":mode.name(),"CpuSelection":"explicit CPU","OperationFilter":operation_filter,"ParametersFilter":parameter_filter,"PatternLanguage":"checked ASCII ECMAScript regular-language core; unsupported syntax reported explicitly","TestFileSha256":text.map(str::as_bytes).map(planner::hash).transpose()?,"InputGeometries":geometries.len(),"TotalCrtDraws":offset,"Items":items}),
     )
 }

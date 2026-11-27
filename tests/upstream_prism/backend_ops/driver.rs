@@ -94,7 +94,7 @@ fn compact_result(row: &Json, directory: &Path) -> Result<Json> {
         "Index":row["Index"], "Class":row["Class"],
         "ArgumentsSha256":row["ArgumentsSha256"], "Status":row["Status"],
         "CrtOffset":row["CrtOffset"], "CrtDraws":row["CrtDraws"],
-        "ResultSha256":planner::hash(&serde_json::to_vec(row)?),
+        "ResultSha256":planner::hash(&serde_json::to_vec(row)?)?,
         "CaseReceipt":format!("{directory}/case-receipt.json")
     });
     validate_compact(&compact)?;
@@ -415,7 +415,7 @@ pub(super) fn aggregate(reports: &[Json], plan: &Json) -> Result<Json> {
         );
     }
     Ok(
-        json!({"SchemaVersion":1,"ItemFormatVersion":ITEM_FORMAT_VERSION,"SourceId":"test-backend-ops","SourceSha256":SOURCE_SHA256,"GeometrySha256":geometry_hash,"Mode":mode.name(),"CpuSelection":"explicit CPU","Status":if passed{"pass"}else{"fail"},"PlanSha256":plan["PlanSha256"],"Filter":plan["Filter"],"Seed":plan["Seed"],"ExpectedGeometries":geometries.len(),"CompletedGeometries":digests.len(),"PassedGeometries":pass_count,"OriginalSkippedGeometries":skip_count,"FailedGeometries":fail_count,"ErrorGeometries":error_count,"OrderedResultSha256":planner::hash(&serde_json::to_vec(&digests)?),"TotalCrtDraws":plan["TotalCrtDraws"]}),
+        json!({"SchemaVersion":1,"ItemFormatVersion":ITEM_FORMAT_VERSION,"SourceId":"test-backend-ops","SourceSha256":SOURCE_SHA256,"GeometrySha256":geometry_hash,"Mode":mode.name(),"CpuSelection":"explicit CPU","Status":if passed{"pass"}else{"fail"},"PlanSha256":plan["PlanSha256"],"Filter":plan["Filter"],"Seed":plan["Seed"],"ExpectedGeometries":geometries.len(),"CompletedGeometries":digests.len(),"PassedGeometries":pass_count,"OriginalSkippedGeometries":skip_count,"FailedGeometries":fail_count,"ErrorGeometries":error_count,"OrderedResultSha256":planner::hash(&serde_json::to_vec(&digests)?)?,"TotalCrtDraws":plan["TotalCrtDraws"]}),
     )
 }
 
@@ -437,12 +437,12 @@ mod tests {
         let compact = compact_result(&full, directory)?;
         assert_eq!(
             compact["ResultSha256"],
-            planner::hash(&serde_json::to_vec(&full)?)
+            planner::hash(&serde_json::to_vec(&full)?)?
         );
         let persisted: Json = serde_json::from_slice(&serde_json::to_vec_pretty(&full)?)?;
         assert_eq!(
             compact["ResultSha256"],
-            planner::hash(&serde_json::to_vec(&persisted)?)
+            planner::hash(&serde_json::to_vec(&persisted)?)?
         );
         assert_eq!(persisted["MeasuredMicroseconds"], 1_000_007);
         assert_eq!(
@@ -498,20 +498,20 @@ mod tests {
                 _ => "skip",
             };
             let full = json!({"Index":index,"Class":geometry.class,"ArgumentsSha256":arguments,"CrtOffset":offset,"CrtDraws":draws,"Status":status,"SyntheticMetadataOnly":true,"FullMetrics":{"MeasuredMicroseconds":17,"InputAndOutputReceipts":["input-only synthetic hash"]}});
-            digests.push(planner::hash(&serde_json::to_vec(&full)?));
+            digests.push(planner::hash(&serde_json::to_vec(&full)?)?);
             let directory = format!("backend-{}-run-{index:05}-1-1", mode.name());
             items[index % 2].push(compact_result(&full, Path::new(&directory))?);
             offset += draws;
         }
         let mut plan = json!({"SchemaVersion":1,"SourceId":"test-backend-ops","SourceSha256":SOURCE_SHA256,"GeometrySha256":geometry_hash,"Mode":mode.name(),"CpuSelection":"explicit CPU","Seed":1,"Status":"planned-complete","ExpectedGeometries":geometries.len(),"Filter":null,"Threads":1,"Items":rows,"TotalCrtDraws":offset});
-        plan["PlanSha256"] = json!(planner::hash(&serde_json::to_vec(&plan)?));
+        plan["PlanSha256"] = json!(planner::hash(&serde_json::to_vec(&plan)?)?);
         let reports = items.into_iter().enumerate().map(|(index, items)| {
             json!({"SchemaVersion":1,"ItemFormatVersion":ITEM_FORMAT_VERSION,"SourceId":"test-backend-ops","SourceSha256":SOURCE_SHA256,"GeometrySha256":geometry_hash,"Mode":mode.name(),"CpuSelection":"explicit CPU","Partition":{"Index":index,"Count":2},"Status":"fail","PlanSha256":plan["PlanSha256"],"ExpectedGeometries":geometries.len(),"Items":items})
         }).collect();
         Ok(Synthetic {
             plan,
             reports,
-            ordered_sha256: planner::hash(&serde_json::to_vec(&digests)?),
+            ordered_sha256: planner::hash(&serde_json::to_vec(&digests)?)?,
         })
     }
 

@@ -9,7 +9,6 @@ use super::super::windows_random::{Random, hash_name64};
 use super::{Result, invalid};
 use bonsai_gguf::{Metadata as SourceMetadata, MetadataArray, MetadataValue, VerifiedModel};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -24,21 +23,21 @@ const SEED: u64 = 12345;
 
 fn sha256(path: &Path, bytes: u64) -> Result<String> {
     let mut input = File::open(path)?.take(bytes);
-    let mut hash = Sha256::new();
+    let mut hash = bonsai_native_hash::Hasher::new()?;
     let mut buffer = [0; 16384];
     loop {
         let count = input.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        hash.update(&buffer[..count]);
+        hash.update(&buffer[..count])?;
     }
     if input.limit() != 0 {
         return Err(invalid(
             "generated backend sampler hash extent is truncated",
         ));
     }
-    Ok(super::hex(&hash.finalize()))
+    Ok(super::hex(&hash.finish()?))
 }
 
 fn vocabulary(source: &SourceMetadata, output: &mut Metadata) -> Result<()> {
@@ -203,7 +202,7 @@ pub(super) fn create(source: &Path, directory: &Path) -> Result<(PathBuf, Value)
     let bytes = lora_gguf::write(&path, &metadata, &tensors, |index| {
         let tensor = &tensors[index];
         let data = weights(tensor)?;
-        observations.push(json!({"Name":tensor.name,"Shape":tensor.shape,"Bytes":data.len(),"Sha256":super::hex(&Sha256::digest(&data))}));
+        observations.push(json!({"Name":tensor.name,"Shape":tensor.shape,"Bytes":data.len(),"Sha256":super::hex(&bonsai_native_hash::hash_bytes(&data)?)}));
         Ok(data)
     })?;
     let digest = sha256(&path, bytes)?;

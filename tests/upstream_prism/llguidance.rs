@@ -6,7 +6,6 @@ use super::llama_grammar::{array, exact_fields, field, uint};
 use super::model_session::{Client, ModelSession};
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
@@ -87,7 +86,7 @@ fn verify_vocab(engine: &Engine) -> Result<std::path::PathBuf> {
     if fs::metadata(&path)?.len() != 7_818_140 {
         return Err(invalid("LLG pinned vocabulary length differs"));
     }
-    let digest = Sha256::digest(fs::read(&path)?);
+    let digest = bonsai_native_hash::hash_bytes(&fs::read(&path)?)?;
     if hex(&digest) != VOCAB_SHA {
         return Err(invalid("LLG pinned vocabulary digest differs"));
     }

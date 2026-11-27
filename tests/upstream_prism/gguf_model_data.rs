@@ -9,7 +9,6 @@ use super::engine::Engine;
 use super::llama_grammar::{array, exact_fields, field, uint};
 use super::{Result, invalid};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -653,7 +652,7 @@ impl<'a> Frozen<'a> {
         if u64::try_from(bytes.len())? != count {
             return Err(invalid("metadata artifact length mismatch"));
         }
-        let hash = Sha256::digest(&bytes);
+        let hash = bonsai_native_hash::hash_bytes(&bytes)?;
         let actual = hex::encode(hash);
         if actual != digest.to_ascii_lowercase() {
             return Err(invalid("metadata artifact SHA256 mismatch"));

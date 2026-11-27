@@ -1497,7 +1497,6 @@ mod tests {
     use std::io::{Cursor, Read};
 
     use serde::Deserialize;
-    use sha2::{Digest, Sha256};
 
     use super::{
         row, step_in_place, step_into, step_silu_in_place, step_silu_into,
@@ -1539,7 +1538,7 @@ mod tests {
         let capture: Capture = serde_json::from_str(include_str!(
             "../../tests/fixtures/swift-convolution-native.json"
         ))?;
-        let hash = hex::encode(Sha256::digest(bytes));
+        let hash = hex::encode(bonsai_native_hash::hash_bytes(bytes)?);
         assert_eq!(bytes.len(), capture.fixture_bytes);
         assert_eq!(hash, capture.fixture_sha256);
         assert_eq!(

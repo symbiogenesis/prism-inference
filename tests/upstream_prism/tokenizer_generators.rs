@@ -482,7 +482,7 @@ mod tests {
                 emitted += 1;
                 Ok(emitted < limit)
             })?;
-            if emitted != limit || super::super::lora_inputs::hash_bytes(&raw) != expected {
+            if emitted != limit || super::super::lora_inputs::hash_bytes(&raw)? != expected {
                 return Err(invalid("original Python generator input parity differs"));
             }
         }

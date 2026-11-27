@@ -9,7 +9,6 @@ use super::gguf_model_data::{Frozen, Model};
 use super::llama_grammar::{array, exact_fields, field, uint};
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -270,10 +269,10 @@ fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .as_str()
         .ok_or_else(|| invalid(format!("quantization {name} must be text")))
 }
-fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn digest(bytes: &[u8]) -> Result<String> {
+    Ok(hex::encode(bonsai_native_hash::hash_bytes(bytes)?))
 }
-fn input_summary(model: &Model) -> Value {
+fn input_summary(model: &Model) -> Result<Value> {
     let mut raw = Vec::new();
     raw.extend(model.version.to_le_bytes());
     for entry in &model.entries {
@@ -290,7 +289,9 @@ fn input_summary(model: &Model) -> Value {
         }
         raw.extend(tensor.offset.to_le_bytes());
     }
-    json!({"ArchitectureBytes":model.architecture,"Layers":model.n_layer,"Tensors":model.tensors.len(),"SplitCount":model.n_split,"SplitTensorCount":model.n_split_tensors,"ParsedDescriptorSha256":digest(&raw)})
+    Ok(
+        json!({"ArchitectureBytes":model.architecture,"Layers":model.n_layer,"Tensors":model.tensors.len(),"SplitCount":model.n_split,"SplitTensorCount":model.n_split_tensors,"ParsedDescriptorSha256":digest(&raw)?}),
+    )
 }
 fn required(provider: &mut Frozen<'_>, cache: &Path, repo: &str, quant: &str) -> Result<Model> {
     provider.fetch(cache,repo,quant)?.ok_or_else(||invalid(format!("required immutable GGUF metadata failed: {repo}/{quant}; source network skip cannot count as coverage")))
@@ -378,7 +379,11 @@ pub(super) fn run_metadata(engine: &Engine) -> Result<Value> {
     );
     output["CoverageKind"] = json!("TargetIndependentTestHelper");
     output["CachedFetchPrefixReads"] = json!(cached_prefix_reads);
-    output["Inputs"] = json!([input_summary(&q), input_summary(&glm), input_summary(&step)]);
+    output["Inputs"] = json!([
+        input_summary(&q)?,
+        input_summary(&glm)?,
+        input_summary(&step)?
+    ]);
     output["SourceCorrections"] = json!(provider.corrections());
     Ok(output)
 }
@@ -689,7 +694,7 @@ pub(super) fn run_quantization(engine: &Engine) -> Result<Value> {
                 failed.push(format!("{file} ftype{}", section.ftype));
             }
         }
-        model_rows.push(json!({"Repo":repo,"Quant":quant,"Schema":format!("{file}.schema"),"SchemaSha256":digest(&schema),"Sections":33,"Overrides":expected_overrides,"QuantizableTensors":indices.len(),"Predicates":predicates,"FailedSections":bad,"Input":input_summary(&model)}));
+        model_rows.push(json!({"Repo":repo,"Quant":quant,"Schema":format!("{file}.schema"),"SchemaSha256":digest(&schema)?,"Sections":33,"Overrides":expected_overrides,"QuantizableTensors":indices.len(),"Predicates":predicates,"FailedSections":bad,"Input":input_summary(&model)?}));
     }
     let provider_kind = if engine.is_rust() {
         "production-rust"

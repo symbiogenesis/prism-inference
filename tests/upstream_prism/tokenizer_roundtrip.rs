@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::engine::Engine;
 use super::llama_grammar::{array, exact_fields, field, uint};
@@ -114,15 +113,15 @@ fn verify_asset(engine: &Engine, asset: &Value) -> Result<std::path::PathBuf> {
     }
     let mut file = File::open(&path)?;
     let mut buffer = [0; 16 * 1024];
-    let mut hash = Sha256::new();
+    let mut hash = bonsai_native_hash::Hasher::new()?;
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        hash.update(&buffer[..count]);
+        hash.update(&buffer[..count])?;
     }
-    let digest = hex::encode(hash.finalize());
+    let digest = hex::encode(hash.finish()?);
     if digest != text(asset, "Sha256")? {
         return Err(invalid("roundtrip vocabulary digest mismatch"));
     }

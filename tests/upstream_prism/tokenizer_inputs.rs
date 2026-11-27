@@ -46,7 +46,7 @@ fn read_locked(path: &Path, length: u64, sha: &str) -> Result<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     File::open(path)?.take(length + 1).read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len())? != length || super::lora_inputs::hash_bytes(&bytes) != sha {
+    if u64::try_from(bytes.len())? != length || super::lora_inputs::hash_bytes(&bytes)? != sha {
         return Err(invalid(format!(
             "Tokenizer input identity differs: {}",
             path.display()
@@ -141,7 +141,7 @@ pub(super) fn materialize(bytes: &[u8], row: &Value) -> Result<Vec<u8>> {
         .get("Target")
         .ok_or_else(|| invalid("Tokenizer reconstruction target missing"))?;
     if u64::try_from(output.len())? != number(target, "Bytes")?
-        || super::lora_inputs::hash_bytes(output.as_bytes()) != string(target, "Sha256")?
+        || super::lora_inputs::hash_bytes(output.as_bytes())? != string(target, "Sha256")?
         || target["ExactOriginal"] != true
     {
         return Err(invalid(
@@ -280,6 +280,6 @@ pub(super) fn prepare(engine: &Engine) -> Result<Prepared> {
     }
     Ok(Prepared {
         cases: result,
-        receipt: json!({"AssetLockSha256":super::lora_inputs::hash_bytes(LOCK.as_bytes()),"VerifiedPublisherFiles":files.len(),"VerifiedPublisherBytes":total,"PinnedSourceVocabularies":13,"GeneratedVocabFixtures":generated,"SourceDocuments":documents,"MptCanonicalDependency":manifest["MptCanonicalDependency"],"Cases":receipts}),
+        receipt: json!({"AssetLockSha256":super::lora_inputs::hash_bytes(LOCK.as_bytes())?,"VerifiedPublisherFiles":files.len(),"VerifiedPublisherBytes":total,"PinnedSourceVocabularies":13,"GeneratedVocabFixtures":generated,"SourceDocuments":documents,"MptCanonicalDependency":manifest["MptCanonicalDependency"],"Cases":receipts}),
     })
 }

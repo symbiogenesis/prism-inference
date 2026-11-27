@@ -8,13 +8,12 @@ use super::program::Program;
 use super::random::{Mt19937, SeedLedger};
 use super::tensor::Tensor;
 use serde_json::{Value as Json, json};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 fn write_floats(writer: &mut impl Write, values: &[f32]) -> Result<String> {
-    let mut hash = Sha256::new();
+    let mut hash = bonsai_native_hash::Hasher::new()?;
     let mut bytes = vec![0_u8; 64 * 1024];
     for values in values.chunks(bytes.len() / 4) {
         for (value, destination) in values.iter().zip(bytes.as_chunks_mut::<4>().0) {
@@ -22,9 +21,9 @@ fn write_floats(writer: &mut impl Write, values: &[f32]) -> Result<String> {
         }
         let encoded = &bytes[..values.len() * 4];
         writer.write_all(encoded)?;
-        hash.update(encoded);
+        hash.update(encoded)?;
     }
-    Ok(super::host::encode_hex(&hash.finalize()))
+    Ok(super::host::encode_hex(&hash.finish()?))
 }
 
 pub(super) struct Inputs {
@@ -64,20 +63,20 @@ impl Inputs {
             return Err(invalid("source input exceeds bounded file extent"));
         }
         let mut file = File::open(path)?;
-        let mut hash = Sha256::new();
+        let mut hash = bonsai_native_hash::Hasher::new()?;
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
             let count = file.read(&mut buffer)?;
             if count == 0 {
                 break;
             }
-            hash.update(&buffer[..count]);
+            hash.update(&buffer[..count])?;
         }
         self.record_digest(
             path,
             purpose,
             size,
-            &super::host::encode_hex(&hash.finalize()),
+            &super::host::encode_hex(&hash.finish()?),
         )
     }
 
@@ -103,7 +102,7 @@ impl Inputs {
             &path,
             purpose,
             bytes.len() as u64,
-            &super::host::encode_hex(&Sha256::digest(bytes)),
+            &super::host::encode_hex(&bonsai_native_hash::hash_bytes(bytes)?),
         )?;
         Ok(path)
     }
@@ -415,7 +414,7 @@ mod tests {
             assert_eq!(observed, expected);
             assert_eq!(
                 digest,
-                super::super::host::encode_hex(&Sha256::digest(&expected))
+                super::super::host::encode_hex(&bonsai_native_hash::hash_bytes(&expected)?)
             );
         }
         Ok(())

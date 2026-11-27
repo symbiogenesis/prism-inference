@@ -4,7 +4,6 @@
 use super::super::{Result, invalid};
 use super::host::encode_hex;
 use serde_json::{Value as Json, json};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -25,7 +24,7 @@ fn digest(path: &Path, bytes: u64) -> Result<String> {
             .checked_add(1)
             .ok_or_else(|| invalid("artifact size overflow"))?,
     );
-    let mut hash = Sha256::new();
+    let mut hash = bonsai_native_hash::Hasher::new()?;
     let mut count = 0_u64;
     let mut buffer = vec![0_u8; 65_536];
     loop {
@@ -34,12 +33,12 @@ fn digest(path: &Path, bytes: u64) -> Result<String> {
             break;
         }
         count += u64::try_from(read)?;
-        hash.update(&buffer[..read]);
+        hash.update(&buffer[..read])?;
     }
     if count != bytes {
         return Err(invalid("backend artifact extent changed while hashing"));
     }
-    Ok(encode_hex(&hash.finalize()))
+    Ok(encode_hex(&hash.finish()?))
 }
 
 impl Budget {
@@ -92,7 +91,7 @@ impl Budget {
         let bytes = serde_json::to_vec_pretty(&receipt)?;
         fs::write(owned.join("retention-receipt.json"), &bytes)?;
         Ok(
-            json!({"Receipt":"retention-receipt.json","ReceiptSha256":encode_hex(&Sha256::digest(&bytes)),"RetainedBytes":retained,"PrunedBytes":deleted,"PartitionRetainedBytes":self.retained_bytes}),
+            json!({"Receipt":"retention-receipt.json","ReceiptSha256":encode_hex(&bonsai_native_hash::hash_bytes(&bytes)?),"RetainedBytes":retained,"PrunedBytes":deleted,"PartitionRetainedBytes":self.retained_bytes}),
         )
     }
 }

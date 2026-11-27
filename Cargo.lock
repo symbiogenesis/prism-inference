@@ -132,7 +132,6 @@ dependencies = [
  "bonsai-ternary",
  "hex",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -1104,7 +1103,6 @@ dependencies = [
  "sentencepiece-rs",
  "serde",
  "serde_json",
- "sha2",
  "tokenizers",
  "unicode-normalization-alignments",
 ]

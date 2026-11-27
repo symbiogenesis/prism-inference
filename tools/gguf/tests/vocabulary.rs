@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 use bonsai_gguf::{MetadataArray, MetadataValue, Result, VerifiedModel, read_vocabulary};
-use sha2::{Digest, Sha256};
 use std::fs;
 
 mod support;
@@ -14,8 +13,8 @@ fn text(output: &mut Vec<u8>, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn digest(bytes: &[u8]) -> Result<String> {
+    Ok(hex::encode(bonsai_native_hash::hash_bytes(bytes)?))
 }
 
 #[test]
@@ -38,7 +37,7 @@ fn legacy_vocabulary_metadata_is_verified_without_relaxing_model_execution() -> 
     }
     fs::write(&path, &bytes)?;
     let size = u64::try_from(bytes.len())?;
-    let hash = digest(&bytes);
+    let hash = digest(&bytes)?;
     let metadata = read_vocabulary(&path, size, &hash, 16_384)?;
     assert_eq!(
         metadata.get("tokenizer.ggml.tokens"),
@@ -56,14 +55,14 @@ fn legacy_vocabulary_metadata_is_verified_without_relaxing_model_execution() -> 
         bytes[4..8].copy_from_slice(&version.to_le_bytes());
         fs::write(&path, &bytes)?;
         assert_eq!(
-            read_vocabulary(&path, size, &digest(&bytes), 16_384).is_ok(),
+            read_vocabulary(&path, size, &digest(&bytes)?, 16_384).is_ok(),
             version == 3
         );
     }
     bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
     bytes[8..16].copy_from_slice(&1_u64.to_le_bytes());
     fs::write(&path, &bytes)?;
-    assert!(read_vocabulary(&path, size, &digest(&bytes), 16_384).is_err());
+    assert!(read_vocabulary(&path, size, &digest(&bytes)?, 16_384).is_err());
     scratch.close()?;
     Ok(())
 }

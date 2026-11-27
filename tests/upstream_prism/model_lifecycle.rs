@@ -7,7 +7,6 @@ use super::engine::Engine;
 use super::model_session::{Client, ModelSession, Reply};
 use super::{Result, invalid, result};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
 
@@ -54,7 +53,7 @@ fn verify_artifact(path: &Path, length: u64, sha256: &str) -> Result<()> {
         file.metadata()?.len() == length,
         "model artifact length differs from its lock",
     )?;
-    let mut hash = Sha256::new();
+    let mut hash = bonsai_native_hash::Hasher::new()?;
     let mut buffer = [0_u8; 8192];
     let mut total = 0_u64;
     loop {
@@ -66,9 +65,9 @@ fn verify_artifact(path: &Path, length: u64, sha256: &str) -> Result<()> {
             .checked_add(u64::try_from(count)?)
             .ok_or_else(|| invalid("model artifact length overflow"))?;
         verify(total <= length, "model artifact grew while hashing")?;
-        hash.update(&buffer[..count]);
+        hash.update(&buffer[..count])?;
     }
-    let actual = hex::encode(hash.finalize());
+    let actual = hex::encode(hash.finish()?);
     verify(
         total == length && actual == sha256,
         "model artifact SHA-256 differs from its lock",

@@ -8,7 +8,6 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::gguf_model::{GgufValue, ModelData, TensorEntry, f64_to_f32};
 use crate::{Result, invalid};
@@ -46,7 +45,7 @@ pub(super) fn export_lora_in_process(
     if !(24..=256 * 1024 * 1024).contains(&length) {
         return Err(invalid("merged production GGUF extent differs"));
     }
-    let sha = hex::encode(Sha256::digest(&bytes));
+    let sha = hex::encode(bonsai_native_hash::hash_bytes(&bytes)?);
     Ok(json!({
         "Tool": "in-process-reference-lora-merge",
         "Status": 0,

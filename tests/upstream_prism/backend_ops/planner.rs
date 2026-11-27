@@ -9,14 +9,15 @@ use super::prepare::{Mode, Prepared, prepare};
 use super::program::{self, Geometry, Program, SOURCE_SHA256};
 use super::transport;
 use serde_json::{Value as Json, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn hash(bytes: &[u8]) -> String {
-    super::host::encode_hex(&Sha256::digest(bytes))
+pub(super) fn hash(bytes: &[u8]) -> Result<String> {
+    Ok(super::host::encode_hex(&bonsai_native_hash::hash_bytes(
+        bytes,
+    )?))
 }
 pub(super) fn arguments_hash(geometry: &Geometry) -> Result<String> {
-    Ok(hash(&serde_json::to_vec(&geometry.arguments)?))
+    hash(&serde_json::to_vec(&geometry.arguments)?)
 }
 pub(super) fn extent(mode: Mode) -> Result<(&'static Program, &'static [Geometry], &'static str)> {
     let (program, geometries) = program::load().map_err(invalid)?;
@@ -63,7 +64,7 @@ pub(super) fn receipt(
         contexts.push(json!({"Context":context,"Tensors":tensors.iter().map(|tensor|json!({"Id":tensor.id,"Type":tensor.kind,"NE":tensor.ne,"NB":tensor.nb,"Op":tensor.op,"Flags":tensor.flags,"Name":tensor.name,"Sources":tensor.sources,"OpParamsHex":tensor.op_params_hex,"ViewSource":tensor.view_source,"ViewOffset":tensor.view_offset,"NBytes":tensor.bytes,"NElements":tensor.elements})).collect::<Vec<_>>()}));
     }
     Ok(
-        json!({"Index":index,"Class":geometry.class,"ArgumentsSha256":arguments_hash(geometry)?,"ShouldInitialize":prepared.initialize,"CrtDraws":prepared.crt_draws,"Supported":prepared.supported,"SkipReason":prepared.skip,"Operation":prepared.operation,"Variables":prepared.variables,"ReferenceAvailable":prepared.reference_available,"MetadataSha256":hash(&serde_json::to_vec(&contexts)?),"SourceAssertions":host.assertions}),
+        json!({"Index":index,"Class":geometry.class,"ArgumentsSha256":arguments_hash(geometry)?,"ShouldInitialize":prepared.initialize,"CrtDraws":prepared.crt_draws,"Supported":prepared.supported,"SkipReason":prepared.skip,"Operation":prepared.operation,"Variables":prepared.variables,"ReferenceAvailable":prepared.reference_available,"MetadataSha256":hash(&serde_json::to_vec(&contexts)?)?,"SourceAssertions":host.assertions}),
     )
 }
 
@@ -223,7 +224,7 @@ pub(super) fn aggregate(plans: &[Json]) -> Result<Json> {
         ordered.push(row);
     }
     let mut combined = json!({"SchemaVersion":1,"SourceId":"test-backend-ops","SourceSha256":SOURCE_SHA256,"GeometrySha256":geometry_hash,"Mode":mode.name(),"CpuSelection":"explicit CPU","Seed":1,"Status":"planned-complete","ExpectedGeometries":geometries.len(),"Filter":first["Filter"],"Threads":first["Threads"],"Items":ordered,"TotalCrtDraws":offset});
-    combined["PlanSha256"] = json!(hash(&serde_json::to_vec(&combined)?));
+    combined["PlanSha256"] = json!(hash(&serde_json::to_vec(&combined)?)?);
     Ok(combined)
 }
 
@@ -235,7 +236,7 @@ pub(super) fn validate(plan: &Json, mode: Mode) -> Result<&[Json]> {
         .ok_or_else(|| invalid("backend aggregate plan is not an object"))?
         .remove("PlanSha256")
         .ok_or_else(|| invalid("backend aggregate plan digest missing"))?;
-    if claimed != hash(&serde_json::to_vec(&unsigned)?)
+    if claimed != hash(&serde_json::to_vec(&unsigned)?)?
         || plan["SchemaVersion"] != 1
         || plan["SourceId"] != "test-backend-ops"
         || plan["SourceSha256"] != SOURCE_SHA256

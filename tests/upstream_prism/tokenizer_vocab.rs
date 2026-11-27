@@ -69,7 +69,7 @@ fn pre(reference: &Reference) -> Result<(String, String)> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let hash = super::lora_inputs::hash_bytes(representation.as_bytes());
+    let hash = super::lora_inputs::hash_bytes(representation.as_bytes())?;
     // The original generated function uses ordered if statements; duplicate
     // fingerprints intentionally retain the final assignment.
     let label = inputs["HashPre"]

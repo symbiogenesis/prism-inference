@@ -3,7 +3,6 @@
 //! pinned examples/convert-llama2c-to-ggml. No quantizer/model API is called.
 use super::engine::Engine;
 use super::{Result, invalid};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -15,16 +14,16 @@ fn require(v: bool, message: &str) -> Result<()> {
 }
 fn digest(path: &Path) -> Result<String> {
     let mut input = File::open(path)?;
-    let mut hash = Sha256::new();
+    let mut hash = bonsai_native_hash::Hasher::new()?;
     let mut block = [0_u8; 8192];
     loop {
         let n = input.read(&mut block)?;
         if n == 0 {
             break;
         }
-        hash.update(&block[..n]);
+        hash.update(&block[..n])?;
     }
-    Ok(hex::encode(hash.finalize()))
+    Ok(hex::encode(hash.finish()?))
 }
 struct Cursor<'a> {
     bytes: &'a [u8],

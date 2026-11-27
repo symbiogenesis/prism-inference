@@ -6,7 +6,6 @@ use std::fs;
 use std::path::PathBuf;
 
 use bonsai_gguf::{NARIQ_DIALECT, PRISM_DIALECT, Result, VerifiedModel, inspect};
-use sha2::{Digest, Sha256};
 
 mod support;
 use support::ScratchDirectory;
@@ -69,13 +68,13 @@ fn build_gguf(specs: &[(&str, &[u64], u32, usize)]) -> Result<Vec<u8>> {
     Ok(header)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+fn sha256_hex(bytes: &[u8]) -> Result<String> {
+    let digest = bonsai_native_hash::hash_bytes(bytes)?;
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         let _ = write!(out, "{byte:02x}");
     }
-    out
+    Ok(out)
 }
 
 fn write_fixture(
@@ -85,7 +84,7 @@ fn write_fixture(
 ) -> Result<(PathBuf, u64, String)> {
     let path = dir.path().join(name);
     fs::write(&path, bytes)?;
-    Ok((path, u64::try_from(bytes.len())?, sha256_hex(bytes)))
+    Ok((path, u64::try_from(bytes.len())?, sha256_hex(bytes)?))
 }
 
 #[test]

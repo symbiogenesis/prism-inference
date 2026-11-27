@@ -16,7 +16,6 @@ use bonsai_gguf::{Metadata, MetadataArray};
 use bonsai_prism_runtime::tokenizer::gguf::GgufTokenizer;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::llama_grammar::{array, exact_fields, field, uint};
 use super::{Result, invalid};
@@ -105,16 +104,16 @@ pub(super) fn metadata(path: &Path) -> Result<Metadata> {
     if !file.metadata()?.is_file() || bytes > 64 * 1024 * 1024 {
         return Err(invalid("vocabulary artifact is not a bounded regular file"));
     }
-    let mut hash = Sha256::new();
+    let mut hash = bonsai_native_hash::Hasher::new()?;
     let mut buffer = [0; 16384];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        hash.update(&buffer[..count]);
+        hash.update(&buffer[..count])?;
     }
-    let digest = hex::encode(hash.finalize());
+    let digest = hex::encode(hash.finish()?);
     bonsai_gguf::read_vocabulary(path, bytes, &digest, 128 * 1024 * 1024)
 }
 

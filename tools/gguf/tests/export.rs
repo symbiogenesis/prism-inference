@@ -11,7 +11,6 @@ use bonsai_gguf::{
     CODEC_COMMIT, MetadataArray, MetadataValue, PRISM_DIALECT, Result, VerifiedModel, export_ptq1,
     inspect,
 };
-use sha2::{Digest, Sha256};
 
 mod support;
 use support::ScratchDirectory;
@@ -118,8 +117,8 @@ fn scratch() -> Result<ScratchDirectory> {
     Ok(ScratchDirectory::new()?)
 }
 
-fn sha(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn sha(bytes: &[u8]) -> Result<String> {
+    Ok(hex::encode(bonsai_native_hash::hash_bytes(bytes)?))
 }
 
 fn convert(source: &Path, output: &Path, bytes: &[u8]) -> Result<serde_json::Value> {
@@ -127,7 +126,7 @@ fn convert(source: &Path, output: &Path, bytes: &[u8]) -> Result<serde_json::Val
         source,
         output,
         u64::try_from(bytes.len())?,
-        &sha(bytes),
+        &sha(bytes)?,
         Duration::from_secs(30),
     )
 }
@@ -203,7 +202,7 @@ fn inspection_cursor_preserves_offsets_and_hashes_across_metadata_paths() -> Res
     bytes.resize(data_offset, 0);
     bytes.extend([1, 2, 3, 4]);
     fs::write(&source, &bytes)?;
-    let digest = sha(&bytes);
+    let digest = sha(&bytes)?;
     let report = inspect(
         &source,
         "Stock",
@@ -221,11 +220,11 @@ fn inspection_cursor_preserves_offsets_and_hashes_across_metadata_paths() -> Res
     );
     assert_eq!(
         report["TokenizerMetadataSha256"],
-        sha(&bytes[tokenizer_start..tokenizer_end])
+        sha(&bytes[tokenizer_start..tokenizer_end])?
     );
     assert_eq!(
         report["EmbeddedTemplates"]["tokenizer.chat_template"]["Sha256"],
-        sha(long_text.as_bytes())
+        sha(long_text.as_bytes())?
     );
     assert_eq!(
         report["Scalars"]["synthetic.last"],
@@ -247,7 +246,7 @@ fn inspection_cursor_preserves_offsets_and_hashes_across_metadata_paths() -> Res
     // refills, including report mode where the array itself is not retained.
     bytes[boolean_start + 65_536] = 2;
     fs::write(&source, &bytes)?;
-    let digest = sha(&bytes);
+    let digest = sha(&bytes)?;
     let length = u64::try_from(bytes.len())?;
     assert!(inspect(&source, "Stock", false, length, &digest).is_err());
     assert!(VerifiedModel::open(&source, "Stock", length, &digest, 8 * 1024 * 1024).is_err());
@@ -307,7 +306,7 @@ fn streamed_export_matches_independent_wire_bytes_across_batch_boundary() -> Res
     assert_eq!(report["ConvertedBlocks"], 1929);
     assert_eq!(report["ConvertedTensorCount"], 2);
     assert_eq!(report["OutputBytes"], u64::try_from(converted.len())?);
-    assert_eq!(report["OutputSha256"], sha(&converted));
+    assert_eq!(report["OutputSha256"], sha(&converted)?);
     assert_eq!(report["WorkingBufferBytes"], 193_202);
     assert_eq!(report["ExactPq2ReconstructionVerified"], true);
     assert_eq!(report["NonPq2TensorBytesCopiedVerbatim"], true);
@@ -316,7 +315,7 @@ fn streamed_export_matches_independent_wire_bytes_across_batch_boundary() -> Res
         PRISM_DIALECT,
         false,
         u64::try_from(converted.len())?,
-        &sha(&converted),
+        &sha(&converted)?,
     )?;
     assert_eq!(inspected["Scalars"]["general.file_type"], 143);
     assert_eq!(
@@ -392,7 +391,7 @@ fn census_counts_raw_symbols_across_batches_and_disqualifies_invalid_scales() ->
         PRISM_DIALECT,
         true,
         u64::try_from(fixture.bytes.len())?,
-        &sha(&fixture.bytes),
+        &sha(&fixture.bytes)?,
     )?;
     let census = &report["Pq2Census"];
     assert_eq!(census["Blocks"], 1929);

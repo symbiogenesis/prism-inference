@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 
 use super::{Result, invalid};
 
@@ -502,7 +501,7 @@ impl Resolver {
             )));
         }
         if file.oid.len() == 64 && file.oid.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let actual = sha256_hex(&response.body);
+            let actual = sha256_hex(&response.body)?;
             if !actual.eq_ignore_ascii_case(&file.oid) {
                 return Err(invalid("HF downloaded file SHA-256 mismatch"));
             }
@@ -1253,8 +1252,8 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
     Err(invalid("unable to allocate unique temporary cache file"))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn sha256_hex(bytes: &[u8]) -> Result<String> {
+    Ok(hex::encode(bonsai_native_hash::hash_bytes(bytes)?))
 }
 
 // ============================================================================
@@ -2148,7 +2147,7 @@ fn verify_cached_bytes(
             "cached/downloaded byte count {actual_len} differs from ExpectedBytes {expected_len}"
         )));
     }
-    let digest = sha256_hex(bytes);
+    let digest = sha256_hex(bytes)?;
     if let Some(expected_hash) = expected_sha256
         && digest != expected_hash
     {
@@ -2800,7 +2799,7 @@ mod tests {
     fn http_client_handles_head_and_redirect_chain_with_sha256() -> Result<()> {
         let cache = TempDirGuard::new("prism-mr-http-1")?;
         let payload = b"0123456789abcdef";
-        let full_sha = sha256_hex(payload);
+        let full_sha = sha256_hex(payload)?;
 
         let (head_base, head_thread) = spawn_scripted_http(|req| {
             if req.request_line.starts_with("HEAD ") {
@@ -2880,7 +2879,7 @@ mod tests {
     fn http_client_handles_etag_304_range_206_offline_and_sha_mismatch() -> Result<()> {
         let cache = TempDirGuard::new("prism-mr-http-2")?;
         let payload = b"0123456789abcdef";
-        let full_sha = sha256_hex(payload);
+        let full_sha = sha256_hex(payload)?;
         fs::create_dir_all(cache.path().join("sub"))?;
         fs::write(cache.path().join("sub/model.bin"), payload)?;
 

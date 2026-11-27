@@ -778,8 +778,8 @@ mod tests {
                 .ok_or_else(|| invalid("native pipe API unavailable"))?;
             assert_eq!(actual, expected);
             assert_eq!(
-                planner::hash(&serde_json::to_vec(&actual)?),
-                planner::hash(&serde_json::to_vec(&expected)?)
+                planner::hash(&serde_json::to_vec(&actual)?)?,
+                planner::hash(&serde_json::to_vec(&expected)?)?
             );
         }
         let (_, geometries, _) = planner::extent(Mode::Eval)?;

@@ -4,7 +4,6 @@ use std::io::{Cursor, Read};
 use std::sync::Arc;
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::{
     BF16, F16, F32, MatvecBackend, MatvecScratch, decode_row_into, matvec_into, packed_dot,
@@ -96,7 +95,7 @@ fn aligned_pinned_float_projections_match_native_without_changing_generic_or_bf1
         "701b354a38b25e5c6dc57a1559f71cd26b2d0f8d69c1576a0e77a59a4273d2ab"
     );
     assert_eq!(bytes.len(), capture.fixture_bytes);
-    let hash = hex::encode(Sha256::digest(bytes));
+    let hash = hex::encode(bonsai_native_hash::hash_bytes(bytes)?);
     assert_eq!(hash, capture.fixture_sha256);
     assert_eq!(
         hash,

@@ -3,7 +3,6 @@
 use super::windows_random::{Normal, Random, hash_name64};
 use super::{Result, invalid};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -190,7 +189,7 @@ pub(super) fn weights(
         let seed32 = u32::from_le_bytes(combined.to_le_bytes()[..4].try_into()?);
         let mut random = Random::new(seed32);
         let mut normal = Normal::new(0.0, 1e-2);
-        let mut hasher = Sha256::new();
+        let mut hasher = bonsai_native_hash::Hasher::new()?;
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -204,15 +203,15 @@ pub(super) fn weights(
             bytes.extend_from_slice(&value.to_bits().to_le_bytes());
             if bytes.len() == 8192 {
                 file.write_all(&bytes)?;
-                hasher.update(&bytes);
+                hasher.update(&bytes)?;
                 bytes.clear();
             }
         }
         file.write_all(&bytes)?;
-        hasher.update(&bytes);
+        hasher.update(&bytes)?;
         drop(file);
         state.bytes += length;
-        state.tensors.push(json!({"Spec":spec,"Seed32":seed32,"InputSHA256":hex(&hasher.finalize()),"FloatInputBytes":length}));
+        state.tensors.push(json!({"Spec":spec,"Seed32":seed32,"InputSHA256":hex(&hasher.finish()?),"FloatInputBytes":length}));
         drop(state);
         Ok(json!({"DataFile":path,"Length":length,"Encoding":"float32-le"}))
     });

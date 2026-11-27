@@ -7281,8 +7281,6 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::sync::Arc;
 
-    use sha2::{Digest, Sha256};
-
     use super::{
         Arithmetic, Geometry, KV_PAGE_TOKENS, KvCache, LayerState, MAX_STATE_BYTES,
         ProjectionScratch, Transforms, append_decayed_head, copy_state, dot, dot_f16,
@@ -7312,7 +7310,7 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/swift-gdn-parity.bin");
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/swift-gdn-parity.json"))?;
-        let hash = hex::encode(Sha256::digest(bytes));
+        let hash = hex::encode(bonsai_native_hash::hash_bytes(bytes)?);
         assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
         assert_eq!(
             provenance["runtime_commit"].as_str(),
@@ -8881,7 +8879,7 @@ mod tests {
         // Git may check text fixtures out with CRLF. Pin the captured contents
         // with LF normalization while preserving every numeric oracle word.
         let normalized = coefficients.replace("\r\n", "\n");
-        let hash = hex::encode(Sha256::digest(normalized.as_bytes()));
+        let hash = hex::encode(bonsai_native_hash::hash_bytes(normalized.as_bytes())?);
         assert_eq!(
             hash,
             "e58b3c96b6ce704361d7a397775817959793e2a6cbaa78598e8a07075548ae93"
@@ -9020,7 +9018,7 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/swift-rope-inplace.bin");
         let provenance: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/swift-rope-inplace.json"))?;
-        let hash = hex::encode(Sha256::digest(bytes));
+        let hash = hex::encode(bonsai_native_hash::hash_bytes(bytes)?);
         assert_eq!(Some(hash.as_str()), provenance["fixture_sha256"].as_str());
         assert_eq!(
             hash,

@@ -162,15 +162,13 @@ pub(super) fn run(engine: &Engine) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use sha2::{Digest, Sha256};
-
     use super::*;
 
     #[test]
     fn frozen_corpus_contains_only_original_inputs_in_original_order() -> Result<()> {
         assert_eq!(INPUTS.len(), 167_652);
         assert_eq!(
-            Sha256::digest(INPUTS).as_slice(),
+            bonsai_native_hash::hash_bytes(INPUTS)?.as_slice(),
             &[
                 0xa3, 0x7e, 0x4e, 0x61, 0x33, 0x36, 0x47, 0xff, 0x52, 0x8a, 0xc5, 0x97, 0xe8, 0xbb,
                 0xa7, 0x5b, 0x94, 0x5a, 0xc0, 0x25, 0x54, 0x30, 0xa8, 0x73, 0x32, 0x71, 0x9f, 0x34,

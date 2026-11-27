@@ -2507,7 +2507,6 @@ struct DriverArtifact {
 #[cfg(feature = "cli")]
 impl DriverArtifact {
     fn new(model: &Model) -> Result<Self> {
-        use sha2::{Digest, Sha256};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -2522,7 +2521,7 @@ impl DriverArtifact {
             path: directory.join("fixture.gguf"),
             directory,
             bytes: u64::try_from(bytes.len())?,
-            digest: hex::encode(Sha256::digest(&bytes)),
+            digest: hex::encode(bonsai_native_hash::hash_bytes(&bytes)?),
         };
         std::fs::write(&artifact.path, bytes)?;
         Ok(artifact)

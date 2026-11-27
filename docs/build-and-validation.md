@@ -120,6 +120,14 @@ and tool crates enable extra `windows-sys`, `serde_json`, and `syn` features. A 
 crate is omitted so publishable crates pass `cargo package` without path dependencies and
 `--no-default-features --lib` stays minimal.
 
+Omit `--release` during local inner-loop `check`, `build`, `clippy`, and focused `test`
+invocations. `[profile.dev]` and `[profile.test]` share `opt-level = 1`,
+`debug = "line-tables-only"`, and incremental workspace compilation with `opt-level = 2`,
+`debug = 0` dependencies. That lets `build` and `test` reuse compiled dependencies, cuts
+Windows `.pdb` I/O while keeping `file:line` backtraces, and avoids full O3 rebuilds and
+the AArch64 Windows incremental + O3 SEH unwind bug; reserve `--release` for CI and
+production builds.
+
 ## Build a checkout
 
 Run builds and checks from a unique system-temp directory, with absolute

@@ -104,9 +104,28 @@ required-features = ["cli"]
 overflow-checks = true
 debug-assertions = false
 
-[profile.test]
+# Match dev and test profiles so check/build/run and test share compiled
+# dependencies, keep workspace crates incremental below opt-level = 3 (avoiding
+# the AArch64 Windows incremental + O3 SEH unwind bug), and cut Windows PDB I/O.
+[profile.dev]
+opt-level = 1
 overflow-checks = true
 debug-assertions = true
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = 0
+
+[profile.test]
+opt-level = 1
+overflow-checks = true
+debug-assertions = true
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+opt-level = 2
+debug = 0
 
 [lints]
 workspace = true

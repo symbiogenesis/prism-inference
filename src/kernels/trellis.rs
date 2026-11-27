@@ -11,7 +11,17 @@ use crate::{Result, invalid};
 use bonsai_gguf::{MetadataArray, MetadataValue};
 
 use super::parallel_rows::RowParallelism;
+use super::prefill::MAX_TILE_TOKENS;
 use super::{F16, F32, I32, MatvecBackend, scale, trellis_bits};
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+use fearless_simd::{Neon, f32x4, prelude::*, u32x4};
 
 /// Maximum number of fused output slices supported by a `NariQ` trellis descriptor.
 pub(crate) const MAX_PARTS: usize = 8;
@@ -57,6 +67,77 @@ const fn make_paley<const M: usize>() -> [[i8; M]; M] {
 const H_12: [[i8; 12]; 12] = make_paley::<12>();
 const H_20: [[i8; 20]; 20] = make_paley::<20>();
 const H_68: [[i8; 68]; 68] = make_paley::<68>();
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+const fn make_paley_masks<const M: usize>(mat: &[[i8; M]; M], transpose: bool) -> [[u32; M]; M] {
+    let mut out = [[0_u32; M]; M];
+    let mut a = 0_usize;
+    while a < M {
+        let mut b = 0_usize;
+        while b < M {
+            let sign = if transpose { mat[b][a] } else { mat[a][b] };
+            out[a][b] = if sign > 0 { 0_u32 } else { 0x8000_0000_u32 };
+            b += 1;
+        }
+        a += 1;
+    }
+    out
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+static H_12_MASKS: [[u32; 12]; 12] = make_paley_masks::<12>(&H_12, false);
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+static H_12_T_MASKS: [[u32; 12]; 12] = make_paley_masks::<12>(&H_12, true);
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+static H_20_MASKS: [[u32; 20]; 20] = make_paley_masks::<20>(&H_20, false);
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+static H_20_T_MASKS: [[u32; 20]; 20] = make_paley_masks::<20>(&H_20, true);
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+static H_68_MASKS: [[u32; 68]; 68] = make_paley_masks::<68>(&H_68, false);
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+static H_68_T_MASKS: [[u32; 68]; 68] = make_paley_masks::<68>(&H_68, true);
 
 #[inline]
 #[expect(
@@ -158,7 +239,7 @@ impl Parts {
     }
 }
 
-fn fwht_scaled(values: &mut [f32], block: usize, scale_factor: f32) {
+fn fwht_scaled_scalar(values: &mut [f32], block: usize, scale_factor: f32) {
     let mut half = 1_usize;
     while half < block {
         let step = half * 2;
@@ -176,6 +257,128 @@ fn fwht_scaled(values: &mut [f32], block: usize, scale_factor: f32) {
     for slot in values.iter_mut() {
         *slot *= scale_factor;
     }
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn fwht_scaled_neon(neon: Neon, values: &mut [f32], block: usize, scale_factor: f32) {
+    if !block.is_power_of_two() || !values.len().is_multiple_of(block) {
+        fwht_scaled_scalar(values, block, scale_factor);
+        return;
+    }
+    let scale_vec = f32x4::splat(neon, scale_factor);
+    if block == 1 {
+        let (chunks, tail) = values.as_chunks_mut::<4>();
+        for c4 in chunks {
+            let scaled = f32x4::from_slice(neon, c4) * scale_vec;
+            scaled.store_slice(c4);
+        }
+        for slot in tail {
+            *slot *= scale_factor;
+        }
+        return;
+    }
+    if block == 2 {
+        let (chunks, tail) = values.as_chunks_mut::<4>();
+        for c4 in chunks {
+            let v = f32x4::from_slice(neon, c4);
+            let even = v.unzip_low(v);
+            let odd = v.unzip_high(v);
+            let sums = even + odd;
+            let diffs = even - odd;
+            let out = sums.zip_low(diffs) * scale_vec;
+            out.store_slice(c4);
+        }
+        fwht_scaled_scalar(tail, 2, scale_factor);
+        return;
+    }
+    if block == 4 {
+        for c4 in values.as_chunks_mut::<4>().0 {
+            let vec4 = f32x4::from_slice(neon, c4);
+            let even = vec4.unzip_low(vec4);
+            let odd = vec4.unzip_high(vec4);
+            let sums = even + odd;
+            let diffs = even - odd;
+            let lhs = sums.unzip_low(diffs);
+            let rhs = sums.unzip_high(diffs);
+            let plus = lhs + rhs;
+            let minus = lhs - rhs;
+            let out = plus.unzip_low(minus) * scale_vec;
+            out.store_slice(c4);
+        }
+        return;
+    }
+
+    // `block >= 8` and `values.len()` is a multiple of `block`, so 8-lane chunks cover all elements.
+    for c8 in values.as_chunks_mut::<8>().0 {
+        let v0 = f32x4::from_slice(neon, &c8[0..4]);
+        let v1 = f32x4::from_slice(neon, &c8[4..8]);
+        let even = v0.unzip_low(v1);
+        let odd = v0.unzip_high(v1);
+        let sums = even + odd;
+        let diffs = even - odd;
+        let lhs = sums.unzip_low(diffs);
+        let rhs = sums.unzip_high(diffs);
+        let plus = lhs + rhs;
+        let minus = lhs - rhs;
+        let lo = plus.unzip_low(minus);
+        let hi = plus.unzip_high(minus);
+        let mut z0 = lo + hi;
+        let mut z1 = lo - hi;
+        if block == 8 {
+            z0 *= scale_vec;
+            z1 *= scale_vec;
+        }
+        z0.store_slice(&mut c8[0..4]);
+        z1.store_slice(&mut c8[4..8]);
+    }
+
+    let mut half = 8_usize;
+    while half < block {
+        let step = half * 2;
+        let final_stage = step == block;
+        for chunk in values.chunks_exact_mut(step) {
+            let (left, right) = chunk.split_at_mut(half);
+            for (l4, r4) in left
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(right.as_chunks_mut::<4>().0.iter_mut())
+            {
+                let a = f32x4::from_slice(neon, l4);
+                let b = f32x4::from_slice(neon, r4);
+                let mut sum = a + b;
+                let mut diff = a - b;
+                if final_stage {
+                    sum *= scale_vec;
+                    diff *= scale_vec;
+                }
+                sum.store_slice(l4);
+                diff.store_slice(r4);
+            }
+        }
+        half = step;
+    }
+}
+
+fn fwht_scaled(values: &mut [f32], block: usize, scale_factor: f32) {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        fwht_scaled_neon(neon, values, block, scale_factor);
+        return;
+    }
+    fwht_scaled_scalar(values, block, scale_factor);
 }
 
 /// Applies the normalized blockwise Sylvester Hadamard transform matching `ggml_trellis_rht`.
@@ -213,7 +416,7 @@ fn paley_elem(m: usize, row: usize, col: usize) -> Result<i8> {
     }
 }
 
-fn paley_cross(
+fn paley_cross_scalar(
     input: &[f32],
     output: &mut [f32],
     m: usize,
@@ -221,6 +424,12 @@ fn paley_cross(
     transpose: bool,
     factor: f32,
 ) -> Result<()> {
+    let needed = m
+        .checked_mul(run)
+        .ok_or_else(|| invalid("trellis paley_cross length overflow"))?;
+    if input.len() < needed || output.len() < needed {
+        return Err(invalid("trellis paley_cross buffer length mismatch"));
+    }
     for a in 0..m {
         let out_row = &mut output[a * run..(a + 1) * run];
         out_row.fill(0.0);
@@ -258,6 +467,219 @@ fn paley_cross(
         }
     }
     Ok(())
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+fn xor_sign_f32x4(neon: Neon, x: u32x4<Neon>, sign_mask: u32) -> f32x4<Neon> {
+    (x ^ u32x4::splat(neon, sign_mask)).bitcast::<f32x4<Neon>>()
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Passes four-row sign masks, column range, and SIMD token without bundling."
+)]
+fn paley_4rows_8lanes<const M: usize>(
+    neon: Neon,
+    input: &[f32],
+    output: &mut [f32],
+    run: usize,
+    a_base: usize,
+    col: usize,
+    rows: [&[u32; M]; 4],
+    factor_vec: f32x4<Neon>,
+) {
+    let [r0, r1, r2, r3] = rows;
+    let mut acc0_lo = f32x4::splat(neon, 0.0);
+    let mut acc0_hi = f32x4::splat(neon, 0.0);
+    let mut acc1_lo = f32x4::splat(neon, 0.0);
+    let mut acc1_hi = f32x4::splat(neon, 0.0);
+    let mut acc2_lo = f32x4::splat(neon, 0.0);
+    let mut acc2_hi = f32x4::splat(neon, 0.0);
+    let mut acc3_lo = f32x4::splat(neon, 0.0);
+    let mut acc3_hi = f32x4::splat(neon, 0.0);
+    for b in 0..M {
+        let x_slice = &input[b * run + col..b * run + col + 8];
+        let x_lo = f32x4::from_slice(neon, &x_slice[0..4]).bitcast::<u32x4<Neon>>();
+        let x_hi = f32x4::from_slice(neon, &x_slice[4..8]).bitcast::<u32x4<Neon>>();
+        acc0_lo += xor_sign_f32x4(neon, x_lo, r0[b]);
+        acc0_hi += xor_sign_f32x4(neon, x_hi, r0[b]);
+        acc1_lo += xor_sign_f32x4(neon, x_lo, r1[b]);
+        acc1_hi += xor_sign_f32x4(neon, x_hi, r1[b]);
+        acc2_lo += xor_sign_f32x4(neon, x_lo, r2[b]);
+        acc2_hi += xor_sign_f32x4(neon, x_hi, r2[b]);
+        acc3_lo += xor_sign_f32x4(neon, x_lo, r3[b]);
+        acc3_hi += xor_sign_f32x4(neon, x_hi, r3[b]);
+    }
+    let out_accs = [
+        (0, acc0_lo, acc0_hi),
+        (1, acc1_lo, acc1_hi),
+        (2, acc2_lo, acc2_hi),
+        (3, acc3_lo, acc3_hi),
+    ];
+    for (dr, lo, hi) in out_accs {
+        let row_off = (a_base + dr) * run + col;
+        (lo * factor_vec).store_slice(&mut output[row_off..row_off + 4]);
+        (hi * factor_vec).store_slice(&mut output[row_off + 4..row_off + 8]);
+    }
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn paley_cross_neon_m<const M: usize>(
+    neon: Neon,
+    input: &[f32],
+    output: &mut [f32],
+    run: usize,
+    masks: &[[u32; M]; M],
+    factor: f32,
+) -> Result<()> {
+    let needed = M
+        .checked_mul(run)
+        .ok_or_else(|| invalid("trellis paley_cross length overflow"))?;
+    if input.len() < needed || output.len() < needed {
+        return Err(invalid("trellis paley_cross buffer length mismatch"));
+    }
+    if run == 0 {
+        return Ok(());
+    }
+    let factor_vec = f32x4::splat(neon, factor);
+    if run == 1 {
+        for a_base in (0..M).step_by(4) {
+            let [r0, r1, r2, r3] = [
+                &masks[a_base],
+                &masks[a_base + 1],
+                &masks[a_base + 2],
+                &masks[a_base + 3],
+            ];
+            let mut acc = f32x4::splat(neon, 0.0);
+            for (b, &x_val) in input[..M].iter().enumerate() {
+                let xb = f32x4::splat(neon, x_val).bitcast::<u32x4<Neon>>();
+                let sign_mask = u32x4::from_slice(neon, &[r0[b], r1[b], r2[b], r3[b]]);
+                acc += (xb ^ sign_mask).bitcast::<f32x4<Neon>>();
+            }
+            (acc * factor_vec).store_slice(&mut output[a_base..a_base + 4]);
+        }
+        return Ok(());
+    }
+
+    for a_base in (0..M).step_by(4) {
+        let rows = [
+            &masks[a_base],
+            &masks[a_base + 1],
+            &masks[a_base + 2],
+            &masks[a_base + 3],
+        ];
+        let [r0, r1, r2, r3] = rows;
+        let mut col = 0_usize;
+        while col + 8 <= run {
+            paley_4rows_8lanes(neon, input, output, run, a_base, col, rows, factor_vec);
+            col += 8;
+        }
+        if col + 4 <= run {
+            let mut acc0 = f32x4::splat(neon, 0.0);
+            let mut acc1 = f32x4::splat(neon, 0.0);
+            let mut acc2 = f32x4::splat(neon, 0.0);
+            let mut acc3 = f32x4::splat(neon, 0.0);
+            for b in 0..M {
+                let x = f32x4::from_slice(neon, &input[b * run + col..b * run + col + 4])
+                    .bitcast::<u32x4<Neon>>();
+                acc0 += xor_sign_f32x4(neon, x, r0[b]);
+                acc1 += xor_sign_f32x4(neon, x, r1[b]);
+                acc2 += xor_sign_f32x4(neon, x, r2[b]);
+                acc3 += xor_sign_f32x4(neon, x, r3[b]);
+            }
+            for (dr, acc) in [(0, acc0), (1, acc1), (2, acc2), (3, acc3)] {
+                let row_off = (a_base + dr) * run + col;
+                (acc * factor_vec).store_slice(&mut output[row_off..row_off + 4]);
+            }
+            col += 4;
+        }
+        for tail_col in col..run {
+            let mut acc0 = 0.0_f32;
+            let mut acc1 = 0.0_f32;
+            let mut acc2 = 0.0_f32;
+            let mut acc3 = 0.0_f32;
+            for b in 0..M {
+                let x_bits = input[b * run + tail_col].to_bits();
+                acc0 += f32::from_bits(x_bits ^ r0[b]);
+                acc1 += f32::from_bits(x_bits ^ r1[b]);
+                acc2 += f32::from_bits(x_bits ^ r2[b]);
+                acc3 += f32::from_bits(x_bits ^ r3[b]);
+            }
+            output[a_base * run + tail_col] = acc0 * factor;
+            output[(a_base + 1) * run + tail_col] = acc1 * factor;
+            output[(a_base + 2) * run + tail_col] = acc2 * factor;
+            output[(a_base + 3) * run + tail_col] = acc3 * factor;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn paley_cross_neon(
+    neon: Neon,
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    run: usize,
+    transpose: bool,
+    factor: f32,
+) -> Result<()> {
+    match (m, transpose) {
+        (12, false) => paley_cross_neon_m(neon, input, output, run, &H_12_MASKS, factor),
+        (12, true) => paley_cross_neon_m(neon, input, output, run, &H_12_T_MASKS, factor),
+        (20, false) => paley_cross_neon_m(neon, input, output, run, &H_20_MASKS, factor),
+        (20, true) => paley_cross_neon_m(neon, input, output, run, &H_20_T_MASKS, factor),
+        (68, false) => paley_cross_neon_m(neon, input, output, run, &H_68_MASKS, factor),
+        (68, true) => paley_cross_neon_m(neon, input, output, run, &H_68_T_MASKS, factor),
+        _ => Err(invalid("unsupported Paley matrix dimension")),
+    }
+}
+
+fn paley_cross(
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    run: usize,
+    transpose: bool,
+    factor: f32,
+) -> Result<()> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+        return paley_cross_neon(neon, input, output, m, run, transpose, factor);
+    }
+    paley_cross_scalar(input, output, m, run, transpose, factor)
 }
 
 /// Applies the whole-slice `NariQ` Hadamard transform (`m * 2^j`, `m in {1, 12, 20, 68}`) on shard `shard_idx`.
@@ -945,6 +1367,37 @@ pub(crate) fn trellis_matvec_into(
     check_all_finite(output, &weight.name)
 }
 
+fn finish_trellis_token_output(
+    weight: &TrellisWeight,
+    yb_flat: &[f32],
+    strip_stride: usize,
+    token_idx: usize,
+    yb: &mut Vec<f32>,
+    output: &mut Vec<f32>,
+    tmp: &mut [f32],
+) -> Result<()> {
+    if yb.len() != weight.n {
+        yb.resize(weight.n, 0.0);
+    }
+    let strip_count = weight.n / TILE_DIM;
+    let token_col_offset = token_idx * TILE_DIM;
+    for strip_idx in 0..strip_count {
+        let src_off = strip_idx * strip_stride + token_col_offset;
+        let dst_off = strip_idx * TILE_DIM;
+        yb[dst_off..dst_off + TILE_DIM].copy_from_slice(&yb_flat[src_off..src_off + TILE_DIM]);
+    }
+    apply_side_transform(yb, &weight.desc.rows, true, None, Some(&weight.post), tmp)?;
+    ensure_len(output, weight.n);
+    if let Some(pout) = &weight.pout {
+        for (dst, &src_idx) in output.iter_mut().zip(pout.iter()) {
+            *dst = yb[usize::try_from(src_idx)?];
+        }
+    } else {
+        output.copy_from_slice(yb);
+    }
+    check_all_finite(output, &weight.name)
+}
+
 /// Evaluates `outputs[t] = W * inputs[t]` across a batch of tokens, sharing decoded weight tiles.
 ///
 /// # Errors
@@ -981,9 +1434,17 @@ pub(crate) fn trellis_matmul_tokens_into(
         );
     }
 
-    let tmp_len = (weight.k.max(weight.n)) * 2;
-    if scratch.tmp.len() < tmp_len {
-        scratch.tmp.resize(tmp_len, 0.0);
+    let per_token_tmp_len = (weight.k.max(weight.n)) * 2;
+    let parallel_tokens = token_count >= 2 && parallelism.workers() > 1;
+    let needed_tmp = if parallel_tokens {
+        token_count
+            .checked_mul(per_token_tmp_len)
+            .ok_or_else(|| invalid("trellis scratch length overflow"))?
+    } else {
+        per_token_tmp_len
+    };
+    if scratch.tmp.len() < needed_tmp {
+        scratch.tmp.resize(needed_tmp, 0.0);
     }
     if scratch.multi_xr.len() < token_count {
         scratch.multi_xr.resize_with(token_count, Vec::new);
@@ -992,100 +1453,150 @@ pub(crate) fn trellis_matmul_tokens_into(
         scratch.multi_yb_token.resize_with(token_count, Vec::new);
     }
 
-    for (token_idx, input) in inputs.iter().enumerate() {
-        check_all_finite(input, "trellis batch activation input")?;
-        ensure_len(&mut scratch.multi_xr[token_idx], weight.k);
-        transform_input_into(
-            weight,
-            input,
-            &mut scratch.multi_xr[token_idx],
-            &mut scratch.tmp,
+    if parallel_tokens {
+        parallelism.update_paired_chunks(
+            &mut scratch.multi_xr[..token_count],
+            1,
+            &mut scratch.tmp[..needed_tmp],
+            per_token_tmp_len,
+            |base_token, xr_chunk, tmp_chunk| {
+                for (local_idx, (xr, tmp)) in xr_chunk
+                    .iter_mut()
+                    .zip(tmp_chunk.chunks_exact_mut(per_token_tmp_len))
+                    .enumerate()
+                {
+                    let input = &inputs[base_token + local_idx];
+                    check_all_finite(input, "trellis batch activation input")?;
+                    if xr.len() != weight.k {
+                        xr.resize(weight.k, 0.0);
+                    }
+                    transform_input_into(weight, input, xr, tmp)?;
+                }
+                Ok(())
+            },
         )?;
-        ensure_len(&mut scratch.multi_yb_token[token_idx], weight.n);
+    } else {
+        for (token_idx, input) in inputs.iter().enumerate() {
+            check_all_finite(input, "trellis batch activation input")?;
+            if scratch.multi_xr[token_idx].len() != weight.k {
+                scratch.multi_xr[token_idx].resize(weight.k, 0.0);
+            }
+            transform_input_into(
+                weight,
+                input,
+                &mut scratch.multi_xr[token_idx],
+                &mut scratch.tmp[..per_token_tmp_len],
+            )?;
+        }
     }
 
     let strip_count = weight.n / TILE_DIM;
     let strip_stride = TILE_DIM * token_count;
     ensure_len(&mut scratch.multi_yb_flat, strip_count * strip_stride);
 
-    let x_refs: Vec<&[f32]> = scratch.multi_xr[..token_count]
-        .iter()
-        .map(Vec::as_slice)
-        .collect();
+    let mut x_stack: [&[f32]; MAX_TILE_TOKENS] = [&[]; MAX_TILE_TOKENS];
+    let mut x_heap = Vec::new();
+    let x_refs: &[&[f32]] = if token_count <= MAX_TILE_TOKENS {
+        for (dst, src) in x_stack[..token_count]
+            .iter_mut()
+            .zip(scratch.multi_xr[..token_count].iter())
+        {
+            *dst = src.as_slice();
+        }
+        &x_stack[..token_count]
+    } else {
+        x_heap.extend(scratch.multi_xr[..token_count].iter().map(Vec::as_slice));
+        &x_heap
+    };
+
     let strip_bytes = weight.strip_bytes();
     let data: &[u8] = &weight.data;
 
     let compute_strip = |strip_idx: usize,
                          flat_chunk: &mut [f32],
-                         local_outs: &mut [[f32; TILE_DIM]]|
+                         out_refs: &mut [&mut [f32; TILE_DIM]]|
      -> Result<()> {
         let row_tiles = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
-        for slot in local_outs.iter_mut() {
-            *slot = [0.0_f32; TILE_DIM];
+        for slot in out_refs.iter_mut() {
+            **slot = [0.0_f32; TILE_DIM];
         }
-        let mut out_refs: Vec<&mut [f32; TILE_DIM]> = local_outs.iter_mut().collect();
-        dispatch_strip_matmul_tokens(row_tiles, weight.bits, &x_refs, &mut out_refs, backend)?;
+        dispatch_strip_matmul_tokens(row_tiles, weight.bits, x_refs, out_refs, backend)?;
         for (dst, src) in flat_chunk
             .as_chunks_mut::<TILE_DIM>()
             .0
             .iter_mut()
-            .zip(local_outs.iter())
+            .zip(out_refs.iter())
         {
-            dst.copy_from_slice(src);
+            dst.copy_from_slice(*src);
+        }
+        Ok(())
+    };
+
+    let run_strips = |base_strip: usize, chunk: &mut [f32]| -> Result<()> {
+        if token_count <= MAX_TILE_TOKENS {
+            let mut local_outs = [[0.0_f32; TILE_DIM]; MAX_TILE_TOKENS];
+            let mut out_refs = local_outs.each_mut();
+            let out_slice = &mut out_refs[..token_count];
+            for (local_idx, strip_chunk) in chunk.chunks_exact_mut(strip_stride).enumerate() {
+                compute_strip(base_strip + local_idx, strip_chunk, out_slice)?;
+            }
+        } else {
+            let mut local_outs = vec![[0.0_f32; TILE_DIM]; token_count];
+            let mut out_refs: Vec<&mut [f32; TILE_DIM]> = local_outs.iter_mut().collect();
+            for (local_idx, strip_chunk) in chunk.chunks_exact_mut(strip_stride).enumerate() {
+                compute_strip(base_strip + local_idx, strip_chunk, &mut out_refs)?;
+            }
         }
         Ok(())
     };
 
     if parallelism.workers() > 1 && strip_count >= 2 {
-        parallelism.update_chunks(
-            &mut scratch.multi_yb_flat,
-            strip_stride,
-            |base_strip, chunk| {
-                let mut local_outs = vec![[0.0_f32; TILE_DIM]; token_count];
-                for (local_idx, strip_chunk) in chunk.chunks_exact_mut(strip_stride).enumerate() {
-                    compute_strip(base_strip + local_idx, strip_chunk, &mut local_outs)?;
+        parallelism.update_chunks(&mut scratch.multi_yb_flat, strip_stride, run_strips)?;
+    } else {
+        run_strips(0, &mut scratch.multi_yb_flat)?;
+    }
+
+    let yb_flat: &[f32] = &scratch.multi_yb_flat;
+    if parallel_tokens {
+        parallelism.update_triple_chunks(
+            &mut scratch.multi_yb_token[..token_count],
+            1,
+            outputs,
+            1,
+            &mut scratch.tmp[..needed_tmp],
+            per_token_tmp_len,
+            |base_token, yb_chunk, out_chunk, tmp_chunk| {
+                for (local_idx, ((yb, output), tmp)) in yb_chunk
+                    .iter_mut()
+                    .zip(out_chunk.iter_mut())
+                    .zip(tmp_chunk.chunks_exact_mut(per_token_tmp_len))
+                    .enumerate()
+                {
+                    finish_trellis_token_output(
+                        weight,
+                        yb_flat,
+                        strip_stride,
+                        base_token + local_idx,
+                        yb,
+                        output,
+                        tmp,
+                    )?;
                 }
                 Ok(())
             },
         )?;
     } else {
-        let mut local_outs = vec![[0.0_f32; TILE_DIM]; token_count];
-        for (strip_idx, strip_chunk) in scratch
-            .multi_yb_flat
-            .chunks_exact_mut(strip_stride)
-            .enumerate()
-        {
-            compute_strip(strip_idx, strip_chunk, &mut local_outs)?;
+        for (token_idx, output) in outputs.iter_mut().enumerate() {
+            finish_trellis_token_output(
+                weight,
+                yb_flat,
+                strip_stride,
+                token_idx,
+                &mut scratch.multi_yb_token[token_idx],
+                output,
+                &mut scratch.tmp[..per_token_tmp_len],
+            )?;
         }
-    }
-
-    for (strip_idx, strip_chunk) in scratch.multi_yb_flat.chunks_exact(strip_stride).enumerate() {
-        let row_offset = strip_idx * TILE_DIM;
-        for (t, token_vals) in strip_chunk.as_chunks::<TILE_DIM>().0.iter().enumerate() {
-            scratch.multi_yb_token[t][row_offset..row_offset + TILE_DIM]
-                .copy_from_slice(token_vals);
-        }
-    }
-
-    for (token_idx, output) in outputs.iter_mut().enumerate() {
-        let yb = &mut scratch.multi_yb_token[token_idx];
-        apply_side_transform(
-            yb,
-            &weight.desc.rows,
-            true,
-            None,
-            Some(&weight.post),
-            &mut scratch.tmp,
-        )?;
-        ensure_len(output, weight.n);
-        if let Some(pout) = &weight.pout {
-            for (dst, &src_idx) in output.iter_mut().zip(pout.iter()) {
-                *dst = yb[usize::try_from(src_idx)?];
-            }
-        } else {
-            output.copy_from_slice(yb);
-        }
-        check_all_finite(output, &weight.name)?;
     }
 
     Ok(())
@@ -1099,9 +1610,10 @@ pub(crate) mod tests {
     use crate::model::{Tensor, TensorBytes};
 
     use super::{
-        MatvecBackend, RowParallelism, SideTransform, TILE_DIM, TrellisDesc, TrellisScratch,
-        TrellisWeight, apply_side_transform, decode_tile_single_value, rht, trellis_get_row,
-        trellis_matmul_tokens_into, trellis_matvec_into,
+        MAX_TILE_TOKENS, MatvecBackend, RowParallelism, SideTransform, TILE_DIM, TrellisDesc,
+        TrellisScratch, TrellisWeight, apply_side_transform, decode_tile_single_value, fwht_scaled,
+        fwht_scaled_scalar, hadfull_slice, inv_sqrt_f32, paley_cross, paley_cross_scalar, rht,
+        trellis_get_row, trellis_matmul_tokens_into, trellis_matvec_into,
     };
 
     fn make_prng_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -1495,6 +2007,248 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+
+        Ok(())
+    }
+
+    fn make_pattern_vec(len: usize, seed: usize) -> Vec<f32> {
+        (0..len)
+            .map(|idx| match (idx + seed) % 7 {
+                0 => -0.0_f32,
+                1 => 0.0_f32,
+                _ => {
+                    let raw = i16::try_from((idx * 17 + seed * 13) % 41).unwrap_or(0) - 20;
+                    f32::from(raw) * 0.0625
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fwht_scaled_and_paley_cross_neon_match_scalar_zero_ulp() -> Result<()> {
+        for (idx, block) in [1_usize, 2, 4, 8, 16, 32, 64, 128, 256]
+            .into_iter()
+            .enumerate()
+        {
+            for repeat in [1_usize, 2, 3] {
+                let len = block * repeat;
+                let factor = inv_sqrt_f32(block)?;
+                let mut scalar_buf = make_pattern_vec(len, idx + repeat);
+                let mut neon_buf = scalar_buf.clone();
+                fwht_scaled_scalar(&mut scalar_buf, block, factor);
+                fwht_scaled(&mut neon_buf, block, factor);
+                assert_eq!(
+                    neon_buf
+                        .iter()
+                        .copied()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>(),
+                    scalar_buf
+                        .iter()
+                        .copied()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>(),
+                    "fwht_scaled 0-ULP mismatch for block={block}, repeat={repeat}"
+                );
+            }
+        }
+
+        for m in [12_usize, 20, 68] {
+            let factor = inv_sqrt_f32(m)?;
+            for run in [1_usize, 2, 3, 4, 5, 7, 8, 11, 12, 16, 20, 32] {
+                for transpose in [false, true] {
+                    let input = make_pattern_vec(m * run, m + run + usize::from(transpose));
+                    let mut scalar_out = vec![0.0_f32; m * run];
+                    let mut neon_out = vec![0.0_f32; m * run];
+                    paley_cross_scalar(&input, &mut scalar_out, m, run, transpose, factor)?;
+                    paley_cross(&input, &mut neon_out, m, run, transpose, factor)?;
+                    assert_eq!(
+                        neon_out
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        scalar_out
+                            .iter()
+                            .copied()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        "paley_cross 0-ULP mismatch for m={m}, run={run}, transpose={transpose}"
+                    );
+                }
+            }
+        }
+
+        // Cover full hadfull_slice across m in {1, 12, 20, 68} including small power-of-two runs.
+        for &(m, run) in &[
+            (1_usize, 16_usize),
+            (1, 64),
+            (12, 1),
+            (12, 2),
+            (12, 4),
+            (12, 16),
+            (20, 1),
+            (20, 2),
+            (20, 8),
+            (68, 1),
+            (68, 4),
+            (68, 16),
+        ] {
+            let len = m * run;
+            let pre = make_pattern_vec(len, m + 3);
+            let post = make_pattern_vec(len, run + 5);
+            let mut tmp = vec![0.0_f32; len * 2];
+            for inverse in [false, true] {
+                let mut values = make_pattern_vec(len, m * 3 + run);
+                let orig = values.clone();
+                hadfull_slice(
+                    &mut values,
+                    None,
+                    1,
+                    0,
+                    inverse,
+                    Some(&pre),
+                    Some(&post),
+                    &mut tmp,
+                )?;
+                assert_ne!(values, orig);
+                assert!(values.iter().all(|v| v.is_finite()));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn trellis_matmul_tokens_parallel_matches_serial() -> Result<()> {
+        let cases: &[(usize, usize, usize, &[i32], bool)] = &[
+            (2, 64, 48, &[1, 16, 1, 1, 32, 1, 0], true),
+            (3, 12 * 16, 20 * 16, &[2, 1, 2, 2, 1, 2, 2, 160, 160], false),
+            (4, 68 * 16, 64, &[2, 1, 1, 2, 1, 1, 0], true),
+        ];
+        let serial = RowParallelism::default();
+        let parallel = if cfg!(feature = "parallel-rows") {
+            Some(RowParallelism::new(4)?)
+        } else {
+            None
+        };
+
+        for (case_idx, &(bits, k, n, desc_raw, perms)) in cases.iter().enumerate() {
+            let weight = build_synthetic_weight(
+                bits,
+                k,
+                n,
+                desc_raw,
+                perms,
+                0xdead_beef_u64 + u64::try_from(case_idx)?,
+            )?;
+            // Test small batch, exact MAX_TILE_TOKENS boundary, and > MAX_TILE_TOKENS fallback.
+            for token_count in [2_usize, 5, MAX_TILE_TOKENS, MAX_TILE_TOKENS + 3] {
+                let inputs: Vec<Vec<f32>> = (0..token_count)
+                    .map(|t| make_pattern_vec(k, case_idx * 100 + t))
+                    .collect();
+
+                for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+                    let mut serial_scratch = TrellisScratch::default();
+                    let mut serial_outs = vec![Vec::new(); token_count];
+                    trellis_matmul_tokens_into(
+                        &weight,
+                        &inputs,
+                        &mut serial_outs,
+                        backend,
+                        &serial,
+                        &mut serial_scratch,
+                    )?;
+
+                    if let Some(par) = &parallel {
+                        let mut par_scratch = TrellisScratch::default();
+                        let mut par_outs = vec![Vec::new(); token_count];
+                        trellis_matmul_tokens_into(
+                            &weight,
+                            &inputs,
+                            &mut par_outs,
+                            backend,
+                            par,
+                            &mut par_scratch,
+                        )?;
+                        for (t, (p, s)) in par_outs.iter().zip(&serial_outs).enumerate() {
+                            assert_eq!(
+                                p.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                                s.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                                "parallel mismatch case={case_idx} tokens={token_count} token={t}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn trellis_matmul_tokens_parallel_preserves_error_semantics() -> Result<()> {
+        if !cfg!(feature = "parallel-rows") {
+            return Ok(());
+        }
+        let serial = RowParallelism::default();
+        let par = RowParallelism::new(4)?;
+        let k = 64_usize;
+        let n = 48_usize;
+        let weight = build_synthetic_weight(2, k, n, &[1, 16, 1, 1, 32, 1, 0], true, 0xfeed_face)?;
+
+        let mut bad_inputs: Vec<Vec<f32>> = (0..6).map(|t| make_pattern_vec(k, t + 11)).collect();
+        bad_inputs[4][k / 2] = f32::NAN;
+        let mut serial_scratch = TrellisScratch::default();
+        let mut par_scratch = TrellisScratch::default();
+        let mut serial_outs = vec![Vec::new(); bad_inputs.len()];
+        let mut par_outs = vec![Vec::new(); bad_inputs.len()];
+        let serial_err = trellis_matmul_tokens_into(
+            &weight,
+            &bad_inputs,
+            &mut serial_outs,
+            MatvecBackend::Auto,
+            &serial,
+            &mut serial_scratch,
+        );
+        let par_err = trellis_matmul_tokens_into(
+            &weight,
+            &bad_inputs,
+            &mut par_outs,
+            MatvecBackend::Auto,
+            &par,
+            &mut par_scratch,
+        );
+        assert_eq!(
+            par_err.as_ref().map_err(ToString::to_string),
+            serial_err.as_ref().map_err(ToString::to_string),
+        );
+        assert!(par_err.is_err());
+
+        let mut overflow_inputs: Vec<Vec<f32>> =
+            (0..6).map(|t| make_pattern_vec(k, t + 19)).collect();
+        overflow_inputs[3].fill(f32::MAX);
+        let serial_ov = trellis_matmul_tokens_into(
+            &weight,
+            &overflow_inputs,
+            &mut serial_outs,
+            MatvecBackend::Auto,
+            &serial,
+            &mut serial_scratch,
+        );
+        let par_ov = trellis_matmul_tokens_into(
+            &weight,
+            &overflow_inputs,
+            &mut par_outs,
+            MatvecBackend::Auto,
+            &par,
+            &mut par_scratch,
+        );
+        assert_eq!(
+            par_ov.as_ref().map_err(ToString::to_string),
+            serial_ov.as_ref().map_err(ToString::to_string),
+        );
+        assert!(par_ov.is_err());
 
         Ok(())
     }

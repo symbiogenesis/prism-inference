@@ -341,6 +341,8 @@ pub struct VulkanLayerPipelines {
     permute_ssm_heads_batched: PipelineId,
     copy_slice: PipelineId,
     copy_slice_offset: PipelineId,
+    vocab_argmax_stage1: PipelineId,
+    vocab_argmax_stage2: PipelineId,
     use_sdot: bool,
     attn_qk_digest: String,
     attn_qk_f16kv_digest: String,
@@ -357,7 +359,7 @@ struct PreparedLayerShaders {
     use_sdot: bool,
     use_wave64: bool,
     proj: PreparedProjectionShaders,
-    modules: [PreparedShaderSpec; 68],
+    modules: [PreparedShaderSpec; 70],
     shader_digests_sha256: String,
 }
 
@@ -739,6 +741,18 @@ impl VulkanLayerPipelines {
                 2,
                 3,
             )?,
+            make_spec(
+                b"vocab_argmax_stage1",
+                spirv::vocab_argmax_stage1_with_subgroup(use_wave64_shuffle),
+                2,
+                1,
+            )?,
+            make_spec(
+                b"vocab_argmax_stage2",
+                spirv::vocab_argmax_stage2_with_subgroup(use_wave64_shuffle),
+                2,
+                1,
+            )?,
         ];
 
         let digest_bytes = hasher
@@ -858,7 +872,9 @@ impl VulkanLayerPipelines {
             permute_ssm_heads_batched,
             copy_slice,
             copy_slice_offset,
-        ]: [PipelineId; 68] = ids
+            vocab_argmax_stage1,
+            vocab_argmax_stage2,
+        ]: [PipelineId; 70] = ids
             .try_into()
             .map_err(|_| Error::InvalidInput("layer pipeline count mismatch".to_owned()))?;
 
@@ -932,6 +948,8 @@ impl VulkanLayerPipelines {
             permute_ssm_heads_batched,
             copy_slice,
             copy_slice_offset,
+            vocab_argmax_stage1,
+            vocab_argmax_stage2,
             use_sdot: prepared.use_sdot,
             attn_qk_digest,
             attn_qk_f16kv_digest,
@@ -1380,13 +1398,38 @@ struct GpuGraphScratch {
     logits: BufferId,
     dummy_state: BufferId,
     decode_params: BufferId,
+    argmax_partials: BufferId,
+    argmax_out: BufferId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum LogitOutputMode {
+    None,
+    Logits,
+    Argmax,
+}
+
+enum TileOutputTarget<'a> {
+    None,
+    Logits(&'a mut Vec<f32>),
+    Argmax(&'a mut u32),
+}
+
+impl TileOutputTarget<'_> {
+    const fn mode(&self) -> LogitOutputMode {
+        match self {
+            Self::None => LogitOutputMode::None,
+            Self::Logits(_) => LogitOutputMode::Logits,
+            Self::Argmax(_) => LogitOutputMode::Argmax,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct DecodeCbCacheKey {
     has_active_lora: bool,
     splitk_bucket: u32,
-    need_logits: bool,
+    output_mode: LogitOutputMode,
 }
 
 struct CachedDecodeProgram {
@@ -1875,6 +1918,33 @@ impl VulkanBatchedGraphExecutor {
             logits.clear();
         }
         res
+    }
+
+    /// Evaluates one decode step on GPU and returns the greedy `argmax` token ID via a 2-stage
+    /// wave64 subgroup reduction with full-vocabulary IEEE-754 non-finite verification, reading
+    /// back only 12 bytes instead of the full logits vector.
+    ///
+    /// # Errors
+    /// Returns an error description if validation fails, GPU execution fails, or any output logit
+    /// is non-finite (`NaN` or `+/-inf`).
+    pub fn evaluate_argmax(&mut self, token: u32) -> Result<u32, String> {
+        self.validate_execution_ready(&[token])
+            .map_err(|err| err.to_string())?;
+        if self.geometry.vocabulary == 0 || self.geometry.vocabulary > 1_048_576 {
+            self.state_consistent = false;
+            self.kv_tracker.invalidate();
+            return Err("GPU returned invalid logit vocabulary extent".to_owned());
+        }
+        let mut best_token = 0_u32;
+        self.run_tile_gpu_target_into(
+            &[token],
+            TileOutputTarget::Argmax(&mut best_token),
+            true,
+            &mut || Ok(()),
+        )
+        .map_err(|err| err.to_string())?;
+        self.commit_tile_position(1);
+        Ok(best_token)
     }
 
     /// Advances model recurrent/KV state on GPU by ingesting one prompt token without reading logits.
@@ -2847,7 +2917,7 @@ impl VulkanBatchedGraphExecutor {
         prepared: &PreparedTileUpload,
         t_len: usize,
         drain_at_tile_end: bool,
-        need_logits: bool,
+        output_mode: LogitOutputMode,
     ) -> Result<Option<DecodeCbCacheKey>, Error> {
         if t_len != 1 || !drain_at_tile_end || prepared.staged_bank.is_some() {
             return Ok(None);
@@ -2871,7 +2941,7 @@ impl VulkanBatchedGraphExecutor {
         Ok(Some(DecodeCbCacheKey {
             has_active_lora: self.multi_rank_scale.is_some_and(|s| s != 0.0),
             splitk_bucket,
-            need_logits,
+            output_mode,
         }))
     }
 
@@ -2880,10 +2950,11 @@ impl VulkanBatchedGraphExecutor {
         range: Range<usize>,
         t_len: usize,
         total_layers: usize,
-        need_logits: bool,
+        output_mode: LogitOutputMode,
         is_final_chunk: bool,
         min_align: usize,
     ) -> Result<(), Error> {
+        let need_logits = output_mode != LogitOutputMode::None;
         for layer_idx in range {
             let mode = if layer_idx + 1 == total_layers {
                 if !need_logits {
@@ -2899,7 +2970,7 @@ impl VulkanBatchedGraphExecutor {
             self.record_layer_tokens(layer_idx, t_len, mode, min_align)?;
         }
         if is_final_chunk && need_logits {
-            self.record_final_logits(t_len)?;
+            self.record_final_logits(t_len, output_mode == LogitOutputMode::Argmax)?;
         }
         Ok(())
     }
@@ -2944,14 +3015,25 @@ impl VulkanBatchedGraphExecutor {
         self.run_tile_gpu_pipelined_into(tokens, logits_out, true, check)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Coordinates host-staged tile upload, layered TDR command chunks, fused final-token logits, and optional queue drain."
-    )]
     fn run_tile_gpu_pipelined_into(
         &mut self,
         tokens: &[u32],
         logits_out: Option<&mut Vec<f32>>,
+        drain_at_tile_end: bool,
+        check: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let target = logits_out.map_or(TileOutputTarget::None, TileOutputTarget::Logits);
+        self.run_tile_gpu_target_into(tokens, target, drain_at_tile_end, check)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Coordinates host-staged tile upload, layered TDR command chunks, fused final-token logits or GPU argmax, and optional queue drain."
+    )]
+    fn run_tile_gpu_target_into(
+        &mut self,
+        tokens: &[u32],
+        target: TileOutputTarget<'_>,
         drain_at_tile_end: bool,
         check: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
@@ -2962,7 +3044,8 @@ impl VulkanBatchedGraphExecutor {
             .config
             .tdr_policy
             .layer_chunk_ranges_for_tokens(self.layers.len(), t_len)?;
-        let need_logits = logits_out.is_some();
+        let output_mode = target.mode();
+        let need_logits = output_mode != LogitOutputMode::None;
         let total_layers = self.layers.len();
         let min_align = usize::try_from(self.device.min_storage_buffer_offset_alignment().max(1))
             .unwrap_or(256);
@@ -3009,7 +3092,7 @@ impl VulkanBatchedGraphExecutor {
                     self.batch_recorder.clear();
                     record_tile_prologue(self)?;
                     if need_logits {
-                        self.record_final_logits(t_len)?;
+                        self.record_final_logits(t_len, output_mode == LogitOutputMode::Argmax)?;
                     }
                     if !self.batch_recorder.is_empty() {
                         mutated_gpu = true;
@@ -3025,7 +3108,7 @@ impl VulkanBatchedGraphExecutor {
                     }
                 }
             } else if let Some(cache_key) =
-                self.decode_cb_cache_key(&prepared, t_len, drain_at_tile_end, need_logits)?
+                self.decode_cb_cache_key(&prepared, t_len, drain_at_tile_end, output_mode)?
             {
                 if self
                     .decode_cb_cache
@@ -3075,7 +3158,7 @@ impl VulkanBatchedGraphExecutor {
                                 range.clone(),
                                 t_len,
                                 total_layers,
-                                need_logits,
+                                output_mode,
                                 is_final_chunk,
                                 min_align,
                             )?;
@@ -3157,7 +3240,7 @@ impl VulkanBatchedGraphExecutor {
                         range.clone(),
                         t_len,
                         total_layers,
-                        need_logits,
+                        output_mode,
                         is_final_chunk,
                         min_align,
                     )?;
@@ -3184,9 +3267,30 @@ impl VulkanBatchedGraphExecutor {
                 self.staging_bank_in_flight = [false; 2];
             }
 
-            if let Some(dst) = logits_out {
-                dst.resize(self.geometry.vocabulary, 0.0_f32);
-                self.device.read_buffer_f32(self.scratch.logits, dst)?;
+            match target {
+                TileOutputTarget::None => {}
+                TileOutputTarget::Logits(dst) => {
+                    dst.resize(self.geometry.vocabulary, 0.0_f32);
+                    self.device.read_buffer_f32(self.scratch.logits, dst)?;
+                }
+                TileOutputTarget::Argmax(out_tok) => {
+                    let mut raw = [0_u8; 12];
+                    self.device
+                        .read_buffer_bytes(self.scratch.argmax_out, &mut raw)?;
+                    let max_bits = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                    let best_idx = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+                    let non_finite_flag = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+                    if non_finite_flag != 0
+                        || !f32::from_bits(max_bits).is_finite()
+                        || !usize::try_from(best_idx)
+                            .is_ok_and(|idx| idx < self.geometry.vocabulary)
+                    {
+                        return Err(Error::InvalidInput(
+                            "GPU batched graph produced non-finite logits".to_owned(),
+                        ));
+                    }
+                    *out_tok = best_idx;
+                }
             }
             Ok(())
         })();
@@ -4901,7 +5005,7 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
-    fn record_final_logits(&mut self, tile_tokens: usize) -> Result<(), Error> {
+    fn record_final_logits(&mut self, tile_tokens: usize, argmax: bool) -> Result<(), Error> {
         let embed_u32 = u32::try_from(self.geometry.embedding)
             .map_err(|_| Error::ResourceLimit("embedding exceeds u32".to_owned()))?;
         if self.layers.is_empty() {
@@ -4948,7 +5052,31 @@ impl VulkanBatchedGraphExecutor {
             self.scratch.norm,
             &[(self.output_weight, self.scratch.logits)],
             1,
-        )
+        )?;
+        if argmax {
+            let vocab_u32 = u32::try_from(self.geometry.vocabulary)
+                .map_err(|_| Error::ResourceLimit("vocabulary exceeds u32".to_owned()))?;
+            let partials_wg = vocab_u32.div_ceil(256).max(1);
+            self.batch_recorder.push_barrier(
+                self.pipelines.vocab_argmax_stage1,
+                &[
+                    BufferSpan::whole(self.scratch.logits),
+                    BufferSpan::whole(self.scratch.argmax_partials),
+                ],
+                &[vocab_u32],
+                checked_grid(&self.device, [partials_wg, 1, 1])?,
+            );
+            self.batch_recorder.push_barrier(
+                self.pipelines.vocab_argmax_stage2,
+                &[
+                    BufferSpan::whole(self.scratch.argmax_partials),
+                    BufferSpan::whole(self.scratch.argmax_out),
+                ],
+                &[partials_wg],
+                checked_grid(&self.device, [1, 1, 1])?,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -7495,6 +7623,10 @@ fn allocate_scratch(
         logits: guard.alloc_readback_storage(sizes[19])?,
         dummy_state: guard.alloc_storage(sizes[20])?,
         decode_params: guard.alloc_storage(16_u64.max(MIN_SCRATCH_BYTES))?,
+        argmax_partials: guard.alloc_storage(
+            u32_slice_bytes(geometry.vocabulary.div_ceil(256).max(1) * 3)?.max(MIN_SCRATCH_BYTES),
+        )?,
+        argmax_out: guard.alloc_readback_storage(12_u64.max(MIN_SCRATCH_BYTES))?,
     })
 }
 
@@ -8841,8 +8973,8 @@ mod tests {
         let p_wave = VulkanLayerPipelines::prepare(false, true)?;
         let p_both = VulkanLayerPipelines::prepare(true, true)?;
 
-        assert_eq!(p_base.modules.len(), 68);
-        assert_eq!(p_both.modules.len(), 68);
+        assert_eq!(p_base.modules.len(), 70);
+        assert_eq!(p_both.modules.len(), 70);
         assert_eq!(
             p_both.shader_digests_sha256,
             VulkanLayerPipelines::prepare(true, true)?.shader_digests_sha256
@@ -8859,6 +8991,8 @@ mod tests {
             b"deinterleave_q_gate_rms_norm_rope".as_slice(),
             b"swiglu_hadamard1024_q8k_pinned".as_slice(),
             b"swiglu_hadamard1024_q8k_unpinned".as_slice(),
+            b"vocab_argmax_stage1".as_slice(),
+            b"vocab_argmax_stage2".as_slice(),
         ] {
             assert!(
                 tags.contains(&expected),

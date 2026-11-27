@@ -26,7 +26,7 @@ use bonsai_prism_runtime::{
         Model, Tensor,
         lora::{MultiRankAdapter, MultiRankPolicy},
     },
-    runtime::{Limits, Runtime},
+    runtime::{Limits, Runtime, greedy},
 };
 use bonsai_ternary::{float_to_half, pack_ptq};
 
@@ -712,6 +712,16 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         (
             "pq2_q8k_16tok_false",
             spirv::pq2_q8k_gemm_16tok_coalesced(false, false, false),
+        ),
+        ("vocab_argmax_stage1", spirv::vocab_argmax_stage1()),
+        (
+            "vocab_argmax_stage1_subgroup",
+            spirv::vocab_argmax_stage1_with_subgroup(true),
+        ),
+        ("vocab_argmax_stage2", spirv::vocab_argmax_stage2()),
+        (
+            "vocab_argmax_stage2_subgroup",
+            spirv::vocab_argmax_stage2_with_subgroup(true),
         ),
         (
             "pq2_q8k_16tok_false_fused_res",
@@ -3254,4 +3264,216 @@ fn live_fused_gdn_norm_attn_qk_and_swiglu_h1024_match_unfused_zero_ulp() -> Test
     verify_live_full_attn_key_prep_parity(&mut dev, use_subgroup)?;
     verify_live_full_attn_query_prep_parity(&mut dev, use_subgroup)?;
     verify_live_swiglu_h1024_q8k_parity(&mut dev, use_subgroup)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Tests 2-stage GPU vocab_argmax across tie-breaking, Qwen3.5 248320 vocab, NaN/Inf rejection, and full executor evaluate_argmax parity."
+)]
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_gpu_vocab_argmax_matches_cpu_greedy_and_rejects_nonfinite() -> TestResult {
+    let mut dev = AdrenoVulkanDevice::open()?;
+    let max_vocab = 248_320_usize;
+    let max_partials = max_vocab.div_ceil(256);
+    let b_logits = dev.create_storage_buffer(u64::try_from(max_vocab * 4)?)?;
+    let b_partials = dev.create_storage_buffer(u64::try_from(max_partials * 3 * 4)?)?;
+    let b_out = dev.create_readback_storage_buffer(4096)?;
+
+    let mut subgroup_modes = vec![false];
+    if dev.capabilities().wave64_subgroup_shuffle {
+        subgroup_modes.push(true);
+    }
+
+    for use_subgroup in subgroup_modes {
+        let p_s1 = dev.create_compute_pipeline(
+            &spirv::vocab_argmax_stage1_with_subgroup(use_subgroup),
+            2,
+            1,
+        )?;
+        let p_s2 = dev.create_compute_pipeline(
+            &spirv::vocab_argmax_stage2_with_subgroup(use_subgroup),
+            2,
+            1,
+        )?;
+
+        for &vocab in &[1_usize, 63, 64, 65, 255, 256, 257, 1025, max_vocab] {
+            let mut vals: Vec<f32> = (0..vocab)
+                .map(|i| {
+                    let s = i16::try_from((i * 17 + 5) % 97).unwrap_or(0) - 48;
+                    f32::mul_add(f32::from(s), 0.125, -10.0)
+                })
+                .collect();
+            if vocab >= 4 {
+                vals[1] = 42.25;
+                vals[vocab - 1] = 42.25;
+            }
+            if vocab >= 300 {
+                vals[64] = 42.25;
+                vals[257] = 42.25;
+            }
+
+            let expected = greedy(&vals)?;
+            dev.write_buffer_f32(b_logits, &vals)?;
+
+            let vocab_u = u32::try_from(vocab)?;
+            let wg_u = vocab_u.div_ceil(256).max(1);
+            let mut rec = CommandBatchRecorder::new();
+            rec.push_barrier(
+                p_s1,
+                &[BufferSpan::whole(b_logits), BufferSpan::whole(b_partials)],
+                &[vocab_u],
+                [wg_u, 1, 1],
+            );
+            rec.push_barrier(
+                p_s2,
+                &[BufferSpan::whole(b_partials), BufferSpan::whole(b_out)],
+                &[wg_u],
+                [1, 1, 1],
+            );
+            dev.submit_compute_batch(&rec)?;
+
+            let mut raw = [0_u8; 12];
+            dev.read_buffer_bytes(b_out, &mut raw)?;
+            let max_bits = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let best_idx = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+            let non_finite = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+            assert_eq!(
+                non_finite, 0,
+                "unexpected non-finite flag subgroup={use_subgroup} vocab={vocab}"
+            );
+            assert_eq!(
+                best_idx, expected,
+                "vocab_argmax mismatch subgroup={use_subgroup} vocab={vocab}"
+            );
+            assert_eq!(
+                max_bits,
+                vals[usize::try_from(expected)?].to_bits(),
+                "vocab_argmax max_bits mismatch subgroup={use_subgroup} vocab={vocab}"
+            );
+        }
+
+        // Verify -0.0 vs +0.0 tie-breaking retains lowest index.
+        let mut zero_tie = vec![-5.0_f32; 512];
+        zero_tie[73] = -0.0_f32;
+        zero_tie[301] = 0.0_f32;
+        let expected_zero = greedy(&zero_tie)?;
+        assert_eq!(expected_zero, 73);
+        dev.write_buffer_f32(b_logits, &zero_tie)?;
+        let mut rec = CommandBatchRecorder::new();
+        rec.push_barrier(
+            p_s1,
+            &[BufferSpan::whole(b_logits), BufferSpan::whole(b_partials)],
+            &[512],
+            [2, 1, 1],
+        );
+        rec.push_barrier(
+            p_s2,
+            &[BufferSpan::whole(b_partials), BufferSpan::whole(b_out)],
+            &[2],
+            [1, 1, 1],
+        );
+        dev.submit_compute_batch(&rec)?;
+        let mut raw = [0_u8; 12];
+        dev.read_buffer_bytes(b_out, &mut raw)?;
+        assert_eq!(u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]), 0);
+        assert_eq!(u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]), 73);
+
+        // Verify all-negative including -f32::MAX works cleanly.
+        let mut extreme_neg = vec![f32::MIN; 257];
+        extreme_neg[256] = -1e38_f32;
+        dev.write_buffer_f32(b_logits, &extreme_neg)?;
+        let mut rec = CommandBatchRecorder::new();
+        rec.push_barrier(
+            p_s1,
+            &[BufferSpan::whole(b_logits), BufferSpan::whole(b_partials)],
+            &[257],
+            [2, 1, 1],
+        );
+        rec.push_barrier(
+            p_s2,
+            &[BufferSpan::whole(b_partials), BufferSpan::whole(b_out)],
+            &[2],
+            [1, 1, 1],
+        );
+        dev.submit_compute_batch(&rec)?;
+        dev.read_buffer_bytes(b_out, &mut raw)?;
+        assert_eq!(u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]), 0);
+        assert_eq!(u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]), 256);
+
+        // Verify IEEE-754 non-finite detection (+inf, -inf, qNaN, sNaN) anywhere in vocab.
+        for (label, pos, bad_bits) in [
+            ("pos_inf_last", 1024_usize, 0x7F80_0000_u32),
+            ("neg_inf_first", 0, 0xFF80_0000),
+            ("qnan_mid", 513, 0x7FC0_0000),
+            ("snan_tail", 1023, 0x7F80_0001),
+        ] {
+            let mut words = vec![1.0_f32.to_bits(); 1025];
+            words[10] = f32::MAX.to_bits();
+            words[pos] = bad_bits;
+            dev.write_buffer_u32(b_logits, &words)?;
+            let mut rec = CommandBatchRecorder::new();
+            rec.push_barrier(
+                p_s1,
+                &[BufferSpan::whole(b_logits), BufferSpan::whole(b_partials)],
+                &[1025],
+                [5, 1, 1],
+            );
+            rec.push_barrier(
+                p_s2,
+                &[BufferSpan::whole(b_partials), BufferSpan::whole(b_out)],
+                &[5],
+                [1, 1, 1],
+            );
+            dev.submit_compute_batch(&rec)?;
+            dev.read_buffer_bytes(b_out, &mut raw)?;
+            let nf = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+            assert_ne!(
+                nf, 0,
+                "expected non-finite flag for {label} subgroup={use_subgroup}"
+            );
+        }
+    }
+
+    // End-to-end VulkanBatchedGraphExecutor::evaluate_argmax parity against evaluate_token + sampling::greedy.
+    let gpu_model_ref = synthetic_hybrid_qwen35_model("live-vocab-argmax")?;
+    let gpu_model_fast = synthetic_hybrid_qwen35_model("live-vocab-argmax")?;
+    let mut exec_ref =
+        VulkanBatchedGraphExecutor::open(&gpu_model_ref, VulkanBatchedConfig::default())?;
+    let mut exec_fast =
+        VulkanBatchedGraphExecutor::open(&gpu_model_fast, VulkanBatchedConfig::default())?;
+
+    let logits_t0 = exec_ref.evaluate_token(0)?;
+    let argmax_t0 = exec_fast
+        .evaluate_argmax(0)
+        .map_err(|err| format!("evaluate_argmax token 0 failed: {err}"))?;
+    assert_eq!(argmax_t0, greedy(&logits_t0)?);
+    assert_eq!(exec_fast.submits_completed(), 1);
+    assert_eq!(exec_fast.position(), 1);
+
+    exec_ref.ingest_token(1)?;
+    exec_fast.ingest_token(1)?;
+
+    // Token 2 hits cached decode CBs for `LogitOutputMode::Argmax`!
+    let logits_t2 = exec_ref.evaluate_token(2)?;
+    let argmax_t2 = exec_fast
+        .evaluate_argmax(2)
+        .map_err(|err| format!("evaluate_argmax token 2 failed: {err}"))?;
+    assert_eq!(argmax_t2, greedy(&logits_t2)?);
+    assert_eq!(exec_fast.submits_completed(), 3);
+    assert_eq!(exec_fast.position(), 3);
+
+    // Overflowing output_norm triggers IEEE-754 non-finite detection in evaluate_argmax and latches inconsistency.
+    let mut bad_model = synthetic_hybrid_qwen35_model("live-vocab-argmax-nonfinite")?;
+    let embed = bad_model.tensors["output_norm.weight"].dimensions[0];
+    bad_model.tensors.insert(
+        "output_norm.weight".to_owned(),
+        f32_tensor("output_norm.weight", &[embed], &vec![1e38_f32; embed]),
+    );
+    let mut bad_exec =
+        VulkanBatchedGraphExecutor::open(&bad_model, VulkanBatchedConfig::default())?;
+    assert!(bad_exec.evaluate_argmax(0).is_err());
+    assert!(bad_exec.evaluate_argmax(0).is_err());
+
+    Ok(())
 }

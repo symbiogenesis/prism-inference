@@ -11328,6 +11328,258 @@ pub fn kv_append_batched_f16() -> Vec<u32> {
     b.finish()
 }
 
+const VOCAB_ARGMAX_WG_X: u32 = 256;
+
+fn emit_argmax_pair_merge(
+    b: &mut ShaderBuilder,
+    cur_val: u32,
+    cur_idx: u32,
+    cur_nf: u32,
+    cand_val: u32,
+    cand_idx: u32,
+    cand_nf: u32,
+) -> (u32, u32, u32) {
+    let gt = b.f_gt(cand_val, cur_val);
+    let eq = b.f_eq(cand_val, cur_val);
+    let idx_lt = b.u_lt(cand_idx, cur_idx);
+    let tie_win = b.logical_and(eq, idx_lt);
+    let take_cand = b.logical_or(gt, tie_win);
+    let next_val = b.select(b.f32_t, take_cand, cand_val, cur_val);
+    let next_idx = b.select(b.u32_t, take_cand, cand_idx, cur_idx);
+    let next_nf = b.uor(cur_nf, cand_nf);
+    (next_val, next_idx, next_nf)
+}
+
+fn emit_argmax_wg256_store(
+    b: &mut ShaderBuilder,
+    out_buf: u32,
+    wg_idx: u32,
+    lid: u32,
+    init_val: u32,
+    init_idx: u32,
+    init_nf: u32,
+) {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+
+    if b.uses_subgroup_shuffle() {
+        let smem_val = b.workgroup_f32_array(4);
+        let smem_idx = b.workgroup_u32_array(4);
+        let smem_nf = b.workgroup_u32_array(4);
+        let c6 = b.const_u32(6);
+        let c63 = b.const_u32(63);
+
+        let mut cur_val = init_val;
+        let mut cur_idx = init_idx;
+        let mut cur_nf = init_nf;
+        for mask in [32_u32, 16, 8, 4, 2, 1] {
+            let other_val = b.subgroup_shuffle_xor(b.f32_t, cur_val, mask);
+            let other_idx = b.subgroup_shuffle_xor(b.u32_t, cur_idx, mask);
+            let other_nf = b.subgroup_shuffle_xor(b.u32_t, cur_nf, mask);
+            (cur_val, cur_idx, cur_nf) =
+                emit_argmax_pair_merge(b, cur_val, cur_idx, cur_nf, other_val, other_idx, other_nf);
+        }
+        let lane = b.uand(lid, c63);
+        let wave = b.ushr(lid, c6);
+        let is_lane0 = b.u_eq(lane, c0);
+        b.emit_if(is_lane0, |b| {
+            b.store_wg_f32(smem_val, wave, cur_val);
+            b.store_wg_u32(smem_idx, wave, cur_idx);
+            b.store_wg_u32(smem_nf, wave, cur_nf);
+        });
+        b.workgroup_barrier();
+
+        let is_t0 = b.u_eq(lid, c0);
+        b.emit_if(is_t0, |b| {
+            let mut wave_val = b.load_wg_f32(smem_val, c0);
+            let mut wave_idx = b.load_wg_u32(smem_idx, c0);
+            let mut wave_nf = b.load_wg_u32(smem_nf, c0);
+            for w in 1_u32..4 {
+                let wc = b.const_u32(w);
+                let cv = b.load_wg_f32(smem_val, wc);
+                let ci = b.load_wg_u32(smem_idx, wc);
+                let cn = b.load_wg_u32(smem_nf, wc);
+                (wave_val, wave_idx, wave_nf) =
+                    emit_argmax_pair_merge(b, wave_val, wave_idx, wave_nf, cv, ci, cn);
+            }
+            let val_bits = b.bitcast(b.u32_t, wave_val);
+            let out_base = b.umul(wg_idx, c3);
+            let out_i = b.uadd(out_base, c1);
+            let out_n = b.uadd(out_base, c2);
+            b.store_sb_u32(out_buf, out_base, val_bits);
+            b.store_sb_u32(out_buf, out_i, wave_idx);
+            b.store_sb_u32(out_buf, out_n, wave_nf);
+        });
+    } else {
+        let smem_val = b.workgroup_f32_array(VOCAB_ARGMAX_WG_X);
+        let smem_idx = b.workgroup_u32_array(VOCAB_ARGMAX_WG_X);
+        let smem_nf = b.workgroup_u32_array(VOCAB_ARGMAX_WG_X);
+        b.store_wg_f32(smem_val, lid, init_val);
+        b.store_wg_u32(smem_idx, lid, init_idx);
+        b.store_wg_u32(smem_nf, lid, init_nf);
+        b.workgroup_barrier();
+
+        for stride in [128_u32, 64, 32, 16, 8, 4, 2, 1] {
+            let sc = b.const_u32(stride);
+            let active = b.u_lt(lid, sc);
+            b.emit_if(active, |b| {
+                let other = b.uadd(lid, sc);
+                let v0 = b.load_wg_f32(smem_val, lid);
+                let i0 = b.load_wg_u32(smem_idx, lid);
+                let n0 = b.load_wg_u32(smem_nf, lid);
+                let v1 = b.load_wg_f32(smem_val, other);
+                let i1 = b.load_wg_u32(smem_idx, other);
+                let n1 = b.load_wg_u32(smem_nf, other);
+                let (nv, ni, nn) = emit_argmax_pair_merge(b, v0, i0, n0, v1, i1, n1);
+                b.store_wg_f32(smem_val, lid, nv);
+                b.store_wg_u32(smem_idx, lid, ni);
+                b.store_wg_u32(smem_nf, lid, nn);
+            });
+            b.workgroup_barrier();
+        }
+        let is_t0 = b.u_eq(lid, c0);
+        b.emit_if(is_t0, |b| {
+            let fv = b.load_wg_f32(smem_val, c0);
+            let fi = b.load_wg_u32(smem_idx, c0);
+            let fnf = b.load_wg_u32(smem_nf, c0);
+            let val_bits = b.bitcast(b.u32_t, fv);
+            let out_base = b.umul(wg_idx, c3);
+            let out_i = b.uadd(out_base, c1);
+            let out_n = b.uadd(out_base, c2);
+            b.store_sb_u32(out_buf, out_base, val_bits);
+            b.store_sb_u32(out_buf, out_i, fi);
+            b.store_sb_u32(out_buf, out_n, fnf);
+        });
+    }
+}
+
+/// Emits stage-1 GPU vocabulary `argmax` + IEEE-754 non-finite detection SPIR-V 1.6 words.
+///
+/// Reduces groups of `256` logits into `[max_val_bits, best_idx, non_finite_flag]` triplets with
+/// lowest-index tie-breaking matching `sampling::greedy`.
+/// Bindings: `0` read-only `logits_bits` (`u32`), `1` writable `partials` (`u32`).
+/// Push constants (`1 × u32`): `[vocab]`. Dispatch: `(vocab.div_ceil(256), 1, 1)`.
+#[must_use]
+pub fn vocab_argmax_stage1() -> Vec<u32> {
+    vocab_argmax_stage1_with_subgroup(false)
+}
+
+/// Emits stage-1 GPU vocabulary `argmax` + non-finite detection with optional wave64 subgroup shuffle.
+#[must_use]
+pub fn vocab_argmax_stage1_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 1);
+    let push_var = push_var.unwrap_or(0);
+    let logits_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let partials_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadWrite);
+
+    let gid_vec = b.global_invocation_id();
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let gid = b.load_input_component(gid_vec, 0);
+    let lid = b.load_input_component(lid_vec, 0);
+    let wid = b.load_input_component(wid_vec, 0);
+    let vocab = b.load_push(push_var, 0);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let exp_mask = b.const_u32(0x7F80_0000);
+    let neg_inf_bits = b.const_u32(0xFF80_0000);
+    let neg_inf = b.bitcast(b.f32_t, neg_inf_bits);
+    let sentinel_idx = b.const_u32(u32::MAX);
+
+    let val_var = b.local_f32_var();
+    let idx_var = b.local_u32_var();
+    let nf_var = b.local_u32_var();
+    b.store_var(val_var, neg_inf);
+    b.store_var(idx_var, sentinel_idx);
+    b.store_var(nf_var, c0);
+
+    let in_bounds = b.u_lt(gid, vocab);
+    b.emit_if(in_bounds, |b| {
+        let raw_bits = b.load_sb_u32(logits_buf, gid);
+        let exp_bits = b.uand(raw_bits, exp_mask);
+        let is_nf = b.u_eq(exp_bits, exp_mask);
+        let nf_u32 = b.select(b.u32_t, is_nf, c1, c0);
+        let fval = b.bitcast(b.f32_t, raw_bits);
+        b.store_var(val_var, fval);
+        b.store_var(idx_var, gid);
+        b.store_var(nf_var, nf_u32);
+    });
+
+    let init_val = b.load_var_f32(val_var);
+    let init_idx = b.load_var_u32(idx_var);
+    let init_nf = b.load_var_u32(nf_var);
+    emit_argmax_wg256_store(&mut b, partials_buf, wid, lid, init_val, init_idx, init_nf);
+
+    b.finish_with_local_size([VOCAB_ARGMAX_WG_X, 1, 1])
+}
+
+/// Emits stage-2 GPU vocabulary `argmax` + IEEE-754 non-finite reduction SPIR-V 1.6 words.
+///
+/// Reduces `num_partials` `[max_val_bits, best_idx, non_finite_flag]` triplets into a single
+/// 12-byte `[max_val_bits, best_token_u32, non_finite_flag]` result.
+/// Bindings: `0` read-only `partials` (`u32`), `1` writable `result_out` (`u32`).
+/// Push constants (`1 × u32`): `[num_partials]`. Dispatch: `(1, 1, 1)`.
+#[must_use]
+pub fn vocab_argmax_stage2() -> Vec<u32> {
+    vocab_argmax_stage2_with_subgroup(false)
+}
+
+/// Emits stage-2 GPU vocabulary `argmax` + non-finite reduction with optional wave64 subgroup shuffle.
+#[must_use]
+pub fn vocab_argmax_stage2_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 1);
+    let push_var = push_var.unwrap_or(0);
+    let partials_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadWrite);
+
+    let lid_vec = b.local_invocation_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let num_partials = b.load_push(push_var, 0);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
+    let c256 = b.const_u32(VOCAB_ARGMAX_WG_X);
+    let neg_inf_bits = b.const_u32(0xFF80_0000);
+    let neg_inf = b.bitcast(b.f32_t, neg_inf_bits);
+    let sentinel_idx = b.const_u32(u32::MAX);
+
+    let val_var = b.local_f32_var();
+    let idx_var = b.local_u32_var();
+    let nf_var = b.local_u32_var();
+    b.store_var(val_var, neg_inf);
+    b.store_var(idx_var, sentinel_idx);
+    b.store_var(nf_var, c0);
+
+    b.emit_for_range(lid, num_partials, c256, |b, p| {
+        let p_base = b.umul(p, c3);
+        let p_i = b.uadd(p_base, c1);
+        let p_n = b.uadd(p_base, c2);
+        let c_bits = b.load_sb_u32(partials_buf, p_base);
+        let cv = b.bitcast(b.f32_t, c_bits);
+        let ci = b.load_sb_u32(partials_buf, p_i);
+        let cn = b.load_sb_u32(partials_buf, p_n);
+        let pv = b.load_var_f32(val_var);
+        let pi = b.load_var_u32(idx_var);
+        let pn = b.load_var_u32(nf_var);
+        let (nv, ni, nn) = emit_argmax_pair_merge(b, pv, pi, pn, cv, ci, cn);
+        b.store_var(val_var, nv);
+        b.store_var(idx_var, ni);
+        b.store_var(nf_var, nn);
+    });
+
+    let init_val = b.load_var_f32(val_var);
+    let init_idx = b.load_var_u32(idx_var);
+    let init_nf = b.load_var_u32(nf_var);
+    emit_argmax_wg256_store(&mut b, out_buf, c0, lid, init_val, init_idx, init_nf);
+
+    b.finish_with_local_size([VOCAB_ARGMAX_WG_X, 1, 1])
+}
+
 /// Emits packed-FP16 to F32 KV unpack SPIR-V 1.6 words for `#40` attention consumption.
 ///
 /// Bindings: `0` read-only `cache_u32` (`u32`), `1` writable `out_f32` (`f32`).
@@ -13232,6 +13484,10 @@ mod tests {
             gdn_scan_batched_f32_with_subgroup(true),
             f32_matvec_with_subgroup(true),
             f32_gemm_batched_with_subgroup(true),
+            vocab_argmax_stage1_with_subgroup(false),
+            vocab_argmax_stage1_with_subgroup(true),
+            vocab_argmax_stage2_with_subgroup(false),
+            vocab_argmax_stage2_with_subgroup(true),
         ] {
             assert_valid_spirv_structure(&module, Some(false));
             assert_eq!(shader_digest(&module)?.len(), 64);

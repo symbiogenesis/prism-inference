@@ -1904,7 +1904,7 @@ fn repack_test_ptq1_coalesced(raw: &[u8], cols: usize, rows: usize) -> Vec<u32> 
 fn build_q8k_4plane_words(cols: usize, tokens: usize) -> (Vec<Q8KBlock>, Vec<u32>) {
     let q8k_per_tok = cols / 256;
     let mut blocks = Vec::with_capacity(tokens * q8k_per_tok);
-    let mut words = Vec::with_capacity(tokens * q8k_per_tok * 68);
+    let mut words = Vec::with_capacity(tokens * q8k_per_tok * 72);
     for t in 0..tokens {
         for b in 0..q8k_per_tok {
             let mut values = [0_i8; 256];
@@ -1937,6 +1937,8 @@ fn build_q8k_4plane_words(cols: usize, tokens: usize) -> (Vec<Q8KBlock>, Vec<u32
                     .sum();
                 words.push(blk.scale.to_bits());
                 words.push((64 * hsum).cast_unsigned());
+                words.push(0);
+                words.push(0);
                 for chunk4 in hvals.as_chunks::<4>().0 {
                     words.push(u32::from_le_bytes([
                         chunk4[0].cast_unsigned(),
@@ -1954,13 +1956,16 @@ fn build_q8k_4plane_words(cols: usize, tokens: usize) -> (Vec<Q8KBlock>, Vec<u32
 
 fn build_q8_0_words(cols: usize, tokens: usize) -> Vec<u32> {
     let blocks_per_tok = cols / 32;
-    let mut words = Vec::with_capacity(tokens * blocks_per_tok * 9);
+    let mut words = Vec::with_capacity(tokens * blocks_per_tok * 12);
     for t in 0..tokens {
         for b in 0..blocks_per_tok {
             let sign = if (t + b).is_multiple_of(2) { 1.0 } else { -1.0 };
             let scale =
                 sign * (0.031_25_f32 * f32::from(u8::try_from((t + b) % 5 + 1).unwrap_or(1)));
             words.push(scale.to_bits());
+            words.push(0);
+            words.push(0);
+            words.push(0);
             for j in 0..8 {
                 let b0 =
                     i8::try_from(i32::try_from((t * 7 + b * 3 + j * 4) % 181).unwrap_or(0) - 90)
@@ -2134,12 +2139,13 @@ fn live_fused_hadamard1024_quant_matches_unfused_zero_ulp() -> TestResult {
     let sign_tmp = dev.create_storage_buffer(f32_bytes)?;
     let rot_tmp = dev.create_storage_buffer(f32_bytes)?;
     let fused_q8k =
-        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 128) * 34 * 4)?)?;
+        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 128) * 36 * 4)?)?;
     let unfused_q8k =
-        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 128) * 34 * 4)?)?;
-    let fused_q8_0 = dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 32) * 9 * 4)?)?;
+        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 128) * 36 * 4)?)?;
+    let fused_q8_0 =
+        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 32) * 12 * 4)?)?;
     let unfused_q8_0 =
-        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 32) * 9 * 4)?)?;
+        dev.create_storage_buffer(u64::try_from(max_tokens * (cols / 32) * 12 * 4)?)?;
 
     dev.write_buffer_f32(src_buf, &src_vals)?;
     dev.write_buffer_f32(sign_buf, &sign_vals)?;
@@ -2175,7 +2181,7 @@ fn live_fused_hadamard1024_quant_matches_unfused_zero_ulp() -> TestResult {
         for (pinned, pipe_uq8k, pipe_fq8k) in &q8k_variant_pipes {
             let uq8k = (*pipe_uq8k).clone()?;
             let fq8k = (*pipe_fq8k).clone()?;
-            let byte_len = usize::try_from(tokens)? * (cols / 128) * 34 * 4;
+            let byte_len = usize::try_from(tokens)? * (cols / 128) * 36 * 4;
             verify_fused_hadamard_case(
                 &mut dev,
                 &base_rec,
@@ -2201,7 +2207,7 @@ fn live_fused_hadamard1024_quant_matches_unfused_zero_ulp() -> TestResult {
             let uq8 = (*pipe_uq8).clone()?;
             let fq8 = (*pipe_fq8).clone()?;
             let q8_blocks = cols_u32 / 32;
-            let byte_len = usize::try_from(tokens)? * (cols / 32) * 9 * 4;
+            let byte_len = usize::try_from(tokens)? * (cols / 32) * 12 * 4;
             verify_fused_hadamard_case(
                 &mut dev,
                 &base_rec,
@@ -2310,8 +2316,8 @@ fn verify_coalesced_16tok_and_ptq1_for_mode(
     let row_tiles = rows_u32.div_ceil(64);
     let blk_128 = u32::try_from(cols / 128)?;
     let blk_32 = u32::try_from(cols / 32)?;
-    let act_w_k = blk_128 * 34;
-    let act_w_8 = blk_32 * 9;
+    let act_w_k = blk_128 * 36;
+    let act_w_8 = blk_32 * 12;
 
     for fused in [false, true] {
         let p_ref = dev.create_compute_pipeline(
@@ -3140,7 +3146,7 @@ fn verify_live_swiglu_h1024_q8k_parity(
     let b_sign = dev.create_storage_buffer(u64::try_from(cols * 4)?)?;
     let b_mid_ref = dev.create_storage_buffer(u64::try_from(max_t * cols * 4)?)?;
     let b_mid_fus = dev.create_storage_buffer(u64::try_from(max_t * cols * 4)?)?;
-    let q8k_words = max_t * (cols / 128) * 34;
+    let q8k_words = max_t * (cols / 128) * 36;
     let b_q8k_ref = dev.create_storage_buffer(u64::try_from(q8k_words * 4)?)?;
     let b_q8k_fus = dev.create_storage_buffer(u64::try_from(q8k_words * 4)?)?;
     dev.write_buffer_f32(b_gate, &gate_vals)?;
@@ -3198,7 +3204,7 @@ fn verify_live_swiglu_h1024_q8k_parity(
             );
             dev.submit_compute_batch(&rec)?;
 
-            let words = tokens * (cols / 128) * 34;
+            let words = tokens * (cols / 128) * 36;
             let q_ref = read_buffer_words(dev, b_q8k_ref, words)?;
             let q_fus = read_buffer_words(dev, b_q8k_fus, words)?;
             assert_eq!(

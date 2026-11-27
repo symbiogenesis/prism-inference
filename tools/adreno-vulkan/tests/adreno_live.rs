@@ -671,7 +671,7 @@ fn gpu_quantize_q8k_4plane_matches_cpu_bit_for_bit() -> TestResult {
 
     let in_buf = device.create_storage_buffer(u64::try_from(cols * 4)?)?;
     device.write_buffer_f32(in_buf, &act)?;
-    let words_out = (cols / 128) * 34;
+    let words_out = (cols / 128) * 36;
     let out_buf = device.create_storage_buffer(u64::try_from(words_out * 4)?)?;
     device.submit_compute(
         pipe,
@@ -711,6 +711,8 @@ fn gpu_quantize_q8k_4plane_matches_cpu_bit_for_bit() -> TestResult {
         for (h_idx, sub) in qs.as_chunks::<128>().0.iter().enumerate() {
             expected.push(scale.to_bits());
             expected.push((if h_idx == 0 { h0 } else { h1 }).cast_unsigned());
+            expected.push(0);
+            expected.push(0);
             for c16 in sub.as_chunks::<16>().0 {
                 for d in 0..4 {
                     expected.push(u32::from_le_bytes([
@@ -735,8 +737,8 @@ fn gpu_quantize_q8k_4plane_matches_cpu_bit_for_bit() -> TestResult {
             g,
             e,
             "q8k_4plane word {idx} (blk={}, w={}): gpu=0x{g:08x} cpu=0x{e:08x}",
-            idx / 34,
-            idx % 34
+            idx / 36,
+            idx % 36
         );
     }
     Ok(())

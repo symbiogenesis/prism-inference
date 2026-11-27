@@ -5479,10 +5479,13 @@ impl VulkanBatchedGraphExecutor {
                     })?;
                     let act_words = u32::try_from(blocks_per_row * Q8K_4PLANE_WORDS_PER_HALF)
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
-                    let pipe = if use_decode_splitk && rows_u32 <= 4096 && blocks_per_row >= 8 {
+                    let pipe = if use_decode_splitk
+                        && ((rows_u32 <= 4096 && blocks_per_row >= 8)
+                            || (rows_u32 <= 8192 && blocks_per_row >= 32))
+                    {
                         self.pipelines
                             .proj
-                            .select_pq2_q8k_decode_splitk(self.resolved_pinned_arithmetic)
+                            .select_pq2_q8k_decode_splitk(self.resolved_pinned_arithmetic, false)
                     } else {
                         self.pipelines.proj.select_pq2_q8k(
                             self.resolved_pinned_arithmetic,
@@ -5516,7 +5519,9 @@ impl VulkanBatchedGraphExecutor {
                     })?;
                     let act_words = u32::try_from((cols / 32) * Q8_0_WORDS_PER_BLOCK)
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
-                    let splitk = use_decode_splitk && rows_u32 <= 4096 && blocks_per_row >= 8;
+                    let splitk = use_decode_splitk
+                        && ((rows_u32 <= 4096 && blocks_per_row >= 8)
+                            || (rows_u32 <= 8192 && blocks_per_row >= 32));
                     let (pipe, tok_tiles_y) = match weight.encoding {
                         WeightEncoding::Pq2Q8_0 => (
                             if splitk {

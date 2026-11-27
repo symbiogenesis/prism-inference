@@ -17,8 +17,10 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-bonsai-ternary.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
+bonsai-ternary.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 bonsai-windows-process.workspace = true

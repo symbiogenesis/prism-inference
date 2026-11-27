@@ -5963,23 +5963,21 @@ mod tests {
         let mut output = Vec::new();
         matvec_into(&tensor, &[1.0; 2], &mut output, &mut scratch)?;
         let activation_pointer = scratch.activations.as_ptr();
-        let row_pointer = scratch.row.as_ptr();
+        assert_eq!(scratch.row.capacity(), 0);
         tensor.dimensions = vec![1];
         tensor.data = Arc::<[u8]>::from(super::half_bits(2.0).to_le_bytes().as_slice()).into();
         matvec_into(&tensor, &[3.0], &mut output, &mut scratch)?;
         assert_eq!(scratch.activations.len(), 1);
-        assert_eq!(scratch.row.len(), 1);
+        assert_eq!(scratch.row.capacity(), 0);
         assert_eq!(scratch.activations.as_ptr(), activation_pointer);
-        assert_eq!(scratch.row.as_ptr(), row_pointer);
         assert_eq!(output, [6.0]);
         // Direct and scalar-column F32 projections do not touch floating scratch.
         tensor.kind = super::F32;
         tensor.data = Arc::<[u8]>::from(2.0_f32.to_le_bytes().as_slice()).into();
         matvec_into(&tensor, &[3.0], &mut output, &mut scratch)?;
         assert_eq!(scratch.activations.len(), 1);
-        assert_eq!(scratch.row.len(), 1);
+        assert_eq!(scratch.row.capacity(), 0);
         assert_eq!(scratch.activations.as_ptr(), activation_pointer);
-        assert_eq!(scratch.row.as_ptr(), row_pointer);
         assert_eq!(output, [6.0]);
         Ok(())
     }

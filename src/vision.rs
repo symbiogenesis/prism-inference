@@ -3371,15 +3371,15 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
     #[test]
     fn softmax_four_queries_neon_matches_scalar_and_rejects_nonfinite() -> Result<()> {
-        #[cfg(all(
-            feature = "experimental-neon",
-            target_arch = "aarch64",
-            target_os = "windows",
-            target_env = "msvc",
-            target_feature = "neon"
-        ))]
         if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
             for &n_pos in &[1_usize, 3, 4, 17, 64, 256] {
                 let mut ref_rows = [

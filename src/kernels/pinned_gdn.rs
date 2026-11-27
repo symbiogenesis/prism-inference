@@ -278,13 +278,16 @@ pub(crate) fn dot_pair_eight_rows_tokens(
 /// # Errors
 /// Rejects batches exceeding 32 tokens, mismatched vector lengths, or a nonfinite result.
 #[cfg_attr(
-    not(all(
-        feature = "experimental-neon",
-        target_arch = "aarch64",
-        target_os = "windows",
-        target_env = "msvc",
-        target_feature = "neon"
-    )),
+    all(
+        not(test),
+        not(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))
+    ),
     expect(
         dead_code,
         reason = "Dispatched from NEON 8-row GDN prefill and NEON parity tests."

@@ -76,6 +76,25 @@ const _: () = assert!(size_of::<Ptq1Activation>() == 208);
 const _: () = assert!(core::mem::offset_of!(Ptq1Activation, values) == 16);
 const _: () = assert!(core::mem::offset_of!(Ptq1Activation, neg_lane_sums) == 144);
 
+/// Pre-packed two-token `I8MM` (`SMMLA`) activation panel for one 32-element `Q8_0` group
+/// under `PTQ1_0` pinned four-lane accumulation.
+///
+/// Each of the four 16-byte `planes[l]` holds the 8-element lane `l` from token `t0`
+/// (`values[4*l..4*l+4]`, `values[16+4*l..16+4*l+4]`) followed by the 8-element lane `l`
+/// from token `t1`.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug)]
+pub struct Ptq1PinnedI8mmPairBlock {
+    /// Four lane-deinterleaved `(t0, t1)` 16-byte `SMMLA` panels for lanes `0..4`.
+    pub planes: [[i8; 16]; 4],
+    /// Original `f32` activation scales `[t0.scale(), t1.scale()]` for the token pair.
+    pub scales: [f32; 2],
+}
+
+const _: () = assert!(size_of::<Ptq1PinnedI8mmPairBlock>() == 80);
+const _: () = assert!(core::mem::offset_of!(Ptq1PinnedI8mmPairBlock, planes) == 0);
+const _: () = assert!(core::mem::offset_of!(Ptq1PinnedI8mmPairBlock, scales) == 64);
+
 impl Ptq1Activation {
     /// Returns a zeroed [`Ptq1Activation`] block.
     #[inline]
@@ -434,6 +453,48 @@ pub(super) fn valid_ptq1_8x8_chunks<A: Q8ActivationView>(
             .iter()
             .flatten()
             .all(|tok| tok.len() == len && tok.iter().all(|block| block.scale().is_finite()))
+}
+
+pub(super) fn valid_ptq1_8x8_chunks_up_to_8<A: Q8ActivationView>(
+    rows: [&[u8]; 8],
+    chunks: &[[&[A]; 8]],
+    outputs_len: usize,
+) -> Option<usize> {
+    let first_len = chunks.first().map(|chunk| chunk[0].len())?;
+    if chunks.len() > 8
+        || outputs_len != chunks.len()
+        || !chunks
+            .chunks(4)
+            .all(|c| c[0][0].len() == first_len && valid_ptq1_8x8_chunks(rows, c, c.len()))
+    {
+        return None;
+    }
+    Some(first_len)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn portable_append_ptq1_pinned_i8mm_pair_blocks<A: Q8ActivationView>(
+    t0: &[A],
+    t1: &[A],
+    out: &mut Vec<Ptq1PinnedI8mmPairBlock>,
+) {
+    out.reserve(t0.len());
+    for (b0, b1) in t0.iter().zip(t1.iter()) {
+        let v0 = b0.values();
+        let v1 = b1.values();
+        let mut planes = [[0_i8; 16]; 4];
+        for (lane, dst) in planes.iter_mut().enumerate() {
+            let off = lane * 4;
+            dst[0..4].copy_from_slice(&v0[off..off + 4]);
+            dst[4..8].copy_from_slice(&v0[16 + off..16 + off + 4]);
+            dst[8..12].copy_from_slice(&v1[off..off + 4]);
+            dst[12..16].copy_from_slice(&v1[16 + off..16 + off + 4]);
+        }
+        out.push(Ptq1PinnedI8mmPairBlock {
+            planes,
+            scales: [b0.scale(), b1.scale()],
+        });
+    }
 }
 
 pub(super) fn valid_q8_0_activation<A: Q8ActivationView>(activation: &[A]) -> Option<usize> {
@@ -2966,6 +3027,89 @@ mod tests {
         for (out_c, sen_c) in out.iter().zip(sentinel.iter()) {
             for (out_r, sen_r) in out_c.iter().zip(sen_c.iter()) {
                 assert_eq!(out_r.map(f32::to_bits), sen_r.map(f32::to_bits));
+            }
+        }
+    }
+
+    #[test]
+    fn x1_ptq1_pinned_i8mm_panels_match_portable_and_reject_bad_inputs() {
+        use super::portable_ptq1_8x8_chunks_validated;
+
+        let Some(caps) = ptq1_test_caps() else {
+            return;
+        };
+        for block_count in [1_usize, 3, 5] {
+            let q8_len = block_count * 4;
+            let (rows, acts) = sample_ptq1_32tok_fixture(block_count, 13);
+            let row_refs: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+            let chunk_slices: [[&[super::Q8ActivationBlock]; 8]; 4] =
+                std::array::from_fn(|c| std::array::from_fn(|t| acts[c * 8 + t].as_slice()));
+            let mut expected = [[[0.0_f32; 8]; 8]; 4];
+            assert!(
+                portable_ptq1_8x8_chunks_validated::<true, _>(
+                    row_refs,
+                    &chunk_slices,
+                    &mut expected
+                )
+                .is_some()
+            );
+
+            for &cap in &caps {
+                let mut packed = Vec::new();
+                for chunk in &chunk_slices {
+                    for p in 0..4 {
+                        assert!(
+                            cap.append_pinned_i8mm_pair_blocks(
+                                chunk[2 * p],
+                                chunk[2 * p + 1],
+                                &mut packed,
+                            )
+                            .is_some()
+                        );
+                    }
+                }
+                let panel_chunks: [[&[super::Ptq1PinnedI8mmPairBlock]; 4]; 4] =
+                    std::array::from_fn(|c| {
+                        std::array::from_fn(|p| {
+                            let start = (c * 4 + p) * q8_len;
+                            &packed[start..start + q8_len]
+                        })
+                    });
+
+                let mut actual = [[[f32::NAN; 8]; 8]; 4];
+                assert!(
+                    cap.dot_scaled_8x8_chunks_with_pinned_panels(
+                        row_refs,
+                        &chunk_slices,
+                        &panel_chunks,
+                        &mut actual,
+                    )
+                    .is_some()
+                );
+                for (e, a) in expected.iter().zip(actual.iter()) {
+                    for r in 0..8 {
+                        assert_eq!(e[r].map(f32::to_bits), a[r].map(f32::to_bits));
+                    }
+                }
+
+                // Mismatched panel length must return None without touching sentinel outputs.
+                let sentinel = [[[77.5_f32; 8]; 8]; 4];
+                let mut bad_out = sentinel;
+                let mut bad_panels = panel_chunks;
+                bad_panels[1][2] = &panel_chunks[1][2][..q8_len - 1];
+                assert!(
+                    cap.dot_scaled_8x8_chunks_with_pinned_panels(
+                        row_refs,
+                        &chunk_slices,
+                        &bad_panels,
+                        &mut bad_out,
+                    )
+                    .is_none()
+                );
+                assert_eq!(
+                    bad_out.map(|c| c.map(|r| r.map(f32::to_bits))),
+                    sentinel.map(|c| c.map(|r| r.map(f32::to_bits)))
+                );
             }
         }
     }

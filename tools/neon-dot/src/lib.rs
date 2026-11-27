@@ -11,7 +11,8 @@
 
 mod scaled;
 pub use scaled::{
-    Pq2Activation, Pq2I8mmPairBlock, Ptq1Activation, Q8ActivationBlock, Q8ActivationView,
+    Pq2Activation, Pq2I8mmPairBlock, Ptq1Activation, Ptq1PinnedI8mmPairBlock, Q8ActivationBlock,
+    Q8ActivationView,
 };
 
 pub use bonsai_ternary::{
@@ -782,6 +783,52 @@ impl Ptq1Dotprod {
         })
     }
 
+    /// Returns whether runtime CPU/OS detection enabled `I8MM` (`SMMLA`) on this capability.
+    #[inline]
+    #[must_use]
+    pub const fn has_i8mm(self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.i8mm
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    }
+
+    /// Appends pre-packed lane-deinterleaved `SMMLA` panels ([`Ptq1PinnedI8mmPairBlock`])
+    /// for `(t0, t1)` into `out` without clearing prior panels.
+    ///
+    /// Returns `None` for empty, unaligned, mismatched, or overflowing extents, or nonfinite scales.
+    #[inline]
+    #[must_use]
+    pub fn append_pinned_i8mm_pair_blocks<A: Q8ActivationView>(
+        self,
+        t0: &[A],
+        t1: &[A],
+        out: &mut Vec<Ptq1PinnedI8mmPairBlock>,
+    ) -> Option<()> {
+        let _ = self;
+        if t0.is_empty()
+            || t0.len() != t1.len()
+            || !t0.len().is_multiple_of(4)
+            || (t0.len() / 4).checked_mul(28).is_none()
+            || !t0.iter().chain(t1.iter()).all(|b| b.scale().is_finite())
+        {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::ptq1_append_pinned_i8mm_pair_blocks(t0, t1, out);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            scaled::portable_append_ptq1_pinned_i8mm_pair_blocks(t0, t1, out);
+        }
+        Some(())
+    }
+
     /// Validates current `Q8_0` activation scales once for any number of `PTQ1_0` row groups.
     ///
     /// Returns `None` for empty/unaligned inputs, overflowing extents, or nonfinite scales.
@@ -967,6 +1014,50 @@ impl Ptq1Dotprod {
             let _ = self;
             for (c, o) in chunks.chunks(4).zip(outputs.chunks_mut(4)) {
                 scaled::portable_ptq1_8x8_chunks_validated::<PINNED, A>(rows, c, o)?;
+            }
+            Some(())
+        }
+    }
+
+    /// Consumes `8` complete 28-byte `PTQ1_0` rows across `1..=8` aligned eight-token
+    /// chunks (`8..=64` tokens) in `PinnedSwift` mode using pre-packed lane-deinterleaved
+    /// `SMMLA` panels ([`Ptq1PinnedI8mmPairBlock`]) when `I8MM` is active.
+    ///
+    /// Preserves exact `0 ULP` parity and falls back cleanly when `I8MM` is absent.
+    /// Returns `None` for unsupported geometry, panel mismatch, or nonfinite scales/outputs.
+    #[inline]
+    #[must_use]
+    pub fn dot_scaled_8x8_chunks_with_pinned_panels<A: Q8ActivationView>(
+        self,
+        rows: [&[u8]; 8],
+        chunks: &[[&[A]; 8]],
+        panels: &[[&[Ptq1PinnedI8mmPairBlock]; 4]],
+        outputs: &mut [[[f32; 8]; 8]],
+    ) -> Option<()> {
+        let q8_len = scaled::valid_ptq1_8x8_chunks_up_to_8(rows, chunks, outputs.len())?;
+        if panels.len() != chunks.len()
+            || !panels
+                .iter()
+                .flatten()
+                .all(|pair_blocks| pair_blocks.len() == q8_len)
+        {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.i8mm {
+                aarch64::ptq1_detected_dot_scaled_8x8_chunks_with_pinned_panels(
+                    self, rows, panels, outputs,
+                )
+            } else {
+                aarch64::ptq1_detected_dot_scaled_8x8_chunks::<true, A>(self, rows, chunks, outputs)
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = self;
+            for (c, o) in chunks.chunks(4).zip(outputs.chunks_mut(4)) {
+                scaled::portable_ptq1_8x8_chunks_validated::<true, A>(rows, c, o)?;
             }
             Some(())
         }

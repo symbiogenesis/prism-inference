@@ -550,16 +550,24 @@ pub(crate) struct PipeConnection {
     pending_eof_seq: u64,
 }
 
-impl Drop for PipeConnection {
-    fn drop(&mut self) {
+impl PipeConnection {
+    /// Closes the inbound read channel and recycles any buffered or queued frames.
+    pub(crate) fn close_read(&mut self) {
         let leftover = std::mem::take(&mut self.buffered);
         self.pool.recycle(leftover);
+        self.offset = 0;
         self.rx.close();
         while let Ok(item) = self.rx.try_recv() {
             if let Ok(chunk) = item {
                 self.pool.recycle(chunk);
             }
         }
+    }
+}
+
+impl Drop for PipeConnection {
+    fn drop(&mut self) {
+        self.close_read();
         if !self.eof_enqueued {
             let mut state = lock_unpoisoned(&self.tx.state);
             if !state.closed && !state.failed && !state.is_reset(self.stream_id) {
@@ -922,9 +930,11 @@ fn dispatch_reader_frame<R: Read>(
             if let Some((active_id, sender)) = active
                 && *active_id == stream_id
             {
-                if let Err(mpsc::error::SendError(Ok(returned))) = sender.blocking_send(Ok(payload))
-                {
-                    pool.recycle(returned);
+                if let Err(mpsc::error::SendError(item)) = sender.blocking_send(Ok(payload)) {
+                    if let Ok(returned) = item {
+                        pool.recycle(returned);
+                    }
+                    *active = None;
                 }
             } else {
                 pool.recycle(payload);
@@ -1538,6 +1548,85 @@ mod tests {
                 assert!(endpoint.accept().await.is_err());
                 drop(p_to_c_w);
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn close_read_unblocks_full_reader_channel_before_early_response() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (p_to_c_r, mut p_to_c_w) = io::pipe()?;
+            let (mut c_to_p_r, c_to_p_w) = io::pipe()?;
+            let writer = std::thread::spawn(move || -> io::Result<()> {
+                p_to_c_w.write_all(HANDSHAKE_REQUEST_MAGIC)?;
+                p_to_c_w.write_all(VALID_KEY.as_bytes())?;
+                p_to_c_w.flush()?;
+
+                let mut ack = [0_u8; 8];
+                c_to_p_r.read_exact(&mut ack)?;
+                if &ack != HANDSHAKE_RESPONSE_MAGIC {
+                    return Err(io::Error::other("unexpected handshake ack"));
+                }
+                if read_frame(&mut c_to_p_r)? != (0, KIND_SERVER_READY, Vec::new()) {
+                    return Err(io::Error::other("missing server ready"));
+                }
+
+                // Stream 1 sends more frames than CHANNEL_CAPACITY (64) and >OS pipe buffer
+                // before reading the early rejection response.
+                let chunk = vec![b'x'; MAX_FRAME_PAYLOAD];
+                write_frame(&mut p_to_c_w, 1, KIND_OPEN, &[])?;
+                write_frame(&mut p_to_c_w, 1, KIND_DATA, b"POST /v1/chat/completions HTTP/1.1\r\n\r\n")?;
+                for _ in 0..(CHANNEL_CAPACITY + 32) {
+                    write_frame(&mut p_to_c_w, 1, KIND_DATA, &chunk)?;
+                }
+                write_frame(&mut p_to_c_w, 1, KIND_EOF, &[])?;
+
+                let (s1, k1, d1) = read_frame(&mut c_to_p_r)?;
+                let (s1_eof, k1_eof, d1_eof) = read_frame(&mut c_to_p_r)?;
+                if (s1, k1, d1.as_slice()) != (1, KIND_DATA, b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                    || (s1_eof, k1_eof, d1_eof.as_slice()) != (1, KIND_EOF, b"")
+                {
+                    return Err(io::Error::other("unexpected early rejection response"));
+                }
+
+                write_frame(&mut p_to_c_w, 2, KIND_OPEN, &[])?;
+                write_frame(&mut p_to_c_w, 2, KIND_DATA, b"ok")?;
+                write_frame(&mut p_to_c_w, 2, KIND_EOF, &[])?;
+                drop(p_to_c_w);
+                Ok(())
+            });
+
+            let (mut endpoint, _) = ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+            endpoint.mark_ready()?;
+
+            let mut conn1 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "accept stream 1 timed out"))??
+                .ok_or_else(|| io::Error::other("missing stream 1"))?;
+            let mut head = [0_u8; 38];
+            conn1.read_exact(&mut head).await?;
+            // Close inbound read channel while conn1 is still held for writing the rejection.
+            conn1.close_read();
+            conn1.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+            conn1.shutdown().await?;
+            drop(conn1);
+
+            let mut conn2 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "accept stream 2 timed out"))??
+                .ok_or_else(|| io::Error::other("missing stream 2"))?;
+            let mut body2 = Vec::new();
+            conn2.read_to_end(&mut body2).await?;
+            assert_eq!(body2, b"ok");
+            drop(conn2);
+
+            assert!(endpoint.accept().await?.is_none());
+            writer
+                .join()
+                .map_err(|_| io::Error::other("writer thread panicked"))??;
             Ok(())
         })
     }

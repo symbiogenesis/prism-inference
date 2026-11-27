@@ -829,6 +829,13 @@ fn prepare_transport(transport: &ChildTransport) -> io::Result<PreparedTransport
     }
 }
 
+fn memory_limit_overflow() -> io::Error {
+    startup::at(
+        Stage::Memory,
+        &io::Error::other("native Swift startup memory limit overflow"),
+    )
+}
+
 fn required_memory_bytes(config: &Config) -> io::Result<u64> {
     const DAISYROSE_SCRATCH_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
     let base_required_bytes = if let Some((_, memory)) = config.capacity {
@@ -842,32 +849,24 @@ fn required_memory_bytes(config: &Config) -> io::Result<u64> {
         };
         crate::configuration::REQUIRED_AVAILABLE_BYTES
             .checked_add(extra)
-            .ok_or_else(|| {
-                startup::at(
-                    Stage::Memory,
-                    &io::Error::other("native Swift startup memory limit overflow"),
-                )
-            })?
+            .ok_or_else(memory_limit_overflow)?
     };
     let vision_reserve_bytes = if config.mmproj.is_some() {
         u64::try_from(MMPROJ_MEMORY_BYTES).map_err(|_| startup::at(Stage::Arguments, &invalid()))?
     } else {
         0
     };
-    let daisyrose_reserve_bytes = config
-        .daisyrose_lora
-        .as_ref()
-        .and_then(|item| item.bytes.checked_add(DAISYROSE_SCRATCH_HEADROOM_BYTES))
-        .unwrap_or(0);
+    let daisyrose_reserve_bytes = match config.daisyrose_lora.as_ref() {
+        Some(item) => item
+            .bytes
+            .checked_add(DAISYROSE_SCRATCH_HEADROOM_BYTES)
+            .ok_or_else(memory_limit_overflow)?,
+        None => 0,
+    };
     base_required_bytes
         .checked_add(vision_reserve_bytes)
         .and_then(|bytes| bytes.checked_add(daisyrose_reserve_bytes))
-        .ok_or_else(|| {
-            startup::at(
-                Stage::Memory,
-                &io::Error::other("native Swift startup memory limit overflow"),
-            )
-        })
+        .ok_or_else(memory_limit_overflow)
 }
 
 enum PreparedBackend {
@@ -2848,6 +2847,46 @@ mod tests {
         let last = tile64.len() - 1;
         tile64[last] = "0".into();
         assert!(parse(tile64).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn required_memory_bytes_rejects_daisyrose_lora_headroom_overflow_as_memory_stage()
+    -> io::Result<()> {
+        let (directory, [model, key, _adapter]) = files()?;
+        let daisy = directory.path().join("daisyrose.gguf");
+        std::fs::write(&daisy, [])?;
+        let args = vec![
+            OsString::from("--native-engine-child"),
+            "--model".into(),
+            model,
+            "--key-file".into(),
+            key,
+            "--port".into(),
+            "8080".into(),
+            "--seed".into(),
+            "42".into(),
+            "--bonsai-2-5".into(),
+            "pq2".into(),
+            "--daisyrose-lora".into(),
+            daisy.into_os_string(),
+            "--daisyrose-lora-bytes".into(),
+            "128".into(),
+            "--daisyrose-lora-sha256".into(),
+            "ab".repeat(32).into(),
+        ];
+        let mut cfg = parse(args)?;
+        cfg.daisyrose_lora
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing daisyrose config"))?
+            .bytes = u64::MAX - 1024;
+        let error = required_memory_bytes(&cfg)
+            .err()
+            .ok_or_else(|| io::Error::other("daisyrose overflow was accepted"))?;
+        let mut formatted = Vec::new();
+        startup::write_failure(&mut formatted, &error)?;
+        let formatted = String::from_utf8(formatted).map_err(io::Error::other)?;
+        assert!(formatted.starts_with("private-inference-startup-failed stage=memory "));
         Ok(())
     }
 }

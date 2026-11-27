@@ -223,6 +223,8 @@ async fn serve_engine_with_options<E: worker::Engine>(
     options: WorkerOptions,
     prefill_row_workers: Option<usize>,
 ) -> Result<(), NativeBackendError> {
+    const INITIAL_ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX_ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
     let address = listener
         .local_addr()
         .map_err(|_| NativeBackendError::Configuration)?;
@@ -235,21 +237,98 @@ async fn serve_engine_with_options<E: worker::Engine>(
     let mut worker =
         Worker::with_prefill_options(engine, seed, placement, &options, prefill_row_workers)?;
     let policy = base_policy.with_vision(worker.profile.vision);
+    let mut accept_backoff = INITIAL_ACCEPT_BACKOFF;
     loop {
-        let (client, peer) = listener
-            .accept()
-            .await
-            .map_err(|_| NativeBackendError::Io)?;
+        let (client, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                accept_backoff = INITIAL_ACCEPT_BACKOFF;
+                accepted
+            }
+            Err(error) => match classify_accept_error(&error) {
+                AcceptAction::RetryImmediate => continue,
+                AcceptAction::RetryBackoff => {
+                    let _ = write_accept_failure(&mut std::io::stderr().lock(), &error);
+                    tokio::time::sleep(accept_backoff).await;
+                    accept_backoff = accept_backoff.saturating_mul(2).min(MAX_ACCEPT_BACKOFF);
+                    continue;
+                }
+                AcceptAction::Fatal => return Err(NativeBackendError::Io),
+            },
+        };
         if !peer.is_ipv4() || !peer.ip().is_loopback() {
             continue;
         }
-        client
-            .set_nodelay(true)
-            .map_err(|_| NativeBackendError::Io)?;
+        if let Err(error) = client.set_nodelay(true) {
+            let _ = write_nodelay_failure(&mut std::io::stderr().lock(), &error);
+            continue;
+        }
         if let Err(error) = serve_connection(client, &policy, &mut worker, None).await {
             let _ = write_request_failure(&mut std::io::stderr().lock(), error);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptAction {
+    RetryImmediate,
+    RetryBackoff,
+    Fatal,
+}
+
+fn is_transient_resource_exhaustion(error: &std::io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        // ERROR_TOO_MANY_OPEN_FILES (4), ERROR_NOT_ENOUGH_MEMORY (8),
+        // ERROR_OUTOFMEMORY (14), WSAEMFILE (10024), WSAENOBUFS (10055).
+        matches!(code, 4 | 8 | 14 | 10_024 | 10_055)
+    }
+    #[cfg(unix)]
+    {
+        // ENOMEM (12), ENFILE (23), EMFILE (24); ENOBUFS differs across Unix targets (105 Linux, 55 BSD/macOS).
+        matches!(code, 12 | 23 | 24 | 55 | 105)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
+fn classify_accept_error(error: &std::io::Error) -> AcceptAction {
+    match error.kind() {
+        std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::WouldBlock => AcceptAction::RetryImmediate,
+        std::io::ErrorKind::OutOfMemory => AcceptAction::RetryBackoff,
+        _ if is_transient_resource_exhaustion(error) => AcceptAction::RetryBackoff,
+        _ => AcceptAction::Fatal,
+    }
+}
+
+fn write_accept_failure(
+    writer: &mut impl std::io::Write,
+    error: &std::io::Error,
+) -> std::io::Result<()> {
+    writeln!(
+        writer,
+        "private-inference-accept-failed stage=accept errorKind={:?}",
+        error.kind()
+    )
+}
+
+fn write_nodelay_failure(
+    writer: &mut impl std::io::Write,
+    error: &std::io::Error,
+) -> std::io::Result<()> {
+    writeln!(
+        writer,
+        "private-inference-accept-failed stage=nodelay errorKind={:?}",
+        error.kind()
+    )
 }
 
 pub(crate) async fn serve_broker_pipe_with_prefill_workers(
@@ -373,7 +452,22 @@ impl Drop for CancelOnDrop<'_> {
     }
 }
 
-async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
+trait ConnectionStream: AsyncRead + AsyncWrite + Unpin + 'static {
+    fn close_read(&mut self) {}
+}
+
+impl ConnectionStream for tokio::net::TcpStream {}
+
+impl ConnectionStream for crate::broker_pipe::PipeConnection {
+    fn close_read(&mut self) {
+        self.close_read();
+    }
+}
+
+#[cfg(test)]
+impl ConnectionStream for tokio::io::DuplexStream {}
+
+async fn serve_connection<C: ConnectionStream>(
     mut client: C,
     policy: &RequestPolicy,
     worker: &mut Worker,
@@ -383,6 +477,7 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
     let received = match receive(&mut client, policy, &worker.profile, deadline).await {
         Ok(value) => value,
         Err(error) => {
+            client.close_read();
             let status = if error == NativeBackendError::Unauthorized {
                 401
             } else {
@@ -406,6 +501,7 @@ async fn serve_connection<C: AsyncRead + AsyncWrite + Unpin + 'static>(
             return write_json(&mut client, 200, &worker.readiness(), deadline).await;
         }
         Route::Warm if !worker.is_idle() => {
+            client.close_read();
             write_json(&mut client, 409, &json!({"error":"worker busy"}), deadline).await?;
             return Err(NativeBackendError::Engine);
         }
@@ -1181,6 +1277,220 @@ mod warm_tests {
             let res = serve_connection(server, &policy, &mut worker_cancel, None).await;
             assert!(res.is_err());
             assert!(worker_cancel.settled_within(Duration::from_secs(2)).await);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn accept_error_classification_and_failure_diagnostics() {
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert_eq!(
+                classify_accept_error(&std::io::Error::from(kind)),
+                AcceptAction::RetryImmediate
+            );
+        }
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
+            AcceptAction::RetryBackoff
+        );
+        #[cfg(windows)]
+        for code in [4, 8, 14, 10_024, 10_055] {
+            assert_eq!(
+                classify_accept_error(&std::io::Error::from_raw_os_error(code)),
+                AcceptAction::RetryBackoff
+            );
+        }
+        #[cfg(unix)]
+        for code in [12, 23, 24] {
+            assert_eq!(
+                classify_accept_error(&std::io::Error::from_raw_os_error(code)),
+                AcceptAction::RetryBackoff
+            );
+        }
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+            AcceptAction::Fatal
+        );
+
+        let mut accept_buf = Vec::new();
+        assert!(
+            write_accept_failure(
+                &mut accept_buf,
+                &std::io::Error::from(std::io::ErrorKind::OutOfMemory)
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            accept_buf,
+            b"private-inference-accept-failed stage=accept errorKind=OutOfMemory\n"
+        );
+
+        let mut nodelay_buf = Vec::new();
+        assert!(
+            write_nodelay_failure(
+                &mut nodelay_buf,
+                &std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            nodelay_buf,
+            b"private-inference-accept-failed stage=nodelay errorKind=ConnectionReset\n"
+        );
+    }
+
+    fn send_pipe_frame(
+        writer: &mut impl std::io::Write,
+        stream_id: u32,
+        kind: u8,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        let len = u32::try_from(payload.len()).map_err(std::io::Error::other)?;
+        let mut header = [0_u8; 9];
+        header[..4].copy_from_slice(&stream_id.to_be_bytes());
+        header[4] = kind;
+        header[5..9].copy_from_slice(&len.to_be_bytes());
+        writer.write_all(&header)?;
+        writer.write_all(payload)?;
+        writer.flush()
+    }
+
+    fn recv_pipe_frame(reader: &mut impl std::io::Read) -> std::io::Result<(u32, u8, Vec<u8>)> {
+        let mut header = [0_u8; 9];
+        reader.read_exact(&mut header)?;
+        let stream_id = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let kind = header[4];
+        let len = usize::try_from(u32::from_be_bytes([
+            header[5], header[6], header[7], header[8],
+        ]))
+        .map_err(std::io::Error::other)?;
+        let mut payload = vec![0_u8; len];
+        reader.read_exact(&mut payload)?;
+        Ok((stream_id, kind, payload))
+    }
+
+    fn read_stream_reply(
+        reader: &mut impl std::io::Read,
+        expected_stream: u32,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut reply = Vec::new();
+        loop {
+            let (stream_id, kind, data) = recv_pipe_frame(reader)?;
+            if stream_id != expected_stream {
+                return Err(std::io::Error::other("unexpected stream id for reply"));
+            }
+            if kind == 2 {
+                reply.extend_from_slice(&data);
+            } else if kind == 3 {
+                return Ok(reply);
+            }
+        }
+    }
+
+    fn drive_oversized_broker_pipe_client(
+        mut p_to_c_w: std::io::PipeWriter,
+        mut c_to_p_r: std::io::PipeReader,
+    ) -> std::io::Result<()> {
+        use std::io::{Read as _, Write as _};
+
+        p_to_c_w.write_all(b"SB2PIPE1")?;
+        p_to_c_w.write_all(KEY.as_bytes())?;
+        p_to_c_w.flush()?;
+
+        let mut ack = [0_u8; 8];
+        c_to_p_r.read_exact(&mut ack)?;
+        if &ack != b"SB2OKAY1" {
+            return Err(std::io::Error::other("unexpected handshake ack"));
+        }
+        if recv_pipe_frame(&mut c_to_p_r)? != (0, 5, Vec::new()) {
+            return Err(std::io::Error::other("missing server ready"));
+        }
+
+        // Stream 1: oversized Content-Length followed by >64 frames (>1.5 MiB)
+        // written synchronously before reading the 400 response.
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            crate::broker_pipe::BROKER_PIPE_HOST_PORT,
+            MAX_MULTIMODAL_BODY_BYTES + 1
+        );
+        let chunk = vec![b'a'; 16_384];
+        send_pipe_frame(&mut p_to_c_w, 1, 1, &[])?;
+        send_pipe_frame(&mut p_to_c_w, 1, 2, head.as_bytes())?;
+        for _ in 0..96 {
+            send_pipe_frame(&mut p_to_c_w, 1, 2, &chunk)?;
+        }
+        send_pipe_frame(&mut p_to_c_w, 1, 3, &[])?;
+        if !read_stream_reply(&mut c_to_p_r, 1)?.starts_with(b"HTTP/1.1 400 ") {
+            return Err(std::io::Error::other("expected 400 early rejection"));
+        }
+
+        // Stream 2: subsequent /health request succeeds cleanly.
+        let health = format!(
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {KEY}\r\nConnection: close\r\n\r\n",
+            crate::broker_pipe::BROKER_PIPE_HOST_PORT
+        );
+        send_pipe_frame(&mut p_to_c_w, 2, 1, &[])?;
+        send_pipe_frame(&mut p_to_c_w, 2, 2, health.as_bytes())?;
+        send_pipe_frame(&mut p_to_c_w, 2, 3, &[])?;
+        if !read_stream_reply(&mut c_to_p_r, 2)?.starts_with(b"HTTP/1.1 200 ") {
+            return Err(std::io::Error::other("expected 200 health response"));
+        }
+        drop(p_to_c_w);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_connection_over_broker_pipe_closes_read_before_early_rejection() -> TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (p_to_c_r, p_to_c_w) = std::io::pipe()?;
+            let (c_to_p_r, c_to_p_w) = std::io::pipe()?;
+            let parent = std::thread::spawn(move || {
+                drive_oversized_broker_pipe_client(p_to_c_w, c_to_p_r)
+            });
+
+            let (mut endpoint, _) = crate::broker_pipe::ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+            endpoint.mark_ready()?;
+            let policy = RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, KEY)
+                .map_err(|e| format!("{e:?}"))?;
+            let mut worker = Worker::with_options(
+                WarmableEngine {
+                    warmable: true,
+                    hold_until_cancel: false,
+                    warm_calls: Arc::new(AtomicUsize::new(0)),
+                    complete_calls: Arc::new(AtomicUsize::new(0)),
+                    row_workers: 1,
+                },
+                42,
+                Placement::Cpu,
+                &WorkerOptions::default(),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+
+            let conn1 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await??
+                .ok_or("missing stream 1")?;
+            let err1 = serve_connection(conn1, &policy, &mut worker, None).await;
+            assert_eq!(err1, Err(NativeBackendError::Configuration));
+
+            let conn2 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await??
+                .ok_or("missing stream 2")?;
+            serve_connection(conn2, &policy, &mut worker, None)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+
+            assert!(endpoint.accept().await?.is_none());
+            parent
+                .join()
+                .map_err(|_| std::io::Error::other("parent thread panicked"))??;
             Ok(())
         })
     }

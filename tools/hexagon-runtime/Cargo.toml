@@ -11,6 +11,8 @@ keywords = ["hexagon", "prism", "inference"]
 categories = ["hardware-support"]
 
 [features]
+default = ["probe"]
+probe = ["dep:serde", "dep:serde_json", "dep:bonsai-windows-process"]
 experimental-neon = ["prism-inference/experimental-neon"]
 parallel-rows = ["prism-inference/parallel-rows"]
 
@@ -20,15 +22,16 @@ bonsai-hexagon-native = { path = "../hexagon-native" }
 bonsai-ternary = { path = "../ternary" }
 bonsai-native-hash = { path = "../native-hash" }
 hex.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-bonsai-windows-process.workspace = true
+bonsai-windows-process = { workspace = true, optional = true }
 
 [[bin]]
 name = "prism-hexagon-model-probe"
 path = "src/bin/model_probe.rs"
+required-features = ["probe"]
 
 [dev-dependencies]
 bonsai-gguf = { path = "../gguf", default-features = false }

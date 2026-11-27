@@ -34,7 +34,7 @@ bonsai-windows-credentials = "=0.1.8"
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))'.dependencies]
 bonsai-hexagon-native = { path = "../tools/hexagon-native" }
-bonsai-hexagon-runtime = { path = "../tools/hexagon-runtime" }
+bonsai-hexagon-runtime = { path = "../tools/hexagon-runtime", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["test-util"] }

@@ -25,7 +25,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-bonsai-hexagon-runtime = { path = "../hexagon-runtime" }
+bonsai-hexagon-runtime = { path = "../hexagon-runtime", default-features = false }
 bonsai-gguf = { path = "../gguf", default-features = false }
 
 [lints]

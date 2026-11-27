@@ -8131,14 +8131,19 @@ fn build_flash_gqa6_context(
 /// `3` writable `out` (`f32`). Push constants (`8 × u32`): `[query_len, total_seq, past_len,
 /// num_heads, num_kv_heads, head_dim, scale_bits, causal]`.
 /// Dispatch: `(1, num_kv_heads, query_len)` with `num_heads == num_kv_heads * 6`.
+/// Push constants (`9 × u32`): `[query_len, total_seq, past_len, num_heads, num_kv_heads,
+/// head_dim, scale_bits, causal, use_decode_params]`.
+/// Bindings: `0` read-only `Q` (`f32`), `1` read-only `K` (`u32`), `2` read-only `V` (`u32`),
+/// `3` writable `O` (`f32`), `4` read-only `decode_params` (`u32[4]`).
 #[must_use]
 pub fn attn_flash_gqa6_prefill_f16kv_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 8);
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 9);
     let push_var = push_var.unwrap_or(0);
     let q_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let k_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
     let v_buf = b.storage_buffer(2, ElemType::U32, AccessMode::ReadOnly);
     let o_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
+    let params_buf = b.storage_buffer(4, ElemType::U32, AccessMode::ReadOnly);
 
     let smem_probs = b.workgroup_f32_array(ATTN_FUSED_GQA6_RATIO * WORKGROUP_X);
     let wg_reduce =
@@ -8150,14 +8155,24 @@ pub fn attn_flash_gqa6_prefill_f16kv_with_subgroup(use_subgroup_shuffle: bool) -
     let kv_h = b.load_input_component(wid_vec, 1);
     let qi = b.load_input_component(wid_vec, 2);
 
-    let total_seq = b.load_push(push_var, 1);
-    let past_len = b.load_push(push_var, 2);
+    let push_total_seq = b.load_push(push_var, 1);
+    let push_past_len = b.load_push(push_var, 2);
     let num_heads = b.load_push(push_var, 3);
     let num_kv_heads = b.load_push(push_var, 4);
     let head_dim = b.load_push(push_var, 5);
     let scale_bits = b.load_push(push_var, 6);
     let causal = b.load_push(push_var, 7);
+    let use_decode_params = b.load_push(push_var, 8);
     let scale = b.bitcast(b.f32_t, scale_bits);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let use_dp = b.u_ne(use_decode_params, c0);
+    let dp_total_seq = b.load_sb_u32(params_buf, c1);
+    let dp_past_len = b.load_sb_u32(params_buf, c2);
+    let total_seq = b.select(b.u32_t, use_dp, dp_total_seq, push_total_seq);
+    let past_len = b.select(b.u32_t, use_dp, dp_past_len, push_past_len);
 
     let valid_len = attn_valid_len(&mut b, qi, past_len, total_seq, causal);
     let ctx = build_flash_gqa6_context(
@@ -8176,8 +8191,6 @@ pub fn attn_flash_gqa6_prefill_f16kv_with_subgroup(use_subgroup_shuffle: bool) -
         scale,
     );
 
-    let c0 = b.const_u32(0);
-    let c1 = b.const_u32(1);
     let c6 = b.const_u32(ATTN_FUSED_GQA6_RATIO);
     let c64 = b.const_u32(WORKGROUP_X);
     let f_zero = b.const_f32(0.0);
@@ -8228,18 +8241,20 @@ pub fn attn_flash_gqa6_prefill_f16kv_with_subgroup(use_subgroup_shuffle: bool) -
 /// into `partial_buf`.
 ///
 /// Bindings: `0` read-only `Q` (`f32`), `1` read-only `K` (`u32`), `2` read-only `V` (`u32`),
-/// `3` writable `partial_out` (`f32`, `[num_splits, num_heads, head_dim + 2]`).
-/// Push constants (`9 × u32`): `[query_len(=1), total_seq, past_len, num_heads, num_kv_heads,
-/// head_dim, scale_bits, causal, num_splits]`.
+/// `3` writable `partial_out` (`f32`, `[num_splits, num_heads, head_dim + 2]`),
+/// `4` read-only `decode_params` (`u32[4]`).
+/// Push constants (`10 × u32`): `[query_len(=1), total_seq, past_len, num_heads, num_kv_heads,
+/// head_dim, scale_bits, causal, num_splits, use_decode_params]`.
 /// Dispatch: `(num_splits, num_kv_heads, 1)`.
 #[must_use]
 pub fn attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 9);
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 10);
     let push_var = push_var.unwrap_or(0);
     let q_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let k_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
     let v_buf = b.storage_buffer(2, ElemType::U32, AccessMode::ReadOnly);
     let partial_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
+    let params_buf = b.storage_buffer(4, ElemType::U32, AccessMode::ReadOnly);
 
     let smem_probs = b.workgroup_f32_array(ATTN_FUSED_GQA6_RATIO * WORKGROUP_X);
     let wg_reduce =
@@ -8251,21 +8266,30 @@ pub fn attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_subgroup_shuffle: b
     let split_id = b.load_input_component(wid_vec, 0);
     let kv_h = b.load_input_component(wid_vec, 1);
 
-    let total_seq = b.load_push(push_var, 1);
-    let past_len = b.load_push(push_var, 2);
+    let push_total_seq = b.load_push(push_var, 1);
+    let push_past_len = b.load_push(push_var, 2);
     let num_heads = b.load_push(push_var, 3);
     let num_kv_heads = b.load_push(push_var, 4);
     let head_dim = b.load_push(push_var, 5);
     let scale_bits = b.load_push(push_var, 6);
     let causal = b.load_push(push_var, 7);
-    let num_splits = b.load_push(push_var, 8);
+    let push_num_splits = b.load_push(push_var, 8);
+    let use_decode_params = b.load_push(push_var, 9);
     let scale = b.bitcast(b.f32_t, scale_bits);
 
     let c0 = b.const_u32(0);
     let c1 = b.const_u32(1);
     let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
     let c6 = b.const_u32(ATTN_FUSED_GQA6_RATIO);
     let c64 = b.const_u32(WORKGROUP_X);
+    let use_dp = b.u_ne(use_decode_params, c0);
+    let dp_total_seq = b.load_sb_u32(params_buf, c1);
+    let dp_past_len = b.load_sb_u32(params_buf, c2);
+    let dp_num_splits = b.load_sb_u32(params_buf, c3);
+    let total_seq = b.select(b.u32_t, use_dp, dp_total_seq, push_total_seq);
+    let past_len = b.select(b.u32_t, use_dp, dp_past_len, push_past_len);
+    let num_splits = b.select(b.u32_t, use_dp, dp_num_splits, push_num_splits);
     let valid_len = attn_valid_len(&mut b, c0, past_len, total_seq, causal);
     let ctx = build_flash_gqa6_context(
         &mut b,
@@ -8992,8 +9016,9 @@ fn emit_smem_rope_pair(
 ///
 /// Replaces `rms_norm` + `rope(round_f16=1)` + `kv_append_f16` for `head_dim <= 1024` (even `head_dim`).
 /// Bindings: `0` read-only `key_in` (`f32`), `1` read-only `key_norm_w` (`f32`),
-/// `2` read-only `rope_freqs` (`f32`), `3` writable `k_cache_u32` (`u32`).
-/// Push constants (`6 × u32`): `[kv_heads, head_dim, rope_dim, eps_bits, start_pos, tokens]`.
+/// `2` read-only `rope_freqs` (`f32`), `3` writable `k_cache_u32` (`u32`),
+/// `4` read-only `decode_params` (`u32[4]`).
+/// Push constants (`7 × u32`): `[kv_heads, head_dim, rope_dim, eps_bits, start_pos, tokens, use_decode_params]`.
 /// Dispatch: `(1, kv_heads, tokens)`.
 #[must_use]
 pub fn rms_norm_rope_kv_append_f16() -> Vec<u32> {
@@ -9003,12 +9028,13 @@ pub fn rms_norm_rope_kv_append_f16() -> Vec<u32> {
 /// Emits fused `RMSNorm + NeoX RoPE(f16) + packed-FP16 KV append` with optional wave64 subgroup shuffle.
 #[must_use]
 pub fn rms_norm_rope_kv_append_f16_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 6);
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 7);
     let push_var = push_var.unwrap_or(0);
     let key_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let w_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
     let freqs_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
     let cache_buf = b.storage_buffer(3, ElemType::U32, AccessMode::ReadWrite);
+    let params_buf = b.storage_buffer(4, ElemType::U32, AccessMode::ReadOnly);
     let smem = b.workgroup_f32_array(FUSED_HEAD_NORM_ROPE_MAX_DIM_U32);
     let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
 
@@ -9022,13 +9048,17 @@ pub fn rms_norm_rope_kv_append_f16_with_subgroup(use_subgroup_shuffle: bool) -> 
     let head_dim = b.load_push(push_var, 1);
     let rope_dim = b.load_push(push_var, 2);
     let eps_bits = b.load_push(push_var, 3);
-    let start_pos = b.load_push(push_var, 4);
+    let push_start_pos = b.load_push(push_var, 4);
     let tokens = b.load_push(push_var, 5);
+    let use_decode_params = b.load_push(push_var, 6);
 
     let c0 = b.const_u32(0);
     let c1 = b.const_u32(1);
     let c16 = b.const_u32(16);
     let c64 = b.const_u32(WORKGROUP_X);
+    let use_dp = b.u_ne(use_decode_params, c0);
+    let dp_pos = b.load_sb_u32(params_buf, c0);
+    let start_pos = b.select(b.u32_t, use_dp, dp_pos, push_start_pos);
     let dim_ok = b.u_ne(head_dim, c0);
     let head_ok = b.u_lt(h, kv_heads);
     let tok_ok = b.u_lt(tok, tokens);
@@ -11229,23 +11259,30 @@ fn emit_kv_append_f16_pair(
 
 /// Emits GPU packed-FP16 KV cache token append SPIR-V 1.6 words (`cache_u32[pos * (kv_width/2) + p]`).
 ///
-/// Bindings: `0` read-only `cur` (`f32`, even `kv_width`), `1` writable `cache_u32` (`u32`).
-/// Push constants (`2 × u32`): `[kv_width, pos]`. Dispatch: `((kv_width / 2).div_ceil(64), 1, 1)`.
+/// Bindings: `0` read-only `cur` (`f32`, even `kv_width`), `1` writable `cache_u32` (`u32`),
+/// `2` read-only `decode_params` (`u32[4]`).
+/// Push constants (`3 × u32`): `[kv_width, pos, use_decode_params]`.
+/// Dispatch: `((kv_width / 2).div_ceil(64), 1, 1)`.
 #[must_use]
 pub fn kv_append_f16() -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new(false, 2);
+    let (mut b, push_var) = ShaderBuilder::new(false, 3);
     let push_var = push_var.unwrap_or(0);
     let cur_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
     let cache_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadWrite);
+    let params_buf = b.storage_buffer(2, ElemType::U32, AccessMode::ReadOnly);
 
     let gid = b.global_invocation_id();
     let pair_idx = b.load_input_component(gid, 0);
     let kv_width = b.load_push(push_var, 0);
-    let pos = b.load_push(push_var, 1);
+    let push_pos = b.load_push(push_var, 1);
+    let use_decode_params = b.load_push(push_var, 2);
 
     let c0 = b.const_u32(0);
     let c1 = b.const_u32(1);
     let half_width = b.ushr(kv_width, c1);
+    let use_dp = b.u_ne(use_decode_params, c0);
+    let dp_pos = b.load_sb_u32(params_buf, c0);
+    let pos = b.select(b.u32_t, use_dp, dp_pos, push_pos);
 
     let in_bounds = b.u_lt(pair_idx, half_width);
     b.emit_if(in_bounds, |b| {

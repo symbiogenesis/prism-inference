@@ -659,6 +659,11 @@ enum BufferMemoryPreference {
     HostCachedReadback,
 }
 
+pub(crate) struct CachedComputeChunk {
+    command_buffer: vk::CommandBuffer,
+    is_final_chunk: bool,
+}
+
 struct CommandSlot {
     command_buffer: vk::CommandBuffer,
     descriptor_pool: vk::DescriptorPool,
@@ -716,6 +721,7 @@ pub struct AdrenoVulkanDevice {
     persistent_desc_cache: HashMap<DescriptorCacheKey, CachedDescriptorSet>,
     persistent_sets_used: usize,
     persistent_descriptors_used: usize,
+    buffer_free_generation: u64,
     scratch_sets: Vec<vk::DescriptorSet>,
     scratch_stage_miss_idx: Vec<usize>,
     scratch_miss_lookup: HashMap<DescriptorCacheKey, usize>,
@@ -1242,6 +1248,7 @@ impl AdrenoVulkanDevice {
             persistent_desc_cache: HashMap::new(),
             persistent_sets_used: 0,
             persistent_descriptors_used: 0,
+            buffer_free_generation: 0,
             scratch_sets: Vec::new(),
             scratch_stage_miss_idx: Vec::new(),
             scratch_miss_lookup: HashMap::new(),
@@ -1842,6 +1849,10 @@ impl AdrenoVulkanDevice {
         Ok(())
     }
 
+    pub(crate) const fn buffer_free_generation(&self) -> u64 {
+        self.buffer_free_generation
+    }
+
     /// Releases a buffer immediately when healthy, or retains it in uncertain storage when faulted.
     ///
     /// Also invalidates and frees any persistently cached descriptor sets referencing `id` so
@@ -1854,6 +1865,7 @@ impl AdrenoVulkanDevice {
         let Some(buf) = slot.take() else {
             return;
         };
+        self.buffer_free_generation = self.buffer_free_generation.wrapping_add(1);
         if self.faulted {
             self.uncertain_buffers.push(buf);
         } else {
@@ -2347,6 +2359,76 @@ impl AdrenoVulkanDevice {
         Ok(submits)
     }
 
+    pub(crate) fn record_cached_batches_with_max_stages(
+        &mut self,
+        batch: &CommandBatchRecorder,
+        max_stages_per_submit: usize,
+        is_final_batch: bool,
+    ) -> Result<Option<Vec<CachedComputeChunk>>, Error> {
+        self.ensure_healthy()?;
+        let chunks = batch.split_chunks(max_stages_per_submit)?;
+        if chunks.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        self.validate_owned_stages(batch.stages(), false)?;
+        let last_idx = chunks.len() - 1;
+        let mut recorded = Vec::with_capacity(chunks.len());
+        for (chunk_idx, range) in chunks.into_iter().enumerate() {
+            let chunk_is_final = is_final_batch && chunk_idx == last_idx;
+            let stages = &batch.stages()[range];
+            let all_persistent = self.prepare_persistent_descriptor_sets_for_chunk(
+                stages
+                    .iter()
+                    .map(|s| (s.pipeline, StageSpans::Spans(s.buffers()))),
+            )?;
+            if !all_persistent {
+                self.free_cached_chunks(recorded);
+                return Ok(None);
+            }
+            match self.record_reusable_chunk_cb(
+                stages
+                    .iter()
+                    .map(|s| (s.pipeline, s.push_u32s(), s.workgroups, s.barrier_before)),
+                chunk_is_final,
+            ) {
+                Ok(chunk) => recorded.push(chunk),
+                Err(err) => {
+                    self.free_cached_chunks(recorded);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(Some(recorded))
+    }
+
+    pub(crate) fn submit_cached_chunk(&mut self, chunk: &CachedComputeChunk) -> Result<(), Error> {
+        self.ensure_healthy()?;
+        let window_full = self.unwaited_slots + 1 >= PIPELINED_CB_COUNT;
+        let attach_fence = chunk.is_final_chunk || window_full;
+        self.submit_raw_command_buffer(chunk.command_buffer, attach_fence)?;
+        if attach_fence {
+            self.wait_fence_and_clear_unwaited()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn free_cached_chunks(&mut self, chunks: Vec<CachedComputeChunk>) {
+        if chunks.is_empty() {
+            return;
+        }
+        if !self.faulted && self.unwaited_slots > 0 {
+            let _ = self.finish_pipelined_session();
+        }
+        if !self.faulted {
+            let raw: Vec<vk::CommandBuffer> =
+                chunks.into_iter().map(|c| c.command_buffer).collect();
+            // SAFETY: Prior GPU queue submissions completed or drained above before freeing CBs.
+            unsafe {
+                self.device.free_command_buffers(self.command_pool, &raw);
+            }
+        }
+    }
+
     pub(crate) fn finish_pipelined_session(&mut self) -> Result<(), Error> {
         if self.unwaited_slots == 0 {
             return Ok(());
@@ -2409,6 +2491,43 @@ impl AdrenoVulkanDevice {
             return Ok(());
         }
         self.allocate_chunk_miss_sets(slot_idx)?;
+        self.commit_allocated_miss_descriptors()
+    }
+
+    fn prepare_persistent_descriptor_sets_for_chunk<'a>(
+        &mut self,
+        stages: impl Iterator<Item = (PipelineId, StageSpans<'a>)>,
+    ) -> Result<bool, Error> {
+        self.collect_chunk_descriptor_misses(stages);
+        if self.scratch_misses.is_empty() {
+            return Ok(true);
+        }
+        let max_pers_sets = usize::try_from(PERSISTENT_MAX_SETS).unwrap_or(8192);
+        let max_pers_descs = usize::try_from(PERSISTENT_MAX_DESCRIPTORS).unwrap_or(32_768);
+        let avail_pers_sets = max_pers_sets.saturating_sub(self.persistent_sets_used);
+        let avail_pers_descs = max_pers_descs.saturating_sub(self.persistent_descriptors_used);
+        let needed_descs: usize = self.scratch_misses.iter().map(|m| m.binding_count).sum();
+        if self.scratch_misses.len() > avail_pers_sets || needed_descs > avail_pers_descs {
+            return Ok(false);
+        }
+        for miss in &self.scratch_misses {
+            self.scratch_miss_layouts
+                .push(self.pipelines[miss.key.pipeline.0].set_layout);
+        }
+        let alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.persistent_descriptor_pool)
+            .set_layouts(&self.scratch_miss_layouts);
+        // SAFETY: Allocating persistent descriptor sets for reusable cached command buffers.
+        let Ok(sets) = (unsafe { self.device.allocate_descriptor_sets(&alloc) }) else {
+            return Ok(false);
+        };
+        self.scratch_allocated_sets.extend_from_slice(&sets);
+        self.scratch_allocated_persistent.resize(sets.len(), true);
+        self.commit_allocated_miss_descriptors()?;
+        Ok(true)
+    }
+
+    fn commit_allocated_miss_descriptors(&mut self) -> Result<(), Error> {
         self.write_chunk_miss_descriptors()?;
         for (stage_set, &miss_idx) in self
             .scratch_sets
@@ -2685,23 +2804,15 @@ impl AdrenoVulkanDevice {
         )
     }
 
-    fn record_and_submit_slot<'a>(
-        &mut self,
-        slot_idx: usize,
+    fn record_cb_stages<'a>(
+        &self,
+        cmd_buf: vk::CommandBuffer,
         stages: impl Iterator<Item = (PipelineId, &'a [u32], [u32; 3], bool)>,
         is_final_chunk: bool,
+        usage_flags: vk::CommandBufferUsageFlags,
     ) -> Result<(), Error> {
-        let cmd_buf = self.command_slots[slot_idx].command_buffer;
-        // SAFETY: Command slot `slot_idx` is guaranteed idle before recording.
-        if let Err(err) = unsafe {
-            self.device
-                .reset_command_buffer(cmd_buf, vk::CommandBufferResetFlags::empty())
-        } {
-            return Err(Error::Vulkan(format!("reset_command_buffer: {err:?}")));
-        }
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: Recording commands into reset primary command buffer `cmd_buf`.
+        let begin = vk::CommandBufferBeginInfo::default().flags(usage_flags);
+        // SAFETY: Beginning primary command buffer recording into `cmd_buf`.
         if let Err(err) = unsafe { self.device.begin_command_buffer(cmd_buf, &begin) } {
             return Err(Error::Vulkan(format!("begin_command_buffer: {err:?}")));
         }
@@ -2732,8 +2843,6 @@ impl AdrenoVulkanDevice {
             self.record_stage_dispatch(cmd_buf, pipe_id, set, push_u32s, workgroups, bind_pipeline);
         }
 
-        let window_full = self.unwaited_slots + 1 >= PIPELINED_CB_COUNT;
-        let attach_fence = is_final_chunk || window_full;
         let (dst_stage, dst_access) = if is_final_chunk {
             (
                 vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -2765,7 +2874,63 @@ impl AdrenoVulkanDevice {
         if let Err(err) = unsafe { self.device.end_command_buffer(cmd_buf) } {
             return Err(Error::Vulkan(format!("end_command_buffer: {err:?}")));
         }
+        Ok(())
+    }
 
+    fn record_reusable_chunk_cb<'a>(
+        &self,
+        stages: impl Iterator<Item = (PipelineId, &'a [u32], [u32; 3], bool)>,
+        is_final_chunk: bool,
+    ) -> Result<CachedComputeChunk, Error> {
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: Allocating dedicated reusable primary command buffer from `self.command_pool`.
+        let cmd_buf = unsafe { self.device.allocate_command_buffers(&alloc) }
+            .map_err(|err| Error::Vulkan(format!("allocate_command_buffers: {err:?}")))?[0];
+        if let Err(err) = self.record_cb_stages(
+            cmd_buf,
+            stages,
+            is_final_chunk,
+            vk::CommandBufferUsageFlags::empty(),
+        ) {
+            let cbs = [cmd_buf];
+            // SAFETY: Releasing freshly allocated command buffer after recording error.
+            unsafe {
+                self.device.free_command_buffers(self.command_pool, &cbs);
+            }
+            return Err(err);
+        }
+        Ok(CachedComputeChunk {
+            command_buffer: cmd_buf,
+            is_final_chunk,
+        })
+    }
+
+    fn record_and_submit_slot<'a>(
+        &mut self,
+        slot_idx: usize,
+        stages: impl Iterator<Item = (PipelineId, &'a [u32], [u32; 3], bool)>,
+        is_final_chunk: bool,
+    ) -> Result<(), Error> {
+        let cmd_buf = self.command_slots[slot_idx].command_buffer;
+        // SAFETY: Command slot `slot_idx` is guaranteed idle before recording.
+        if let Err(err) = unsafe {
+            self.device
+                .reset_command_buffer(cmd_buf, vk::CommandBufferResetFlags::empty())
+        } {
+            return Err(Error::Vulkan(format!("reset_command_buffer: {err:?}")));
+        }
+        self.record_cb_stages(
+            cmd_buf,
+            stages,
+            is_final_chunk,
+            vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+        )?;
+
+        let window_full = self.unwaited_slots + 1 >= PIPELINED_CB_COUNT;
+        let attach_fence = is_final_chunk || window_full;
         self.submit_cb_slot(slot_idx, cmd_buf, attach_fence)?;
         if attach_fence {
             self.wait_fence_and_clear_unwaited()?;
@@ -2834,9 +2999,8 @@ impl AdrenoVulkanDevice {
         }
     }
 
-    fn submit_cb_slot(
+    fn submit_raw_command_buffer(
         &mut self,
-        slot_idx: usize,
         cmd_buf: vk::CommandBuffer,
         attach_fence: bool,
     ) -> Result<(), Error> {
@@ -2857,7 +3021,7 @@ impl AdrenoVulkanDevice {
 
         let cmd_bufs = [cmd_buf];
         let submits = [vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
-        // SAFETY: Submitting recorded command buffer slot to `compute_queue` (FIFO).
+        // SAFETY: Submitting recorded command buffer to `compute_queue` (FIFO).
         if let Err(err) = unsafe {
             self.device
                 .queue_submit(self.compute_queue, &submits, fence)
@@ -2871,8 +3035,18 @@ impl AdrenoVulkanDevice {
             return Err(Error::Vulkan(format!("queue_submit: {err:?}")));
         }
 
-        self.next_slot_idx = (slot_idx + 1) % PIPELINED_CB_COUNT;
         self.unwaited_slots += 1;
+        Ok(())
+    }
+
+    fn submit_cb_slot(
+        &mut self,
+        slot_idx: usize,
+        cmd_buf: vk::CommandBuffer,
+        attach_fence: bool,
+    ) -> Result<(), Error> {
+        self.submit_raw_command_buffer(cmd_buf, attach_fence)?;
+        self.next_slot_idx = (slot_idx + 1) % PIPELINED_CB_COUNT;
         Ok(())
     }
 

@@ -2878,13 +2878,14 @@ fn verify_live_full_attn_key_prep_parity(
         dev.create_compute_pipeline(&spirv::rms_norm_f32_with_subgroup(use_subgroup), 3, 2)?;
     let p_rope_1 = dev.create_compute_pipeline(&spirv::rope_f32(), 2, 4)?;
     let p_rope_n = dev.create_compute_pipeline(&spirv::rope_batched_f32(), 2, 5)?;
-    let p_kva_1 = dev.create_compute_pipeline(&spirv::kv_append_f16(), 2, 2)?;
+    let p_kva_1 = dev.create_compute_pipeline(&spirv::kv_append_f16(), 3, 3)?;
     let p_kva_n = dev.create_compute_pipeline(&spirv::kv_append_batched_f16(), 2, 3)?;
     let p_fused = dev.create_compute_pipeline(
         &spirv::rms_norm_rope_kv_append_f16_with_subgroup(use_subgroup),
-        4,
-        6,
+        5,
+        7,
     )?;
+    let buf_decode_params = dev.create_storage_buffer(16)?;
 
     for (tokens, kv_heads, head_dim, rope_dim, start_pos) in [
         (1_usize, 2_usize, 256_usize, 64_usize, 5_usize),
@@ -2923,6 +2924,10 @@ fn verify_live_full_attn_key_prep_parity(
         dev.write_buffer_f32(buf_freqs, &freqs)?;
         dev.write_buffer_u32(buf_cache_ref, &vec![0_u32; cache_words])?;
         dev.write_buffer_u32(buf_cache_fus, &vec![0_u32; cache_words])?;
+        dev.write_buffer_u32(
+            buf_decode_params,
+            &[pos_u, u32::try_from(total_slots)?, pos_u, 1],
+        )?;
 
         let mut rec = CommandBatchRecorder::new();
         rec.push_barrier(
@@ -2944,8 +2949,12 @@ fn verify_live_full_attn_key_prep_parity(
             );
             rec.push_barrier(
                 p_kva_1,
-                &[BufferSpan::whole(buf_ref), BufferSpan::whole(buf_cache_ref)],
-                &[u32::try_from(kv_w)?, pos_u],
+                &[
+                    BufferSpan::whole(buf_ref),
+                    BufferSpan::whole(buf_cache_ref),
+                    BufferSpan::whole(buf_decode_params),
+                ],
+                &[u32::try_from(kv_w)?, pos_u, 1],
                 [(u32::try_from(kv_w)? / 2).div_ceil(64), 1, 1],
             );
         } else {
@@ -2969,8 +2978,17 @@ fn verify_live_full_attn_key_prep_parity(
                 BufferSpan::whole(buf_norm),
                 BufferSpan::whole(buf_freqs),
                 BufferSpan::whole(buf_cache_fus),
+                BufferSpan::whole(buf_decode_params),
             ],
-            &[kvh_u, hd_u, rope_u, eps_bits, pos_u, tok_u],
+            &[
+                kvh_u,
+                hd_u,
+                rope_u,
+                eps_bits,
+                pos_u,
+                tok_u,
+                u32::from(tokens == 1),
+            ],
             [1, kvh_u, tok_u],
         );
         dev.submit_compute_batch(&rec)?;

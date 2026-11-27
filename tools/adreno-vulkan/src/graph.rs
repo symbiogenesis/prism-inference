@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -29,7 +29,7 @@ use crate::{
     AdrenoAttentionPath, AttentionDescriptor, AttentionStrategy, Error, ProjectionKernelPath,
     attention_cache_key,
     device::{
-        AdrenoVulkanDevice, BufferId, BufferSpan, CommandBatchRecorder,
+        AdrenoVulkanDevice, BufferId, BufferSpan, CachedComputeChunk, CommandBatchRecorder,
         MAX_DESCRIPTOR_SETS_PER_SUBMIT, PipelineId, WeightArena,
     },
     executor::{
@@ -433,14 +433,14 @@ impl VulkanLayerPipelines {
             make_spec(
                 b"attn_flash_gqa6_prefill_f16kv",
                 spirv::attn_flash_gqa6_prefill_f16kv_with_subgroup(use_wave64_shuffle),
-                4,
-                8,
+                5,
+                9,
             )?,
             make_spec(
                 b"attn_flash_gqa6_decode_splitk_f16kv",
                 spirv::attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_wave64_shuffle),
-                4,
-                9,
+                5,
+                10,
             )?,
             make_spec(
                 b"attn_flash_decode_combine",
@@ -574,7 +574,7 @@ impl VulkanLayerPipelines {
                 2,
                 3,
             )?,
-            make_spec(b"kv_append_f16", spirv::kv_append_f16(), 2, 2)?,
+            make_spec(b"kv_append_f16", spirv::kv_append_f16(), 3, 3)?,
             make_spec(
                 b"kv_append_batched_f16",
                 spirv::kv_append_batched_f16(),
@@ -584,8 +584,8 @@ impl VulkanLayerPipelines {
             make_spec(
                 b"rms_norm_rope_kv_append_f16",
                 spirv::rms_norm_rope_kv_append_f16_with_subgroup(use_wave64_shuffle),
-                4,
-                6,
+                5,
+                7,
             )?,
             make_spec(
                 b"quant_q8_0_source",
@@ -1379,6 +1379,19 @@ struct GpuGraphScratch {
     allocated_tile_tokens: usize,
     logits: BufferId,
     dummy_state: BufferId,
+    decode_params: BufferId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct DecodeCbCacheKey {
+    has_active_lora: bool,
+    splitk_bucket: u32,
+    need_logits: bool,
+}
+
+struct CachedDecodeProgram {
+    generation: u64,
+    layer_chunks: Vec<Vec<CachedComputeChunk>>,
 }
 
 struct BufferCleanupGuard<'a> {
@@ -1459,6 +1472,8 @@ pub struct VulkanBatchedGraphExecutor {
     output_weight: GpuMatrixWeight,
     scratch: GpuGraphScratch,
     batch_recorder: CommandBatchRecorder,
+    decode_cb_cache: HashMap<DecodeCbCacheKey, CachedDecodeProgram>,
+    current_tile_uses_decode_params: bool,
     host_embed_scratch: Vec<f32>,
     host_embed_tile_scratch: Vec<f32>,
     host_rope_freqs: Vec<f32>,
@@ -1479,6 +1494,7 @@ pub struct VulkanBatchedGraphExecutor {
 
 impl Drop for VulkanBatchedGraphExecutor {
     fn drop(&mut self) {
+        self.invalidate_decode_cb_cache();
         for &id in &self.owned_buffers {
             self.device.free_buffer(id);
         }
@@ -1815,6 +1831,8 @@ impl VulkanBatchedGraphExecutor {
             output_weight,
             scratch,
             batch_recorder: CommandBatchRecorder::with_capacity(256),
+            decode_cb_cache: HashMap::new(),
+            current_tile_uses_decode_params: false,
             host_embed_scratch: Vec::with_capacity(geometry.embedding),
             host_embed_tile_scratch,
             host_rope_freqs,
@@ -1975,6 +1993,18 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
+    fn invalidate_decode_cb_cache(&mut self) {
+        if self.decode_cb_cache.is_empty() {
+            return;
+        }
+        let stale = std::mem::take(&mut self.decode_cb_cache);
+        for (_, prog) in stale {
+            for chunks in prog.layer_chunks {
+                self.device.free_cached_chunks(chunks);
+            }
+        }
+    }
+
     /// Returns the active multi-rank `LoRA` adapter scale, or `None` when none is loaded.
     #[must_use]
     pub const fn multi_rank_scale(&self) -> Option<f32> {
@@ -2004,6 +2034,9 @@ impl VulkanBatchedGraphExecutor {
     pub fn set_adapter_scales(&mut self, multi_rank_scale: Option<f32>) -> Result<(), Error> {
         let resolved_mr = self.validate_adapter_scale_update(multi_rank_scale)?;
         let new_identity = compute_executor_identity(&self.base_provenance_sha256, resolved_mr)?;
+        if self.multi_rank_scale != resolved_mr {
+            self.invalidate_decode_cb_cache();
+        }
         self.multi_rank_scale = resolved_mr;
         self.identity_sha256 = new_identity;
         self.provenance_nonce = self.provenance_nonce.wrapping_add(1);
@@ -2036,6 +2069,9 @@ impl VulkanBatchedGraphExecutor {
         let resolved_mr = self.validate_adapter_scale_update(multi_rank_scale)?;
         let new_identity = compute_executor_identity(&self.base_provenance_sha256, resolved_mr)?;
         self.reset()?;
+        if self.multi_rank_scale != resolved_mr {
+            self.invalidate_decode_cb_cache();
+        }
         self.multi_rank_scale = resolved_mr;
         self.identity_sha256 = new_identity;
         self.provenance_nonce = self.provenance_nonce.wrapping_add(1);
@@ -2778,10 +2814,94 @@ impl VulkanBatchedGraphExecutor {
                 .write_buffer_f32(rope_dst, &self.host_rope_freqs[..rope_end])?;
         }
 
+        self.current_tile_uses_decode_params = tokens.len() == 1 && staged_bank.is_none();
+        if self.current_tile_uses_decode_params {
+            let pos_u32 = u32::try_from(self.position)
+                .map_err(|_| Error::ResourceLimit("position exceeds u32".to_owned()))?;
+            let total_seq = self.position + 1;
+            let total_seq_u32 = u32::try_from(total_seq)
+                .map_err(|_| Error::ResourceLimit("total_seq exceeds u32".to_owned()))?;
+            let num_splits_u32 = if self.can_use_flash_gqa6() && total_seq >= 128 {
+                let max_splits =
+                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(8);
+                let num_splits = total_seq.div_ceil(64).min(max_splits).max(2);
+                u32::try_from(num_splits)
+                    .map_err(|_| Error::ResourceLimit("num_splits exceeds u32".to_owned()))?
+            } else {
+                1
+            };
+            self.device.write_buffer_u32(
+                self.scratch.decode_params,
+                &[pos_u32, total_seq_u32, pos_u32, num_splits_u32],
+            )?;
+        }
+
         Ok(PreparedTileUpload {
             staged_bank,
             has_full_layers,
         })
+    }
+
+    fn decode_cb_cache_key(
+        &self,
+        prepared: &PreparedTileUpload,
+        t_len: usize,
+        drain_at_tile_end: bool,
+        need_logits: bool,
+    ) -> Result<Option<DecodeCbCacheKey>, Error> {
+        if t_len != 1 || !drain_at_tile_end || prepared.staged_bank.is_some() {
+            return Ok(None);
+        }
+        let splitk_bucket = if !prepared.has_full_layers {
+            0_u32
+        } else if self.can_use_flash_gqa6() {
+            let total_seq = self.position + 1;
+            if total_seq < 128 {
+                1_u32
+            } else {
+                let max_splits =
+                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(8);
+                let num_splits = total_seq.div_ceil(64).min(max_splits).max(2);
+                u32::try_from(num_splits)
+                    .map_err(|_| Error::ResourceLimit("num_splits exceeds u32".to_owned()))?
+            }
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(DecodeCbCacheKey {
+            has_active_lora: self.multi_rank_scale.is_some_and(|s| s != 0.0),
+            splitk_bucket,
+            need_logits,
+        }))
+    }
+
+    fn record_chunk_layers(
+        &mut self,
+        range: Range<usize>,
+        t_len: usize,
+        total_layers: usize,
+        need_logits: bool,
+        is_final_chunk: bool,
+        min_align: usize,
+    ) -> Result<(), Error> {
+        for layer_idx in range {
+            let mode = if layer_idx + 1 == total_layers {
+                if !need_logits {
+                    FinalLayerMode::IngestOnly
+                } else if t_len > 1 {
+                    FinalLayerMode::LastTokenLogits
+                } else {
+                    FinalLayerMode::FullAllTokens
+                }
+            } else {
+                FinalLayerMode::FullAllTokens
+            };
+            self.record_layer_tokens(layer_idx, t_len, mode, min_align)?;
+        }
+        if is_final_chunk && need_logits {
+            self.record_final_logits(t_len)?;
+        }
+        Ok(())
     }
 
     fn step_tile_pipelined_impl(
@@ -2904,6 +3024,125 @@ impl VulkanBatchedGraphExecutor {
                         }
                     }
                 }
+            } else if let Some(cache_key) =
+                self.decode_cb_cache_key(&prepared, t_len, drain_at_tile_end, need_logits)?
+            {
+                if self
+                    .decode_cb_cache
+                    .get(&cache_key)
+                    .is_some_and(|prog| prog.generation != self.device.buffer_free_generation())
+                {
+                    self.invalidate_decode_cb_cache();
+                }
+
+                if let Some(cached) = self.decode_cb_cache.remove(&cache_key) {
+                    let hit_res = (|| -> Result<(), Error> {
+                        for (chunk_idx, cb_chunks) in cached.layer_chunks.iter().enumerate() {
+                            if chunk_idx > 0 {
+                                check()?;
+                            }
+                            if !cb_chunks.is_empty() && !mutated_gpu {
+                                self.kv_tracker.begin_write(self.position, t_len);
+                                mutated_gpu = true;
+                            }
+                            for cb_chunk in cb_chunks {
+                                self.device.submit_cached_chunk(cb_chunk)?;
+                                self.submits_completed = self.submits_completed.saturating_add(1);
+                            }
+                        }
+                        Ok(())
+                    })();
+                    self.decode_cb_cache.insert(cache_key, cached);
+                    hit_res?;
+                    if !self.device.has_unwaited_slots() {
+                        self.staging_bank_in_flight = [false; 2];
+                    }
+                } else {
+                    let mut recorded_layers: Vec<Vec<CachedComputeChunk>> =
+                        Vec::with_capacity(chunks.len());
+                    let mut all_cacheable = true;
+                    let miss_res = (|| -> Result<(), Error> {
+                        for (chunk_idx, range) in chunks.iter().enumerate() {
+                            if chunk_idx > 0 {
+                                check()?;
+                            }
+                            self.batch_recorder.clear();
+                            if chunk_idx == 0 {
+                                record_tile_prologue(self)?;
+                            }
+                            let is_final_chunk = chunk_idx + 1 == chunks.len();
+                            self.record_chunk_layers(
+                                range.clone(),
+                                t_len,
+                                total_layers,
+                                need_logits,
+                                is_final_chunk,
+                                min_align,
+                            )?;
+                            if !self.batch_recorder.is_empty() {
+                                if !mutated_gpu {
+                                    self.kv_tracker.begin_write(self.position, t_len);
+                                    mutated_gpu = true;
+                                }
+                                if all_cacheable
+                                    && let Some(cb_chunks) =
+                                        self.device.record_cached_batches_with_max_stages(
+                                            &self.batch_recorder,
+                                            self.config.tdr_policy.max_stages_per_submit,
+                                            is_final_chunk,
+                                        )?
+                                {
+                                    for cb_chunk in &cb_chunks {
+                                        self.device.submit_cached_chunk(cb_chunk)?;
+                                        self.submits_completed =
+                                            self.submits_completed.saturating_add(1);
+                                    }
+                                    recorded_layers.push(cb_chunks);
+                                    if !self.device.has_unwaited_slots() {
+                                        self.staging_bank_in_flight = [false; 2];
+                                    }
+                                    continue;
+                                }
+                                if all_cacheable {
+                                    all_cacheable = false;
+                                    for stale_chunks in std::mem::take(&mut recorded_layers) {
+                                        self.device.free_cached_chunks(stale_chunks);
+                                    }
+                                }
+                                let fence_this_chunk = drain_at_tile_end && is_final_chunk;
+                                let submits =
+                                    self.device.submit_pipelined_batches_with_max_stages(
+                                        &self.batch_recorder,
+                                        self.config.tdr_policy.max_stages_per_submit,
+                                        fence_this_chunk,
+                                    )?;
+                                self.submits_completed =
+                                    self.submits_completed.saturating_add(submits);
+                                if !self.device.has_unwaited_slots() {
+                                    self.staging_bank_in_flight = [false; 2];
+                                }
+                            } else if all_cacheable {
+                                recorded_layers.push(Vec::new());
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(err) = miss_res {
+                        for stale_chunks in recorded_layers {
+                            self.device.free_cached_chunks(stale_chunks);
+                        }
+                        return Err(err);
+                    }
+                    if all_cacheable {
+                        self.decode_cb_cache.insert(
+                            cache_key,
+                            CachedDecodeProgram {
+                                generation: self.device.buffer_free_generation(),
+                                layer_chunks: recorded_layers,
+                            },
+                        );
+                    }
+                }
             } else {
                 for (chunk_idx, range) in chunks.iter().enumerate() {
                     if chunk_idx > 0 {
@@ -2913,24 +3152,15 @@ impl VulkanBatchedGraphExecutor {
                     if chunk_idx == 0 {
                         record_tile_prologue(self)?;
                     }
-                    for layer_idx in range.clone() {
-                        let mode = if layer_idx + 1 == total_layers {
-                            if !need_logits {
-                                FinalLayerMode::IngestOnly
-                            } else if t_len > 1 {
-                                FinalLayerMode::LastTokenLogits
-                            } else {
-                                FinalLayerMode::FullAllTokens
-                            }
-                        } else {
-                            FinalLayerMode::FullAllTokens
-                        };
-                        self.record_layer_tokens(layer_idx, t_len, mode, min_align)?;
-                    }
                     let is_final_chunk = chunk_idx + 1 == chunks.len();
-                    if is_final_chunk && need_logits {
-                        self.record_final_logits(t_len)?;
-                    }
+                    self.record_chunk_layers(
+                        range.clone(),
+                        t_len,
+                        total_layers,
+                        need_logits,
+                        is_final_chunk,
+                        min_align,
+                    )?;
                     if !self.batch_recorder.is_empty() {
                         if !mutated_gpu {
                             self.kv_tracker.begin_write(self.position, t_len);
@@ -3834,7 +4064,7 @@ impl VulkanBatchedGraphExecutor {
         let q_tokens_u32 = u32::try_from(q_tokens)
             .map_err(|_| Error::ResourceLimit("q_tokens exceed u32".to_owned()))?;
         if self.geometry.head <= spirv::FUSED_HEAD_NORM_ROPE_MAX_DIM {
-            self.batch_recorder.push_barrier(
+            self.batch_recorder.push(
                 self.pipelines.deinterleave_q_gate_rms_norm_rope,
                 &[
                     BufferSpan::whole(q_gate_buf),
@@ -3852,6 +4082,7 @@ impl VulkanBatchedGraphExecutor {
                     q_tokens_u32,
                 ],
                 checked_grid(&self.device, [1, num_heads_u32, q_tokens_u32])?,
+                mode != FinalLayerMode::FullAllTokens,
             );
         } else {
             if q_tokens == 1 {
@@ -3958,6 +4189,7 @@ impl VulkanBatchedGraphExecutor {
             && self.geometry.head <= spirv::FUSED_HEAD_NORM_ROPE_MAX_DIM
             && self.geometry.head.is_multiple_of(2)
         {
+            let use_dp = u32::from(self.current_tile_uses_decode_params);
             self.batch_recorder.push_barrier(
                 self.pipelines.rms_norm_rope_kv_append_f16,
                 &[
@@ -3965,6 +4197,7 @@ impl VulkanBatchedGraphExecutor {
                     BufferSpan::whole(key_norm_w),
                     BufferSpan::whole(self.scratch.rope_freqs),
                     BufferSpan::whole(k_cache),
+                    BufferSpan::whole(self.scratch.decode_params),
                 ],
                 &[
                     kv_heads_u32,
@@ -3973,6 +4206,7 @@ impl VulkanBatchedGraphExecutor {
                     eps_bits,
                     pos_u32,
                     tokens_u32,
+                    use_dp,
                 ],
                 checked_grid(&self.device, [1, kv_heads_u32, tokens_u32])?,
             );
@@ -4066,6 +4300,22 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
+    fn can_use_flash_gqa6(&self) -> bool {
+        self.config.kv_precision == VulkanKvPrecision::Fp16
+            && self.config.attention_strategy != AttentionStrategy::ForceDecomposed
+            && self.geometry.kv_heads > 0
+            && self.geometry.heads == self.geometry.kv_heads * 6
+            && self.geometry.head > 0
+            && self.geometry.head <= 256
+            && self.geometry.head.is_multiple_of(2)
+            && self
+                .device
+                .capabilities()
+                .compute_limits
+                .max_compute_shared_memory_size
+                >= spirv::ATTN_FLASH_GQA6_SHARED_MEMORY_BYTES * 2
+    }
+
     #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -4082,19 +4332,7 @@ impl VulkanBatchedGraphExecutor {
         q_width: usize,
         min_align: usize,
     ) -> Result<(), Error> {
-        let can_use_flash_gqa6 = self.config.kv_precision == VulkanKvPrecision::Fp16
-            && self.config.attention_strategy != AttentionStrategy::ForceDecomposed
-            && self.geometry.kv_heads > 0
-            && self.geometry.heads == self.geometry.kv_heads * 6
-            && self.geometry.head > 0
-            && self.geometry.head <= 256
-            && self.geometry.head.is_multiple_of(2)
-            && self
-                .device
-                .capabilities()
-                .compute_limits
-                .max_compute_shared_memory_size
-                >= spirv::ATTN_FLASH_GQA6_SHARED_MEMORY_BYTES * 2;
+        let can_use_flash_gqa6 = self.can_use_flash_gqa6();
         if can_use_flash_gqa6 {
             let past_len = self.position + past_token_offset;
             let total_seq = past_len + tokens;
@@ -4112,6 +4350,7 @@ impl VulkanBatchedGraphExecutor {
                 .map_err(|_| Error::ResourceLimit("head exceeds u32".to_owned()))?;
             let head_f32 = u16::try_from(self.geometry.head).map_or(1.0_f32, f32::from);
             let scale_bits = (1.0_f32 / head_f32.sqrt()).to_bits();
+            let use_dp = u32::from(self.current_tile_uses_decode_params);
 
             if tokens == 1 && total_seq >= 128 {
                 let max_splits =
@@ -4126,6 +4365,7 @@ impl VulkanBatchedGraphExecutor {
                         BufferSpan::whole(k_cache),
                         BufferSpan::whole(v_cache),
                         BufferSpan::whole(self.scratch.flash_decode_partials),
+                        BufferSpan::whole(self.scratch.decode_params),
                     ],
                     &[
                         query_len_u32,
@@ -4137,6 +4377,7 @@ impl VulkanBatchedGraphExecutor {
                         scale_bits,
                         1,
                         num_splits_u32,
+                        use_dp,
                     ],
                     checked_grid(&self.device, [num_splits_u32, kv_heads_u32, 1])?,
                 );
@@ -4157,6 +4398,7 @@ impl VulkanBatchedGraphExecutor {
                         BufferSpan::whole(k_cache),
                         BufferSpan::whole(v_cache),
                         BufferSpan::whole(attended_buf),
+                        BufferSpan::whole(self.scratch.decode_params),
                     ],
                     &[
                         query_len_u32,
@@ -4167,6 +4409,7 @@ impl VulkanBatchedGraphExecutor {
                         head_dim_u32,
                         scale_bits,
                         1,
+                        use_dp,
                     ],
                     checked_grid(&self.device, [1, kv_heads_u32, query_len_u32])?,
                 );
@@ -4471,10 +4714,15 @@ impl VulkanBatchedGraphExecutor {
         let half_w = kv_width_u32 / 2;
         if tokens_u32 == 1 {
             let grid = checked_grid(&self.device, [half_w.div_ceil(WORKGROUP_X), 1, 1])?;
+            let use_dp = u32::from(self.current_tile_uses_decode_params);
             self.batch_recorder.push(
                 self.pipelines.kv_append_f16,
-                &[BufferSpan::whole(src_buf), BufferSpan::whole(cache_buf)],
-                &[kv_width_u32, pos_u32],
+                &[
+                    BufferSpan::whole(src_buf),
+                    BufferSpan::whole(cache_buf),
+                    BufferSpan::whole(self.scratch.decode_params),
+                ],
+                &[kv_width_u32, pos_u32, use_dp],
                 grid,
                 barrier_before,
             );
@@ -4824,14 +5072,14 @@ impl VulkanBatchedGraphExecutor {
             if active.is_empty() {
                 return Ok(());
             }
-            for chunk in active.chunks(rank_bufs.len()) {
+            for (chunk_idx, chunk) in active.chunks(rank_bufs.len()).enumerate() {
                 for (idx, &(lora, _)) in chunk.iter().enumerate() {
                     self.record_linear_lora_a_tokens(
                         src_buf,
                         rank_bufs[idx],
                         lora,
                         tokens,
-                        idx == 0,
+                        idx == 0 && chunk_idx > 0,
                     )?;
                 }
                 for (idx, &(lora, out_buf)) in chunk.iter().enumerate() {
@@ -7246,6 +7494,7 @@ fn allocate_scratch(
         allocated_tile_tokens: plan.allocated_tile_tokens,
         logits: guard.alloc_readback_storage(sizes[19])?,
         dummy_state: guard.alloc_storage(sizes[20])?,
+        decode_params: guard.alloc_storage(16_u64.max(MIN_SCRATCH_BYTES))?,
     })
 }
 
@@ -8398,13 +8647,13 @@ mod tests {
         let kv_pack = dev.create_compute_pipeline(&spirv::kv_append_batched_f16(), 4, 4)?;
         let flash_prefill = dev.create_compute_pipeline(
             &spirv::attn_flash_gqa6_prefill_f16kv_with_subgroup(use_subgroup),
-            4,
-            8,
+            5,
+            9,
         )?;
         let flash_splitk = dev.create_compute_pipeline(
             &spirv::attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_subgroup),
-            4,
-            9,
+            5,
+            10,
         )?;
         let flash_combine =
             dev.create_compute_pipeline(&spirv::attn_flash_decode_combine_f32(), 2, 3)?;
@@ -8462,6 +8711,11 @@ mod tests {
             u32::try_from(num_splits).map_err(|_| Error::ResourceLimit("splits".to_owned()))?;
         let scale = 1.0_f32 / f32::from(u16::try_from(head_dim).unwrap_or(1)).sqrt();
         let scale_bits = scale.to_bits();
+        let decode_params_buf = dev.create_storage_buffer(16)?;
+        dev.write_buffer_u32(
+            decode_params_buf,
+            &[total_u - 1, total_u, total_u - 1, splits_u],
+        )?;
 
         dev.submit_compute(
             kv_pack,
@@ -8471,15 +8725,27 @@ mod tests {
         )?;
         dev.submit_compute(
             flash_prefill,
-            &[q_pre_buf, key_cache_buf, val_cache_buf, o_pre_buf],
             &[
-                q_len_u, total_u, past_u, heads_u, kvh_u, dim_u, scale_bits, 1,
+                q_pre_buf,
+                key_cache_buf,
+                val_cache_buf,
+                o_pre_buf,
+                decode_params_buf,
+            ],
+            &[
+                q_len_u, total_u, past_u, heads_u, kvh_u, dim_u, scale_bits, 1, 0,
             ],
             [1, kvh_u, q_len_u],
         )?;
         dev.submit_compute(
             flash_splitk,
-            &[q_dec_buf, key_cache_buf, val_cache_buf, partial_buf],
+            &[
+                q_dec_buf,
+                key_cache_buf,
+                val_cache_buf,
+                partial_buf,
+                decode_params_buf,
+            ],
             &[
                 1,
                 total_u,
@@ -8490,6 +8756,7 @@ mod tests {
                 scale_bits,
                 1,
                 splits_u,
+                1,
             ],
             [splits_u, kvh_u, 1],
         )?;

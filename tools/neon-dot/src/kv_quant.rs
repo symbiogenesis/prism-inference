@@ -112,6 +112,37 @@ impl<'a, const G: usize> PreparedQueryGroup<'a, G> {
         }
         portable_dot_group(packed, self.bits, self.centroids, &self.queries).map(finite_binary32)
     }
+
+    /// Computes code-only dots for `out.len()` contiguous key rows (`N * row_bytes`).
+    ///
+    /// Returns `false` if `packed_rows.len()` mismatches `out.len() * row_bytes` or
+    /// any computed dot overflows finite binary32.
+    #[must_use]
+    pub fn score_rows(&self, packed_rows: &[u8], out: &mut [[f32; G]]) -> bool {
+        let Some(expected_bytes) = out
+            .len()
+            .checked_mul(DIMENSION * usize::from(self.bits) / 8)
+        else {
+            return false;
+        };
+        if packed_rows.len() != expected_bytes {
+            return false;
+        }
+        if out.is_empty() {
+            return true;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.neon {
+            return native::score_rows_group(
+                packed_rows,
+                self.bits,
+                self.centroids,
+                &self.queries,
+                out,
+            );
+        }
+        portable_score_rows_group(packed_rows, self.bits, self.centroids, &self.queries, out)
+    }
 }
 
 /// An immutable pair of `G`-head query groups sharing a codebook for 2-token
@@ -194,6 +225,52 @@ impl<'a, const G: usize> PreparedQueryPair<'a, G> {
                 .map(finite_binary32);
         }
         portable_dot_group(packed, self.bits, self.centroids, &self.queries[1]).map(finite_binary32)
+    }
+
+    /// Computes code-only dots for `out0.len()` contiguous key rows (`N * row_bytes`)
+    /// across both `G`-head token groups.
+    ///
+    /// Returns `false` if slice lengths mismatch or any dot overflows finite binary32.
+    #[must_use]
+    pub fn score_rows(
+        &self,
+        packed_rows: &[u8],
+        out0: &mut [[f32; G]],
+        out1: &mut [[f32; G]],
+    ) -> bool {
+        let Some(expected_bytes) = out0
+            .len()
+            .checked_mul(DIMENSION * usize::from(self.bits) / 8)
+        else {
+            return false;
+        };
+        if out0.len() != out1.len() || packed_rows.len() != expected_bytes {
+            return false;
+        }
+        if out0.is_empty() {
+            return true;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.neon {
+            return native::score_rows_pair(
+                packed_rows,
+                self.bits,
+                self.centroids,
+                &self.queries[0],
+                &self.queries[1],
+                out0,
+                out1,
+            );
+        }
+        portable_score_rows_pair(
+            packed_rows,
+            self.bits,
+            self.centroids,
+            &self.queries[0],
+            &self.queries[1],
+            out0,
+            out1,
+        )
     }
 }
 
@@ -364,6 +441,64 @@ impl<'a, const G: usize> ValueGroupAccumulator<'a, G> {
             }
         }
         std::array::from_fn(|head| !self.failed[head])
+    }
+
+    /// Accumulates `scales.len()` contiguous packed value rows across all `G` heads.
+    ///
+    /// Validates slice lengths, prior failure state, and scale finiteness upfront.
+    /// Returns `false` and poisons all heads if any input is invalid or any output
+    /// becomes nonfinite; otherwise preserves exact per-row binary32 rounding.
+    #[must_use]
+    pub fn accumulate_rows(&mut self, packed_rows: &[u8], scales: &[[f32; G]]) -> bool {
+        let Some(expected_bytes) = scales
+            .len()
+            .checked_mul(DIMENSION * usize::from(self.bits) / 8)
+        else {
+            self.failed = [true; G];
+            return false;
+        };
+        if packed_rows.len() != expected_bytes
+            || self.failed.iter().any(|&failed| failed)
+            || scales
+                .iter()
+                .any(|row| row.iter().any(|scale| !scale.is_finite()))
+        {
+            self.failed = [true; G];
+            return false;
+        }
+        if scales.is_empty() {
+            return true;
+        }
+        #[cfg(target_arch = "aarch64")]
+        let finite = if self.neon {
+            native::accumulate_rows_group(
+                packed_rows,
+                self.bits,
+                self.centroids,
+                scales,
+                &mut self.outputs,
+            )
+        } else {
+            portable_accumulate_rows_group(
+                packed_rows,
+                self.bits,
+                self.centroids,
+                scales,
+                &mut self.outputs,
+            )
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let finite = portable_accumulate_rows_group(
+            packed_rows,
+            self.bits,
+            self.centroids,
+            scales,
+            &mut self.outputs,
+        );
+        if !finite {
+            self.failed = [true; G];
+        }
+        finite
     }
 
     /// Publishes per-head sums for every head whose appends remained valid and finite.
@@ -545,6 +680,74 @@ impl<'a, const G: usize> ValueGroupPairAccumulator<'a, G> {
             }
         }
         std::array::from_fn(|head| !self.failed[1][head])
+    }
+
+    /// Accumulates `scales0.len()` contiguous shared packed value rows across both token groups.
+    ///
+    /// Validates slice lengths, prior failure state, and scale finiteness upfront.
+    /// Returns `false` and poisons both token groups if any input is invalid or any
+    /// output becomes nonfinite; otherwise preserves exact per-row binary32 rounding.
+    #[must_use]
+    pub fn accumulate_rows(
+        &mut self,
+        packed_rows: &[u8],
+        scales0: &[[f32; G]],
+        scales1: &[[f32; G]],
+    ) -> bool {
+        let Some(expected_bytes) = scales0
+            .len()
+            .checked_mul(DIMENSION * usize::from(self.bits) / 8)
+        else {
+            self.failed = [[true; G]; 2];
+            return false;
+        };
+        if scales0.len() != scales1.len()
+            || packed_rows.len() != expected_bytes
+            || self.failed.iter().flatten().any(|&failed| failed)
+            || scales0
+                .iter()
+                .chain(scales1.iter())
+                .any(|row| row.iter().any(|scale| !scale.is_finite()))
+        {
+            self.failed = [[true; G]; 2];
+            return false;
+        }
+        if scales0.is_empty() {
+            return true;
+        }
+        #[cfg(target_arch = "aarch64")]
+        let finite = if self.neon {
+            native::accumulate_rows_group_pair(
+                packed_rows,
+                self.bits,
+                self.centroids,
+                scales0,
+                scales1,
+                &mut self.outputs,
+            )
+        } else {
+            portable_accumulate_rows_group_pair(
+                packed_rows,
+                self.bits,
+                self.centroids,
+                scales0,
+                scales1,
+                &mut self.outputs,
+            )
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let finite = portable_accumulate_rows_group_pair(
+            packed_rows,
+            self.bits,
+            self.centroids,
+            scales0,
+            scales1,
+            &mut self.outputs,
+        );
+        if !finite {
+            self.failed = [[true; G]; 2];
+        }
+        finite
     }
 
     /// Publishes per-head sums for both token groups if their appends remained valid.
@@ -835,6 +1038,59 @@ fn portable_dot_group_pair<const G: usize>(
     (first_sums.map(reduce), second_sums.map(reduce))
 }
 
+fn portable_score_rows_group<const G: usize>(
+    packed_rows: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    queries: &[&[f32; DIMENSION]; G],
+    out: &mut [[f32; G]],
+) -> bool {
+    let row_bytes = DIMENSION * usize::from(bits) / 8;
+    for (dst, row) in out.iter_mut().zip(packed_rows.chunks_exact(row_bytes)) {
+        let dots = portable_dot_group(row, bits, centroids, queries);
+        for (dst_head, dot_f64) in dst.iter_mut().zip(dots) {
+            let Some(val) = finite_binary32(dot_f64) else {
+                return false;
+            };
+            *dst_head = val;
+        }
+    }
+    true
+}
+
+fn portable_score_rows_pair<const G: usize>(
+    packed_rows: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    first_queries: &[&[f32; DIMENSION]; G],
+    second_queries: &[&[f32; DIMENSION]; G],
+    out0: &mut [[f32; G]],
+    out1: &mut [[f32; G]],
+) -> bool {
+    let row_bytes = DIMENSION * usize::from(bits) / 8;
+    for ((dst0, dst1), row) in out0
+        .iter_mut()
+        .zip(out1.iter_mut())
+        .zip(packed_rows.chunks_exact(row_bytes))
+    {
+        let (dots0, dots1) =
+            portable_dot_group_pair(row, bits, centroids, first_queries, second_queries);
+        for (dst_head, dot_f64) in dst0.iter_mut().zip(dots0) {
+            let Some(val) = finite_binary32(dot_f64) else {
+                return false;
+            };
+            *dst_head = val;
+        }
+        for (dst_head, dot_f64) in dst1.iter_mut().zip(dots1) {
+            let Some(val) = finite_binary32(dot_f64) else {
+                return false;
+            };
+            *dst_head = val;
+        }
+    }
+    true
+}
+
 fn reduce(sums: [f64; 4]) -> f64 {
     ((sums[0] + sums[1]) + sums[2]) + sums[3]
 }
@@ -924,6 +1180,52 @@ fn portable_accumulate_group_pair<const G: usize>(
     finite.into()
 }
 
+fn portable_accumulate_rows_group<const G: usize>(
+    packed_rows: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    scales: &[[f32; G]],
+    outputs: &mut [[f32; DIMENSION]; G],
+) -> bool {
+    let row_bytes = DIMENSION * usize::from(bits) / 8;
+    for (row, &row_scales) in packed_rows.chunks_exact(row_bytes).zip(scales) {
+        let ok = portable_accumulate_group(row, bits, centroids, row_scales, [true; G], outputs);
+        if !ok.iter().all(|&head_ok| head_ok) {
+            return false;
+        }
+    }
+    true
+}
+
+fn portable_accumulate_rows_group_pair<const G: usize>(
+    packed_rows: &[u8],
+    bits: u8,
+    centroids: &[f32; 16],
+    scales0: &[[f32; G]],
+    scales1: &[[f32; G]],
+    outputs: &mut [[[f32; DIMENSION]; G]; 2],
+) -> bool {
+    let row_bytes = DIMENSION * usize::from(bits) / 8;
+    for ((row, &row_scales0), &row_scales1) in packed_rows
+        .chunks_exact(row_bytes)
+        .zip(scales0)
+        .zip(scales1)
+    {
+        let (ok0, ok1) = portable_accumulate_group_pair(
+            row,
+            bits,
+            centroids,
+            [row_scales0, row_scales1],
+            [[true; G]; 2],
+            outputs,
+        );
+        if !ok0.iter().chain(ok1.iter()).all(|&head_ok| head_ok) {
+            return false;
+        }
+    }
+    true
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     clippy::as_conversions,
@@ -1008,26 +1310,39 @@ fn portable_hadamard(values: &mut [f32; DIMENSION]) {
 )]
 mod native {
     use core::arch::aarch64::{
-        float32x4_t, float32x4x4_t, float64x2_t, uint8x16_t, uint8x16x2_t, uint8x16x4_t,
-        uint32x4_t, vabdq_f32, vaddq_f32, vaddq_f64, vaddvq_u32, vandq_u8, vandq_u32, vbslq_f32,
-        vbslq_u32, vcltq_f32, vcltq_u32, vcvt_f32_f64, vcvt_f64_f32, vcvt_high_f32_f64,
-        vcvt_high_f64_f32, vdivq_f64, vdupq_laneq_f32, vdupq_n_f32, vdupq_n_f64, vdupq_n_u8,
-        vdupq_n_u32, vget_low_f32, vld1q_f32, vld1q_s32, vld1q_u8, vld1q_u8_x2, vld1q_u8_x4,
-        vld3q_u8, vld4q_f32, vminvq_u32, vmulq_f32, vmulq_f64, vorrq_u8, vorrq_u32, vqtbl2q_u8,
-        vqtbl4q_u8, vreinterpretq_f32_u8, vreinterpretq_u8_u16, vreinterpretq_u16_u8,
-        vreinterpretq_u32_f32, vshlq_n_u8, vshlq_u32, vshrq_n_u8, vsliq_n_u8, vst1q_f32, vst1q_f64,
-        vst4q_f32, vsubq_f32, vzip1q_u8, vzip1q_u16, vzip2q_u8, vzip2q_u16,
+        float32x4_t, float32x4x4_t, float64x2_t, int32x4_t, uint8x16_t, uint8x16x2_t,
+        uint8x16x4_t, uint32x4_t, vabdq_f32, vaddq_f32, vaddq_f64, vaddvq_u32, vandq_u8,
+        vandq_u32, vbslq_f32, vbslq_u32, vcltq_f32, vcltq_u32, vcvt_f32_f64, vcvt_f64_f32,
+        vcvt_high_f32_f64, vcvt_high_f64_f32, vdivq_f64, vdupq_laneq_f32, vdupq_n_f32,
+        vdupq_n_f64, vdupq_n_u8, vdupq_n_u32, vdupq_n_u64, vget_low_f32, vld1q_f32, vld1q_s32,
+        vld1q_u8, vld1q_u8_x2, vld1q_u8_x4, vld3q_u8, vld4q_f32, vminvq_u32, vmulq_f32,
+        vmulq_f64, vmulq_u32, vorrq_u8, vorrq_u32, vqtbl2q_u8, vqtbl4q_u8, vreinterpretq_f32_u8,
+        vreinterpretq_u8_u16, vreinterpretq_u8_u32, vreinterpretq_u8_u64, vreinterpretq_u16_u8,
+        vreinterpretq_u32_f32, vshlq_n_u8, vshlq_u32, vshrq_n_u8, vsliq_n_u8, vst1q_f32,
+        vst1q_f64, vst4q_f32, vsubq_f32, vzip1q_u8, vzip1q_u16, vzip2q_u8, vzip2q_u16,
     };
-    #[cfg(test)]
-    use core::arch::aarch64::{vmulq_u32, vreinterpretq_u8_u32};
 
     use super::DIMENSION;
 
     const TILE_OFFSETS: [u8; 16] = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
+    const THREE_BIT_UNPACK_SHIFTS_LO: [i32; 4] = [0, -3, -6, -9];
+    const THREE_BIT_UNPACK_SHIFTS_HI: [i32; 4] = [-12, -15, -18, -21];
     const THREE_BIT_PACK_SHIFTS_LO: [i32; 4] = [0, 3, 6, 9];
     const THREE_BIT_PACK_SHIFTS_HI: [i32; 4] = [12, 15, 18, 21];
     const FOUR_BIT_PACK_SHIFTS_LO: [i32; 4] = [0, 4, 8, 12];
     const FOUR_BIT_PACK_SHIFTS_HI: [i32; 4] = [16, 20, 24, 28];
+
+    #[inline]
+    fn prefetch_l1(ptr: *const u8) {
+        // SAFETY: `prfm pldl1keep` is a non-faulting architectural read prefetch hint.
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) ptr,
+                options(nostack, readonly, preserves_flags),
+            );
+        }
+    }
 
     #[inline]
     #[target_feature(enable = "neon")]
@@ -1422,6 +1737,411 @@ mod native {
         )
     }
 
+    #[derive(Clone, Copy)]
+    struct FourBitTables {
+        table: uint8x16x4_t,
+        mask_3c: uint8x16_t,
+        offsets: uint8x16_t,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ThreeBitTables {
+        table: uint8x16x2_t,
+        mask_1c: uint8x16_t,
+        offsets: uint8x16_t,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ThreeBitStripTables {
+        table: uint8x16x2_t,
+        sh_lo: int32x4_t,
+        sh_hi: int32x4_t,
+        mask_7: uint32x4_t,
+        mul_04: uint32x4_t,
+        offsets: uint8x16_t,
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn widen_queries<const G: usize>(
+        queries: &[&[f32; DIMENSION]; G],
+    ) -> [[[float64x2_t; 2]; G]; 64] {
+        std::array::from_fn(|tile| {
+            let base = tile * 4;
+            std::array::from_fn(|head| {
+                // SAFETY: tile < 64 guarantees base + 4 <= DIMENSION.
+                let query = unsafe { vld1q_f32(queries[head][base..].as_ptr()) };
+                [vcvt_f64_f32(vget_low_f32(query)), vcvt_high_f64_f32(query)]
+            })
+        })
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn dot_tile_widened<const G: usize, const H: usize>(
+        values: float32x4_t,
+        widened_tile: &[[float64x2_t; 2]; G],
+        head_start: usize,
+        low_sums: &mut [float64x2_t; H],
+        high_sums: &mut [float64x2_t; H],
+    ) {
+        let values_low = vcvt_f64_f32(vget_low_f32(values));
+        let values_high = vcvt_high_f64_f32(values);
+        for h in 0..H {
+            let [q_lo, q_hi] = widened_tile[head_start + h];
+            low_sums[h] = vaddq_f64(low_sums[h], vmulq_f64(values_low, q_lo));
+            high_sums[h] = vaddq_f64(high_sums[h], vmulq_f64(values_high, q_hi));
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn store_reduced_rows<const G: usize, const R: usize, const H: usize>(
+        low_sums: &[[float64x2_t; H]; R],
+        high_sums: &[[float64x2_t; H]; R],
+        head_start: usize,
+        out: &mut [[f32; G]],
+    ) -> bool {
+        for r in 0..R {
+            for h in 0..H {
+                let mut low = [0.0; 2];
+                let mut high = [0.0; 2];
+                // SAFETY: low is a unique initialized two-element output array.
+                unsafe { vst1q_f64(low.as_mut_ptr(), low_sums[r][h]) };
+                // SAFETY: high is a disjoint unique two-element output array.
+                unsafe { vst1q_f64(high.as_mut_ptr(), high_sums[r][h]) };
+                let Some(val) =
+                    super::finite_binary32(super::reduce([low[0], low[1], high[0], high[1]]))
+                else {
+                    return false;
+                };
+                out[r][head_start + h] = val;
+            }
+        }
+        true
+    }
+
+    #[target_feature(enable = "neon")]
+    fn score_rows_chunk_4bit<const G: usize, const R: usize, const H: usize>(
+        rows: [&[u8]; R],
+        tables: FourBitTables,
+        widened: &[[[float64x2_t; 2]; G]; 64],
+        head_start: usize,
+        out: &mut [[f32; G]],
+    ) -> bool {
+        let mut low_sums = [[vdupq_n_f64(0.0); H]; R];
+        let mut high_sums = [[vdupq_n_f64(0.0); H]; R];
+        for chunk_idx in 0..8 {
+            let byte_off = chunk_idx * 16;
+            let tile_base = chunk_idx * 8;
+            for r in 0..R {
+                // SAFETY: caller ensures every row in `rows` has 128 bytes (`byte_off + 16 <= 128`).
+                let packed_bytes = unsafe { vld1q_u8(rows[r][byte_off..].as_ptr()) };
+                let low_codes = vandq_u8(vshlq_n_u8::<2>(packed_bytes), tables.mask_3c);
+                let high_codes = vandq_u8(vshrq_n_u8::<2>(packed_bytes), tables.mask_3c);
+                let first_16 = expand_4bit_16(
+                    vzip1q_u8(low_codes, high_codes),
+                    tables.table,
+                    tables.offsets,
+                );
+                for (tile_idx, values) in first_16.into_iter().enumerate() {
+                    dot_tile_widened(
+                        values,
+                        &widened[tile_base + tile_idx],
+                        head_start,
+                        &mut low_sums[r],
+                        &mut high_sums[r],
+                    );
+                }
+                let second_16 = expand_4bit_16(
+                    vzip2q_u8(low_codes, high_codes),
+                    tables.table,
+                    tables.offsets,
+                );
+                for (tile_idx, values) in second_16.into_iter().enumerate() {
+                    dot_tile_widened(
+                        values,
+                        &widened[tile_base + 4 + tile_idx],
+                        head_start,
+                        &mut low_sums[r],
+                        &mut high_sums[r],
+                    );
+                }
+            }
+        }
+        store_reduced_rows(&low_sums, &high_sums, head_start, out)
+    }
+
+    #[target_feature(enable = "neon")]
+    fn score_rows_chunk_3bit<const G: usize, const R: usize, const H: usize>(
+        rows: [&[u8]; R],
+        tables: ThreeBitTables,
+        widened: &[[[float64x2_t; 2]; G]; 64],
+        head_start: usize,
+        out: &mut [[f32; G]],
+    ) -> bool {
+        let mut low_sums = [[vdupq_n_f64(0.0); H]; R];
+        let mut high_sums = [[vdupq_n_f64(0.0); H]; R];
+        for chunk_idx in 0..2 {
+            let chunk_base = chunk_idx * 32;
+            for r in 0..R {
+                let chunk_arr = &rows[r].as_chunks::<48>().0[chunk_idx];
+                let pairs = unpack_3bit_128(chunk_arr, tables.mask_1c);
+                for (pair_idx, pair) in pairs.into_iter().enumerate() {
+                    let tiles = expand_3bit_32(pair, tables.table, tables.offsets);
+                    let pair_base = chunk_base + pair_idx * 8;
+                    for (tile_idx, values) in tiles.into_iter().enumerate() {
+                        dot_tile_widened(
+                            values,
+                            &widened[pair_base + tile_idx],
+                            head_start,
+                            &mut low_sums[r],
+                            &mut high_sums[r],
+                        );
+                    }
+                }
+            }
+        }
+        store_reduced_rows(&low_sums, &high_sums, head_start, out)
+    }
+
+    #[target_feature(enable = "neon")]
+    fn score_rows_sub<const BITS: u8, const G: usize, const R: usize, const H: usize>(
+        rows: [&[u8]; R],
+        tables4: Option<FourBitTables>,
+        tables3: Option<ThreeBitTables>,
+        widened: &[[[float64x2_t; 2]; G]; 64],
+        head_start: usize,
+        out: &mut [[f32; G]],
+    ) -> bool {
+        if BITS == 4 {
+            let Some(tables) = tables4 else {
+                return false;
+            };
+            score_rows_chunk_4bit::<G, R, H>(rows, tables, widened, head_start, out)
+        } else {
+            let Some(tables) = tables3 else {
+                return false;
+            };
+            score_rows_chunk_3bit::<G, R, H>(rows, tables, widened, head_start, out)
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn score_rows_dispatch_heads<const BITS: u8, const G: usize, const R: usize>(
+        rows: [&[u8]; R],
+        tables4: Option<FourBitTables>,
+        tables3: Option<ThreeBitTables>,
+        widened: &[[[float64x2_t; 2]; G]; 64],
+        out: &mut [[f32; G]],
+    ) -> bool {
+        let max_h = if R == 1 { 6 } else if G <= 4 { G } else { 3 };
+        let mut head_start = 0_usize;
+        while head_start < G {
+            let rem = G - head_start;
+            let step = rem.min(max_h);
+            let ok = match step {
+                1 => score_rows_sub::<BITS, G, R, 1>(rows, tables4, tables3, widened, head_start, out),
+                2 => score_rows_sub::<BITS, G, R, 2>(rows, tables4, tables3, widened, head_start, out),
+                3 => score_rows_sub::<BITS, G, R, 3>(rows, tables4, tables3, widened, head_start, out),
+                4 => score_rows_sub::<BITS, G, R, 4>(rows, tables4, tables3, widened, head_start, out),
+                5 => score_rows_sub::<BITS, G, R, 5>(rows, tables4, tables3, widened, head_start, out),
+                _ => score_rows_sub::<BITS, G, R, 6>(rows, tables4, tables3, widened, head_start, out),
+            };
+            if !ok {
+                return false;
+            }
+            head_start += step;
+        }
+        true
+    }
+
+    #[target_feature(enable = "neon")]
+    fn score_rows_with_widened<const BITS: u8, const G: usize>(
+        packed_rows: &[u8],
+        centroids: &[f32; 16],
+        widened: &[[[float64x2_t; 2]; G]; 64],
+        out: &mut [[f32; G]],
+    ) -> bool {
+        let row_bytes = if BITS == 4 { 128 } else { 96 };
+        let offsets = tile_offsets();
+        let tables4 = (BITS == 4).then(|| FourBitTables {
+            table: codebook_bytes(centroids),
+            mask_3c: vdupq_n_u8(0x3c),
+            offsets,
+        });
+        let tables3 = (BITS == 3).then(|| ThreeBitTables {
+            table: codebook_bytes_3(centroids),
+            mask_1c: vdupq_n_u8(0x1c),
+            offsets,
+        });
+        let mut row_idx = 0_usize;
+        if G <= 2 {
+            let batch_bytes = 4 * row_bytes;
+            let mut batches = packed_rows.chunks_exact(batch_bytes);
+            for (batch_idx, chunk) in batches.by_ref().enumerate() {
+                let pf_off = (batch_idx + 2) * batch_bytes;
+                if pf_off + row_bytes <= packed_rows.len() {
+                    prefetch_l1(packed_rows[pf_off..].as_ptr());
+                    prefetch_l1(packed_rows[pf_off + 64..].as_ptr());
+                }
+                let rows = [
+                    &chunk[..row_bytes],
+                    &chunk[row_bytes..2 * row_bytes],
+                    &chunk[2 * row_bytes..3 * row_bytes],
+                    &chunk[3 * row_bytes..4 * row_bytes],
+                ];
+                if !score_rows_dispatch_heads::<BITS, G, 4>(
+                    rows,
+                    tables4,
+                    tables3,
+                    widened,
+                    &mut out[row_idx..row_idx + 4],
+                ) {
+                    return false;
+                }
+                row_idx += 4;
+            }
+            for row in batches.remainder().chunks_exact(row_bytes) {
+                if !score_rows_dispatch_heads::<BITS, G, 1>(
+                    [row],
+                    tables4,
+                    tables3,
+                    widened,
+                    &mut out[row_idx..=row_idx],
+                ) {
+                    return false;
+                }
+                row_idx += 1;
+            }
+        } else {
+            let batch_bytes = 2 * row_bytes;
+            let mut batches = packed_rows.chunks_exact(batch_bytes);
+            for (batch_idx, chunk) in batches.by_ref().enumerate() {
+                let pf_off = (batch_idx + 2) * batch_bytes;
+                if pf_off + row_bytes <= packed_rows.len() {
+                    prefetch_l1(packed_rows[pf_off..].as_ptr());
+                    prefetch_l1(packed_rows[pf_off + 64..].as_ptr());
+                }
+                let rows = [&chunk[..row_bytes], &chunk[row_bytes..2 * row_bytes]];
+                if !score_rows_dispatch_heads::<BITS, G, 2>(
+                    rows,
+                    tables4,
+                    tables3,
+                    widened,
+                    &mut out[row_idx..row_idx + 2],
+                ) {
+                    return false;
+                }
+                row_idx += 2;
+            }
+            for row in batches.remainder().chunks_exact(row_bytes) {
+                if !score_rows_dispatch_heads::<BITS, G, 1>(
+                    [row],
+                    tables4,
+                    tables3,
+                    widened,
+                    &mut out[row_idx..=row_idx],
+                ) {
+                    return false;
+                }
+                row_idx += 1;
+            }
+        }
+        true
+    }
+
+    pub(super) fn score_rows_group<const G: usize>(
+        packed_rows: &[u8],
+        bits: u8,
+        centroids: &[f32; 16],
+        queries: &[&[f32; DIMENSION]; G],
+        out: &mut [[f32; G]],
+    ) -> bool {
+        if bits == 4 {
+            // SAFETY: caller detects NEON and validates packed row lengths and finite inputs.
+            unsafe { score_rows_group_neon::<4, G>(packed_rows, centroids, queries, out) }
+        } else {
+            // SAFETY: caller detects NEON and validates 3-bit packed row lengths and finite inputs.
+            unsafe { score_rows_group_neon::<3, G>(packed_rows, centroids, queries, out) }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn score_rows_group_neon<const BITS: u8, const G: usize>(
+        packed_rows: &[u8],
+        centroids: &[f32; 16],
+        queries: &[&[f32; DIMENSION]; G],
+        out: &mut [[f32; G]],
+    ) -> bool {
+        let widened = widen_queries(queries);
+        score_rows_with_widened::<BITS, G>(packed_rows, centroids, &widened, out)
+    }
+
+    pub(super) fn score_rows_pair<const G: usize>(
+        packed_rows: &[u8],
+        bits: u8,
+        centroids: &[f32; 16],
+        first_queries: &[&[f32; DIMENSION]; G],
+        second_queries: &[&[f32; DIMENSION]; G],
+        out0: &mut [[f32; G]],
+        out1: &mut [[f32; G]],
+    ) -> bool {
+        if bits == 4 {
+            // SAFETY: caller detects NEON and validates packed row lengths and finite inputs.
+            unsafe {
+                score_rows_pair_neon::<4, G>(
+                    packed_rows,
+                    centroids,
+                    first_queries,
+                    second_queries,
+                    out0,
+                    out1,
+                )
+            }
+        } else {
+            // SAFETY: caller detects NEON and validates 3-bit packed row lengths and finite inputs.
+            unsafe {
+                score_rows_pair_neon::<3, G>(
+                    packed_rows,
+                    centroids,
+                    first_queries,
+                    second_queries,
+                    out0,
+                    out1,
+                )
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn score_rows_pair_neon<const BITS: u8, const G: usize>(
+        packed_rows: &[u8],
+        centroids: &[f32; 16],
+        first_queries: &[&[f32; DIMENSION]; G],
+        second_queries: &[&[f32; DIMENSION]; G],
+        out0: &mut [[f32; G]],
+        out1: &mut [[f32; G]],
+    ) -> bool {
+        let widened0 = widen_queries(first_queries);
+        let widened1 = widen_queries(second_queries);
+        let row_bytes = if BITS == 4 { 128 } else { 96 };
+        let chunk_bytes = 64 * row_bytes;
+        for ((row_chunk, out0_chunk), out1_chunk) in packed_rows
+            .chunks(chunk_bytes)
+            .zip(out0.chunks_mut(64))
+            .zip(out1.chunks_mut(64))
+        {
+            if !score_rows_with_widened::<BITS, G>(row_chunk, centroids, &widened0, out0_chunk) {
+                return false;
+            }
+            if !score_rows_with_widened::<BITS, G>(row_chunk, centroids, &widened1, out1_chunk) {
+                return false;
+            }
+        }
+        true
+    }
+
     #[inline]
     #[target_feature(enable = "neon")]
     fn accumulate_tile_single(
@@ -1738,6 +2458,390 @@ mod native {
             std::array::from_fn(|head| active[0][head] && vminvq_u32(finite0[head]) != 0),
             std::array::from_fn(|head| active[1][head] && vminvq_u32(finite1[head]) != 0),
         )
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn unpack_4bit_8(bytes: &[u8], tables: FourBitTables) -> [float32x4_t; 2] {
+        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let packed = vreinterpretq_u8_u32(vdupq_n_u32(word));
+        let low_codes = vandq_u8(vshlq_n_u8::<2>(packed), tables.mask_3c);
+        let high_codes = vandq_u8(vshrq_n_u8::<2>(packed), tables.mask_3c);
+        let interleaved = vzip1q_u8(low_codes, high_codes);
+        let dup = vzip1q_u8(interleaved, interleaved);
+        [
+            vreinterpretq_f32_u8(vqtbl4q_u8(
+                tables.table,
+                vorrq_u8(vzip1q_u8(dup, dup), tables.offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl4q_u8(
+                tables.table,
+                vorrq_u8(vzip2q_u8(dup, dup), tables.offsets),
+            )),
+        ]
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn unpack_4bit_16(bytes: &[u8], tables: FourBitTables) -> [float32x4_t; 4] {
+        let word = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let packed = vreinterpretq_u8_u64(vdupq_n_u64(word));
+        let low_codes = vandq_u8(vshlq_n_u8::<2>(packed), tables.mask_3c);
+        let high_codes = vandq_u8(vshrq_n_u8::<2>(packed), tables.mask_3c);
+        expand_4bit_16(
+            vzip1q_u8(low_codes, high_codes),
+            tables.table,
+            tables.offsets,
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn unpack_3bit_8(bytes: &[u8], tables: ThreeBitStripTables) -> [float32x4_t; 2] {
+        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+        let vec = vdupq_n_u32(word);
+        let codes0 = vandq_u32(vshlq_u32(vec, tables.sh_lo), tables.mask_7);
+        let codes1 = vandq_u32(vshlq_u32(vec, tables.sh_hi), tables.mask_7);
+        let bases0 = vreinterpretq_u8_u32(vmulq_u32(codes0, tables.mul_04));
+        let bases1 = vreinterpretq_u8_u32(vmulq_u32(codes1, tables.mul_04));
+        [
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                tables.table,
+                vorrq_u8(bases0, tables.offsets),
+            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(
+                tables.table,
+                vorrq_u8(bases1, tables.offsets),
+            )),
+        ]
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn unpack_3bit_16(bytes: &[u8], tables: ThreeBitStripTables) -> [float32x4_t; 4] {
+        let lo = unpack_3bit_8(&bytes[0..3], tables);
+        let hi = unpack_3bit_8(&bytes[3..6], tables);
+        [lo[0], lo[1], hi[0], hi[1]]
+    }
+
+    #[target_feature(enable = "neon")]
+    fn accumulate_strip_batch<
+        const BITS: u8,
+        const G: usize,
+        const TILES: usize,
+        const H: usize,
+    >(
+        row_chunk: &[u8],
+        scales: &[[f32; G]],
+        head_start: usize,
+        tables4: Option<FourBitTables>,
+        tables3: Option<ThreeBitStripTables>,
+        outputs: &mut [[f32; DIMENSION]; G],
+    ) -> bool {
+        let row_bytes = if BITS == 4 { 128 } else { 96 };
+        let strip_chans = TILES * 4;
+        let strip_bytes = if BITS == 4 {
+            strip_chans / 2
+        } else {
+            (strip_chans * 3) / 8
+        };
+        let strips = DIMENSION / strip_chans;
+        let magnitude = vdupq_n_u32(0x7fff_ffff);
+        let infinity = vdupq_n_u32(0x7f80_0000);
+        for strip in 0..strips {
+            let chan_base = strip * strip_chans;
+            let byte_off = strip * strip_bytes;
+            let mut acc: [[float32x4_t; TILES]; H] = std::array::from_fn(|h| {
+                std::array::from_fn(|t| {
+                    // SAFETY: chan_base + t * 4 + 4 <= DIMENSION.
+                    unsafe { vld1q_f32(outputs[head_start + h][chan_base + t * 4..].as_ptr()) }
+                })
+            });
+            for (r, (row, row_scales)) in row_chunk
+                .chunks_exact(row_bytes)
+                .zip(scales)
+                .enumerate()
+            {
+                if r + 4 < scales.len() {
+                    prefetch_l1(row_chunk[(r + 4) * row_bytes + byte_off..].as_ptr());
+                }
+                let slice = &row[byte_off..byte_off + strip_bytes];
+                let tiles: [float32x4_t; TILES] = if BITS == 4 {
+                    let Some(t4) = tables4 else {
+                        return false;
+                    };
+                    if TILES == 4 {
+                        let unpacked = unpack_4bit_16(slice, t4);
+                        std::array::from_fn(|t| unpacked[t])
+                    } else {
+                        let unpacked = unpack_4bit_8(slice, t4);
+                        std::array::from_fn(|t| unpacked[t])
+                    }
+                } else {
+                    let Some(t3) = tables3 else {
+                        return false;
+                    };
+                    if TILES == 4 {
+                        let unpacked = unpack_3bit_16(slice, t3);
+                        std::array::from_fn(|t| unpacked[t])
+                    } else {
+                        let unpacked = unpack_3bit_8(slice, t3);
+                        std::array::from_fn(|t| unpacked[t])
+                    }
+                };
+                for h in 0..H {
+                    let scale_vec = vdupq_n_f32(row_scales[head_start + h]);
+                    for t in 0..TILES {
+                        acc[h][t] = vaddq_f32(acc[h][t], vmulq_f32(scale_vec, tiles[t]));
+                    }
+                }
+            }
+            let mut strip_finite = vdupq_n_u32(u32::MAX);
+            for head_acc in &acc {
+                for &vec in head_acc {
+                    let abs = vandq_u32(vreinterpretq_u32_f32(vec), magnitude);
+                    strip_finite = vandq_u32(strip_finite, vcltq_u32(abs, infinity));
+                }
+            }
+            if vminvq_u32(strip_finite) == 0 {
+                return false;
+            }
+            for (h, head_acc) in acc.iter().enumerate() {
+                for (t, &vec) in head_acc.iter().enumerate() {
+                    // SAFETY: chan_base + t * 4 + 4 <= DIMENSION.
+                    unsafe {
+                        vst1q_f32(
+                            outputs[head_start + h][chan_base + t * 4..].as_mut_ptr(),
+                            vec,
+                        );
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    pub(super) fn accumulate_rows_group<const G: usize>(
+        packed_rows: &[u8],
+        bits: u8,
+        centroids: &[f32; 16],
+        scales: &[[f32; G]],
+        outputs: &mut [[f32; DIMENSION]; G],
+    ) -> bool {
+        if bits == 4 {
+            // SAFETY: caller detects NEON and validates packed row lengths and finite inputs.
+            unsafe { accumulate_rows_group_neon::<4, G>(packed_rows, centroids, scales, outputs) }
+        } else {
+            // SAFETY: caller detects NEON and validates 3-bit packed row lengths and finite inputs.
+            unsafe { accumulate_rows_group_neon::<3, G>(packed_rows, centroids, scales, outputs) }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn accumulate_chunk_neon<const BITS: u8, const G: usize>(
+        row_chunk: &[u8],
+        scale_chunk: &[[f32; G]],
+        tables4: Option<FourBitTables>,
+        tables3: Option<ThreeBitStripTables>,
+        outputs: &mut [[f32; DIMENSION]; G],
+    ) -> bool {
+        if G <= 4 {
+            return match G {
+                1 => accumulate_strip_batch::<BITS, G, 4, 1>(
+                    row_chunk,
+                    scale_chunk,
+                    0,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+                2 => accumulate_strip_batch::<BITS, G, 4, 2>(
+                    row_chunk,
+                    scale_chunk,
+                    0,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+                3 => accumulate_strip_batch::<BITS, G, 4, 3>(
+                    row_chunk,
+                    scale_chunk,
+                    0,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+                _ => accumulate_strip_batch::<BITS, G, 4, 4>(
+                    row_chunk,
+                    scale_chunk,
+                    0,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+            };
+        }
+        let mut head_start = 0_usize;
+        while head_start < G {
+            let step = (G - head_start).min(6);
+            let ok = match step {
+                1 => accumulate_strip_batch::<BITS, G, 2, 1>(
+                    row_chunk,
+                    scale_chunk,
+                    head_start,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+                2 => accumulate_strip_batch::<BITS, G, 2, 2>(
+                    row_chunk,
+                    scale_chunk,
+                    head_start,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+                3 => accumulate_strip_batch::<BITS, G, 2, 3>(
+                    row_chunk,
+                    scale_chunk,
+                    head_start,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+                4 => accumulate_strip_batch::<BITS, G, 2, 4>(
+                    row_chunk,
+                    scale_chunk,
+                    head_start,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+                5 => accumulate_strip_batch::<BITS, G, 2, 5>(
+                    row_chunk,
+                    scale_chunk,
+                    head_start,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+                _ => accumulate_strip_batch::<BITS, G, 2, 6>(
+                    row_chunk,
+                    scale_chunk,
+                    head_start,
+                    tables4,
+                    tables3,
+                    outputs,
+                ),
+            };
+            if !ok {
+                return false;
+            }
+            head_start += step;
+        }
+        true
+    }
+
+    #[target_feature(enable = "neon")]
+    fn accumulate_rows_group_neon<const BITS: u8, const G: usize>(
+        packed_rows: &[u8],
+        centroids: &[f32; 16],
+        scales: &[[f32; G]],
+        outputs: &mut [[f32; DIMENSION]; G],
+    ) -> bool {
+        let row_bytes = if BITS == 4 { 128 } else { 96 };
+        let offsets = tile_offsets();
+        let tables4 = (BITS == 4).then(|| FourBitTables {
+            table: codebook_bytes(centroids),
+            mask_3c: vdupq_n_u8(0x3c),
+            offsets,
+        });
+        let tables3 = (BITS == 3).then(|| ThreeBitStripTables {
+            table: codebook_bytes_3(centroids),
+            // SAFETY: THREE_BIT_UNPACK_SHIFTS_LO is a static 4-element initialized array.
+            sh_lo: unsafe { vld1q_s32(THREE_BIT_UNPACK_SHIFTS_LO.as_ptr()) },
+            // SAFETY: THREE_BIT_UNPACK_SHIFTS_HI is a static 4-element initialized array.
+            sh_hi: unsafe { vld1q_s32(THREE_BIT_UNPACK_SHIFTS_HI.as_ptr()) },
+            mask_7: vdupq_n_u32(7),
+            mul_04: vdupq_n_u32(0x0404_0404),
+            offsets,
+        });
+        for (row_chunk, scale_chunk) in packed_rows.chunks(64 * row_bytes).zip(scales.chunks(64)) {
+            if !accumulate_chunk_neon::<BITS, G>(row_chunk, scale_chunk, tables4, tables3, outputs) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(super) fn accumulate_rows_group_pair<const G: usize>(
+        packed_rows: &[u8],
+        bits: u8,
+        centroids: &[f32; 16],
+        scales0: &[[f32; G]],
+        scales1: &[[f32; G]],
+        outputs: &mut [[[f32; DIMENSION]; G]; 2],
+    ) -> bool {
+        if bits == 4 {
+            // SAFETY: caller detects NEON and validates packed row lengths and finite inputs.
+            unsafe {
+                accumulate_rows_group_pair_neon::<4, G>(
+                    packed_rows,
+                    centroids,
+                    scales0,
+                    scales1,
+                    outputs,
+                )
+            }
+        } else {
+            // SAFETY: caller detects NEON and validates 3-bit packed row lengths and finite inputs.
+            unsafe {
+                accumulate_rows_group_pair_neon::<3, G>(
+                    packed_rows,
+                    centroids,
+                    scales0,
+                    scales1,
+                    outputs,
+                )
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn accumulate_rows_group_pair_neon<const BITS: u8, const G: usize>(
+        packed_rows: &[u8],
+        centroids: &[f32; 16],
+        scales0: &[[f32; G]],
+        scales1: &[[f32; G]],
+        outputs: &mut [[[f32; DIMENSION]; G]; 2],
+    ) -> bool {
+        let row_bytes = if BITS == 4 { 128 } else { 96 };
+        let chunk_bytes = 64 * row_bytes;
+        for ((row_chunk, s0_chunk), s1_chunk) in packed_rows
+            .chunks(chunk_bytes)
+            .zip(scales0.chunks(64))
+            .zip(scales1.chunks(64))
+        {
+            if !accumulate_rows_group_neon::<BITS, G>(
+                row_chunk,
+                centroids,
+                s0_chunk,
+                &mut outputs[0],
+            ) {
+                return false;
+            }
+            if !accumulate_rows_group_neon::<BITS, G>(
+                row_chunk,
+                centroids,
+                s1_chunk,
+                &mut outputs[1],
+            ) {
+                return false;
+            }
+        }
+        true
     }
 
     pub(super) fn normalize(values: &mut [f32; DIMENSION], scale: f32) -> bool {
@@ -2894,5 +3998,220 @@ mod tests {
                 &mut out[..byte_len - 1],
             ));
         }
+    }
+
+    fn verify_batched_group_and_pair<const G: usize>(bits: u8) -> Result<(), &'static str> {
+        use super::{
+            PreparedQueryGroup, PreparedQueryPair, ValueGroupAccumulator,
+            ValueGroupPairAccumulator,
+        };
+
+        let centroids = codebook();
+        let row_bytes = DIMENSION * usize::from(bits) / 8;
+        let queries0: [[f32; DIMENSION]; G] = make_pair_queries(3, 7, 0.03125);
+        let queries1: [[f32; DIMENSION]; G] = make_pair_queries(9, 5, 0.0625);
+        let refs0: [&[f32; DIMENSION]; G] = std::array::from_fn(|head| &queries0[head]);
+        let refs1: [&[f32; DIMENSION]; G] = std::array::from_fn(|head| &queries1[head]);
+        let group_query =
+            PreparedQueryGroup::new(bits, &centroids, refs0).ok_or("finite group query")?;
+        let pair_query =
+            PreparedQueryPair::new(bits, &centroids, refs0, refs1).ok_or("finite pair query")?;
+
+        for len in [0_usize, 1, 2, 3, 7, 16, 63, 64, 65] {
+            let mut packed_rows = Vec::with_capacity(len * row_bytes);
+            let mut scales0 = Vec::with_capacity(len);
+            let mut scales1 = Vec::with_capacity(len);
+            for row_idx in 0..len {
+                let offset = u8::try_from((row_idx * 5 + 1) & 0xff).unwrap_or(0);
+                packed_rows.extend_from_slice(&packed(&codes(bits, offset), bits));
+                scales0.push(std::array::from_fn(|head| {
+                    if (row_idx + head).is_multiple_of(11) {
+                        -0.0
+                    } else {
+                        let signed = i16::try_from((row_idx * 3 + head * 7) % 19).unwrap_or(0) - 9;
+                        f32::from(signed) * 0.0625
+                    }
+                }));
+                scales1.push(std::array::from_fn(|head| {
+                    if (row_idx + head + 2).is_multiple_of(13) {
+                        0.0
+                    } else {
+                        let signed = i16::try_from((row_idx * 5 + head * 3) % 17).unwrap_or(0) - 8;
+                        f32::from(signed) * 0.03125
+                    }
+                }));
+            }
+
+            let mut actual_scores = vec![[0.0_f32; G]; len];
+            assert!(group_query.score_rows(&packed_rows, &mut actual_scores));
+            let mut oracle_scores = vec![[0.0_f32; G]; len];
+            assert!(super::portable_score_rows_group(
+                &packed_rows,
+                bits,
+                &centroids,
+                &refs0,
+                &mut oracle_scores,
+            ));
+            for (actual, expected) in actual_scores.iter().zip(&oracle_scores) {
+                assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+            }
+
+            let mut actual_p0 = vec![[0.0_f32; G]; len];
+            let mut actual_p1 = vec![[0.0_f32; G]; len];
+            assert!(pair_query.score_rows(&packed_rows, &mut actual_p0, &mut actual_p1));
+            let mut oracle_p0 = vec![[0.0_f32; G]; len];
+            let mut oracle_p1 = vec![[0.0_f32; G]; len];
+            assert!(super::portable_score_rows_pair(
+                &packed_rows,
+                bits,
+                &centroids,
+                &refs0,
+                &refs1,
+                &mut oracle_p0,
+                &mut oracle_p1,
+            ));
+            for ((a0, e0), (a1, e1)) in actual_p0
+                .iter()
+                .zip(&oracle_p0)
+                .zip(actual_p1.iter().zip(&oracle_p1))
+            {
+                assert_eq!(a0.map(f32::to_bits), e0.map(f32::to_bits));
+                assert_eq!(a1.map(f32::to_bits), e1.map(f32::to_bits));
+            }
+
+            let mut group_acc =
+                ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite group acc")?;
+            assert!(group_acc.accumulate_rows(&packed_rows, &scales0));
+            let mut oracle_group_out = [[0.0_f32; DIMENSION]; G];
+            assert!(super::portable_accumulate_rows_group(
+                &packed_rows,
+                bits,
+                &centroids,
+                &scales0,
+                &mut oracle_group_out,
+            ));
+            let actual_group_out = group_acc.finish();
+            for head in 0..G {
+                assert_eq!(
+                    actual_group_out[head].map(|row| row.map(f32::to_bits)),
+                    Some(oracle_group_out[head].map(f32::to_bits)),
+                );
+            }
+
+            let mut pair_acc =
+                ValueGroupPairAccumulator::<G>::new(bits, &centroids).ok_or("finite pair acc")?;
+            assert!(pair_acc.accumulate_rows(&packed_rows, &scales0, &scales1));
+            let mut oracle_pair_out = [[[0.0_f32; DIMENSION]; G]; 2];
+            assert!(super::portable_accumulate_rows_group_pair(
+                &packed_rows,
+                bits,
+                &centroids,
+                &scales0,
+                &scales1,
+                &mut oracle_pair_out,
+            ));
+            let [actual_out0, actual_out1] = pair_acc.finish();
+            for head in 0..G {
+                assert_eq!(
+                    actual_out0[head].map(|row| row.map(f32::to_bits)),
+                    Some(oracle_pair_out[0][head].map(f32::to_bits)),
+                );
+                assert_eq!(
+                    actual_out1[head].map(|row| row.map(f32::to_bits)),
+                    Some(oracle_pair_out[1][head].map(f32::to_bits)),
+                );
+            }
+        }
+
+        // Mismatching slice lengths.
+        let one_row = packed(&codes(bits, 0), bits);
+        let mut two_out = vec![[0.0_f32; G]; 2];
+        assert!(!group_query.score_rows(&one_row, &mut two_out));
+        assert!(!group_query.score_rows(&one_row[..row_bytes - 1], &mut two_out[..1]));
+        let mut one_out0 = vec![[0.0_f32; G]; 1];
+        assert!(!pair_query.score_rows(&one_row, &mut one_out0, &mut two_out));
+        assert!(!pair_query.score_rows(&one_row[..row_bytes - 1], &mut one_out0, &mut two_out[..1]));
+
+        let mut acc_bad =
+            ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite group acc")?;
+        assert!(!acc_bad.accumulate_rows(&one_row, &[[1.0; G]; 2]));
+        assert!(acc_bad.finish().iter().all(Option::is_none));
+
+        let mut pair_bad =
+            ValueGroupPairAccumulator::<G>::new(bits, &centroids).ok_or("finite pair acc")?;
+        assert!(!pair_bad.accumulate_rows(&one_row, &[[1.0; G]; 1], &[[1.0; G]; 2]));
+        assert!(
+            pair_bad
+                .finish()
+                .iter()
+                .flatten()
+                .all(Option::is_none)
+        );
+
+        // Non-finite scales rejected upfront and poison accumulator.
+        for bad_scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut acc =
+                ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite group acc")?;
+            assert!(acc.accumulate_rows(&one_row, &[[0.25; G]]));
+            let mut bad_scales = [0.25; G];
+            bad_scales[G - 1] = bad_scale;
+            assert!(!acc.accumulate_rows(&one_row, &[bad_scales]));
+            assert!(!acc.accumulate_rows(&one_row, &[[0.25; G]]));
+            assert!(acc.finish().iter().all(Option::is_none));
+
+            let mut pacc =
+                ValueGroupPairAccumulator::<G>::new(bits, &centroids).ok_or("finite pair acc")?;
+            assert!(pacc.accumulate_rows(&one_row, &[[0.25; G]], &[[0.25; G]]));
+            assert!(!pacc.accumulate_rows(&one_row, &[[0.25; G]], &[bad_scales]));
+            assert!(!pacc.accumulate_rows(&one_row, &[[0.25; G]], &[[0.25; G]]));
+            assert!(pacc.finish().iter().flatten().all(Option::is_none));
+        }
+
+        // Overflow to +/-Inf in scoring and accumulation.
+        let huge_q = [f32::MAX; DIMENSION];
+        let huge_book = [f32::MAX; 16];
+        let huge_gq =
+            PreparedQueryGroup::new(bits, &huge_book, [(&huge_q); G]).ok_or("huge group query")?;
+        let huge_pq = PreparedQueryPair::new(bits, &huge_book, [(&huge_q); G], [(&huge_q); G])
+            .ok_or("huge pair query")?;
+        let mut score_overflow = [[0.0_f32; G]; 1];
+        assert!(!huge_gq.score_rows(&one_row, &mut score_overflow));
+        let mut p0_overflow = [[0.0_f32; G]; 1];
+        let mut p1_overflow = [[0.0_f32; G]; 1];
+        assert!(!huge_pq.score_rows(&one_row, &mut p0_overflow, &mut p1_overflow));
+
+        for extreme in [f32::MAX, -f32::MAX] {
+            let mut extreme_book = [1.0_f32; 16];
+            extreme_book[0] = extreme;
+            let mut zero_codes = [0_u8; DIMENSION];
+            zero_codes[DIMENSION - 1] = 0;
+            let zero_row = packed(&zero_codes, bits);
+            let mut two_rows = Vec::with_capacity(2 * row_bytes);
+            two_rows.extend_from_slice(&zero_row);
+            two_rows.extend_from_slice(&zero_row);
+
+            let mut acc =
+                ValueGroupAccumulator::<G>::new(bits, &extreme_book).ok_or("extreme acc")?;
+            assert!(!acc.accumulate_rows(&two_rows, &[[1.0; G], [1.0; G]]));
+            assert!(acc.finish().iter().all(Option::is_none));
+
+            let mut pacc =
+                ValueGroupPairAccumulator::<G>::new(bits, &extreme_book).ok_or("extreme pacc")?;
+            assert!(!pacc.accumulate_rows(&two_rows, &[[0.5; G], [0.5; G]], &[[1.0; G], [1.0; G]]));
+            assert!(pacc.finish().iter().flatten().all(Option::is_none));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn batched_group_and_pair_match_scalar_oracle_bit_for_bit() -> Result<(), &'static str> {
+        for bits in [3, 4] {
+            verify_batched_group_and_pair::<1>(bits)?;
+            verify_batched_group_and_pair::<2>(bits)?;
+            verify_batched_group_and_pair::<3>(bits)?;
+            verify_batched_group_and_pair::<6>(bits)?;
+        }
+        Ok(())
     }
 }

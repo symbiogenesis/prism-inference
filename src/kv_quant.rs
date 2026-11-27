@@ -32,6 +32,107 @@ const FORMAT_VERSION: u32 = 1;
 const FITTED_SCALE_VERSION: u32 = 2;
 const COOPTIMIZED_SCALE_VERSION: u32 = 3;
 
+const MAX_BATCH_ROWS: usize = 64;
+const MAX_CODE_BYTES: usize = HEAD_DIM / 2;
+
+#[repr(C, align(16))]
+struct AlignedCodeBatch([u8; MAX_BATCH_ROWS * MAX_CODE_BYTES]);
+
+impl AlignedCodeBatch {
+    const fn new() -> Self {
+        Self([0_u8; MAX_BATCH_ROWS * MAX_CODE_BYTES])
+    }
+}
+
+fn validate_strided_rows(
+    packed_rows: &[u8],
+    row_stride: usize,
+    head_offset: usize,
+    encoded_len: usize,
+    count: usize,
+) -> Result<()> {
+    let end_offset = head_offset
+        .checked_add(encoded_len)
+        .ok_or_else(|| invalid("KV codec batch offset overflow"))?;
+    if row_stride < end_offset {
+        return Err(invalid("KV codec batch stride too small"));
+    }
+    let expected = count
+        .checked_mul(row_stride)
+        .ok_or_else(|| invalid("KV codec batch byte count overflow"))?;
+    if packed_rows.len() != expected {
+        return Err(invalid("KV codec batch length mismatch"));
+    }
+    Ok(())
+}
+
+struct ScoreBatchScratch {
+    code_buf: AlignedCodeBatch,
+    scales: [f32; MAX_BATCH_ROWS],
+    nonzero_indices: [usize; MAX_BATCH_ROWS],
+}
+
+impl ScoreBatchScratch {
+    const fn new() -> Self {
+        Self {
+            code_buf: AlignedCodeBatch::new(),
+            scales: [0.0_f32; MAX_BATCH_ROWS],
+            nonzero_indices: [0_usize; MAX_BATCH_ROWS],
+        }
+    }
+}
+
+fn gather_score_batch(
+    quantizer: &Quantizer,
+    row_chunk: &[u8],
+    row_stride: usize,
+    head_offset: usize,
+    trusted: bool,
+    scratch: &mut ScoreBatchScratch,
+) -> Result<usize> {
+    let encoded_len = quantizer.encoded_len();
+    let code_bytes = encoded_len - SCALE_BYTES;
+    let mut nonzero_count = 0_usize;
+    for (row_idx, row) in row_chunk.chunks_exact(row_stride).enumerate() {
+        let record = &row[head_offset..head_offset + encoded_len];
+        let (scale, codes) = if trusted {
+            quantizer.trusted_record(record)?
+        } else {
+            quantizer.record(record)?
+        };
+        scratch.scales[row_idx] = scale;
+        if scale != 0.0 {
+            let dst_start = nonzero_count * code_bytes;
+            scratch.code_buf.0[dst_start..dst_start + code_bytes].copy_from_slice(codes);
+            scratch.nonzero_indices[nonzero_count] = row_idx;
+            nonzero_count += 1;
+        }
+    }
+    Ok(nonzero_count)
+}
+
+fn compute_weighted_scales<const G: usize>(
+    weights: [f32; G],
+    scale: f32,
+) -> Result<([f32; G], bool)> {
+    if weights.iter().any(|weight| !weight.is_finite()) {
+        return Err(invalid("KV codec weight must be finite"));
+    }
+    let mut weighted_scales = [0.0_f32; G];
+    let mut any_nonzero = false;
+    for (dst, weight) in weighted_scales.iter_mut().zip(weights) {
+        let weighted = weight * scale;
+        if !weighted.is_finite() {
+            return Err(invalid("KV codec weighted scale overflow"));
+        }
+        if weighted != 0.0 {
+            any_nonzero = true;
+        }
+        *dst = weighted;
+    }
+    Ok((weighted_scales, any_nonzero))
+}
+
 /// Packed scalar precision; both key and value precision are explicit policies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Bits {
@@ -166,10 +267,104 @@ impl<const G: usize> PreparedQueryGroup<'_, G> {
         self.score_group_with_record(record)
     }
 
-    /// Scores `G` heads from one already-validated immutable internal page record.
-    pub(crate) fn score_group_trusted(&self, packed: &[u8]) -> Result<[f32; G]> {
-        let record = self.quantizer.trusted_record(packed)?;
-        self.score_group_with_record(record)
+    /// Scores `out.len()` strided packed key records across `G` heads.
+    pub(crate) fn score_rows(
+        &self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        out: &mut [[f32; G]],
+    ) -> Result<()> {
+        self.score_rows_inner(packed_rows, row_stride, head_offset, false, out)
+    }
+
+    /// Scores `out.len()` strided immutable internal page key records across `G` heads.
+    pub(crate) fn score_rows_trusted(
+        &self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        out: &mut [[f32; G]],
+    ) -> Result<()> {
+        self.score_rows_inner(packed_rows, row_stride, head_offset, true, out)
+    }
+
+    fn score_rows_inner(
+        &self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        trusted: bool,
+        out: &mut [[f32; G]],
+    ) -> Result<()> {
+        let encoded_len = self.quantizer.encoded_len();
+        validate_strided_rows(packed_rows, row_stride, head_offset, encoded_len, out.len())?;
+        if out.is_empty() {
+            return Ok(());
+        }
+        let code_bytes = encoded_len - SCALE_BYTES;
+        let mut scratch = ScoreBatchScratch::new();
+        let mut unscaled = [[0.0_f32; G]; MAX_BATCH_ROWS];
+        for (row_chunk, out_chunk) in packed_rows
+            .chunks(MAX_BATCH_ROWS * row_stride)
+            .zip(out.chunks_mut(MAX_BATCH_ROWS))
+        {
+            let nonzero_count = gather_score_batch(
+                self.quantizer,
+                row_chunk,
+                row_stride,
+                head_offset,
+                trusted,
+                &mut scratch,
+            )?;
+            if nonzero_count < out_chunk.len() {
+                for (dst, &scale) in out_chunk.iter_mut().zip(&scratch.scales) {
+                    if scale == 0.0 {
+                        *dst = [0.0; G];
+                    }
+                }
+            }
+            if nonzero_count == 0 {
+                continue;
+            }
+            let codes_slice = &scratch.code_buf.0[..nonzero_count * code_bytes];
+            let unscaled_slice = &mut unscaled[..nonzero_count];
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            if let Some(native) = &self.native {
+                if !native.score_rows(codes_slice, unscaled_slice) {
+                    return Err(invalid("KV codec native dot rejected arithmetic"));
+                }
+            } else {
+                for (dst, codes) in unscaled_slice
+                    .iter_mut()
+                    .zip(codes_slice.chunks_exact(code_bytes))
+                {
+                    *dst = self.scalar_dots(codes)?;
+                }
+            }
+            #[cfg(not(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            )))]
+            for (dst, codes) in unscaled_slice
+                .iter_mut()
+                .zip(codes_slice.chunks_exact(code_bytes))
+            {
+                *dst = self.scalar_dots(codes)?;
+            }
+            for idx in 0..nonzero_count {
+                let row_idx = scratch.nonzero_indices[idx];
+                out_chunk[row_idx] = scale_dots(unscaled[idx], scratch.scales[row_idx])?;
+            }
+        }
+        Ok(())
     }
 
     fn score_group_with_record(&self, (scale, codes): (f32, &[u8])) -> Result<[f32; G]> {
@@ -241,11 +436,124 @@ impl<const G: usize> PreparedQueryPair<'_, G> {
         self.score_pair_with_record(record)
     }
 
-    /// Scores both token query groups (`2 * G` heads) from one already-validated
-    /// immutable internal page record.
-    pub(crate) fn score_pair_trusted(&self, packed: &[u8]) -> Result<([f32; G], [f32; G])> {
-        let record = self.quantizer.trusted_record(packed)?;
-        self.score_pair_with_record(record)
+    /// Scores `out0.len()` strided packed key records across both `G`-head token groups.
+    pub(crate) fn score_rows(
+        &self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        out0: &mut [[f32; G]],
+        out1: &mut [[f32; G]],
+    ) -> Result<()> {
+        self.score_rows_inner(packed_rows, row_stride, head_offset, false, out0, out1)
+    }
+
+    /// Scores `out0.len()` strided immutable internal page key records across both token groups.
+    pub(crate) fn score_rows_trusted(
+        &self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        out0: &mut [[f32; G]],
+        out1: &mut [[f32; G]],
+    ) -> Result<()> {
+        self.score_rows_inner(packed_rows, row_stride, head_offset, true, out0, out1)
+    }
+
+    fn score_rows_inner(
+        &self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        trusted: bool,
+        out0: &mut [[f32; G]],
+        out1: &mut [[f32; G]],
+    ) -> Result<()> {
+        if out0.len() != out1.len() {
+            return Err(invalid("KV codec batch output length mismatch"));
+        }
+        let encoded_len = self.quantizer.encoded_len();
+        validate_strided_rows(packed_rows, row_stride, head_offset, encoded_len, out0.len())?;
+        if out0.is_empty() {
+            return Ok(());
+        }
+        let code_bytes = encoded_len - SCALE_BYTES;
+        let mut scratch = ScoreBatchScratch::new();
+        let mut unscaled0 = [[0.0_f32; G]; MAX_BATCH_ROWS];
+        let mut unscaled1 = [[0.0_f32; G]; MAX_BATCH_ROWS];
+        for ((row_chunk, out0_chunk), out1_chunk) in packed_rows
+            .chunks(MAX_BATCH_ROWS * row_stride)
+            .zip(out0.chunks_mut(MAX_BATCH_ROWS))
+            .zip(out1.chunks_mut(MAX_BATCH_ROWS))
+        {
+            let nonzero_count = gather_score_batch(
+                self.quantizer,
+                row_chunk,
+                row_stride,
+                head_offset,
+                trusted,
+                &mut scratch,
+            )?;
+            if nonzero_count < out0_chunk.len() {
+                for ((dst0, dst1), &scale) in out0_chunk
+                    .iter_mut()
+                    .zip(out1_chunk.iter_mut())
+                    .zip(&scratch.scales)
+                {
+                    if scale == 0.0 {
+                        *dst0 = [0.0; G];
+                        *dst1 = [0.0; G];
+                    }
+                }
+            }
+            if nonzero_count == 0 {
+                continue;
+            }
+            let codes_slice = &scratch.code_buf.0[..nonzero_count * code_bytes];
+            let unscaled0_slice = &mut unscaled0[..nonzero_count];
+            let unscaled1_slice = &mut unscaled1[..nonzero_count];
+            #[cfg(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            ))]
+            if let Some(native) = &self.native {
+                if !native.score_rows(codes_slice, unscaled0_slice, unscaled1_slice) {
+                    return Err(invalid("KV codec native dot rejected arithmetic"));
+                }
+            } else {
+                for ((dst0, dst1), codes) in unscaled0_slice
+                    .iter_mut()
+                    .zip(unscaled1_slice.iter_mut())
+                    .zip(codes_slice.chunks_exact(code_bytes))
+                {
+                    *dst0 = self.scalar_dots(codes, 0)?;
+                    *dst1 = self.scalar_dots(codes, 1)?;
+                }
+            }
+            #[cfg(not(all(
+                feature = "experimental-neon",
+                target_arch = "aarch64",
+                target_os = "windows",
+                target_env = "msvc"
+            )))]
+            for ((dst0, dst1), codes) in unscaled0_slice
+                .iter_mut()
+                .zip(unscaled1_slice.iter_mut())
+                .zip(codes_slice.chunks_exact(code_bytes))
+            {
+                *dst0 = self.scalar_dots(codes, 0)?;
+                *dst1 = self.scalar_dots(codes, 1)?;
+            }
+            for idx in 0..nonzero_count {
+                let row_idx = scratch.nonzero_indices[idx];
+                let scale = scratch.scales[row_idx];
+                out0_chunk[row_idx] = scale_dots(unscaled0[idx], scale)?;
+                out1_chunk[row_idx] = scale_dots(unscaled1[idx], scale)?;
+            }
+        }
+        Ok(())
     }
 
     fn score_pair_with_record(&self, (scale, codes): (f32, &[u8])) -> Result<([f32; G], [f32; G])> {
@@ -369,24 +677,6 @@ impl<const G: usize> ValueGroupPairAccumulator<'_, G> {
         let result = self
             .quantizer
             .record(packed)
-            .and_then(|rec| self.append_pair_with_record(rec, weights0, weights1));
-        self.failed = result.is_err();
-        result
-    }
-
-    /// Accumulates one already-validated immutable internal page value row across both token groups.
-    pub(crate) fn accumulate_pair_trusted(
-        &mut self,
-        packed: &[u8],
-        weights0: [f32; G],
-        weights1: [f32; G],
-    ) -> Result<()> {
-        if self.failed {
-            return Err(invalid("KV codec accumulation already failed"));
-        }
-        let result = self
-            .quantizer
-            .trusted_record(packed)
             .and_then(|rec| self.append_pair_with_record(rec, weights0, weights1));
         self.failed = result.is_err();
         result
@@ -532,6 +822,151 @@ impl<const G: usize> ValueGroupPairAccumulator<'_, G> {
         }
     }
 
+    /// Accumulates `weights0.len()` strided shared packed value rows across both token groups.
+    pub(crate) fn accumulate_rows(
+        &mut self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        weights0: &[[f32; G]],
+        weights1: &[[f32; G]],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result =
+            self.accumulate_rows_inner(packed_rows, row_stride, head_offset, false, weights0, weights1);
+        self.failed = result.is_err();
+        result
+    }
+
+    /// Accumulates `weights0.len()` strided immutable internal page value rows across both groups.
+    pub(crate) fn accumulate_rows_trusted(
+        &mut self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        weights0: &[[f32; G]],
+        weights1: &[[f32; G]],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result =
+            self.accumulate_rows_inner(packed_rows, row_stride, head_offset, true, weights0, weights1);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn accumulate_rows_inner(
+        &mut self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        trusted: bool,
+        weights0: &[[f32; G]],
+        weights1: &[[f32; G]],
+    ) -> Result<()> {
+        if weights0.len() != weights1.len() {
+            return Err(invalid("KV codec batch weight length mismatch"));
+        }
+        let encoded_len = self.quantizer.encoded_len();
+        validate_strided_rows(
+            packed_rows,
+            row_stride,
+            head_offset,
+            encoded_len,
+            weights0.len(),
+        )?;
+        if weights0.is_empty() {
+            return Ok(());
+        }
+        let code_bytes = encoded_len - SCALE_BYTES;
+        let mut code_buf = AlignedCodeBatch::new();
+        let mut weighted0 = [[0.0_f32; G]; MAX_BATCH_ROWS];
+        let mut weighted1 = [[0.0_f32; G]; MAX_BATCH_ROWS];
+        for ((row_chunk, w0_chunk), w1_chunk) in packed_rows
+            .chunks(MAX_BATCH_ROWS * row_stride)
+            .zip(weights0.chunks(MAX_BATCH_ROWS))
+            .zip(weights1.chunks(MAX_BATCH_ROWS))
+        {
+            let mut nonzero_count = 0_usize;
+            for ((row, &row_w0), &row_w1) in row_chunk
+                .chunks_exact(row_stride)
+                .zip(w0_chunk)
+                .zip(w1_chunk)
+            {
+                let record = &row[head_offset..head_offset + encoded_len];
+                let (scale, codes) = if trusted {
+                    self.quantizer.trusted_record(record)?
+                } else {
+                    self.quantizer.record(record)?
+                };
+                let (ws0, nz0) = compute_weighted_scales(row_w0, scale)?;
+                let (ws1, nz1) = compute_weighted_scales(row_w1, scale)?;
+                if nz0 || nz1 {
+                    let dst_start = nonzero_count * code_bytes;
+                    code_buf.0[dst_start..dst_start + code_bytes].copy_from_slice(codes);
+                    weighted0[nonzero_count] = ws0;
+                    weighted1[nonzero_count] = ws1;
+                    nonzero_count += 1;
+                }
+            }
+            if nonzero_count == 0 {
+                continue;
+            }
+            let codes_slice = &code_buf.0[..nonzero_count * code_bytes];
+            let ws0_slice = &weighted0[..nonzero_count];
+            let ws1_slice = &weighted1[..nonzero_count];
+            match &mut self.state {
+                GroupPairAccumulatorState::Scalar(outputs) => {
+                    let bits = self.quantizer.identity.bits.bit_width();
+                    let centroids = self.quantizer.centroids();
+                    for ((codes, ws0), ws1) in codes_slice
+                        .chunks_exact(code_bytes)
+                        .zip(ws0_slice)
+                        .zip(ws1_slice)
+                    {
+                        for (output, &weighted_scale) in outputs[0].iter_mut().zip(ws0) {
+                            if weighted_scale != 0.0 {
+                                scalar::accumulate_in_place(
+                                    codes,
+                                    bits,
+                                    centroids,
+                                    weighted_scale,
+                                    output,
+                                )?;
+                            }
+                        }
+                        for (output, &weighted_scale) in outputs[1].iter_mut().zip(ws1) {
+                            if weighted_scale != 0.0 {
+                                scalar::accumulate_in_place(
+                                    codes,
+                                    bits,
+                                    centroids,
+                                    weighted_scale,
+                                    output,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc"
+                ))]
+                GroupPairAccumulatorState::Native(acc) => {
+                    if !acc.accumulate_rows(codes_slice, ws0_slice, ws1_slice) {
+                        return Err(invalid("KV codec native accumulation rejected arithmetic"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Publishes both token groups' `G` accumulated output rows if every append succeeded.
     pub(crate) fn finish(self) -> Result<[[[f32; HEAD_DIM]; G]; 2]> {
         if self.failed {
@@ -593,23 +1028,6 @@ impl<const G: usize> ValueGroupAccumulator<'_, G> {
         result
     }
 
-    /// Accumulates one already-validated immutable internal page value row with `G` weights.
-    pub(crate) fn accumulate_group_trusted(
-        &mut self,
-        packed: &[u8],
-        weights: [f32; G],
-    ) -> Result<()> {
-        if self.failed {
-            return Err(invalid("KV codec accumulation already failed"));
-        }
-        let result = self
-            .quantizer
-            .trusted_record(packed)
-            .and_then(|rec| self.append_group_with_record(rec, weights));
-        self.failed = result.is_err();
-        result
-    }
-
     fn append_group_with_record(
         &mut self,
         (scale, codes): (f32, &[u8]),
@@ -665,6 +1083,115 @@ impl<const G: usize> ValueGroupAccumulator<'_, G> {
                 }
             }
         }
+    }
+
+    /// Accumulates `weights.len()` strided packed value rows across `G` heads.
+    pub(crate) fn accumulate_rows(
+        &mut self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        weights: &[[f32; G]],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result =
+            self.accumulate_rows_inner(packed_rows, row_stride, head_offset, false, weights);
+        self.failed = result.is_err();
+        result
+    }
+
+    /// Accumulates `weights.len()` strided immutable internal page value rows across `G` heads.
+    pub(crate) fn accumulate_rows_trusted(
+        &mut self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        weights: &[[f32; G]],
+    ) -> Result<()> {
+        if self.failed {
+            return Err(invalid("KV codec accumulation already failed"));
+        }
+        let result =
+            self.accumulate_rows_inner(packed_rows, row_stride, head_offset, true, weights);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn accumulate_rows_inner(
+        &mut self,
+        packed_rows: &[u8],
+        row_stride: usize,
+        head_offset: usize,
+        trusted: bool,
+        weights: &[[f32; G]],
+    ) -> Result<()> {
+        let encoded_len = self.quantizer.encoded_len();
+        validate_strided_rows(packed_rows, row_stride, head_offset, encoded_len, weights.len())?;
+        if weights.is_empty() {
+            return Ok(());
+        }
+        let code_bytes = encoded_len - SCALE_BYTES;
+        let mut code_buf = AlignedCodeBatch::new();
+        let mut weighted_scales = [[0.0_f32; G]; MAX_BATCH_ROWS];
+        for (row_chunk, w_chunk) in packed_rows
+            .chunks(MAX_BATCH_ROWS * row_stride)
+            .zip(weights.chunks(MAX_BATCH_ROWS))
+        {
+            let mut nonzero_count = 0_usize;
+            for (row, &row_weights) in row_chunk.chunks_exact(row_stride).zip(w_chunk) {
+                let record = &row[head_offset..head_offset + encoded_len];
+                let (scale, codes) = if trusted {
+                    self.quantizer.trusted_record(record)?
+                } else {
+                    self.quantizer.record(record)?
+                };
+                let (ws, any_nonzero) = compute_weighted_scales(row_weights, scale)?;
+                if any_nonzero {
+                    let dst_start = nonzero_count * code_bytes;
+                    code_buf.0[dst_start..dst_start + code_bytes].copy_from_slice(codes);
+                    weighted_scales[nonzero_count] = ws;
+                    nonzero_count += 1;
+                }
+            }
+            if nonzero_count == 0 {
+                continue;
+            }
+            let codes_slice = &code_buf.0[..nonzero_count * code_bytes];
+            let ws_slice = &weighted_scales[..nonzero_count];
+            match &mut self.state {
+                GroupAccumulatorState::Scalar(outputs) => {
+                    let bits = self.quantizer.identity.bits.bit_width();
+                    let centroids = self.quantizer.centroids();
+                    for (codes, ws) in codes_slice.chunks_exact(code_bytes).zip(ws_slice) {
+                        for (output, &weighted_scale) in outputs.iter_mut().zip(ws) {
+                            if weighted_scale != 0.0 {
+                                scalar::accumulate_in_place(
+                                    codes,
+                                    bits,
+                                    centroids,
+                                    weighted_scale,
+                                    output,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                #[cfg(all(
+                    feature = "experimental-neon",
+                    target_arch = "aarch64",
+                    target_os = "windows",
+                    target_env = "msvc"
+                ))]
+                GroupAccumulatorState::Native(acc) => {
+                    if !acc.accumulate_rows(codes_slice, ws_slice) {
+                        return Err(invalid("KV codec native accumulation rejected arithmetic"));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Publishes all `G` accumulated output rows if every append succeeded.

@@ -328,6 +328,43 @@ impl PackedCache {
         self.tail.chunks_exact(self.row_bytes)
     }
 
+    fn for_each_chunk(
+        &self,
+        history_tokens: usize,
+        max_chunk_rows: usize,
+        mut on_chunk: impl FnMut(&[u8], usize, bool) -> Result<()>,
+    ) -> Result<()> {
+        let sealed_take = history_tokens.min(self.sealed_rows());
+        let tail_take = history_tokens - sealed_take;
+        let mut token = 0_usize;
+        for page in &self.pages {
+            if token >= sealed_take {
+                break;
+            }
+            let page_rows = page.len() / self.row_bytes;
+            let take = (sealed_take - token).min(page_rows);
+            for chunk in page[..take * self.row_bytes].chunks(max_chunk_rows * self.row_bytes) {
+                let chunk_rows = chunk.len() / self.row_bytes;
+                on_chunk(chunk, chunk_rows, true)?;
+                token += chunk_rows;
+            }
+        }
+        if token != sealed_take {
+            return Err(invalid("packed cache row is short"));
+        }
+        if tail_take > 0 {
+            let tail_bytes = tail_take * self.row_bytes;
+            if tail_bytes > self.tail.len() {
+                return Err(invalid("packed cache row is short"));
+            }
+            for chunk in self.tail[..tail_bytes].chunks(max_chunk_rows * self.row_bytes) {
+                let chunk_rows = chunk.len() / self.row_bytes;
+                on_chunk(chunk, chunk_rows, false)?;
+            }
+        }
+        Ok(())
+    }
+
     fn rows(&self) -> impl Iterator<Item = &[u8]> {
         self.page_rows().chain(self.tail_rows())
     }
@@ -2158,14 +2195,13 @@ impl PackedAttention<'_> {
         self.attend_chunk_with_score_rows::<G>(base_head, attended, &mut score_rows)
     }
 
-    fn attend_group<const G: usize>(
+    fn score_group<const G: usize>(
         &self,
         base_head: usize,
-        results: &mut [&mut [f32]; G],
+        kv_head: usize,
         score_rows: &mut [&mut [f32]; G],
     ) -> Result<()> {
         const PROB_PACK_CHUNK: usize = 64;
-        let kv_head = base_head / self.heads_per_kv;
         let mut rotated_queries = [[0.0; HEAD_DIM]; G];
         for (offset, rotated) in rotated_queries.iter_mut().enumerate() {
             let head = base_head + offset;
@@ -2177,27 +2213,42 @@ impl PackedAttention<'_> {
         let query_refs: [&[f32; HEAD_DIM]; G] =
             std::array::from_fn(|offset| &rotated_queries[offset]);
         let prepared_query = self.keys.quantizer.prepare_query_group(query_refs)?;
-        let key_sealed_take = self.history_tokens.min(self.keys.sealed_rows());
-        let key_tail_take = self.history_tokens - key_sealed_take;
+        let key_head_offset = kv_head * self.keys.quantizer.encoded_len();
+        let mut chunk_scores = [[0.0_f32; G]; PROB_PACK_CHUNK];
         let mut token = 0_usize;
-        for row in self.keys.page_rows().take(key_sealed_take) {
-            let scores = prepared_query.score_group_trusted(self.keys.record(row, kv_head))?;
-            for (probabilities, score) in score_rows.iter_mut().zip(scores) {
-                probabilities[token] = score * self.scale;
-            }
-            token += 1;
-        }
-        for row in self
-            .keys
-            .tail_rows()
-            .take(key_tail_take)
-            .chain(std::iter::once(self.current_keys))
-        {
-            let scores = prepared_query.score_group(self.keys.record(row, kv_head))?;
-            for (probabilities, score) in score_rows.iter_mut().zip(scores) {
-                probabilities[token] = score * self.scale;
-            }
-            token += 1;
+        self.keys
+            .for_each_chunk(self.history_tokens, PROB_PACK_CHUNK, |chunk, chunk_rows, trusted| {
+                let out_slice = &mut chunk_scores[..chunk_rows];
+                if trusted {
+                    prepared_query.score_rows_trusted(
+                        chunk,
+                        self.keys.row_bytes,
+                        key_head_offset,
+                        out_slice,
+                    )?;
+                } else {
+                    prepared_query.score_rows(
+                        chunk,
+                        self.keys.row_bytes,
+                        key_head_offset,
+                        out_slice,
+                    )?;
+                }
+                for (head, probabilities) in score_rows.iter_mut().enumerate() {
+                    for (dst, scores) in probabilities[token..token + chunk_rows]
+                        .iter_mut()
+                        .zip(&chunk_scores[..chunk_rows])
+                    {
+                        *dst = scores[head] * self.scale;
+                    }
+                }
+                token += chunk_rows;
+                Ok(())
+            })?;
+        let current_scores =
+            prepared_query.score_group(self.keys.record(self.current_keys, kv_head))?;
+        for (probabilities, score) in score_rows.iter_mut().zip(current_scores) {
+            probabilities[token] = score * self.scale;
         }
         for probabilities in score_rows.iter_mut() {
             match self.arithmetic {
@@ -2207,44 +2258,57 @@ impl PackedAttention<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn attend_group<const G: usize>(
+        &self,
+        base_head: usize,
+        results: &mut [&mut [f32]; G],
+        score_rows: &mut [&mut [f32]; G],
+    ) -> Result<()> {
+        const PROB_PACK_CHUNK: usize = 64;
         let total_tokens = self.history_tokens + 1;
         if score_rows.iter().any(|row| row.len() != total_tokens) {
             return Err(invalid("packed attention score row length mismatch"));
         }
+        let kv_head = base_head / self.heads_per_kv;
+        self.score_group::<G>(base_head, kv_head, score_rows)?;
         let mut accumulator = self.values.quantizer.value_group_accumulator::<G>()?;
+        let val_head_offset = kv_head * self.values.quantizer.encoded_len();
         let mut packed_weights = [[0.0_f32; G]; PROB_PACK_CHUNK];
-        let val_sealed_take = self.history_tokens.min(self.values.sealed_rows());
-        let val_tail_take = self.history_tokens - val_sealed_take;
-        let mut page_value_rows = self.values.page_rows().take(val_sealed_take);
-        let mut tail_value_rows = self
-            .values
-            .tail_rows()
-            .take(val_tail_take)
-            .chain(std::iter::once(self.current_values));
-        for chunk_start in (0..total_tokens).step_by(PROB_PACK_CHUNK) {
-            let chunk_len = (total_tokens - chunk_start).min(PROB_PACK_CHUNK);
-            for (head, probabilities) in score_rows.iter().enumerate() {
-                for (slot, &weight) in packed_weights[..chunk_len]
-                    .iter_mut()
-                    .zip(&probabilities[chunk_start..chunk_start + chunk_len])
-                {
-                    slot[head] = weight;
+        let mut val_token = 0_usize;
+        self.values
+            .for_each_chunk(self.history_tokens, PROB_PACK_CHUNK, |chunk, chunk_rows, trusted| {
+                for (head, probabilities) in score_rows.iter().enumerate() {
+                    for (slot, &weight) in packed_weights[..chunk_rows]
+                        .iter_mut()
+                        .zip(&probabilities[val_token..val_token + chunk_rows])
+                    {
+                        slot[head] = weight;
+                    }
                 }
-            }
-            let sealed_in_chunk = val_sealed_take.saturating_sub(chunk_start).min(chunk_len);
-            for &weights in &packed_weights[..sealed_in_chunk] {
-                let row = page_value_rows
-                    .next()
-                    .ok_or_else(|| invalid("packed value cache row is short"))?;
-                accumulator.accumulate_group_trusted(self.values.record(row, kv_head), weights)?;
-            }
-            for &weights in &packed_weights[sealed_in_chunk..chunk_len] {
-                let row = tail_value_rows
-                    .next()
-                    .ok_or_else(|| invalid("packed value cache row is short"))?;
-                accumulator.accumulate_group(self.values.record(row, kv_head), weights)?;
-            }
-        }
+                let weights_slice = &packed_weights[..chunk_rows];
+                if trusted {
+                    accumulator.accumulate_rows_trusted(
+                        chunk,
+                        self.values.row_bytes,
+                        val_head_offset,
+                        weights_slice,
+                    )?;
+                } else {
+                    accumulator.accumulate_rows(
+                        chunk,
+                        self.values.row_bytes,
+                        val_head_offset,
+                        weights_slice,
+                    )?;
+                }
+                val_token += chunk_rows;
+                Ok(())
+            })?;
+        let last_weights: [f32; G] = std::array::from_fn(|head| score_rows[head][val_token]);
+        accumulator.accumulate_group(self.values.record(self.current_values, kv_head), last_weights)?;
         let mut outputs = accumulator.finish()?;
         for (offset, (output, result)) in outputs.iter_mut().zip(results.iter_mut()).enumerate() {
             let head = base_head + offset;
@@ -2332,6 +2396,7 @@ fn score_pair_group<const G: usize>(
     kv_head: usize,
     score_rows: &mut [&mut [&mut [f32]; G]; 2],
 ) -> Result<()> {
+    const PROB_PACK_CHUNK: usize = 64;
     let pos0 = pair[0].history_tokens;
     let pos1 = pair[1].history_tokens;
     let mut rotated0 = [[0.0; HEAD_DIM]; G];
@@ -2351,33 +2416,58 @@ fn score_pair_group<const G: usize>(
     let refs0: [&[f32; HEAD_DIM]; G] = std::array::from_fn(|offset| &rotated0[offset]);
     let refs1: [&[f32; HEAD_DIM]; G] = std::array::from_fn(|offset| &rotated1[offset]);
     let prepared_pair = pair[0].keys.quantizer.prepare_query_pair(refs0, refs1)?;
-    let key_sealed_take = pos0.min(pair[0].keys.sealed_rows());
-    let key_tail_take = pos0 - key_sealed_take;
+    let key_head_offset = kv_head * pair[0].keys.quantizer.encoded_len();
+    let mut chunk_s0 = [[0.0_f32; G]; PROB_PACK_CHUNK];
+    let mut chunk_s1 = [[0.0_f32; G]; PROB_PACK_CHUNK];
     let mut token = 0_usize;
-    for row in pair[0].keys.page_rows().take(key_sealed_take) {
-        let (s0, s1) = prepared_pair.score_pair_trusted(pair[0].keys.record(row, kv_head))?;
-        for (probabilities, score) in score_rows[0].iter_mut().zip(s0) {
-            probabilities[token] = score * pair[0].scale;
-        }
-        for (probabilities, score) in score_rows[1].iter_mut().zip(s1) {
-            probabilities[token] = score * pair[1].scale;
-        }
-        token += 1;
-    }
-    for row in pair[0]
+    pair[0]
         .keys
-        .tail_rows()
-        .take(key_tail_take)
-        .chain(std::iter::once(pair[0].current_keys))
-    {
-        let (s0, s1) = prepared_pair.score_pair(pair[0].keys.record(row, kv_head))?;
-        for (probabilities, score) in score_rows[0].iter_mut().zip(s0) {
-            probabilities[token] = score * pair[0].scale;
-        }
-        for (probabilities, score) in score_rows[1].iter_mut().zip(s1) {
-            probabilities[token] = score * pair[1].scale;
-        }
-        token += 1;
+        .for_each_chunk(pos0, PROB_PACK_CHUNK, |chunk, chunk_rows, trusted| {
+            let out0_slice = &mut chunk_s0[..chunk_rows];
+            let out1_slice = &mut chunk_s1[..chunk_rows];
+            if trusted {
+                prepared_pair.score_rows_trusted(
+                    chunk,
+                    pair[0].keys.row_bytes,
+                    key_head_offset,
+                    out0_slice,
+                    out1_slice,
+                )?;
+            } else {
+                prepared_pair.score_rows(
+                    chunk,
+                    pair[0].keys.row_bytes,
+                    key_head_offset,
+                    out0_slice,
+                    out1_slice,
+                )?;
+            }
+            for (head, probabilities) in score_rows[0].iter_mut().enumerate() {
+                for (dst, scores) in probabilities[token..token + chunk_rows]
+                    .iter_mut()
+                    .zip(&chunk_s0[..chunk_rows])
+                {
+                    *dst = scores[head] * pair[0].scale;
+                }
+            }
+            for (head, probabilities) in score_rows[1].iter_mut().enumerate() {
+                for (dst, scores) in probabilities[token..token + chunk_rows]
+                    .iter_mut()
+                    .zip(&chunk_s1[..chunk_rows])
+                {
+                    *dst = scores[head] * pair[1].scale;
+                }
+            }
+            token += chunk_rows;
+            Ok(())
+        })?;
+    let (s0_cur, s1_cur) =
+        prepared_pair.score_pair(pair[0].keys.record(pair[0].current_keys, kv_head))?;
+    for (probabilities, score) in score_rows[0].iter_mut().zip(s0_cur) {
+        probabilities[token] = score * pair[0].scale;
+    }
+    for (probabilities, score) in score_rows[1].iter_mut().zip(s1_cur) {
+        probabilities[token] = score * pair[1].scale;
     }
     let s1_last = prepared_pair.score_second(pair[1].keys.record(pair[1].current_keys, kv_head))?;
     for (probabilities, score) in score_rows[1].iter_mut().zip(s1_last) {
@@ -2417,52 +2507,58 @@ fn attend_group_pair<const G: usize>(
         .values
         .quantizer
         .value_group_pair_accumulator::<G>()?;
+    let val_head_offset = kv_head * pair[0].values.quantizer.encoded_len();
     let mut packed_w0 = [[0.0_f32; G]; PROB_PACK_CHUNK];
     let mut packed_w1 = [[0.0_f32; G]; PROB_PACK_CHUNK];
-    let val_sealed_take = pos0.min(pair[0].values.sealed_rows());
-    let val_tail_take = pos0 - val_sealed_take;
-    let mut page_value_rows = pair[0].values.page_rows().take(val_sealed_take);
-    let mut tail_value_rows = pair[0]
+    let mut val_token = 0_usize;
+    pair[0]
         .values
-        .tail_rows()
-        .take(val_tail_take)
-        .chain(std::iter::once(pair[0].current_values));
-    for chunk_start in (0..total0).step_by(PROB_PACK_CHUNK) {
-        let chunk_len = (total0 - chunk_start).min(PROB_PACK_CHUNK);
-        for (head, (probs0, probs1)) in score_rows[0].iter().zip(score_rows[1].iter()).enumerate() {
-            for (slot, &w0) in packed_w0[..chunk_len]
-                .iter_mut()
-                .zip(&probs0[chunk_start..chunk_start + chunk_len])
+        .for_each_chunk(pos0, PROB_PACK_CHUNK, |chunk, chunk_rows, trusted| {
+            for (head, (probs0, probs1)) in
+                score_rows[0].iter().zip(score_rows[1].iter()).enumerate()
             {
-                slot[head] = w0;
+                for (slot, &w0) in packed_w0[..chunk_rows]
+                    .iter_mut()
+                    .zip(&probs0[val_token..val_token + chunk_rows])
+                {
+                    slot[head] = w0;
+                }
+                for (slot, &w1) in packed_w1[..chunk_rows]
+                    .iter_mut()
+                    .zip(&probs1[val_token..val_token + chunk_rows])
+                {
+                    slot[head] = w1;
+                }
             }
-            for (slot, &w1) in packed_w1[..chunk_len]
-                .iter_mut()
-                .zip(&probs1[chunk_start..chunk_start + chunk_len])
-            {
-                slot[head] = w1;
+            let w0_slice = &packed_w0[..chunk_rows];
+            let w1_slice = &packed_w1[..chunk_rows];
+            if trusted {
+                accumulator.accumulate_rows_trusted(
+                    chunk,
+                    pair[0].values.row_bytes,
+                    val_head_offset,
+                    w0_slice,
+                    w1_slice,
+                )?;
+            } else {
+                accumulator.accumulate_rows(
+                    chunk,
+                    pair[0].values.row_bytes,
+                    val_head_offset,
+                    w0_slice,
+                    w1_slice,
+                )?;
             }
-        }
-        let sealed_in_chunk = val_sealed_take.saturating_sub(chunk_start).min(chunk_len);
-        for (&w0, &w1) in packed_w0[..sealed_in_chunk]
-            .iter()
-            .zip(&packed_w1[..sealed_in_chunk])
-        {
-            let row = page_value_rows
-                .next()
-                .ok_or_else(|| invalid("packed value cache row is short"))?;
-            accumulator.accumulate_pair_trusted(pair[0].values.record(row, kv_head), w0, w1)?;
-        }
-        for (&w0, &w1) in packed_w0[sealed_in_chunk..chunk_len]
-            .iter()
-            .zip(&packed_w1[sealed_in_chunk..chunk_len])
-        {
-            let row = tail_value_rows
-                .next()
-                .ok_or_else(|| invalid("packed value cache row is short"))?;
-            accumulator.accumulate_pair(pair[0].values.record(row, kv_head), w0, w1)?;
-        }
-    }
+            val_token += chunk_rows;
+            Ok(())
+        })?;
+    let w0_cur: [f32; G] = std::array::from_fn(|head| score_rows[0][head][val_token]);
+    let w1_cur: [f32; G] = std::array::from_fn(|head| score_rows[1][head][val_token]);
+    accumulator.accumulate_pair(
+        pair[0].values.record(pair[0].current_values, kv_head),
+        w0_cur,
+        w1_cur,
+    )?;
     let w1_last: [f32; G] = std::array::from_fn(|head| score_rows[1][head][total0]);
     accumulator.accumulate_second(
         pair[1].values.record(pair[1].current_values, kv_head),

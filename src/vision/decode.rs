@@ -555,14 +555,19 @@ fn inflate_zlib(data: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     let body_end = data.len() - 4;
     let mut input_index = 0_usize;
     let mut output_index = 0_usize;
-    while input_index < body_end {
-        let (consumed, produced) = decoder
-            .read(
-                &data[input_index..body_end],
-                &mut output,
-                output_index,
-                false,
+    while !decoder.is_done() {
+        let (chunk, end_of_input) = if input_index < body_end {
+            (&data[input_index..body_end], false)
+        } else if input_index < data.len() {
+            (
+                &data[input_index..=input_index],
+                input_index + 1 == data.len(),
             )
+        } else {
+            (&[][..], true)
+        };
+        let (consumed, produced) = decoder
+            .read(chunk, &mut output, output_index, end_of_input)
             .map_err(|_| invalid("corrupt PNG zlib stream"))?;
         input_index += consumed;
         output_index += produced;
@@ -570,7 +575,7 @@ fn inflate_zlib(data: &[u8], expected_len: usize) -> Result<Vec<u8>> {
             return Err(invalid("DEFLATE output exceeds scanline bound"));
         }
         if decoder.is_done() {
-            return Err(invalid("trailing bytes after PNG zlib stream"));
+            break;
         }
         if consumed == 0 && produced == 0 {
             if output.len() >= max_out {
@@ -581,24 +586,7 @@ fn inflate_zlib(data: &[u8], expected_len: usize) -> Result<Vec<u8>> {
             output.resize(next_len, 0);
         }
     }
-    for (idx, &byte) in data[body_end..].iter().enumerate() {
-        let (consumed, produced) = decoder
-            .read(
-                std::slice::from_ref(&byte),
-                &mut output,
-                output_index,
-                idx == 3,
-            )
-            .map_err(|_| invalid("corrupt PNG zlib trailer or Adler-32 mismatch"))?;
-        output_index += produced;
-        if consumed != 1 || output_index > expected_len {
-            return Err(invalid("PNG zlib trailer or scanline bound mismatch"));
-        }
-        if idx < 3 && decoder.is_done() {
-            return Err(invalid("trailing bytes after PNG zlib stream"));
-        }
-    }
-    if !decoder.is_done() || output_index != expected_len {
+    if !decoder.is_done() || input_index != data.len() || output_index != expected_len {
         return Err(invalid("PNG decompressed byte count mismatch"));
     }
     output.truncate(expected_len);
@@ -842,6 +830,26 @@ mod tests {
         // Overlong uncompressed IDAT payload exceeding expected scanline length must be rejected.
         let overlong = stored_zlib(&[0, 10, 20, 30, 40])?;
         assert!(decode_png(&build_png_from_zlib(1, 1, 2, &overlong)?).is_err());
+
+        // Stored (>32 KiB) zlib stream crossing initial output capacity boundary near trailer.
+        let stored_rows = 128_u32;
+        let stored_row_bytes = 256_usize * 3;
+        let mut raw_stored_large =
+            Vec::with_capacity(usize::try_from(stored_rows)? * (stored_row_bytes + 1));
+        for y in 0..stored_rows {
+            raw_stored_large.push(0);
+            for x in 0..stored_row_bytes {
+                raw_stored_large
+                    .push(u8::try_from((usize::try_from(y)? * 13 + x) & 0xff).unwrap_or(0));
+            }
+        }
+        let stored_large_zlib = stored_zlib(&raw_stored_large)?;
+        let decoded_stored_large =
+            decode_png(&build_png_from_zlib(256, stored_rows, 2, &stored_large_zlib)?)?;
+        assert_eq!(
+            decoded_stored_large.rgb.len(),
+            256 * usize::try_from(stored_rows)? * 3
+        );
         Ok(())
     }
 

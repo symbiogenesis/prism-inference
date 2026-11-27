@@ -287,7 +287,7 @@ impl SwiftVisionEncoder {
         {
             return Err(invalid("invalid RGB image dimensions or buffer length"));
         }
-        let sha256 = sha256_bytes(rgb)?;
+        let sha256 = sha256_rgb_image(rgb, width, height)?;
         if let Some(cached) = self.cache_lookup(sha256, max_tokens)? {
             return Ok(cached);
         }
@@ -2305,6 +2305,15 @@ fn sha256_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
     Ok(hasher.finish()?)
 }
 
+fn sha256_rgb_image(rgb: &[u8], width: usize, height: usize) -> Result<[u8; 32]> {
+    let mut hasher = Hasher::new()?;
+    hasher.update(b"prism-vision-rgb-v1\0")?;
+    hasher.update(&u64::try_from(width)?.to_le_bytes())?;
+    hasher.update(&u64::try_from(height)?.to_le_bytes())?;
+    hasher.update(rgb)?;
+    Ok(hasher.finish()?)
+}
+
 fn parse_vision_config(model: &Model) -> Result<VisionConfig> {
     let md = &model.metadata;
     if md.get("general.architecture").and_then(|v| v.as_str()) != Some("clip")
@@ -2805,6 +2814,17 @@ mod tests {
         let second = encoder.encode_rgb_image(&rgb, 8, 8, 16)?;
         assert_eq!(second.sha256, image_out.sha256);
         assert!(Arc::ptr_eq(&second.embeddings, &image_out.embeddings));
+
+        // Same byte length with swapped dimensions must not collide in cache.
+        let rect_rgb = vec![42_u8; 8 * 16 * 3];
+        let wide = encoder.encode_rgb_image(&rect_rgb, 16, 8, 16)?;
+        let tall = encoder.encode_rgb_image(&rect_rgb, 8, 16, 16)?;
+        assert_ne!(wide.sha256, tall.sha256);
+        assert!(!Arc::ptr_eq(&wide.embeddings, &tall.embeddings));
+        assert_ne!(
+            (wide.grid_width, wide.grid_height),
+            (tall.grid_width, tall.grid_height)
+        );
         encoder.clear_cache()?;
         Ok(())
     }

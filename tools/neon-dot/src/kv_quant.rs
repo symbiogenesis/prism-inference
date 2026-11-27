@@ -1310,16 +1310,16 @@ fn portable_hadamard(values: &mut [f32; DIMENSION]) {
 )]
 mod native {
     use core::arch::aarch64::{
-        float32x4_t, float32x4x4_t, float64x2_t, int32x4_t, uint8x16_t, uint8x16x2_t,
-        uint8x16x4_t, uint32x4_t, vabdq_f32, vaddq_f32, vaddq_f64, vaddvq_u32, vandq_u8,
-        vandq_u32, vbslq_f32, vbslq_u32, vcltq_f32, vcltq_u32, vcvt_f32_f64, vcvt_f64_f32,
-        vcvt_high_f32_f64, vcvt_high_f64_f32, vdivq_f64, vdupq_laneq_f32, vdupq_n_f32,
-        vdupq_n_f64, vdupq_n_u8, vdupq_n_u32, vdupq_n_u64, vget_low_f32, vld1q_f32, vld1q_s32,
-        vld1q_u8, vld1q_u8_x2, vld1q_u8_x4, vld3q_u8, vld4q_f32, vminvq_u32, vmulq_f32,
-        vmulq_f64, vmulq_u32, vorrq_u8, vorrq_u32, vqtbl2q_u8, vqtbl4q_u8, vreinterpretq_f32_u8,
-        vreinterpretq_u8_u16, vreinterpretq_u8_u32, vreinterpretq_u8_u64, vreinterpretq_u16_u8,
-        vreinterpretq_u32_f32, vshlq_n_u8, vshlq_u32, vshrq_n_u8, vsliq_n_u8, vst1q_f32,
-        vst1q_f64, vst4q_f32, vsubq_f32, vzip1q_u8, vzip1q_u16, vzip2q_u8, vzip2q_u16,
+        float32x4_t, float32x4x4_t, float64x2_t, int32x4_t, uint8x16_t, uint8x16x2_t, uint8x16x4_t,
+        uint32x4_t, vabdq_f32, vaddq_f32, vaddq_f64, vaddvq_u32, vandq_u8, vandq_u32, vbslq_f32,
+        vbslq_u32, vcltq_f32, vcltq_u32, vcvt_f32_f64, vcvt_f64_f32, vcvt_high_f32_f64,
+        vcvt_high_f64_f32, vdivq_f64, vdupq_laneq_f32, vdupq_n_f32, vdupq_n_f64, vdupq_n_u8,
+        vdupq_n_u32, vdupq_n_u64, vget_low_f32, vld1q_f32, vld1q_s32, vld1q_u8, vld1q_u8_x2,
+        vld1q_u8_x4, vld3q_u8, vld4q_f32, vminvq_u32, vmulq_f32, vmulq_f64, vmulq_u32, vorrq_u8,
+        vorrq_u32, vqtbl2q_u8, vqtbl4q_u8, vreinterpretq_f32_u8, vreinterpretq_u8_u16,
+        vreinterpretq_u8_u32, vreinterpretq_u8_u64, vreinterpretq_u16_u8, vreinterpretq_u32_f32,
+        vshlq_n_u8, vshlq_u32, vshrq_n_u8, vsliq_n_u8, vst1q_f32, vst1q_f64, vst4q_f32, vsubq_f32,
+        vzip1q_u8, vzip1q_u16, vzip2q_u8, vzip2q_u16,
     };
 
     use super::DIMENSION;
@@ -1935,18 +1935,36 @@ mod native {
         widened: &[[[float64x2_t; 2]; G]; 64],
         out: &mut [[f32; G]],
     ) -> bool {
-        let max_h = if R == 1 { 6 } else if G <= 4 { G } else { 3 };
+        let max_h = if R == 1 {
+            6
+        } else if G <= 4 {
+            G
+        } else {
+            3
+        };
         let mut head_start = 0_usize;
         while head_start < G {
             let rem = G - head_start;
             let step = rem.min(max_h);
             let ok = match step {
-                1 => score_rows_sub::<BITS, G, R, 1>(rows, tables4, tables3, widened, head_start, out),
-                2 => score_rows_sub::<BITS, G, R, 2>(rows, tables4, tables3, widened, head_start, out),
-                3 => score_rows_sub::<BITS, G, R, 3>(rows, tables4, tables3, widened, head_start, out),
-                4 => score_rows_sub::<BITS, G, R, 4>(rows, tables4, tables3, widened, head_start, out),
-                5 => score_rows_sub::<BITS, G, R, 5>(rows, tables4, tables3, widened, head_start, out),
-                _ => score_rows_sub::<BITS, G, R, 6>(rows, tables4, tables3, widened, head_start, out),
+                1 => score_rows_sub::<BITS, G, R, 1>(
+                    rows, tables4, tables3, widened, head_start, out,
+                ),
+                2 => score_rows_sub::<BITS, G, R, 2>(
+                    rows, tables4, tables3, widened, head_start, out,
+                ),
+                3 => score_rows_sub::<BITS, G, R, 3>(
+                    rows, tables4, tables3, widened, head_start, out,
+                ),
+                4 => score_rows_sub::<BITS, G, R, 4>(
+                    rows, tables4, tables3, widened, head_start, out,
+                ),
+                5 => score_rows_sub::<BITS, G, R, 5>(
+                    rows, tables4, tables3, widened, head_start, out,
+                ),
+                _ => score_rows_sub::<BITS, G, R, 6>(
+                    rows, tables4, tables3, widened, head_start, out,
+                ),
             };
             if !ok {
                 return false;
@@ -2507,14 +2525,8 @@ mod native {
         let bases0 = vreinterpretq_u8_u32(vmulq_u32(codes0, tables.mul_04));
         let bases1 = vreinterpretq_u8_u32(vmulq_u32(codes1, tables.mul_04));
         [
-            vreinterpretq_f32_u8(vqtbl2q_u8(
-                tables.table,
-                vorrq_u8(bases0, tables.offsets),
-            )),
-            vreinterpretq_f32_u8(vqtbl2q_u8(
-                tables.table,
-                vorrq_u8(bases1, tables.offsets),
-            )),
+            vreinterpretq_f32_u8(vqtbl2q_u8(tables.table, vorrq_u8(bases0, tables.offsets))),
+            vreinterpretq_f32_u8(vqtbl2q_u8(tables.table, vorrq_u8(bases1, tables.offsets))),
         ]
     }
 
@@ -2559,10 +2571,7 @@ mod native {
                     unsafe { vld1q_f32(outputs[head_start + h][chan_base + t * 4..].as_ptr()) }
                 })
             });
-            for (r, (row, row_scales)) in row_chunk
-                .chunks_exact(row_bytes)
-                .zip(scales)
-                .enumerate()
+            for (r, (row, row_scales)) in row_chunk.chunks_exact(row_bytes).zip(scales).enumerate()
             {
                 if r + 4 < scales.len() {
                     prefetch_l1(row_chunk[(r + 4) * row_bytes + byte_off..].as_ptr());
@@ -2769,7 +2778,8 @@ mod native {
             offsets,
         });
         for (row_chunk, scale_chunk) in packed_rows.chunks(64 * row_bytes).zip(scales.chunks(64)) {
-            if !accumulate_chunk_neon::<BITS, G>(row_chunk, scale_chunk, tables4, tables3, outputs) {
+            if !accumulate_chunk_neon::<BITS, G>(row_chunk, scale_chunk, tables4, tables3, outputs)
+            {
                 return false;
             }
         }
@@ -4002,8 +4012,7 @@ mod tests {
 
     fn verify_batched_group_and_pair<const G: usize>(bits: u8) -> Result<(), &'static str> {
         use super::{
-            PreparedQueryGroup, PreparedQueryPair, ValueGroupAccumulator,
-            ValueGroupPairAccumulator,
+            PreparedQueryGroup, PreparedQueryPair, ValueGroupAccumulator, ValueGroupPairAccumulator,
         };
 
         let centroids = codebook();
@@ -4130,7 +4139,11 @@ mod tests {
         assert!(!group_query.score_rows(&one_row[..row_bytes - 1], &mut two_out[..1]));
         let mut one_out0 = vec![[0.0_f32; G]; 1];
         assert!(!pair_query.score_rows(&one_row, &mut one_out0, &mut two_out));
-        assert!(!pair_query.score_rows(&one_row[..row_bytes - 1], &mut one_out0, &mut two_out[..1]));
+        assert!(!pair_query.score_rows(
+            &one_row[..row_bytes - 1],
+            &mut one_out0,
+            &mut two_out[..1]
+        ));
 
         let mut acc_bad =
             ValueGroupAccumulator::<G>::new(bits, &centroids).ok_or("finite group acc")?;
@@ -4140,13 +4153,7 @@ mod tests {
         let mut pair_bad =
             ValueGroupPairAccumulator::<G>::new(bits, &centroids).ok_or("finite pair acc")?;
         assert!(!pair_bad.accumulate_rows(&one_row, &[[1.0; G]; 1], &[[1.0; G]; 2]));
-        assert!(
-            pair_bad
-                .finish()
-                .iter()
-                .flatten()
-                .all(Option::is_none)
-        );
+        assert!(pair_bad.finish().iter().flatten().all(Option::is_none));
 
         // Non-finite scales rejected upfront and poison accumulator.
         for bad_scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

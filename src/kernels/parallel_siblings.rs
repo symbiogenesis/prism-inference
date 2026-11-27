@@ -1,8 +1,8 @@
 //! One joined pool submission over independent prepared sibling matrices.
 
+use super::RowParallelism;
 #[cfg(feature = "parallel-rows")]
 use super::{CHUNK_WORK_FACTOR, DECODE_ROW_ALIGN, MAX_ROW_WORKERS};
-use super::RowParallelism;
 use crate::{Result, invalid};
 
 #[cfg(feature = "parallel-rows")]

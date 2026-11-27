@@ -1129,8 +1129,8 @@ fn fill_qkv_heads(
     let d_head = d / config.num_heads;
     let n_dims = d_head / 2;
     let head_plane = n_pos * d_head;
-    let pinned_qkv = !matches!(backend, MatvecBackend::Scalar)
-        && block.attn_qkv_w.kind == crate::kernels::F16;
+    let pinned_qkv =
+        !matches!(backend, MatvecBackend::Scalar) && block.attn_qkv_w.kind == crate::kernels::F16;
     for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
         let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
         copy_tile_rows(&mut projector.inputs, chunk, normed, tile_start, d);
@@ -1599,8 +1599,8 @@ fn project_attn_output(
     let d = config.hidden_size;
     let d_head = d / config.num_heads;
     let head_plane = n_pos * d_head;
-    let pinned_out = !matches!(backend, MatvecBackend::Scalar)
-        && block.attn_out_w.kind == crate::kernels::F16;
+    let pinned_out =
+        !matches!(backend, MatvecBackend::Scalar) && block.attn_out_w.kind == crate::kernels::F16;
     for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
         let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
         for (t, dst) in projector.inputs.iter_mut().take(chunk).enumerate() {
@@ -1668,7 +1668,9 @@ fn vector_exp_neg_x4(neon: Neon, neg_abs: f32x4<Neon>) -> f32x4<Neon> {
     );
     let exp_val = polynomial.mul_add(k, k);
     // Clamp exp(-inf / very negative) underflow cleanly to 0 while keeping NaNs.
-    neg_abs.simd_lt(min_arg).select(f32x4::splat(neon, 0.0), exp_val)
+    neg_abs
+        .simd_lt(min_arg)
+        .select(f32x4::splat(neon, 0.0), exp_val)
 }
 
 #[cfg(all(
@@ -1857,11 +1859,8 @@ fn layer_norm_row_neon(
     let (dst4_all, dst_tail_all) = dst.as_chunks_mut::<4>();
     let (w4_all, w_tail_all) = weight.as_chunks::<4>();
     let (b4_all, b_tail_all) = bias.as_chunks::<4>();
-    for (((s_chunk, d_chunk), w_chunk), b_chunk) in src4_all
-        .iter()
-        .zip(dst4_all)
-        .zip(w4_all)
-        .zip(b4_all)
+    for (((s_chunk, d_chunk), w_chunk), b_chunk) in
+        src4_all.iter().zip(dst4_all).zip(w4_all).zip(b4_all)
     {
         let normalized = (f32x4::from_slice(neon, s_chunk) - mean_vec) * inv_std_vec;
         let out = normalized.mul_add_precise(
@@ -2812,7 +2811,11 @@ mod tests {
         let scalar_enc =
             SwiftVisionEncoder::from_model(&model, MatvecBackend::Scalar, RowParallelism::new(1)?)?;
         let scalar_out = scalar_enc.encode_rgb_image(&rgb, 16, 12, 16)?;
-        let workers = if cfg!(feature = "parallel-rows") { 4 } else { 1 };
+        let workers = if cfg!(feature = "parallel-rows") {
+            4
+        } else {
+            1
+        };
         let auto_enc = SwiftVisionEncoder::from_model(
             &model,
             MatvecBackend::Auto,

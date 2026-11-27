@@ -473,7 +473,13 @@ impl<const G: usize> PreparedQueryPair<'_, G> {
             return Err(invalid("KV codec batch output length mismatch"));
         }
         let encoded_len = self.quantizer.encoded_len();
-        validate_strided_rows(packed_rows, row_stride, head_offset, encoded_len, out0.len())?;
+        validate_strided_rows(
+            packed_rows,
+            row_stride,
+            head_offset,
+            encoded_len,
+            out0.len(),
+        )?;
         if out0.is_empty() {
             return Ok(());
         }
@@ -834,8 +840,14 @@ impl<const G: usize> ValueGroupPairAccumulator<'_, G> {
         if self.failed {
             return Err(invalid("KV codec accumulation already failed"));
         }
-        let result =
-            self.accumulate_rows_inner(packed_rows, row_stride, head_offset, false, weights0, weights1);
+        let result = self.accumulate_rows_inner(
+            packed_rows,
+            row_stride,
+            head_offset,
+            false,
+            weights0,
+            weights1,
+        );
         self.failed = result.is_err();
         result
     }
@@ -852,8 +864,14 @@ impl<const G: usize> ValueGroupPairAccumulator<'_, G> {
         if self.failed {
             return Err(invalid("KV codec accumulation already failed"));
         }
-        let result =
-            self.accumulate_rows_inner(packed_rows, row_stride, head_offset, true, weights0, weights1);
+        let result = self.accumulate_rows_inner(
+            packed_rows,
+            row_stride,
+            head_offset,
+            true,
+            weights0,
+            weights1,
+        );
         self.failed = result.is_err();
         result
     }
@@ -1128,7 +1146,13 @@ impl<const G: usize> ValueGroupAccumulator<'_, G> {
         weights: &[[f32; G]],
     ) -> Result<()> {
         let encoded_len = self.quantizer.encoded_len();
-        validate_strided_rows(packed_rows, row_stride, head_offset, encoded_len, weights.len())?;
+        validate_strided_rows(
+            packed_rows,
+            row_stride,
+            head_offset,
+            encoded_len,
+            weights.len(),
+        )?;
         if weights.is_empty() {
             return Ok(());
         }

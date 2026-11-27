@@ -2216,8 +2216,10 @@ impl PackedAttention<'_> {
         let key_head_offset = kv_head * self.keys.quantizer.encoded_len();
         let mut chunk_scores = [[0.0_f32; G]; PROB_PACK_CHUNK];
         let mut token = 0_usize;
-        self.keys
-            .for_each_chunk(self.history_tokens, PROB_PACK_CHUNK, |chunk, chunk_rows, trusted| {
+        self.keys.for_each_chunk(
+            self.history_tokens,
+            PROB_PACK_CHUNK,
+            |chunk, chunk_rows, trusted| {
                 let out_slice = &mut chunk_scores[..chunk_rows];
                 if trusted {
                     prepared_query.score_rows_trusted(
@@ -2244,7 +2246,8 @@ impl PackedAttention<'_> {
                 }
                 token += chunk_rows;
                 Ok(())
-            })?;
+            },
+        )?;
         let current_scores =
             prepared_query.score_group(self.keys.record(self.current_keys, kv_head))?;
         for (probabilities, score) in score_rows.iter_mut().zip(current_scores) {
@@ -2278,8 +2281,10 @@ impl PackedAttention<'_> {
         let val_head_offset = kv_head * self.values.quantizer.encoded_len();
         let mut packed_weights = [[0.0_f32; G]; PROB_PACK_CHUNK];
         let mut val_token = 0_usize;
-        self.values
-            .for_each_chunk(self.history_tokens, PROB_PACK_CHUNK, |chunk, chunk_rows, trusted| {
+        self.values.for_each_chunk(
+            self.history_tokens,
+            PROB_PACK_CHUNK,
+            |chunk, chunk_rows, trusted| {
                 for (head, probabilities) in score_rows.iter().enumerate() {
                     for (slot, &weight) in packed_weights[..chunk_rows]
                         .iter_mut()
@@ -2306,9 +2311,13 @@ impl PackedAttention<'_> {
                 }
                 val_token += chunk_rows;
                 Ok(())
-            })?;
+            },
+        )?;
         let last_weights: [f32; G] = std::array::from_fn(|head| score_rows[head][val_token]);
-        accumulator.accumulate_group(self.values.record(self.current_values, kv_head), last_weights)?;
+        accumulator.accumulate_group(
+            self.values.record(self.current_values, kv_head),
+            last_weights,
+        )?;
         let mut outputs = accumulator.finish()?;
         for (offset, (output, result)) in outputs.iter_mut().zip(results.iter_mut()).enumerate() {
             let head = base_head + offset;

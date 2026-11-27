@@ -144,11 +144,11 @@ repository = "https://github.com/symbiogenesis/prism-inference"
 
 [workspace.dependencies]
 ash = { version = "=0.38.0", default-features = false }
-bonsai-gguf = { version = "=0.1.10", path = "tools/gguf", default-features = false }
-bonsai-native-hash = { version = "=0.1.7", path = "tools/native-hash" }
-bonsai-neon-dot = { version = "=0.1.10", path = "tools/neon-dot" }
-bonsai-prism = { version = "=0.1.9", path = "tools/prism" }
-bonsai-ternary = { version = "=0.1.6", path = "tools/ternary" }
+bonsai-gguf = { version = "=0.1.11", path = "tools/gguf", default-features = false }
+bonsai-native-hash = { version = "=0.1.8", path = "tools/native-hash" }
+bonsai-neon-dot = { version = "=0.1.11", path = "tools/neon-dot" }
+bonsai-prism = { version = "=0.1.10", path = "tools/prism" }
+bonsai-ternary = { version = "=0.1.7", path = "tools/ternary" }
 bonsai-windows-credentials = "=0.1.8"
 bonsai-windows-process = "=0.1.7"
 hex = "=0.4.3"

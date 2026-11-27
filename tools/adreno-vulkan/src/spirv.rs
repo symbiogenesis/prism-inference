@@ -2261,10 +2261,34 @@ fn stream_ptq1_block_strided<L, C>(
     mut load_weight: L,
     wbase: u32,
     word_stride: u32,
-    mut consume_word: C,
+    consume_word: C,
 ) -> u32
 where
     L: FnMut(&mut ShaderBuilder, u32) -> u32,
+    C: FnMut(&mut ShaderBuilder, usize, u32, u32),
+{
+    stream_ptq1_block_by_index(
+        b,
+        |b, word_i| {
+            let idx = if word_i == 0 {
+                wbase
+            } else {
+                let off_c = b.const_u32(u32::try_from(word_i).unwrap_or(0) * word_stride);
+                b.uadd(wbase, off_c)
+            };
+            load_weight(b, idx)
+        },
+        consume_word,
+    )
+}
+
+fn stream_ptq1_block_by_index<L, C>(
+    b: &mut ShaderBuilder,
+    mut load_word: L,
+    mut consume_word: C,
+) -> u32
+where
+    L: FnMut(&mut ShaderBuilder, usize) -> u32,
     C: FnMut(&mut ShaderBuilder, usize, u32, u32),
 {
     let m00ff = b.const_u32(0x00FF_00FF);
@@ -2277,19 +2301,14 @@ where
     let mask_trit = b.const_u32(3);
 
     // Load `w6` first for `w_scale` so group `0..=3` can consume streamed trits immediately.
-    let c6 = b.const_u32(6 * word_stride);
-    let w6_idx = b.uadd(wbase, c6);
-    let w6_head = load_weight(b, w6_idx);
+    let w6_head = load_word(b, 6);
     let w_scale_u16 = b.ushr(w6_head, c16);
     let w_scale = b.unpack_half_low(w_scale_u16);
 
     let mut lo = [0_u32; 4];
     let mut hi = [0_u32; 4];
     for g in 0_usize..4 {
-        let g_u32 = u32::try_from(g).unwrap_or(0);
-        let g_c = b.const_u32(g_u32 * word_stride);
-        let word_idx = b.uadd(wbase, g_c);
-        let wg = load_weight(b, word_idx);
+        let wg = load_word(b, g);
         lo[g] = b.uand(wg, m00ff);
         let wg_s8 = b.ushr(wg, c8);
         hi[g] = b.uand(wg_s8, m00ff);
@@ -2307,10 +2326,7 @@ where
     let mut lo2 = [0_u32; 2];
     let mut hi2 = [0_u32; 2];
     for g2 in 0_usize..2 {
-        let g2_u32 = u32::try_from(4 + g2).unwrap_or(4);
-        let g2_c = b.const_u32(g2_u32 * word_stride);
-        let word_idx = b.uadd(wbase, g2_c);
-        let wg = load_weight(b, word_idx);
+        let wg = load_word(b, 4 + g2);
         lo2[g2] = b.uand(wg, m00ff);
         let wg_s8 = b.ushr(wg, c8);
         hi2[g2] = b.uand(wg_s8, m00ff);
@@ -2812,40 +2828,185 @@ fn clamp_four_token_act_bases(
     (tok_clamped, tok_act_bases)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Shares 128-bit uvec4 PQ2 x Q8_K block evaluation across coalesced GEMV and Split-K."
-)]
-fn emit_pq2_q8k_uvec4_block(
+struct Coalesced544LaneCoords {
+    scale_vec_off: u32,
+    scale_comp: u32,
+    is_odd: u32,
+    w0_off: u32,
+    w1_off: u32,
+}
+
+fn coalesced_544_lane_coords(b: &mut ShaderBuilder, lane: u32) -> Coalesced544LaneCoords {
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c3 = b.const_u32(3);
+    let c8 = b.const_u32(8);
+    let c72 = b.const_u32(72);
+    let pair = b.ushr(lane, c1);
+    let scale_vec_off = b.ushr(lane, c3);
+    let scale_comp = b.uand(pair, c3);
+    let odd_bit = b.uand(lane, c1);
+    let is_odd = b.u_ne(odd_bit, c0);
+    let w0_off = b.uadd(c8, lane);
+    let w1_off = b.uadd(c72, lane);
+    Coalesced544LaneCoords {
+        scale_vec_off,
+        scale_comp,
+        is_odd,
+        w0_off,
+        w1_off,
+    }
+}
+
+fn load_coalesced_544_scale_and_vecs(
+    b: &mut ShaderBuilder,
+    weights_buf: u32,
+    tile_vec_base: u32,
+    coords: &Coalesced544LaneCoords,
+) -> (u32, u32, u32) {
+    let scale_idx = b.uadd(tile_vec_base, coords.scale_vec_off);
+    let scale_vec = b.load_sb_uvec4(weights_buf, scale_idx);
+    let w0_idx = b.uadd(tile_vec_base, coords.w0_off);
+    let w_vec0 = b.load_sb_uvec4(weights_buf, w0_idx);
+    let w1_idx = b.uadd(tile_vec_base, coords.w1_off);
+    let w_vec1 = b.load_sb_uvec4(weights_buf, w1_idx);
+
+    let s_words = [
+        b.composite_extract(b.u32_t, scale_vec, 0),
+        b.composite_extract(b.u32_t, scale_vec, 1),
+        b.composite_extract(b.u32_t, scale_vec, 2),
+        b.composite_extract(b.u32_t, scale_vec, 3),
+    ];
+    let raw_pair = select_four_u32(b, coords.scale_comp, s_words);
+    let (s_ev, s_od) = b.unpack_half_pair(raw_pair);
+    let w_scale = b.select(b.f32_t, coords.is_odd, s_od, s_ev);
+    (w_scale, w_vec0, w_vec1)
+}
+
+fn emit_2x_k_loop<T, L, E>(
+    b: &mut ShaderBuilder,
+    start: u32,
+    limit: u32,
+    step: u32,
+    mut load_blk: L,
+    mut eval_blk: E,
+) where
+    L: FnMut(&mut ShaderBuilder, u32) -> T,
+    E: FnMut(&mut ShaderBuilder, T),
+{
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    if step == 1 {
+        let tail = b.uand(limit, c1);
+        let even_blocks = b.usub(limit, tail);
+        b.emit_for_range(start, even_blocks, c2, |b, blk| {
+            let blk1 = b.uadd(blk, c1);
+            let in0 = load_blk(b, blk);
+            let in1 = load_blk(b, blk1);
+            eval_blk(b, in0);
+            eval_blk(b, in1);
+        });
+        let has_tail = b.u_ne(tail, c0);
+        b.emit_if(has_tail, |b| {
+            let in_tail = load_blk(b, even_blocks);
+            eval_blk(b, in_tail);
+        });
+    } else {
+        let c3 = b.const_u32(3);
+        let c4 = b.const_u32(4);
+        let c8 = b.const_u32(8);
+        let has_work = b.u_lt(start, limit);
+        let diff = b.usub(limit, start);
+        let rem = b.select(b.u32_t, has_work, diff, c0);
+        let rem_round = b.uadd(rem, c3);
+        let iters = b.ushr(rem_round, c2);
+        let pairs = b.ushr(iters, c1);
+        let pair_span = b.ushl(pairs, c3);
+        let pair_end = b.uadd(start, pair_span);
+        b.emit_for_range(start, pair_end, c8, |b, blk| {
+            let blk1 = b.uadd(blk, c4);
+            let in0 = load_blk(b, blk);
+            let in1 = load_blk(b, blk1);
+            eval_blk(b, in0);
+            eval_blk(b, in1);
+        });
+        let tail_bit = b.uand(iters, c1);
+        let has_tail = b.u_ne(tail_bit, c0);
+        b.emit_if(has_tail, |b| {
+            let in_tail = load_blk(b, pair_end);
+            eval_blk(b, in_tail);
+        });
+    }
+}
+
+struct Pq2Q8kUvec4BlockInputs {
+    w_scale: u32,
+    w_vec0: u32,
+    w_vec1: u32,
+    act_scale: u32,
+    half_sum: u32,
+    plane_vecs: [u32; 8],
+}
+
+fn load_pq2_q8k_uvec4_block_inputs(
     b: &mut ShaderBuilder,
     weights_buf: u32,
     act_buf: u32,
-    tile_base: u32,
-    lane: u32,
-    act_blk_vec_base: u32,
-    acc_var: u32,
-    use_sdot: bool,
-    use_sdot_acc_sat: bool,
-    fused: bool,
-) {
-    let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, lane);
+    rg_vec_base: u32,
+    tok_act_vec_base: u32,
+    coords: &Coalesced544LaneCoords,
+    blk: u32,
+) -> Pq2Q8kUvec4BlockInputs {
+    let c9 = b.const_u32(9);
+    let c136 = b.const_u32(136);
+    let tile_vec_off = b.umul(blk, c136);
+    let tile_vec_base = b.uadd(rg_vec_base, tile_vec_off);
+    let (w_scale, w_vec0, w_vec1) =
+        load_coalesced_544_scale_and_vecs(b, weights_buf, tile_vec_base, coords);
+
+    let act_vec_off = b.umul(blk, c9);
+    let act_blk_vec_base = b.uadd(tok_act_vec_base, act_vec_off);
     let hdr_vec = b.load_sb_uvec4(act_buf, act_blk_vec_base);
     let act_scale_u32 = b.composite_extract(b.u32_t, hdr_vec, 0);
     let act_scale = b.bitcast(b.f32_t, act_scale_u32);
     let hsum_u32 = b.composite_extract(b.u32_t, hdr_vec, 1);
     let half_sum = b.bitcast(b.i32_t, hsum_u32);
 
-    let mut int_sum = b.const_i32(0);
-    for word_j in 0_u32..8 {
-        let w_off = b.const_u32(32 + word_j * 64);
-        let w_lane_off = b.uadd(w_off, lane);
-        let w_idx = b.uadd(tile_base, w_lane_off);
-        let pq_word = b.load_sb_u32(weights_buf, w_idx);
-        let q = coalesced_pq2_unpack_4digits(b, pq_word);
-
-        let plane_vec_off = b.const_u32(1 + word_j);
+    let plane_vecs = std::array::from_fn(|j| {
+        let plane_vec_off = b.const_u32(1 + u32::try_from(j).unwrap_or(0));
         let plane_vec_idx = b.uadd(act_blk_vec_base, plane_vec_off);
-        let plane_vec = b.load_sb_uvec4(act_buf, plane_vec_idx);
+        b.load_sb_uvec4(act_buf, plane_vec_idx)
+    });
+
+    Pq2Q8kUvec4BlockInputs {
+        w_scale,
+        w_vec0,
+        w_vec1,
+        act_scale,
+        half_sum,
+        plane_vecs,
+    }
+}
+
+fn eval_pq2_q8k_uvec4_block(
+    b: &mut ShaderBuilder,
+    inputs: &Pq2Q8kUvec4BlockInputs,
+    acc_var: u32,
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    fused: bool,
+) {
+    let mut int_sum = b.const_i32(0);
+    for (word_j, &plane_vec) in inputs.plane_vecs.iter().enumerate() {
+        let w_vec = if word_j < 4 {
+            inputs.w_vec0
+        } else {
+            inputs.w_vec1
+        };
+        let w_comp = u32::try_from(word_j % 4).unwrap_or(0);
+        let pq_word = b.composite_extract(b.u32_t, w_vec, w_comp);
+        let q = coalesced_pq2_unpack_4digits(b, pq_word);
         for (digit, &q_word) in q.iter().enumerate() {
             let comp = u32::try_from(digit).unwrap_or(0);
             let plane = b.composite_extract(b.u32_t, plane_vec, comp);
@@ -2862,9 +3023,9 @@ fn emit_pq2_q8k_uvec4_block(
         }
     }
 
-    let corrected = b.isub(int_sum, half_sum);
+    let corrected = b.isub(int_sum, inputs.half_sum);
     let float_dot = b.i32_to_f32(corrected);
-    let d = b.fmul_nc(w_scale, act_scale);
+    let d = b.fmul_nc(inputs.w_scale, inputs.act_scale);
     let prev = b.load_var_f32(acc_var);
     let next = if fused {
         b.fma(d, float_dot, prev)
@@ -2877,7 +3038,7 @@ fn emit_pq2_q8k_uvec4_block(
 
 /// Emits coalesced 64-row `PQ2_0` × 4-plane `Q8_K` GEMV SPIR-V 1.6 words (`0%` weight overhead).
 ///
-/// Bindings: `0` read-only coalesced `weights` (`544` `u32` words per `(row_group_64, k_block_128)`),
+/// Bindings: `0` read-only coalesced `weights` (`136` `uvec4`s / `544` `u32`s per `(row_group_64, k_block_128)`),
 /// `1` read-only 4-plane `Q8_K` (`36` `u32` words / `9` `uvec4`s per 128 elements: `[scale_bits, half_sum_i32, pad0, pad1, 32 plane words]`),
 /// `2` writable `output` (`f32`), optional `3` read-only `residual` (`f32`).
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
@@ -2900,7 +3061,7 @@ pub fn pq2_q8k_gemv_coalesced_with_acc_sat(
 ) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
-    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
     let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
     let res_buf = has_residual.then(|| b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly));
@@ -2924,38 +3085,39 @@ pub fn pq2_q8k_gemv_coalesced_with_acc_sat(
         b.store_var(acc_var, f_zero);
 
         let c0 = b.const_u32(0);
-        let c1 = b.const_u32(1);
         let c2 = b.const_u32(2);
         let c6 = b.const_u32(6);
-        let c9 = b.const_u32(9);
         let c63 = b.const_u32(63);
-        let c544 = b.const_u32(544);
+        let c136 = b.const_u32(136);
 
         let rg = b.ushr(row, c6);
         let lane = b.uand(row, c63);
+        let coords = coalesced_544_lane_coords(b, lane);
         let rg_tiles = b.umul(rg, blocks_per_row);
-        let rg_base = b.umul(rg_tiles, c544);
+        let rg_vec_base = b.umul(rg_tiles, c136);
         let act_vecs_per_token = b.ushr(act_words_per_token, c2);
         let tok_act_vec_base = b.umul(token, act_vecs_per_token);
 
-        b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
-            let blk_off = b.umul(blk, c544);
-            let tile_base = b.uadd(rg_base, blk_off);
-            let act_vec_off = b.umul(blk, c9);
-            let act_blk_vec_base = b.uadd(tok_act_vec_base, act_vec_off);
-            emit_pq2_q8k_uvec4_block(
-                b,
-                weights_buf,
-                act_buf,
-                tile_base,
-                lane,
-                act_blk_vec_base,
-                acc_var,
-                use_sdot,
-                use_sdot_acc_sat,
-                fused,
-            );
-        });
+        emit_2x_k_loop(
+            b,
+            c0,
+            blocks_per_row,
+            1,
+            |b, blk| {
+                load_pq2_q8k_uvec4_block_inputs(
+                    b,
+                    weights_buf,
+                    act_buf,
+                    rg_vec_base,
+                    tok_act_vec_base,
+                    &coords,
+                    blk,
+                )
+            },
+            |b, inputs| {
+                eval_pq2_q8k_uvec4_block(b, &inputs, acc_var, use_sdot, use_sdot_acc_sat, fused);
+            },
+        );
 
         let tok_out = b.umul(token, rows);
         let out_idx = b.uadd(tok_out, row);
@@ -3034,6 +3196,7 @@ pub fn pq2_q8k_gemm_4tok_coalesced_with_acc_sat(
 
         let rg = b.ushr(row, c6);
         let lane = b.uand(row, c63);
+        let lane4 = b.umul(lane, c4);
         let rg_tiles = b.umul(rg, blocks_per_row);
         let rg_base = b.umul(rg_tiles, c544);
 
@@ -3046,8 +3209,8 @@ pub fn pq2_q8k_gemm_4tok_coalesced_with_acc_sat(
             let mut int_sums = [b.const_i32(0); 4];
 
             for word_j in 0_u32..8 {
-                let w_off = b.const_u32(32 + word_j * 64);
-                let w_lane_off = b.uadd(w_off, lane);
+                let w_off = b.const_u32(32 + (word_j / 4) * 256 + (word_j % 4));
+                let w_lane_off = b.uadd(w_off, lane4);
                 let w_idx = b.uadd(tile_base, w_lane_off);
                 let pq_word = b.load_sb_u32(weights_buf, w_idx);
                 let q = coalesced_pq2_unpack_4digits(b, pq_word);
@@ -3100,29 +3263,36 @@ pub fn pq2_q8k_gemm_4tok_coalesced_with_acc_sat(
     b.finish()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Shares 128-bit uvec4 PQ2 x Q8_0 block evaluation across coalesced GEMV and Split-K."
-)]
-fn emit_pq2_q8_0_uvec4_block(
+struct Pq2Q8_0Uvec4BlockInputs {
+    w_scale: u32,
+    w_vec0: u32,
+    w_vec1: u32,
+    act_scales: [u32; 4],
+    aw_vecs: [u32; 8],
+}
+
+fn load_pq2_q8_0_uvec4_block_inputs(
     b: &mut ShaderBuilder,
     weights_buf: u32,
     act_buf: u32,
-    tile_base: u32,
-    lane: u32,
-    blk_act_vec_base: u32,
-    acc_var: u32,
-    use_sdot: bool,
-    use_sdot_acc_sat: bool,
-) {
-    let f_zero = b.const_f32(0.0);
-    let c8 = b.const_u32(8);
-    let c16 = b.const_u32(16);
-    let c24 = b.const_u32(24);
-    let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, lane);
+    rg_vec_base: u32,
+    tok_act_vec_base: u32,
+    coords: &Coalesced544LaneCoords,
+    blk: u32,
+) -> Pq2Q8_0Uvec4BlockInputs {
+    let c12 = b.const_u32(12);
+    let c136 = b.const_u32(136);
+    let tile_vec_off = b.umul(blk, c136);
+    let tile_vec_base = b.uadd(rg_vec_base, tile_vec_off);
+    let (w_scale, w_vec0, w_vec1) =
+        load_coalesced_544_scale_and_vecs(b, weights_buf, tile_vec_base, coords);
 
-    let mut block_sum = f_zero;
+    let blk_act_vec_off = b.umul(blk, c12);
+    let blk_act_vec_base = b.uadd(tok_act_vec_base, blk_act_vec_off);
+    let mut act_scales = [0_u32; 4];
+    let mut aw_vecs = [0_u32; 8];
     for grp in 0_u32..4 {
+        let gi = usize::try_from(grp).unwrap_or(0);
         let grp_vec_base = if grp == 0 {
             blk_act_vec_base
         } else {
@@ -3131,19 +3301,49 @@ fn emit_pq2_q8_0_uvec4_block(
         };
         let hdr_vec = b.load_sb_uvec4(act_buf, grp_vec_base);
         let act_scale_u32 = b.composite_extract(b.u32_t, hdr_vec, 0);
-        let act_scale = b.bitcast(b.f32_t, act_scale_u32);
-
-        let mut grp_int = b.const_i32(0);
+        act_scales[gi] = b.bitcast(b.f32_t, act_scale_u32);
         for pair_idx in 0_u32..2 {
-            let word_j = grp * 2 + pair_idx;
-            let w_off = b.const_u32(32 + word_j * 64);
-            let w_lane_off = b.uadd(w_off, lane);
-            let w_idx = b.uadd(tile_base, w_lane_off);
-            let pq_word = b.load_sb_u32(weights_buf, w_idx);
-
             let aw_vec_off = b.const_u32(1 + pair_idx);
             let aw_vec_idx = b.uadd(grp_vec_base, aw_vec_off);
-            let aw_vec = b.load_sb_uvec4(act_buf, aw_vec_idx);
+            let pi = usize::try_from(pair_idx).unwrap_or(0);
+            aw_vecs[gi * 2 + pi] = b.load_sb_uvec4(act_buf, aw_vec_idx);
+        }
+    }
+
+    Pq2Q8_0Uvec4BlockInputs {
+        w_scale,
+        w_vec0,
+        w_vec1,
+        act_scales,
+        aw_vecs,
+    }
+}
+
+fn eval_pq2_q8_0_uvec4_block(
+    b: &mut ShaderBuilder,
+    inputs: &Pq2Q8_0Uvec4BlockInputs,
+    acc_var: u32,
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) {
+    let f_zero = b.const_f32(0.0);
+    let c8 = b.const_u32(8);
+    let c16 = b.const_u32(16);
+    let c24 = b.const_u32(24);
+    let mut block_sum = f_zero;
+
+    for grp in 0_usize..4 {
+        let mut grp_int = b.const_i32(0);
+        for pair_idx in 0_usize..2 {
+            let word_j = grp * 2 + pair_idx;
+            let w_vec = if word_j < 4 {
+                inputs.w_vec0
+            } else {
+                inputs.w_vec1
+            };
+            let w_comp = u32::try_from(word_j % 4).unwrap_or(0);
+            let pq_word = b.composite_extract(b.u32_t, w_vec, w_comp);
+            let aw_vec = inputs.aw_vecs[word_j];
 
             let b0 = pq_word;
             let b1 = b.ushr(pq_word, c8);
@@ -3168,19 +3368,19 @@ fn emit_pq2_q8_0_uvec4_block(
             }
         }
         let grp_f32 = b.i32_to_f32(grp_int);
-        let scaled = b.fmul_nc(act_scale, grp_f32);
+        let scaled = b.fmul_nc(inputs.act_scales[grp], grp_f32);
         block_sum = b.fadd_nc(block_sum, scaled);
     }
 
     let prev = b.load_var_f32(acc_var);
-    let contrib = b.fmul_nc(w_scale, block_sum);
+    let contrib = b.fmul_nc(inputs.w_scale, block_sum);
     let next = b.fadd_nc(prev, contrib);
     b.store_var(acc_var, next);
 }
 
 /// Emits coalesced 64-row `PQ2_0` × `Q8_0` GEMV SPIR-V 1.6 words (odd `128`-col support).
 ///
-/// Bindings: `0` read-only coalesced `PQ2` weights (`544` `u32`/block-tile), `1` read-only
+/// Bindings: `0` read-only coalesced `PQ2` weights (`136` `uvec4`s / `544` `u32`s per block-tile), `1` read-only
 /// `Q8Block` (`12` `u32` / `3` `uvec4` per 32-elem block), `2` writable `output` (`f32`).
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
@@ -3190,13 +3390,10 @@ pub fn pq2_q8_0_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
 
 /// Emits coalesced 64-row `PQ2_0` × `Q8_0` GEMV SPIR-V 1.6 words with optional `OpSDotAccSat`.
 #[must_use]
-pub fn pq2_q8_0_gemv_coalesced_with_acc_sat(
-    use_sdot: bool,
-    use_sdot_acc_sat: bool,
-) -> Vec<u32> {
+pub fn pq2_q8_0_gemv_coalesced_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
-    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
     let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
 
@@ -3219,37 +3416,39 @@ pub fn pq2_q8_0_gemv_coalesced_with_acc_sat(
         b.store_var(acc_var, f_zero);
 
         let c0 = b.const_u32(0);
-        let c1 = b.const_u32(1);
         let c2 = b.const_u32(2);
         let c6 = b.const_u32(6);
-        let c12 = b.const_u32(12);
         let c63 = b.const_u32(63);
-        let c544 = b.const_u32(544);
+        let c136 = b.const_u32(136);
 
         let rg = b.ushr(row, c6);
         let lane = b.uand(row, c63);
+        let coords = coalesced_544_lane_coords(b, lane);
         let rg_tiles = b.umul(rg, blocks_per_row);
-        let rg_base = b.umul(rg_tiles, c544);
+        let rg_vec_base = b.umul(rg_tiles, c136);
         let act_vecs_per_token = b.ushr(act_words_per_token, c2);
         let tok_act_vec_base = b.umul(token, act_vecs_per_token);
 
-        b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
-            let blk_off = b.umul(blk, c544);
-            let tile_base = b.uadd(rg_base, blk_off);
-            let blk_act_vec_off = b.umul(blk, c12);
-            let blk_act_vec_base = b.uadd(tok_act_vec_base, blk_act_vec_off);
-            emit_pq2_q8_0_uvec4_block(
-                b,
-                weights_buf,
-                act_buf,
-                tile_base,
-                lane,
-                blk_act_vec_base,
-                acc_var,
-                use_sdot,
-                use_sdot_acc_sat,
-            );
-        });
+        emit_2x_k_loop(
+            b,
+            c0,
+            blocks_per_row,
+            1,
+            |b, blk| {
+                load_pq2_q8_0_uvec4_block_inputs(
+                    b,
+                    weights_buf,
+                    act_buf,
+                    rg_vec_base,
+                    tok_act_vec_base,
+                    &coords,
+                    blk,
+                )
+            },
+            |b, inputs| {
+                eval_pq2_q8_0_uvec4_block(b, &inputs, acc_var, use_sdot, use_sdot_acc_sat);
+            },
+        );
 
         let tok_out = b.umul(token, rows);
         let out_idx = b.uadd(tok_out, row);
@@ -3268,7 +3467,7 @@ fn pq2_q8_0_4tok_group_step(
     b: &mut ShaderBuilder,
     weights_buf: u32,
     tile_base: u32,
-    lane: u32,
+    lane4: u32,
     act_buf: u32,
     blk_act_bases: [u32; 4],
     grp: u32,
@@ -3292,8 +3491,10 @@ fn pq2_q8_0_4tok_group_step(
 
     for pair_idx in 0_u32..2 {
         let word_j = grp * 2 + pair_idx;
-        let w_off = b.const_u32(32 + word_j * 64);
-        let w_lane_off = b.uadd(w_off, lane);
+        let half_j = word_j / 4;
+        let comp = word_j % 4;
+        let w_off = b.const_u32(32 + half_j * 256 + comp);
+        let w_lane_off = b.uadd(w_off, lane4);
         let w_idx = b.uadd(tile_base, w_lane_off);
         let pq_word = b.load_sb_u32(weights_buf, w_idx);
         let raw_bytes = [
@@ -3403,6 +3604,7 @@ pub fn pq2_q8_0_gemm_4tok_coalesced_with_acc_sat(
             clamp_four_token_act_bases(b, tok_base, tokens, act_words_per_token);
         let rg = b.ushr(row, c6);
         let lane = b.uand(row, c63);
+        let lane4 = b.umul(lane, c4);
         let rg_tiles = b.umul(rg, blocks_per_row);
         let rg_base = b.umul(rg_tiles, c544);
 
@@ -3419,7 +3621,7 @@ pub fn pq2_q8_0_gemm_4tok_coalesced_with_acc_sat(
                     b,
                     weights_buf,
                     tile_base,
-                    lane,
+                    lane4,
                     act_buf,
                     blk_act_bases,
                     grp,
@@ -3454,7 +3656,8 @@ pub fn pq2_q8_0_gemm_4tok_coalesced_with_acc_sat(
 struct Q8_0Uvec4BlockInputs {
     w_scale: u32,
     act_scale: u32,
-    w_words: [u32; 8],
+    w_vec0: u32,
+    w_vec1: u32,
     aw_vec0: u32,
     aw_vec1: u32,
 }
@@ -3463,19 +3666,20 @@ fn load_q8_0_uvec4_block_inputs(
     b: &mut ShaderBuilder,
     weights_buf: u32,
     act_buf: u32,
-    rg_base: u32,
+    rg_vec_base: u32,
     tok_act_vec_base: u32,
-    lane: u32,
+    coords: &Coalesced544LaneCoords,
     blk: u32,
 ) -> Q8_0Uvec4BlockInputs {
     let c1 = b.const_u32(1);
     let c2 = b.const_u32(2);
     let c3 = b.const_u32(3);
-    let c544 = b.const_u32(544);
+    let c136 = b.const_u32(136);
 
-    let blk_off = b.umul(blk, c544);
-    let tile_base = b.uadd(rg_base, blk_off);
-    let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, lane);
+    let tile_vec_off = b.umul(blk, c136);
+    let tile_vec_base = b.uadd(rg_vec_base, tile_vec_off);
+    let (w_scale, w_vec0, w_vec1) =
+        load_coalesced_544_scale_and_vecs(b, weights_buf, tile_vec_base, coords);
 
     let blk_act_vec_off = b.umul(blk, c3);
     let blk_act_vec_base = b.uadd(tok_act_vec_base, blk_act_vec_off);
@@ -3487,19 +3691,11 @@ fn load_q8_0_uvec4_block_inputs(
     let aw_idx1 = b.uadd(blk_act_vec_base, c2);
     let aw_vec1 = b.load_sb_uvec4(act_buf, aw_idx1);
 
-    let mut w_words = [0_u32; 8];
-    for (word_j, slot) in w_words.iter_mut().enumerate() {
-        let j_u32 = u32::try_from(word_j).unwrap_or(0);
-        let w_off = b.const_u32(32 + j_u32 * 64);
-        let w_lane_off = b.uadd(w_off, lane);
-        let w_idx = b.uadd(tile_base, w_lane_off);
-        *slot = b.load_sb_u32(weights_buf, w_idx);
-    }
-
     Q8_0Uvec4BlockInputs {
         w_scale,
         act_scale,
-        w_words,
+        w_vec0,
+        w_vec1,
         aw_vec0,
         aw_vec1,
     }
@@ -3512,13 +3708,19 @@ fn eval_q8_0_uvec4_block_contrib(
     use_sdot_acc_sat: bool,
 ) -> u32 {
     let mut isum = b.const_i32(0);
-    for (word_j, &w_word) in inputs.w_words.iter().enumerate() {
+    for word_j in 0_usize..8 {
+        let w_vec = if word_j < 4 {
+            inputs.w_vec0
+        } else {
+            inputs.w_vec1
+        };
         let aw_vec = if word_j < 4 {
             inputs.aw_vec0
         } else {
             inputs.aw_vec1
         };
         let comp = u32::try_from(word_j % 4).unwrap_or(0);
+        let w_word = b.composite_extract(b.u32_t, w_vec, comp);
         let act_word = b.composite_extract(b.u32_t, aw_vec, comp);
         isum = if use_sdot && use_sdot_acc_sat {
             b.sdot_acc_sat_packed(w_word, act_word, isum)
@@ -3538,8 +3740,8 @@ fn eval_q8_0_uvec4_block_contrib(
 
 /// Emits coalesced 64-row `Q8_0` × `Q8_0` GEMV SPIR-V 1.6 words (`32`-element blocks, 2x K-unrolled).
 ///
-/// Bindings: `0` read-only coalesced `Q8_0` weights (`544` `u32` words per `(row_group_64, k_block_32)`
-/// tile: `32` packed `f16` scale pairs + `8 × 64` `i8x4` payload words), `1` read-only `Q8Block`
+/// Bindings: `0` read-only coalesced `Q8_0` weights (`136` `uvec4`s / `544` `u32` words per `(row_group_64, k_block_32)`
+/// tile: `32` packed `f16` scale pairs + `2 × 64 × uvec4` `i8x4` payload words), `1` read-only `Q8Block`
 /// (`12` `u32` / `3` `uvec4` per 32-element block), `2` writable `output` (`f32`).
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
@@ -3549,13 +3751,10 @@ pub fn q8_0_q8_0_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
 
 /// Emits coalesced 64-row `Q8_0` × `Q8_0` GEMV SPIR-V 1.6 words with optional `OpSDotAccSat`.
 #[must_use]
-pub fn q8_0_q8_0_gemv_coalesced_with_acc_sat(
-    use_sdot: bool,
-    use_sdot_acc_sat: bool,
-) -> Vec<u32> {
+pub fn q8_0_q8_0_gemv_coalesced_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
-    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
     let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
 
@@ -3578,66 +3777,42 @@ pub fn q8_0_q8_0_gemv_coalesced_with_acc_sat(
         b.store_var(acc_var, f_zero);
 
         let c0 = b.const_u32(0);
-        let c1 = b.const_u32(1);
         let c2 = b.const_u32(2);
         let c6 = b.const_u32(6);
         let c63 = b.const_u32(63);
-        let c544 = b.const_u32(544);
+        let c136 = b.const_u32(136);
 
         let rg = b.ushr(row, c6);
         let lane = b.uand(row, c63);
+        let coords = coalesced_544_lane_coords(b, lane);
         let rg_tiles = b.umul(rg, blocks_per_row);
-        let rg_base = b.umul(rg_tiles, c544);
+        let rg_vec_base = b.umul(rg_tiles, c136);
         let act_vecs_per_token = b.ushr(act_words_per_token, c2);
         let tok_act_vec_base = b.umul(token, act_vecs_per_token);
 
-        let tail = b.uand(blocks_per_row, c1);
-        let even_blocks = b.usub(blocks_per_row, tail);
-        b.emit_for_range(c0, even_blocks, c2, |b, blk| {
-            let blk1 = b.uadd(blk, c1);
-            let in0 = load_q8_0_uvec4_block_inputs(
-                b,
-                weights_buf,
-                act_buf,
-                rg_base,
-                tok_act_vec_base,
-                lane,
-                blk,
-            );
-            let in1 = load_q8_0_uvec4_block_inputs(
-                b,
-                weights_buf,
-                act_buf,
-                rg_base,
-                tok_act_vec_base,
-                lane,
-                blk1,
-            );
-            let contrib0 = eval_q8_0_uvec4_block_contrib(b, &in0, use_sdot, use_sdot_acc_sat);
-            let contrib1 = eval_q8_0_uvec4_block_contrib(b, &in1, use_sdot, use_sdot_acc_sat);
-            let prev = b.load_var_f32(acc_var);
-            let next0 = b.fadd_nc(prev, contrib0);
-            let next1 = b.fadd_nc(next0, contrib1);
-            b.store_var(acc_var, next1);
-        });
-
-        let has_tail = b.u_ne(tail, c0);
-        b.emit_if(has_tail, |b| {
-            let in_tail = load_q8_0_uvec4_block_inputs(
-                b,
-                weights_buf,
-                act_buf,
-                rg_base,
-                tok_act_vec_base,
-                lane,
-                even_blocks,
-            );
-            let contrib_tail =
-                eval_q8_0_uvec4_block_contrib(b, &in_tail, use_sdot, use_sdot_acc_sat);
-            let prev = b.load_var_f32(acc_var);
-            let next = b.fadd_nc(prev, contrib_tail);
-            b.store_var(acc_var, next);
-        });
+        emit_2x_k_loop(
+            b,
+            c0,
+            blocks_per_row,
+            1,
+            |b, blk| {
+                load_q8_0_uvec4_block_inputs(
+                    b,
+                    weights_buf,
+                    act_buf,
+                    rg_vec_base,
+                    tok_act_vec_base,
+                    &coords,
+                    blk,
+                )
+            },
+            |b, inputs| {
+                let contrib = eval_q8_0_uvec4_block_contrib(b, &inputs, use_sdot, use_sdot_acc_sat);
+                let prev = b.load_var_f32(acc_var);
+                let next = b.fadd_nc(prev, contrib);
+                b.store_var(acc_var, next);
+            },
+        );
 
         let tok_out = b.umul(token, rows);
         let out_idx = b.uadd(tok_out, row);
@@ -3656,7 +3831,7 @@ fn q8_0_q8_0_4tok_block_step(
     b: &mut ShaderBuilder,
     weights_buf: u32,
     tile_base: u32,
-    lane: u32,
+    lane4: u32,
     w_scale: u32,
     act_buf: u32,
     blk_act_bases: [u32; 4],
@@ -3671,8 +3846,10 @@ fn q8_0_q8_0_4tok_block_step(
     let mut int_sums = [b.const_i32(0); 4];
 
     for word_j in 0_u32..8 {
-        let w_off = b.const_u32(32 + word_j * 64);
-        let w_lane_off = b.uadd(w_off, lane);
+        let half_j = word_j / 4;
+        let comp = word_j % 4;
+        let w_off = b.const_u32(32 + half_j * 256 + comp);
+        let w_lane_off = b.uadd(w_off, lane4);
         let w_idx = b.uadd(tile_base, w_lane_off);
         let w_word = b.load_sb_u32(weights_buf, w_idx);
         let act_off = b.const_u32(4 + word_j);
@@ -3769,6 +3946,7 @@ pub fn q8_0_q8_0_gemm_4tok_coalesced_with_acc_sat(
             clamp_four_token_act_bases(b, tok_base, tokens, act_words_per_token);
         let rg = b.ushr(row, c6);
         let lane = b.uand(row, c63);
+        let lane4 = b.umul(lane, c4);
         let rg_tiles = b.umul(rg, blocks_per_row);
         let rg_base = b.umul(rg_tiles, c544);
 
@@ -3782,7 +3960,7 @@ pub fn q8_0_q8_0_gemm_4tok_coalesced_with_acc_sat(
                 b,
                 weights_buf,
                 tile_base,
-                lane,
+                lane4,
                 w_scale,
                 act_buf,
                 blk_act_bases,
@@ -3820,16 +3998,70 @@ fn finalize_ptq1_lane_vars(b: &mut ShaderBuilder, lane_vars: &[u32; 4], pinned_4
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Shares 128-bit uvec4 streaming PTQ1 x Q8_0 block evaluation across coalesced GEMV and Split-K."
-)]
-fn emit_ptq1_q8_0_uvec4_gemv_block(
+struct Ptq1Q8_0Uvec4BlockInputs {
+    w_words: [u32; 7],
+    act_scales: [u32; 4],
+    aw_vecs: [u32; 8],
+}
+
+fn load_ptq1_q8_0_uvec4_gemv_block(
     b: &mut ShaderBuilder,
     weights_buf: u32,
     act_buf: u32,
-    wbase: u32,
-    blk_act_vec_base: u32,
+    rg_base: u32,
+    lane: u32,
+    tok_act_vec_base: u32,
+    blk: u32,
+) -> Ptq1Q8_0Uvec4BlockInputs {
+    let c12 = b.const_u32(12);
+    let c448 = b.const_u32(448);
+    let blk_off = b.umul(blk, c448);
+    let tile_base = b.uadd(rg_base, blk_off);
+    let wbase = b.uadd(tile_base, lane);
+
+    let w_words = std::array::from_fn(|j| {
+        if j == 0 {
+            b.load_sb_u32(weights_buf, wbase)
+        } else {
+            let off_c = b.const_u32(u32::try_from(j * 64).unwrap_or(0));
+            let w_idx = b.uadd(wbase, off_c);
+            b.load_sb_u32(weights_buf, w_idx)
+        }
+    });
+
+    let blk_act_vec_off = b.umul(blk, c12);
+    let blk_act_vec_base = b.uadd(tok_act_vec_base, blk_act_vec_off);
+    let mut act_scales = [0_u32; 4];
+    let mut aw_vecs = [0_u32; 8];
+    for grp in 0_u32..4 {
+        let gi = usize::try_from(grp).unwrap_or(0);
+        let hdr_idx = if grp == 0 {
+            blk_act_vec_base
+        } else {
+            let grp_vec_off = b.const_u32(grp * 3);
+            b.uadd(blk_act_vec_base, grp_vec_off)
+        };
+        let hdr_vec = b.load_sb_uvec4(act_buf, hdr_idx);
+        let scale_u32 = b.composite_extract(b.u32_t, hdr_vec, 0);
+        act_scales[gi] = b.bitcast(b.f32_t, scale_u32);
+        for pair_idx in 0_u32..2 {
+            let aw_off = b.const_u32(grp * 3 + 1 + pair_idx);
+            let aw_idx = b.uadd(blk_act_vec_base, aw_off);
+            let pi = usize::try_from(pair_idx).unwrap_or(0);
+            aw_vecs[gi * 2 + pi] = b.load_sb_uvec4(act_buf, aw_idx);
+        }
+    }
+
+    Ptq1Q8_0Uvec4BlockInputs {
+        w_words,
+        act_scales,
+        aw_vecs,
+    }
+}
+
+fn eval_ptq1_q8_0_uvec4_gemv_block(
+    b: &mut ShaderBuilder,
+    inputs: &Ptq1Q8_0Uvec4BlockInputs,
     use_sdot: bool,
     use_sdot_acc_sat: bool,
     pinned_4lane: bool,
@@ -3837,45 +4069,26 @@ fn emit_ptq1_q8_0_uvec4_gemv_block(
 ) {
     let f_zero = b.const_f32(0.0);
     let i_zero = b.const_i32(0);
-    let mut act_scale = f_zero;
-    let mut aw_vec = 0_u32;
     let mut block_sum = f_zero;
     let mut lane_sums = [i_zero; 4];
     let mut isum = i_zero;
 
-    let w_scale = stream_ptq1_block_strided(
+    let w_scale = stream_ptq1_block_by_index(
         b,
-        |b, idx| b.load_sb_u32(weights_buf, idx),
-        wbase,
-        64,
+        |_, j| inputs.w_words[j],
         |b, word_idx, packed_trits, w_scale| {
-            let grp = u32::try_from(word_idx / 8).unwrap_or(0);
-            let in_grp = u32::try_from(word_idx % 8).unwrap_or(0);
+            let grp = word_idx / 8;
+            let in_grp = word_idx % 8;
             if in_grp == 0 {
-                let hdr_idx = if grp == 0 {
-                    blk_act_vec_base
-                } else {
-                    let grp_vec_off = b.const_u32(grp * 3);
-                    b.uadd(blk_act_vec_base, grp_vec_off)
-                };
-                let hdr_vec = b.load_sb_uvec4(act_buf, hdr_idx);
-                let scale_u32 = b.composite_extract(b.u32_t, hdr_vec, 0);
-                act_scale = b.bitcast(b.f32_t, scale_u32);
-                let aw0_off = b.const_u32(grp * 3 + 1);
-                let aw0_idx = b.uadd(blk_act_vec_base, aw0_off);
-                aw_vec = b.load_sb_uvec4(act_buf, aw0_idx);
                 if pinned_4lane {
                     lane_sums = [i_zero; 4];
                 } else {
                     isum = i_zero;
                 }
-            } else if in_grp == 4 {
-                let aw1_off = b.const_u32(grp * 3 + 2);
-                let aw1_idx = b.uadd(blk_act_vec_base, aw1_off);
-                aw_vec = b.load_sb_uvec4(act_buf, aw1_idx);
             }
 
-            let aw = b.composite_extract(b.u32_t, aw_vec, in_grp % 4);
+            let aw_vec = inputs.aw_vecs[word_idx / 4];
+            let aw = b.composite_extract(b.u32_t, aw_vec, u32::try_from(in_grp % 4).unwrap_or(0));
             let lane_idx = word_idx % 4;
             if use_sdot && use_sdot_acc_sat {
                 let packed_w = swar_bias_minus_one(b, packed_trits);
@@ -3894,6 +4107,7 @@ fn emit_ptq1_q8_0_uvec4_gemv_block(
             }
 
             if in_grp == 7 {
+                let act_scale = inputs.act_scales[grp];
                 if pinned_4lane {
                     let d = b.fmul_nc(w_scale, act_scale);
                     for (&lane_var, &sum_val) in lane_vars.iter().zip(&lane_sums) {
@@ -3974,10 +4188,8 @@ pub fn ptq1_q8_0_gemv_coalesced_with_acc_sat(
         }
 
         let c0 = b.const_u32(0);
-        let c1 = b.const_u32(1);
         let c2 = b.const_u32(2);
         let c6 = b.const_u32(6);
-        let c12 = b.const_u32(12);
         let c63 = b.const_u32(63);
         let c448 = b.const_u32(448);
 
@@ -3988,25 +4200,33 @@ pub fn ptq1_q8_0_gemv_coalesced_with_acc_sat(
         let act_vecs_per_token = b.ushr(act_words_per_token, c2);
         let tok_act_vec_base = b.umul(token, act_vecs_per_token);
 
-        b.emit_for_range(c0, blocks_per_row, c1, |b, blk| {
-            let blk_off = b.umul(blk, c448);
-            let tile_base = b.uadd(rg_base, blk_off);
-            let wbase = b.uadd(tile_base, lane);
-            let blk_act_vec_off = b.umul(blk, c12);
-            let blk_act_vec_base = b.uadd(tok_act_vec_base, blk_act_vec_off);
-
-            emit_ptq1_q8_0_uvec4_gemv_block(
-                b,
-                weights_buf,
-                act_buf,
-                wbase,
-                blk_act_vec_base,
-                use_sdot,
-                use_sdot_acc_sat,
-                pinned_4lane,
-                &lane_vars,
-            );
-        });
+        emit_2x_k_loop(
+            b,
+            c0,
+            blocks_per_row,
+            1,
+            |b, blk| {
+                load_ptq1_q8_0_uvec4_gemv_block(
+                    b,
+                    weights_buf,
+                    act_buf,
+                    rg_base,
+                    lane,
+                    tok_act_vec_base,
+                    blk,
+                )
+            },
+            |b, inputs| {
+                eval_ptq1_q8_0_uvec4_gemv_block(
+                    b,
+                    &inputs,
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    pinned_4lane,
+                    &lane_vars,
+                );
+            },
+        );
 
         let final_val = finalize_ptq1_lane_vars(b, &lane_vars, pinned_4lane);
         let tok_out = b.umul(token, rows);
@@ -4427,19 +4647,24 @@ fn emit_pq2_q8k_16tok_block(
 ) {
     let c0 = b.const_u32(0);
     let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
     let c4 = b.const_u32(4);
     let c8 = b.const_u32(8);
     let c32 = b.const_u32(32);
-    let c64 = b.const_u32(64);
+    let lane4 = b.ushl(lane, c2);
     let i_zero = b.const_i32(0);
 
     b.store_var(isum0_var, i_zero);
     b.store_var(isum1_var, i_zero);
 
     b.emit_for_range(c0, c8, c1, |b, word_j| {
-        let j64 = b.umul(word_j, c64);
-        let w_off = b.uadd(c32, j64);
-        let w_idx = b.uadd(w_off, lane);
+        let half_j = b.ushr(word_j, c2);
+        let comp = b.uand(word_j, c3);
+        let half256 = b.ushl(half_j, c8);
+        let w_base = b.uadd(c32, half256);
+        let w_lane = b.uadd(w_base, lane4);
+        let w_idx = b.uadd(w_lane, comp);
         let pq_word = b.load_wg_u32(smem_w, w_idx);
         let q = coalesced_pq2_unpack_4digits(b, pq_word);
 
@@ -4622,18 +4847,23 @@ fn emit_q8_0_q8_0_16tok_block(
     let c0 = b.const_u32(0);
     let c4 = b.const_u32(4);
     let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c3 = b.const_u32(3);
     let c8 = b.const_u32(8);
     let c32 = b.const_u32(32);
-    let c64 = b.const_u32(64);
+    let lane4 = b.ushl(lane, c2);
     let i_zero = b.const_i32(0);
 
     b.store_var(isum0_var, i_zero);
     b.store_var(isum1_var, i_zero);
 
     b.emit_for_range(c0, c8, c1, |b, word_j| {
-        let j64 = b.umul(word_j, c64);
-        let w_off = b.uadd(c32, j64);
-        let w_idx = b.uadd(w_off, lane);
+        let half_j = b.ushr(word_j, c2);
+        let comp = b.uand(word_j, c3);
+        let half256 = b.ushl(half_j, c8);
+        let w_base = b.uadd(c32, half256);
+        let w_lane = b.uadd(w_base, lane4);
+        let w_idx = b.uadd(w_lane, comp);
         let w_word = b.load_wg_u32(smem_w, w_idx);
         let act_off = b.uadd(c4, word_j);
 
@@ -5185,11 +5415,15 @@ fn emit_pq2_q8k_32tok_block(
     fused: bool,
 ) {
     let c1 = b.const_u32(1);
+    let c4 = b.const_u32(4);
+    let lane4 = b.umul(lane, c4);
     let mut isums = [b.const_i32(0); 4];
 
     for word_j in 0_u32..8 {
-        let w_off = b.const_u32(32 + word_j * 64);
-        let w_local = b.uadd(w_off, lane);
+        let half_j = word_j / 4;
+        let comp = word_j % 4;
+        let w_off = b.const_u32(32 + half_j * 256 + comp);
+        let w_local = b.uadd(w_off, lane4);
         let w_idx = b.uadd(w_smem_base, w_local);
         let pq_word = b.load_wg_u32(smem_w, w_idx);
         let q = coalesced_pq2_unpack_4digits(b, pq_word);
@@ -5419,11 +5653,15 @@ fn emit_q8_0_q8_0_32tok_block(
     use_sdot: bool,
     use_sdot_acc_sat: bool,
 ) {
+    let c4 = b.const_u32(4);
+    let lane4 = b.umul(lane, c4);
     let mut isums = [b.const_i32(0); 4];
 
     for word_j in 0_u32..8 {
-        let w_off = b.const_u32(32 + word_j * 64);
-        let w_local = b.uadd(w_off, lane);
+        let half_j = word_j / 4;
+        let comp = word_j % 4;
+        let w_off = b.const_u32(32 + half_j * 256 + comp);
+        let w_local = b.uadd(w_off, lane4);
         let w_idx = b.uadd(w_smem_base, w_local);
         let w_word = b.load_wg_u32(smem_w, w_idx);
         let act_off = b.const_u32(4 + word_j);
@@ -5648,9 +5886,11 @@ fn emit_pq2_q8_0_32tok_block(
     use_sdot_acc_sat: bool,
 ) {
     let f_zero = b.const_f32(0.0);
+    let c4 = b.const_u32(4);
     let c8 = b.const_u32(8);
     let c16 = b.const_u32(16);
     let c24 = b.const_u32(24);
+    let lane4 = b.umul(lane, c4);
     let mut block_sums = [f_zero; 4];
 
     for grp in 0_u32..4 {
@@ -5664,8 +5904,10 @@ fn emit_pq2_q8_0_32tok_block(
 
         for pair_idx in 0_u32..2 {
             let word_j = grp * 2 + pair_idx;
-            let w_off = b.const_u32(32 + word_j * 64);
-            let w_local = b.uadd(w_off, lane);
+            let half_j = word_j / 4;
+            let comp = word_j % 4;
+            let w_off = b.const_u32(32 + half_j * 256 + comp);
+            let w_local = b.uadd(w_off, lane4);
             let w_idx = b.uadd(w_smem_base, w_local);
             let pq_word = b.load_wg_u32(smem_w, w_idx);
             let raw_bytes = [
@@ -6218,7 +6460,7 @@ pub fn pq2_q8k_gemv_splitk_with_acc_sat(
 ) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
-    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
     let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
     let res_buf = has_residual.then(|| b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly));
@@ -6233,33 +6475,41 @@ pub fn pq2_q8k_gemv_splitk_with_acc_sat(
 
         b.emit_if(ids.row_ok, |b| {
             let c2 = b.const_u32(2);
-            let c4 = b.const_u32(4);
-            let c9 = b.const_u32(9);
-            let c544 = b.const_u32(544);
+            let c136 = b.const_u32(136);
 
+            let coords = coalesced_544_lane_coords(b, ids.lane);
             let rg_tiles = b.umul(ids.rg, ids.blocks_per_row);
-            let rg_base = b.umul(rg_tiles, c544);
+            let rg_vec_base = b.umul(rg_tiles, c136);
             let act_vecs_per_token = b.ushr(ids.act_words_per_token, c2);
             let tok_act_vec_base = b.umul(ids.token, act_vecs_per_token);
 
-            b.emit_for_range(ids.wy, ids.blocks_per_row, c4, |b, blk| {
-                let blk_off = b.umul(blk, c544);
-                let tile_base = b.uadd(rg_base, blk_off);
-                let act_vec_off = b.umul(blk, c9);
-                let act_blk_vec_base = b.uadd(tok_act_vec_base, act_vec_off);
-                emit_pq2_q8k_uvec4_block(
-                    b,
-                    weights_buf,
-                    act_buf,
-                    tile_base,
-                    ids.lane,
-                    act_blk_vec_base,
-                    acc_var,
-                    use_sdot,
-                    use_sdot_acc_sat,
-                    fused,
-                );
-            });
+            emit_2x_k_loop(
+                b,
+                ids.wy,
+                ids.blocks_per_row,
+                4,
+                |b, blk| {
+                    load_pq2_q8k_uvec4_block_inputs(
+                        b,
+                        weights_buf,
+                        act_buf,
+                        rg_vec_base,
+                        tok_act_vec_base,
+                        &coords,
+                        blk,
+                    )
+                },
+                |b, inputs| {
+                    eval_pq2_q8k_uvec4_block(
+                        b,
+                        &inputs,
+                        acc_var,
+                        use_sdot,
+                        use_sdot_acc_sat,
+                        fused,
+                    );
+                },
+            );
         });
 
         let partial = b.load_var_f32(acc_var);
@@ -6283,7 +6533,7 @@ pub fn pq2_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
 pub fn pq2_q8_0_gemv_splitk_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
-    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
     let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
 
@@ -6297,32 +6547,34 @@ pub fn pq2_q8_0_gemv_splitk_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool)
 
         b.emit_if(ids.row_ok, |b| {
             let c2 = b.const_u32(2);
-            let c4 = b.const_u32(4);
-            let c12 = b.const_u32(12);
-            let c544 = b.const_u32(544);
+            let c136 = b.const_u32(136);
 
+            let coords = coalesced_544_lane_coords(b, ids.lane);
             let rg_tiles = b.umul(ids.rg, ids.blocks_per_row);
-            let rg_base = b.umul(rg_tiles, c544);
+            let rg_vec_base = b.umul(rg_tiles, c136);
             let act_vecs_per_token = b.ushr(ids.act_words_per_token, c2);
             let tok_act_vec_base = b.umul(ids.token, act_vecs_per_token);
 
-            b.emit_for_range(ids.wy, ids.blocks_per_row, c4, |b, blk| {
-                let blk_off = b.umul(blk, c544);
-                let tile_base = b.uadd(rg_base, blk_off);
-                let blk_act_vec_off = b.umul(blk, c12);
-                let blk_act_vec_base = b.uadd(tok_act_vec_base, blk_act_vec_off);
-                emit_pq2_q8_0_uvec4_block(
-                    b,
-                    weights_buf,
-                    act_buf,
-                    tile_base,
-                    ids.lane,
-                    blk_act_vec_base,
-                    acc_var,
-                    use_sdot,
-                    use_sdot_acc_sat,
-                );
-            });
+            emit_2x_k_loop(
+                b,
+                ids.wy,
+                ids.blocks_per_row,
+                4,
+                |b, blk| {
+                    load_pq2_q8_0_uvec4_block_inputs(
+                        b,
+                        weights_buf,
+                        act_buf,
+                        rg_vec_base,
+                        tok_act_vec_base,
+                        &coords,
+                        blk,
+                    )
+                },
+                |b, inputs| {
+                    eval_pq2_q8_0_uvec4_block(b, &inputs, acc_var, use_sdot, use_sdot_acc_sat);
+                },
+            );
         });
 
         let partial = b.load_var_f32(acc_var);
@@ -6346,7 +6598,7 @@ pub fn q8_0_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
 pub fn q8_0_q8_0_gemv_splitk_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
-    let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
     let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
 
@@ -6360,30 +6612,38 @@ pub fn q8_0_q8_0_gemv_splitk_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool
 
         b.emit_if(ids.row_ok, |b| {
             let c2 = b.const_u32(2);
-            let c4 = b.const_u32(4);
-            let c544 = b.const_u32(544);
+            let c136 = b.const_u32(136);
 
+            let coords = coalesced_544_lane_coords(b, ids.lane);
             let rg_tiles = b.umul(ids.rg, ids.blocks_per_row);
-            let rg_base = b.umul(rg_tiles, c544);
+            let rg_vec_base = b.umul(rg_tiles, c136);
             let act_vecs_per_token = b.ushr(ids.act_words_per_token, c2);
             let tok_act_vec_base = b.umul(ids.token, act_vecs_per_token);
 
-            b.emit_for_range(ids.wy, ids.blocks_per_row, c4, |b, blk| {
-                let inputs = load_q8_0_uvec4_block_inputs(
-                    b,
-                    weights_buf,
-                    act_buf,
-                    rg_base,
-                    tok_act_vec_base,
-                    ids.lane,
-                    blk,
-                );
-                let contrib =
-                    eval_q8_0_uvec4_block_contrib(b, &inputs, use_sdot, use_sdot_acc_sat);
-                let prev = b.load_var_f32(acc_var);
-                let next = b.fadd_nc(prev, contrib);
-                b.store_var(acc_var, next);
-            });
+            emit_2x_k_loop(
+                b,
+                ids.wy,
+                ids.blocks_per_row,
+                4,
+                |b, blk| {
+                    load_q8_0_uvec4_block_inputs(
+                        b,
+                        weights_buf,
+                        act_buf,
+                        rg_vec_base,
+                        tok_act_vec_base,
+                        &coords,
+                        blk,
+                    )
+                },
+                |b, inputs| {
+                    let contrib =
+                        eval_q8_0_uvec4_block_contrib(b, &inputs, use_sdot, use_sdot_acc_sat);
+                    let prev = b.load_var_f32(acc_var);
+                    let next = b.fadd_nc(prev, contrib);
+                    b.store_var(acc_var, next);
+                },
+            );
         });
 
         let partial = b.load_var_f32(acc_var);
@@ -6438,8 +6698,6 @@ pub fn ptq1_q8_0_gemv_splitk_with_acc_sat(
 
         b.emit_if(ids.row_ok, |b| {
             let c2 = b.const_u32(2);
-            let c4 = b.const_u32(4);
-            let c12 = b.const_u32(12);
             let c448 = b.const_u32(448);
 
             let rg_tiles = b.umul(ids.rg, ids.blocks_per_row);
@@ -6447,25 +6705,33 @@ pub fn ptq1_q8_0_gemv_splitk_with_acc_sat(
             let act_vecs_per_token = b.ushr(ids.act_words_per_token, c2);
             let tok_act_vec_base = b.umul(ids.token, act_vecs_per_token);
 
-            b.emit_for_range(ids.wy, ids.blocks_per_row, c4, |b, blk| {
-                let blk_off = b.umul(blk, c448);
-                let tile_base = b.uadd(rg_base, blk_off);
-                let wbase = b.uadd(tile_base, ids.lane);
-                let blk_act_vec_off = b.umul(blk, c12);
-                let blk_act_vec_base = b.uadd(tok_act_vec_base, blk_act_vec_off);
-
-                emit_ptq1_q8_0_uvec4_gemv_block(
-                    b,
-                    weights_buf,
-                    act_buf,
-                    wbase,
-                    blk_act_vec_base,
-                    use_sdot,
-                    use_sdot_acc_sat,
-                    pinned_4lane,
-                    &lane_vars,
-                );
-            });
+            emit_2x_k_loop(
+                b,
+                ids.wy,
+                ids.blocks_per_row,
+                4,
+                |b, blk| {
+                    load_ptq1_q8_0_uvec4_gemv_block(
+                        b,
+                        weights_buf,
+                        act_buf,
+                        rg_base,
+                        ids.lane,
+                        tok_act_vec_base,
+                        blk,
+                    )
+                },
+                |b, inputs| {
+                    eval_ptq1_q8_0_uvec4_gemv_block(
+                        b,
+                        &inputs,
+                        use_sdot,
+                        use_sdot_acc_sat,
+                        pinned_4lane,
+                        &lane_vars,
+                    );
+                },
+            );
         });
 
         let partial = finalize_ptq1_lane_vars(b, &lane_vars, pinned_4lane);
@@ -15176,10 +15442,7 @@ mod tests {
             (pq2_q8_0_gemv_splitk(true), Some(true)),
             (pq2_q8_0_gemv_splitk(false), Some(false)),
             (q8_0_q8_0_gemv_splitk(true), Some(true)),
-            (
-                q8_0_q8_0_gemv_splitk_with_acc_sat(true, true),
-                Some(true),
-            ),
+            (q8_0_q8_0_gemv_splitk_with_acc_sat(true, true), Some(true)),
             (q8_0_q8_0_gemv_splitk(false), Some(false)),
             (ptq1_q8_0_gemv_splitk(true, true), Some(true)),
             (
@@ -15410,7 +15673,10 @@ mod tests {
             [64, 1, 1]
         );
 
-        assert_eq!(count_spirv_barriers(&rms_norm_vec4_f32_with_subgroup(true)), 1);
+        assert_eq!(
+            count_spirv_barriers(&rms_norm_vec4_f32_with_subgroup(true)),
+            1
+        );
         assert_eq!(
             count_spirv_barriers(&add_rms_norm_vec4_f32_with_subgroup(true)),
             1

@@ -3406,15 +3406,18 @@ fn repack_scale_and_32b_coalesced_64(
                     continue;
                 }
                 let block = &raw[r * row_bytes + blk_off..][..Q8_0_BLOCK_BYTES];
-                for word_j in 0..8 {
-                    let c_off = 2 + word_j * 4;
-                    let word = u32::from_le_bytes([
-                        block[c_off],
-                        block[c_off + 1],
-                        block[c_off + 2],
-                        block[c_off + 3],
-                    ]);
-                    tile[32 + word_j * 64 + lane] = word;
+                for half_j in 0..2 {
+                    for c in 0..4 {
+                        let word_j = half_j * 4 + c;
+                        let c_off = 2 + word_j * 4;
+                        let word = u32::from_le_bytes([
+                            block[c_off],
+                            block[c_off + 1],
+                            block[c_off + 2],
+                            block[c_off + 3],
+                        ]);
+                        tile[32 + (half_j * 64 + lane) * 4 + c] = word;
+                    }
                 }
             }
         }
@@ -3618,6 +3621,8 @@ mod tests {
                     u16::from_le_bytes([raw[raw_off], raw[raw_off + 1]])
                 );
                 for word_j in 0..8 {
+                    let half_j = word_j / 4;
+                    let c = word_j % 4;
                     let c_off = raw_off + 2 + word_j * 4;
                     let expected_word = u32::from_le_bytes([
                         raw[c_off],
@@ -3625,7 +3630,10 @@ mod tests {
                         raw[c_off + 2],
                         raw[c_off + 3],
                     ]);
-                    assert_eq!(dst[tile_base + 32 + word_j * 64 + lane], expected_word);
+                    assert_eq!(
+                        dst[tile_base + 32 + (half_j * 64 + lane) * 4 + c],
+                        expected_word
+                    );
                 }
             }
         }
@@ -3638,9 +3646,11 @@ mod tests {
             for pair in 2..32 {
                 assert_eq!(dst[tile_base + pair], 0);
             }
-            for word_j in 0..8 {
+            for half_j in 0..2 {
                 for lane in 3..64 {
-                    assert_eq!(dst[tile_base + 32 + word_j * 64 + lane], 0);
+                    for c in 0..4 {
+                        assert_eq!(dst[tile_base + 32 + (half_j * 64 + lane) * 4 + c], 0);
+                    }
                 }
             }
         }
@@ -3858,11 +3868,8 @@ mod tests {
             // 4. PQ2 x Q8_0
             let pq_q8_ref =
                 dev.create_compute_pipeline(&spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?;
-            let pq_q8_32 = dev.create_compute_pipeline(
-                &spirv::pq2_q8_0_gemm_32tok_coalesced(use_sdot),
-                3,
-                4,
-            )?;
+            let pq_q8_32 =
+                dev.create_compute_pipeline(&spirv::pq2_q8_0_gemm_32tok_coalesced(use_sdot), 3, 4)?;
             let push_pq8 = [
                 rows_u32,
                 u32::try_from(pq2_bpr).unwrap_or(0),

@@ -50,8 +50,8 @@ regex = "=1.13.1"
 fancy-regex = "=0.20.2"
 unicode-normalization-alignments = "=0.1.12"
 bonsai-native-hash = { version = "=0.1.7", path = "tools/native-hash" }
-base64ct = { version = "=1.8.3", default-features = false, features = ["alloc"] }
-crc32fast = { version = "=1.5.5", default-features = false }
+base64ct = { version = "=1.8.3", default-features = false }
+crc32fast = "=1.5.5"
 fdeflate = "=0.3.7"
 hex.workspace = true
 

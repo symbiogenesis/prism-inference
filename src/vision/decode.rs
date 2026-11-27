@@ -609,6 +609,13 @@ fn inflate_zlib(data: &[u8], expected_len: usize) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn encode_base64(bytes: &[u8]) -> Result<String> {
+        let mut out = vec![0; Base64::encoded_len(bytes)];
+        let encoded =
+            Base64::encode(bytes, &mut out).map_err(|_| invalid("test base64 encode failed"))?;
+        Ok(encoded.to_owned())
+    }
+
     fn test_adler32(data: &[u8]) -> u32 {
         const MOD_ADLER: u32 = 65_521;
         let mut s1 = 1_u32;
@@ -684,7 +691,7 @@ mod tests {
         let ppm = b"P6\n# test comment\n2 1\n255\n\x01\x02\x03\xff\x80\x00";
         let url = format!(
             "data:image/x-portable-pixmap;base64,{}",
-            Base64::encode_string(ppm)
+            encode_base64(ppm)?
         );
         let (decoded, raw) = decode_image_data_url(&url)?;
         assert_eq!(raw, ppm);
@@ -704,7 +711,7 @@ mod tests {
             1, 255, 255, 255, 255, 1, 0, 1, 0, // row 1 Sub: px0=(255,255,255), px1=(0,255,0)
         ];
         let png = build_test_png(2, 2, 6, &raw_png_lines)?;
-        let png_url = format!("data:image/png;base64,{}", Base64::encode_string(&png));
+        let png_url = format!("data:image/png;base64,{}", encode_base64(&png)?);
         let (decoded_png, _) = decode_image_data_url(&png_url)?;
         assert_eq!(
             decoded_png.rgb,
@@ -841,7 +848,7 @@ mod tests {
     #[test]
     fn decode_image_data_url_raw_and_early_ihdr_budget_guard() -> Result<()> {
         let png = build_test_png(1, 1, 2, &[0, 11, 22, 33])?;
-        let url = format!("data:image/png;base64,{}", Base64::encode_string(&png));
+        let url = format!("data:image/png;base64,{}", encode_base64(&png)?);
         let (fmt, raw) = decode_image_data_url_raw(&url)?;
         assert_eq!(fmt, ImageContainerFormat::Png);
         assert_eq!(raw, png);

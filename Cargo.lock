@@ -1101,7 +1101,6 @@ dependencies = [
  "fdeflate",
  "fearless_simd",
  "hex",
- "rayon",
  "regex",
  "sentencepiece-rs",
  "serde",

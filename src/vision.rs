@@ -13,6 +13,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bonsai_native_hash::Hasher;
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+use fearless_simd::{Neon, f32x4, prelude::*};
 
 use crate::kernels::prefill::{MAX_TILE_TOKENS, ProjectionTile};
 use crate::kernels::{
@@ -335,6 +343,10 @@ impl SwiftVisionEncoder {
         Ok(())
     }
 
+    const fn use_pinned_projection(&self, tensor: &Tensor) -> bool {
+        !matches!(self.backend, MatvecBackend::Scalar) && tensor.kind == crate::kernels::F16
+    }
+
     fn encode_decoded(
         &self,
         decoded: &DecodedImage,
@@ -416,6 +428,7 @@ impl SwiftVisionEncoder {
             self.config.eps,
             &mut norm_buf,
             &self.row_parallelism,
+            self.backend,
         )?;
         let embeddings = self.run_merger(&norm_buf, n_tokens, &mut projector)?;
         Ok(EncodedImage {
@@ -452,6 +465,7 @@ impl SwiftVisionEncoder {
             self.config.eps,
             norm_buf,
             &self.row_parallelism,
+            self.backend,
         )?;
         run_self_attention(
             block,
@@ -463,6 +477,7 @@ impl SwiftVisionEncoder {
             attn_out_buf,
             projector,
             &self.row_parallelism,
+            self.backend,
         )?;
         for (h, (&res, &attn_val)) in hidden.iter_mut().zip(residual.iter().zip(&*attn_out_buf)) {
             *h = res + attn_val;
@@ -481,6 +496,7 @@ impl SwiftVisionEncoder {
             self.config.eps,
             norm_buf,
             &self.row_parallelism,
+            self.backend,
         )?;
         run_mlp_block(
             block,
@@ -491,6 +507,7 @@ impl SwiftVisionEncoder {
             hidden,
             projector,
             &self.row_parallelism,
+            self.backend,
         )?;
         if !is_finite_slice(hidden) {
             return Err(invalid("nonfinite values after ViT MLP residual"));
@@ -554,7 +571,7 @@ impl SwiftVisionEncoder {
                 &self.patch_embd,
                 &projector.inputs[..chunk],
                 &mut projector.outputs[..chunk],
-                false,
+                self.use_pinned_projection(&self.patch_embd),
                 &|| Ok(()),
             )?;
             let base_idx = tile_idx * MAX_TILE_TOKENS;
@@ -610,13 +627,14 @@ impl SwiftVisionEncoder {
                 &self.mm_0_w,
                 &projector.inputs[..chunk],
                 &mut projector.outputs[..chunk],
-                false,
+                self.use_pinned_projection(&self.mm_0_w),
                 &|| Ok(()),
             )?;
             apply_bias_gelu_rows(
                 &mut projector.outputs[..chunk],
                 &self.mm_0_b,
                 &self.row_parallelism,
+                self.backend,
             )?;
             std::mem::swap(&mut projector.inputs, &mut projector.outputs);
             projector.tile.project_with_previous(
@@ -624,7 +642,7 @@ impl SwiftVisionEncoder {
                 &self.mm_2_w,
                 &projector.inputs[..chunk],
                 &mut projector.outputs[..chunk],
-                false,
+                self.use_pinned_projection(&self.mm_2_w),
                 &|| Ok(()),
             )?;
             for proj_row in &projector.outputs[..chunk] {
@@ -1042,6 +1060,7 @@ fn run_self_attention(
     attn_out_buf: &mut [f32],
     projector: &mut TiledProjector,
     row_parallelism: &RowParallelism,
+    backend: MatvecBackend,
 ) -> Result<()> {
     let d = config.hidden_size;
     let d_head = d / config.num_heads;
@@ -1055,6 +1074,7 @@ fn run_self_attention(
         attn,
         projector,
         row_parallelism,
+        backend,
     )?;
 
     let kq_scale = 1.0_f32 / head_sqrt(d_head)?;
@@ -1072,7 +1092,7 @@ fn run_self_attention(
                 let k_head = &attn.k_heads[head * head_plane..(head + 1) * head_plane];
                 let v_head = &attn.v_heads[head * head_plane..(head + 1) * head_plane];
                 attend_head_four_queries(
-                    q_head, k_head, v_head, n_pos, d_head, kq_scale, scores_buf, out_head,
+                    q_head, k_head, v_head, n_pos, d_head, kq_scale, scores_buf, out_head, backend,
                 )?;
             }
             Ok(())
@@ -1086,6 +1106,7 @@ fn run_self_attention(
         &attn.head_out,
         attn_out_buf,
         projector,
+        backend,
     )
 }
 
@@ -1102,11 +1123,14 @@ fn fill_qkv_heads(
     attn: &mut AttentionScratch,
     projector: &mut TiledProjector,
     row_parallelism: &RowParallelism,
+    backend: MatvecBackend,
 ) -> Result<()> {
     let d = config.hidden_size;
     let d_head = d / config.num_heads;
     let n_dims = d_head / 2;
     let head_plane = n_pos * d_head;
+    let pinned_qkv = !matches!(backend, MatvecBackend::Scalar)
+        && block.attn_qkv_w.kind == crate::kernels::F16;
     for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
         let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
         copy_tile_rows(&mut projector.inputs, chunk, normed, tile_start, d);
@@ -1115,7 +1139,7 @@ fn fill_qkv_heads(
             &block.attn_qkv_w,
             &projector.inputs[..chunk],
             &mut projector.outputs[..chunk],
-            false,
+            pinned_qkv,
             &|| Ok(()),
         )?;
         let proj_rows = &projector.outputs[..chunk];
@@ -1192,7 +1216,24 @@ fn attend_head_four_queries(
     kq_scale: f32,
     scores_buf: &mut [f32],
     out_head: &mut [f32],
+    backend: MatvecBackend,
 ) -> Result<()> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if !matches!(backend, MatvecBackend::Scalar)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        return attend_head_four_queries_neon(
+            neon, q_head, k_head, v_head, n_pos, d_head, kq_scale, scores_buf, out_head,
+        );
+    }
+    let _ = backend;
+
     let quad_end = (n_pos / 4) * 4;
     let (s0, rest) = scores_buf.split_at_mut(n_pos);
     let (s1, rest) = rest.split_at_mut(n_pos);
@@ -1254,6 +1295,271 @@ fn attend_head_four_queries(
     Ok(())
 }
 
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+fn reduce4_f32x4(
+    a0: f32x4<Neon>,
+    a1: f32x4<Neon>,
+    a2: f32x4<Neon>,
+    a3: f32x4<Neon>,
+) -> f32x4<Neon> {
+    let p01 = a0.unzip_low(a1) + a0.unzip_high(a1);
+    let p23 = a2.unzip_low(a3) + a2.unzip_high(a3);
+    p01.unzip_low(p23) + p01.unzip_high(p23)
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Vectorized 4-query tiled ViT attention on baseline NEON."
+)]
+fn attend_head_four_queries_neon(
+    neon: Neon,
+    q_head: &[f32],
+    k_head: &[f32],
+    v_head: &[f32],
+    n_pos: usize,
+    d_head: usize,
+    kq_scale: f32,
+    scores_buf: &mut [f32],
+    out_head: &mut [f32],
+) -> Result<()> {
+    let quad_end = (n_pos / 4) * 4;
+    let (s0, rest) = scores_buf.split_at_mut(n_pos);
+    let (s1, rest) = rest.split_at_mut(n_pos);
+    let (s2, s3) = rest.split_at_mut(n_pos);
+    let s3 = &mut s3[..n_pos];
+
+    for q_base in (0..quad_end).step_by(4) {
+        let q0 = &q_head[q_base * d_head..(q_base + 1) * d_head];
+        let q1 = &q_head[(q_base + 1) * d_head..(q_base + 2) * d_head];
+        let q2 = &q_head[(q_base + 2) * d_head..(q_base + 3) * d_head];
+        let q3 = &q_head[(q_base + 3) * d_head..(q_base + 4) * d_head];
+        qk_four_queries_neon(
+            neon,
+            [q0, q1, q2, q3],
+            k_head,
+            n_pos,
+            d_head,
+            kq_scale,
+            &mut [s0, s1, s2, s3],
+        )?;
+        softmax(s0)?;
+        softmax(s1)?;
+        softmax(s2)?;
+        softmax(s3)?;
+        let (o0, rest) = out_head[q_base * d_head..(q_base + 4) * d_head].split_at_mut(d_head);
+        let (o1, rest) = rest.split_at_mut(d_head);
+        let (o2, o3) = rest.split_at_mut(d_head);
+        pv_four_queries_neon(
+            neon,
+            [s0, s1, s2, s3],
+            v_head,
+            n_pos,
+            d_head,
+            [o0, o1, o2, o3],
+        );
+    }
+
+    for q_tok in quad_end..n_pos {
+        let q = &q_head[q_tok * d_head..(q_tok + 1) * d_head];
+        let out_row = &mut out_head[q_tok * d_head..(q_tok + 1) * d_head];
+        attend_single_query(q, k_head, v_head, d_head, kq_scale, s0, out_row)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn qk_four_queries_neon(
+    neon: Neon,
+    qs: [&[f32]; 4],
+    k_head: &[f32],
+    n_pos: usize,
+    d_head: usize,
+    kq_scale: f32,
+    scores: &mut [&mut [f32]; 4],
+) -> Result<()> {
+    let k_quad_end = (n_pos / 4) * 4;
+    let d_vec_end = (d_head / 4) * 4;
+    let scale_vec = f32x4::splat(neon, kq_scale);
+    let mut finite_mask = scale_vec.is_finite();
+
+    for k_base in (0..k_quad_end).step_by(4) {
+        let ks = [
+            &k_head[k_base * d_head..(k_base + 1) * d_head],
+            &k_head[(k_base + 1) * d_head..(k_base + 2) * d_head],
+            &k_head[(k_base + 2) * d_head..(k_base + 3) * d_head],
+            &k_head[(k_base + 3) * d_head..(k_base + 4) * d_head],
+        ];
+        let mut acc = [[f32x4::splat(neon, 0.0); 4]; 4];
+        for d in (0..d_vec_end).step_by(4) {
+            let qv = [
+                f32x4::from_slice(neon, &qs[0][d..d + 4]),
+                f32x4::from_slice(neon, &qs[1][d..d + 4]),
+                f32x4::from_slice(neon, &qs[2][d..d + 4]),
+                f32x4::from_slice(neon, &qs[3][d..d + 4]),
+            ];
+            let kv = [
+                f32x4::from_slice(neon, &ks[0][d..d + 4]),
+                f32x4::from_slice(neon, &ks[1][d..d + 4]),
+                f32x4::from_slice(neon, &ks[2][d..d + 4]),
+                f32x4::from_slice(neon, &ks[3][d..d + 4]),
+            ];
+            for qi in 0..4 {
+                for ki in 0..4 {
+                    acc[qi][ki] = qv[qi].mul_add_precise(kv[ki], acc[qi][ki]);
+                }
+            }
+        }
+        for qi in 0..4 {
+            let mut dot = reduce4_f32x4(acc[qi][0], acc[qi][1], acc[qi][2], acc[qi][3]);
+            if d_vec_end < d_head {
+                let mut arr = dot.to_array();
+                for (ki, dst) in arr.iter_mut().enumerate() {
+                    for d in d_vec_end..d_head {
+                        *dst = qs[qi][d].mul_add(ks[ki][d], *dst);
+                    }
+                }
+                dot = f32x4::from_slice(neon, &arr);
+            }
+            let scaled = dot * scale_vec;
+            finite_mask &= scaled.is_finite();
+            scaled.store_slice(&mut scores[qi][k_base..k_base + 4]);
+        }
+    }
+
+    for k_tok in k_quad_end..n_pos {
+        let k = &k_head[k_tok * d_head..(k_tok + 1) * d_head];
+        let mut acc = [f32x4::splat(neon, 0.0); 4];
+        for d in (0..d_vec_end).step_by(4) {
+            let kv = f32x4::from_slice(neon, &k[d..d + 4]);
+            for (qi, &q) in qs.iter().enumerate() {
+                acc[qi] = f32x4::from_slice(neon, &q[d..d + 4]).mul_add_precise(kv, acc[qi]);
+            }
+        }
+        let mut arr = reduce4_f32x4(acc[0], acc[1], acc[2], acc[3]).to_array();
+        for (qi, dst) in arr.iter_mut().enumerate() {
+            for d in d_vec_end..d_head {
+                *dst = qs[qi][d].mul_add(k[d], *dst);
+            }
+            *dst *= kq_scale;
+            if !dst.is_finite() {
+                return Err(invalid("nonfinite ViT attention dot product"));
+            }
+            scores[qi][k_tok] = *dst;
+        }
+    }
+
+    if !finite_mask.all_true() {
+        return Err(invalid("nonfinite ViT attention dot product"));
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn pv_tile_chunks<const W: usize>(
+    neon: Neon,
+    scores: [&[f32]; 4],
+    v_head: &[f32],
+    n_pos: usize,
+    d_head: usize,
+    d_off: usize,
+    out: &mut [&mut [f32]; 4],
+) {
+    let mut acc = [[f32x4::splat(neon, 0.0); W]; 4];
+    for v_tok in 0..n_pos {
+        let p0 = f32x4::splat(neon, scores[0][v_tok]);
+        let p1 = f32x4::splat(neon, scores[1][v_tok]);
+        let p2 = f32x4::splat(neon, scores[2][v_tok]);
+        let p3 = f32x4::splat(neon, scores[3][v_tok]);
+        let v_base = v_tok * d_head + d_off;
+        for c in 0..W {
+            let vv = f32x4::from_slice(neon, &v_head[v_base + c * 4..v_base + (c + 1) * 4]);
+            acc[0][c] = p0.mul_add_precise(vv, acc[0][c]);
+            acc[1][c] = p1.mul_add_precise(vv, acc[1][c]);
+            acc[2][c] = p2.mul_add_precise(vv, acc[2][c]);
+            acc[3][c] = p3.mul_add_precise(vv, acc[3][c]);
+        }
+    }
+    for (dst, row_acc) in out.iter_mut().zip(acc) {
+        for (c, vec) in row_acc.into_iter().enumerate() {
+            vec.store_slice(&mut dst[d_off + c * 4..d_off + (c + 1) * 4]);
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn pv_four_queries_neon(
+    neon: Neon,
+    scores: [&[f32]; 4],
+    v_head: &[f32],
+    n_pos: usize,
+    d_head: usize,
+    mut out: [&mut [f32]; 4],
+) {
+    let d_16 = (d_head / 16) * 16;
+    let d_4 = (d_head / 4) * 4;
+    for d_off in (0..d_16).step_by(16) {
+        pv_tile_chunks::<4>(neon, scores, v_head, n_pos, d_head, d_off, &mut out);
+    }
+    match (d_4 - d_16) / 4 {
+        1 => pv_tile_chunks::<1>(neon, scores, v_head, n_pos, d_head, d_16, &mut out),
+        2 => pv_tile_chunks::<2>(neon, scores, v_head, n_pos, d_head, d_16, &mut out),
+        3 => pv_tile_chunks::<3>(neon, scores, v_head, n_pos, d_head, d_16, &mut out),
+        _ => {}
+    }
+    if d_4 < d_head {
+        for row in &mut out {
+            row[d_4..d_head].fill(0.0);
+        }
+        for (v_tok, v) in v_head.chunks_exact(d_head).enumerate() {
+            let (p0, p1, p2, p3) = (
+                scores[0][v_tok],
+                scores[1][v_tok],
+                scores[2][v_tok],
+                scores[3][v_tok],
+            );
+            for d in d_4..d_head {
+                let vv = v[d];
+                out[0][d] = p0.mul_add(vv, out[0][d]);
+                out[1][d] = p1.mul_add(vv, out[1][d]);
+                out[2][d] = p2.mul_add(vv, out[2][d]);
+                out[3][d] = p3.mul_add(vv, out[3][d]);
+            }
+        }
+    }
+}
+
 fn attend_single_query(
     q: &[f32],
     k_head: &[f32],
@@ -1288,10 +1594,13 @@ fn project_attn_output(
     head_out: &[f32],
     attn_out_buf: &mut [f32],
     projector: &mut TiledProjector,
+    backend: MatvecBackend,
 ) -> Result<()> {
     let d = config.hidden_size;
     let d_head = d / config.num_heads;
     let head_plane = n_pos * d_head;
+    let pinned_out = !matches!(backend, MatvecBackend::Scalar)
+        && block.attn_out_w.kind == crate::kernels::F16;
     for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
         let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
         for (t, dst) in projector.inputs.iter_mut().take(chunk).enumerate() {
@@ -1308,7 +1617,7 @@ fn project_attn_output(
             &block.attn_out_w,
             &projector.inputs[..chunk],
             &mut projector.outputs[..chunk],
-            false,
+            pinned_out,
             &|| Ok(()),
         )?;
         for (t, proj_row) in projector.outputs[..chunk].iter().enumerate() {
@@ -1324,11 +1633,96 @@ fn project_attn_output(
     Ok(())
 }
 
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+fn vector_exp_neg_x4(neon: Neon, neg_abs: f32x4<Neon>) -> f32x4<Neon> {
+    use fearless_simd::u32x4;
+
+    let min_arg = f32x4::splat(neon, -87.0);
+    let clamped = neg_abs.simd_lt(min_arg).select(min_arg, neg_abs);
+    let magic = f32x4::splat(neon, 12_582_912.0);
+    let z = clamped.mul_add(f32x4::splat(neon, f32::from_bits(0x3fb8_aa3b)), magic);
+    let n = z - magic;
+    let neg_n = -n;
+    let remainder = neg_n.mul_add(f32x4::splat(neon, f32::from_bits(0x3f31_7200)), clamped);
+    let remainder = neg_n.mul_add(f32x4::splat(neon, f32::from_bits(0x35bf_be8e)), remainder);
+    let exponent = z.bitcast::<u32x4<Neon>>() << 23;
+    let k = (exponent + u32x4::splat(neon, 1.0_f32.to_bits())).bitcast::<f32x4<Neon>>();
+    let square = remainder * remainder;
+    let inner = f32x4::splat(neon, f32::from_bits(0x3c07_2010))
+        .mul_add(remainder, f32x4::splat(neon, f32::from_bits(0x3d2b_9f17)))
+        .mul_add(
+            square,
+            f32x4::splat(neon, f32::from_bits(0x3e2a_af33))
+                .mul_add(remainder, f32x4::splat(neon, f32::from_bits(0x3eff_fedb))),
+        );
+    let polynomial = inner.mul_add(
+        square,
+        f32x4::splat(neon, f32::from_bits(0x3f7f_fff6)) * remainder,
+    );
+    let exp_val = polynomial.mul_add(k, k);
+    // Clamp exp(-inf / very negative) underflow cleanly to 0 while keeping NaNs.
+    neg_abs.simd_lt(min_arg).select(f32x4::splat(neon, 0.0), exp_val)
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[inline]
+fn gelu_tanh_x4(neon: Neon, x: f32x4<Neon>) -> f32x4<Neon> {
+    let one = f32x4::splat(neon, 1.0);
+    let zero = f32x4::splat(neon, 0.0);
+    let coeff = f32x4::splat(neon, 0.044_715);
+    let sqrt_2_over_pi = f32x4::splat(neon, SQRT_2_OVER_PI);
+    let z = sqrt_2_over_pi * x * coeff.mul_add_precise(x * x, one);
+    let e = vector_exp_neg_x4(neon, f32x4::splat(neon, -2.0) * z.abs());
+    let num = z.simd_ge(zero).select(one, e);
+    x * num / (one + e)
+}
+
 fn apply_bias_gelu_rows(
     rows: &mut [Vec<f32>],
     bias: &[f32],
     row_parallelism: &RowParallelism,
+    backend: MatvecBackend,
 ) -> Result<()> {
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if !matches!(backend, MatvecBackend::Scalar)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        return row_parallelism.update_chunks(rows, 1, |_, row_chunk| {
+            let (bias_chunks, bias_tail) = bias.as_chunks::<4>();
+            for proj_row in row_chunk {
+                let (dst_chunks, dst_tail) = proj_row.as_chunks_mut::<4>();
+                for (dst, b) in dst_chunks.iter_mut().zip(bias_chunks) {
+                    let x = f32x4::from_slice(neon, dst) + f32x4::from_slice(neon, b);
+                    gelu_tanh_x4(neon, x).store_slice(dst);
+                }
+                for (dst, &b) in dst_tail.iter_mut().zip(bias_tail) {
+                    *dst = gelu_tanh(*dst + b);
+                }
+            }
+            Ok(())
+        });
+    }
+    let _ = backend;
+
     row_parallelism.update_chunks(rows, 1, |_, row_chunk| {
         for proj_row in row_chunk {
             for (dst, &b) in proj_row.iter_mut().zip(bias) {
@@ -1352,8 +1746,13 @@ fn run_mlp_block(
     hidden: &mut [f32],
     projector: &mut TiledProjector,
     row_parallelism: &RowParallelism,
+    backend: MatvecBackend,
 ) -> Result<()> {
     let d = config.hidden_size;
+    let pinned_up =
+        !matches!(backend, MatvecBackend::Scalar) && block.ffn_up_w.kind == crate::kernels::F16;
+    let pinned_down =
+        !matches!(backend, MatvecBackend::Scalar) && block.ffn_down_w.kind == crate::kernels::F16;
     for tile_start in (0..n_pos).step_by(MAX_TILE_TOKENS) {
         let chunk = (n_pos - tile_start).min(MAX_TILE_TOKENS);
         copy_tile_rows(&mut projector.inputs, chunk, normed, tile_start, d);
@@ -1362,13 +1761,14 @@ fn run_mlp_block(
             &block.ffn_up_w,
             &projector.inputs[..chunk],
             &mut projector.outputs[..chunk],
-            false,
+            pinned_up,
             &|| Ok(()),
         )?;
         apply_bias_gelu_rows(
             &mut projector.outputs[..chunk],
             &block.ffn_up_b,
             row_parallelism,
+            backend,
         )?;
         std::mem::swap(&mut projector.inputs, &mut projector.outputs);
         projector.tile.project_with_previous(
@@ -1376,7 +1776,7 @@ fn run_mlp_block(
             &block.ffn_down_w,
             &projector.inputs[..chunk],
             &mut projector.outputs[..chunk],
-            false,
+            pinned_down,
             &|| Ok(()),
         )?;
         for (t, proj_row) in projector.outputs[..chunk].iter().enumerate() {
@@ -1392,6 +1792,92 @@ fn run_mlp_block(
         }
     }
     Ok(())
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "Vectorized LayerNorm mean/variance accumulation in binary32 across 4-wide NEON lanes."
+)]
+fn layer_norm_row_neon(
+    neon: Neon,
+    src: &[f32],
+    dst: &mut [f32],
+    weight: &[f32],
+    bias: &[f32],
+    eps: f32,
+) {
+    let inv_cols = 1.0_f32 / (src.len() as f32);
+    let (src8, src_rem8) = src.as_chunks::<8>();
+    let mut sum0 = f32x4::splat(neon, 0.0);
+    let mut sum1 = f32x4::splat(neon, 0.0);
+    for chunk in src8 {
+        sum0 += f32x4::from_slice(neon, &chunk[..4]);
+        sum1 += f32x4::from_slice(neon, &chunk[4..]);
+    }
+    let (src4, src_tail) = src_rem8.as_chunks::<4>();
+    for chunk in src4 {
+        sum0 += f32x4::from_slice(neon, chunk);
+    }
+    let mut sum = (sum0 + sum1).reduce_sum();
+    for &v in src_tail {
+        sum += v;
+    }
+    let mean = sum * inv_cols;
+    let mean_vec = f32x4::splat(neon, mean);
+
+    let mut var0 = f32x4::splat(neon, 0.0);
+    let mut var1 = f32x4::splat(neon, 0.0);
+    for chunk in src8 {
+        let d0 = f32x4::from_slice(neon, &chunk[..4]) - mean_vec;
+        let d1 = f32x4::from_slice(neon, &chunk[4..]) - mean_vec;
+        var0 = d0.mul_add_precise(d0, var0);
+        var1 = d1.mul_add_precise(d1, var1);
+    }
+    for chunk in src4 {
+        let d0 = f32x4::from_slice(neon, chunk) - mean_vec;
+        var0 = d0.mul_add_precise(d0, var0);
+    }
+    let mut var = (var0 + var1).reduce_sum();
+    for &v in src_tail {
+        let diff = v - mean;
+        var = diff.mul_add(diff, var);
+    }
+    let inv_std = 1.0_f32 / var.mul_add(inv_cols, eps).sqrt();
+    let inv_std_vec = f32x4::splat(neon, inv_std);
+
+    let (src4_all, src_tail_all) = src.as_chunks::<4>();
+    let (dst4_all, dst_tail_all) = dst.as_chunks_mut::<4>();
+    let (w4_all, w_tail_all) = weight.as_chunks::<4>();
+    let (b4_all, b_tail_all) = bias.as_chunks::<4>();
+    for (((s_chunk, d_chunk), w_chunk), b_chunk) in src4_all
+        .iter()
+        .zip(dst4_all)
+        .zip(w4_all)
+        .zip(b4_all)
+    {
+        let normalized = (f32x4::from_slice(neon, s_chunk) - mean_vec) * inv_std_vec;
+        let out = normalized.mul_add_precise(
+            f32x4::from_slice(neon, w_chunk),
+            f32x4::from_slice(neon, b_chunk),
+        );
+        out.store_slice(d_chunk);
+    }
+    for ((d, &s), (&w, &b)) in dst_tail_all
+        .iter_mut()
+        .zip(src_tail_all)
+        .zip(w_tail_all.iter().zip(b_tail_all))
+    {
+        let normalized = (s - mean) * inv_std;
+        *d = normalized.mul_add(w, b);
+    }
 }
 
 #[expect(
@@ -1413,6 +1899,7 @@ fn layer_norm_rows(
     eps: f32,
     output: &mut [f32],
     row_parallelism: &RowParallelism,
+    backend: MatvecBackend,
 ) -> Result<()> {
     if rows == 0
         || cols == 0
@@ -1423,6 +1910,32 @@ fn layer_norm_rows(
     {
         return Err(invalid("invalid LayerNorm dimensions"));
     }
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    if !matches!(backend, MatvecBackend::Scalar)
+        && let Some(neon) = fearless_simd::Level::baseline().as_neon()
+    {
+        row_parallelism.update_chunks(output, cols, |base_row, chunk| {
+            for (offset, dst) in chunk.chunks_exact_mut(cols).enumerate() {
+                let r = base_row + offset;
+                let src = &input[r * cols..(r + 1) * cols];
+                layer_norm_row_neon(neon, src, dst, weight, bias, eps);
+            }
+            Ok(())
+        })?;
+        if !is_finite_slice(output) {
+            return Err(invalid("nonfinite LayerNorm output"));
+        }
+        return Ok(());
+    }
+    let _ = backend;
+
     let inv_cols = 1.0_f64 / (cols as f64);
     row_parallelism.update_chunks(output, cols, |base_row, chunk| {
         for (offset, dst) in chunk.chunks_exact_mut(cols).enumerate() {
@@ -2061,16 +2574,16 @@ mod tests {
             &[1]
         };
         for &workers in workers_list {
-            let encoder = SwiftVisionEncoder::from_model(
+            let scalar_parallel = SwiftVisionEncoder::from_model(
                 &model,
-                MatvecBackend::Auto,
+                MatvecBackend::Scalar,
                 RowParallelism::new(workers)?,
             )?;
-            let actual = encoder.encode_rgb_image(&rgb, 16, 12, 16)?;
-            assert_eq!(actual.grid_width, expected.grid_width);
-            assert_eq!(actual.grid_height, expected.grid_height);
+            let actual_scalar = scalar_parallel.encode_rgb_image(&rgb, 16, 12, 16)?;
+            assert_eq!(actual_scalar.grid_width, expected.grid_width);
+            assert_eq!(actual_scalar.grid_height, expected.grid_height);
             assert_eq!(
-                actual
+                actual_scalar
                     .embeddings
                     .iter()
                     .map(|v| v.to_bits())
@@ -2080,7 +2593,26 @@ mod tests {
                     .iter()
                     .map(|v| v.to_bits())
                     .collect::<Vec<_>>(),
-                "vision encoder bit mismatch for Auto/{workers} workers"
+                "vision encoder bit mismatch for Scalar/{workers} workers"
+            );
+
+            let encoder = SwiftVisionEncoder::from_model(
+                &model,
+                MatvecBackend::Auto,
+                RowParallelism::new(workers)?,
+            )?;
+            let actual = encoder.encode_rgb_image(&rgb, 16, 12, 16)?;
+            assert_eq!(actual.grid_width, expected.grid_width);
+            assert_eq!(actual.grid_height, expected.grid_height);
+            let max_diff = actual
+                .embeddings
+                .iter()
+                .zip(expected.embeddings.iter())
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_diff < 1e-3,
+                "vision encoder Auto/{workers} max_diff={max_diff} exceeded tolerance"
             );
         }
 
@@ -2117,6 +2649,7 @@ mod tests {
             kq_scale,
             &mut quad_scores,
             &mut actual_head,
+            MatvecBackend::Scalar,
         )?;
         assert_eq!(
             actual_head.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -2124,6 +2657,178 @@ mod tests {
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>()
+        );
+
+        let mut auto_head = vec![0.0_f32; n_pos * d_head];
+        attend_head_four_queries(
+            &q_head,
+            &k_head,
+            &v_head,
+            n_pos,
+            d_head,
+            kq_scale,
+            &mut quad_scores,
+            &mut auto_head,
+            MatvecBackend::Auto,
+        )?;
+        let attn_diff = auto_head
+            .iter()
+            .zip(expected_head.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            attn_diff < 1e-4,
+            "4-query Auto attention diff={attn_diff} exceeded tolerance"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_f16_vit_encoder_and_simd_ops_match_scalar_within_tolerance() -> Result<()> {
+        // Test vectorized attention at ViT d_head = 72 (not a multiple of 16) with non-divisible n_pos.
+        let n_pos = 19;
+        let d_head = 72;
+        let kq_scale = 1.0_f32 / head_sqrt(d_head)?;
+        let q_head = varied_values(n_pos * d_head, 3, 0.15);
+        let k_head = varied_values(n_pos * d_head, 7, 0.15);
+        let v_head = varied_values(n_pos * d_head, 13, 0.15);
+        let mut s_scores = vec![0.0_f32; 4 * n_pos];
+        let mut expected_attn = vec![0.0_f32; n_pos * d_head];
+        let mut actual_attn = vec![0.0_f32; n_pos * d_head];
+        attend_head_four_queries(
+            &q_head,
+            &k_head,
+            &v_head,
+            n_pos,
+            d_head,
+            kq_scale,
+            &mut s_scores,
+            &mut expected_attn,
+            MatvecBackend::Scalar,
+        )?;
+        attend_head_four_queries(
+            &q_head,
+            &k_head,
+            &v_head,
+            n_pos,
+            d_head,
+            kq_scale,
+            &mut s_scores,
+            &mut actual_attn,
+            MatvecBackend::Auto,
+        )?;
+        let attn_max_diff = actual_attn
+            .iter()
+            .zip(&expected_attn)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            attn_max_diff < 1e-4,
+            "d_head=72 attention max_diff={attn_max_diff}"
+        );
+
+        // Test vectorized GELU across [-100, 100] and tail elements.
+        let gelu_inputs: Vec<f32> = (-200..=200)
+            .map(|i| f32::from(i16::try_from(i).unwrap_or(0)) * 0.05)
+            .chain([-100.0, -25.0, 25.0, 100.0])
+            .collect();
+        let gelu_bias = varied_values(gelu_inputs.len(), 9, 0.05);
+        let mut scalar_gelu = vec![gelu_inputs.clone()];
+        let mut auto_gelu = vec![gelu_inputs];
+        let serial = RowParallelism::new(1)?;
+        apply_bias_gelu_rows(&mut scalar_gelu, &gelu_bias, &serial, MatvecBackend::Scalar)?;
+        apply_bias_gelu_rows(&mut auto_gelu, &gelu_bias, &serial, MatvecBackend::Auto)?;
+        let gelu_max_diff = auto_gelu[0]
+            .iter()
+            .zip(&scalar_gelu[0])
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            gelu_max_diff < 1e-5,
+            "GELU SIMD max_diff={gelu_max_diff} exceeded 1e-5"
+        );
+
+        // Test vectorized LayerNorm across 1152-wide and odd 35-wide rows.
+        for cols in [35_usize, 1152_usize] {
+            let rows = 3;
+            let ln_in = varied_values(rows * cols, 17, 0.3);
+            let ln_w = varied_values(cols, 5, 0.1)
+                .into_iter()
+                .map(|v| v + 1.0)
+                .collect::<Vec<_>>();
+            let ln_b = varied_values(cols, 11, 0.05);
+            let mut ln_scalar = vec![0.0_f32; rows * cols];
+            let mut ln_auto = vec![0.0_f32; rows * cols];
+            layer_norm_rows(
+                &ln_in,
+                rows,
+                cols,
+                &ln_w,
+                &ln_b,
+                1e-6,
+                &mut ln_scalar,
+                &serial,
+                MatvecBackend::Scalar,
+            )?;
+            layer_norm_rows(
+                &ln_in,
+                rows,
+                cols,
+                &ln_w,
+                &ln_b,
+                1e-6,
+                &mut ln_auto,
+                &serial,
+                MatvecBackend::Auto,
+            )?;
+            let ln_max_diff = ln_auto
+                .iter()
+                .zip(&ln_scalar)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                ln_max_diff < 1e-5,
+                "LayerNorm cols={cols} max_diff={ln_max_diff} exceeded 1e-5"
+            );
+        }
+
+        // Full multi-head F16 ViT block + merger encoder parity (Auto vs Scalar).
+        let mut model = non_uniform_mmproj_model()?;
+        for (name, cols, rows, seed, scale) in [
+            ("v.blk.0.attn_qkv.weight", 32, 96, 13, 0.025),
+            ("v.blk.0.attn_out.weight", 32, 32, 19, 0.02),
+            ("v.blk.0.ffn_up.weight", 32, 64, 23, 0.02),
+            ("mm.0.weight", 128, 128, 31, 0.012),
+            ("mm.2.weight", 128, 32, 37, 0.015),
+        ] {
+            model.tensors.insert(
+                name.to_owned(),
+                f16_tensor(name, cols, rows, &varied_values(cols * rows, seed, scale))?,
+            );
+        }
+        let rgb: Vec<u8> = (0..16 * 12 * 3)
+            .map(|i| u8::try_from((i * 43 + 17) & 0xff).unwrap_or(0))
+            .collect();
+        let scalar_enc =
+            SwiftVisionEncoder::from_model(&model, MatvecBackend::Scalar, RowParallelism::new(1)?)?;
+        let scalar_out = scalar_enc.encode_rgb_image(&rgb, 16, 12, 16)?;
+        let workers = if cfg!(feature = "parallel-rows") { 4 } else { 1 };
+        let auto_enc = SwiftVisionEncoder::from_model(
+            &model,
+            MatvecBackend::Auto,
+            RowParallelism::new(workers)?,
+        )?;
+        let auto_out = auto_enc.encode_rgb_image(&rgb, 16, 12, 16)?;
+        assert_eq!(auto_out.embeddings.len(), scalar_out.embeddings.len());
+        let f16_max_diff = auto_out
+            .embeddings
+            .iter()
+            .zip(scalar_out.embeddings.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            f16_max_diff < 1e-3,
+            "full F16 ViT encoder Auto vs Scalar max_diff={f16_max_diff} exceeded 1e-3"
         );
         Ok(())
     }

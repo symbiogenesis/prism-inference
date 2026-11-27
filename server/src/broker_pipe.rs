@@ -1600,6 +1600,9 @@ mod tests {
                 write_frame(&mut p_to_c_w, 2, KIND_OPEN, &[])?;
                 write_frame(&mut p_to_c_w, 2, KIND_DATA, b"ok")?;
                 write_frame(&mut p_to_c_w, 2, KIND_EOF, &[])?;
+                if read_frame(&mut c_to_p_r)? != (2, KIND_EOF, Vec::new()) {
+                    return Err(io::Error::other("missing stream 2 eof"));
+                }
                 drop(p_to_c_w);
                 Ok(())
             });
@@ -1626,6 +1629,7 @@ mod tests {
             let mut body2 = Vec::new();
             conn2.read_to_end(&mut body2).await?;
             assert_eq!(body2, b"ok");
+            conn2.shutdown().await?;
             drop(conn2);
 
             assert!(endpoint.accept().await?.is_none());

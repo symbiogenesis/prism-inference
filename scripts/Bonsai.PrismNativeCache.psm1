@@ -25,19 +25,30 @@ function Initialize-BonsaiPrismNativeTree {
             throw 'Native build outputs exist without their verified source tree; use a fresh native build cache.'
         }
         if (-not $PSCmdlet.ShouldProcess($cached, "Copy verified Prism $Kind inputs for native build reuse")) { return }
-        [void][IO.Directory]::CreateDirectory($cached)
-        foreach ($entry in $Entries) {
-            $destination = Join-Path $cached ([IO.Path]::GetRelativePath($SourceDirectory, $entry.FullName))
-            if ($entry.PSIsContainer) { [void][IO.Directory]::CreateDirectory($destination) }
-            else {
-                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
-                [IO.File]::Copy($entry.FullName, $destination, $false)
-                [IO.File]::SetLastWriteTimeUtc($destination, $entry.LastWriteTimeUtc)
+        [void][IO.Directory]::CreateDirectory($BuildDirectory)
+        $staging = Join-Path $BuildDirectory ($Kind + '.tmp-' + [guid]::NewGuid().ToString('N'))
+        try {
+            [void][IO.Directory]::CreateDirectory($staging)
+            foreach ($entry in $Entries) {
+                $destination = Join-Path $staging ([IO.Path]::GetRelativePath($SourceDirectory, $entry.FullName))
+                if ($entry.PSIsContainer) { [void][IO.Directory]::CreateDirectory($destination) }
+                else {
+                    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
+                    [IO.File]::Copy($entry.FullName, $destination, $false)
+                    [IO.File]::SetLastWriteTimeUtc($destination, $entry.LastWriteTimeUtc)
+                }
             }
+            # Preserve the source mirror's post-copy path check without repeating
+            # ancestor walks when an existing cache is reused.
+            if ($Kind -eq 'source') { $null = Resolve-ExternalPath $staging }
+            [IO.Directory]::Move($staging, $cached)
+            if ($Kind -eq 'source') { $null = Resolve-ExternalPath $cached }
+        } catch {
+            if ([IO.Directory]::Exists($staging)) {
+                Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            throw
         }
-        # Preserve the source mirror's post-copy path check without repeating
-        # ancestor walks when an existing cache is reused.
-        if ($Kind -eq 'source') { $null = Resolve-ExternalPath $cached }
     }
     $cachedEntries = @(Get-ChildItem -LiteralPath $cached -Force -Recurse)
     if ($cachedEntries.Where({ $_.Attributes -band [IO.FileAttributes]::ReparsePoint }, 'First').Count) {

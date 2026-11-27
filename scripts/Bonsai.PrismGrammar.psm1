@@ -70,10 +70,29 @@ function Initialize-BonsaiPrismGrammarDependency {
             if ($name.EndsWith('/', [StringComparison]::Ordinal)) {
                 [void][IO.Directory]::CreateDirectory($path)
             } else {
-                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
-                $inputStream = $entry.Open()
-                $outputStream = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-                try { $inputStream.CopyTo($outputStream) } finally { $inputStream.Dispose(); $outputStream.Dispose() }
+                $parent = [IO.Path]::GetDirectoryName($path)
+                [void][IO.Directory]::CreateDirectory($parent)
+                $tempPath = Join-Path $parent ([IO.Path]::GetFileName($path) + '.tmp-' + [guid]::NewGuid().ToString('N'))
+                $inputStream = $null
+                $outputStream = $null
+                $committed = $false
+                try {
+                    $inputStream = $entry.Open()
+                    $outputStream = [IO.FileStream]::new($tempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                    $inputStream.CopyTo($outputStream)
+                    $outputStream.Dispose()
+                    $outputStream = $null
+                    $inputStream.Dispose()
+                    $inputStream = $null
+                    [IO.File]::Move($tempPath, $path, $false)
+                    $committed = $true
+                } finally {
+                    if ($null -ne $outputStream) { $outputStream.Dispose() }
+                    if ($null -ne $inputStream) { $inputStream.Dispose() }
+                    if (-not $committed -and (Test-Path -LiteralPath $tempPath)) {
+                        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                    }
+                }
             }
         }
     } finally { $zip.Dispose() }

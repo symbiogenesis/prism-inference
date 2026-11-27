@@ -38,52 +38,78 @@ function Save-BonsaiPrismMetadataAsset {
                     throw 'Invalid bounded metadata asset identity.'
                 }
                 $destination = Resolve-ExternalPath (Join-Path $root $asset.Path)
-                [void][IO.Directory]::CreateDirectory((Split-Path $destination -Parent))
+                $parent = [IO.Path]::GetDirectoryName($destination)
+                [void][IO.Directory]::CreateDirectory($parent)
                 if (Test-Path -LiteralPath $destination) { throw 'Metadata fixture destination must be fresh.' }
-                if ($asset.ContainsKey('CorpusPath')) {
-                    if ($asset.CorpusPath -cnotmatch '^tools/prism/upstream/metadata-api/[A-Za-z0-9_.-]+\.json$' -or
-                        $asset.Url -cne "https://huggingface.co/api/models/$provider/revision/$($model.Revision)") {
-                        throw 'Invalid frozen API corpus provenance.'
-                    }
-                    # API listings include changing activity fields even at a revision URL.
-                    # Use the original raw response corpus, never a decoded expected schema.
-                    Copy-Item -LiteralPath (Join-Path $runtimeSource $asset.CorpusPath) -Destination $destination
-                } else {
-                    if ($asset.Filename -cnotmatch '^[A-Za-z0-9_./-]+\.gguf$' -or
-                        $asset.Filename.Split('/') -ccontains '..' -or
-                        $asset.Status -ne 206 -or $asset.RangeBytes -ne $asset.Bytes -or
-                        $asset.Url -cne "https://huggingface.co/$provider/resolve/$($model.Revision)/$($asset.Filename)") {
-                        throw 'Invalid immutable GGUF range provenance.'
-                    }
-                    $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $asset.Url)
-                    $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::new(0, $asset.RangeBytes - 1)
-                    $response = $null
-                    try {
-                        $response = $client.Send($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead)
-                        $null = $response.EnsureSuccessStatusCode()
-                        $range = $response.Content.Headers.ContentRange
-                        if ([int]$response.StatusCode -ne 206 -or $null -eq $range -or $range.From -ne 0 -or
-                            $range.To -ne $asset.RangeBytes - 1 -or $response.Content.Headers.ContentLength -gt $asset.Bytes) {
-                            throw 'Server did not honor the exact bounded GGUF prefix request.'
+                $tempPath = Join-Path $parent ([IO.Path]::GetFileName($destination) + '.tmp-' + [guid]::NewGuid().ToString('N'))
+                $committed = $false
+                try {
+                    if ($asset.ContainsKey('CorpusPath')) {
+                        if ($asset.CorpusPath -cnotmatch '^tools/prism/upstream/metadata-api/[A-Za-z0-9_.-]+\.json$' -or
+                            $asset.Url -cne "https://huggingface.co/api/models/$provider/revision/$($model.Revision)") {
+                            throw 'Invalid frozen API corpus provenance.'
                         }
-                        $inputStream = $response.Content.ReadAsStream()
-                        $outputStream = [IO.FileStream]::new($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                        # API listings include changing activity fields even at a revision URL.
+                        # Use the original raw response corpus, never a decoded expected schema.
+                        [IO.File]::Copy((Join-Path $runtimeSource $asset.CorpusPath), $tempPath, $false)
+                    } else {
+                        if ($asset.Filename -cnotmatch '^[A-Za-z0-9_./-]+\.gguf$' -or
+                            $asset.Filename.Split('/') -ccontains '..' -or
+                            $asset.Status -ne 206 -or $asset.RangeBytes -ne $asset.Bytes -or
+                            $asset.Url -cne "https://huggingface.co/$provider/resolve/$($model.Revision)/$($asset.Filename)") {
+                            throw 'Invalid immutable GGUF range provenance.'
+                        }
+                        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $asset.Url)
+                        $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::new(0, $asset.RangeBytes - 1)
+                        $response = $null
+                        $inputStream = $null
+                        $outputStream = $null
                         try {
+                            $response = $client.Send($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+                            $null = $response.EnsureSuccessStatusCode()
+                            $range = $response.Content.Headers.ContentRange
+                            if ([int]$response.StatusCode -ne 206 -or $null -eq $range -or $range.From -ne 0 -or
+                                $range.To -ne $asset.RangeBytes - 1 -or $response.Content.Headers.ContentLength -gt $asset.Bytes) {
+                                throw 'Server did not honor the exact bounded GGUF prefix request.'
+                            }
+                            $inputStream = $response.Content.ReadAsStream()
+                            $outputStream = [IO.FileStream]::new($tempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
                             $buffer = [byte[]]::new(65536)
                             while (($count = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
                                 if ($outputStream.Length + $count -gt $asset.Bytes) { throw 'GGUF prefix exceeds its pinned size.' }
                                 $outputStream.Write($buffer, 0, $count)
                             }
-                        } finally { $inputStream.Dispose(); $outputStream.Dispose() }
-                    } finally { if ($response) { $response.Dispose() }; $request.Dispose() }
+                        } finally {
+                            if ($null -ne $outputStream) { $outputStream.Dispose() }
+                            if ($null -ne $inputStream) { $inputStream.Dispose() }
+                            if ($null -ne $response) { $response.Dispose() }
+                            $request.Dispose()
+                        }
+                    }
+                    Test-LockedArtifact -Path $tempPath -Bytes $asset.Bytes -Sha256 $asset.Sha256
+                    [IO.File]::Move($tempPath, $destination, $false)
+                    $committed = $true
+                } finally {
+                    if (-not $committed -and (Test-Path -LiteralPath $tempPath)) {
+                        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                    }
                 }
-                Test-LockedArtifact -Path $destination -Bytes $asset.Bytes -Sha256 $asset.Sha256
                 $receipts.Add(@{ Path=$destination; Bytes=$asset.Bytes; Sha256=$asset.Sha256; Url=$asset.Url })
             }
         }
         # The same verified manifest is consumed by both safe Rust target runs.
         $manifestDestination = Join-Path $root 'metadata/manifest.json'
-        Copy-Item -LiteralPath $lockPath -Destination $manifestDestination
+        $manifestTemp = Join-Path ([IO.Path]::GetDirectoryName($manifestDestination)) ('manifest.json.tmp-' + [guid]::NewGuid().ToString('N'))
+        $manifestCommitted = $false
+        try {
+            [IO.File]::Copy($lockPath, $manifestTemp, $false)
+            [IO.File]::Move($manifestTemp, $manifestDestination, $false)
+            $manifestCommitted = $true
+        } finally {
+            if (-not $manifestCommitted -and (Test-Path -LiteralPath $manifestTemp)) {
+                Remove-Item -LiteralPath $manifestTemp -Force -ErrorAction SilentlyContinue
+            }
+        }
         return @{ Assets=$receipts.ToArray(); Manifest=$manifestDestination; ManifestSha256=(Get-FileHash -LiteralPath $manifestDestination -Algorithm SHA256).Hash.ToLowerInvariant() }
     } finally { $client.Dispose() }
 }
@@ -122,9 +148,20 @@ function Save-BonsaiPrismFixture {
         if ($cache) {
             $cached = Resolve-ExternalPath (Join-Path $cache ($Lock.AssetPrefix + $entry.Path))
             $null = Receive-LockedArtifact -Uri $entry.Url -Path $cached -Bytes $entry.Bytes -Sha256 $entry.Sha256 -TimeoutSeconds 600
-            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
-            [IO.File]::Copy($cached, $path, $false)
-            Test-LockedArtifact -Path $path -Bytes $entry.Bytes -Sha256 $entry.Sha256
+            $parent = [IO.Path]::GetDirectoryName($path)
+            [void][IO.Directory]::CreateDirectory($parent)
+            $tempPath = Join-Path $parent ([IO.Path]::GetFileName($path) + '.tmp-' + [guid]::NewGuid().ToString('N'))
+            $committed = $false
+            try {
+                [IO.File]::Copy($cached, $tempPath, $false)
+                Test-LockedArtifact -Path $tempPath -Bytes $entry.Bytes -Sha256 $entry.Sha256
+                [IO.File]::Move($tempPath, $path, $false)
+                $committed = $true
+            } finally {
+                if (-not $committed -and (Test-Path -LiteralPath $tempPath)) {
+                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                }
+            }
         } else {
             $null = Receive-LockedArtifact -Uri $entry.Url -Path $path -Bytes $entry.Bytes -Sha256 $entry.Sha256 -TimeoutSeconds 600
         }

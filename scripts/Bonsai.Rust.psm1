@@ -212,6 +212,13 @@ function Invoke-BonsaiRustCheck {
         throw
     } finally {
         $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidence 'rust-checks.json') -Encoding utf8NoBOM
+        try {
+            if (Test-Path -LiteralPath $work) {
+                Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        } catch {
+            # Best-effort temp cleanup after writing rust-checks.json.
+        }
     }
     return $receipt
 }

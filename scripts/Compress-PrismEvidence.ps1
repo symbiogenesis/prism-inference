@@ -46,17 +46,33 @@ while ($directories.Count) {
     }
 }
 if (-not $files.Count) { throw 'No selected Prism evidence files were produced.' }
-[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
-$stream = [IO.FileStream]::new($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+if (Test-Path -LiteralPath $destination) { throw "Destination archive already exists: $destination" }
+$parent = [IO.Path]::GetDirectoryName($destination)
+[void][IO.Directory]::CreateDirectory($parent)
+$tempPath = Join-Path $parent ([IO.Path]::GetFileName($destination) + '.tmp-' + [guid]::NewGuid().ToString('N'))
+$stream = $null
+$archive = $null
+$committed = $false
+[long]$inputBytes = 0
 try {
+    $stream = [IO.FileStream]::new($tempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $true)
-    try {
-        [long]$inputBytes = 0
-        foreach ($file in $files) {
-            $relative = [IO.Path]::GetRelativePath($source, $file.FullName).Replace('\', '/')
-            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $relative, [IO.Compression.CompressionLevel]::Fastest)
-            $inputBytes += $file.Length
-        }
-    } finally { $archive.Dispose() }
-} finally { $stream.Dispose() }
+    foreach ($file in $files) {
+        $relative = [IO.Path]::GetRelativePath($source, $file.FullName).Replace('\', '/')
+        [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $relative, [IO.Compression.CompressionLevel]::Fastest)
+        $inputBytes += $file.Length
+    }
+    $archive.Dispose()
+    $archive = $null
+    $stream.Dispose()
+    $stream = $null
+    [IO.File]::Move($tempPath, $destination, $false)
+    $committed = $true
+} finally {
+    if ($null -ne $archive) { $archive.Dispose() }
+    if ($null -ne $stream) { $stream.Dispose() }
+    if (-not $committed -and (Test-Path -LiteralPath $tempPath)) {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
 return @{ ArchivePath=$destination; EvidenceKind=$EvidenceKind; FileCount=$files.Count; InputBytes=$inputBytes; ArchiveBytes=([IO.FileInfo]::new($destination)).Length }

@@ -3,6 +3,23 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
+function Stop-BonsaiProcessTree {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory)][string]$ErrorMessage
+    )
+    try {
+        if (-not $Process.HasExited) {
+            $Process.Kill($true)
+        }
+    } catch [System.InvalidOperationException], [System.ComponentModel.Win32Exception] {
+        if (-not $Process.HasExited) { throw }
+    }
+    if (-not $Process.WaitForExit(10000)) { throw $ErrorMessage }
+}
+
 function Invoke-BonsaiNativeProcess {
     <#
     .SYNOPSIS
@@ -54,8 +71,7 @@ function Invoke-BonsaiNativeProcess {
         if ($TimeoutSeconds -eq 0) { $process.WaitForExit() }
         elseif (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             $timedOut = $true
-            $process.Kill($true)
-            if (-not $process.WaitForExit(10000)) { throw "Native process did not terminate: $Executable" }
+            Stop-BonsaiProcessTree -Process $process -ErrorMessage "Native process did not terminate: $Executable"
         }
         # A descendant may keep a redirected pipe open after the root exits.
         if (-not $stdout.Wait(10000) -or -not $stderr.Wait(10000)) { throw "Native process output drain timed out: $Executable" }
@@ -73,8 +89,7 @@ function Invoke-BonsaiNativeProcess {
     } finally {
         try {
             if ($started -and -not $process.HasExited) {
-                $process.Kill($true)
-                if (-not $process.WaitForExit(10000)) { throw "Native process did not terminate during cleanup: $Executable" }
+                Stop-BonsaiProcessTree -Process $process -ErrorMessage "Native process did not terminate during cleanup: $Executable"
             }
         } finally { $process.Dispose() }
     }

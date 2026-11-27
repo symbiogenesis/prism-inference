@@ -97,6 +97,44 @@ struct PreparedBatch {
     tensors: [Option<crate::model::WeakTensorBytes>; 4],
 }
 
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+fn pack_pair_panels<P: Clone + Send>(
+    parallelism: &RowParallelism,
+    dst: &mut Vec<P>,
+    zeroed: P,
+    total_pairs: usize,
+    unit_len: usize,
+    pack_pair: impl Fn(usize, &mut [P]) -> Option<()> + Sync,
+) -> bool {
+    dst.clear();
+    let Some(total_elems) = total_pairs.checked_mul(unit_len) else {
+        return false;
+    };
+    if total_elems == 0 || dst.try_reserve_exact(total_elems).is_err() {
+        return false;
+    }
+    dst.resize(total_elems, zeroed);
+    let ok = parallelism
+        .update_chunks(&mut dst[..total_elems], unit_len, |base_pair, chunk| {
+            for (pair_offset, dst_pair) in chunk.chunks_exact_mut(unit_len).enumerate() {
+                pack_pair(base_pair + pair_offset, dst_pair)
+                    .ok_or_else(|| invalid("nonfinite or invalid panel block"))?;
+            }
+            Ok(())
+        })
+        .is_ok();
+    if !ok {
+        dst.clear();
+    }
+    ok && dst.len() == total_elems
+}
+
 #[derive(Default)]
 pub(crate) struct ProjectionTile {
     backend: MatvecBackend,
@@ -458,32 +496,23 @@ impl ProjectionTile {
                         || self.pq2_panels_blocks != block_count)
                 {
                     let chunks8_len = inputs.len() / 8;
-                    self.pq2_panels.clear();
-                    let mut packed_ok = true;
-                    for c in 0..chunks8_len {
-                        for p in 0..4 {
-                            let t0 =
-                                &self.preparations[c * 8 + p * 2].pq2_consumption[..block_count];
-                            let t1 = &self.preparations[c * 8 + p * 2 + 1].pq2_consumption
-                                [..block_count];
-                            if dotprod
-                                .append_i8mm_pair_blocks(t0, t1, &mut self.pq2_panels)
-                                .is_none()
-                            {
-                                packed_ok = false;
-                                break;
-                            }
-                        }
-                        if !packed_ok {
-                            break;
-                        }
-                    }
-                    if packed_ok && self.pq2_panels.len() == chunks8_len * 4 * block_count {
+                    let preparations = &self.preparations[..inputs.len()];
+                    if pack_pair_panels(
+                        &self.row_parallelism,
+                        &mut self.pq2_panels,
+                        bonsai_neon_dot::Pq2I8mmPairBlock::zeroed(),
+                        chunks8_len * 4,
+                        block_count,
+                        |pair_idx, dst_pair| {
+                            let t0 = &preparations[pair_idx * 2].pq2_consumption[..block_count];
+                            let t1 = &preparations[pair_idx * 2 + 1].pq2_consumption[..block_count];
+                            dotprod.pack_i8mm_pair_blocks_into(t0, t1, dst_pair)
+                        },
+                    ) {
                         self.pq2_panels_valid = true;
                         self.pq2_panels_tokens = inputs.len();
                         self.pq2_panels_blocks = block_count;
                     } else {
-                        self.pq2_panels.clear();
                         self.pq2_panels_valid = false;
                     }
                 }
@@ -516,30 +545,23 @@ impl ProjectionTile {
                         || self.ptq1_panels_groups != q8_len)
                 {
                     let chunks8_len = inputs.len() / 8;
-                    self.ptq1_panels.clear();
-                    let mut packed_ok = true;
-                    for c in 0..chunks8_len {
-                        for p in 0..4 {
-                            let t0 = &self.preparations[c * 8 + p * 2].q8[..q8_len];
-                            let t1 = &self.preparations[c * 8 + p * 2 + 1].q8[..q8_len];
-                            if ptq1_dotprod
-                                .append_pinned_i8mm_pair_blocks(t0, t1, &mut self.ptq1_panels)
-                                .is_none()
-                            {
-                                packed_ok = false;
-                                break;
-                            }
-                        }
-                        if !packed_ok {
-                            break;
-                        }
-                    }
-                    if packed_ok && self.ptq1_panels.len() == chunks8_len * 4 * q8_len {
+                    let preparations = &self.preparations[..inputs.len()];
+                    if pack_pair_panels(
+                        &self.row_parallelism,
+                        &mut self.ptq1_panels,
+                        bonsai_neon_dot::Ptq1PinnedI8mmPairBlock::zeroed(),
+                        chunks8_len * 4,
+                        q8_len,
+                        |pair_idx, dst_pair| {
+                            let t0 = &preparations[pair_idx * 2].q8[..q8_len];
+                            let t1 = &preparations[pair_idx * 2 + 1].q8[..q8_len];
+                            ptq1_dotprod.pack_pinned_i8mm_pair_blocks_into(t0, t1, dst_pair)
+                        },
+                    ) {
                         self.ptq1_panels_valid = true;
                         self.ptq1_panels_tokens = inputs.len();
                         self.ptq1_panels_groups = q8_len;
                     } else {
-                        self.ptq1_panels.clear();
                         self.ptq1_panels_valid = false;
                     }
                 }
@@ -2873,6 +2895,79 @@ mod tests {
                     assert!(outs.iter().all(Vec::is_empty));
                     tile.project(&valid_tensor, &zero_inputs, &mut outs, pinned, &|| Ok(()))?;
                     assert!(outs.iter().all(|out| out.len() == 13));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "experimental-neon",
+        feature = "parallel-rows",
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc",
+        target_feature = "neon"
+    ))]
+    #[test]
+    fn parallel_panel_packing_matches_serial_bits_across_workers() -> Result<()> {
+        let columns = 512_usize;
+        let rows = 16_usize;
+        for kind in [PQ2, PTQ1] {
+            let blocks_per_row = columns / 128;
+            let mut data = Vec::new();
+            for row in 0..rows {
+                for blk in 0..blocks_per_row {
+                    let mut raw = [0_u8; 34];
+                    let scale = u16::try_from(0x3400_usize + ((row * 3 + blk) % 16) * 0x10)?;
+                    raw[..2].copy_from_slice(&scale.to_le_bytes());
+                    for (idx, slot) in raw[2..].iter_mut().enumerate() {
+                        *slot = if kind == PTQ1 {
+                            [0x00, 0x55, 0x66, 0x99, 0xaa][(row + blk + idx) % 5]
+                        } else {
+                            u8::try_from((row * 29 + blk * 13 + idx * 7) & 0xff)?
+                        };
+                    }
+                    if kind == PTQ1 {
+                        data.extend_from_slice(&bonsai_ternary::pack_ptq(&raw)?);
+                    } else {
+                        data.extend_from_slice(&raw);
+                    }
+                }
+            }
+            let tensor = Tensor {
+                name: format!("panel-pack-{kind}"),
+                dimensions: vec![columns, rows],
+                kind,
+                data: Arc::<[u8]>::from(data).into(),
+            };
+            let inputs = make_f32_inputs(MAX_TILE_TOKENS, columns, 41);
+            let mut serial_tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
+            let mut serial_out = vec![Vec::new(); MAX_TILE_TOKENS];
+            serial_tile.project(&tensor, &inputs, &mut serial_out, true, &|| Ok(()))?;
+            for workers in [2_usize, 4, 8] {
+                let mut par_tile = ProjectionTile::with_backend(MatvecBackend::ExperimentalNeon);
+                par_tile.set_row_parallelism(RowParallelism::new(workers)?);
+                let mut par_out = vec![Vec::new(); MAX_TILE_TOKENS];
+                par_tile.project(&tensor, &inputs, &mut par_out, true, &|| Ok(()))?;
+                for (s, p) in serial_out.iter().zip(&par_out) {
+                    let sb: Vec<u32> = s.iter().copied().map(f32::to_bits).collect();
+                    let pb: Vec<u32> = p.iter().copied().map(f32::to_bits).collect();
+                    assert_eq!(sb, pb, "kind={kind} workers={workers}");
+                }
+                if kind == PQ2 {
+                    assert_eq!(par_tile.pq2_panels.len(), serial_tile.pq2_panels.len());
+                    for (a, b) in serial_tile.pq2_panels.iter().zip(&par_tile.pq2_panels) {
+                        assert_eq!(a.planes, b.planes);
+                        assert_eq!(a.sums, b.sums);
+                        assert_eq!(a.scales.map(f32::to_bits), b.scales.map(f32::to_bits));
+                    }
+                } else {
+                    assert_eq!(par_tile.ptq1_panels.len(), serial_tile.ptq1_panels.len());
+                    for (a, b) in serial_tile.ptq1_panels.iter().zip(&par_tile.ptq1_panels) {
+                        assert_eq!(a.planes, b.planes);
+                        assert_eq!(a.scales.map(f32::to_bits), b.scales.map(f32::to_bits));
+                    }
                 }
             }
         }

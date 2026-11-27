@@ -45,6 +45,19 @@ const _: () = assert!(core::mem::offset_of!(Pq2I8mmPairBlock, planes) == 0);
 const _: () = assert!(core::mem::offset_of!(Pq2I8mmPairBlock, sums) == 256);
 const _: () = assert!(core::mem::offset_of!(Pq2I8mmPairBlock, scales) == 264);
 
+impl Pq2I8mmPairBlock {
+    /// Returns a zeroed [`Pq2I8mmPairBlock`].
+    #[inline]
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self {
+            planes: [([0_i8; 16], [0_i8; 16]); 8],
+            sums: [0; 2],
+            scales: [0.0; 2],
+        }
+    }
+}
+
 /// One 32-element quantized `Q8_0` activation group with its original finite scale.
 #[derive(Clone, Copy, Debug)]
 pub struct Q8ActivationBlock {
@@ -94,6 +107,18 @@ pub struct Ptq1PinnedI8mmPairBlock {
 const _: () = assert!(size_of::<Ptq1PinnedI8mmPairBlock>() == 80);
 const _: () = assert!(core::mem::offset_of!(Ptq1PinnedI8mmPairBlock, planes) == 0);
 const _: () = assert!(core::mem::offset_of!(Ptq1PinnedI8mmPairBlock, scales) == 64);
+
+impl Ptq1PinnedI8mmPairBlock {
+    /// Returns a zeroed [`Ptq1PinnedI8mmPairBlock`].
+    #[inline]
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self {
+            planes: [[0_i8; 16]; 4],
+            scales: [0.0; 2],
+        }
+    }
+}
 
 impl Ptq1Activation {
     /// Returns a zeroed [`Ptq1Activation`] block.
@@ -298,6 +323,25 @@ pub(super) fn valid_pq2_tokens_only(tokens: &[&[Pq2Activation]]) -> Option<usize
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+fn portable_pack_pq2_i8mm_pair_block(b0: &Pq2Activation, b1: &Pq2Activation) -> Pq2I8mmPairBlock {
+    let mut planes = [([0_i8; 16], [0_i8; 16]); 8];
+    for (plane_idx, dst) in planes.iter_mut().enumerate() {
+        let off = plane_idx * 16;
+        let p0 = &b0.values[off..off + 16];
+        let p1 = &b1.values[off..off + 16];
+        dst.0[..8].copy_from_slice(&p0[..8]);
+        dst.0[8..].copy_from_slice(&p1[..8]);
+        dst.1[..8].copy_from_slice(&p0[8..]);
+        dst.1[8..].copy_from_slice(&p1[8..]);
+    }
+    Pq2I8mmPairBlock {
+        planes,
+        sums: [b0.sum, b1.sum],
+        scales: [b0.scale, b1.scale],
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn portable_append_i8mm_pair_blocks(
     t0: &[Pq2Activation],
     t1: &[Pq2Activation],
@@ -305,21 +349,18 @@ pub(super) fn portable_append_i8mm_pair_blocks(
 ) {
     out.reserve(t0.len());
     for (b0, b1) in t0.iter().zip(t1.iter()) {
-        let mut planes = [([0_i8; 16], [0_i8; 16]); 8];
-        for (plane_idx, dst) in planes.iter_mut().enumerate() {
-            let off = plane_idx * 16;
-            let p0 = &b0.values[off..off + 16];
-            let p1 = &b1.values[off..off + 16];
-            dst.0[..8].copy_from_slice(&p0[..8]);
-            dst.0[8..].copy_from_slice(&p1[..8]);
-            dst.1[..8].copy_from_slice(&p0[8..]);
-            dst.1[8..].copy_from_slice(&p1[8..]);
-        }
-        out.push(Pq2I8mmPairBlock {
-            planes,
-            sums: [b0.sum, b1.sum],
-            scales: [b0.scale, b1.scale],
-        });
+        out.push(portable_pack_pq2_i8mm_pair_block(b0, b1));
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn portable_pack_i8mm_pair_blocks_into(
+    t0: &[Pq2Activation],
+    t1: &[Pq2Activation],
+    out: &mut [Pq2I8mmPairBlock],
+) {
+    for (dst, (b0, b1)) in out.iter_mut().zip(t0.iter().zip(t1.iter())) {
+        *dst = portable_pack_pq2_i8mm_pair_block(b0, b1);
     }
 }
 
@@ -473,6 +514,27 @@ pub(super) fn valid_ptq1_8x8_chunks_up_to_8<A: Q8ActivationView>(
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+fn portable_pack_ptq1_pinned_i8mm_pair_block<A: Q8ActivationView>(
+    b0: &A,
+    b1: &A,
+) -> Ptq1PinnedI8mmPairBlock {
+    let v0 = b0.values();
+    let v1 = b1.values();
+    let mut planes = [[0_i8; 16]; 4];
+    for (lane, dst) in planes.iter_mut().enumerate() {
+        let off = lane * 4;
+        dst[0..4].copy_from_slice(&v0[off..off + 4]);
+        dst[4..8].copy_from_slice(&v0[16 + off..16 + off + 4]);
+        dst[8..12].copy_from_slice(&v1[off..off + 4]);
+        dst[12..16].copy_from_slice(&v1[16 + off..16 + off + 4]);
+    }
+    Ptq1PinnedI8mmPairBlock {
+        planes,
+        scales: [b0.scale(), b1.scale()],
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn portable_append_ptq1_pinned_i8mm_pair_blocks<A: Q8ActivationView>(
     t0: &[A],
     t1: &[A],
@@ -480,20 +542,18 @@ pub(super) fn portable_append_ptq1_pinned_i8mm_pair_blocks<A: Q8ActivationView>(
 ) {
     out.reserve(t0.len());
     for (b0, b1) in t0.iter().zip(t1.iter()) {
-        let v0 = b0.values();
-        let v1 = b1.values();
-        let mut planes = [[0_i8; 16]; 4];
-        for (lane, dst) in planes.iter_mut().enumerate() {
-            let off = lane * 4;
-            dst[0..4].copy_from_slice(&v0[off..off + 4]);
-            dst[4..8].copy_from_slice(&v0[16 + off..16 + off + 4]);
-            dst[8..12].copy_from_slice(&v1[off..off + 4]);
-            dst[12..16].copy_from_slice(&v1[16 + off..16 + off + 4]);
-        }
-        out.push(Ptq1PinnedI8mmPairBlock {
-            planes,
-            scales: [b0.scale(), b1.scale()],
-        });
+        out.push(portable_pack_ptq1_pinned_i8mm_pair_block(b0, b1));
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn portable_pack_ptq1_pinned_i8mm_pair_blocks_into<A: Q8ActivationView>(
+    t0: &[A],
+    t1: &[A],
+    out: &mut [Ptq1PinnedI8mmPairBlock],
+) {
+    for (dst, (b0, b1)) in out.iter_mut().zip(t0.iter().zip(t1.iter())) {
+        *dst = portable_pack_ptq1_pinned_i8mm_pair_block(b0, b1);
     }
 }
 
@@ -1372,6 +1432,10 @@ mod tests {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verifies 1..=8 chunk PQ2 I8MM panel parity, slice-fill packing, and NaN/Inf scale rejection."
+    )]
     #[test]
     fn x1_pq2_prepared_chunks_and_i8mm_panels_match_portable() -> Result<(), &'static str> {
         let Some(detected) = crate::Pq2Dotprod::detect() else {
@@ -1388,13 +1452,13 @@ mod tests {
         #[cfg(not(target_arch = "aarch64"))]
         let caps = [detected];
 
-        for (seed, block_count) in [1_usize, 16, 17, 33].into_iter().enumerate() {
+        for (seed, block_count) in [1_usize, 3, 4, 5, 7, 8, 9, 40, 136].into_iter().enumerate() {
             let (owned_rows, act_storage) = sample_scaled_8x8_fixture(block_count, seed + 19);
             let row_refs: [&[u8]; 8] = std::array::from_fn(|r| owned_rows[r].as_slice());
             let chunk_slices: [[&[Pq2Activation]; 8]; 8] = std::array::from_fn(|c| {
                 std::array::from_fn(|t| act_storage[(c * 8 + t) % act_storage.len()].as_slice())
             });
-            for count in [1_usize, 4, 8] {
+            for count in 1..=8_usize {
                 let active_chunks = &chunk_slices[..count];
                 let mut expected_fused = vec![[[0.0_f32; 8]; 8]; count];
                 let mut expected_unfused = vec![[[0.0_f32; 8]; 8]; count];
@@ -1424,6 +1488,82 @@ mod tests {
                         &expected_unfused,
                         block_count,
                     )?;
+                }
+            }
+            // Verify slice-fill packing parity and NaN/Inf weight scale rejection at first/middle/last block.
+            let mut appended = Vec::new();
+            let mut into_buf = vec![super::Pq2I8mmPairBlock::zeroed(); block_count];
+            assert!(
+                detected
+                    .append_i8mm_pair_blocks(chunk_slices[0][0], chunk_slices[0][1], &mut appended)
+                    .is_some()
+            );
+            assert!(
+                detected
+                    .pack_i8mm_pair_blocks_into(
+                        chunk_slices[0][0],
+                        chunk_slices[0][1],
+                        &mut into_buf
+                    )
+                    .is_some()
+            );
+            assert_eq!(appended.len(), into_buf.len());
+            for (a, b) in appended.iter().zip(&into_buf) {
+                assert_eq!(a.planes, b.planes);
+                assert_eq!(a.sums, b.sums);
+                assert_eq!(a.scales.map(f32::to_bits), b.scales.map(f32::to_bits));
+            }
+            if block_count >= 1 {
+                let mut panel_storage = Vec::new();
+                for chunk in &chunk_slices[..2] {
+                    for p in 0..4 {
+                        assert!(
+                            detected
+                                .append_i8mm_pair_blocks(
+                                    chunk[2 * p],
+                                    chunk[2 * p + 1],
+                                    &mut panel_storage
+                                )
+                                .is_some()
+                        );
+                    }
+                }
+                let panel_chunks: [[&[super::Pq2I8mmPairBlock]; 4]; 2] = std::array::from_fn(|c| {
+                    std::array::from_fn(|p| {
+                        let start = (c * 4 + p) * block_count;
+                        &panel_storage[start..start + block_count]
+                    })
+                });
+                let prepared = detected
+                    .prepare_scaled_chunks(&chunk_slices[..2])
+                    .ok_or("valid PQ2 chunks must prepare")?;
+                for bad_f16 in [0x7e00_u16, 0x7c00, 0xfc00] {
+                    for bad_blk in [0_usize, block_count / 2, block_count - 1] {
+                        let mut bad_rows = owned_rows.clone();
+                        let row_slot = (bad_blk + 3) % 8;
+                        bad_rows[row_slot][bad_blk * 34..bad_blk * 34 + 2]
+                            .copy_from_slice(&bad_f16.to_le_bytes());
+                        let bad_refs: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                        let mut out = [[[0.0_f32; 8]; 8]; 2];
+                        assert!(
+                            prepared
+                                .dot_scaled_8x8_chunks_with_panels::<true>(
+                                    bad_refs,
+                                    &panel_chunks,
+                                    &mut out
+                                )
+                                .is_none()
+                        );
+                        assert!(
+                            prepared
+                                .dot_scaled_8x8_chunks_with_panels::<false>(
+                                    bad_refs,
+                                    &panel_chunks,
+                                    &mut out
+                                )
+                                .is_none()
+                        );
+                    }
                 }
             }
         }
@@ -3031,6 +3171,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verifies 1..=8 chunk PTQ1 pinned I8MM panel parity, slice-fill packing, and NaN/Inf scale rejection."
+    )]
     #[test]
     fn x1_ptq1_pinned_i8mm_panels_match_portable_and_reject_bad_inputs() {
         use super::portable_ptq1_8x8_chunks_validated;
@@ -3038,79 +3182,173 @@ mod tests {
         let Some(caps) = ptq1_test_caps() else {
             return;
         };
-        for block_count in [1_usize, 3, 5] {
+        for block_count in [1_usize, 3, 4, 5, 7, 8, 9, 40, 136] {
             let q8_len = block_count * 4;
             let (rows, acts) = sample_ptq1_32tok_fixture(block_count, 13);
             let row_refs: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
-            let chunk_slices: [[&[super::Q8ActivationBlock]; 8]; 4] =
-                std::array::from_fn(|c| std::array::from_fn(|t| acts[c * 8 + t].as_slice()));
-            let mut expected = [[[0.0_f32; 8]; 8]; 4];
-            assert!(
-                portable_ptq1_8x8_chunks_validated::<true, _>(
-                    row_refs,
-                    &chunk_slices,
-                    &mut expected
-                )
-                .is_some()
-            );
+            let chunk_slices: [[&[super::Q8ActivationBlock]; 8]; 8] = std::array::from_fn(|c| {
+                std::array::from_fn(|t| acts[(c * 8 + t) % acts.len()].as_slice())
+            });
 
-            for &cap in &caps {
-                let mut packed = Vec::new();
-                for chunk in &chunk_slices {
-                    for p in 0..4 {
-                        assert!(
-                            cap.append_pinned_i8mm_pair_blocks(
+            for count in 1..=8_usize {
+                let active_chunks = &chunk_slices[..count];
+                let mut expected = vec![[[0.0_f32; 8]; 8]; count];
+                for (c_chunk, e_chunk) in active_chunks.chunks(4).zip(expected.chunks_mut(4)) {
+                    assert!(
+                        portable_ptq1_8x8_chunks_validated::<true, _>(row_refs, c_chunk, e_chunk)
+                            .is_some()
+                    );
+                }
+
+                for &cap in &caps {
+                    let mut packed = Vec::new();
+                    for chunk in active_chunks {
+                        for p in 0..4 {
+                            assert!(
+                                cap.append_pinned_i8mm_pair_blocks(
+                                    chunk[2 * p],
+                                    chunk[2 * p + 1],
+                                    &mut packed,
+                                )
+                                .is_some()
+                            );
+                        }
+                    }
+                    let mut packed_into =
+                        vec![super::Ptq1PinnedI8mmPairBlock::zeroed(); count * 4 * q8_len];
+                    for (c, chunk) in active_chunks.iter().enumerate() {
+                        for p in 0..4 {
+                            let start = (c * 4 + p) * q8_len;
+                            assert!(
+                                cap.pack_pinned_i8mm_pair_blocks_into(
+                                    chunk[2 * p],
+                                    chunk[2 * p + 1],
+                                    &mut packed_into[start..start + q8_len],
+                                )
+                                .is_some()
+                            );
+                        }
+                    }
+                    for (a, b) in packed.iter().zip(&packed_into) {
+                        assert_eq!(a.planes, b.planes);
+                        assert_eq!(a.scales.map(f32::to_bits), b.scales.map(f32::to_bits));
+                    }
+
+                    let panel_chunks: Vec<[&[super::Ptq1PinnedI8mmPairBlock]; 4]> = (0..count)
+                        .map(|c| {
+                            std::array::from_fn(|p| {
+                                let start = (c * 4 + p) * q8_len;
+                                &packed_into[start..start + q8_len]
+                            })
+                        })
+                        .collect();
+
+                    let mut actual = vec![[[f32::NAN; 8]; 8]; count];
+                    assert!(
+                        cap.dot_scaled_8x8_chunks_with_pinned_panels(
+                            row_refs,
+                            active_chunks,
+                            &panel_chunks,
+                            &mut actual,
+                        )
+                        .is_some()
+                    );
+                    for (e, a) in expected.iter().zip(actual.iter()) {
+                        for r in 0..8 {
+                            assert_eq!(e[r].map(f32::to_bits), a[r].map(f32::to_bits));
+                        }
+                    }
+                }
+            }
+
+            let mut packed_bad = Vec::new();
+            for chunk in &chunk_slices[..2] {
+                for p in 0..4 {
+                    assert!(
+                        caps[0]
+                            .append_pinned_i8mm_pair_blocks(
                                 chunk[2 * p],
                                 chunk[2 * p + 1],
-                                &mut packed,
+                                &mut packed_bad,
                             )
                             .is_some()
+                    );
+                }
+            }
+            let panel_chunks_bad: [[&[super::Ptq1PinnedI8mmPairBlock]; 4]; 2] =
+                std::array::from_fn(|c| {
+                    std::array::from_fn(|p| {
+                        let start = (c * 4 + p) * q8_len;
+                        &packed_bad[start..start + q8_len]
+                    })
+                });
+            for bad_f16 in [0x7e00_u16, 0x7c00, 0xfc00] {
+                for bad_blk in [0_usize, block_count / 2, block_count - 1] {
+                    let mut bad_rows = rows.clone();
+                    let row_slot = (bad_blk + 5) % 8;
+                    let off = bad_blk * 28 + 26;
+                    bad_rows[row_slot][off..off + 2].copy_from_slice(&bad_f16.to_le_bytes());
+                    let bad_refs: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                    for &cap in &caps {
+                        let mut out = [[[0.0_f32; 8]; 8]; 2];
+                        assert!(
+                            cap.dot_scaled_8x8_chunks_with_pinned_panels(
+                                bad_refs,
+                                &chunk_slices[..2],
+                                &panel_chunks_bad,
+                                &mut out,
+                            )
+                            .is_none()
                         );
                     }
                 }
-                let panel_chunks: [[&[super::Ptq1PinnedI8mmPairBlock]; 4]; 4] =
-                    std::array::from_fn(|c| {
-                        std::array::from_fn(|p| {
-                            let start = (c * 4 + p) * q8_len;
-                            &packed[start..start + q8_len]
-                        })
-                    });
-
-                let mut actual = [[[f32::NAN; 8]; 8]; 4];
-                assert!(
-                    cap.dot_scaled_8x8_chunks_with_pinned_panels(
-                        row_refs,
-                        &chunk_slices,
-                        &panel_chunks,
-                        &mut actual,
-                    )
-                    .is_some()
-                );
-                for (e, a) in expected.iter().zip(actual.iter()) {
-                    for r in 0..8 {
-                        assert_eq!(e[r].map(f32::to_bits), a[r].map(f32::to_bits));
-                    }
-                }
-
-                // Mismatched panel length must return None without touching sentinel outputs.
-                let sentinel = [[[77.5_f32; 8]; 8]; 4];
-                let mut bad_out = sentinel;
-                let mut bad_panels = panel_chunks;
-                bad_panels[1][2] = &panel_chunks[1][2][..q8_len - 1];
-                assert!(
-                    cap.dot_scaled_8x8_chunks_with_pinned_panels(
-                        row_refs,
-                        &chunk_slices,
-                        &bad_panels,
-                        &mut bad_out,
-                    )
-                    .is_none()
-                );
-                assert_eq!(
-                    bad_out.map(|c| c.map(|r| r.map(f32::to_bits))),
-                    sentinel.map(|c| c.map(|r| r.map(f32::to_bits)))
-                );
             }
+        }
+
+        // Mismatched panel length must return None without touching sentinel outputs.
+        let q8_len = 3 * 4;
+        let (rows, acts) = sample_ptq1_32tok_fixture(3, 13);
+        let row_refs: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+        let chunk_slices: [[&[super::Q8ActivationBlock]; 8]; 4] =
+            std::array::from_fn(|c| std::array::from_fn(|t| acts[c * 8 + t].as_slice()));
+        for &cap in &caps {
+            let mut packed = Vec::new();
+            for chunk in &chunk_slices {
+                for p in 0..4 {
+                    assert!(
+                        cap.append_pinned_i8mm_pair_blocks(
+                            chunk[2 * p],
+                            chunk[2 * p + 1],
+                            &mut packed,
+                        )
+                        .is_some()
+                    );
+                }
+            }
+            let panel_chunks: [[&[super::Ptq1PinnedI8mmPairBlock]; 4]; 4] =
+                std::array::from_fn(|c| {
+                    std::array::from_fn(|p| {
+                        let start = (c * 4 + p) * q8_len;
+                        &packed[start..start + q8_len]
+                    })
+                });
+            let sentinel = [[[77.5_f32; 8]; 8]; 4];
+            let mut bad_out = sentinel;
+            let mut bad_panels = panel_chunks;
+            bad_panels[1][2] = &panel_chunks[1][2][..q8_len - 1];
+            assert!(
+                cap.dot_scaled_8x8_chunks_with_pinned_panels(
+                    row_refs,
+                    &chunk_slices,
+                    &bad_panels,
+                    &mut bad_out,
+                )
+                .is_none()
+            );
+            assert_eq!(
+                bad_out.map(|c| c.map(|r| r.map(f32::to_bits))),
+                sentinel.map(|c| c.map(|r| r.map(f32::to_bits)))
+            );
         }
     }
 

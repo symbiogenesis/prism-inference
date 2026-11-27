@@ -673,11 +673,7 @@ impl Pq2Dotprod {
         out: &mut Vec<Pq2I8mmPairBlock>,
     ) -> Option<()> {
         let _ = self;
-        if t0.is_empty()
-            || t0.len() != t1.len()
-            || t0.len().checked_mul(34).is_none()
-            || !t0.iter().chain(t1.iter()).all(|b| b.scale.is_finite())
-        {
+        if !Self::valid_pair_block_inputs(t0, t1) {
             return None;
         }
         #[cfg(target_arch = "aarch64")]
@@ -689,6 +685,41 @@ impl Pq2Dotprod {
             scaled::portable_append_i8mm_pair_blocks(t0, t1, out);
         }
         Some(())
+    }
+
+    /// Pre-packs a pair of aligned PQ2 activation slices `(t0, t1)` into a pre-sized
+    /// destination slice `out`, allowing parallel packing across independent token pairs.
+    ///
+    /// Returns `None` for empty/mismatched extents or nonfinite activation scales.
+    #[inline]
+    #[must_use]
+    pub fn pack_i8mm_pair_blocks_into(
+        self,
+        t0: &[Pq2Activation],
+        t1: &[Pq2Activation],
+        out: &mut [Pq2I8mmPairBlock],
+    ) -> Option<()> {
+        let _ = self;
+        if out.len() != t0.len() || !Self::valid_pair_block_inputs(t0, t1) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::pq2_pack_i8mm_pair_blocks_into(t0, t1, out);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            scaled::portable_pack_i8mm_pair_blocks_into(t0, t1, out);
+        }
+        Some(())
+    }
+
+    #[inline]
+    fn valid_pair_block_inputs(t0: &[Pq2Activation], t1: &[Pq2Activation]) -> bool {
+        !t0.is_empty()
+            && t0.len() == t1.len()
+            && t0.len().checked_mul(34).is_some()
+            && t0.iter().chain(t1.iter()).all(|b| b.scale.is_finite())
     }
 
     /// Validates `1..=8` eight-token PQ2 activation chunks once across all row tiles.
@@ -1197,12 +1228,7 @@ impl Ptq1Dotprod {
         out: &mut Vec<Ptq1PinnedI8mmPairBlock>,
     ) -> Option<()> {
         let _ = self;
-        if t0.is_empty()
-            || t0.len() != t1.len()
-            || !t0.len().is_multiple_of(4)
-            || (t0.len() / 4).checked_mul(28).is_none()
-            || !t0.iter().chain(t1.iter()).all(|b| b.scale().is_finite())
-        {
+        if !Self::valid_pinned_pair_inputs(t0, t1) {
             return None;
         }
         #[cfg(target_arch = "aarch64")]
@@ -1214,6 +1240,42 @@ impl Ptq1Dotprod {
             scaled::portable_append_ptq1_pinned_i8mm_pair_blocks(t0, t1, out);
         }
         Some(())
+    }
+
+    /// Pre-packs lane-deinterleaved `SMMLA` panels ([`Ptq1PinnedI8mmPairBlock`])
+    /// for `(t0, t1)` into a pre-sized destination slice `out`, allowing parallel packing.
+    ///
+    /// Returns `None` for empty, unaligned, mismatched, or overflowing extents, or nonfinite scales.
+    #[inline]
+    #[must_use]
+    pub fn pack_pinned_i8mm_pair_blocks_into<A: Q8ActivationView>(
+        self,
+        t0: &[A],
+        t1: &[A],
+        out: &mut [Ptq1PinnedI8mmPairBlock],
+    ) -> Option<()> {
+        let _ = self;
+        if out.len() != t0.len() || !Self::valid_pinned_pair_inputs(t0, t1) {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            aarch64::ptq1_pack_pinned_i8mm_pair_blocks_into(t0, t1, out);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            scaled::portable_pack_ptq1_pinned_i8mm_pair_blocks_into(t0, t1, out);
+        }
+        Some(())
+    }
+
+    #[inline]
+    fn valid_pinned_pair_inputs<A: Q8ActivationView>(t0: &[A], t1: &[A]) -> bool {
+        !t0.is_empty()
+            && t0.len() == t1.len()
+            && t0.len().is_multiple_of(4)
+            && (t0.len() / 4).checked_mul(28).is_some()
+            && t0.iter().chain(t1.iter()).all(|b| b.scale().is_finite())
     }
 
     /// Validates current `Q8_0` activation scales once for any number of `PTQ1_0` row groups.

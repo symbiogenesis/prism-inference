@@ -3172,12 +3172,6 @@ impl VulkanBatchedGraphExecutor {
         check: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
         let t_len = tokens.len();
-        let prepared = self.prepare_tile_host_inputs(tokens)?;
-
-        let chunks = self
-            .config
-            .tdr_policy
-            .layer_chunk_ranges_for_tokens(self.layers.len(), t_len)?;
         let output_mode = target.mode();
         let need_logits = output_mode != LogitOutputMode::None;
         let total_layers = self.layers.len();
@@ -3187,6 +3181,11 @@ impl VulkanBatchedGraphExecutor {
         let had_unwaited_before = self.device.has_unwaited_slots();
         let mut mutated_gpu = false;
         let run_result = (|| -> Result<(), Error> {
+            let prepared = self.prepare_tile_host_inputs(tokens)?;
+            let chunks = self
+                .config
+                .tdr_policy
+                .layer_chunk_ranges_for_tokens(self.layers.len(), t_len)?;
             let record_tile_prologue = |this: &mut Self| -> Result<(), Error> {
                 if let Some(bank) = prepared.staged_bank {
                     let total_embed_u32 =
@@ -3309,12 +3308,14 @@ impl VulkanBatchedGraphExecutor {
                                             is_final_chunk,
                                         )?
                                 {
-                                    for cb_chunk in &cb_chunks {
-                                        self.device.submit_cached_chunk(cb_chunk)?;
-                                        self.submits_completed =
-                                            self.submits_completed.saturating_add(1);
-                                    }
                                     recorded_layers.push(cb_chunks);
+                                    if let Some(layer_cb_chunks) = recorded_layers.last() {
+                                        for cb_chunk in layer_cb_chunks {
+                                            self.device.submit_cached_chunk(cb_chunk)?;
+                                            self.submits_completed =
+                                                self.submits_completed.saturating_add(1);
+                                        }
+                                    }
                                     if !self.device.has_unwaited_slots() {
                                         self.staging_bank_in_flight = [false; 2];
                                     }

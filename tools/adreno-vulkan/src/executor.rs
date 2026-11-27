@@ -1332,6 +1332,7 @@ impl VulkanPq2Executor {
             cols,
             rows,
         };
+        let mut stale_protected_standalone = false;
         if let Some(cached) = self.weight_cache.get_mut(lookup.as_key()) {
             if cached
                 .weak_source
@@ -1343,9 +1344,10 @@ impl VulkanPq2Executor {
                 return Ok(WeightLease::Cached(cached.storage.span()));
             }
             let stale_buf = cached.storage.span().buffer;
-            if !protected.contains(&stale_buf)
-                && let Some(removed) = self.weight_cache.remove(lookup.as_key())
-            {
+            if protected.contains(&stale_buf) {
+                stale_protected_standalone =
+                    matches!(cached.storage, ResidentStorage::Standalone(_));
+            } else if let Some(removed) = self.weight_cache.remove(lookup.as_key()) {
                 self.cached_bytes = self.cached_bytes.saturating_sub(removed.bytes);
                 if let ResidentStorage::Standalone(id) = removed.storage {
                     self.device.free_buffer(id);
@@ -1377,7 +1379,10 @@ impl VulkanPq2Executor {
             )));
         }
 
-        if self.max_cached_weight_bytes == 0 || upload_bytes > self.max_cached_weight_bytes {
+        if stale_protected_standalone
+            || self.max_cached_weight_bytes == 0
+            || upload_bytes > self.max_cached_weight_bytes
+        {
             return self.upload_standalone_transient(upload_u64);
         }
 
@@ -1396,25 +1401,8 @@ impl VulkanPq2Executor {
             return Ok(WeightLease::Cached(span));
         }
 
-        while self.cached_bytes + upload_bytes > self.max_cached_weight_bytes {
-            let Some(evict_key) = self
-                .weight_cache
-                .iter()
-                .filter(|(_, entry)| match entry.storage {
-                    ResidentStorage::Standalone(id) => !protected.contains(&id),
-                    ResidentStorage::Arena(_) => false,
-                })
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(k, _)| k.clone())
-            else {
-                return self.upload_standalone_transient(upload_u64);
-            };
-            if let Some(removed) = self.weight_cache.remove(&evict_key) {
-                self.cached_bytes = self.cached_bytes.saturating_sub(removed.bytes);
-                if let ResidentStorage::Standalone(id) = removed.storage {
-                    self.device.free_buffer(id);
-                }
-            }
+        if !self.evict_standalone_cache_for_budget(upload_bytes, protected) {
+            return self.upload_standalone_transient(upload_u64);
         }
 
         let buf = self.device.create_storage_buffer(upload_u64)?;
@@ -1429,6 +1417,34 @@ impl VulkanPq2Executor {
             &tensor.data,
         );
         Ok(WeightLease::Cached(BufferSpan::whole(buf)))
+    }
+
+    fn evict_standalone_cache_for_budget(
+        &mut self,
+        upload_bytes: usize,
+        protected: &[BufferId],
+    ) -> bool {
+        while self.cached_bytes + upload_bytes > self.max_cached_weight_bytes {
+            let Some(evict_key) = self
+                .weight_cache
+                .iter()
+                .filter(|(_, entry)| match entry.storage {
+                    ResidentStorage::Standalone(id) => !protected.contains(&id),
+                    ResidentStorage::Arena(_) => false,
+                })
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                return false;
+            };
+            if let Some(removed) = self.weight_cache.remove(&evict_key) {
+                self.cached_bytes = self.cached_bytes.saturating_sub(removed.bytes);
+                if let ResidentStorage::Standalone(id) = removed.storage {
+                    self.device.free_buffer(id);
+                }
+            }
+        }
+        true
     }
 
     fn upload_standalone_transient(&mut self, upload_u64: u64) -> Result<WeightLease, Error> {
@@ -1448,8 +1464,7 @@ impl VulkanPq2Executor {
         source: &TensorBytes,
     ) {
         self.cache_access_counter += 1;
-        self.cached_bytes += bytes;
-        self.weight_cache.insert(
+        if let Some(prev) = self.weight_cache.insert(
             key,
             CachedWeight {
                 storage,
@@ -1457,7 +1472,13 @@ impl VulkanPq2Executor {
                 weak_source: TensorBytes::downgrade(source),
                 last_used: self.cache_access_counter,
             },
-        );
+        ) {
+            self.cached_bytes = self.cached_bytes.saturating_sub(prev.bytes);
+            if let ResidentStorage::Standalone(id) = prev.storage {
+                self.device.free_buffer(id);
+            }
+        }
+        self.cached_bytes += bytes;
     }
 
     fn acquire_three_weights(
@@ -1467,10 +1488,12 @@ impl VulkanPq2Executor {
         t2: Option<&Tensor>,
     ) -> Result<[Option<WeightLease>; 3], Error> {
         let (c0, r0) = validate_matrix(t0, KIND_PQ2, 256)?;
+        let dims1 = t1.map(|t| validate_matrix(t, KIND_PQ2, 256)).transpose()?;
+        let dims2 = t2.map(|t| validate_matrix(t, KIND_PQ2, 256)).transpose()?;
+
         let l0 = self.acquire_weight_buffer(t0, c0, r0, &[])?;
         let mut leases = [Some(l0), None, None];
-        if let Some(t1) = t1 {
-            let (c1, r1) = validate_matrix(t1, KIND_PQ2, 256)?;
+        if let (Some(t1), Some((c1, r1))) = (t1, dims1) {
             let prot = [l0.buffer_id()];
             match self.acquire_weight_buffer(t1, c1, r1, &prot) {
                 Ok(l1) => leases[1] = Some(l1),
@@ -1480,8 +1503,7 @@ impl VulkanPq2Executor {
                 }
             }
         }
-        if let Some(t2) = t2 {
-            let (c2, r2) = validate_matrix(t2, KIND_PQ2, 256)?;
+        if let (Some(t2), Some((c2, r2))) = (t2, dims2) {
             let l1_buf = leases[1].map_or_else(|| l0.buffer_id(), WeightLease::buffer_id);
             let prot = [l0.buffer_id(), l1_buf];
             match self.acquire_weight_buffer(t2, c2, r2, &prot) {

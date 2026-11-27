@@ -1537,6 +1537,26 @@ impl AdrenoVulkanDevice {
         }
     }
 
+    fn invalidate_whole_memory(&self, memory: vk::DeviceMemory) -> Result<(), Error> {
+        let range = [vk::MappedMemoryRange::default()
+            .memory(memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        // SAFETY: Invalidating persistently mapped non-coherent range before host readback.
+        unsafe { self.device.invalidate_mapped_memory_ranges(&range) }
+            .map_err(|err| Error::Vulkan(format!("invalidate_mapped_memory_ranges: {err:?}")))
+    }
+
+    fn flush_whole_memory(&self, memory: vk::DeviceMemory) -> Result<(), Error> {
+        let range = [vk::MappedMemoryRange::default()
+            .memory(memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        // SAFETY: Flushing persistently mapped non-coherent range after host write.
+        unsafe { self.device.flush_mapped_memory_ranges(&range) }
+            .map_err(|err| Error::Vulkan(format!("flush_mapped_memory_ranges: {err:?}")))
+    }
+
     fn with_mapped_slice_mut<F>(
         &self,
         id: BufferId,
@@ -1574,23 +1594,13 @@ impl AdrenoVulkanDevice {
         let total_usize = usize::try_from(entry.size_bytes)
             .map_err(|_| Error::InvalidInput("buffer size overflow".to_owned()))?;
         if invalidate_before && !entry.host_coherent {
-            let range = [vk::MappedMemoryRange::default()
-                .memory(entry.memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE)];
-            // SAFETY: Invalidating persistently mapped non-coherent range before host readback.
-            let _ = unsafe { self.device.invalidate_mapped_memory_ranges(&range) };
+            self.invalidate_whole_memory(entry.memory)?;
         }
         // SAFETY: `entry.mapped` stays persistently valid for `total_usize` bytes while no GPU queue uses `self`.
         let whole = unsafe { slice::from_raw_parts_mut(entry.mapped.0.as_ptr(), total_usize) };
         visit(&mut whole[off_usize..off_usize + byte_len]);
         if flush_after && !entry.host_coherent {
-            let range = [vk::MappedMemoryRange::default()
-                .memory(entry.memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE)];
-            // SAFETY: Flushing persistently mapped non-coherent range after host write.
-            let _ = unsafe { self.device.flush_mapped_memory_ranges(&range) };
+            self.flush_whole_memory(entry.memory)?;
         }
         Ok(())
     }
@@ -1853,12 +1863,7 @@ impl AdrenoVulkanDevice {
         let dst_total_u = usize::try_from(dst_entry.size_bytes)
             .map_err(|_| Error::InvalidInput("destination buffer size overflow".to_owned()))?;
         if !src_entry.host_coherent {
-            let range = [vk::MappedMemoryRange::default()
-                .memory(src_entry.memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE)];
-            // SAFETY: Invalidating persistently mapped non-coherent source range before host copy.
-            let _ = unsafe { self.device.invalidate_mapped_memory_ranges(&range) };
+            self.invalidate_whole_memory(src_entry.memory)?;
         }
         // SAFETY: `src_entry.mapped` is persistently mapped for `src_total_u` bytes while queue is idle.
         let src_whole = unsafe { slice::from_raw_parts(src_entry.mapped.0.as_ptr(), src_total_u) };
@@ -1868,12 +1873,7 @@ impl AdrenoVulkanDevice {
         dst_whole[dst_off_u..dst_off_u + len_u]
             .copy_from_slice(&src_whole[src_off_u..src_off_u + len_u]);
         if !dst_entry.host_coherent {
-            let range = [vk::MappedMemoryRange::default()
-                .memory(dst_entry.memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE)];
-            // SAFETY: Flushing persistently mapped non-coherent destination range after host copy.
-            let _ = unsafe { self.device.flush_mapped_memory_ranges(&range) };
+            self.flush_whole_memory(dst_entry.memory)?;
         }
         Ok(())
     }
@@ -2161,6 +2161,11 @@ impl AdrenoVulkanDevice {
                 "stage count exceeds descriptor pool capacity".to_owned(),
             ));
         }
+        let max_range = u64::from(
+            self.capabilities
+                .compute_limits
+                .max_storage_buffer_range,
+        );
         let mut total_descriptors = 0_usize;
         for stage in stages {
             self.validate_span_stage(
@@ -2171,15 +2176,18 @@ impl AdrenoVulkanDevice {
             )?;
             total_descriptors += stage.buffers.len();
             for &buf_id in stage.buffers {
-                if self
+                let entry = self
                     .buffers
                     .get(buf_id.0)
                     .and_then(Option::as_ref)
-                    .is_none()
-                {
-                    return Err(Error::InvalidInput(
-                        "invalid buffer handle in stage".to_owned(),
-                    ));
+                    .ok_or_else(|| {
+                        Error::InvalidInput("invalid buffer handle in stage".to_owned())
+                    })?;
+                if entry.size_bytes > max_range {
+                    return Err(Error::ResourceLimit(format!(
+                        "buffer size ({} B) exceeds maxStorageBufferRange ({max_range} B)",
+                        entry.size_bytes
+                    )));
                 }
             }
         }
@@ -2193,32 +2201,18 @@ impl AdrenoVulkanDevice {
 
     fn validate_buffer_spans(&self, buffers: &[BufferSpan]) -> Result<(), Error> {
         let align = self.min_storage_buffer_offset_alignment.max(1);
-        for span in buffers {
+        let max_range = u64::from(
+            self.capabilities
+                .compute_limits
+                .max_storage_buffer_range,
+        );
+        for &span in buffers {
             let entry = self
                 .buffers
                 .get(span.buffer.0)
                 .and_then(Option::as_ref)
                 .ok_or_else(|| Error::InvalidInput("invalid buffer span handle".to_owned()))?;
-            if span.offset % align != 0 {
-                return Err(Error::InvalidInput(
-                    "unaligned buffer span offset".to_owned(),
-                ));
-            }
-            if span.range != vk::WHOLE_SIZE {
-                let end = span
-                    .offset
-                    .checked_add(span.range)
-                    .ok_or_else(|| Error::InvalidInput("buffer span overflow".to_owned()))?;
-                if span.range == 0 || end > entry.size_bytes {
-                    return Err(Error::InvalidInput(
-                        "buffer span exceeds backing buffer size".to_owned(),
-                    ));
-                }
-            } else if span.offset >= entry.size_bytes {
-                return Err(Error::InvalidInput(
-                    "buffer span offset exceeds backing buffer size".to_owned(),
-                ));
-            }
+            validate_buffer_span_limits(span, entry.size_bytes, align, max_range)?;
         }
         Ok(())
     }
@@ -2446,7 +2440,7 @@ impl AdrenoVulkanDevice {
             return;
         }
         if !self.faulted && self.unwaited_slots > 0 {
-            let _ = self.finish_pipelined_session();
+            self.abort_pipelined_session();
         }
         if !self.faulted {
             let raw: Vec<vk::CommandBuffer> =
@@ -2463,42 +2457,55 @@ impl AdrenoVulkanDevice {
             return Ok(());
         }
         self.ensure_healthy()?;
-        let slot_idx = self.next_slot_idx;
-        let cmd_buf = self.command_slots[slot_idx].command_buffer;
-        // SAFETY: Command slot `slot_idx` is outside the active unwaited window (< PIPELINED_CB_COUNT).
-        if let Err(err) = unsafe {
-            self.device
-                .reset_command_buffer(cmd_buf, vk::CommandBufferResetFlags::empty())
-        } {
-            return Err(Error::Vulkan(format!("reset_command_buffer: {err:?}")));
+        let drain_res = (|| -> Result<(), Error> {
+            let slot_idx = self.next_slot_idx;
+            let cmd_buf = self.command_slots[slot_idx].command_buffer;
+            // SAFETY: Command slot `slot_idx` is outside the active unwaited window (< PIPELINED_CB_COUNT).
+            if let Err(err) = unsafe {
+                self.device
+                    .reset_command_buffer(cmd_buf, vk::CommandBufferResetFlags::empty())
+            } {
+                return Err(Error::Vulkan(format!("reset_command_buffer: {err:?}")));
+            }
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: Beginning drain command buffer recording.
+            if let Err(err) = unsafe { self.device.begin_command_buffer(cmd_buf, &begin) } {
+                return Err(Error::Vulkan(format!("begin_command_buffer: {err:?}")));
+            }
+            let host_barrier = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::SHADER_READ)];
+            // SAFETY: Synchronizing all prior queued compute writes for host readback before fence signal.
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cmd_buf,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &host_barrier,
+                    &[],
+                    &[],
+                );
+            }
+            // SAFETY: Ending drain command buffer before fenced queue submit.
+            if let Err(err) = unsafe { self.device.end_command_buffer(cmd_buf) } {
+                return Err(Error::Vulkan(format!("end_command_buffer: {err:?}")));
+            }
+            self.submit_cb_slot(slot_idx, cmd_buf, true)?;
+            self.wait_fence_and_clear_unwaited()
+        })();
+        if let Err(err) = drain_res {
+            if !self.faulted && self.unwaited_slots > 0 {
+                // SAFETY: Fallback drain when fenced barrier submission failed; latch fault if wait fails.
+                if unsafe { self.device.device_wait_idle() }.is_err() {
+                    self.faulted = true;
+                }
+                self.unwaited_slots = 0;
+            }
+            return Err(err);
         }
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: Beginning drain command buffer recording.
-        if let Err(err) = unsafe { self.device.begin_command_buffer(cmd_buf, &begin) } {
-            return Err(Error::Vulkan(format!("begin_command_buffer: {err:?}")));
-        }
-        let host_barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::SHADER_READ)];
-        // SAFETY: Synchronizing all prior queued compute writes for host readback before fence signal.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                cmd_buf,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &host_barrier,
-                &[],
-                &[],
-            );
-        }
-        // SAFETY: Ending drain command buffer before fenced queue submit.
-        if let Err(err) = unsafe { self.device.end_command_buffer(cmd_buf) } {
-            return Err(Error::Vulkan(format!("end_command_buffer: {err:?}")));
-        }
-        self.submit_cb_slot(slot_idx, cmd_buf, true)?;
-        self.wait_fence_and_clear_unwaited()
+        Ok(())
     }
 
     pub(crate) fn abort_pipelined_session(&mut self) {
@@ -2506,8 +2513,13 @@ impl AdrenoVulkanDevice {
             self.unwaited_slots = 0;
             return;
         }
-        let _ = self.finish_pipelined_session();
-        self.unwaited_slots = 0;
+        if self.finish_pipelined_session().is_err() && !self.faulted && self.unwaited_slots > 0 {
+            // SAFETY: Fallback drain when fenced barrier submission failed; latch fault if wait fails.
+            if unsafe { self.device.device_wait_idle() }.is_err() {
+                self.faulted = true;
+            }
+            self.unwaited_slots = 0;
+        }
     }
 
     fn prepare_descriptor_sets_for_chunk<'a>(
@@ -2556,8 +2568,31 @@ impl AdrenoVulkanDevice {
         Ok(true)
     }
 
+    fn rollback_pending_persistent_sets(&mut self) {
+        let persistent_sets: Vec<vk::DescriptorSet> = self
+            .scratch_allocated_sets
+            .iter()
+            .zip(&self.scratch_allocated_persistent)
+            .filter_map(|(&set, &is_persistent)| is_persistent.then_some(set))
+            .collect();
+        if !persistent_sets.is_empty() && !self.faulted {
+            // SAFETY: Freeing uncommitted persistent descriptor sets allocated during a failed prep.
+            let _ = unsafe {
+                self.device
+                    .free_descriptor_sets(self.persistent_descriptor_pool, &persistent_sets)
+            };
+        }
+        self.scratch_allocated_sets.clear();
+        self.scratch_allocated_persistent.clear();
+        self.scratch_writes.clear();
+        self.scratch_buffer_infos.clear();
+    }
+
     fn commit_allocated_miss_descriptors(&mut self) -> Result<(), Error> {
-        self.write_chunk_miss_descriptors()?;
+        if let Err(err) = self.write_chunk_miss_descriptors() {
+            self.rollback_pending_persistent_sets();
+            return Err(err);
+        }
         for (stage_set, &miss_idx) in self
             .scratch_sets
             .iter_mut()
@@ -2685,6 +2720,7 @@ impl AdrenoVulkanDevice {
                         vk::DescriptorPoolResetFlags::empty(),
                     )
                 } {
+                    self.rollback_pending_persistent_sets();
                     return Err(Error::Vulkan(format!("reset_descriptor_pool: {err:?}")));
                 }
                 slot.needs_pool_reset = false;
@@ -2701,17 +2737,7 @@ impl AdrenoVulkanDevice {
             let sets = match unsafe { self.device.allocate_descriptor_sets(&alloc) } {
                 Ok(s) => s,
                 Err(err) => {
-                    if !self.scratch_allocated_sets.is_empty() {
-                        // SAFETY: Freeing persistent sets allocated in this failed chunk prep.
-                        let _ = unsafe {
-                            self.device.free_descriptor_sets(
-                                self.persistent_descriptor_pool,
-                                &self.scratch_allocated_sets,
-                            )
-                        };
-                        self.scratch_allocated_sets.clear();
-                        self.scratch_allocated_persistent.clear();
-                    }
+                    self.rollback_pending_persistent_sets();
                     return Err(Error::Vulkan(format!("allocate_descriptor_sets: {err:?}")));
                 }
             };
@@ -3561,6 +3587,44 @@ fn spirv_uses_group_non_uniform_shuffle(words: &[u32]) -> bool {
     false
 }
 
+fn validate_buffer_span_limits(
+    span: BufferSpan,
+    backing_size: u64,
+    align: u64,
+    max_storage_buffer_range: u64,
+) -> Result<(), Error> {
+    if !span.offset.is_multiple_of(align) {
+        return Err(Error::InvalidInput(
+            "unaligned buffer span offset".to_owned(),
+        ));
+    }
+    let bound_range = if span.range == vk::WHOLE_SIZE {
+        if span.offset >= backing_size {
+            return Err(Error::InvalidInput(
+                "buffer span offset exceeds backing buffer size".to_owned(),
+            ));
+        }
+        backing_size - span.offset
+    } else {
+        let end = span
+            .offset
+            .checked_add(span.range)
+            .ok_or_else(|| Error::InvalidInput("buffer span overflow".to_owned()))?;
+        if span.range == 0 || end > backing_size {
+            return Err(Error::InvalidInput(
+                "buffer span exceeds backing buffer size".to_owned(),
+            ));
+        }
+        span.range
+    };
+    if bound_range > max_storage_buffer_range {
+        return Err(Error::ResourceLimit(format!(
+            "buffer span range ({bound_range} B) exceeds maxStorageBufferRange ({max_storage_buffer_range} B)"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3572,6 +3636,64 @@ mod tests {
         assert!(is_forbidden_vk_env("vk_icd_filenames"));
         assert!(is_forbidden_vk_env("VK_LAYER_PATH"));
         assert!(!is_forbidden_vk_env("SYSTEMROOT"));
+    }
+
+    #[test]
+    fn buffer_span_validation_enforces_alignment_bounds_and_max_range() -> Result<(), Error> {
+        let ok_explicit = BufferSpan {
+            buffer: BufferId(0),
+            offset: 256,
+            range: 1024,
+        };
+        validate_buffer_span_limits(ok_explicit, 2048, 256, 1024)?;
+
+        let ok_whole = BufferSpan {
+            buffer: BufferId(0),
+            offset: 1024,
+            range: vk::WHOLE_SIZE,
+        };
+        validate_buffer_span_limits(ok_whole, 2048, 256, 1024)?;
+
+        let unaligned = BufferSpan {
+            buffer: BufferId(0),
+            offset: 128,
+            range: 256,
+        };
+        assert!(matches!(
+            validate_buffer_span_limits(unaligned, 2048, 256, 4096),
+            Err(Error::InvalidInput(_))
+        ));
+
+        let over_explicit_range = BufferSpan {
+            buffer: BufferId(0),
+            offset: 256,
+            range: 2048,
+        };
+        assert!(matches!(
+            validate_buffer_span_limits(over_explicit_range, 4096, 256, 1024),
+            Err(Error::ResourceLimit(_))
+        ));
+
+        let over_whole_range = BufferSpan {
+            buffer: BufferId(0),
+            offset: 256,
+            range: vk::WHOLE_SIZE,
+        };
+        assert!(matches!(
+            validate_buffer_span_limits(over_whole_range, 4096, 256, 1024),
+            Err(Error::ResourceLimit(_))
+        ));
+
+        let whole_past_end = BufferSpan {
+            buffer: BufferId(0),
+            offset: 2048,
+            range: vk::WHOLE_SIZE,
+        };
+        assert!(matches!(
+            validate_buffer_span_limits(whole_past_end, 2048, 256, 4096),
+            Err(Error::InvalidInput(_))
+        ));
+        Ok(())
     }
 
     #[test]

@@ -318,7 +318,10 @@ mod tests {
             interrupted_once: false,
         };
         let mut frame = Vec::new();
-        assert!(matches!(read_frame(&mut reader, &mut frame, 128)?, Frame::Complete));
+        assert!(matches!(
+            read_frame(&mut reader, &mut frame, 128)?,
+            Frame::Complete
+        ));
         assert_eq!(frame, br#"{"id":1,"op":"count","text":"hi"}"#);
         Ok(())
     }

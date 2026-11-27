@@ -2534,8 +2534,10 @@ mod tests {
             ssm_values: 4,
             convolution: 4,
         };
-        let initial_conv = vec![0.125_f32; geometry.convolution_width() * (geometry.convolution - 1)];
-        let initial_matrix = vec![0.25_f32; geometry.ssm_values * geometry.ssm_head * geometry.ssm_head];
+        let initial_conv =
+            vec![0.125_f32; geometry.convolution_width() * (geometry.convolution - 1)];
+        let initial_matrix =
+            vec![0.25_f32; geometry.ssm_values * geometry.ssm_head * geometry.ssm_head];
         let mut tape = build_folded_carry_tape(2, &geometry)?;
         tape.carried_decay[0] = f32::NAN;
 

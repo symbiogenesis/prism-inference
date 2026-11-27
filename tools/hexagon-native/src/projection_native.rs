@@ -2762,7 +2762,14 @@ impl NativeQ2OpenRollback {
 
     fn disarm(
         mut self,
-    ) -> Result<(super::Calls, [ExtraWeightArena; MAX_EXTRA_WEIGHT_ARENAS], usize), Error> {
+    ) -> Result<
+        (
+            super::Calls,
+            [ExtraWeightArena; MAX_EXTRA_WEIGHT_ARENAS],
+            usize,
+        ),
+        Error,
+    > {
         let calls = self.calls.take().ok_or(Error::Contract)?;
         Ok((calls, self.extra_arenas, self.extra_arena_count))
     }

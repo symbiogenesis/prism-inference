@@ -4731,7 +4731,8 @@ mod tests {
     }
 
     #[test]
-    fn native_registry_can_reserve_chunks_checks_per_arena_fit_across_boundaries() -> Result<(), Error> {
+    fn native_registry_can_reserve_chunks_checks_per_arena_fit_across_boundaries()
+    -> Result<(), Error> {
         let mut caps = [0_usize; NATIVE_Q2_MAX_WEIGHT_ARENAS];
         caps[0] = 2048;
         caps[1] = 2048;

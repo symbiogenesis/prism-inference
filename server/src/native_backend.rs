@@ -1452,11 +1452,11 @@ mod warm_tests {
         runtime.block_on(async {
             let (p_to_c_r, p_to_c_w) = std::io::pipe()?;
             let (c_to_p_r, c_to_p_w) = std::io::pipe()?;
-            let parent = std::thread::spawn(move || {
-                drive_oversized_broker_pipe_client(p_to_c_w, c_to_p_r)
-            });
+            let parent =
+                std::thread::spawn(move || drive_oversized_broker_pipe_client(p_to_c_w, c_to_p_r));
 
-            let (mut endpoint, _) = crate::broker_pipe::ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+            let (mut endpoint, _) =
+                crate::broker_pipe::ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
             endpoint.mark_ready()?;
             let policy = RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, KEY)
                 .map_err(|e| format!("{e:?}"))?;

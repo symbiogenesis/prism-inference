@@ -2161,11 +2161,7 @@ impl AdrenoVulkanDevice {
                 "stage count exceeds descriptor pool capacity".to_owned(),
             ));
         }
-        let max_range = u64::from(
-            self.capabilities
-                .compute_limits
-                .max_storage_buffer_range,
-        );
+        let max_range = u64::from(self.capabilities.compute_limits.max_storage_buffer_range);
         let mut total_descriptors = 0_usize;
         for stage in stages {
             self.validate_span_stage(
@@ -2201,11 +2197,7 @@ impl AdrenoVulkanDevice {
 
     fn validate_buffer_spans(&self, buffers: &[BufferSpan]) -> Result<(), Error> {
         let align = self.min_storage_buffer_offset_alignment.max(1);
-        let max_range = u64::from(
-            self.capabilities
-                .compute_limits
-                .max_storage_buffer_range,
-        );
+        let max_range = u64::from(self.capabilities.compute_limits.max_storage_buffer_range);
         for &span in buffers {
             let entry = self
                 .buffers
@@ -3429,8 +3421,7 @@ fn inspect_adreno_candidate(
         identity_sha256: String::new(),
     };
     let sdot_acc_sat_supported = sdot_feats.shader_integer_dot_product == vk::TRUE
-        && sdot_props
-            .integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated
+        && sdot_props.integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated
             == vk::TRUE;
 
     caps.recompute_identity_sha256().ok()?;

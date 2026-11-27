@@ -1578,7 +1578,12 @@ mod tests {
                 // before reading the early rejection response.
                 let chunk = vec![b'x'; MAX_FRAME_PAYLOAD];
                 write_frame(&mut p_to_c_w, 1, KIND_OPEN, &[])?;
-                write_frame(&mut p_to_c_w, 1, KIND_DATA, b"POST /v1/chat/completions HTTP/1.1\r\n\r\n")?;
+                write_frame(
+                    &mut p_to_c_w,
+                    1,
+                    KIND_DATA,
+                    b"POST /v1/chat/completions HTTP/1.1\r\n\r\n",
+                )?;
                 for _ in 0..(CHANNEL_CAPACITY + 32) {
                     write_frame(&mut p_to_c_w, 1, KIND_DATA, &chunk)?;
                 }

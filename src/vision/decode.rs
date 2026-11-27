@@ -844,8 +844,12 @@ mod tests {
             }
         }
         let stored_large_zlib = stored_zlib(&raw_stored_large)?;
-        let decoded_stored_large =
-            decode_png(&build_png_from_zlib(256, stored_rows, 2, &stored_large_zlib)?)?;
+        let decoded_stored_large = decode_png(&build_png_from_zlib(
+            256,
+            stored_rows,
+            2,
+            &stored_large_zlib,
+        )?)?;
         assert_eq!(
             decoded_stored_large.rgb.len(),
             256 * usize::try_from(stored_rows)? * 3

@@ -323,7 +323,8 @@ mod tests {
 
     #[test]
     fn reset_restores_initial_state_across_counting_forcing_and_done() -> Result<()> {
-        let mut counting = ReasoningBudget::new(vec![vec![1]], vec![vec![2]], vec![2], 3, State::Counting)?;
+        let mut counting =
+            ReasoningBudget::new(vec![vec![1]], vec![vec![2]], vec![2], 3, State::Counting)?;
         assert_eq!(counting.state(), State::Counting);
         counting.accept(10);
         counting.accept(2);

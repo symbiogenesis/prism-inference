@@ -1723,10 +1723,9 @@ mod tests {
         let mut weights = [0.0_f32; 2];
         dist.apply_sorted_top_p_distribution(&top_p, &mut inf_candidates, &mut weights)?;
         assert!(
-            inf_candidates
-                .data()
-                .iter()
-                .all(|entry| entry.probability.is_finite() && (entry.probability - 0.5).abs() < 1e-6)
+            inf_candidates.data().iter().all(
+                |entry| entry.probability.is_finite() && (entry.probability - 0.5).abs() < 1e-6
+            )
         );
         Ok(())
     }

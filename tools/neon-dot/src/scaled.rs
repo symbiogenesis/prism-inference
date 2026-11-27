@@ -159,17 +159,45 @@ impl Ptq1Activation {
         }
     }
 
-    /// Constructs a [`Ptq1Activation`] from four 32-element group slices.
+    /// Constructs a [`Ptq1Activation`] without computing `neg_lane_sums`.
+    ///
+    /// Intended for non-SVE paths (`!Ptq1Dotprod::has_sve()`) where the 64-byte
+    /// SVE correction table is unused, preserving the exact 208-byte layout.
+    #[inline]
+    #[must_use]
+    pub const fn new_without_lane_sums(scales: [f32; 4], values: [i8; 128]) -> Self {
+        Self {
+            scales,
+            values,
+            neg_lane_sums: [[0; 4]; 4],
+        }
+    }
+
+    /// Constructs a [`Ptq1Activation`] from four 32-element group slices,
+    /// precomputing the negated lane sums once for SVE consumption.
     #[inline]
     #[must_use]
     pub fn from_groups(scales: [f32; 4], groups: [&[i8; 32]; 4]) -> Self {
+        Self::new(scales, Self::copy_groups(groups))
+    }
+
+    /// Constructs a [`Ptq1Activation`] from four 32-element group slices without
+    /// computing SVE `neg_lane_sums`, for non-SVE targets.
+    #[inline]
+    #[must_use]
+    pub const fn from_groups_without_lane_sums(scales: [f32; 4], groups: [&[i8; 32]; 4]) -> Self {
+        Self::new_without_lane_sums(scales, Self::copy_groups(groups))
+    }
+
+    #[inline]
+    const fn copy_groups(groups: [&[i8; 32]; 4]) -> [i8; 128] {
         let mut values = [0_i8; 128];
         let chunks = values.as_chunks_mut::<32>().0;
         chunks[0].copy_from_slice(groups[0]);
         chunks[1].copy_from_slice(groups[1]);
         chunks[2].copy_from_slice(groups[2]);
         chunks[3].copy_from_slice(groups[3]);
-        Self::new(scales, values)
+        values
     }
 
     /// Returns the original `f32` activation scales for groups `0..4`.
@@ -2217,6 +2245,129 @@ mod tests {
                 .dot_scaled_rows::<16, false>([ovf_row.as_slice(); 16])
                 .is_none()
         );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Verifies 4-row and 8-row non-SVE PTQ1 decode parity vs 1-row, all 243 trit bytes, signed zeros, and NaN/Inf in every row slot."
+    )]
+    #[test]
+    fn x1_ptq1_packed_4_and_8rows_non_sve_parity_and_extremes() {
+        use super::portable_ptq1_packed_rows_validated;
+
+        #[cfg(target_arch = "aarch64")]
+        let Some(detected) = crate::Ptq1Dotprod::detect() else {
+            return;
+        };
+        #[cfg(target_arch = "aarch64")]
+        let non_sve = crate::Ptq1Dotprod {
+            sve: false,
+            ..detected
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let non_sve = crate::Ptq1Dotprod { _detected: () };
+
+        let to_packed_no_sve = |acts: &[super::Q8ActivationBlock]| -> Vec<super::Ptq1Activation> {
+            acts.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|g| {
+                    super::Ptq1Activation::from_groups_without_lane_sums(
+                        [g[0].scale, g[1].scale, g[2].scale, g[3].scale],
+                        [&g[0].values, &g[1].values, &g[2].values, &g[3].values],
+                    )
+                })
+                .collect()
+        };
+
+        // Sweep all 243 valid 5-trit bytes across positions and all block counts.
+        let valid_bytes: Vec<u8> = (0..=242_u8)
+            .map(|idx| {
+                // Map 5-trit index 0..243 into canonical PTQ1 byte (round-up base-3 encoding).
+                let v = u32::from(idx);
+                u8::try_from((v * 256 + 242) / 243).unwrap_or(0)
+            })
+            .collect();
+
+        for (seed, block_count) in [1_usize, 2, 3, 4, 5, 40, 136].into_iter().enumerate() {
+            let (mut rows, mut acts) = sample_ptq1_fixture_blocks(block_count, seed + 71);
+            // Inject all 243 valid 5-trit bytes and signed zeros across the 8 rows.
+            for (blk_idx, row) in rows[..8].iter_mut().enumerate() {
+                for b in 0..block_count {
+                    let off = b * 28;
+                    for pos in 0..26 {
+                        row[off + pos] =
+                            valid_bytes[(blk_idx * 37 + b * 29 + pos * 11 + seed) % 243];
+                    }
+                    if (blk_idx + b) % 9 == 0 {
+                        let sign_zero: u16 = if (blk_idx + b).is_multiple_of(2) {
+                            0x0000
+                        } else {
+                            0x8000
+                        };
+                        row[off + 26..off + 28].copy_from_slice(&sign_zero.to_le_bytes());
+                    }
+                }
+            }
+            for (g_idx, blk) in acts[0].iter_mut().enumerate() {
+                if g_idx % 11 == 0 {
+                    blk.scale = if g_idx.is_multiple_of(2) { 0.0 } else { -0.0 };
+                }
+            }
+            let packed = to_packed_no_sve(&acts[0]);
+            let Some(prepared) = non_sve.prepare_packed(&packed) else {
+                assert!(non_sve.prepare_packed(&packed).is_some());
+                return;
+            };
+            let r4: [&[u8]; 4] = std::array::from_fn(|r| rows[r].as_slice());
+            let r8: [&[u8]; 8] = std::array::from_fn(|r| rows[r].as_slice());
+
+            let got4 = prepared.dot_scaled_rows::<4, true>(r4);
+            let got8 = prepared.dot_scaled_rows::<8, true>(r8);
+            let exp4 = portable_ptq1_packed_rows_validated::<4, true>(r4, &packed);
+            let exp8 = portable_ptq1_packed_rows_validated::<8, true>(r8, &packed);
+            assert_eq!(
+                got4.map(|v| v.map(f32::to_bits)),
+                exp4.map(|v| v.map(f32::to_bits))
+            );
+            assert_eq!(
+                got8.map(|v| v.map(f32::to_bits)),
+                exp8.map(|v| v.map(f32::to_bits))
+            );
+
+            // Compare 0-ULP bit-for-bit against 1-row pinned kernel (`ptq1_packed_1row_pinned_accum`).
+            for (r, row) in r8.iter().enumerate() {
+                let single = prepared.dot_scaled_rows::<1, true>([*row]);
+                assert_eq!(
+                    single.map(|v| v[0].to_bits()),
+                    got8.map(|v| v[r].to_bits()),
+                    "block_count={block_count} row={r}"
+                );
+            }
+
+            // Inject NaN/Inf scales in every row slot 0..7 at first, middle, and last block.
+            for bad_f16 in [0x7e00_u16, 0x7c00, 0xfc00] {
+                for bad_blk in [0_usize, block_count / 2, block_count - 1] {
+                    for bad_row in 0..8_usize {
+                        let mut bad_rows = rows[..8].to_vec();
+                        let off = bad_blk * 28 + 26;
+                        bad_rows[bad_row][off..off + 2].copy_from_slice(&bad_f16.to_le_bytes());
+                        let bad8: [&[u8]; 8] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                        assert!(
+                            prepared.dot_scaled_rows::<8, true>(bad8).is_none(),
+                            "expected None for bad_f16={bad_f16:#x} blk={bad_blk} row={bad_row}"
+                        );
+                        if bad_row < 4 {
+                            let bad4: [&[u8]; 4] = std::array::from_fn(|r| bad_rows[r].as_slice());
+                            assert!(
+                                prepared.dot_scaled_rows::<4, true>(bad4).is_none(),
+                                "expected None for 4-row bad_f16={bad_f16:#x} blk={bad_blk} row={bad_row}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

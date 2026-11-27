@@ -1215,6 +1215,20 @@ impl Ptq1Dotprod {
         }
     }
 
+    /// Returns whether runtime CPU/OS detection enabled `SVE` on this capability.
+    #[inline]
+    #[must_use]
+    pub const fn has_sve(self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.sve
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    }
+
     /// Appends pre-packed lane-deinterleaved `SMMLA` panels ([`Ptq1PinnedI8mmPairBlock`])
     /// for `(t0, t1)` into `out` without clearing prior panels.
     ///

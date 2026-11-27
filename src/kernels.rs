@@ -2491,22 +2491,26 @@ impl MatvecScratch {
         }
         let block_count = self.q8.len() / 4;
         self.ptq1_consumption.try_reserve_exact(block_count)?;
+        let use_sve = bonsai_neon_dot::Ptq1Dotprod::detect()
+            .is_some_and(bonsai_neon_dot::Ptq1Dotprod::has_sve);
         for group4 in self.q8.as_chunks::<4>().0 {
-            self.ptq1_consumption
-                .push(bonsai_neon_dot::Ptq1Activation::from_groups(
-                    [
-                        group4[0].scale,
-                        group4[1].scale,
-                        group4[2].scale,
-                        group4[3].scale,
-                    ],
-                    [
-                        &group4[0].values,
-                        &group4[1].values,
-                        &group4[2].values,
-                        &group4[3].values,
-                    ],
-                ));
+            let scales = [
+                group4[0].scale,
+                group4[1].scale,
+                group4[2].scale,
+                group4[3].scale,
+            ];
+            let groups = [
+                &group4[0].values,
+                &group4[1].values,
+                &group4[2].values,
+                &group4[3].values,
+            ];
+            self.ptq1_consumption.push(if use_sve {
+                bonsai_neon_dot::Ptq1Activation::from_groups(scales, groups)
+            } else {
+                bonsai_neon_dot::Ptq1Activation::from_groups_without_lane_sums(scales, groups)
+            });
         }
         Ok(())
     }

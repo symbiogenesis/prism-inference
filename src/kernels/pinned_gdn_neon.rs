@@ -2376,7 +2376,7 @@ mod two_row_provisional_tests {
     fn provisional_two_row_path_matches_scalar_across_widths_and_replays_errors() -> Result<()> {
         for width in [16_usize, 32, 64, 128, 256] {
             let previous: Vec<f32> = (0..8 * width)
-                .map(|i| f32::from(u8::try_from(i % 13).unwrap_or(0)) * 0.125 - 0.5)
+                .map(|i| f32::from(u8::try_from(i % 13).unwrap_or(0)).mul_add(0.125, -0.5))
                 .collect();
             let key: Vec<f32> = (0..width)
                 .map(|i| f32::from(u8::try_from((i * 3) % 11).unwrap_or(0)) * 0.0625)

@@ -95,6 +95,7 @@ pub struct ReasoningBudget {
     forced: Vec<i32>,
     budget: i32,
     remaining: i32,
+    initial_state: State,
     state: State,
     force_position: usize,
     end_match: Option<usize>,
@@ -118,17 +119,19 @@ impl ReasoningBudget {
         if forced.len() > 1024 {
             return Err(invalid("reasoning forced-token extent exceeds bound"));
         }
+        let initial_state = if initial == State::Counting && budget <= 0 {
+            State::Forcing
+        } else {
+            initial
+        };
         Ok(Self {
             start: Matcher::new(start)?,
             end: Matcher::new(end)?,
             forced,
             budget,
             remaining: budget,
-            state: if initial == State::Counting && budget <= 0 {
-                State::Forcing
-            } else {
-                initial
-            },
+            initial_state,
+            state: initial_state,
             force_position: 0,
             end_match: None,
         })
@@ -250,9 +253,9 @@ impl ReasoningBudget {
         true
     }
 
-    /// Restores idle state, the original budget and empty delimiter histories.
+    /// Restores the initial state, the original budget and empty delimiter histories.
     pub fn reset(&mut self) {
-        self.state = State::Idle;
+        self.state = self.initial_state;
         self.remaining = self.budget;
         self.start.suffix.clear();
         self.end.suffix.clear();
@@ -315,6 +318,34 @@ mod tests {
                 f32::NEG_INFINITY.to_bits(),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_restores_initial_state_across_counting_forcing_and_done() -> Result<()> {
+        let mut counting = ReasoningBudget::new(vec![vec![1]], vec![vec![2]], vec![2], 3, State::Counting)?;
+        assert_eq!(counting.state(), State::Counting);
+        counting.accept(10);
+        counting.accept(2);
+        assert_eq!(counting.state(), State::Done);
+        counting.reset();
+        assert_eq!(counting.state(), State::Counting);
+        assert_eq!(counting.end_match(), None);
+
+        let mut forcing = ReasoningBudget::new(vec![], vec![vec![2]], vec![2], 0, State::Counting)?;
+        assert_eq!(forcing.state(), State::Forcing);
+        forcing.accept(2);
+        assert_eq!(forcing.state(), State::Done);
+        forcing.reset();
+        assert_eq!(forcing.state(), State::Forcing);
+        assert_eq!(forcing.forced_token(), Some(2));
+
+        let mut done = ReasoningBudget::new(vec![vec![1]], vec![vec![2]], vec![2], 3, State::Done)?;
+        assert_eq!(done.state(), State::Done);
+        done.accept(1);
+        assert_eq!(done.state(), State::Counting);
+        done.reset();
+        assert_eq!(done.state(), State::Done);
         Ok(())
     }
 }

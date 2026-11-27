@@ -358,10 +358,30 @@ impl State {
             .ok_or_else(|| invalid("missing sampler random state"))?;
         let maximum = candidates.data()[0].logit;
         let mut sum = 0.0_f32;
-        for (entry, weight) in candidates.data_mut().iter_mut().zip(weights.iter_mut()) {
-            *weight = (entry.logit - maximum).exp();
-            entry.probability = *weight;
-            sum += *weight;
+        if maximum.is_finite() {
+            for (entry, weight) in candidates.data_mut().iter_mut().zip(weights.iter_mut()) {
+                *weight = (entry.logit - maximum).exp();
+                entry.probability = *weight;
+                sum += *weight;
+            }
+        } else {
+            for (entry, weight) in candidates.data_mut().iter_mut().zip(weights.iter_mut()) {
+                *weight = if entry.logit.to_bits() == maximum.to_bits() {
+                    1.0
+                } else {
+                    0.0
+                };
+                entry.probability = *weight;
+                sum += *weight;
+            }
+            if sum <= 0.0 || !sum.is_finite() {
+                sum = 0.0;
+                for (entry, weight) in candidates.data_mut().iter_mut().zip(weights.iter_mut()) {
+                    *weight = 1.0;
+                    entry.probability = 1.0;
+                    sum += 1.0;
+                }
+            }
         }
         for entry in candidates.data_mut() {
             entry.probability /= sum;
@@ -1028,12 +1048,20 @@ fn typical(candidates: &mut Candidates, probability: f32, min_keep: usize) {
     candidates.softmax(true);
     let mut entropy = 0.0_f32;
     for entry in candidates.data() {
-        entropy += -entry.probability * entry.probability.ln();
+        if entry.probability > 0.0 {
+            entropy += -entry.probability * entry.probability.ln();
+        }
     }
     let scores = candidates
         .data()
         .iter()
-        .map(|entry| (-entry.probability.ln() - entropy).abs())
+        .map(|entry| {
+            if entry.probability > 0.0 {
+                (-entry.probability.ln() - entropy).abs()
+            } else {
+                f32::INFINITY
+            }
+        })
         .collect::<Vec<_>>();
     let mut indices = (0..candidates.size).collect::<Vec<_>>();
     indices.sort_unstable_by(|&left, &right| {
@@ -1322,7 +1350,7 @@ fn collect_dry_penalties_from_history(
         }
         let penalty = (f64::from(multiplier)
             * f64::from(base).powi(i32::try_from(exponent).unwrap_or(i32::MAX)))
-            as f32;
+        .min(f64::from(f32::MAX)) as f32;
         out.push((token, penalty));
     }
 }
@@ -1622,6 +1650,84 @@ mod tests {
         })?
         .apply(&mut min_p)?;
         assert_eq!(min_p.data().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn typical_dry_and_top_p_distribution_guard_nonfinite_and_zero_prob() -> Result<()> {
+        let mut typical_candidates = Candidates::new(
+            vec![
+                Candidate {
+                    id: 1,
+                    logit: 2.0,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 2,
+                    logit: 1.0,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 3,
+                    logit: f32::NEG_INFINITY,
+                    probability: 0.0,
+                },
+            ],
+            -1,
+            false,
+        )?;
+        State::new(Config::Typical {
+            probability: 0.8,
+            min_keep: 1,
+        })?
+        .apply(&mut typical_candidates)?;
+        assert!(
+            typical_candidates
+                .data()
+                .iter()
+                .all(|entry| entry.probability.is_finite() && entry.id != 3)
+        );
+
+        let mut history = VecDeque::new();
+        for tok in [10_i32, 11, 12, 10, 11] {
+            history.push_back(tok);
+        }
+        let mut penalties = Vec::new();
+        collect_dry_penalties_from_history(&history, 1.0e38, 10.0, 1, &[], &mut penalties);
+        assert_eq!(penalties.len(), 1);
+        assert!(penalties[0].1.is_finite());
+        assert_eq!(penalties[0].1, f32::MAX);
+
+        let top_p = State::new(Config::TopP {
+            probability: 0.9,
+            min_keep: 1,
+        })?;
+        let mut dist = State::new(Config::Distribution(7))?;
+        let mut inf_candidates = Candidates::new(
+            vec![
+                Candidate {
+                    id: 0,
+                    logit: f32::NEG_INFINITY,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 1,
+                    logit: f32::NEG_INFINITY,
+                    probability: 0.0,
+                },
+            ],
+            -1,
+            false,
+        )?;
+        inf_candidates.sort();
+        let mut weights = [0.0_f32; 2];
+        dist.apply_sorted_top_p_distribution(&top_p, &mut inf_candidates, &mut weights)?;
+        assert!(
+            inf_candidates
+                .data()
+                .iter()
+                .all(|entry| entry.probability.is_finite() && (entry.probability - 0.5).abs() < 1e-6)
+        );
         Ok(())
     }
 }

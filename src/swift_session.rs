@@ -2124,6 +2124,89 @@ impl SwiftSession {
         setup
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves borrowed generation state and cancellation guards without extra allocation."
+    )]
+    fn generate_pre_delivery_rich(
+        &mut self,
+        prompt: &PreparedChat,
+        options: &crate::runtime::Generation,
+        suffix_config: Option<SuffixDraftConfig>,
+        cancellation: &Cancellation,
+        deadline: Option<Instant>,
+        timings: Option<&mut GenerationTimings>,
+        display: &mut Utf8Output,
+        output_bytes: &mut usize,
+        emit: &mut impl FnMut(RichTextEvent<'_>) -> Result<()>,
+    ) -> Result<(Completion, Option<SpeculativeStats>)> {
+        let chunks: Vec<MultimodalChunk<'_>> = prompt
+            .media_chunks
+            .iter()
+            .map(|chunk| MultimodalChunk {
+                span: chunk.span,
+                embeddings: &chunk.encoded.embeddings,
+            })
+            .collect();
+        let reset_only =
+            self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0;
+        let saved_sampler = self.sampler.clone();
+        let outcome = (|| -> Result<(Completion, Option<SpeculativeStats>)> {
+            self.configure_request_sampler(prompt)?;
+            if let Some(suffix_config) = suffix_config {
+                let consume = |token| {
+                    emit_decoded_token_rich(
+                        &self.vocabulary,
+                        display,
+                        output_bytes,
+                        token,
+                        None,
+                        emit,
+                    )
+                };
+                let (completion, stats) = self.runtime.generate_sampled_speculative_until(
+                    &prompt.tokens,
+                    options,
+                    Prefill { block_tokens: 64 },
+                    suffix_config,
+                    cancellation,
+                    deadline,
+                    &mut self.sampler,
+                    consume,
+                )?;
+                Ok((completion, Some(stats)))
+            } else {
+                let consume = |token, confidence: Option<TokenConfidence>| {
+                    emit_decoded_token_rich(
+                        &self.vocabulary,
+                        display,
+                        output_bytes,
+                        token,
+                        confidence,
+                        emit,
+                    )
+                };
+                let completion = self.runtime.generate_swift_until(
+                    &prompt.tokens,
+                    &chunks,
+                    options,
+                    Prefill { block_tokens: 64 },
+                    cancellation,
+                    deadline,
+                    &mut self.sampler,
+                    timings,
+                    reset_only,
+                    consume,
+                )?;
+                Ok((completion, None))
+            }
+        })();
+        if outcome.is_err() {
+            self.sampler = saved_sampler;
+        }
+        outcome
+    }
+
     fn complete_observed_rich(
         &mut self,
         prompt: &PreparedChat,
@@ -2141,70 +2224,27 @@ impl SwiftSession {
                 "runtime phase timings are unavailable for CPU speculation",
             ));
         }
-        self.last_speculative_stats = None;
-        self.prepare_completion_prompt(prompt, cancellation, deadline)?;
-        self.configure_request_sampler(prompt)?;
         let options = self.chat.generation(prompt.output_tokens)?;
+        let suffix_config = if use_speculation && let Some(speculation) = self.cpu_speculation {
+            Some(speculation.suffix_config()?)
+        } else {
+            None
+        };
+        self.prepare_completion_prompt(prompt, cancellation, deadline)?;
+        self.last_speculative_stats = None;
         let mut display = Utf8Output::new();
         let mut output_bytes = 0usize;
-        let chunks: Vec<MultimodalChunk<'_>> = prompt
-            .media_chunks
-            .iter()
-            .map(|chunk| MultimodalChunk {
-                span: chunk.span,
-                embeddings: &chunk.encoded.embeddings,
-            })
-            .collect();
-        let reset_only =
-            self.prompt_reuse == PromptReuse::Disabled && self.runtime_checkpoints == 0;
-        let mut recorded_stats = None;
-        let completion = if use_speculation && let Some(speculation) = self.cpu_speculation {
-            let consume = |token| {
-                emit_decoded_token_rich(
-                    &self.vocabulary,
-                    &mut display,
-                    &mut output_bytes,
-                    token,
-                    None,
-                    &mut emit,
-                )
-            };
-            let (completion, stats) = self.runtime.generate_sampled_speculative_until(
-                &prompt.tokens,
-                &options,
-                Prefill { block_tokens: 64 },
-                speculation.suffix_config()?,
-                cancellation,
-                deadline,
-                &mut self.sampler,
-                consume,
-            )?;
-            recorded_stats = Some(stats);
-            completion
-        } else {
-            let consume = |token, confidence: Option<TokenConfidence>| {
-                emit_decoded_token_rich(
-                    &self.vocabulary,
-                    &mut display,
-                    &mut output_bytes,
-                    token,
-                    confidence,
-                    &mut emit,
-                )
-            };
-            self.runtime.generate_swift_until(
-                &prompt.tokens,
-                &chunks,
-                &options,
-                Prefill { block_tokens: 64 },
-                cancellation,
-                deadline,
-                &mut self.sampler,
-                timings,
-                reset_only,
-                consume,
-            )?
-        };
+        let (completion, recorded_stats) = self.generate_pre_delivery_rich(
+            prompt,
+            &options,
+            suffix_config,
+            cancellation,
+            deadline,
+            timings,
+            &mut display,
+            &mut output_bytes,
+            &mut emit,
+        )?;
         self.delivery_fault = true;
         let suffix = display.finish();
         charge_output(&mut output_bytes, suffix.len())?;

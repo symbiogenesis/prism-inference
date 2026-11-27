@@ -30,7 +30,7 @@ tokio = { version = "=1.54.1", features = ["io-util", "net", "rt", "sync", "time
 [target.'cfg(windows)'.dependencies]
 bonsai-adreno-vulkan = { path = "../tools/adreno-vulkan" }
 bonsai-windows-process.workspace = true
-bonsai-windows-credentials = "=0.1.8"
+bonsai-windows-credentials.workspace = true
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))'.dependencies]
 bonsai-hexagon-native = { path = "../tools/hexagon-native" }

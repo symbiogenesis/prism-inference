@@ -12,10 +12,10 @@ categories = ["hardware-support"]
 
 [dependencies]
 prism-inference = { path = "../..", default-features = false }
-bonsai-ternary = { version = "=0.1.6", path = "../ternary" }
-bonsai-native-hash = { version = "=0.1.7", path = "../native-hash" }
+bonsai-ternary.workspace = true
+bonsai-native-hash.workspace = true
 hex.workspace = true
-ash = { version = "=0.38.0", default-features = false }
+ash.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -26,7 +26,7 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 bonsai-hexagon-runtime = { path = "../hexagon-runtime", default-features = false }
-bonsai-gguf = { path = "../gguf", default-features = false }
+bonsai-gguf.workspace = true
 
 [lints]
 workspace = true

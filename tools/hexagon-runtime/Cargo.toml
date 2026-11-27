@@ -19,8 +19,8 @@ parallel-rows = ["prism-inference/parallel-rows"]
 [dependencies]
 prism-inference = { path = "../..", default-features = false }
 bonsai-hexagon-native = { path = "../hexagon-native" }
-bonsai-ternary = { path = "../ternary" }
-bonsai-native-hash = { path = "../native-hash" }
+bonsai-ternary.workspace = true
+bonsai-native-hash.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
@@ -34,7 +34,7 @@ path = "src/bin/model_probe.rs"
 required-features = ["probe"]
 
 [dev-dependencies]
-bonsai-gguf = { path = "../gguf", default-features = false }
+bonsai-gguf.workspace = true
 
 [lints]
 workspace = true

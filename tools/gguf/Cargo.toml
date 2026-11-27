@@ -23,8 +23,8 @@ path = "src/main.rs"
 required-features = ["report"]
 
 [dependencies]
-bonsai-native-hash = { path = "../native-hash", version = "=0.1.7" }
-bonsai-ternary = { path = "../ternary", version = "=0.1.6", optional = true }
+bonsai-native-hash.workspace = true
+bonsai-ternary = { workspace = true, optional = true }
 hex.workspace = true
 serde_json = { workspace = true, optional = true }
 

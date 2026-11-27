@@ -2755,7 +2755,7 @@ mod tests {
                             // Also verify explicit contract against float_dot vs pinned_gdn::dot.
                             let rounded_act: Vec<f32> =
                                 input.iter().map(|&v| super::super::round_f16(v)).collect();
-                            for r in 0..rows {
+                            for (r, &actual_val) in out.iter().enumerate() {
                                 super::super::row_into(&tensor, r, &mut ref_row)?;
                                 let ref_val = if pinned && columns.is_multiple_of(16) {
                                     super::super::pinned_gdn::dot(&ref_row, &rounded_act)?
@@ -2763,7 +2763,7 @@ mod tests {
                                     finite(super::super::float_dot(&ref_row, &rounded_act))?
                                 };
                                 assert_eq!(
-                                    out[r].to_bits(),
+                                    actual_val.to_bits(),
                                     ref_val.to_bits(),
                                     "scalar matvec contract cols={columns} rows={rows} r={r} pinned={pinned}"
                                 );
@@ -2858,7 +2858,7 @@ mod tests {
                         matvec_into(&bad_tensor, &zero_inputs[0], &mut mv_out, &mut scratch)
                             .is_err()
                     );
-                    assert!(mv_out.is_empty());
+                    assert_eq!(mv_out, Vec::<f32>::new());
                     matvec_into(&valid_tensor, &zero_inputs[0], &mut mv_out, &mut scratch)?;
                     assert_eq!(mv_out.len(), 13);
 

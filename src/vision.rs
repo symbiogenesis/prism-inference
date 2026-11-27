@@ -401,7 +401,12 @@ impl SwiftVisionEncoder {
         let total_hidden = hidden.len();
         let mut residual = vec![0.0_f32; total_hidden];
         let mut norm_buf = vec![0.0_f32; total_hidden];
-        let mut attn = AttentionScratch::new(total_hidden, self.config.num_heads, n_pos)?;
+        let mut attn = AttentionScratch::new(
+            total_hidden,
+            self.config.num_heads,
+            n_pos,
+            self.row_parallelism.workers(),
+        )?;
         let mut attn_out_buf = vec![0.0_f32; total_hidden];
         let rope_cache = build_vit_rope_cache(&self.config, &patch_coords)?;
 
@@ -674,8 +679,9 @@ struct AttentionScratch {
 }
 
 impl AttentionScratch {
-    fn new(len: usize, num_heads: usize, n_pos: usize) -> Result<Self> {
-        let score_len = num_heads
+    fn new(len: usize, num_heads: usize, n_pos: usize, workers: usize) -> Result<Self> {
+        let score_slots = num_heads.max(workers);
+        let score_len = score_slots
             .checked_mul(4)
             .and_then(|n| n.checked_mul(n_pos))
             .ok_or_else(|| invalid("vision attention score scratch overflow"))?;
@@ -1064,7 +1070,6 @@ fn run_self_attention(
 ) -> Result<()> {
     let d = config.hidden_size;
     let d_head = d / config.num_heads;
-    let head_plane = n_pos * d_head;
     fill_qkv_heads(
         block,
         config,
@@ -1077,26 +1082,13 @@ fn run_self_attention(
         backend,
     )?;
 
-    let kq_scale = 1.0_f32 / head_sqrt(d_head)?;
-    let score_stride = 4 * n_pos;
-    row_parallelism.update_paired_chunks(
-        &mut attn.head_out,
-        head_plane,
-        &mut attn.head_scores,
-        score_stride,
-        |base_head, out_chunk, score_chunk| {
-            let scores_buf = &mut score_chunk[..score_stride];
-            for (offset, out_head) in out_chunk.chunks_exact_mut(head_plane).enumerate() {
-                let head = base_head + offset;
-                let q_head = &attn.q_heads[head * head_plane..(head + 1) * head_plane];
-                let k_head = &attn.k_heads[head * head_plane..(head + 1) * head_plane];
-                let v_head = &attn.v_heads[head * head_plane..(head + 1) * head_plane];
-                attend_head_four_queries(
-                    q_head, k_head, v_head, n_pos, d_head, kq_scale, scores_buf, out_head, backend,
-                )?;
-            }
-            Ok(())
-        },
+    dispatch_self_attention_heads(
+        config.num_heads,
+        n_pos,
+        d_head,
+        attn,
+        row_parallelism,
+        backend,
     )?;
 
     project_attn_output(
@@ -1108,6 +1100,134 @@ fn run_self_attention(
         projector,
         backend,
     )
+}
+
+struct AttnWorkUnit<'a> {
+    head_tiles: usize,
+    n_pos: usize,
+    d_head: usize,
+    tile_start: usize,
+    tile_end: usize,
+    out_chunk: &'a mut [f32],
+    scores_buf: &'a mut [f32],
+}
+
+fn run_attn_work_unit(
+    unit: &mut AttnWorkUnit<'_>,
+    q_heads: &[f32],
+    k_heads: &[f32],
+    v_heads: &[f32],
+    kq_scale: f32,
+    backend: MatvecBackend,
+) -> Result<()> {
+    let head_plane = unit.n_pos * unit.d_head;
+    let first_head = unit.tile_start / unit.head_tiles;
+    let last_head = (unit.tile_end - 1) / unit.head_tiles;
+    let mut out_cursor = &mut unit.out_chunk[..];
+    for head in first_head..=last_head {
+        let q_begin = if head == first_head {
+            (unit.tile_start % unit.head_tiles) * 4
+        } else {
+            0
+        };
+        let q_end = if head == last_head {
+            let rem = unit.tile_end % unit.head_tiles;
+            if rem == 0 { unit.n_pos } else { rem * 4 }
+        } else {
+            unit.n_pos
+        };
+        let q_count = q_end - q_begin;
+        let q_elems = q_count * unit.d_head;
+        let (out_sub, rest_out) = out_cursor.split_at_mut(q_elems);
+        out_cursor = rest_out;
+        let q_start_elem = (head * unit.n_pos + q_begin) * unit.d_head;
+        let q_sub = &q_heads[q_start_elem..q_start_elem + q_elems];
+        let k_head = &k_heads[head * head_plane..(head + 1) * head_plane];
+        let v_head = &v_heads[head * head_plane..(head + 1) * head_plane];
+        attend_head_query_slice(
+            q_sub,
+            k_head,
+            v_head,
+            unit.n_pos,
+            q_count,
+            unit.d_head,
+            kq_scale,
+            unit.scores_buf,
+            out_sub,
+            backend,
+        )?;
+    }
+    Ok(())
+}
+
+fn dispatch_self_attention_heads(
+    num_heads: usize,
+    n_pos: usize,
+    d_head: usize,
+    attn: &mut AttentionScratch,
+    row_parallelism: &RowParallelism,
+    backend: MatvecBackend,
+) -> Result<()> {
+    let head_plane = n_pos * d_head;
+    let kq_scale = 1.0_f32 / head_sqrt(d_head)?;
+    let score_stride = 4 * n_pos;
+    let head_tiles = n_pos.div_ceil(4);
+    let total_tiles = num_heads * head_tiles;
+    let workers = row_parallelism.workers();
+
+    if workers > 1 && total_tiles > 1 {
+        let num_tasks = workers.min(total_tiles);
+        let mut units: [Option<AttnWorkUnit<'_>>; crate::kernels::MAX_ROW_WORKERS] =
+            std::array::from_fn(|_| None);
+        let mut out_rem = &mut attn.head_out[..];
+        let mut score_rem = &mut attn.head_scores[..];
+        let mut prev_elem = 0_usize;
+        for (w, slot) in units.iter_mut().take(num_tasks).enumerate() {
+            let tile_start = (w * total_tiles) / num_tasks;
+            let tile_end = ((w + 1) * total_tiles) / num_tasks;
+            let end_elem = if tile_end == total_tiles {
+                num_heads * head_plane
+            } else {
+                let h = tile_end / head_tiles;
+                let q = (tile_end % head_tiles) * 4;
+                (h * n_pos + q) * d_head
+            };
+            let (out_chunk, next_out) = out_rem.split_at_mut(end_elem - prev_elem);
+            out_rem = next_out;
+            let (scores_buf, next_score) = score_rem.split_at_mut(score_stride);
+            score_rem = next_score;
+            prev_elem = end_elem;
+            *slot = Some(AttnWorkUnit {
+                head_tiles,
+                n_pos,
+                d_head,
+                tile_start,
+                tile_end,
+                out_chunk,
+                scores_buf,
+            });
+        }
+        let q_heads = &attn.q_heads;
+        let k_heads = &attn.k_heads;
+        let v_heads = &attn.v_heads;
+        return row_parallelism.update_chunks(&mut units[..num_tasks], 1, |_, batch| {
+            for unit in batch.iter_mut().flatten() {
+                run_attn_work_unit(unit, q_heads, k_heads, v_heads, kq_scale, backend)?;
+            }
+            Ok(())
+        });
+    }
+
+    let scores_buf = &mut attn.head_scores[..score_stride];
+    for (head, out_head) in attn.head_out.chunks_exact_mut(head_plane).enumerate() {
+        let q_head = &attn.q_heads[head * head_plane..(head + 1) * head_plane];
+        let k_head = &attn.k_heads[head * head_plane..(head + 1) * head_plane];
+        let v_head = &attn.v_heads[head * head_plane..(head + 1) * head_plane];
+        attend_head_four_queries(
+            q_head, k_head, v_head, n_pos, d_head, kq_scale, scores_buf, out_head, backend,
+        )?;
+    }
+    Ok(())
 }
 
 #[expect(
@@ -1218,6 +1338,27 @@ fn attend_head_four_queries(
     out_head: &mut [f32],
     backend: MatvecBackend,
 ) -> Result<()> {
+    attend_head_query_slice(
+        q_head, k_head, v_head, n_pos, n_pos, d_head, kq_scale, scores_buf, out_head, backend,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Execute a contiguous query tile slice for one head with caller-owned scratch."
+)]
+fn attend_head_query_slice(
+    q_slice: &[f32],
+    k_head: &[f32],
+    v_head: &[f32],
+    n_pos: usize,
+    q_count: usize,
+    d_head: usize,
+    kq_scale: f32,
+    scores_buf: &mut [f32],
+    out_slice: &mut [f32],
+    backend: MatvecBackend,
+) -> Result<()> {
     #[cfg(all(
         feature = "experimental-neon",
         target_arch = "aarch64",
@@ -1229,22 +1370,22 @@ fn attend_head_four_queries(
         && let Some(neon) = fearless_simd::Level::baseline().as_neon()
     {
         return attend_head_four_queries_neon(
-            neon, q_head, k_head, v_head, n_pos, d_head, kq_scale, scores_buf, out_head,
+            neon, q_slice, k_head, v_head, n_pos, q_count, d_head, kq_scale, scores_buf, out_slice,
         );
     }
     let _ = backend;
 
-    let quad_end = (n_pos / 4) * 4;
+    let quad_end = (q_count / 4) * 4;
     let (s0, rest) = scores_buf.split_at_mut(n_pos);
     let (s1, rest) = rest.split_at_mut(n_pos);
     let (s2, s3) = rest.split_at_mut(n_pos);
     let s3 = &mut s3[..n_pos];
 
     for q_base in (0..quad_end).step_by(4) {
-        let q0 = &q_head[q_base * d_head..(q_base + 1) * d_head];
-        let q1 = &q_head[(q_base + 1) * d_head..(q_base + 2) * d_head];
-        let q2 = &q_head[(q_base + 2) * d_head..(q_base + 3) * d_head];
-        let q3 = &q_head[(q_base + 3) * d_head..(q_base + 4) * d_head];
+        let q0 = &q_slice[q_base * d_head..(q_base + 1) * d_head];
+        let q1 = &q_slice[(q_base + 1) * d_head..(q_base + 2) * d_head];
+        let q2 = &q_slice[(q_base + 2) * d_head..(q_base + 3) * d_head];
+        let q3 = &q_slice[(q_base + 3) * d_head..(q_base + 4) * d_head];
         for (k_tok, k) in k_head.chunks_exact(d_head).enumerate() {
             let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
             for ((((&qv0, &qv1), &qv2), &qv3), &kv) in q0.iter().zip(q1).zip(q2).zip(q3).zip(k) {
@@ -1263,7 +1404,7 @@ fn attend_head_four_queries(
         softmax(s1)?;
         softmax(s2)?;
         softmax(s3)?;
-        let (o0, rest) = out_head[q_base * d_head..(q_base + 4) * d_head].split_at_mut(d_head);
+        let (o0, rest) = out_slice[q_base * d_head..(q_base + 4) * d_head].split_at_mut(d_head);
         let (o1, rest) = rest.split_at_mut(d_head);
         let (o2, o3) = rest.split_at_mut(d_head);
         o0.fill(0.0);
@@ -1287,9 +1428,9 @@ fn attend_head_four_queries(
         }
     }
 
-    for q_tok in quad_end..n_pos {
-        let q = &q_head[q_tok * d_head..(q_tok + 1) * d_head];
-        let out_row = &mut out_head[q_tok * d_head..(q_tok + 1) * d_head];
+    for q_tok in quad_end..q_count {
+        let q = &q_slice[q_tok * d_head..(q_tok + 1) * d_head];
+        let out_row = &mut out_slice[q_tok * d_head..(q_tok + 1) * d_head];
         attend_single_query(q, k_head, v_head, d_head, kq_scale, s0, out_row)?;
     }
     Ok(())
@@ -1321,32 +1462,176 @@ fn reduce4_f32x4(
     target_env = "msvc",
     target_feature = "neon"
 ))]
+fn softmax_four_queries_max_neon(neon: Neon, scores: [&[f32]; 4]) -> Option<[f32; 4]> {
+    let [s0, s1, s2, s3] = scores;
+    let (c0, t0) = s0.as_chunks::<4>();
+    let (c1, t1) = s1.as_chunks::<4>();
+    let (c2, t2) = s2.as_chunks::<4>();
+    let (c3, t3) = s3.as_chunks::<4>();
+
+    let mut max_v = [f32x4::splat(neon, f32::NEG_INFINITY); 4];
+    let mut all_finite = f32x4::splat(neon, 0.0).is_finite();
+    for (((v0_sl, v1_sl), v2_sl), v3_sl) in c0.iter().zip(c1).zip(c2).zip(c3) {
+        let v0 = f32x4::from_slice(neon, v0_sl);
+        let v1 = f32x4::from_slice(neon, v1_sl);
+        let v2 = f32x4::from_slice(neon, v2_sl);
+        let v3 = f32x4::from_slice(neon, v3_sl);
+        all_finite &= (v0.is_finite() & v1.is_finite()) & (v2.is_finite() & v3.is_finite());
+        max_v[0] = max_v[0].max(v0);
+        max_v[1] = max_v[1].max(v1);
+        max_v[2] = max_v[2].max(v2);
+        max_v[3] = max_v[3].max(v3);
+    }
+
+    let mut tail_finite = true;
+    let mut tail_max = [f32::NEG_INFINITY; 4];
+    for (((&a0, &a1), &a2), &a3) in t0.iter().zip(t1).zip(t2).zip(t3) {
+        tail_finite &= a0.is_finite() && a1.is_finite() && a2.is_finite() && a3.is_finite();
+        tail_max[0] = tail_max[0].max(a0);
+        tail_max[1] = tail_max[1].max(a1);
+        tail_max[2] = tail_max[2].max(a2);
+        tail_max[3] = tail_max[3].max(a3);
+    }
+    if !all_finite.all_true() || !tail_finite {
+        return None;
+    }
+
+    Some(std::array::from_fn(|row| {
+        let a = max_v[row].to_array();
+        a[0].max(a[1]).max(a[2]).max(a[3]).max(tail_max[row])
+    }))
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Vectorized 4-row softmax accumulates lane sums in binary64 before inverse scaling."
+)]
+fn softmax_four_queries_neon(neon: Neon, scores: [&mut [f32]; 4]) -> Result<()> {
+    let [s0, s1, s2, s3] = scores;
+    let n = s0.len();
+    let Some(max_vals) = (n >= 4 && s1.len() == n && s2.len() == n && s3.len() == n)
+        .then(|| softmax_four_queries_max_neon(neon, [s0, s1, s2, s3]))
+        .flatten()
+    else {
+        softmax(s0)?;
+        softmax(s1)?;
+        softmax(s2)?;
+        softmax(s3)?;
+        return Ok(());
+    };
+
+    let (c0, t0) = s0.as_chunks_mut::<4>();
+    let (c1, t1) = s1.as_chunks_mut::<4>();
+    let (c2, t2) = s2.as_chunks_mut::<4>();
+    let (c3, t3) = s3.as_chunks_mut::<4>();
+
+    let m_vec = max_vals.map(|m| f32x4::splat(neon, m));
+    let mut sum_v = [f32x4::splat(neon, 0.0); 4];
+    for (((v0_sl, v1_sl), v2_sl), v3_sl) in c0
+        .iter_mut()
+        .zip(c1.iter_mut())
+        .zip(c2.iter_mut())
+        .zip(c3.iter_mut())
+    {
+        for (sl, (&mv, sv)) in [v0_sl, v1_sl, v2_sl, v3_sl]
+            .into_iter()
+            .zip(m_vec.iter().zip(sum_v.iter_mut()))
+        {
+            let e = vector_exp_neg_x4(neon, f32x4::from_slice(neon, sl) - mv);
+            e.store_slice(sl);
+            *sv += e;
+        }
+    }
+
+    let mut tail_sum = [0.0_f64; 4];
+    for (((a0, a1), a2), a3) in t0
+        .iter_mut()
+        .zip(t1.iter_mut())
+        .zip(t2.iter_mut())
+        .zip(t3.iter_mut())
+    {
+        for ((val, &max_val), sum_slot) in [a0, a1, a2, a3]
+            .into_iter()
+            .zip(max_vals.iter())
+            .zip(tail_sum.iter_mut())
+        {
+            *val = (*val - max_val).exp();
+            *sum_slot += f64::from(*val);
+        }
+    }
+
+    let inv_vals: [f32; 4] = std::array::from_fn(|row| {
+        let a = sum_v[row].to_array();
+        let total =
+            f64::from(a[0]) + f64::from(a[1]) + f64::from(a[2]) + f64::from(a[3]) + tail_sum[row];
+        (1.0_f64 / total) as f32
+    });
+    let inv_vec = inv_vals.map(|inv| f32x4::splat(neon, inv));
+    for (((v0_sl, v1_sl), v2_sl), v3_sl) in c0
+        .iter_mut()
+        .zip(c1.iter_mut())
+        .zip(c2.iter_mut())
+        .zip(c3.iter_mut())
+    {
+        for (sl, &iv) in [v0_sl, v1_sl, v2_sl, v3_sl].into_iter().zip(inv_vec.iter()) {
+            (f32x4::from_slice(neon, sl) * iv).store_slice(sl);
+        }
+    }
+    for (((a0, a1), a2), a3) in t0
+        .iter_mut()
+        .zip(t1.iter_mut())
+        .zip(t2.iter_mut())
+        .zip(t3.iter_mut())
+    {
+        for (val, &inv) in [a0, a1, a2, a3].into_iter().zip(inv_vals.iter()) {
+            *val *= inv;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "experimental-neon",
+    target_arch = "aarch64",
+    target_os = "windows",
+    target_env = "msvc",
+    target_feature = "neon"
+))]
 #[expect(
     clippy::too_many_arguments,
     reason = "Vectorized 4-query tiled ViT attention on baseline NEON."
 )]
 fn attend_head_four_queries_neon(
     neon: Neon,
-    q_head: &[f32],
+    q_slice: &[f32],
     k_head: &[f32],
     v_head: &[f32],
     n_pos: usize,
+    q_count: usize,
     d_head: usize,
     kq_scale: f32,
     scores_buf: &mut [f32],
-    out_head: &mut [f32],
+    out_slice: &mut [f32],
 ) -> Result<()> {
-    let quad_end = (n_pos / 4) * 4;
+    let quad_end = (q_count / 4) * 4;
     let (s0, rest) = scores_buf.split_at_mut(n_pos);
     let (s1, rest) = rest.split_at_mut(n_pos);
     let (s2, s3) = rest.split_at_mut(n_pos);
     let s3 = &mut s3[..n_pos];
 
     for q_base in (0..quad_end).step_by(4) {
-        let q0 = &q_head[q_base * d_head..(q_base + 1) * d_head];
-        let q1 = &q_head[(q_base + 1) * d_head..(q_base + 2) * d_head];
-        let q2 = &q_head[(q_base + 2) * d_head..(q_base + 3) * d_head];
-        let q3 = &q_head[(q_base + 3) * d_head..(q_base + 4) * d_head];
+        let q0 = &q_slice[q_base * d_head..(q_base + 1) * d_head];
+        let q1 = &q_slice[(q_base + 1) * d_head..(q_base + 2) * d_head];
+        let q2 = &q_slice[(q_base + 2) * d_head..(q_base + 3) * d_head];
+        let q3 = &q_slice[(q_base + 3) * d_head..(q_base + 4) * d_head];
         qk_four_queries_neon(
             neon,
             [q0, q1, q2, q3],
@@ -1356,11 +1641,8 @@ fn attend_head_four_queries_neon(
             kq_scale,
             &mut [s0, s1, s2, s3],
         )?;
-        softmax(s0)?;
-        softmax(s1)?;
-        softmax(s2)?;
-        softmax(s3)?;
-        let (o0, rest) = out_head[q_base * d_head..(q_base + 4) * d_head].split_at_mut(d_head);
+        softmax_four_queries_neon(neon, [s0, s1, s2, s3])?;
+        let (o0, rest) = out_slice[q_base * d_head..(q_base + 4) * d_head].split_at_mut(d_head);
         let (o1, rest) = rest.split_at_mut(d_head);
         let (o2, o3) = rest.split_at_mut(d_head);
         pv_four_queries_neon(
@@ -1373,9 +1655,9 @@ fn attend_head_four_queries_neon(
         );
     }
 
-    for q_tok in quad_end..n_pos {
-        let q = &q_head[q_tok * d_head..(q_tok + 1) * d_head];
-        let out_row = &mut out_head[q_tok * d_head..(q_tok + 1) * d_head];
+    for q_tok in quad_end..q_count {
+        let q = &q_slice[q_tok * d_head..(q_tok + 1) * d_head];
+        let out_row = &mut out_slice[q_tok * d_head..(q_tok + 1) * d_head];
         attend_single_query(q, k_head, v_head, d_head, kq_scale, s0, out_row)?;
     }
     Ok(())
@@ -1481,17 +1763,30 @@ fn qk_four_queries_neon(
     target_env = "msvc",
     target_feature = "neon"
 ))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tile P*V over k-chunks resident in L1D across d_head sub-tiles."
+)]
 fn pv_tile_chunks<const W: usize>(
     neon: Neon,
     scores: [&[f32]; 4],
     v_head: &[f32],
-    n_pos: usize,
+    k_start: usize,
+    k_end: usize,
     d_head: usize,
     d_off: usize,
     out: &mut [&mut [f32]; 4],
 ) {
-    let mut acc = [[f32x4::splat(neon, 0.0); W]; 4];
-    for v_tok in 0..n_pos {
+    let mut acc = if k_start == 0 {
+        [[f32x4::splat(neon, 0.0); W]; 4]
+    } else {
+        std::array::from_fn(|row| {
+            std::array::from_fn(|c| {
+                f32x4::from_slice(neon, &out[row][d_off + c * 4..d_off + (c + 1) * 4])
+            })
+        })
+    };
+    for v_tok in k_start..k_end {
         let p0 = f32x4::splat(neon, scores[0][v_tok]);
         let p1 = f32x4::splat(neon, scores[1][v_tok]);
         let p2 = f32x4::splat(neon, scores[2][v_tok]);
@@ -1529,32 +1824,43 @@ fn pv_four_queries_neon(
 ) {
     let d_16 = (d_head / 16) * 16;
     let d_4 = (d_head / 4) * 4;
-    for d_off in (0..d_16).step_by(16) {
-        pv_tile_chunks::<4>(neon, scores, v_head, n_pos, d_head, d_off, &mut out);
-    }
-    match (d_4 - d_16) / 4 {
-        1 => pv_tile_chunks::<1>(neon, scores, v_head, n_pos, d_head, d_16, &mut out),
-        2 => pv_tile_chunks::<2>(neon, scores, v_head, n_pos, d_head, d_16, &mut out),
-        3 => pv_tile_chunks::<3>(neon, scores, v_head, n_pos, d_head, d_16, &mut out),
-        _ => {}
-    }
+    // Tile v_head over k chunks fitting in L1D (~16 KiB) so v_head is read once
+    // across all d_head sub-tiles (e.g., 5 sub-tiles for d_head = 72).
+    let k_tile = (4096 / d_head.max(1)).clamp(16, 64);
     if d_4 < d_head {
         for row in &mut out {
             row[d_4..d_head].fill(0.0);
         }
-        for (v_tok, v) in v_head.chunks_exact(d_head).enumerate() {
-            let (p0, p1, p2, p3) = (
-                scores[0][v_tok],
-                scores[1][v_tok],
-                scores[2][v_tok],
-                scores[3][v_tok],
+    }
+    for k_start in (0..n_pos).step_by(k_tile) {
+        let k_end = (k_start + k_tile).min(n_pos);
+        for d_off in (0..d_16).step_by(16) {
+            pv_tile_chunks::<4>(
+                neon, scores, v_head, k_start, k_end, d_head, d_off, &mut out,
             );
-            for d in d_4..d_head {
-                let vv = v[d];
-                out[0][d] = p0.mul_add(vv, out[0][d]);
-                out[1][d] = p1.mul_add(vv, out[1][d]);
-                out[2][d] = p2.mul_add(vv, out[2][d]);
-                out[3][d] = p3.mul_add(vv, out[3][d]);
+        }
+        match (d_4 - d_16) / 4 {
+            1 => pv_tile_chunks::<1>(neon, scores, v_head, k_start, k_end, d_head, d_16, &mut out),
+            2 => pv_tile_chunks::<2>(neon, scores, v_head, k_start, k_end, d_head, d_16, &mut out),
+            3 => pv_tile_chunks::<3>(neon, scores, v_head, k_start, k_end, d_head, d_16, &mut out),
+            _ => {}
+        }
+        if d_4 < d_head {
+            for v_tok in k_start..k_end {
+                let v = &v_head[v_tok * d_head..(v_tok + 1) * d_head];
+                let (p0, p1, p2, p3) = (
+                    scores[0][v_tok],
+                    scores[1][v_tok],
+                    scores[2][v_tok],
+                    scores[3][v_tok],
+                );
+                for d in d_4..d_head {
+                    let vv = v[d];
+                    out[0][d] = p0.mul_add(vv, out[0][d]);
+                    out[1][d] = p1.mul_add(vv, out[1][d]);
+                    out[2][d] = p2.mul_add(vv, out[2][d]);
+                    out[3][d] = p3.mul_add(vv, out[3][d]);
+                }
             }
         }
     }
@@ -2555,6 +2861,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Preexisting end-to-end multi-worker scalar/Auto ViT encoder parity test."
+    )]
     fn parallel_tiled_encoder_and_four_query_attention_match_scalar_bit_for_bit() -> Result<()> {
         let model = non_uniform_mmproj_model()?;
         let rgb: Vec<u8> = (0..16 * 12 * 3)
@@ -2683,6 +2993,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Preexisting end-to-end F16 ViT encoder and SIMD operator parity test."
+    )]
     fn auto_f16_vit_encoder_and_simd_ops_match_scalar_within_tolerance() -> Result<()> {
         // Test vectorized attention at ViT d_head = 72 (not a multiple of 16) with non-divisible n_pos.
         let n_pos = 19;
@@ -2894,6 +3208,224 @@ mod tests {
         let first = encoder.encode_data_url(&ppm_url, 16)?;
         let second = encoder.encode_data_url(&ppm_url, 16)?;
         assert!(Arc::ptr_eq(&first.embeddings, &second.embeddings));
+        Ok(())
+    }
+
+    #[test]
+    fn four_query_neon_attention_matches_scalar_across_n_pos_and_d_head() -> Result<()> {
+        for &d_head in &[64_usize, 72] {
+            let kq_scale = 1.0_f32 / head_sqrt(d_head)?;
+            for &n_pos in &[1_usize, 3, 4, 17, 64, 256] {
+                let q_head = varied_values(n_pos * d_head, 5 + n_pos, 0.12);
+                let k_head = varied_values(n_pos * d_head, 11 + d_head, 0.12);
+                let v_head = varied_values(n_pos * d_head, 19 + n_pos, 0.12);
+                let mut scores_buf = vec![0.0_f32; 4 * n_pos];
+                let mut scalar_out = vec![0.0_f32; n_pos * d_head];
+                let mut neon_out = vec![0.0_f32; n_pos * d_head];
+                attend_head_four_queries(
+                    &q_head,
+                    &k_head,
+                    &v_head,
+                    n_pos,
+                    d_head,
+                    kq_scale,
+                    &mut scores_buf,
+                    &mut scalar_out,
+                    MatvecBackend::Scalar,
+                )?;
+                attend_head_four_queries(
+                    &q_head,
+                    &k_head,
+                    &v_head,
+                    n_pos,
+                    d_head,
+                    kq_scale,
+                    &mut scores_buf,
+                    &mut neon_out,
+                    MatvecBackend::Auto,
+                )?;
+                let max_diff = neon_out
+                    .iter()
+                    .zip(&scalar_out)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    max_diff <= 1e-5,
+                    "attention parity failed for n_pos={n_pos}, d_head={d_head}: max_diff={max_diff}"
+                );
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    let mut bad_q = q_head.clone();
+                    bad_q[n_pos * d_head - 1] = bad;
+                    let mut dummy = vec![0.0_f32; n_pos * d_head];
+                    for backend in [MatvecBackend::Scalar, MatvecBackend::Auto] {
+                        assert!(
+                            attend_head_four_queries(
+                                &bad_q,
+                                &k_head,
+                                &v_head,
+                                n_pos,
+                                d_head,
+                                kq_scale,
+                                &mut scores_buf,
+                                &mut dummy,
+                                backend,
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn self_attention_2d_parallelism_matches_scalar_across_workers() -> Result<()> {
+        let num_heads = 16_usize;
+        let workers_list: &[usize] = if cfg!(feature = "parallel-rows") {
+            &[1, 4, 12]
+        } else {
+            &[1]
+        };
+        for &d_head in &[64_usize, 72] {
+            for &n_pos in &[1_usize, 3, 4, 17, 64, 256] {
+                let total_len = num_heads * n_pos * d_head;
+                let mut baseline_auto_bits: Option<Vec<u32>> = None;
+                let mut baseline_scalar_bits: Option<Vec<u32>> = None;
+                for &workers in workers_list {
+                    let policy = RowParallelism::new(workers)?;
+                    let mut attn_scalar =
+                        AttentionScratch::new(total_len, num_heads, n_pos, workers)?;
+                    attn_scalar.q_heads = varied_values(total_len, 3, 0.1);
+                    attn_scalar.k_heads = varied_values(total_len, 7, 0.1);
+                    attn_scalar.v_heads = varied_values(total_len, 13, 0.1);
+                    dispatch_self_attention_heads(
+                        num_heads,
+                        n_pos,
+                        d_head,
+                        &mut attn_scalar,
+                        &policy,
+                        MatvecBackend::Scalar,
+                    )?;
+                    let scalar_bits: Vec<u32> =
+                        attn_scalar.head_out.iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(
+                        baseline_scalar_bits.get_or_insert_with(|| scalar_bits.clone()),
+                        &scalar_bits,
+                        "Scalar multi-worker mismatch for n_pos={n_pos}, d_head={d_head}, workers={workers}"
+                    );
+
+                    let mut attn_auto =
+                        AttentionScratch::new(total_len, num_heads, n_pos, workers)?;
+                    attn_auto.q_heads = attn_scalar.q_heads.clone();
+                    attn_auto.k_heads = attn_scalar.k_heads.clone();
+                    attn_auto.v_heads = attn_scalar.v_heads.clone();
+                    dispatch_self_attention_heads(
+                        num_heads,
+                        n_pos,
+                        d_head,
+                        &mut attn_auto,
+                        &policy,
+                        MatvecBackend::Auto,
+                    )?;
+                    let auto_bits: Vec<u32> =
+                        attn_auto.head_out.iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(
+                        baseline_auto_bits.get_or_insert_with(|| auto_bits.clone()),
+                        &auto_bits,
+                        "Auto multi-worker bit mismatch for n_pos={n_pos}, d_head={d_head}, workers={workers}"
+                    );
+                    let worker_diff = attn_auto
+                        .head_out
+                        .iter()
+                        .zip(&attn_scalar.head_out)
+                        .map(|(&a, &b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        worker_diff <= 1e-5,
+                        "2D attention parity failed for n_pos={n_pos}, d_head={d_head}, workers={workers}: max_diff={worker_diff}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn softmax_four_queries_neon_matches_scalar_and_rejects_nonfinite() -> Result<()> {
+        #[cfg(all(
+            feature = "experimental-neon",
+            target_arch = "aarch64",
+            target_os = "windows",
+            target_env = "msvc",
+            target_feature = "neon"
+        ))]
+        if let Some(neon) = fearless_simd::Level::baseline().as_neon() {
+            for &n_pos in &[1_usize, 3, 4, 17, 64, 256] {
+                let mut ref_rows = [
+                    varied_values(n_pos, 1, 1.5),
+                    varied_values(n_pos, 7, 2.0),
+                    varied_values(n_pos, 13, 0.5),
+                    varied_values(n_pos, 23, 3.0),
+                ];
+                let mut neon_rows = ref_rows.clone();
+                for row in &mut ref_rows {
+                    softmax(row)?;
+                }
+                let [r0, r1, r2, r3] = &mut neon_rows;
+                softmax_four_queries_neon(neon, [r0, r1, r2, r3])?;
+                for row_idx in 0..4 {
+                    let diff = neon_rows[row_idx]
+                        .iter()
+                        .zip(&ref_rows[row_idx])
+                        .map(|(&a, &b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        diff <= 1e-5,
+                        "softmax_four_queries_neon diff={diff} for n_pos={n_pos}, row={row_idx}"
+                    );
+                }
+                if n_pos >= 2 {
+                    let mut p_ref = [
+                        vec![0.0_f32; n_pos],
+                        vec![1.0_f32; n_pos],
+                        vec![-2.0_f32; n_pos],
+                        vec![3.0_f32; n_pos],
+                    ];
+                    p_ref[0][0] = f32::NEG_INFINITY;
+                    p_ref[2][n_pos - 1] = f32::NEG_INFINITY;
+                    let mut p_neon = p_ref.clone();
+                    for row in &mut p_ref {
+                        softmax(row)?;
+                    }
+                    let [n0, n1, n2, n3] = &mut p_neon;
+                    softmax_four_queries_neon(neon, [n0, n1, n2, n3])?;
+                    for row_idx in 0..4 {
+                        let diff = p_neon[row_idx]
+                            .iter()
+                            .zip(&p_ref[row_idx])
+                            .map(|(&a, &b)| (a - b).abs())
+                            .fold(0.0_f32, f32::max);
+                        assert!(diff <= 1e-5);
+                    }
+                }
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    let mut bad_rows = [
+                        vec![0.0_f32; n_pos],
+                        vec![0.0_f32; n_pos],
+                        vec![0.0_f32; n_pos],
+                        vec![0.0_f32; n_pos],
+                    ];
+                    if bad == f32::NEG_INFINITY {
+                        bad_rows[1].fill(f32::NEG_INFINITY);
+                    } else {
+                        bad_rows[1][n_pos - 1] = bad;
+                    }
+                    let [b0, b1, b2, b3] = &mut bad_rows;
+                    assert!(softmax_four_queries_neon(neon, [b0, b1, b2, b3]).is_err());
+                }
+            }
+        }
         Ok(())
     }
 }

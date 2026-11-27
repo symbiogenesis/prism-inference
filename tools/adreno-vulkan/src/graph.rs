@@ -282,7 +282,9 @@ pub struct VulkanLayerPipelines {
     attn_fused_f16prob_f16kv: PipelineId,
     attn_fused_gqa_prefill_f16kv: PipelineId,
     attn_flash_gqa6_prefill_f16kv: PipelineId,
+    attn_flash_gqa6_prefill_bq4_f16kv: PipelineId,
     attn_flash_gqa6_decode_splitk_f16kv: PipelineId,
+    attn_flash_gqa6_decode_splitk_uvec4_f16kv: PipelineId,
     attn_flash_decode_combine: PipelineId,
     rms_norm: PipelineId,
     rms_norm_vec4: PipelineId,
@@ -370,7 +372,7 @@ struct PreparedLayerShaders {
     use_sdot_acc_sat: bool,
     use_wave64: bool,
     proj: PreparedProjectionShaders,
-    modules: [PreparedShaderSpec; 79],
+    modules: [PreparedShaderSpec; 81],
     shader_digests_sha256: String,
 }
 
@@ -460,8 +462,20 @@ impl VulkanLayerPipelines {
                 9,
             )?,
             make_spec(
+                b"attn_flash_gqa6_prefill_bq4_f16kv",
+                spirv::attn_flash_gqa6_prefill_bq4_f16kv_with_subgroup(use_wave64_shuffle),
+                5,
+                9,
+            )?,
+            make_spec(
                 b"attn_flash_gqa6_decode_splitk_f16kv",
                 spirv::attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_wave64_shuffle),
+                5,
+                10,
+            )?,
+            make_spec(
+                b"attn_flash_gqa6_decode_splitk_uvec4_f16kv",
+                spirv::attn_flash_gqa6_decode_splitk_uvec4_f16kv_with_subgroup(use_wave64_shuffle),
                 5,
                 10,
             )?,
@@ -889,7 +903,9 @@ impl VulkanLayerPipelines {
             attn_fused_f16prob_f16kv,
             attn_fused_gqa_prefill_f16kv,
             attn_flash_gqa6_prefill_f16kv,
+            attn_flash_gqa6_prefill_bq4_f16kv,
             attn_flash_gqa6_decode_splitk_f16kv,
+            attn_flash_gqa6_decode_splitk_uvec4_f16kv,
             attn_flash_decode_combine,
             rms_norm,
             rms_norm_vec4,
@@ -959,7 +975,7 @@ impl VulkanLayerPipelines {
             copy_slice_offset,
             vocab_argmax_stage1,
             vocab_argmax_stage2,
-        ]: [PipelineId; 79] = ids
+        ]: [PipelineId; 81] = ids
             .try_into()
             .map_err(|_| Error::InvalidInput("layer pipeline count mismatch".to_owned()))?;
 
@@ -974,7 +990,9 @@ impl VulkanLayerPipelines {
             attn_fused_f16prob_f16kv,
             attn_fused_gqa_prefill_f16kv,
             attn_flash_gqa6_prefill_f16kv,
+            attn_flash_gqa6_prefill_bq4_f16kv,
             attn_flash_gqa6_decode_splitk_f16kv,
+            attn_flash_gqa6_decode_splitk_uvec4_f16kv,
             attn_flash_decode_combine,
             rms_norm,
             rms_norm_vec4,
@@ -3007,9 +3025,9 @@ impl VulkanBatchedGraphExecutor {
             let total_seq = self.position + 1;
             let total_seq_u32 = u32::try_from(total_seq)
                 .map_err(|_| Error::ResourceLimit("total_seq exceeds u32".to_owned()))?;
-            let num_splits_u32 = if self.can_use_flash_gqa6() && total_seq >= 128 {
+            let num_splits_u32 = if self.can_use_flash_gqa6() && total_seq >= 64 {
                 let max_splits =
-                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(8);
+                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(32);
                 let num_splits = total_seq.div_ceil(64).min(max_splits).max(2);
                 u32::try_from(num_splits)
                     .map_err(|_| Error::ResourceLimit("num_splits exceeds u32".to_owned()))?
@@ -3042,11 +3060,11 @@ impl VulkanBatchedGraphExecutor {
             0_u32
         } else if self.can_use_flash_gqa6() {
             let total_seq = self.position + 1;
-            if total_seq < 128 {
+            if total_seq < 64 {
                 1_u32
             } else {
                 let max_splits =
-                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(8);
+                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(32);
                 let num_splits = total_seq.div_ceil(64).min(max_splits).max(2);
                 u32::try_from(num_splits)
                     .map_err(|_| Error::ResourceLimit("num_splits exceeds u32".to_owned()))?
@@ -4571,14 +4589,19 @@ impl VulkanBatchedGraphExecutor {
             let scale_bits = (1.0_f32 / head_f32.sqrt()).to_bits();
             let use_dp = u32::from(self.current_tile_uses_decode_params);
 
-            if tokens == 1 && total_seq >= 128 {
+            if tokens == 1 && total_seq >= 64 {
                 let max_splits =
-                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(8);
+                    usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(32);
                 let num_splits = total_seq.div_ceil(64).min(max_splits).max(2);
                 let num_splits_u32 = u32::try_from(num_splits)
                     .map_err(|_| Error::ResourceLimit("num_splits exceeds u32".to_owned()))?;
+                let decode_pipeline = if self.geometry.head.is_multiple_of(8) {
+                    self.pipelines.attn_flash_gqa6_decode_splitk_uvec4_f16kv
+                } else {
+                    self.pipelines.attn_flash_gqa6_decode_splitk_f16kv
+                };
                 self.batch_recorder.push_barrier(
-                    self.pipelines.attn_flash_gqa6_decode_splitk_f16kv,
+                    decode_pipeline,
                     &[
                         BufferSpan::whole(query_buf),
                         BufferSpan::whole(k_cache),
@@ -4610,8 +4633,23 @@ impl VulkanBatchedGraphExecutor {
                     checked_grid(&self.device, [num_heads_u32, 1, 1])?,
                 );
             } else {
+                let caps = self.device.capabilities();
+                let use_bq4 = tokens > 1
+                    && self.geometry.head.is_multiple_of(8)
+                    && caps.compute_limits.max_compute_shared_memory_size
+                        >= spirv::attn_flash_gqa6_bq4_shared_memory_bytes(
+                            caps.wave64_subgroup_shuffle,
+                        );
+                let (prefill_pipeline, z_groups) = if use_bq4 {
+                    (
+                        self.pipelines.attn_flash_gqa6_prefill_bq4_f16kv,
+                        query_len_u32.div_ceil(spirv::ATTN_FLASH_GQA6_BQ4_Q_TILE),
+                    )
+                } else {
+                    (self.pipelines.attn_flash_gqa6_prefill_f16kv, query_len_u32)
+                };
                 self.batch_recorder.push_barrier(
-                    self.pipelines.attn_flash_gqa6_prefill_f16kv,
+                    prefill_pipeline,
                     &[
                         BufferSpan::whole(query_buf),
                         BufferSpan::whole(k_cache),
@@ -4630,7 +4668,7 @@ impl VulkanBatchedGraphExecutor {
                         1,
                         use_dp,
                     ],
-                    checked_grid(&self.device, [1, kv_heads_u32, query_len_u32])?,
+                    checked_grid(&self.device, [1, kv_heads_u32, z_groups])?,
                 );
             }
             return Ok(());
@@ -9125,37 +9163,30 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
     #[expect(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "Live GQA-6 FlashAttention-2 and FlashDecoding Split-K hardware parity check."
+        reason = "Live GQA-6 FlashAttention-2 and FlashDecoding Split-K hardware parity helper."
     )]
-    fn live_flash_gqa6_prefill_and_decode_splitk_match_cpu_within_1e4() -> Result<(), Error> {
-        let mut dev = AdrenoVulkanDevice::open()?;
-        let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
-        let kv_pack = dev.create_compute_pipeline(&spirv::kv_append_batched_f16(), 4, 4)?;
-        let flash_prefill = dev.create_compute_pipeline(
-            &spirv::attn_flash_gqa6_prefill_f16kv_with_subgroup(use_subgroup),
-            5,
-            9,
-        )?;
-        let flash_splitk = dev.create_compute_pipeline(
-            &spirv::attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_subgroup),
-            5,
-            10,
-        )?;
-        let flash_combine =
-            dev.create_compute_pipeline(&spirv::attn_flash_decode_combine_f32(), 2, 3)?;
-
+    fn verify_live_flash_gqa6_case(
+        dev: &mut AdrenoVulkanDevice,
+        kv_pack: PipelineId,
+        flash_prefill_1q: PipelineId,
+        flash_prefill_bq4: PipelineId,
+        flash_splitk_u32: PipelineId,
+        flash_splitk_uvec4: PipelineId,
+        flash_combine: PipelineId,
+        head_dim: usize,
+        query_len: usize,
+        past_len: usize,
+        total_seq: usize,
+    ) -> Result<(), Error> {
         let num_kv_heads = 2_usize;
         let num_heads = 12_usize;
-        let head_dim = 128_usize;
-        let total_seq = 640_usize; // > 512 cliff!
-        let query_len = 32_usize;
-        let past_len = total_seq - query_len;
         let q_width = num_heads * head_dim;
         let kv_width = num_kv_heads * head_dim;
+        let max_splits = usize::try_from(spirv::ATTN_FLASH_GQA6_MAX_DECODE_SPLITS).unwrap_or(32);
+        let num_splits = total_seq.div_ceil(64).min(max_splits).max(2);
 
         let pat = |len: usize, mul: usize, add: usize, m: usize, sub: i16| -> Vec<f32> {
             (0..len)
@@ -9176,7 +9207,6 @@ mod tests {
         let q_pre_buf = dev.create_storage_buffer(f32_slice_bytes(q_prefill.len())?)?;
         let o_pre_buf = dev.create_storage_buffer(f32_slice_bytes(q_prefill.len())?)?;
         let q_dec_buf = dev.create_storage_buffer(f32_slice_bytes(q_decode.len())?)?;
-        let num_splits = 8_usize;
         let partial_buf =
             dev.create_storage_buffer(f32_slice_bytes(num_splits * num_heads * (head_dim + 2))?)?;
         let o_dec_buf = dev.create_storage_buffer(f32_slice_bytes(q_decode.len())?)?;
@@ -9201,10 +9231,13 @@ mod tests {
             u32::try_from(num_splits).map_err(|_| Error::ResourceLimit("splits".to_owned()))?;
         let scale = 1.0_f32 / f32::from(u16::try_from(head_dim).unwrap_or(1)).sqrt();
         let scale_bits = scale.to_bits();
+        let dec_past_u = u32::try_from((past_len + query_len - 1).min(total_seq - 1))
+            .map_err(|_| Error::ResourceLimit("decpast".to_owned()))?;
+        let dec_total_u = dec_past_u + 1;
         let decode_params_buf = dev.create_storage_buffer(16)?;
         dev.write_buffer_u32(
             decode_params_buf,
-            &[total_u - 1, total_u, total_u - 1, splits_u],
+            &[dec_past_u, dec_total_u, dec_past_u, splits_u],
         )?;
 
         dev.submit_compute(
@@ -9213,8 +9246,17 @@ mod tests {
             &[kv_w_u, 0, total_u, (kv_w_u / 2) * total_u],
             [(kv_w_u / 2).div_ceil(WORKGROUP_X), total_u, 1],
         )?;
+        let use_bq4 = query_len > 1 && head_dim.is_multiple_of(8);
+        let (prefill_pipe, prefill_z) = if use_bq4 {
+            (
+                flash_prefill_bq4,
+                q_len_u.div_ceil(spirv::ATTN_FLASH_GQA6_BQ4_Q_TILE),
+            )
+        } else {
+            (flash_prefill_1q, q_len_u)
+        };
         dev.submit_compute(
-            flash_prefill,
+            prefill_pipe,
             &[
                 q_pre_buf,
                 key_cache_buf,
@@ -9225,10 +9267,15 @@ mod tests {
             &[
                 q_len_u, total_u, past_u, heads_u, kvh_u, dim_u, scale_bits, 1, 0,
             ],
-            [1, kvh_u, q_len_u],
+            [1, kvh_u, prefill_z],
         )?;
+        let splitk_pipe = if head_dim.is_multiple_of(8) {
+            flash_splitk_uvec4
+        } else {
+            flash_splitk_u32
+        };
         dev.submit_compute(
-            flash_splitk,
+            splitk_pipe,
             &[
                 q_dec_buf,
                 key_cache_buf,
@@ -9238,8 +9285,8 @@ mod tests {
             ],
             &[
                 1,
-                total_u,
-                total_u - 1,
+                dec_total_u,
+                dec_past_u,
                 heads_u,
                 kvh_u,
                 dim_u,
@@ -9318,8 +9365,76 @@ mod tests {
         }
         assert!(
             max_pre_diff <= 1e-4 && max_dec_diff <= 1e-4,
-            "Flash GQA-6 max_pre_diff={max_pre_diff}, max_dec_diff={max_dec_diff}"
+            "Flash GQA-6 mismatch (head_dim={head_dim}, q={query_len}, past={past_len}, total={total_seq}, splits={num_splits}): max_pre_diff={max_pre_diff}, max_dec_diff={max_dec_diff}"
         );
+        for buf in [
+            key_f32_buf,
+            val_f32_buf,
+            key_cache_buf,
+            val_cache_buf,
+            q_pre_buf,
+            o_pre_buf,
+            q_dec_buf,
+            partial_buf,
+            o_dec_buf,
+            decode_params_buf,
+        ] {
+            dev.free_buffer(buf);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires live Qualcomm Adreno Vulkan hardware."]
+    fn live_flash_gqa6_prefill_and_decode_splitk_match_cpu_within_1e4() -> Result<(), Error> {
+        let mut dev = AdrenoVulkanDevice::open()?;
+        let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
+        let kv_pack = dev.create_compute_pipeline(&spirv::kv_append_batched_f16(), 4, 4)?;
+        let flash_prefill_1q = dev.create_compute_pipeline(
+            &spirv::attn_flash_gqa6_prefill_f16kv_with_subgroup(use_subgroup),
+            5,
+            9,
+        )?;
+        let flash_prefill_bq4 = dev.create_compute_pipeline(
+            &spirv::attn_flash_gqa6_prefill_bq4_f16kv_with_subgroup(use_subgroup),
+            5,
+            9,
+        )?;
+        let flash_splitk_u32 = dev.create_compute_pipeline(
+            &spirv::attn_flash_gqa6_decode_splitk_f16kv_with_subgroup(use_subgroup),
+            5,
+            10,
+        )?;
+        let flash_splitk_uvec4 = dev.create_compute_pipeline(
+            &spirv::attn_flash_gqa6_decode_splitk_uvec4_f16kv_with_subgroup(use_subgroup),
+            5,
+            10,
+        )?;
+        let flash_combine =
+            dev.create_compute_pipeline(&spirv::attn_flash_decode_combine_f32(), 2, 3)?;
+
+        for (head_dim, query_len, past_len, total_seq) in [
+            (128, 1, 63, 64),
+            (128, 3, 61, 64),
+            (128, 5, 507, 512),
+            (128, 32, 2016, 2048),
+            (256, 5, 67, 72),
+            (130, 5, 59, 64),
+        ] {
+            verify_live_flash_gqa6_case(
+                &mut dev,
+                kv_pack,
+                flash_prefill_1q,
+                flash_prefill_bq4,
+                flash_splitk_u32,
+                flash_splitk_uvec4,
+                flash_combine,
+                head_dim,
+                query_len,
+                past_len,
+                total_seq,
+            )?;
+        }
         Ok(())
     }
 
@@ -9546,8 +9661,8 @@ mod tests {
         let p_wave = VulkanLayerPipelines::prepare(false, false, true)?;
         let p_both = VulkanLayerPipelines::prepare(true, true, true)?;
 
-        assert_eq!(p_base.modules.len(), 79);
-        assert_eq!(p_both.modules.len(), 79);
+        assert_eq!(p_base.modules.len(), 81);
+        assert_eq!(p_both.modules.len(), 81);
         assert_eq!(
             p_both.shader_digests_sha256,
             VulkanLayerPipelines::prepare(true, true, true)?.shader_digests_sha256
@@ -9562,6 +9677,8 @@ mod tests {
 
         let tags: Vec<&[u8]> = p_both.modules.iter().map(|m| m.tag).collect();
         for expected in [
+            b"attn_flash_gqa6_prefill_bq4_f16kv".as_slice(),
+            b"attn_flash_gqa6_decode_splitk_uvec4_f16kv".as_slice(),
             b"rms_norm_vec4_f32".as_slice(),
             b"add_rms_norm_vec4_f32".as_slice(),
             b"gdn_step_4row_d128_vec4_f32".as_slice(),

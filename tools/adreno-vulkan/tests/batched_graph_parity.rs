@@ -562,6 +562,11 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
     let portable_modules = [
         ("rms_norm_f32", spirv::rms_norm_f32()),
         ("rms_norm_batched_f32", spirv::rms_norm_batched_f32()),
+        (
+            "gated_rms_norm_f32_unpinned",
+            spirv::gated_rms_norm_f32(false),
+        ),
+        ("gated_rms_norm_f32_pinned", spirv::gated_rms_norm_f32(true)),
         ("add_rms_norm_f32", spirv::add_rms_norm_f32()),
         (
             "add_rms_norm_batched_f32",
@@ -599,11 +604,19 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
             "deinterleave_q_gate_batched_f32",
             spirv::deinterleave_q_gate_batched_f32(),
         ),
+        (
+            "deinterleave_q_gate_rms_norm_rope",
+            spirv::deinterleave_q_gate_rms_norm_rope(),
+        ),
         ("round_f16_f32", spirv::round_f16_f32()),
         ("kv_append_f32", spirv::kv_append_f32()),
         ("kv_append_batched_f32", spirv::kv_append_batched_f32()),
         ("kv_append_f16", spirv::kv_append_f16()),
         ("kv_append_batched_f16", spirv::kv_append_batched_f16()),
+        (
+            "rms_norm_rope_kv_append_f16",
+            spirv::rms_norm_rope_kv_append_f16(),
+        ),
         ("kv_unpack_f16_to_f32", spirv::kv_unpack_f16_to_f32()),
         (
             "quant_q8k_4plane_src",
@@ -671,6 +684,14 @@ fn spirv_layer_and_helper_modules_pass_structural_validation() {
         (
             "fused_basis_hadamard1024_q8k_pinned",
             spirv::fused_basis_hadamard1024_q8k_4plane(true),
+        ),
+        (
+            "swiglu_hadamard1024_q8k_unpinned",
+            spirv::swiglu_hadamard1024_q8k_4plane(false),
+        ),
+        (
+            "swiglu_hadamard1024_q8k_pinned",
+            spirv::swiglu_hadamard1024_q8k_4plane(true),
         ),
         (
             "fused_basis_hadamard1024_q8_0_src",
@@ -2742,4 +2763,471 @@ fn live_incremental_checkpoint_append_rollback_and_branch_fallback_parity() -> T
         "branch divergence full KV restore fallback parity",
     );
     Ok(())
+}
+
+fn read_buffer_words(
+    dev: &AdrenoVulkanDevice,
+    buf: BufferId,
+    word_count: usize,
+) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut bytes = vec![0_u8; word_count * 4];
+    dev.read_buffer_bytes(buf, &mut bytes)?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
+        .collect())
+}
+
+fn verify_live_gated_rms_norm_parity(
+    dev: &mut AdrenoVulkanDevice,
+    use_subgroup: bool,
+) -> TestResult {
+    for pinned in [false, true] {
+        let p_norm =
+            dev.create_compute_pipeline(&spirv::rms_norm_f32_with_subgroup(use_subgroup), 3, 2)?;
+        let p_swiglu = dev.create_compute_pipeline(&spirv::ffn_swiglu_f32(pinned), 3, 1)?;
+        let p_fused = dev.create_compute_pipeline(
+            &spirv::gated_rms_norm_f32_with_subgroup(pinned, use_subgroup),
+            4,
+            2,
+        )?;
+        for (rows, dim) in [(1_usize, 128_usize), (48, 128), (12, 256)] {
+            let total = rows * dim;
+            let x_vals = fill_pattern(total, 0.017, 5);
+            let gate_vals = fill_pattern(total, 0.023, 11);
+            let weight_vals = fill_pattern(dim, 0.031, 3);
+            let buf_x = dev.create_storage_buffer(u64::try_from(total * 4)?)?;
+            let buf_gate = dev.create_storage_buffer(u64::try_from(total * 4)?)?;
+            let buf_weight = dev.create_storage_buffer(u64::try_from(dim * 4)?)?;
+            let buf_tmp = dev.create_storage_buffer(u64::try_from(total * 4)?)?;
+            let buf_unref = dev.create_storage_buffer(u64::try_from(total * 4)?)?;
+            let buf_fused = dev.create_storage_buffer(u64::try_from(total * 4)?)?;
+            dev.write_buffer_f32(buf_x, &x_vals)?;
+            dev.write_buffer_f32(buf_gate, &gate_vals)?;
+            dev.write_buffer_f32(buf_weight, &weight_vals)?;
+
+            let dim_u = u32::try_from(dim)?;
+            let rows_u = u32::try_from(rows)?;
+            let total_u = u32::try_from(total)?;
+            let eps_bits = 1e-6_f32.to_bits();
+            let mut rec = CommandBatchRecorder::new();
+            rec.push_barrier(
+                p_norm,
+                &[
+                    BufferSpan::whole(buf_x),
+                    BufferSpan::whole(buf_weight),
+                    BufferSpan::whole(buf_tmp),
+                ],
+                &[dim_u, eps_bits],
+                [1, rows_u, 1],
+            );
+            rec.push_barrier(
+                p_swiglu,
+                &[
+                    BufferSpan::whole(buf_gate),
+                    BufferSpan::whole(buf_tmp),
+                    BufferSpan::whole(buf_unref),
+                ],
+                &[total_u],
+                [total_u.div_ceil(64), 1, 1],
+            );
+            rec.push_barrier(
+                p_fused,
+                &[
+                    BufferSpan::whole(buf_x),
+                    BufferSpan::whole(buf_weight),
+                    BufferSpan::whole(buf_gate),
+                    BufferSpan::whole(buf_fused),
+                ],
+                &[dim_u, eps_bits],
+                [1, rows_u, 1],
+            );
+            dev.submit_compute_batch(&rec)?;
+
+            let mut out_ref = vec![0.0_f32; total];
+            let mut out_fus = vec![0.0_f32; total];
+            dev.read_buffer_f32(buf_unref, &mut out_ref)?;
+            dev.read_buffer_f32(buf_fused, &mut out_fus)?;
+            assert_bits_eq(
+                &out_fus,
+                &out_ref,
+                &format!("gated_rms_norm pin={pinned} rows={rows} dim={dim}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Verifies fused K RMSNorm+RoPE+FP16 KV append against unfused stages at 0 ULP."
+)]
+fn verify_live_full_attn_key_prep_parity(
+    dev: &mut AdrenoVulkanDevice,
+    use_subgroup: bool,
+) -> TestResult {
+    let p_norm =
+        dev.create_compute_pipeline(&spirv::rms_norm_f32_with_subgroup(use_subgroup), 3, 2)?;
+    let p_rope_1 = dev.create_compute_pipeline(&spirv::rope_f32(), 2, 4)?;
+    let p_rope_n = dev.create_compute_pipeline(&spirv::rope_batched_f32(), 2, 5)?;
+    let p_kva_1 = dev.create_compute_pipeline(&spirv::kv_append_f16(), 2, 2)?;
+    let p_kva_n = dev.create_compute_pipeline(&spirv::kv_append_batched_f16(), 2, 3)?;
+    let p_fused = dev.create_compute_pipeline(
+        &spirv::rms_norm_rope_kv_append_f16_with_subgroup(use_subgroup),
+        4,
+        6,
+    )?;
+
+    for (tokens, kv_heads, head_dim, rope_dim, start_pos) in [
+        (1_usize, 2_usize, 256_usize, 64_usize, 5_usize),
+        (7, 2, 256, 64, 13),
+        (4, 2, 128, 128, 0),
+    ] {
+        let tok_u = u32::try_from(tokens)?;
+        let kvh_u = u32::try_from(kv_heads)?;
+        let hd_u = u32::try_from(head_dim)?;
+        let rope_u = u32::try_from(rope_dim)?;
+        let pos_u = u32::try_from(start_pos)?;
+        let eps_bits = 1e-6_f32.to_bits();
+        let kv_w = kv_heads * head_dim;
+        let total_slots = start_pos + tokens;
+
+        let input_vals = fill_pattern(tokens * kv_w, 0.019, 7);
+        let norm_weights = fill_pattern(head_dim, 0.029, 3);
+        let freqs: Vec<f32> = (0..tokens * (rope_dim / 2))
+            .flat_map(|i| {
+                let ang = f32::from(u16::try_from(i % 97).unwrap_or(0)) * 0.05;
+                [ang.cos(), ang.sin()]
+            })
+            .collect();
+
+        let buf_ref = dev.create_storage_buffer(u64::try_from(input_vals.len() * 4)?)?;
+        let buf_fus = dev.create_storage_buffer(u64::try_from(input_vals.len() * 4)?)?;
+        let buf_norm = dev.create_storage_buffer(u64::try_from(head_dim * 4)?)?;
+        let buf_freqs = dev.create_storage_buffer(u64::try_from(freqs.len() * 4)?)?;
+        let cache_words = total_slots * (kv_w / 2);
+        let buf_cache_ref = dev.create_storage_buffer(u64::try_from(cache_words * 4)?)?;
+        let buf_cache_fus = dev.create_storage_buffer(u64::try_from(cache_words * 4)?)?;
+
+        dev.write_buffer_f32(buf_ref, &input_vals)?;
+        dev.write_buffer_f32(buf_fus, &input_vals)?;
+        dev.write_buffer_f32(buf_norm, &norm_weights)?;
+        dev.write_buffer_f32(buf_freqs, &freqs)?;
+        dev.write_buffer_u32(buf_cache_ref, &vec![0_u32; cache_words])?;
+        dev.write_buffer_u32(buf_cache_fus, &vec![0_u32; cache_words])?;
+
+        let mut rec = CommandBatchRecorder::new();
+        rec.push_barrier(
+            p_norm,
+            &[
+                BufferSpan::whole(buf_ref),
+                BufferSpan::whole(buf_norm),
+                BufferSpan::whole(buf_ref),
+            ],
+            &[hd_u, eps_bits],
+            [1, tok_u * kvh_u, 1],
+        );
+        if tokens == 1 {
+            rec.push_barrier(
+                p_rope_1,
+                &[BufferSpan::whole(buf_ref), BufferSpan::whole(buf_freqs)],
+                &[kvh_u, hd_u, rope_u, 1],
+                [hd_u.div_ceil(64), kvh_u, 1],
+            );
+            rec.push_barrier(
+                p_kva_1,
+                &[BufferSpan::whole(buf_ref), BufferSpan::whole(buf_cache_ref)],
+                &[u32::try_from(kv_w)?, pos_u],
+                [(u32::try_from(kv_w)? / 2).div_ceil(64), 1, 1],
+            );
+        } else {
+            rec.push_barrier(
+                p_rope_n,
+                &[BufferSpan::whole(buf_ref), BufferSpan::whole(buf_freqs)],
+                &[kvh_u, hd_u, rope_u, 1, tok_u],
+                [hd_u.div_ceil(64), kvh_u, tok_u],
+            );
+            rec.push_barrier(
+                p_kva_n,
+                &[BufferSpan::whole(buf_ref), BufferSpan::whole(buf_cache_ref)],
+                &[u32::try_from(kv_w)?, pos_u, tok_u],
+                [(u32::try_from(kv_w)? / 2).div_ceil(64), tok_u, 1],
+            );
+        }
+        rec.push_barrier(
+            p_fused,
+            &[
+                BufferSpan::whole(buf_fus),
+                BufferSpan::whole(buf_norm),
+                BufferSpan::whole(buf_freqs),
+                BufferSpan::whole(buf_cache_fus),
+            ],
+            &[kvh_u, hd_u, rope_u, eps_bits, pos_u, tok_u],
+            [1, kvh_u, tok_u],
+        );
+        dev.submit_compute_batch(&rec)?;
+
+        let kc_ref = read_buffer_words(dev, buf_cache_ref, cache_words)?;
+        let kc_fus = read_buffer_words(dev, buf_cache_fus, cache_words)?;
+        assert_eq!(
+            kc_fus, kc_ref,
+            "rms_norm_rope_kv_append_f16 mismatch T={tokens}"
+        );
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Verifies fused Q deinterleave+RMSNorm+RoPE against unfused stages at 0 ULP."
+)]
+fn verify_live_full_attn_query_prep_parity(
+    dev: &mut AdrenoVulkanDevice,
+    use_subgroup: bool,
+) -> TestResult {
+    let p_norm =
+        dev.create_compute_pipeline(&spirv::rms_norm_f32_with_subgroup(use_subgroup), 3, 2)?;
+    let p_rope_1 = dev.create_compute_pipeline(&spirv::rope_f32(), 2, 4)?;
+    let p_rope_n = dev.create_compute_pipeline(&spirv::rope_batched_f32(), 2, 5)?;
+    let p_deint_1 = dev.create_compute_pipeline(&spirv::deinterleave_q_gate_f32(), 3, 2)?;
+    let p_deint_n = dev.create_compute_pipeline(&spirv::deinterleave_q_gate_batched_f32(), 3, 3)?;
+    let p_fused = dev.create_compute_pipeline(
+        &spirv::deinterleave_q_gate_rms_norm_rope_with_subgroup(use_subgroup),
+        5,
+        6,
+    )?;
+
+    for (tokens, heads, head_dim, rope_dim) in [
+        (1_usize, 12_usize, 256_usize, 64_usize),
+        (7, 12, 256, 64),
+        (4, 8, 128, 128),
+    ] {
+        let tok_u = u32::try_from(tokens)?;
+        let heads_u = u32::try_from(heads)?;
+        let hd_u = u32::try_from(head_dim)?;
+        let rope_u = u32::try_from(rope_dim)?;
+        let eps_bits = 1e-6_f32.to_bits();
+        let q_w = heads * head_dim;
+
+        let packed_vals = fill_pattern(tokens * 2 * q_w, 0.013, 19);
+        let norm_weights = fill_pattern(head_dim, 0.037, 9);
+        let freqs: Vec<f32> = (0..tokens * (rope_dim / 2))
+            .flat_map(|i| {
+                let ang = f32::from(u16::try_from(i % 97).unwrap_or(0)) * 0.05;
+                [ang.cos(), ang.sin()]
+            })
+            .collect();
+
+        let buf_packed = dev.create_storage_buffer(u64::try_from(packed_vals.len() * 4)?)?;
+        let buf_norm = dev.create_storage_buffer(u64::try_from(head_dim * 4)?)?;
+        let buf_freqs = dev.create_storage_buffer(u64::try_from(freqs.len() * 4)?)?;
+        let buf_out_ref = dev.create_storage_buffer(u64::try_from(tokens * q_w * 4)?)?;
+        let buf_gate_ref = dev.create_storage_buffer(u64::try_from(tokens * q_w * 4)?)?;
+        let buf_out_fus = dev.create_storage_buffer(u64::try_from(tokens * q_w * 4)?)?;
+        let buf_gate_fus = dev.create_storage_buffer(u64::try_from(tokens * q_w * 4)?)?;
+
+        dev.write_buffer_f32(buf_packed, &packed_vals)?;
+        dev.write_buffer_f32(buf_norm, &norm_weights)?;
+        dev.write_buffer_f32(buf_freqs, &freqs)?;
+
+        let mut rec = CommandBatchRecorder::new();
+        if tokens == 1 {
+            rec.push_barrier(
+                p_deint_1,
+                &[
+                    BufferSpan::whole(buf_packed),
+                    BufferSpan::whole(buf_out_ref),
+                    BufferSpan::whole(buf_gate_ref),
+                ],
+                &[heads_u, hd_u],
+                [u32::try_from(q_w)?.div_ceil(64), 1, 1],
+            );
+        } else {
+            rec.push_barrier(
+                p_deint_n,
+                &[
+                    BufferSpan::whole(buf_packed),
+                    BufferSpan::whole(buf_out_ref),
+                    BufferSpan::whole(buf_gate_ref),
+                ],
+                &[heads_u, hd_u, tok_u],
+                [u32::try_from(q_w)?.div_ceil(64), tok_u, 1],
+            );
+        }
+        rec.push_barrier(
+            p_norm,
+            &[
+                BufferSpan::whole(buf_out_ref),
+                BufferSpan::whole(buf_norm),
+                BufferSpan::whole(buf_out_ref),
+            ],
+            &[hd_u, eps_bits],
+            [1, tok_u * heads_u, 1],
+        );
+        if tokens == 1 {
+            rec.push_barrier(
+                p_rope_1,
+                &[BufferSpan::whole(buf_out_ref), BufferSpan::whole(buf_freqs)],
+                &[heads_u, hd_u, rope_u, 1],
+                [hd_u.div_ceil(64), heads_u, 1],
+            );
+        } else {
+            rec.push_barrier(
+                p_rope_n,
+                &[BufferSpan::whole(buf_out_ref), BufferSpan::whole(buf_freqs)],
+                &[heads_u, hd_u, rope_u, 1, tok_u],
+                [hd_u.div_ceil(64), heads_u, tok_u],
+            );
+        }
+        rec.push_barrier(
+            p_fused,
+            &[
+                BufferSpan::whole(buf_packed),
+                BufferSpan::whole(buf_norm),
+                BufferSpan::whole(buf_freqs),
+                BufferSpan::whole(buf_out_fus),
+                BufferSpan::whole(buf_gate_fus),
+            ],
+            &[heads_u, hd_u, rope_u, eps_bits, 1, tok_u],
+            [1, heads_u, tok_u],
+        );
+        dev.submit_compute_batch(&rec)?;
+
+        let mut out_ref = vec![0.0_f32; tokens * q_w];
+        let mut out_fus = vec![0.0_f32; tokens * q_w];
+        let mut gate_ref = vec![0.0_f32; tokens * q_w];
+        let mut gate_fus = vec![0.0_f32; tokens * q_w];
+        dev.read_buffer_f32(buf_out_ref, &mut out_ref)?;
+        dev.read_buffer_f32(buf_out_fus, &mut out_fus)?;
+        dev.read_buffer_f32(buf_gate_ref, &mut gate_ref)?;
+        dev.read_buffer_f32(buf_gate_fus, &mut gate_fus)?;
+        assert_bits_eq(
+            &out_fus,
+            &out_ref,
+            &format!("deinterleave_q_gate_rms_norm_rope Q T={tokens}"),
+        );
+        assert_bits_eq(
+            &gate_fus,
+            &gate_ref,
+            &format!("deinterleave_q_gate_rms_norm_rope gate T={tokens}"),
+        );
+    }
+    Ok(())
+}
+
+fn verify_live_swiglu_h1024_q8k_parity(
+    dev: &mut AdrenoVulkanDevice,
+    use_subgroup: bool,
+) -> TestResult {
+    let cols = 2048_usize;
+    let cols_u = 2048_u32;
+    let max_t = 9_usize;
+    let gate_vals = fill_pattern(max_t * cols, 0.021, 5);
+    let up_vals = fill_pattern(max_t * cols, 0.017, 13);
+    let sign_vals: Vec<f32> = (0..cols)
+        .map(|i| {
+            if (i * 5 + 1) % 3 == 0 {
+                -1.0_f32
+            } else {
+                1.0_f32
+            }
+        })
+        .collect();
+    let b_gate = dev.create_storage_buffer(u64::try_from(gate_vals.len() * 4)?)?;
+    let b_up = dev.create_storage_buffer(u64::try_from(up_vals.len() * 4)?)?;
+    let b_sign = dev.create_storage_buffer(u64::try_from(cols * 4)?)?;
+    let b_mid_ref = dev.create_storage_buffer(u64::try_from(max_t * cols * 4)?)?;
+    let b_mid_fus = dev.create_storage_buffer(u64::try_from(max_t * cols * 4)?)?;
+    let q8k_words = max_t * (cols / 128) * 34;
+    let b_q8k_ref = dev.create_storage_buffer(u64::try_from(q8k_words * 4)?)?;
+    let b_q8k_fus = dev.create_storage_buffer(u64::try_from(q8k_words * 4)?)?;
+    dev.write_buffer_f32(b_gate, &gate_vals)?;
+    dev.write_buffer_f32(b_up, &up_vals)?;
+    dev.write_buffer_f32(b_sign, &sign_vals)?;
+
+    let norm_bits = (1.0_f32 / 32.0_f32).to_bits();
+    for pinned in [false, true] {
+        let p_swiglu = dev.create_compute_pipeline(&spirv::ffn_swiglu_f32(pinned), 3, 1)?;
+        let p_h_ref = dev.create_compute_pipeline(
+            &spirv::fused_basis_hadamard1024_q8k_4plane_with_subgroup(pinned, use_subgroup),
+            3,
+            7,
+        )?;
+        let p_h_fus = dev.create_compute_pipeline(
+            &spirv::swiglu_hadamard1024_q8k_4plane_with_subgroup(pinned, use_subgroup),
+            5,
+            4,
+        )?;
+        for (tokens, has_signs, write_mid) in [(1_usize, 1_u32, 0_u32), (9, 1, 1), (4, 0, 1)] {
+            let tok_u = u32::try_from(tokens)?;
+            let total_u = tok_u * cols_u;
+            let mut rec = CommandBatchRecorder::new();
+            rec.push_barrier(
+                p_swiglu,
+                &[
+                    BufferSpan::whole(b_gate),
+                    BufferSpan::whole(b_up),
+                    BufferSpan::whole(b_mid_ref),
+                ],
+                &[total_u],
+                [total_u.div_ceil(64), 1, 1],
+            );
+            rec.push_barrier(
+                p_h_ref,
+                &[
+                    BufferSpan::whole(b_mid_ref),
+                    BufferSpan::whole(b_sign),
+                    BufferSpan::whole(b_q8k_ref),
+                ],
+                &[cols_u, norm_bits, has_signs, 0, 1, 1, 1],
+                [cols_u / 1024, tok_u, 1],
+            );
+            rec.push_barrier(
+                p_h_fus,
+                &[
+                    BufferSpan::whole(b_gate),
+                    BufferSpan::whole(b_up),
+                    BufferSpan::whole(b_sign),
+                    BufferSpan::whole(b_q8k_fus),
+                    BufferSpan::whole(b_mid_fus),
+                ],
+                &[cols_u, norm_bits, has_signs, write_mid],
+                [cols_u / 1024, tok_u, 1],
+            );
+            dev.submit_compute_batch(&rec)?;
+
+            let words = tokens * (cols / 128) * 34;
+            let q_ref = read_buffer_words(dev, b_q8k_ref, words)?;
+            let q_fus = read_buffer_words(dev, b_q8k_fus, words)?;
+            assert_eq!(
+                q_fus, q_ref,
+                "swiglu_hadamard1024_q8k mismatch pin={pinned} T={tokens} s={has_signs}"
+            );
+            if write_mid != 0 {
+                let mut m_ref = vec![0.0_f32; tokens * cols];
+                let mut m_fus = vec![0.0_f32; tokens * cols];
+                dev.read_buffer_f32(b_mid_ref, &mut m_ref)?;
+                dev.read_buffer_f32(b_mid_fus, &mut m_fus)?;
+                assert_bits_eq(
+                    &m_fus,
+                    &m_ref,
+                    &format!("swiglu_hadamard1024_q8k mid_out pin={pinned} T={tokens}"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires physical Qualcomm Adreno Vulkan Windows ARM64 hardware"]
+fn live_fused_gdn_norm_attn_qk_and_swiglu_h1024_match_unfused_zero_ulp() -> TestResult {
+    let mut dev = AdrenoVulkanDevice::open()?;
+    let use_subgroup = dev.capabilities().wave64_subgroup_shuffle;
+    verify_live_gated_rms_norm_parity(&mut dev, use_subgroup)?;
+    verify_live_full_attn_key_prep_parity(&mut dev, use_subgroup)?;
+    verify_live_full_attn_query_prep_parity(&mut dev, use_subgroup)?;
+    verify_live_swiglu_h1024_q8k_parity(&mut dev, use_subgroup)
 }

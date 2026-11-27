@@ -5905,181 +5905,30 @@ pub fn quantize_f32_to_q8k_4plane_batched(pinned: bool) -> Vec<u32> {
 
 const HADAMARD_1024_WG_X: u32 = 256;
 
-#[expect(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "Maintains clean single-pass SPIR-V emission for fused optional SSM permutation, sign scaling, and 1024-point FWHT in wave64 registers and shared memory."
-)]
-fn emit_fused_basis_hadamard1024_smem_fwht(
-    b: &mut ShaderBuilder,
-    in_buf: u32,
-    sign_buf: u32,
-    smem: u32,
-    lid: u32,
-    blk1024: u32,
-    tok: u32,
-    push_var: u32,
-) -> (u32, u32) {
-    let cols = b.load_push(push_var, 0);
-    let norm_bits = b.load_push(push_var, 1);
-    let has_signs = b.load_push(push_var, 2);
-    let use_permute = b.load_push(push_var, 3);
-    let num_k_heads = b.load_push(push_var, 4);
-    let repetitions = b.load_push(push_var, 5);
-    let head_dim = b.load_push(push_var, 6);
-    let norm = b.bitcast(b.f32_t, norm_bits);
+#[derive(Clone, Copy)]
+enum Hadamard1024Input {
+    Direct {
+        in_buf: u32,
+        use_permute: u32,
+        num_k_heads: u32,
+        repetitions: u32,
+        head_dim: u32,
+    },
+    Swiglu {
+        gate_buf: u32,
+        up_buf: u32,
+        mid_buf: u32,
+        write_mid: u32,
+        pinned: bool,
+    },
+}
 
-    let c0 = b.const_u32(0);
+fn emit_hadamard1024_smem_stages(b: &mut ShaderBuilder, smem: u32, lid: u32, start_half: u32) {
     let c1 = b.const_u32(1);
     let c256 = b.const_u32(HADAMARD_1024_WG_X);
     let c1024 = b.const_u32(1024);
-
-    let tok_base = b.umul(tok, cols);
-    let blk1024_base = b.umul(blk1024, c1024);
-    let signs_active = b.u_ne(has_signs, c0);
-    let perm_flag = b.u_ne(use_permute, c0);
-    let rep_nz = b.u_ne(repetitions, c0);
-    let hd_nz = b.u_ne(head_dim, c0);
-    let kh_nz = b.u_ne(num_k_heads, c0);
-    let dims_nz = b.logical_and(rep_nz, hd_nz);
-    let dims_all = b.logical_and(dims_nz, kh_nz);
-    let permute_active = b.logical_and(perm_flag, dims_all);
-
-    let src_pos_var = b.local_u32_var();
-    let val_var = b.local_f32_var();
-    if b.uses_subgroup_shuffle() {
-        let c6 = b.const_u32(6);
-        let c8 = b.const_u32(8);
-        let c63 = b.const_u32(63);
-        let c64 = b.const_u32(64);
-        let subwg = b.ushr(lid, c6);
-        let sub_lid = b.uand(lid, c63);
-        let subwg_base = b.ushl(subwg, c8);
-        let mut chunk_vals = [0_u32; 4];
-        let mut chunk_pos = [0_u32; 4];
-        for (idx, chunk) in (0_u32..4).enumerate() {
-            let chunk_off = b.const_u32(chunk * 64);
-            let chunk_base = b.uadd(subwg_base, chunk_off);
-            let local_pos = b.uadd(chunk_base, sub_lid);
-            chunk_pos[idx] = local_pos;
-            let dst_pos = b.uadd(blk1024_base, local_pos);
-            b.store_var(src_pos_var, dst_pos);
-            b.emit_if(permute_active, |b| {
-                let dst_head = b.udiv(dst_pos, head_dim);
-                let dst_head_off = b.umul(dst_head, head_dim);
-                let d = b.usub(dst_pos, dst_head_off);
-                let key = b.udiv(dst_head, repetitions);
-                let key_rep = b.umul(key, repetitions);
-                let repeat = b.usub(dst_head, key_rep);
-                let rep_k = b.umul(repeat, num_k_heads);
-                let src_head = b.uadd(rep_k, key);
-                let src_head_off = b.umul(src_head, head_dim);
-                let src_pos = b.uadd(src_head_off, d);
-                b.store_var(src_pos_var, src_pos);
-            });
-            let resolved_src = b.load_var_u32(src_pos_var);
-            let global_in_idx = b.uadd(tok_base, resolved_src);
-            let raw_val = b.load_sb_f32(in_buf, global_in_idx);
-            b.store_var(val_var, raw_val);
-            b.emit_if(signs_active, |b| {
-                let sign_v = b.load_sb_f32(sign_buf, dst_pos);
-                let cur_v = b.load_var_f32(val_var);
-                let scaled_v = b.fmul_nc(cur_v, sign_v);
-                b.store_var(val_var, scaled_v);
-            });
-            chunk_vals[idx] = b.load_var_f32(val_var);
-        }
-
-        // Stages 1..=32 are 100% subgroup-local in wave64 registers (0 shared memory, 0 barriers).
-        for half in [1_u32, 2, 4, 8, 16, 32] {
-            let half_c = b.const_u32(half);
-            let masked = b.uand(sub_lid, half_c);
-            let is_right = b.u_ne(masked, c0);
-            for v in &mut chunk_vals {
-                let partner = b.subgroup_shuffle_xor(b.f32_t, *v, half);
-                let sum_f = b.fadd_nc(*v, partner);
-                let diff_f = b.fsub_nc(partner, *v);
-                *v = b.select(b.f32_t, is_right, diff_f, sum_f);
-            }
-        }
-        for (&local_pos, &v) in chunk_pos.iter().zip(&chunk_vals) {
-            let v_u32 = b.bitcast(b.u32_t, v);
-            b.store_wg_u32(smem, local_pos, v_u32);
-        }
-        b.workgroup_barrier();
-
-        let half_var = b.local_u32_var();
-        b.store_var(half_var, c64);
-        b.emit_while(
-            |b| {
-                let h = b.load_var_u32(half_var);
-                b.u_lt(h, c1024)
-            },
-            |b| {
-                let half = b.load_var_u32(half_var);
-                let mask = b.binop(OP_I_SUB, b.u32_t, half, c1);
-                let p1 = b.uadd(lid, c256);
-                for p_idx in [lid, p1] {
-                    let lo = b.uand(p_idx, mask);
-                    let bp = b.binop(OP_I_SUB, b.u32_t, p_idx, lo);
-                    let hi = b.ushl(bp, c1);
-                    let left = b.uor(hi, lo);
-                    let right = b.uor(left, half);
-                    let l_bits = b.load_wg_u32(smem, left);
-                    let r_bits = b.load_wg_u32(smem, right);
-                    let l_val = b.bitcast(b.f32_t, l_bits);
-                    let r_val = b.bitcast(b.f32_t, r_bits);
-                    let sum_f = b.fadd_nc(l_val, r_val);
-                    let diff_f = b.fsub_nc(l_val, r_val);
-                    let sum_u = b.bitcast(b.u32_t, sum_f);
-                    let diff_u = b.bitcast(b.u32_t, diff_f);
-                    b.store_wg_u32(smem, left, sum_u);
-                    b.store_wg_u32(smem, right, diff_u);
-                }
-                b.workgroup_barrier();
-                let next_half = b.ushl(half, c1);
-                b.store_var(half_var, next_half);
-            },
-        );
-        return (cols, norm);
-    }
-
-    for k in 0_u32..4 {
-        let k_off = b.const_u32(k * HADAMARD_1024_WG_X);
-        let local_pos = b.uadd(lid, k_off);
-        let dst_pos = b.uadd(blk1024_base, local_pos);
-        b.store_var(src_pos_var, dst_pos);
-        b.emit_if(permute_active, |b| {
-            let dst_head = b.udiv(dst_pos, head_dim);
-            let dst_head_off = b.umul(dst_head, head_dim);
-            let d = b.usub(dst_pos, dst_head_off);
-            let key = b.udiv(dst_head, repetitions);
-            let key_rep = b.umul(key, repetitions);
-            let repeat = b.usub(dst_head, key_rep);
-            let rep_k = b.umul(repeat, num_k_heads);
-            let src_head = b.uadd(rep_k, key);
-            let src_head_off = b.umul(src_head, head_dim);
-            let src_pos = b.uadd(src_head_off, d);
-            b.store_var(src_pos_var, src_pos);
-        });
-        let resolved_src = b.load_var_u32(src_pos_var);
-        let global_in_idx = b.uadd(tok_base, resolved_src);
-        let raw_val = b.load_sb_f32(in_buf, global_in_idx);
-        b.store_var(val_var, raw_val);
-        b.emit_if(signs_active, |b| {
-            let sign_v = b.load_sb_f32(sign_buf, dst_pos);
-            let cur_v = b.load_var_f32(val_var);
-            let scaled_v = b.fmul_nc(cur_v, sign_v);
-            b.store_var(val_var, scaled_v);
-        });
-        let final_v = b.load_var_f32(val_var);
-        let v_u32 = b.bitcast(b.u32_t, final_v);
-        b.store_wg_u32(smem, local_pos, v_u32);
-    }
-    b.workgroup_barrier();
-
     let half_var = b.local_u32_var();
-    b.store_var(half_var, c1);
+    b.store_var(half_var, start_half);
     b.emit_while(
         |b| {
             let h = b.load_var_u32(half_var);
@@ -6111,6 +5960,167 @@ fn emit_fused_basis_hadamard1024_smem_fwht(
             b.store_var(half_var, next_half);
         },
     );
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Maintains clean single-pass SPIR-V emission for fused SwiGLU/permutation, sign scaling, and 1024-point FWHT in wave64 registers and shared memory."
+)]
+fn emit_fused_basis_hadamard1024_smem_fwht(
+    b: &mut ShaderBuilder,
+    input: Hadamard1024Input,
+    sign_buf: u32,
+    smem: u32,
+    lid: u32,
+    blk1024: u32,
+    tok: u32,
+    push_var: u32,
+) -> (u32, u32) {
+    let cols = b.load_push(push_var, 0);
+    let norm_bits = b.load_push(push_var, 1);
+    let has_signs = b.load_push(push_var, 2);
+    let norm = b.bitcast(b.f32_t, norm_bits);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c1024 = b.const_u32(1024);
+
+    let tok_base = b.umul(tok, cols);
+    let blk1024_base = b.umul(blk1024, c1024);
+    let signs_active = b.u_ne(has_signs, c0);
+
+    let permute_active = match input {
+        Hadamard1024Input::Direct {
+            use_permute,
+            num_k_heads,
+            repetitions,
+            head_dim,
+            ..
+        } => {
+            let perm_flag = b.u_ne(use_permute, c0);
+            let rep_nz = b.u_ne(repetitions, c0);
+            let hd_nz = b.u_ne(head_dim, c0);
+            let kh_nz = b.u_ne(num_k_heads, c0);
+            let dims_nz = b.logical_and(rep_nz, hd_nz);
+            let dims_all = b.logical_and(dims_nz, kh_nz);
+            b.logical_and(perm_flag, dims_all)
+        }
+        Hadamard1024Input::Swiglu { .. } => c0,
+    };
+    let write_mid_active = match input {
+        Hadamard1024Input::Swiglu { write_mid, .. } => b.u_ne(write_mid, c0),
+        Hadamard1024Input::Direct { .. } => c0,
+    };
+
+    let src_pos_var = b.local_u32_var();
+    let val_var = b.local_f32_var();
+    let emit_load_scaled = |b: &mut ShaderBuilder, dst_pos: u32| -> u32 {
+        match input {
+            Hadamard1024Input::Direct {
+                in_buf,
+                num_k_heads,
+                repetitions,
+                head_dim,
+                ..
+            } => {
+                b.store_var(src_pos_var, dst_pos);
+                b.emit_if(permute_active, |b| {
+                    let dst_head = b.udiv(dst_pos, head_dim);
+                    let dst_head_off = b.umul(dst_head, head_dim);
+                    let d = b.usub(dst_pos, dst_head_off);
+                    let key = b.udiv(dst_head, repetitions);
+                    let key_rep = b.umul(key, repetitions);
+                    let repeat = b.usub(dst_head, key_rep);
+                    let rep_k = b.umul(repeat, num_k_heads);
+                    let src_head = b.uadd(rep_k, key);
+                    let src_head_off = b.umul(src_head, head_dim);
+                    let src_pos = b.uadd(src_head_off, d);
+                    b.store_var(src_pos_var, src_pos);
+                });
+                let resolved_src = b.load_var_u32(src_pos_var);
+                let global_in_idx = b.uadd(tok_base, resolved_src);
+                let raw_val = b.load_sb_f32(in_buf, global_in_idx);
+                b.store_var(val_var, raw_val);
+            }
+            Hadamard1024Input::Swiglu {
+                gate_buf,
+                up_buf,
+                mid_buf,
+                pinned,
+                ..
+            } => {
+                let global_in_idx = b.uadd(tok_base, dst_pos);
+                let g = b.load_sb_f32(gate_buf, global_in_idx);
+                let u = b.load_sb_f32(up_buf, global_in_idx);
+                let swiglu_v = emit_silu_mul(b, g, u, pinned);
+                b.emit_if(write_mid_active, |b| {
+                    b.store_sb_f32(mid_buf, global_in_idx, swiglu_v);
+                });
+                b.store_var(val_var, swiglu_v);
+            }
+        }
+        b.emit_if(signs_active, |b| {
+            let sign_v = b.load_sb_f32(sign_buf, dst_pos);
+            let cur_v = b.load_var_f32(val_var);
+            let scaled_v = b.fmul_nc(cur_v, sign_v);
+            b.store_var(val_var, scaled_v);
+        });
+        b.load_var_f32(val_var)
+    };
+
+    if b.uses_subgroup_shuffle() {
+        let c6 = b.const_u32(6);
+        let c8 = b.const_u32(8);
+        let c63 = b.const_u32(63);
+        let c64 = b.const_u32(64);
+        let subwg = b.ushr(lid, c6);
+        let sub_lid = b.uand(lid, c63);
+        let subwg_base = b.ushl(subwg, c8);
+        let mut chunk_vals = [0_u32; 4];
+        let mut chunk_pos = [0_u32; 4];
+        for (idx, chunk) in (0_u32..4).enumerate() {
+            let chunk_off = b.const_u32(chunk * 64);
+            let chunk_base = b.uadd(subwg_base, chunk_off);
+            let local_pos = b.uadd(chunk_base, sub_lid);
+            chunk_pos[idx] = local_pos;
+            let dst_pos = b.uadd(blk1024_base, local_pos);
+            chunk_vals[idx] = emit_load_scaled(b, dst_pos);
+        }
+
+        // Stages 1..=32 are 100% subgroup-local in wave64 registers (0 shared memory, 0 barriers).
+        for half in [1_u32, 2, 4, 8, 16, 32] {
+            let half_c = b.const_u32(half);
+            let masked = b.uand(sub_lid, half_c);
+            let is_right = b.u_ne(masked, c0);
+            for v in &mut chunk_vals {
+                let partner = b.subgroup_shuffle_xor(b.f32_t, *v, half);
+                let sum_f = b.fadd_nc(*v, partner);
+                let diff_f = b.fsub_nc(partner, *v);
+                *v = b.select(b.f32_t, is_right, diff_f, sum_f);
+            }
+        }
+        for (&local_pos, &v) in chunk_pos.iter().zip(&chunk_vals) {
+            let v_u32 = b.bitcast(b.u32_t, v);
+            b.store_wg_u32(smem, local_pos, v_u32);
+        }
+        b.workgroup_barrier();
+
+        emit_hadamard1024_smem_stages(b, smem, lid, c64);
+        return (cols, norm);
+    }
+
+    for k in 0_u32..4 {
+        let k_off = b.const_u32(k * HADAMARD_1024_WG_X);
+        let local_pos = b.uadd(lid, k_off);
+        let dst_pos = b.uadd(blk1024_base, local_pos);
+        let final_v = emit_load_scaled(b, dst_pos);
+        let v_u32 = b.bitcast(b.u32_t, final_v);
+        b.store_wg_u32(smem, local_pos, v_u32);
+    }
+    b.workgroup_barrier();
+
+    emit_hadamard1024_smem_stages(b, smem, lid, c1);
 
     (cols, norm)
 }
@@ -6308,9 +6318,82 @@ pub fn fused_basis_hadamard1024_q8k_4plane_with_subgroup(
     let lid = b.load_input_component(lid_vec, 0);
     let blk1024 = b.load_input_component(wid_vec, 0);
     let tok = b.load_input_component(wid_vec, 1);
+    let use_permute = b.load_push(push_var, 3);
+    let num_k_heads = b.load_push(push_var, 4);
+    let repetitions = b.load_push(push_var, 5);
+    let head_dim = b.load_push(push_var, 6);
 
     let (cols, norm) = emit_fused_basis_hadamard1024_smem_fwht(
-        &mut b, in_buf, sign_buf, smem, lid, blk1024, tok, push_var,
+        &mut b,
+        Hadamard1024Input::Direct {
+            in_buf,
+            use_permute,
+            num_k_heads,
+            repetitions,
+            head_dim,
+        },
+        sign_buf,
+        smem,
+        lid,
+        blk1024,
+        tok,
+        push_var,
+    );
+    emit_fused_q8k_quant_phase(&mut b, smem, out_buf, lid, blk1024, tok, cols, norm, pinned);
+
+    b.finish_with_local_size([HADAMARD_1024_WG_X, 1, 1])
+}
+
+/// Emits fused `SwiGLU + [Optional write mid_out] + MulSign + Hadamard(1024) + QuantQ8K_4plane` SPIR-V 1.6 words.
+///
+/// Uses `local_size_x = 256` with a single `4 KiB` `[u32; 1024]` workgroup buffer; when `write_mid != 0`,
+/// also writes unrotated `SwiGLU(gate, up)` to `mid_out` in the same pass for `LoRA`-active `ffn_down`.
+/// Bindings: `0` read-only `gate` (`f32`), `1` read-only `up` (`f32`), `2` read-only `sign_f32` (`f32`),
+/// `3` writable `q8k_4plane` (`u32`), `4` writable `mid_out` (`f32`).
+/// Push constants (`4 × u32`): `[cols, norm_bits, has_signs, write_mid]`.
+/// Dispatch: `(cols / 1024, tokens, 1)`.
+#[must_use]
+pub fn swiglu_hadamard1024_q8k_4plane(pinned: bool) -> Vec<u32> {
+    swiglu_hadamard1024_q8k_4plane_with_subgroup(pinned, false)
+}
+
+/// Emits fused `SwiGLU + [Optional write mid_out] + MulSign + Hadamard(1024) + QuantQ8K_4plane` with optional wave64 shuffle.
+#[must_use]
+pub fn swiglu_hadamard1024_q8k_4plane_with_subgroup(
+    pinned: bool,
+    use_subgroup_shuffle: bool,
+) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 4);
+    let push_var = push_var.unwrap_or(0);
+    let gate_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let up_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let sign_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(3, ElemType::U32, AccessMode::ReadWrite);
+    let mid_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadWrite);
+    let smem = b.workgroup_u32_array(1024);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let blk1024 = b.load_input_component(wid_vec, 0);
+    let tok = b.load_input_component(wid_vec, 1);
+    let write_mid = b.load_push(push_var, 3);
+
+    let (cols, norm) = emit_fused_basis_hadamard1024_smem_fwht(
+        &mut b,
+        Hadamard1024Input::Swiglu {
+            gate_buf,
+            up_buf,
+            mid_buf,
+            write_mid,
+            pinned,
+        },
+        sign_buf,
+        smem,
+        lid,
+        blk1024,
+        tok,
+        push_var,
     );
     emit_fused_q8k_quant_phase(&mut b, smem, out_buf, lid, blk1024, tok, cols, norm, pinned);
 
@@ -6331,6 +6414,10 @@ pub fn fused_basis_hadamard1024_q8_0(pinned: bool, native_scale: bool) -> Vec<u3
 
 /// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8_0` with optional wave64 shuffle.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Emits fused optional SSM permutation, sign scaling, Hadamard(1024) FWHT, and Q8_0 block quantization."
+)]
 pub fn fused_basis_hadamard1024_q8_0_with_subgroup(
     pinned: bool,
     native_scale: bool,
@@ -6348,9 +6435,26 @@ pub fn fused_basis_hadamard1024_q8_0_with_subgroup(
     let lid = b.load_input_component(lid_vec, 0);
     let blk1024 = b.load_input_component(wid_vec, 0);
     let tok = b.load_input_component(wid_vec, 1);
+    let use_permute = b.load_push(push_var, 3);
+    let num_k_heads = b.load_push(push_var, 4);
+    let repetitions = b.load_push(push_var, 5);
+    let head_dim = b.load_push(push_var, 6);
 
     let (cols, norm) = emit_fused_basis_hadamard1024_smem_fwht(
-        &mut b, in_buf, sign_buf, smem, lid, blk1024, tok, push_var,
+        &mut b,
+        Hadamard1024Input::Direct {
+            in_buf,
+            use_permute,
+            num_k_heads,
+            repetitions,
+            head_dim,
+        },
+        sign_buf,
+        smem,
+        lid,
+        blk1024,
+        tok,
+        push_var,
     );
 
     let c0 = b.const_u32(0);
@@ -6492,6 +6596,25 @@ fn vector_exp_spirv(b: &mut ShaderBuilder, value: u32) -> u32 {
     b.select(b.f32_t, gt_126, over, normal)
 }
 
+fn emit_silu_mul(b: &mut ShaderBuilder, g: u32, u: u32, pinned: bool) -> u32 {
+    let f_zero = b.const_f32(0.0);
+    let f_one = b.const_f32(1.0);
+    let neg_g = b.fsub_nc(f_zero, g);
+    let exp_neg_g = if pinned {
+        vector_exp_spirv(b, neg_g)
+    } else {
+        b.glsl1(b.f32_t, GLSL_EXP, neg_g)
+    };
+    let denom = b.fadd_nc(f_one, exp_neg_g);
+    if pinned {
+        let num = b.fmul_nc(g, u);
+        b.fdiv(num, denom)
+    } else {
+        let silu = b.fdiv(g, denom);
+        b.fmul_nc(u, silu)
+    }
+}
+
 /// Emits GPU `SwiGLU` activation (`u * silu(g)` / `(g * u) / (1 + exp(-g))`) SPIR-V 1.6 words.
 ///
 /// Bindings: `0` read-only `gate` (`f32`), `1` read-only `up` (`f32`), `2` writable `out` (`f32`).
@@ -6510,24 +6633,9 @@ pub fn ffn_swiglu_f32(pinned: bool) -> Vec<u32> {
 
     let in_bounds = b.u_lt(idx, count);
     b.emit_if(in_bounds, |b| {
-        let f_zero = b.const_f32(0.0);
-        let f_one = b.const_f32(1.0);
         let g = b.load_sb_f32(gate_buf, idx);
         let u = b.load_sb_f32(up_buf, idx);
-        let neg_g = b.fsub_nc(f_zero, g);
-        let exp_neg_g = if pinned {
-            vector_exp_spirv(b, neg_g)
-        } else {
-            b.glsl1(b.f32_t, GLSL_EXP, neg_g)
-        };
-        let denom = b.fadd_nc(f_one, exp_neg_g);
-        let res = if pinned {
-            let num = b.fmul_nc(g, u);
-            b.fdiv(num, denom)
-        } else {
-            let silu = b.fdiv(g, denom);
-            b.fmul_nc(u, silu)
-        };
+        let res = emit_silu_mul(b, g, u, pinned);
         b.store_sb_f32(out_buf, idx, res);
     });
 
@@ -8257,12 +8365,13 @@ fn emit_dot_qk_row(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Splits shared RMSNorm emission cleanly between standalone and fused residual kernels."
+    reason = "Shares RMSNorm emission cleanly across standalone, fused residual, and gated RMSNorm kernels."
 )]
 fn emit_rms_norm_workgroup_body(
     b: &mut ShaderBuilder,
     in_buf: u32,
     res_update: Option<(u32, u32)>,
+    gate_mul: Option<(u32, bool)>,
     w_buf: u32,
     out_buf: u32,
     wg_reduce: Option<u32>,
@@ -8319,7 +8428,13 @@ fn emit_rms_norm_workgroup_body(
             let w = b.load_sb_f32(w_buf, i);
             let scaled = b.fmul_nc(v, scale);
             let normed = b.fmul_nc(scaled, w);
-            b.store_sb_f32(out_buf, idx, normed);
+            let final_v = if let Some((gate_buf, pinned)) = gate_mul {
+                let g = b.load_sb_f32(gate_buf, idx);
+                emit_silu_mul(b, g, normed, pinned)
+            } else {
+                normed
+            };
+            b.store_sb_f32(out_buf, idx, final_v);
         });
     });
 }
@@ -8346,7 +8461,7 @@ pub fn rms_norm_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
     let dim = b.load_push(push_var, 0);
     let eps_bits = b.load_push(push_var, 1);
     emit_rms_norm_workgroup_body(
-        &mut b, in_buf, None, w_buf, out_buf, wg_reduce, dim, eps_bits,
+        &mut b, in_buf, None, None, w_buf, out_buf, wg_reduce, dim, eps_bits,
     );
 
     b.finish()
@@ -8359,6 +8474,44 @@ pub fn rms_norm_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
 #[must_use]
 pub fn rms_norm_batched_f32() -> Vec<u32> {
     rms_norm_f32()
+}
+
+/// Emits fused `RMSNorm(input, weight) * silu(gate)` SPIR-V 1.6 words for single and batched tokens.
+///
+/// Bindings: `0` read-only `input` (`f32`), `1` read-only `weight` (`f32`),
+/// `2` read-only `gate` (`f32`), `3` writable `out` (`f32`).
+/// Push constants (`2 × u32`): `[dim, eps_bits]`. Dispatch: `(1, rows, 1)`.
+#[must_use]
+pub fn gated_rms_norm_f32(pinned: bool) -> Vec<u32> {
+    gated_rms_norm_f32_with_subgroup(pinned, false)
+}
+
+/// Emits fused `RMSNorm(input, weight) * silu(gate)` SPIR-V 1.6 words with optional wave64 subgroup shuffle reduction.
+#[must_use]
+pub fn gated_rms_norm_f32_with_subgroup(pinned: bool, use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 2);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let w_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let gate_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
+
+    let dim = b.load_push(push_var, 0);
+    let eps_bits = b.load_push(push_var, 1);
+    emit_rms_norm_workgroup_body(
+        &mut b,
+        in_buf,
+        None,
+        Some((gate_buf, pinned)),
+        w_buf,
+        out_buf,
+        wg_reduce,
+        dim,
+        eps_bits,
+    );
+
+    b.finish()
 }
 
 /// Emits fused in-place residual update + `RMSNorm` SPIR-V 1.6 words (`residual += delta; norm_out = rms_norm(residual)`).
@@ -8388,6 +8541,7 @@ pub fn add_rms_norm_f32_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
         &mut b,
         res_buf,
         Some((res_buf, delta_buf)),
+        None,
         w_buf,
         out_buf,
         wg_reduce,
@@ -8569,6 +8723,304 @@ pub fn rope_f32() -> Vec<u32> {
         emit_rope_element(
             b, vec_buf, freqs_buf, head_base, c0, d, rope_dim, round_flag,
         );
+    });
+
+    b.finish()
+}
+
+/// Maximum per-head dimension supported by fused attention head `RMSNorm + RoPE` kernels.
+pub const FUSED_HEAD_NORM_ROPE_MAX_DIM: usize = 1024;
+const FUSED_HEAD_NORM_ROPE_MAX_DIM_U32: u32 = 1024;
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shares per-head workgroup RMSNorm into shared memory between fused K and Q attention prep kernels."
+)]
+fn emit_head_rms_norm_into_smem<F>(
+    b: &mut ShaderBuilder,
+    w_buf: u32,
+    smem: u32,
+    wg_reduce: Option<u32>,
+    lid: u32,
+    head_dim: u32,
+    eps_bits: u32,
+    mut load_val: F,
+) where
+    F: FnMut(&mut ShaderBuilder, u32) -> u32,
+{
+    let c64 = b.const_u32(WORKGROUP_X);
+    let f_zero = b.const_f32(0.0);
+    let f_one = b.const_f32(1.0);
+    let eps = b.bitcast(b.f32_t, eps_bits);
+    let acc_var = b.local_f32_var();
+    b.store_var(acc_var, f_zero);
+
+    b.emit_for_range(lid, head_dim, c64, |b, d| {
+        let val = load_val(b, d);
+        b.store_wg_f32(smem, d, val);
+        let sq = b.fmul_nc(val, val);
+        let prev = b.load_var_f32(acc_var);
+        let next = b.fadd_nc(prev, sq);
+        b.store_var(acc_var, next);
+    });
+
+    let partial = b.load_var_f32(acc_var);
+    let sum_sq = emit_wg_reduce_64_val(b, wg_reduce, lid, partial, false);
+
+    let dim_f = b.u32_to_f32(head_dim);
+    let mean = b.fdiv(sum_sq, dim_f);
+    let mean_eps = b.fadd_nc(mean, eps);
+    let denom = b.f_sqrt(mean_eps);
+    let scale = b.fdiv(f_one, denom);
+
+    b.emit_for_range(lid, head_dim, c64, |b, d| {
+        let v = b.load_wg_f32(smem, d);
+        let w = b.load_sb_f32(w_buf, d);
+        let scaled = b.fmul_nc(v, scale);
+        let normed = b.fmul_nc(scaled, w);
+        b.store_wg_f32(smem, d, normed);
+    });
+    b.workgroup_barrier();
+}
+
+fn emit_smem_rope_pair(
+    b: &mut ShaderBuilder,
+    smem: u32,
+    freqs_buf: u32,
+    freq_base: u32,
+    d: u32,
+    half_rope: u32,
+) -> (u32, u32) {
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let second_idx = b.uadd(d, half_rope);
+    let first = b.load_wg_f32(smem, d);
+    let second = b.load_wg_f32(smem, second_idx);
+    let d2 = b.umul(d, c2);
+    let f_off = b.uadd(freq_base, d2);
+    let f_sin_off = b.uadd(f_off, c1);
+    let cos_v = b.load_sb_f32(freqs_buf, f_off);
+    let sin_v = b.load_sb_f32(freqs_buf, f_sin_off);
+
+    let fc = b.fmul_nc(first, cos_v);
+    let ss = b.fmul_nc(second, sin_v);
+    let r0_raw = b.fsub_nc(fc, ss);
+    let fs = b.fmul_nc(first, sin_v);
+    let sc = b.fmul_nc(second, cos_v);
+    let r1_raw = b.fadd_nc(fs, sc);
+    (r0_raw, r1_raw)
+}
+
+/// Emits fused `RMSNorm + NeoX RoPE(f16) + packed-FP16 KV append` SPIR-V 1.6 words for full-attention K.
+///
+/// Replaces `rms_norm` + `rope(round_f16=1)` + `kv_append_f16` for `head_dim <= 1024` (even `head_dim`).
+/// Bindings: `0` read-only `key_in` (`f32`), `1` read-only `key_norm_w` (`f32`),
+/// `2` read-only `rope_freqs` (`f32`), `3` writable `k_cache_u32` (`u32`).
+/// Push constants (`6 × u32`): `[kv_heads, head_dim, rope_dim, eps_bits, start_pos, tokens]`.
+/// Dispatch: `(1, kv_heads, tokens)`.
+#[must_use]
+pub fn rms_norm_rope_kv_append_f16() -> Vec<u32> {
+    rms_norm_rope_kv_append_f16_with_subgroup(false)
+}
+
+/// Emits fused `RMSNorm + NeoX RoPE(f16) + packed-FP16 KV append` with optional wave64 subgroup shuffle.
+#[must_use]
+pub fn rms_norm_rope_kv_append_f16_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 6);
+    let push_var = push_var.unwrap_or(0);
+    let key_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let w_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let freqs_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let cache_buf = b.storage_buffer(3, ElemType::U32, AccessMode::ReadWrite);
+    let smem = b.workgroup_f32_array(FUSED_HEAD_NORM_ROPE_MAX_DIM_U32);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let h = b.load_input_component(wid_vec, 1);
+    let tok = b.load_input_component(wid_vec, 2);
+
+    let kv_heads = b.load_push(push_var, 0);
+    let head_dim = b.load_push(push_var, 1);
+    let rope_dim = b.load_push(push_var, 2);
+    let eps_bits = b.load_push(push_var, 3);
+    let start_pos = b.load_push(push_var, 4);
+    let tokens = b.load_push(push_var, 5);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c16 = b.const_u32(16);
+    let c64 = b.const_u32(WORKGROUP_X);
+    let dim_ok = b.u_ne(head_dim, c0);
+    let head_ok = b.u_lt(h, kv_heads);
+    let tok_ok = b.u_lt(tok, tokens);
+    let head_tok_ok = b.logical_and(head_ok, tok_ok);
+    let in_bounds = b.logical_and(dim_ok, head_tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let th = b.umul(tok, kv_heads);
+        let row_head = b.uadd(th, h);
+        let head_base = b.umul(row_head, head_dim);
+        let freq_base = b.umul(tok, rope_dim);
+
+        emit_head_rms_norm_into_smem(
+            b,
+            w_buf,
+            smem,
+            wg_reduce,
+            lid,
+            head_dim,
+            eps_bits,
+            |b, d| {
+                let idx = b.uadd(head_base, d);
+                b.load_sb_f32(key_buf, idx)
+            },
+        );
+
+        let half_rope = b.ushr(rope_dim, c1);
+        b.emit_for_range(lid, half_rope, c64, |b, d| {
+            let (r0_raw, r1_raw) = emit_smem_rope_pair(b, smem, freqs_buf, freq_base, d, half_rope);
+            let second_idx = b.uadd(d, half_rope);
+            b.store_wg_f32(smem, d, r0_raw);
+            b.store_wg_f32(smem, second_idx, r1_raw);
+        });
+        b.workgroup_barrier();
+
+        let half_head = b.ushr(head_dim, c1);
+        let kv_half_width = b.umul(kv_heads, half_head);
+        let dst_pos = b.uadd(start_pos, tok);
+        let dst_pos_base = b.umul(dst_pos, kv_half_width);
+        let h_half_off = b.umul(h, half_head);
+        let cache_head_base = b.uadd(dst_pos_base, h_half_off);
+
+        b.emit_for_range(lid, half_head, c64, |b, p| {
+            let e0 = b.ushl(p, c1);
+            let e1 = b.uadd(e0, c1);
+            let v0 = b.load_wg_f32(smem, e0);
+            let v1 = b.load_wg_f32(smem, e1);
+            let h0 = b.round_f16_bits(v0);
+            let h1 = b.round_f16_bits(v1);
+            let hi_shifted = b.ushl(h1, c16);
+            let packed = b.uor(h0, hi_shifted);
+            let dst = b.uadd(cache_head_base, p);
+            b.store_sb_u32(cache_buf, dst, packed);
+        });
+    });
+
+    b.finish()
+}
+
+/// Emits fused `DeinterleaveQGate + RMSNorm + NeoX RoPE` SPIR-V 1.6 words for full-attention Q.
+///
+/// Replaces `deinterleave_q_gate` + `rms_norm` + `rope` for `head_dim <= 1024`.
+/// Bindings: `0` read-only `q_gate_in` (`f32`), `1` read-only `q_norm_w` (`f32`),
+/// `2` read-only `rope_freqs` (`f32`), `3` writable `q_out` (`f32`), `4` writable `gate_out` (`f32`).
+/// Push constants (`6 × u32`): `[num_heads, head_dim, rope_dim, eps_bits, round_f16, tokens]`.
+/// Dispatch: `(1, num_heads, tokens)`.
+#[must_use]
+pub fn deinterleave_q_gate_rms_norm_rope() -> Vec<u32> {
+    deinterleave_q_gate_rms_norm_rope_with_subgroup(false)
+}
+
+/// Emits fused `DeinterleaveQGate + RMSNorm + NeoX RoPE` with optional wave64 subgroup shuffle.
+#[must_use]
+pub fn deinterleave_q_gate_rms_norm_rope_with_subgroup(use_subgroup_shuffle: bool) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 6);
+    let push_var = push_var.unwrap_or(0);
+    let q_gate_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let w_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let freqs_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let q_out_buf = b.storage_buffer(3, ElemType::F32, AccessMode::ReadWrite);
+    let gate_out_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadWrite);
+    let smem = b.workgroup_f32_array(FUSED_HEAD_NORM_ROPE_MAX_DIM_U32);
+    let wg_reduce = (!use_subgroup_shuffle).then(|| b.workgroup_f32_array(WORKGROUP_X));
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let h = b.load_input_component(wid_vec, 1);
+    let tok = b.load_input_component(wid_vec, 2);
+
+    let num_heads = b.load_push(push_var, 0);
+    let head_dim = b.load_push(push_var, 1);
+    let rope_dim = b.load_push(push_var, 2);
+    let eps_bits = b.load_push(push_var, 3);
+    let round_flag = b.load_push(push_var, 4);
+    let tokens = b.load_push(push_var, 5);
+
+    let c0 = b.const_u32(0);
+    let c1 = b.const_u32(1);
+    let c2 = b.const_u32(2);
+    let c64 = b.const_u32(WORKGROUP_X);
+    let dim_ok = b.u_ne(head_dim, c0);
+    let head_ok = b.u_lt(h, num_heads);
+    let tok_ok = b.u_lt(tok, tokens);
+    let head_tok_ok = b.logical_and(head_ok, tok_ok);
+    let in_bounds = b.logical_and(dim_ok, head_tok_ok);
+
+    b.emit_if(in_bounds, |b| {
+        let th = b.umul(tok, num_heads);
+        let row_head = b.uadd(th, h);
+        let dst_base = b.umul(row_head, head_dim);
+        let two_dim = b.umul(c2, head_dim);
+        let q_head_base = b.umul(row_head, two_dim);
+        let g_head_base = b.uadd(q_head_base, head_dim);
+        let freq_base = b.umul(tok, rope_dim);
+
+        emit_head_rms_norm_into_smem(
+            b,
+            w_buf,
+            smem,
+            wg_reduce,
+            lid,
+            head_dim,
+            eps_bits,
+            |b, d| {
+                let q_src = b.uadd(q_head_base, d);
+                let g_src = b.uadd(g_head_base, d);
+                let dst_idx = b.uadd(dst_base, d);
+                let q_val = b.load_sb_f32(q_gate_buf, q_src);
+                let g_val = b.load_sb_f32(q_gate_buf, g_src);
+                b.store_sb_f32(gate_out_buf, dst_idx, g_val);
+                q_val
+            },
+        );
+
+        let half_rope = b.ushr(rope_dim, c1);
+        let do_round = b.u_ne(round_flag, c0);
+        let store_opt_f16 = |b: &mut ShaderBuilder, dst: u32, raw: u32| {
+            b.emit_if_else(
+                do_round,
+                |b| {
+                    let r = b.round_f16(raw);
+                    b.store_sb_f32(q_out_buf, dst, r);
+                },
+                |b| b.store_sb_f32(q_out_buf, dst, raw),
+            );
+        };
+        b.emit_for_range(lid, head_dim, c64, |b, d| {
+            let is_pair = b.u_lt(d, half_rope);
+            b.emit_if_else(
+                is_pair,
+                |b| {
+                    let (r0_raw, r1_raw) =
+                        emit_smem_rope_pair(b, smem, freqs_buf, freq_base, d, half_rope);
+                    let dst0 = b.uadd(dst_base, d);
+                    let dst1 = b.uadd(dst0, half_rope);
+                    store_opt_f16(b, dst0, r0_raw);
+                    store_opt_f16(b, dst1, r1_raw);
+                },
+                |b| {
+                    let past_rope = b.u_ge(d, rope_dim);
+                    b.emit_if(past_rope, |b| {
+                        let v = b.load_wg_f32(smem, d);
+                        let dst = b.uadd(dst_base, d);
+                        store_opt_f16(b, dst, v);
+                    });
+                },
+            );
+        });
     });
 
     b.finish()
@@ -12695,6 +13147,91 @@ mod tests {
         assert_eq!(
             count_barriers(&attn_flash_gqa6_prefill_f16kv_with_subgroup(true)),
             2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fused_layer_kernels_are_valid_spirv_and_match_barrier_contracts() -> Result<(), Error> {
+        let count_barriers = |words: &[u32]| -> usize {
+            let mut barriers = 0_usize;
+            let mut offset = 5_usize;
+            while offset < words.len() {
+                let header = words[offset];
+                let wc = usize::try_from(header >> 16).unwrap_or(0);
+                let op = u16::try_from(header & 0xFFFF).unwrap_or(0);
+                if op == OP_CONTROL_BARRIER {
+                    barriers += 1;
+                }
+                offset += wc;
+            }
+            barriers
+        };
+
+        for module in [
+            gated_rms_norm_f32(false),
+            gated_rms_norm_f32(true),
+            gated_rms_norm_f32_with_subgroup(false, true),
+            gated_rms_norm_f32_with_subgroup(true, true),
+            rms_norm_rope_kv_append_f16(),
+            rms_norm_rope_kv_append_f16_with_subgroup(true),
+            deinterleave_q_gate_rms_norm_rope(),
+            deinterleave_q_gate_rms_norm_rope_with_subgroup(true),
+            swiglu_hadamard1024_q8k_4plane(false),
+            swiglu_hadamard1024_q8k_4plane(true),
+            swiglu_hadamard1024_q8k_4plane_with_subgroup(false, true),
+            swiglu_hadamard1024_q8k_4plane_with_subgroup(true, true),
+        ] {
+            assert_valid_spirv_structure(&module, Some(false));
+            assert_eq!(shader_digest(&module)?.len(), 64);
+        }
+
+        assert_eq!(extract_local_size(&gated_rms_norm_f32(true))?, [64, 1, 1]);
+        assert_eq!(
+            extract_local_size(&rms_norm_rope_kv_append_f16())?,
+            [64, 1, 1]
+        );
+        assert_eq!(
+            extract_local_size(&deinterleave_q_gate_rms_norm_rope())?,
+            [64, 1, 1]
+        );
+        assert_eq!(
+            extract_local_size(&swiglu_hadamard1024_q8k_4plane(true))?,
+            [256, 1, 1]
+        );
+
+        assert_eq!(
+            count_barriers(&gated_rms_norm_f32_with_subgroup(true, true)),
+            0
+        );
+        assert_eq!(
+            count_barriers(&rms_norm_rope_kv_append_f16_with_subgroup(true)),
+            2
+        );
+        assert_eq!(
+            count_barriers(&deinterleave_q_gate_rms_norm_rope_with_subgroup(true)),
+            1
+        );
+        assert_eq!(
+            count_barriers(&swiglu_hadamard1024_q8k_4plane_with_subgroup(true, true)),
+            2
+        );
+
+        assert_ne!(
+            shader_digest(&gated_rms_norm_f32(true))?,
+            shader_digest(&gated_rms_norm_f32(false))?
+        );
+        assert_ne!(
+            shader_digest(&swiglu_hadamard1024_q8k_4plane(true))?,
+            shader_digest(&swiglu_hadamard1024_q8k_4plane(false))?
+        );
+        assert_ne!(
+            shader_digest(&rms_norm_rope_kv_append_f16_with_subgroup(true))?,
+            shader_digest(&rms_norm_rope_kv_append_f16_with_subgroup(false))?
+        );
+        assert_ne!(
+            shader_digest(&deinterleave_q_gate_rms_norm_rope_with_subgroup(true))?,
+            shader_digest(&deinterleave_q_gate_rms_norm_rope_with_subgroup(false))?
         );
         Ok(())
     }

@@ -852,6 +852,11 @@ impl Qwen35 {
                 "decoder state is inconsistent after failed evaluation and requires reset or restore",
             ));
         }
+        let rec_count = self
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.attention, Attention::Recurrent(_)))
+            .count();
         let tile = self
             .tiled_prefill
             .as_mut()
@@ -874,6 +879,19 @@ impl Qwen35 {
                 "folded verification carry tape was not consumed before commit",
             ));
         }
+        if folded.layers.len() != rec_count {
+            return Err(invalid(
+                "folded verification recurrent layer count mismatch",
+            ));
+        }
+        if folded.carried_tokens.capacity() < kept {
+            return Err(invalid(
+                "folded verification carried token buffer lacks required capacity",
+            ));
+        }
+        for layer_tape in &folded.layers {
+            layer_tape.validate_pending_promotion(kept)?;
+        }
         let start_position = self
             .position
             .checked_sub(pending)
@@ -884,24 +902,34 @@ impl Qwen35 {
             .ok_or_else(|| invalid("folded verification MRoPE underflow"))?;
         let target_position = start_position + kept;
         let target_mrope = start_mrope + kept;
-        for state in &mut self.state {
-            if let LayerState::Full { keys, values } = state {
-                keys.truncate_to(target_position)?;
-                values.truncate_to(target_position)?;
+
+        self.state_consistent = false;
+        let result = (|| -> Result<()> {
+            for state in &mut self.state {
+                if let LayerState::Full { keys, values } = state {
+                    keys.truncate_to(target_position)?;
+                    values.truncate_to(target_position)?;
+                }
             }
+            self.position = target_position;
+            self.mrope_position = target_mrope;
+            for layer_tape in &mut folded.layers {
+                layer_tape.promote_pending_to_carried(kept)?;
+            }
+            folded.carried_tokens.clear();
+            if kept > 0 {
+                folded
+                    .carried_tokens
+                    .extend_from_slice(&folded.pending_tokens[..kept]);
+            }
+            folded.pending_tokens.clear();
+            Ok(())
+        })();
+        if result.is_err() {
+            folded.clear_all();
+            return result;
         }
-        self.position = target_position;
-        self.mrope_position = target_mrope;
-        for layer_tape in &mut folded.layers {
-            layer_tape.promote_pending_to_carried(kept)?;
-        }
-        folded.carried_tokens.clear();
-        if kept > 0 {
-            folded
-                .carried_tokens
-                .extend_from_slice(&folded.pending_tokens[..kept]);
-        }
-        folded.pending_tokens.clear();
+        self.state_consistent = true;
         Ok(())
     }
 

@@ -879,7 +879,7 @@ impl FoldedRecurrentLayerTape {
         self.clear_carried();
     }
 
-    pub(super) fn promote_pending_to_carried(&mut self, kept: usize) -> Result<()> {
+    pub(super) fn validate_pending_promotion(&self, kept: usize) -> Result<()> {
         if self.carried_len != 0 {
             return Err(invalid(
                 "cannot commit pending folded verification before flushing prior carry",
@@ -890,6 +890,33 @@ impl FoldedRecurrentLayerTape {
                 "folded verification kept token count exceeds pending block length",
             ));
         }
+        if kept > 0 {
+            let conv_needed = kept
+                .checked_mul(self.conv_width)
+                .ok_or_else(|| invalid("folded raw convolution tape overflow"))?;
+            let key_needed = kept
+                .checked_mul(self.key_width)
+                .ok_or_else(|| invalid("folded key tape overflow"))?;
+            let value_needed = kept
+                .checked_mul(self.value_width)
+                .ok_or_else(|| invalid("folded value tape overflow"))?;
+            let gate_needed = kept
+                .checked_mul(self.ssm_values)
+                .ok_or_else(|| invalid("folded gate tape overflow"))?;
+            if self.pending_raw_conv.len() < conv_needed
+                || self.pending_keys.len() < key_needed
+                || self.pending_values.len() < value_needed
+                || self.pending_decay.len() < gate_needed
+                || self.pending_beta.len() < gate_needed
+            {
+                return Err(invalid("folded recurrent pending tape truncated"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn promote_pending_to_carried(&mut self, kept: usize) -> Result<()> {
+        self.validate_pending_promotion(kept)?;
         if kept > 0 {
             std::mem::swap(&mut self.carried_raw_conv, &mut self.pending_raw_conv);
             self.carried_raw_conv.truncate(kept * self.conv_width);
@@ -1160,7 +1187,7 @@ pub(super) fn flush_recurrent_carry_layer(
             matrix: previous,
         },
         LayerDelta::Recurrent {
-            convolution: _,
+            convolution: next_history,
             matrix,
         },
     ) = (state, delta)
@@ -1168,14 +1195,16 @@ pub(super) fn flush_recurrent_carry_layer(
         return Err(invalid("folded GDN carry flush requires recurrent state"));
     };
     let hist_width = geometry.convolution.saturating_sub(1);
+    resize_into(history.len(), next_history)?;
+    next_history.copy_from_slice(history);
     advance_convolution_history(
-        history,
+        next_history,
         &layer_tape.carried_raw_conv,
         geometry.convolution_width(),
         hist_width,
         kept,
     )?;
-    finite(history, "folded convolution history")?;
+    finite(next_history, "folded convolution history")?;
     resize_into(previous.len(), matrix)?;
     flush_carry_heads(
         layer_tape,
@@ -1188,6 +1217,7 @@ pub(super) fn flush_recurrent_carry_layer(
         kept,
     )?;
     finite(matrix, "folded GDN state matrix")?;
+    std::mem::swap(history, next_history);
     std::mem::swap(previous, matrix);
     layer_tape.clear_carried();
     Ok(())
@@ -2484,6 +2514,63 @@ mod tests {
                 check_folded_carry_flush_case(width, kept)?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn folded_carry_flush_preserves_history_and_matrix_on_failure() -> Result<()> {
+        let geometry = Geometry {
+            embedding: 16,
+            feed_forward: 16,
+            heads: 1,
+            kv_heads: 1,
+            head: 16,
+            rope: 4,
+            rope_sections: [2, 0, 0, 0],
+            rope_base: 10_000.0,
+            epsilon: 1e-6,
+            ssm_head: 32,
+            ssm_keys: 2,
+            ssm_values: 4,
+            convolution: 4,
+        };
+        let initial_conv = vec![0.125_f32; geometry.convolution_width() * (geometry.convolution - 1)];
+        let initial_matrix = vec![0.25_f32; geometry.ssm_values * geometry.ssm_head * geometry.ssm_head];
+        let mut tape = build_folded_carry_tape(2, &geometry)?;
+        tape.carried_decay[0] = f32::NAN;
+
+        let mut state = LayerState::Recurrent {
+            convolution: initial_conv.clone(),
+            matrix: initial_matrix.clone(),
+        };
+        let mut delta = LayerDelta::Recurrent {
+            convolution: Vec::new(),
+            matrix: Vec::new(),
+        };
+        let projector = ProjectionTile::with_backend(crate::kernels::MatvecBackend::Scalar);
+        let mut scratch_out = Vec::new();
+        let Err(err) = flush_recurrent_carry_layer(
+            &mut tape,
+            &mut state,
+            &mut delta,
+            &geometry,
+            Arithmetic::Source,
+            &projector,
+            &mut scratch_out,
+        ) else {
+            return Err(invalid("invalid decay must fail carry flush"));
+        };
+        assert!(err.to_string().contains("gate bounds"));
+        let LayerState::Recurrent {
+            convolution: after_conv,
+            matrix: after_matrix,
+        } = state
+        else {
+            return Err(invalid("expected recurrent state"));
+        };
+        assert_eq!(after_conv, initial_conv);
+        assert_eq!(after_matrix, initial_matrix);
+        assert_eq!(tape.carried_len, 2);
         Ok(())
     }
 

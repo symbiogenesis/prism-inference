@@ -1392,3 +1392,78 @@ fn bonsai25_f32_ssm_gates_and_stacked_adapters_preserve_prefill_decode_and_folde
     }
     Ok(())
 }
+
+#[test]
+fn commit_folded_verification_prevalidation_and_mutation_atomicity() -> Result<()> {
+    let cfg = HybridConfig::small_source();
+    let m1 = hybrid_model_with_identity(&cfg, Arithmetic::Source);
+    let mut folded = configure_folded(m1, &cfg, Arithmetic::Source, 1, KvCachePolicy::F16, false)?;
+
+    folded.evaluate(0)?;
+    let mut rows = Vec::new();
+    folded.evaluate_verification_block_folded(&[], &[1, 2], &mut rows, &|| Ok(()))?;
+    assert_eq!(folded.position, 3);
+
+    // Pre-validation failure (missing recurrent tape) must not mutate decoder state or position.
+    let saved_tape = folded
+        .tiled_prefill
+        .as_mut()
+        .and_then(|tile| tile.folded.as_mut())
+        .and_then(|state| state.layers.pop())
+        .ok_or_else(|| invalid("missing folded layer tape"))?;
+    let Err(pre_err) = folded.commit_folded_verification(1) else {
+        return Err(invalid("expected recurrent layer count mismatch"));
+    };
+    assert!(pre_err.to_string().contains("layer count mismatch"));
+    assert!(folded.state_consistent);
+    assert_eq!(folded.position, 3);
+
+    // Restore tape; pre-validation failure on capacity must also leave state consistent.
+    if let Some(state) = folded
+        .tiled_prefill
+        .as_mut()
+        .and_then(|tile| tile.folded.as_mut())
+    {
+        state.layers.push(saved_tape);
+        state.carried_tokens = Vec::new();
+    }
+    let Err(cap_err) = folded.commit_folded_verification(1) else {
+        return Err(invalid("expected carried token capacity error"));
+    };
+    assert!(cap_err.to_string().contains("capacity"));
+    assert!(folded.state_consistent);
+    assert_eq!(folded.position, 3);
+
+    // Restore capacity, then corrupt Full KV cache to trigger failure inside the mutation loop.
+    if let Some(state) = folded
+        .tiled_prefill
+        .as_mut()
+        .and_then(|tile| tile.folded.as_mut())
+    {
+        state.carried_tokens.try_reserve_exact(cfg.context)?;
+    }
+    for layer_state in &mut folded.state {
+        if let LayerState::Full { keys, .. } = layer_state {
+            keys.width = 0;
+            break;
+        }
+    }
+    let Err(mut_err) = folded.commit_folded_verification(1) else {
+        return Err(invalid("expected KV truncation failure during commit"));
+    };
+    assert!(mut_err.to_string().contains("geometry"));
+    assert!(!folded.state_consistent);
+    assert!(!folded.has_pending_folded_verification());
+    let pending_empty = folded
+        .tiled_prefill
+        .as_ref()
+        .and_then(|tile| tile.folded.as_ref())
+        .is_some_and(|state| state.pending_tokens.is_empty() && state.carried_tokens.is_empty());
+    assert!(pending_empty);
+
+    let Err(inconsistent_err) = folded.commit_folded_verification(0) else {
+        return Err(invalid("expected inconsistent state rejection"));
+    };
+    assert!(inconsistent_err.to_string().contains("inconsistent"));
+    Ok(())
+}

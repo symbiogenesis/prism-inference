@@ -4,12 +4,13 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
 function Stop-BonsaiProcessTree {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     [OutputType([void])]
     param(
         [Parameter(Mandatory)][Diagnostics.Process]$Process,
         [Parameter(Mandatory)][string]$ErrorMessage
     )
+    if (-not $PSCmdlet.ShouldProcess("PID $($Process.Id)", 'Terminate process tree')) { return }
     try {
         if (-not $Process.HasExited) {
             $Process.Kill($true)

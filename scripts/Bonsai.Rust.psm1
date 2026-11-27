@@ -217,7 +217,7 @@ function Invoke-BonsaiRustCheck {
                 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
             }
         } catch {
-            # Best-effort temp cleanup after writing rust-checks.json.
+            Write-Verbose "Best-effort temp cleanup failed for ${work}: $($_.Exception.Message)"
         }
     }
     return $receipt

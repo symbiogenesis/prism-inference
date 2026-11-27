@@ -1,8 +1,28 @@
 #![forbid(unsafe_code)]
 //! Recurrent-state ownership regressions independent of a model artifact.
 
+#[path = "runtime/batch_allocator.rs"]
+mod batch_allocator;
+#[path = "runtime/gguf_context.rs"]
+mod gguf_context;
+#[path = "runtime/model.rs"]
+mod model;
+#[path = "runtime/model_owned.rs"]
+mod model_owned;
+#[path = "runtime/optimization.rs"]
+mod optimization;
+#[path = "runtime/reasoning_budget.rs"]
+mod reasoning_budget;
+#[path = "runtime/sampling.rs"]
+mod sampling;
+#[path = "runtime/text_output.rs"]
+mod text_output;
+#[path = "runtime/text_session.rs"]
+mod text_session;
 #[path = "runtime/timing.rs"]
 mod timing;
+#[path = "runtime/upstream_sampling.rs"]
+mod upstream_sampling;
 
 use bonsai_prism_runtime::{
     Decoder, MAX_PREFILL_BLOCK_TOKENS, Result,

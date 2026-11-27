@@ -114,7 +114,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_runtime_parity_keeps_pr_and_manual_scope_without_duplicate_push(self):
         for path in ("Cargo.toml", "Cargo.lock", "src/runtime.rs", "server/src/main.rs",
-                     "tools/gguf/src/lib.rs", "tools/native-hash/src/lib.rs", "tests/swift_session.rs",
+                     "tools/gguf/src/lib.rs", "tools/native-hash/src/lib.rs", "tests/swift/session.rs",
                      "tools/neon-dot/src/lib.rs", "tools/ternary/src/lib.rs", "tools/prism/src/lib.rs",
                      "tools/hexagon-native/src/lib.rs", "tools/hexagon-runtime/src/native_q2.rs",
                      "tests/graph.rs", "tests/upstream_prism/fixtures/model.json",

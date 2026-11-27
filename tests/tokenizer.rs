@@ -1,6 +1,45 @@
 #![forbid(unsafe_code)]
 //! Focused end-to-end plain-text tokenizer composition regressions.
 
+#[path = "support/tokenization_fixture.rs"]
+mod tokenization_fixture;
+
+#[path = "tokenizer/bpe.rs"]
+mod bpe;
+#[cfg(feature = "cli")]
+#[path = "tokenizer/cli_capabilities.rs"]
+mod cli_capabilities;
+#[cfg(feature = "cli")]
+#[path = "tokenizer/cli_tokenize.rs"]
+mod cli_tokenize;
+#[path = "tokenizer/grammar_runtime.rs"]
+mod grammar_runtime;
+#[cfg(feature = "cli")]
+#[path = "tokenizer/jinja_capabilities.rs"]
+mod jinja_capabilities;
+#[path = "tokenizer/pretokenizer.rs"]
+mod pretokenizer;
+#[path = "tokenizer/prompt_input.rs"]
+mod prompt_input;
+#[path = "tokenizer/special_input.rs"]
+mod special_input;
+#[path = "tokenizer/special_tokens.rs"]
+mod special_tokens;
+#[cfg(feature = "cli")]
+#[path = "tokenizer/token_client.rs"]
+mod token_client;
+#[path = "tokenizer/token_input.rs"]
+mod token_input;
+#[cfg(feature = "cli")]
+#[path = "tokenizer/token_worker.rs"]
+mod token_worker;
+#[path = "tokenizer/tokenization.rs"]
+mod tokenization;
+#[path = "tokenizer/vocabulary.rs"]
+mod vocabulary;
+#[path = "tokenizer/vocabulary_contract.rs"]
+mod vocabulary_contract;
+
 use bonsai_gguf::{Metadata, MetadataValue};
 use bonsai_prism_runtime::Result;
 use bonsai_prism_runtime::bpe::MAX_BPE_INPUT_BYTES;

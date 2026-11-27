@@ -149,10 +149,10 @@ CONTROLS = {
         "text_token_capacity_is_typed_without_reclassifying_byte_safety_limits",
         "text_encoding_charges_piece_limits_across_special_boundaries",
     ],
-    "swift_sampling": [
-        "swift_declared_stop_is_not_delivered_and_commits_its_draw",
-        "swift_rng_rolls_back_after_cancelled_or_abandoned_stream_then_retries",
-        "swift_rejects_invalid_full_vocabulary_without_consuming_draws_and_resets_seed",
+    "swift": [
+        "sampling::swift_declared_stop_is_not_delivered_and_commits_its_draw",
+        "sampling::swift_rng_rolls_back_after_cancelled_or_abandoned_stream_then_retries",
+        "sampling::swift_rejects_invalid_full_vocabulary_without_consuming_draws_and_resets_seed",
     ],
     "server": [
         "native_backend::tests::private_latest_prefix_policy_preserves_counting_and_transactional_reset_boundaries",
@@ -308,9 +308,11 @@ def source_hashes(root):
             files.add(build_script)
     files.update((root / "tests/graph").rglob("*.rs"))
     files.update((root / "tests/runtime").rglob("*.rs"))
+    files.update((root / "tests/swift").rglob("*.rs"))
+    files.update((root / "tests/tokenizer").rglob("*.rs"))
     files.update(path for path in (root / "tests/fixtures").rglob("*") if path.is_file())
     files.update(root / path for path in [
-        "tests/graph.rs", "tests/runtime.rs", "tests/tokenizer.rs", "tests/swift_sampling.rs", ".github/ci/inference_efficiency.py",
+        "tests/graph.rs", "tests/runtime.rs", "tests/tokenizer.rs", "tests/swift.rs", ".github/ci/inference_efficiency.py",
         ".github/ci/test_inference_efficiency.py", ".github/workflows/source-checks.yml",
     ])
     return {str(path.relative_to(root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -357,7 +359,7 @@ def main():
                    "--locked", "--release", "--package", "prism-inference", "--package", "prism-inference-server",
                    "--package", "bonsai-hexagon-native", "--package", "bonsai-hexagon-runtime",
                    "--features", "prism-inference/parallel-rows,prism-inference-server/parallel-rows",
-                   "--lib", "--test", "graph", "--test", "runtime", "--test", "tokenizer", "--test", "swift_sampling", "--no-run", "--message-format=json"]
+                   "--lib", "--test", "graph", "--test", "runtime", "--test", "tokenizer", "--test", "swift", "--no-run", "--message-format=json"]
         compiled = subprocess.run(command, capture_output=True, text=True, check=False)
         (evidence / "compile.log").write_text(compiled.stdout + compiled.stderr, encoding="utf-8")
         receipt["compile"] = {"arguments": command, "exitCode": compiled.returncode}

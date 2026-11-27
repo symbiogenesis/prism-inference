@@ -1,6 +1,31 @@
 #![forbid(unsafe_code)]
 //! Focused graph traversal correctness and bounded-stack regressions.
 
+#[path = "backend/allocation.rs"]
+mod allocation;
+#[path = "backend/backward_graph.rs"]
+mod backward_graph;
+#[path = "backend/backward_image.rs"]
+mod backward_image;
+#[path = "backend/iquants.rs"]
+mod iquants;
+#[path = "backend/kernels.rs"]
+mod kernels;
+#[path = "backend/ops.rs"]
+mod ops;
+#[path = "backend/packed_add.rs"]
+mod packed_add;
+#[path = "backend/parallel_rows.rs"]
+mod parallel_rows;
+#[path = "backend/signquants.rs"]
+mod signquants;
+#[path = "backend/simd.rs"]
+mod simd;
+#[path = "backend/spatial.rs"]
+mod spatial;
+#[path = "backend/threadpool.rs"]
+mod threadpool;
+
 use bonsai_prism_runtime::Result;
 use bonsai_prism_runtime::backend::{Argument, CpuBackend, GraphId, Observation, TensorId};
 

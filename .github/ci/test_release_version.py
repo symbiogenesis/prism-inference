@@ -80,7 +80,7 @@ class ReleaseVersionTests(unittest.TestCase):
                   "--release -p prism-inference --features parallel-rows ")
         self.assertEqual(test_commands, [
             prefix + "--lib kernels::parallel_rows::tile::tests::tiled_parallel_rows_worker_panic_cannot_strand_caller -- --exact",
-            prefix + "--test backend_threadpool failed_worker_group_drains_before_the_plan_is_reused -- --exact",
+            prefix + "--test backend threadpool::failed_worker_group_drains_before_the_plan_is_reused -- --exact",
             *[prefix + "--lib " + name + " -- --exact" for name in (
                 "graph::swift_state::tests::full_context_state_scope_is_geometry_derived_and_preserves_generic_cap",
                 "graph::swift_state::tests::state_scope_rejects_changed_counts_recurrence_and_mtp",

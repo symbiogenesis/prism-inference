@@ -226,20 +226,34 @@ jobs:
               python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09 build --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --features experimental-neon --lib
               python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --all-targets -- -D warnings
               python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --no-default-features --test backend simd::simd_
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --all-targets -- -D warnings
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::packed_pq2::
-              if ($env:CARGO_BUILD_TARGET -ceq 'aarch64-pc-windows-msvc') {
-                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::neon::tests::simd_neon_packed_consumption_
-              }
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --lib kernels::parallel_rows::tests::
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --example swift_model_check tests::row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection -- --exact
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test backend parallel_rows::
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference --locked --offline --release --features parallel-rows --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
+            }
+            $parallelPackages = @()
+            $parallelFeatures = @()
+            if ('prism-inference' -cin $packages) {
+              $parallelPackages += @('-p', 'prism-inference')
+              $parallelFeatures += 'prism-inference/parallel-rows'
             }
             if ('prism-inference-server' -cin $packages) {
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --all-targets -- -D warnings
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_child::tests::
-              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest -p prism-inference-server --locked --offline --release --features parallel-rows --lib native_backend::tests::private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts -- --exact
+              $parallelPackages += @('-p', 'prism-inference-server')
+              $parallelFeatures += 'prism-inference-server/parallel-rows'
+            }
+            if ($parallelPackages.Count) {
+              $parallelFeatureList = $parallelFeatures -join ','
+              python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo clippy' -- cargo +nightly-2026-11-09 clippy --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --all-targets -- -D warnings
+              if ('prism-inference' -cin $packages) {
+                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --lib kernels::packed_pq2::
+                if ($env:CARGO_BUILD_TARGET -ceq 'aarch64-pc-windows-msvc') {
+                  python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --lib kernels::neon::tests::simd_neon_packed_consumption_
+                }
+                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --lib kernels::parallel_rows::tests::
+                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --example swift_model_check tests::row_worker_prefix_is_bounded_and_composes_with_exact_profile_selection -- --exact
+                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --test backend parallel_rows::
+                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --test graph graph_parallel_rows_preserve_logits_checkpoints_and_recovery -- --exact
+              }
+              if ('prism-inference-server' -cin $packages) {
+                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --lib native_child::tests::
+                python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo test' -- cargo +nightly-2026-11-09 test --manifest-path $manifest @parallelPackages --locked --offline --release --features $parallelFeatureList --lib native_backend::tests::private_readiness_reports_engine_worker_budget_and_rejects_invalid_counts -- --exact
+              }
             }
             if ('bonsai-gguf' -cin $packages) {
               python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/run_ci_command.py') --label 'Foundation Cargo build' -- cargo +nightly-2026-11-09 build --manifest-path $manifest -p bonsai-gguf --locked --offline --release --no-default-features --lib
@@ -300,6 +314,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && needs.changes.outputs.overlay == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 35
+    env:
+      CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -377,9 +393,9 @@ jobs:
             ~/.cargo/git/db
             ${{ runner.temp }}/SwiftBonsai-PrismRustChecks
             ${{ runner.temp }}/SwiftBonsai-PrismRustBuild
-          key: prism-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/**', 'scripts/Build-PrismEngine.ps1', 'scripts/Bonsai.Rust.psm1', 'tests/Test-Rust.ps1', 'config/rust-packages.psd1', 'rust-toolchain.toml') }}-content-v1
+          key: prism-rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/prism/**', 'scripts/Build-PrismEngine.ps1', 'scripts/Bonsai.Rust.psm1', 'tests/Test-Rust.ps1', 'config/rust-packages.psd1', 'rust-toolchain.toml') }}-content-v1
           restore-keys: |
-            prism-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-
+            prism-rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_CACHE_HOST }}-nightly-2026-11-09-
       - name: Check Rust and build the pinned engine with its Rust storage overlay
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -444,6 +460,8 @@ jobs:
     needs: changes
     runs-on: windows-11-arm
     timeout-minutes: 10
+    env:
+      CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -465,9 +483,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ env.CARGO_TARGET_DIR }}
-          key: prism-regression-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_REGRESSION_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/native-hash/**', 'tools/prism/**', 'tests/upstream_prism/**', 'tests/fixtures/**') }}-content-v1
+          key: prism-regression-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_REGRESSION_HOST }}-nightly-2026-11-09-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'tools/ternary/**', 'tools/gguf/**', 'tools/native-hash/**', 'tools/prism/**', 'tests/upstream_prism/**', 'tests/fixtures/**') }}-content-v1
           restore-keys: |
-            prism-regression-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_REGRESSION_HOST }}-nightly-2026-11-09-
+            prism-regression-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.PRISM_REGRESSION_HOST }}-nightly-2026-11-09-
       - name: Build this revision's Rust source assertion harness
         shell: pwsh
         run: |
@@ -480,7 +498,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/runtime_regression.py') --harness (Join-Path $env:CARGO_TARGET_DIR 'release/examples/upstream_prism.exe') --evidence (Join-Path $env:RUNNER_TEMP 'Prism-RuntimeRegression')
+          python -B (Join-Path $env:GITHUB_WORKSPACE '.github/ci/runtime_regression.py') --harness (Join-Path $env:CARGO_TARGET_DIR 'aarch64-pc-windows-msvc/release/examples/upstream_prism.exe') --evidence (Join-Path $env:RUNNER_TEMP 'Prism-RuntimeRegression')
       - name: Retain compact regression results and failure logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -494,6 +512,8 @@ jobs:
     needs: changes
     runs-on: windows-11-arm
     timeout-minutes: 15
+    env:
+      CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -515,9 +535,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/Prism-CodecTarget
-          key: prism-codec-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/codec-probe/**', 'tools/ternary/**', 'rust-toolchain.toml') }}-content-v1
+          key: prism-codec-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/codec-probe/**', 'tools/ternary/**', 'rust-toolchain.toml') }}-content-v1
           restore-keys: |
-            prism-codec-v1-${{ runner.os }}-${{ runner.arch }}-
+            prism-codec-v2-${{ runner.os }}-${{ runner.arch }}-
       - name: Check the probe and consume every preserved synthetic native codec input
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -541,7 +561,7 @@ jobs:
             [void][IO.Directory]::CreateDirectory($downloads)
             $archive = Join-Path $downloads $lock.Runtime.asset.filename
             $null = Receive-LockedArtifact -Uri $lock.Runtime.asset.url -Path $archive -Bytes $lock.Runtime.asset.bytes -Sha256 $lock.Runtime.asset.sha256 -TimeoutSeconds 600
-            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismCodec.ps1') -RuntimeArchive $archive -ProbeToolPath (Join-Path $target 'release/bonsai-codec-probe.exe') -EvidenceDirectory (Join-Path $checks 'native')
+            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismCodec.ps1') -RuntimeArchive $archive -ProbeToolPath (Join-Path $target 'aarch64-pc-windows-msvc/release/bonsai-codec-probe.exe') -EvidenceDirectory (Join-Path $checks 'native')
           } finally { Stop-Transcript | Out-Null }
       - name: Retain codec corpus, ABI, package and process receipts
         if: always() && env.PRISM_CODEC_EVIDENCE != ''
@@ -572,6 +592,8 @@ jobs:
             target: x86_64-pc-windows-msvc
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -604,9 +626,11 @@ jobs:
           path: |
             ${{ env.CARGO_TARGET_DIR }}/debug
             ${{ env.CARGO_TARGET_DIR }}/release
-          key: prism-source-package-v1-${{ matrix.target }}-${{ steps.package-toolchain.outputs.image-identity }}-${{ steps.package-toolchain.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'examples/**', 'tools/**', '.github/ci/source_package.py') }}-content-v1
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/debug
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release
+          key: prism-source-package-v2-${{ matrix.target }}-${{ steps.package-toolchain.outputs.image-identity }}-${{ steps.package-toolchain.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'examples/**', 'tools/**', '.github/ci/source_package.py') }}-content-v1
           restore-keys: |
-            prism-source-package-v1-${{ matrix.target }}-${{ steps.package-toolchain.outputs.image-identity }}-${{ steps.package-toolchain.outputs.compiler-identity }}-
+            prism-source-package-v2-${{ matrix.target }}-${{ steps.package-toolchain.outputs.image-identity }}-${{ steps.package-toolchain.outputs.compiler-identity }}-
       - name: Verify normalized packages and an external library consumer
         shell: pwsh
         working-directory: ${{ runner.temp }}

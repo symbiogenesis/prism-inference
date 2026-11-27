@@ -106,6 +106,20 @@ See [row workers](parallel-rows.md) for execution budgets and configuration.
 [Cargo.toml](../Cargo.toml) is authoritative for package versions and dependencies.
 [Native hashing](../tools/native-hash/README.md) documents artifact verification.
 
+Keep `--target aarch64-pc-windows-msvc` or `CARGO_BUILD_TARGET=aarch64-pc-windows-msvc`
+consistent across `build`, `test`, `clippy`, and `doc` when reusing a `--target-dir`. Mixing
+explicit `--target` with omitted `--target` changes Cargo's unit hash and output layout and
+forces a full dependency rebuild.
+
+Standardize on one feature set for daily development: either default features, or
+`--features prism-inference/parallel-rows,prism-inference-server/parallel-rows` when iterating on
+row-parallel or server code. Use a separate `--target-dir` when testing `--no-default-features`
+or switching feature sets. Keep package selections consistent when alternating between
+`prism-inference` and `prism-inference-server` (or pass both `-p` flags together), because server
+and tool crates enable extra `windows-sys`, `serde_json`, and `syn` features. A `workspace-hack`
+crate is omitted so publishable crates pass `cargo package` without path dependencies and
+`--no-default-features --lib` stays minimal.
+
 ## Build a checkout
 
 Run builds and checks from a unique system-temp directory, with absolute
@@ -120,10 +134,11 @@ Push-Location $lane
 try {
     [Environment]::CurrentDirectory = $lane
     cargo +nightly-2026-11-09-aarch64-pc-windows-msvc build --workspace --bins --locked --offline --release `
+        --target aarch64-pc-windows-msvc `
         --manifest-path (Join-Path $repo 'Cargo.toml') `
         --target-dir (Join-Path $lane 'build')
     if ($LASTEXITCODE) { throw 'Prism Inference build failed.' }
-    & (Join-Path $lane 'build/release/prism-inference.exe') --help
+    & (Join-Path $lane 'build/aarch64-pc-windows-msvc/release/prism-inference.exe') --help
 } finally {
     [Environment]::CurrentDirectory = $previous
     Pop-Location
@@ -142,6 +157,7 @@ regression, for example:
 
 ```powershell
 cargo +nightly-2026-11-09-aarch64-pc-windows-msvc test --locked --offline --release `
+    --target aarch64-pc-windows-msvc `
     --manifest-path <repo>/Cargo.toml --target-dir <temp>/build `
     --test runtime edited_turns_restore_complete_recurrent_prefix_and_failed_stream_rolls_back -- --exact
 ```

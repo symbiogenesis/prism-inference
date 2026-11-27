@@ -641,6 +641,8 @@ jobs:
     needs: changes
     runs-on: windows-11-arm
     timeout-minutes: 15
+    env:
+      CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -662,9 +664,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/Prism-CodecTarget
-          key: prism-codec-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/codec-probe/**', 'tools/ternary/**', 'rust-toolchain.toml') }}-content-v1
+          key: prism-codec-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'tools/codec-probe/**', 'tools/ternary/**', 'rust-toolchain.toml') }}-content-v1
           restore-keys: |
-            prism-codec-v1-${{ runner.os }}-${{ runner.arch }}-
+            prism-codec-v2-${{ runner.os }}-${{ runner.arch }}-
       - name: Check the probe and consume every preserved synthetic native codec input
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -688,7 +690,7 @@ jobs:
             [void][IO.Directory]::CreateDirectory($downloads)
             $archive = Join-Path $downloads $lock.Runtime.asset.filename
             $null = Receive-LockedArtifact -Uri $lock.Runtime.asset.url -Path $archive -Bytes $lock.Runtime.asset.bytes -Sha256 $lock.Runtime.asset.sha256 -TimeoutSeconds 600
-            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismCodec.ps1') -RuntimeArchive $archive -ProbeToolPath (Join-Path $target 'release/bonsai-codec-probe.exe') -EvidenceDirectory (Join-Path $checks 'native')
+            & (Join-Path $env:GITHUB_WORKSPACE 'tests/Test-PrismCodec.ps1') -RuntimeArchive $archive -ProbeToolPath (Join-Path $target 'aarch64-pc-windows-msvc/release/bonsai-codec-probe.exe') -EvidenceDirectory (Join-Path $checks 'native')
           } finally { Stop-Transcript | Out-Null }
       - name: Retain codec corpus, ABI, package and process receipts
         if: always() && env.PRISM_CODEC_EVIDENCE != ''

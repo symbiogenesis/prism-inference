@@ -230,6 +230,7 @@ jobs:
     env:
       CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
       CARGO_BUILD_FINGERPRINT: content
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
       EFFICIENCY_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -259,9 +260,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.CARGO_TARGET_DIR }}
-          key: prism-model-free-v1-${{ matrix.target }}-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tests/**', 'tools/**', 'rust-toolchain.toml', 'clippy.toml', 'rustfmt.toml') }}-content-v1
+          key: prism-model-free-v2-${{ matrix.target }}-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'src/**', 'server/**', 'tests/**', 'tools/**', 'rust-toolchain.toml', 'clippy.toml', 'rustfmt.toml') }}-content-v1
           restore-keys: |
-            prism-model-free-v1-${{ matrix.target }}-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-
+            prism-model-free-v2-${{ matrix.target }}-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-
       - name: Check native and fallback lints, transactional serving and worker protocol
         if: github.event_name != 'workflow_dispatch' || inputs.model_free != 'efficiency'
         shell: pwsh
@@ -279,10 +280,9 @@ jobs:
             # Explicit packages also lint helper test targets and the non-ARM
             # NEON stubs that dependency-only ARM64 checks cannot reach.
             cargo +nightly-2026-11-09 clippy --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p bonsai-neon-dot -p bonsai-hexagon-native -p bonsai-hexagon-runtime -p prism-inference -p prism-inference-server --all-targets --features prism-inference/parallel-rows,prism-inference-server/parallel-rows -- -D warnings
-            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf
-            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference --features parallel-rows --test graph --test swift
-            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p prism-inference-server --features parallel-rows
-            cargo +nightly-2026-11-09 doc --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --no-deps
+            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference-server --features prism-inference-server/parallel-rows
+            cargo +nightly-2026-11-09 test --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p bonsai-neon-dot -p bonsai-hexagon-native -p bonsai-hexagon-runtime -p prism-inference -p prism-inference-server --features prism-inference/parallel-rows,prism-inference-server/parallel-rows --test graph --test swift
+            cargo +nightly-2026-11-09 doc --manifest-path $manifest --locked --release -p bonsai-native-hash -p bonsai-gguf -p prism-inference -p prism-inference-server --features prism-inference/parallel-rows,prism-inference-server/parallel-rows --no-deps
           } finally { Stop-Transcript | Out-Null }
       - name: Require exact efficiency controls, analyzers and production linking
         if: github.event_name == 'workflow_dispatch' && inputs.model_free == 'efficiency'

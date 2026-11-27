@@ -74,9 +74,12 @@ class FoundationWorkflowTests(unittest.TestCase):
         cache = package.split("- name: Reuse only source-package compiler outputs\n", 1)[1].split("      - name:", 1)[0]
         paths = re.search(r"(?m)^          path: \|\n((?:            .*\n)+)", cache)[1]
         self.assertEqual([line.strip() for line in paths.splitlines()],
-                         ["${{ env.CARGO_TARGET_DIR }}/debug", "${{ env.CARGO_TARGET_DIR }}/release"])
+                         ["${{ env.CARGO_TARGET_DIR }}/debug",
+                          "${{ env.CARGO_TARGET_DIR }}/release",
+                          "${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/debug",
+                          "${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release"])
         for line in cache.splitlines():
-            if "prism-source-package-v1-" in line:
+            if "prism-source-package-v2-" in line:
                 for identity in ("matrix.target", "steps.package-toolchain.outputs.image-identity",
                                  "steps.package-toolchain.outputs.compiler-identity"):
                     self.assertIn(identity, line)
@@ -89,6 +92,18 @@ class FoundationWorkflowTests(unittest.TestCase):
         self.assertIn('for features in ("scalar", "default", "parallel-rows"):', script)
         self.assertIn('"package", "--manifest-path"', script)
         self.assertIn('CARGO_UNSTABLE_CHECKSUM_FRESHNESS: \'true\'', self.workflow)
+
+    def test_all_foundation_cargo_jobs_set_explicit_build_target(self):
+        for job_name in (
+            "windows",
+            "native-overlay",
+            "rust-regression",
+            "codec-native",
+            "source-package",
+            "cross-native-arm64",
+        ):
+            with self.subTest(job=job_name):
+                self.assertIn("CARGO_BUILD_TARGET:", self.job(job_name))
 
 
 if __name__ == "__main__":

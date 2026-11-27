@@ -83,7 +83,8 @@ if ($buildScripts.Count -ne 1) { throw 'Expected one Rust header-generation buil
 $generatedHeader = Join-Path $buildScripts[0].out_dir 'bonsai_prism.h'
 if (-not [IO.File]::Exists($generatedHeader)) { throw 'Rust did not generate its C ABI declarations.' }
 $libraryName = if ($IsWindows) { 'bonsai_prism.lib' } else { 'libbonsai_prism.a' }
-$rustLibrary = Join-Path $rustBuild ('release/' + $libraryName)
+$releaseSubdir = if ($env:CARGO_BUILD_TARGET) { "$($env:CARGO_BUILD_TARGET)/release" } else { 'release' }
+$rustLibrary = Join-Path $rustBuild ($releaseSubdir + '/' + $libraryName)
 if (-not [IO.File]::Exists($rustLibrary)) { throw 'The Rust static library was not produced.' }
 $rustReceipt = [ordered]@{
     Version = $rustVersion

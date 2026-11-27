@@ -79,12 +79,89 @@ fn rust_selected(paths: &[String]) -> bool {
     })
 }
 
+const TOOLCHAIN_ERROR: &str =
+    "Push formatting requires the outgoing source's dated nightly compiler pin.";
+
+fn strip_comment(line: &str) -> &str {
+    let mut quote: Option<u8> = None;
+    for (index, byte) in line.bytes().enumerate() {
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, b'#') => return &line[..index],
+            (Some(open), current) if current == open => quote = None,
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_quoted_value(value: &str) -> Result<&str> {
+    let bytes = value.as_bytes();
+    let Some(&quote) = bytes.first().filter(|&&byte| matches!(byte, b'\'' | b'"')) else {
+        return Err(TOOLCHAIN_ERROR.into());
+    };
+    let rest = &value[1..];
+    let Some(end) = rest.find(char::from(quote)) else {
+        return Err(TOOLCHAIN_ERROR.into());
+    };
+    let inner = &rest[..end];
+    if quote == b'"' && inner.contains('\\') {
+        return Err(TOOLCHAIN_ERROR.into());
+    }
+    if !rest[end + 1..].trim().is_empty() {
+        return Err(TOOLCHAIN_ERROR.into());
+    }
+    Ok(inner)
+}
+
 fn toolchain(text: &str) -> Result<String> {
-    let pin: toml::Value = toml::from_str(text).map_err(|error| error.to_string())?;
-    let channel = pin
-        .get("toolchain")
-        .and_then(|value| value.get("channel"))
-        .and_then(toml::Value::as_str)
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut section: Option<&str> = None;
+    let mut seen_toolchain = false;
+    let mut channel: Option<&str> = None;
+
+    for raw_line in text.lines() {
+        let line = strip_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(after_open) = line.strip_prefix('[') {
+            let Some(name) = after_open.strip_suffix(']') else {
+                return Err(TOOLCHAIN_ERROR.into());
+            };
+            let name = name.trim();
+            if name.is_empty() || name.contains(['[', ']']) {
+                return Err(TOOLCHAIN_ERROR.into());
+            }
+            if name == "toolchain" {
+                if seen_toolchain {
+                    return Err(TOOLCHAIN_ERROR.into());
+                }
+                seen_toolchain = true;
+            }
+            section = Some(name);
+            continue;
+        }
+        let Some(current_section) = section else {
+            return Err(TOOLCHAIN_ERROR.into());
+        };
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(TOOLCHAIN_ERROR.into());
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(TOOLCHAIN_ERROR.into());
+        }
+        if current_section == "toolchain" && key == "channel" {
+            if channel.is_some() {
+                return Err(TOOLCHAIN_ERROR.into());
+            }
+            channel = Some(parse_quoted_value(value)?);
+        }
+    }
+
+    let channel = channel
         .filter(|channel| {
             channel.len() == 18
                 && channel.starts_with("nightly-")
@@ -96,7 +173,7 @@ fn toolchain(text: &str) -> Result<String> {
                     }
                 })
         })
-        .ok_or("Push formatting requires the outgoing source's dated nightly compiler pin.")?;
+        .ok_or(TOOLCHAIN_ERROR)?;
     Ok(format!("{channel}-aarch64-pc-windows-msvc"))
 }
 
@@ -241,12 +318,29 @@ mod tests {
             toolchain("[toolchain]\nchannel = 'nightly-2026-11-09'\n")?,
             "nightly-2026-11-09-aarch64-pc-windows-msvc"
         );
+        assert_eq!(
+            toolchain(
+                "\u{feff}# pin comment\n[other]\nchannel = 'nightly-2026-01-01'\n[toolchain]\nchannel = \"nightly-2026-11-09\" # inline comment\n"
+            )?,
+            "nightly-2026-11-09-aarch64-pc-windows-msvc"
+        );
         for channel in [
             "nightly",
             "stable",
             "nightly-2026-11-09-aarch64-pc-windows-msvc",
         ] {
             assert!(toolchain(&format!("[toolchain]\nchannel='{channel}'\n")).is_err());
+        }
+        for invalid in [
+            "channel = 'nightly-2026-11-09'\n",
+            "[toolchain]\nchannel = 'nightly-2026-11-09'\nchannel = 'nightly-2026-11-09'\n",
+            "[toolchain]\nchannel = 'nightly-2026-11-09'\n[toolchain]\n",
+            "[toolchain\nchannel = 'nightly-2026-11-09'\n",
+            "[toolchain]\nchannel = 'nightly-2026-11-09' extra\n",
+            "[toolchain]\nchannel = \"nightly-2026\\u002d11-09\"\n",
+            "[other]\nchannel = 'nightly-2026-11-09'\n",
+        ] {
+            assert!(toolchain(invalid).is_err(), "{invalid}");
         }
         Ok(())
     }

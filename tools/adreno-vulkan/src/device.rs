@@ -710,11 +710,22 @@ enum StageSpans<'a> {
     Spans(&'a [BufferSpan]),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntegerDotSupport {
+    Disabled,
+    Basic,
+    #[expect(
+        dead_code,
+        reason = "Retained for future Adreno driver versions whose QGLC implements signed OpSDotAccSat correctly."
+    )]
+    AccumulatingSaturating,
+}
+
 /// Self-contained native Qualcomm Adreno Vulkan compute device and resource owner.
 pub struct AdrenoVulkanDevice {
     capabilities: VulkanDeviceCapabilities,
     min_storage_buffer_offset_alignment: u64,
-    sdot_enabled: bool,
+    sdot_support: IntegerDotSupport,
     buffers: Vec<Option<OwnedBuffer>>,
     uncertain_buffers: Vec<OwnedBuffer>,
     pipelines: Vec<OwnedPipeline>,
@@ -1095,6 +1106,7 @@ impl AdrenoVulkanDevice {
             _ext_set,
             mem_properties,
             min_offset_align,
+            sdot_acc_sat_supported,
         )) = select_native_adreno(&entry, &instance, &physical_devices)
         else {
             // SAFETY: No suitable Adreno adapter found; clean up instance.
@@ -1139,6 +1151,16 @@ impl AdrenoVulkanDevice {
                     return Err(err);
                 }
             };
+        // Qualcomm Adreno X2-90 Vulkan driver (2151018496) advertises
+        // `integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated = VK_TRUE`,
+        // but QGLC compiles SPIR-V `OpSDotAccSat` (4454) as unsigned `u8 x u8`
+        // (`dot(0x01010101, 0xFFFFFFFF, 0) == 1020` instead of `-4`), violating 0-ULP parity.
+        let _ = sdot_acc_sat_supported;
+        let sdot_support = if sdot_enabled {
+            IntegerDotSupport::Basic
+        } else {
+            IntegerDotSupport::Disabled
+        };
 
         Self::create_runtime_objects(
             entry,
@@ -1149,7 +1171,7 @@ impl AdrenoVulkanDevice {
             caps,
             pipeline_cache_uuid,
             initial_pipeline_cache,
-            sdot_enabled,
+            sdot_support,
             &mem_properties,
             min_offset_align,
         )
@@ -1169,7 +1191,7 @@ impl AdrenoVulkanDevice {
         capabilities: VulkanDeviceCapabilities,
         pipeline_cache_uuid: [u8; vk::UUID_SIZE],
         initial_pipeline_cache: Option<&[u8]>,
-        sdot_enabled: bool,
+        sdot_support: IntegerDotSupport,
         mem_properties: &vk::PhysicalDeviceMemoryProperties,
         min_storage_buffer_offset_alignment: u64,
     ) -> Result<Self, Error> {
@@ -1241,7 +1263,7 @@ impl AdrenoVulkanDevice {
         Ok(Self {
             capabilities,
             min_storage_buffer_offset_alignment,
-            sdot_enabled,
+            sdot_support,
             buffers: Vec::new(),
             uncertain_buffers: Vec::new(),
             pipelines: Vec::new(),
@@ -1376,7 +1398,14 @@ impl AdrenoVulkanDevice {
     /// Returns `true` if `VK_KHR_shader_integer_dot_product` was enabled on the logical device.
     #[must_use]
     pub const fn integer_dot_product_enabled(&self) -> bool {
-        self.sdot_enabled
+        !matches!(self.sdot_support, IntegerDotSupport::Disabled)
+    }
+
+    /// Returns `true` if `OpSDotAccSat` (`integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated`)
+    /// is supported and enabled on the logical device.
+    #[must_use]
+    pub const fn integer_dot_product_acc_sat_enabled(&self) -> bool {
+        matches!(self.sdot_support, IntegerDotSupport::AccumulatingSaturating)
     }
 
     /// Returns `true` if a timeout or device loss latched a terminal fault state.
@@ -3246,6 +3275,7 @@ type SelectedAdapter = (
     BTreeSet<String>,
     vk::PhysicalDeviceMemoryProperties,
     u64,
+    bool,
 );
 
 #[cfg(windows)]
@@ -3263,6 +3293,10 @@ fn select_native_adreno(
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Queries Vulkan 1.3 core properties, subgroup size control, dot-product acceleration, cooperative matrices, and memory heaps."
+)]
 fn inspect_adreno_candidate(
     entry: &ash::Entry,
     instance: &ash::Instance,
@@ -3368,6 +3402,11 @@ fn inspect_adreno_candidate(
         memory_heaps,
         identity_sha256: String::new(),
     };
+    let sdot_acc_sat_supported = sdot_feats.shader_integer_dot_product == vk::TRUE
+        && sdot_props
+            .integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated
+            == vk::TRUE;
+
     caps.recompute_identity_sha256().ok()?;
     Some((
         phys,
@@ -3377,6 +3416,7 @@ fn inspect_adreno_candidate(
         ext_set,
         mem_properties,
         props.limits.min_storage_buffer_offset_alignment.max(1),
+        sdot_acc_sat_supported,
     ))
 }
 

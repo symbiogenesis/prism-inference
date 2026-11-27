@@ -260,6 +260,7 @@ pub(crate) struct ProjectionPipelines {
     pub(crate) pq2_q8k_splitk_unfused_res: PipelineId,
     pub(crate) pq2_q8_0: PipelineId,
     pub(crate) pq2_q8_0_4tok: PipelineId,
+    pub(crate) pq2_q8_0_32tok: PipelineId,
     pub(crate) pq2_q8_0_splitk: PipelineId,
     pub(crate) ptq1_q8_0: PipelineId,
     pub(crate) ptq1_q8_0_pinned: PipelineId,
@@ -357,7 +358,7 @@ pub(crate) const fn should_use_decode_splitk(
     tokens == 1
         && cols > 1024
         && supports_splitk_gemv(device)
-        && ((rows <= 4096 && blocks_per_row >= 8) || (rows <= 8192 && blocks_per_row >= 32))
+        && ((rows <= 4096 && blocks_per_row >= 8) || (rows <= 12_288 && blocks_per_row >= 32))
 }
 
 pub(crate) struct PreparedShaderSpec {
@@ -370,7 +371,7 @@ pub(crate) struct PreparedShaderSpec {
 
 pub(crate) struct PreparedProjectionShaders {
     pub(crate) digest_sha256: String,
-    modules: [PreparedShaderSpec; 45],
+    modules: [PreparedShaderSpec; 46],
 }
 
 impl ProjectionPipelines {
@@ -378,13 +379,15 @@ impl ProjectionPipelines {
         clippy::too_many_lines,
         reason = "Emits and digests all 1-tok, Split-K, 4-tok, 16-tok, 32-tok shared-memory GEMM, quantization, and helper SPIR-V modules sequentially."
     )]
-    pub(crate) fn prepare_with_subgroup(
+    pub(crate) fn prepare_with_sdot_acc_sat(
         use_sdot: bool,
+        use_sdot_acc_sat: bool,
         use_wave64_shuffle: bool,
     ) -> Result<PreparedProjectionShaders, Error> {
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"projection-pipelines-v6:")?;
+        hash_bytes(&mut hasher, b"projection-pipelines-v7:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
+        hash_u32(&mut hasher, u32::from(use_sdot_acc_sat))?;
         hash_u32(&mut hasher, u32::from(use_wave64_shuffle))?;
         let mut make_spec = |tag: &'static [u8],
                              words: Vec<u32>,
@@ -406,228 +409,329 @@ impl ProjectionPipelines {
         let modules = [
             make_spec(
                 b"pq2_q8k_fused",
-                spirv::pq2_q8k_gemv_coalesced(use_sdot, true, false),
+                spirv::pq2_q8k_gemv_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat, true, false),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_unfused",
-                spirv::pq2_q8k_gemv_coalesced(use_sdot, false, false),
+                spirv::pq2_q8k_gemv_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_fused_res",
-                spirv::pq2_q8k_gemv_coalesced(use_sdot, true, true),
+                spirv::pq2_q8k_gemv_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat, true, true),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_unfused_res",
-                spirv::pq2_q8k_gemv_coalesced(use_sdot, false, true),
+                spirv::pq2_q8k_gemv_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat, false, true),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_4tok_fused",
-                spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, false),
+                spirv::pq2_q8k_gemm_4tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    true,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_4tok_unfused",
-                spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, false),
+                spirv::pq2_q8k_gemm_4tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_4tok_fused_res",
-                spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, true, true),
+                spirv::pq2_q8k_gemm_4tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    true,
+                    true,
+                ),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_4tok_unfused_res",
-                spirv::pq2_q8k_gemm_4tok_coalesced(use_sdot, false, true),
+                spirv::pq2_q8k_gemm_4tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                    true,
+                ),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_16tok_fused",
-                spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, true, false),
+                spirv::pq2_q8k_gemm_16tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    true,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_16tok_unfused",
-                spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, false, false),
+                spirv::pq2_q8k_gemm_16tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_16tok_fused_res",
-                spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, true, true),
+                spirv::pq2_q8k_gemm_16tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    true,
+                    true,
+                ),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_16tok_unfused_res",
-                spirv::pq2_q8k_gemm_16tok_coalesced(use_sdot, false, true),
+                spirv::pq2_q8k_gemm_16tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                    true,
+                ),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_32tok_fused",
-                spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, true, false),
+                spirv::pq2_q8k_gemm_32tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    true,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_32tok_unfused",
-                spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, false, false),
+                spirv::pq2_q8k_gemm_32tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_32tok_fused_res",
-                spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, true, true),
+                spirv::pq2_q8k_gemm_32tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    true,
+                    true,
+                ),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_32tok_unfused_res",
-                spirv::pq2_q8k_gemm_32tok_coalesced(use_sdot, false, true),
+                spirv::pq2_q8k_gemm_32tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                    true,
+                ),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_splitk_fused",
-                spirv::pq2_q8k_gemv_splitk(use_sdot, true, false),
+                spirv::pq2_q8k_gemv_splitk_with_acc_sat(use_sdot, use_sdot_acc_sat, true, false),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_splitk_unfused",
-                spirv::pq2_q8k_gemv_splitk(use_sdot, false, false),
+                spirv::pq2_q8k_gemv_splitk_with_acc_sat(use_sdot, use_sdot_acc_sat, false, false),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_splitk_fused_res",
-                spirv::pq2_q8k_gemv_splitk(use_sdot, true, true),
+                spirv::pq2_q8k_gemv_splitk_with_acc_sat(use_sdot, use_sdot_acc_sat, true, true),
                 4,
                 4,
             )?,
             make_spec(
                 b"pq2_q8k_splitk_unfused_res",
-                spirv::pq2_q8k_gemv_splitk(use_sdot, false, true),
+                spirv::pq2_q8k_gemv_splitk_with_acc_sat(use_sdot, use_sdot_acc_sat, false, true),
                 4,
                 4,
             )?,
-            make_spec(b"pq2_q8_0", spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?,
+            make_spec(
+                b"pq2_q8_0",
+                spirv::pq2_q8_0_gemv_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat),
+                3,
+                4,
+            )?,
             make_spec(
                 b"pq2_q8_0_4tok",
-                spirv::pq2_q8_0_gemm_4tok_coalesced(use_sdot),
+                spirv::pq2_q8_0_gemm_4tok_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat),
+                3,
+                4,
+            )?,
+            make_spec(
+                b"pq2_q8_0_32tok",
+                spirv::pq2_q8_0_gemm_32tok_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat),
                 3,
                 4,
             )?,
             make_spec(
                 b"pq2_q8_0_splitk",
-                spirv::pq2_q8_0_gemv_splitk(use_sdot),
+                spirv::pq2_q8_0_gemv_splitk_with_acc_sat(use_sdot, use_sdot_acc_sat),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0",
-                spirv::ptq1_q8_0_gemv_coalesced(use_sdot, false),
+                spirv::ptq1_q8_0_gemv_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat, false),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_pinned",
-                spirv::ptq1_q8_0_gemv_coalesced(use_sdot, true),
+                spirv::ptq1_q8_0_gemv_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat, true),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_4tok",
-                spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, false),
+                spirv::ptq1_q8_0_gemm_4tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_4tok_pinned",
-                spirv::ptq1_q8_0_gemm_4tok_coalesced(use_sdot, true),
+                spirv::ptq1_q8_0_gemm_4tok_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat, true),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_16tok",
-                spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, false),
+                spirv::ptq1_q8_0_gemm_16tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_16tok_pinned",
-                spirv::ptq1_q8_0_gemm_16tok_coalesced(use_sdot, true),
+                spirv::ptq1_q8_0_gemm_16tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    true,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_32tok",
-                spirv::ptq1_q8_0_gemm_32tok_coalesced(use_sdot, false),
+                spirv::ptq1_q8_0_gemm_32tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    false,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_32tok_pinned",
-                spirv::ptq1_q8_0_gemm_32tok_coalesced(use_sdot, true),
+                spirv::ptq1_q8_0_gemm_32tok_coalesced_with_acc_sat(
+                    use_sdot,
+                    use_sdot_acc_sat,
+                    true,
+                ),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_splitk",
-                spirv::ptq1_q8_0_gemv_splitk(use_sdot, false),
+                spirv::ptq1_q8_0_gemv_splitk_with_acc_sat(use_sdot, use_sdot_acc_sat, false),
                 3,
                 4,
             )?,
             make_spec(
                 b"ptq1_q8_0_splitk_pinned",
-                spirv::ptq1_q8_0_gemv_splitk(use_sdot, true),
+                spirv::ptq1_q8_0_gemv_splitk_with_acc_sat(use_sdot, use_sdot_acc_sat, true),
                 3,
                 4,
             )?,
             make_spec(
                 b"q8_0_q8_0",
-                spirv::q8_0_q8_0_gemv_coalesced(use_sdot),
+                spirv::q8_0_q8_0_gemv_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat),
                 3,
                 4,
             )?,
             make_spec(
                 b"q8_0_q8_0_4tok",
-                spirv::q8_0_q8_0_gemm_4tok_coalesced(use_sdot),
+                spirv::q8_0_q8_0_gemm_4tok_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat),
                 3,
                 4,
             )?,
             make_spec(
                 b"q8_0_q8_0_16tok",
-                spirv::q8_0_q8_0_gemm_16tok_coalesced(use_sdot),
+                spirv::q8_0_q8_0_gemm_16tok_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat),
                 3,
                 4,
             )?,
             make_spec(
                 b"q8_0_q8_0_32tok",
-                spirv::q8_0_q8_0_gemm_32tok_coalesced(use_sdot),
+                spirv::q8_0_q8_0_gemm_32tok_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat),
                 3,
                 4,
             )?,
             make_spec(
                 b"q8_0_q8_0_splitk",
-                spirv::q8_0_q8_0_gemv_splitk(use_sdot),
+                spirv::q8_0_q8_0_gemv_splitk_with_acc_sat(use_sdot, use_sdot_acc_sat),
                 3,
                 4,
             )?,
-            make_spec(b"ptq1_q8k", spirv::ptq1_q8k_gemv_coalesced(use_sdot), 3, 4)?,
+            make_spec(
+                b"ptq1_q8k",
+                spirv::ptq1_q8k_gemv_coalesced_with_acc_sat(use_sdot, use_sdot_acc_sat),
+                3,
+                4,
+            )?,
             make_spec(
                 b"quant_q8k_pinned",
                 spirv::quantize_f32_to_q8k_4plane_with_subgroup(true, use_wave64_shuffle),
@@ -657,7 +761,7 @@ impl ProjectionPipelines {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "Compiles all 45 prepared projection SPIR-V modules into Vulkan compute pipelines."
+        reason = "Compiles all 46 prepared projection SPIR-V modules into Vulkan compute pipelines."
     )]
     pub(crate) fn compile_prepared(
         device: &mut AdrenoVulkanDevice,
@@ -696,6 +800,7 @@ impl ProjectionPipelines {
             pq2_q8k_splitk_unfused_res,
             pq2_q8_0,
             pq2_q8_0_4tok,
+            pq2_q8_0_32tok,
             pq2_q8_0_splitk,
             ptq1_q8_0,
             ptq1_q8_0_pinned,
@@ -719,7 +824,7 @@ impl ProjectionPipelines {
             swiglu_unpinned,
             hadamard,
             dot_scalar,
-        ]: [PipelineId; 45] = ids
+        ]: [PipelineId; 46] = ids
             .try_into()
             .map_err(|_| Error::InvalidInput("projection pipeline count mismatch".to_owned()))?;
 
@@ -746,6 +851,7 @@ impl ProjectionPipelines {
             pq2_q8k_splitk_unfused_res,
             pq2_q8_0,
             pq2_q8_0_4tok,
+            pq2_q8_0_32tok,
             pq2_q8_0_splitk,
             ptq1_q8_0,
             ptq1_q8_0_pinned,
@@ -814,9 +920,8 @@ impl ProjectionPipelines {
     pub(crate) const fn select_pq2_q8_0(&self, path: BatchTokenPath) -> PipelineId {
         match path {
             BatchTokenPath::Single => self.pq2_q8_0,
-            BatchTokenPath::Four | BatchTokenPath::Sixteen | BatchTokenPath::ThirtyTwo => {
-                self.pq2_q8_0_4tok
-            }
+            BatchTokenPath::Four | BatchTokenPath::Sixteen => self.pq2_q8_0_4tok,
+            BatchTokenPath::ThirtyTwo => self.pq2_q8_0_32tok,
         }
     }
 
@@ -923,8 +1028,10 @@ impl VulkanPq2Executor {
         max_cached_weight_bytes: usize,
     ) -> Result<Self, Error> {
         let use_sdot = spirv::path_uses_sdot(kernel_path);
+        let use_sdot_acc_sat = use_sdot && device.integer_dot_product_acc_sat_enabled();
         let use_wave64 = device.capabilities().wave64_subgroup_shuffle;
-        let prepared = ProjectionPipelines::prepare_with_subgroup(use_sdot, use_wave64)?;
+        let prepared =
+            ProjectionPipelines::prepare_with_sdot_acc_sat(use_sdot, use_sdot_acc_sat, use_wave64)?;
         let pipes = ProjectionPipelines::compile_prepared(&mut device, prepared)?;
         let weight_arena = WeightArena::new(&device);
         let caps = device.capabilities();
@@ -3746,6 +3853,42 @@ mod tests {
                         "ptq1 T=32 sdot={use_sdot} pinned={pinned} idx={i}"
                     );
                 }
+            }
+
+            // 4. PQ2 x Q8_0
+            let pq_q8_ref =
+                dev.create_compute_pipeline(&spirv::pq2_q8_0_gemv_coalesced(use_sdot), 3, 4)?;
+            let pq_q8_32 = dev.create_compute_pipeline(
+                &spirv::pq2_q8_0_gemm_32tok_coalesced(use_sdot),
+                3,
+                4,
+            )?;
+            let push_pq8 = [
+                rows_u32,
+                u32::try_from(pq2_bpr).unwrap_or(0),
+                tokens_u32,
+                u32::try_from(pq2_bpr * 48).unwrap_or(0),
+            ];
+            dev.submit_compute(
+                pq_q8_ref,
+                &[b_w544, buf_act_q8_0, b_ref],
+                &push_pq8,
+                [tile_x, tokens_u32, 1],
+            )?;
+            dev.submit_compute(
+                pq_q8_32,
+                &[b_w544, buf_act_q8_0, b_32],
+                &push_pq8,
+                [tile_x, 1, 1],
+            )?;
+            dev.read_buffer_f32(b_ref, &mut out_ref)?;
+            dev.read_buffer_f32(b_32, &mut out_32)?;
+            for (i, (&a, &b)) in out_32.iter().zip(&out_ref).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "pq2_q8_0 T=32 sdot={use_sdot} idx={i}"
+                );
             }
         }
         Ok(())

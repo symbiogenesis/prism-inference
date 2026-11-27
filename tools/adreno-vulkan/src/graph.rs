@@ -323,6 +323,9 @@ pub struct VulkanLayerPipelines {
     fused_hadamard1024_q8k_unpinned: PipelineId,
     swiglu_hadamard1024_q8k_pinned: PipelineId,
     swiglu_hadamard1024_q8k_unpinned: PipelineId,
+    swiglu_hadamard1024_q8_0_source: PipelineId,
+    swiglu_hadamard1024_q8_0_pinned: PipelineId,
+    swiglu_hadamard1024_q8_0_pinned_native: PipelineId,
     fused_hadamard1024_q8_0_source: PipelineId,
     fused_hadamard1024_q8_0_pinned: PipelineId,
     fused_hadamard1024_q8_0_pinned_native: PipelineId,
@@ -344,6 +347,7 @@ pub struct VulkanLayerPipelines {
     vocab_argmax_stage1: PipelineId,
     vocab_argmax_stage2: PipelineId,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     attn_qk_digest: String,
     attn_qk_f16kv_digest: String,
     attn_softmax_digest: String,
@@ -357,17 +361,22 @@ pub struct VulkanLayerPipelines {
 
 struct PreparedLayerShaders {
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     use_wave64: bool,
     proj: PreparedProjectionShaders,
-    modules: [PreparedShaderSpec; 70],
+    modules: [PreparedShaderSpec; 73],
     shader_digests_sha256: String,
 }
 
 impl VulkanLayerPipelines {
     /// Emits and digests every layer, projection, `LoRA`, and attention SPIR-V 1.6 module without
     /// yet opening a Vulkan device or invoking QGLC compilation.
-    fn prepare(use_sdot: bool, use_wave64_shuffle: bool) -> Result<PreparedLayerShaders, Error> {
-        Self::prepare_with_subgroup(use_sdot, use_wave64_shuffle)
+    fn prepare(
+        use_sdot: bool,
+        use_sdot_acc_sat: bool,
+        use_wave64_shuffle: bool,
+    ) -> Result<PreparedLayerShaders, Error> {
+        Self::prepare_with_subgroup(use_sdot, use_sdot_acc_sat, use_wave64_shuffle)
     }
 
     #[expect(
@@ -376,12 +385,18 @@ impl VulkanLayerPipelines {
     )]
     fn prepare_with_subgroup(
         use_sdot: bool,
+        use_sdot_acc_sat: bool,
         use_wave64_shuffle: bool,
     ) -> Result<PreparedLayerShaders, Error> {
-        let proj = ProjectionPipelines::prepare_with_subgroup(use_sdot, use_wave64_shuffle)?;
+        let proj = ProjectionPipelines::prepare_with_sdot_acc_sat(
+            use_sdot,
+            use_sdot_acc_sat,
+            use_wave64_shuffle,
+        )?;
         let mut hasher = Hasher::new().map_err(|err| Error::InvalidInput(err.to_string()))?;
-        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v7:")?;
+        hash_bytes(&mut hasher, b"vulkan-layer-pipelines-v8:")?;
         hash_u32(&mut hasher, u32::from(use_sdot))?;
+        hash_u32(&mut hasher, u32::from(use_sdot_acc_sat))?;
         hash_u32(&mut hasher, u32::from(use_wave64_shuffle))?;
         hash_bytes(&mut hasher, b"proj_bundle:")?;
         hash_bytes(&mut hasher, proj.digest_sha256.as_bytes())?;
@@ -650,6 +665,24 @@ impl VulkanLayerPipelines {
                 4,
             )?,
             make_spec(
+                b"swiglu_hadamard1024_q8_0_source",
+                spirv::swiglu_hadamard1024_q8_0_with_subgroup(false, false, use_wave64_shuffle),
+                5,
+                4,
+            )?,
+            make_spec(
+                b"swiglu_hadamard1024_q8_0_pinned",
+                spirv::swiglu_hadamard1024_q8_0_with_subgroup(true, false, use_wave64_shuffle),
+                5,
+                4,
+            )?,
+            make_spec(
+                b"swiglu_hadamard1024_q8_0_pinned_native",
+                spirv::swiglu_hadamard1024_q8_0_with_subgroup(true, true, use_wave64_shuffle),
+                5,
+                4,
+            )?,
+            make_spec(
                 b"fused_hadamard1024_q8_0_source",
                 spirv::fused_basis_hadamard1024_q8_0_with_subgroup(
                     false,
@@ -762,6 +795,7 @@ impl VulkanLayerPipelines {
 
         Ok(PreparedLayerShaders {
             use_sdot,
+            use_sdot_acc_sat,
             use_wave64: use_wave64_shuffle,
             proj,
             modules,
@@ -854,6 +888,9 @@ impl VulkanLayerPipelines {
             fused_hadamard1024_q8k_unpinned,
             swiglu_hadamard1024_q8k_pinned,
             swiglu_hadamard1024_q8k_unpinned,
+            swiglu_hadamard1024_q8_0_source,
+            swiglu_hadamard1024_q8_0_pinned,
+            swiglu_hadamard1024_q8_0_pinned_native,
             fused_hadamard1024_q8_0_source,
             fused_hadamard1024_q8_0_pinned,
             fused_hadamard1024_q8_0_pinned_native,
@@ -874,7 +911,7 @@ impl VulkanLayerPipelines {
             copy_slice_offset,
             vocab_argmax_stage1,
             vocab_argmax_stage2,
-        ]: [PipelineId; 70] = ids
+        ]: [PipelineId; 73] = ids
             .try_into()
             .map_err(|_| Error::InvalidInput("layer pipeline count mismatch".to_owned()))?;
 
@@ -930,6 +967,9 @@ impl VulkanLayerPipelines {
             fused_hadamard1024_q8k_unpinned,
             swiglu_hadamard1024_q8k_pinned,
             swiglu_hadamard1024_q8k_unpinned,
+            swiglu_hadamard1024_q8_0_source,
+            swiglu_hadamard1024_q8_0_pinned,
+            swiglu_hadamard1024_q8_0_pinned_native,
             fused_hadamard1024_q8_0_source,
             fused_hadamard1024_q8_0_pinned,
             fused_hadamard1024_q8_0_pinned_native,
@@ -951,6 +991,7 @@ impl VulkanLayerPipelines {
             vocab_argmax_stage1,
             vocab_argmax_stage2,
             use_sdot: prepared.use_sdot,
+            use_sdot_acc_sat: prepared.use_sdot_acc_sat,
             attn_qk_digest,
             attn_qk_f16kv_digest,
             attn_softmax_digest,
@@ -970,7 +1011,8 @@ impl VulkanLayerPipelines {
     /// creation or digest calculation fails.
     pub fn compile(device: &mut AdrenoVulkanDevice, use_sdot: bool) -> Result<Self, Error> {
         let use_wave64 = device.capabilities().wave64_subgroup_shuffle;
-        let prepared = Self::prepare(use_sdot, use_wave64)?;
+        let use_sdot_acc_sat = use_sdot && device.integer_dot_product_acc_sat_enabled();
+        let prepared = Self::prepare(use_sdot, use_sdot_acc_sat, use_wave64)?;
         Self::compile_prepared(device, prepared)
     }
 
@@ -978,6 +1020,12 @@ impl VulkanLayerPipelines {
     #[must_use]
     pub const fn uses_sdot(&self) -> bool {
         self.use_sdot
+    }
+
+    /// Returns whether this compiled bundle emits saturating integer dot-accumulate (`OpSDotAccSat`).
+    #[must_use]
+    pub const fn uses_sdot_acc_sat(&self) -> bool {
+        self.use_sdot_acc_sat
     }
 
     /// Returns the deterministic SHA-256 digest over all compiled SPIR-V shader modules.
@@ -1576,7 +1624,7 @@ impl VulkanBatchedGraphExecutor {
             config.kernel_path,
             Some(ProjectionKernelPath::PortableIntegerFallback)
         );
-        let prepared = VulkanLayerPipelines::prepare(use_sdot_hint, true)?;
+        let prepared = VulkanLayerPipelines::prepare(use_sdot_hint, false, true)?;
         let cached_blob = read_pipeline_cache_file(&cache_path);
         let (device, loaded_from_cache) = match cached_blob.as_deref() {
             Some(blob) => match AdrenoVulkanDevice::open_with_pipeline_cache_data(
@@ -1599,6 +1647,7 @@ impl VulkanBatchedGraphExecutor {
         )?;
         if (!loaded_from_cache
             || executor.pipelines.uses_sdot() != use_sdot_hint
+            || executor.pipelines.uses_sdot_acc_sat()
             || !executor.device.capabilities().wave64_subgroup_shuffle)
             && let Ok(exported) = executor
                 .device
@@ -1665,6 +1714,7 @@ impl VulkanBatchedGraphExecutor {
         if use_sdot && !device.capabilities().supports_integer_dot_4x8() {
             return Err(Error::Unsupported);
         }
+        let use_sdot_acc_sat = use_sdot && device.integer_dot_product_acc_sat_enabled();
 
         let (geometry, layer_count, recurrent_flags) = parse_model_geometry(model, &config)?;
         let resolved_context_limit = geometry.context_limit;
@@ -1684,7 +1734,9 @@ impl VulkanBatchedGraphExecutor {
         let use_wave64 = device.capabilities().wave64_subgroup_shuffle;
         let pipelines = match prepared_shaders {
             Some(prepared)
-                if prepared.use_sdot == use_sdot && prepared.use_wave64 == use_wave64 =>
+                if prepared.use_sdot == use_sdot
+                    && prepared.use_sdot_acc_sat == use_sdot_acc_sat
+                    && prepared.use_wave64 == use_wave64 =>
             {
                 VulkanLayerPipelines::compile_prepared(&mut device, prepared)?
             }
@@ -4913,6 +4965,31 @@ impl VulkanBatchedGraphExecutor {
         Ok(())
     }
 
+    const fn select_swiglu_h1024_pipe(&self, encoding: WeightEncoding) -> (PipelineId, BufferId) {
+        match (encoding, self.resolved_pinned_arithmetic) {
+            (WeightEncoding::Pq2Q8k, true) => (
+                self.pipelines.swiglu_hadamard1024_q8k_pinned,
+                self.scratch.act_q8k,
+            ),
+            (WeightEncoding::Pq2Q8k, false) => (
+                self.pipelines.swiglu_hadamard1024_q8k_unpinned,
+                self.scratch.act_q8k,
+            ),
+            (_, false) => (
+                self.pipelines.swiglu_hadamard1024_q8_0_source,
+                self.scratch.act_q8_0,
+            ),
+            (WeightEncoding::Ptq1Q8_0, true) => (
+                self.pipelines.swiglu_hadamard1024_q8_0_pinned_native,
+                self.scratch.act_q8_0,
+            ),
+            (_, true) => (
+                self.pipelines.swiglu_hadamard1024_q8_0_pinned,
+                self.scratch.act_q8_0,
+            ),
+        }
+    }
+
     fn record_ffn_tokens(&mut self, layer_idx: usize, tokens: usize) -> Result<(), Error> {
         let ffn_gate = self.layers[layer_idx].ffn_gate;
         let ffn_up = self.layers[layer_idx].ffn_up;
@@ -4928,13 +5005,18 @@ impl VulkanBatchedGraphExecutor {
             tokens,
         )?;
 
-        let can_fuse_swiglu_h1024_q8k = ffn_down.encoding == WeightEncoding::Pq2Q8k
-            && ffn_down.rotated
+        let can_fuse_swiglu_h1024 = matches!(
+            ffn_down.encoding,
+            WeightEncoding::Pq2Q8k
+                | WeightEncoding::Pq2Q8_0
+                | WeightEncoding::Ptq1Q8_0
+                | WeightEncoding::Q8_0
+        ) && ffn_down.rotated
             && !ffn_down.grouped_ssm
             && self.transforms.block == 1024
             && self.geometry.feed_forward.is_multiple_of(1024);
 
-        if can_fuse_swiglu_h1024_q8k {
+        if can_fuse_swiglu_h1024 {
             let cols = self.geometry.feed_forward;
             let cols_u32 = u32::try_from(cols)
                 .map_err(|_| Error::ResourceLimit("feed_forward exceeds u32".to_owned()))?;
@@ -4950,18 +5032,14 @@ impl VulkanBatchedGraphExecutor {
             let has_active_lora =
                 ffn_down.multi_rank.is_some() && self.multi_rank_scale.is_some_and(|s| s != 0.0);
             let write_mid = u32::from(has_active_lora);
-            let pipe = if self.resolved_pinned_arithmetic {
-                self.pipelines.swiglu_hadamard1024_q8k_pinned
-            } else {
-                self.pipelines.swiglu_hadamard1024_q8k_unpinned
-            };
+            let (pipe, act_buf) = self.select_swiglu_h1024_pipe(ffn_down.encoding);
             self.batch_recorder.push_barrier(
                 pipe,
                 &[
                     BufferSpan::whole(gate_out_buf),
                     BufferSpan::whole(up_out_buf),
                     BufferSpan::whole(sign_buf),
-                    BufferSpan::whole(self.scratch.act_q8k),
+                    BufferSpan::whole(act_buf),
                     BufferSpan::whole(mid_buf),
                 ],
                 &[cols_u32, hadamard_norm_bits(1024), has_signs, write_mid],
@@ -5857,7 +5935,7 @@ impl VulkanBatchedGraphExecutor {
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
                     let pipe = if use_decode_splitk
                         && ((rows_u32 <= 4096 && blocks_per_row >= 8)
-                            || (rows_u32 <= 8192 && blocks_per_row >= 32))
+                            || (rows_u32 <= 12_288 && blocks_per_row >= 32))
                     {
                         self.pipelines
                             .proj
@@ -5897,7 +5975,7 @@ impl VulkanBatchedGraphExecutor {
                         .map_err(|_| Error::ResourceLimit("act_words exceed u32".to_owned()))?;
                     let splitk = use_decode_splitk
                         && ((rows_u32 <= 4096 && blocks_per_row >= 8)
-                            || (rows_u32 <= 8192 && blocks_per_row >= 32));
+                            || (rows_u32 <= 12_288 && blocks_per_row >= 32));
                     let (pipe, tok_tiles_y) = match weight.encoding {
                         WeightEncoding::Pq2Q8_0 => (
                             if splitk {
@@ -5905,7 +5983,11 @@ impl VulkanBatchedGraphExecutor {
                             } else {
                                 self.pipelines.proj.select_pq2_q8_0(batch_path)
                             },
-                            tile_y_4,
+                            if !splitk && batch_path == BatchTokenPath::ThirtyTwo {
+                                tok_tiles_16y
+                            } else {
+                                tile_y_4
+                            },
                         ),
                         WeightEncoding::Ptq1Q8_0 => (
                             if splitk {
@@ -8966,20 +9048,22 @@ mod tests {
     }
 
     #[test]
-    fn prepared_layer_pipelines_v7_includes_fused_kernels_and_distinct_digests() -> Result<(), Error>
+    fn prepared_layer_pipelines_v8_includes_fused_kernels_and_distinct_digests() -> Result<(), Error>
     {
-        let p_base = VulkanLayerPipelines::prepare(false, false)?;
-        let p_sdot = VulkanLayerPipelines::prepare(true, false)?;
-        let p_wave = VulkanLayerPipelines::prepare(false, true)?;
-        let p_both = VulkanLayerPipelines::prepare(true, true)?;
+        let p_base = VulkanLayerPipelines::prepare(false, false, false)?;
+        let p_sdot = VulkanLayerPipelines::prepare(true, false, false)?;
+        let p_acc_sat = VulkanLayerPipelines::prepare(true, true, false)?;
+        let p_wave = VulkanLayerPipelines::prepare(false, false, true)?;
+        let p_both = VulkanLayerPipelines::prepare(true, true, true)?;
 
-        assert_eq!(p_base.modules.len(), 70);
-        assert_eq!(p_both.modules.len(), 70);
+        assert_eq!(p_base.modules.len(), 73);
+        assert_eq!(p_both.modules.len(), 73);
         assert_eq!(
             p_both.shader_digests_sha256,
-            VulkanLayerPipelines::prepare(true, true)?.shader_digests_sha256
+            VulkanLayerPipelines::prepare(true, true, true)?.shader_digests_sha256
         );
         assert_ne!(p_base.shader_digests_sha256, p_sdot.shader_digests_sha256);
+        assert_ne!(p_sdot.shader_digests_sha256, p_acc_sat.shader_digests_sha256);
         assert_ne!(p_base.shader_digests_sha256, p_wave.shader_digests_sha256);
         assert_ne!(p_base.shader_digests_sha256, p_both.shader_digests_sha256);
 
@@ -8991,6 +9075,9 @@ mod tests {
             b"deinterleave_q_gate_rms_norm_rope".as_slice(),
             b"swiglu_hadamard1024_q8k_pinned".as_slice(),
             b"swiglu_hadamard1024_q8k_unpinned".as_slice(),
+            b"swiglu_hadamard1024_q8_0_source".as_slice(),
+            b"swiglu_hadamard1024_q8_0_pinned".as_slice(),
+            b"swiglu_hadamard1024_q8_0_pinned_native".as_slice(),
             b"vocab_argmax_stage1".as_slice(),
             b"vocab_argmax_stage2".as_slice(),
         ] {

@@ -85,6 +85,7 @@ const OP_RETURN: u16 = 253;
 const OP_GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
 const OP_GROUP_NON_UNIFORM_SHUFFLE_XOR: u16 = 346;
 const OP_S_DOT: u16 = 4450;
+const OP_S_DOT_ACC_SAT: u16 = 4454;
 
 const CAPABILITY_SHADER: u32 = 1;
 const CAPABILITY_FLOAT64: u32 = 10;
@@ -1518,6 +1519,18 @@ impl ShaderBuilder {
         id
     }
 
+    fn sdot_acc_sat_packed(&mut self, a_u32: u32, b_u32: u32, acc_i32: u32) -> u32 {
+        let a_i = self.bitcast(self.i32_t, a_u32);
+        let b_i = self.bitcast(self.i32_t, b_u32);
+        let id = self.alloc_id();
+        push_inst(
+            &mut self.fn_body,
+            OP_S_DOT_ACC_SAT,
+            &[self.i32_t, id, a_i, b_i, acc_i32, PACKED_FORMAT_4X8_BIT],
+        );
+        id
+    }
+
     const fn uses_subgroup_shuffle(&self) -> bool {
         self.use_subgroup_shuffle
     }
@@ -2222,7 +2235,8 @@ where
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Unifies streaming PTQ1_0 x Q8_0 dot product across K tokens (1-tok GEMV, 4-tok GEMM, and 16-tok shared-memory GEMM)."
+    clippy::too_many_lines,
+    reason = "Unifies streaming PTQ1_0 x Q8_0 dot product across K tokens (1-tok GEMV, 4-tok GEMM, and 16-tok/32-tok shared-memory GEMM)."
 )]
 fn emit_ptq1_q8_0_stream_block<const K: usize, LW, LA>(
     b: &mut ShaderBuilder,
@@ -2232,6 +2246,7 @@ fn emit_ptq1_q8_0_stream_block<const K: usize, LW, LA>(
     word_stride: u32,
     blk_act_bases: [u32; K],
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     pinned_4lane: bool,
     lane_vars: &[[u32; 4]; K],
 ) where
@@ -2273,22 +2288,41 @@ fn emit_ptq1_q8_0_stream_block<const K: usize, LW, LA>(
             if K == 1 {
                 let act_w_idx = b.uadd(blk_act_bases[0], act_w_off);
                 let aw = load_act(b, act_w_idx);
-                let dot = dot_trit_lanes_with_act(b, packed_trits, aw, use_sdot);
-                if pinned_4lane {
-                    lane_sums[0][lane_idx] = b.iadd(lane_sums[0][lane_idx], dot);
+                if use_sdot && use_sdot_acc_sat {
+                    let packed_w = swar_bias_minus_one(b, packed_trits);
+                    if pinned_4lane {
+                        lane_sums[0][lane_idx] =
+                            b.sdot_acc_sat_packed(packed_w, aw, lane_sums[0][lane_idx]);
+                    } else {
+                        isums[0] = b.sdot_acc_sat_packed(packed_w, aw, isums[0]);
+                    }
                 } else {
-                    isums[0] = b.iadd(isums[0], dot);
+                    let dot = dot_trit_lanes_with_act(b, packed_trits, aw, use_sdot);
+                    if pinned_4lane {
+                        lane_sums[0][lane_idx] = b.iadd(lane_sums[0][lane_idx], dot);
+                    } else {
+                        isums[0] = b.iadd(isums[0], dot);
+                    }
                 }
             } else if use_sdot {
                 let packed_w = swar_bias_minus_one(b, packed_trits);
                 for (k, &base) in blk_act_bases.iter().enumerate() {
                     let act_w_idx = b.uadd(base, act_w_off);
                     let aw = load_act(b, act_w_idx);
-                    let dot = b.sdot_packed(packed_w, aw);
-                    if pinned_4lane {
-                        lane_sums[k][lane_idx] = b.iadd(lane_sums[k][lane_idx], dot);
+                    if use_sdot_acc_sat {
+                        if pinned_4lane {
+                            lane_sums[k][lane_idx] =
+                                b.sdot_acc_sat_packed(packed_w, aw, lane_sums[k][lane_idx]);
+                        } else {
+                            isums[k] = b.sdot_acc_sat_packed(packed_w, aw, isums[k]);
+                        }
                     } else {
-                        isums[k] = b.iadd(isums[k], dot);
+                        let dot = b.sdot_packed(packed_w, aw);
+                        if pinned_4lane {
+                            lane_sums[k][lane_idx] = b.iadd(lane_sums[k][lane_idx], dot);
+                        } else {
+                            isums[k] = b.iadd(isums[k], dot);
+                        }
                     }
                 }
             } else {
@@ -2404,6 +2438,7 @@ pub fn ptq1_q8_0_gemv(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
                 1,
                 [blk_act_base],
                 use_sdot,
+                false,
                 pinned_4lane,
                 &[lane_vars],
             );
@@ -2590,43 +2625,33 @@ fn coalesced_pq2_unpack_4digits(b: &mut ShaderBuilder, pq_word: u32) -> [u32; 4]
     [q0, q1, q2, q3]
 }
 
-fn dot_pq2_4digits_with_act(
-    b: &mut ShaderBuilder,
-    q: [u32; 4],
-    act_buf: u32,
-    act_words_base: u32,
-    use_sdot: bool,
-) -> u32 {
-    dot_pq2_4digits_from_loader(
-        b,
-        q,
-        |b, idx| b.load_sb_u32(act_buf, idx),
-        act_words_base,
-        use_sdot,
-    )
-}
-
-fn dot_pq2_4digits_from_loader<L>(
+fn dot_pq2_4digits_acc_from_loader<L>(
     b: &mut ShaderBuilder,
     q: [u32; 4],
     mut load_word: L,
     act_words_base: u32,
+    init_sum: u32,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
 ) -> u32
 where
     L: FnMut(&mut ShaderBuilder, u32) -> u32,
 {
-    let mut sum = b.const_i32(0);
+    let mut sum = init_sum;
     for (digit, &q_word) in q.iter().enumerate() {
         let d_off = b.const_u32(u32::try_from(digit).unwrap_or(0));
         let act_idx = b.uadd(act_words_base, d_off);
         let plane = load_word(b, act_idx);
-        let dot = if use_sdot {
-            b.sdot_packed(q_word, plane)
+        sum = if use_sdot && use_sdot_acc_sat {
+            b.sdot_acc_sat_packed(q_word, plane, sum)
         } else {
-            portable_dot4_u8_packed4_s8(b, q_word, plane)
+            let dot = if use_sdot {
+                b.sdot_packed(q_word, plane)
+            } else {
+                portable_dot4_u8_packed4_s8(b, q_word, plane)
+            };
+            b.iadd(sum, dot)
         };
-        sum = b.iadd(sum, dot);
     }
     sum
 }
@@ -2680,6 +2705,7 @@ fn emit_pq2_q8k_uvec4_block(
     act_blk_vec_base: u32,
     acc_var: u32,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     fused: bool,
 ) {
     let w_scale = coalesced_pq2_scale(b, weights_buf, tile_base, lane);
@@ -2703,12 +2729,16 @@ fn emit_pq2_q8k_uvec4_block(
         for (digit, &q_word) in q.iter().enumerate() {
             let comp = u32::try_from(digit).unwrap_or(0);
             let plane = b.composite_extract(b.u32_t, plane_vec, comp);
-            let dot = if use_sdot {
-                b.sdot_packed(q_word, plane)
+            int_sum = if use_sdot && use_sdot_acc_sat {
+                b.sdot_acc_sat_packed(q_word, plane, int_sum)
             } else {
-                portable_dot4_u8_packed4_s8(b, q_word, plane)
+                let dot = if use_sdot {
+                    b.sdot_packed(q_word, plane)
+                } else {
+                    portable_dot4_u8_packed4_s8(b, q_word, plane)
+                };
+                b.iadd(int_sum, dot)
             };
-            int_sum = b.iadd(int_sum, dot);
         }
     }
 
@@ -2733,6 +2763,21 @@ fn emit_pq2_q8k_uvec4_block(
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn pq2_q8k_gemv_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    pq2_q8k_gemv_coalesced_with_acc_sat(use_sdot, false, fused, has_residual)
+}
+
+/// Emits coalesced 64-row `PQ2_0` × 4-plane `Q8_K` GEMV SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Four orthogonal shader specialization flags (sdot, acc_sat, fused, residual)."
+)]
+pub fn pq2_q8k_gemv_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    fused: bool,
+    has_residual: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -2787,6 +2832,7 @@ pub fn pq2_q8k_gemv_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -
                 act_blk_vec_base,
                 acc_var,
                 use_sdot,
+                use_sdot_acc_sat,
                 fused,
             );
         });
@@ -2807,6 +2853,21 @@ pub fn pq2_q8k_gemv_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -
 /// Push constants (`4 Ã— u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn pq2_q8k_gemm_4tok_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    pq2_q8k_gemm_4tok_coalesced_with_acc_sat(use_sdot, false, fused, has_residual)
+}
+
+/// Emits coalesced 64-row × 4-token `PQ2_0` × 4-plane `Q8_K` GEMM SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Four orthogonal shader specialization flags (sdot, acc_sat, fused, residual)."
+)]
+pub fn pq2_q8k_gemm_4tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    fused: bool,
+    has_residual: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -2873,8 +2934,15 @@ pub fn pq2_q8k_gemm_4tok_coalesced(use_sdot: bool, fused: bool, has_residual: bo
                 let plane_off = b.const_u32(4 + word_j * 4);
                 for (t_idx, &a_base) in act_bases.iter().enumerate() {
                     let plane_base = b.uadd(a_base, plane_off);
-                    let part = dot_pq2_4digits_with_act(b, q, act_buf, plane_base, use_sdot);
-                    int_sums[t_idx] = b.iadd(int_sums[t_idx], part);
+                    int_sums[t_idx] = dot_pq2_4digits_acc_from_loader(
+                        b,
+                        q,
+                        |b, idx| b.load_sb_u32(act_buf, idx),
+                        plane_base,
+                        int_sums[t_idx],
+                        use_sdot,
+                        use_sdot_acc_sat,
+                    );
                 }
             }
 
@@ -2925,6 +2993,7 @@ fn emit_pq2_q8_0_uvec4_block(
     blk_act_vec_base: u32,
     acc_var: u32,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
 ) {
     let f_zero = b.const_f32(0.0);
     let c8 = b.const_u32(8);
@@ -2964,13 +3033,18 @@ fn emit_pq2_q8_0_uvec4_block(
             for (comp, raw_byte) in [b0, b1, b2, b3].into_iter().enumerate() {
                 let comp_u32 = u32::try_from(comp).unwrap_or(0);
                 let act_w = b.composite_extract(b.u32_t, aw_vec, comp_u32);
-                let dot = if use_sdot {
+                grp_int = if use_sdot && use_sdot_acc_sat {
                     let packed = swar_pack_4x2bit_to_4xi8(b, raw_byte);
-                    b.sdot_packed(packed, act_w)
+                    b.sdot_acc_sat_packed(packed, act_w, grp_int)
                 } else {
-                    portable_dot4_from_2bit_byte(b, raw_byte, act_w)
+                    let dot = if use_sdot {
+                        let packed = swar_pack_4x2bit_to_4xi8(b, raw_byte);
+                        b.sdot_packed(packed, act_w)
+                    } else {
+                        portable_dot4_from_2bit_byte(b, raw_byte, act_w)
+                    };
+                    b.iadd(grp_int, dot)
                 };
-                grp_int = b.iadd(grp_int, dot);
             }
         }
         let grp_f32 = b.i32_to_f32(grp_int);
@@ -2991,6 +3065,15 @@ fn emit_pq2_q8_0_uvec4_block(
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn pq2_q8_0_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
+    pq2_q8_0_gemv_coalesced_with_acc_sat(use_sdot, false)
+}
+
+/// Emits coalesced 64-row `PQ2_0` × `Q8_0` GEMV SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+pub fn pq2_q8_0_gemv_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -3044,6 +3127,7 @@ pub fn pq2_q8_0_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
                 blk_act_vec_base,
                 acc_var,
                 use_sdot,
+                use_sdot_acc_sat,
             );
         });
 
@@ -3069,6 +3153,7 @@ fn pq2_q8_0_4tok_group_step(
     blk_act_bases: [u32; 4],
     grp: u32,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     block_sums: &mut [u32; 4],
 ) {
     let c1 = b.const_u32(1);
@@ -3107,8 +3192,12 @@ fn pq2_q8_0_4tok_group_step(
                 let a3 = b.uadd(a0, c3);
                 for (pb, ai) in packed_bytes.iter().zip([a0, a1, a2, a3]) {
                     let aw = b.load_sb_u32(act_buf, ai);
-                    let dot = b.sdot_packed(*pb, aw);
-                    grp_ints[k] = b.iadd(grp_ints[k], dot);
+                    if use_sdot_acc_sat {
+                        grp_ints[k] = b.sdot_acc_sat_packed(*pb, aw, grp_ints[k]);
+                    } else {
+                        let dot = b.sdot_packed(*pb, aw);
+                        grp_ints[k] = b.iadd(grp_ints[k], dot);
+                    }
                 }
             }
         } else {
@@ -3141,6 +3230,15 @@ fn pq2_q8_0_4tok_group_step(
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn pq2_q8_0_gemm_4tok_coalesced(use_sdot: bool) -> Vec<u32> {
+    pq2_q8_0_gemm_4tok_coalesced_with_acc_sat(use_sdot, false)
+}
+
+/// Emits coalesced 64-row `×` 4-token `PQ2_0` `×` `Q8_0` GEMM SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+pub fn pq2_q8_0_gemm_4tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -3206,6 +3304,7 @@ pub fn pq2_q8_0_gemm_4tok_coalesced(use_sdot: bool) -> Vec<u32> {
                     blk_act_bases,
                     grp,
                     use_sdot,
+                    use_sdot_acc_sat,
                     &mut block_sums,
                 );
             }
@@ -3290,6 +3389,7 @@ fn eval_q8_0_uvec4_block_contrib(
     b: &mut ShaderBuilder,
     inputs: &Q8_0Uvec4BlockInputs,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
 ) -> u32 {
     let mut isum = b.const_i32(0);
     for (word_j, &w_word) in inputs.w_words.iter().enumerate() {
@@ -3300,12 +3400,16 @@ fn eval_q8_0_uvec4_block_contrib(
         };
         let comp = u32::try_from(word_j % 4).unwrap_or(0);
         let act_word = b.composite_extract(b.u32_t, aw_vec, comp);
-        let dot = if use_sdot {
-            b.sdot_packed(w_word, act_word)
+        isum = if use_sdot && use_sdot_acc_sat {
+            b.sdot_acc_sat_packed(w_word, act_word, isum)
         } else {
-            portable_dot4_packed4_s8(b, w_word, act_word)
+            let dot = if use_sdot {
+                b.sdot_packed(w_word, act_word)
+            } else {
+                portable_dot4_packed4_s8(b, w_word, act_word)
+            };
+            b.iadd(isum, dot)
         };
-        isum = b.iadd(isum, dot);
     }
     let d = b.fmul_nc(inputs.w_scale, inputs.act_scale);
     let sum_f32 = b.i32_to_f32(isum);
@@ -3320,6 +3424,15 @@ fn eval_q8_0_uvec4_block_contrib(
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn q8_0_q8_0_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
+    q8_0_q8_0_gemv_coalesced_with_acc_sat(use_sdot, false)
+}
+
+/// Emits coalesced 64-row `Q8_0` × `Q8_0` GEMV SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+pub fn q8_0_q8_0_gemv_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -3380,8 +3493,8 @@ pub fn q8_0_q8_0_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
                 lane,
                 blk1,
             );
-            let contrib0 = eval_q8_0_uvec4_block_contrib(b, &in0, use_sdot);
-            let contrib1 = eval_q8_0_uvec4_block_contrib(b, &in1, use_sdot);
+            let contrib0 = eval_q8_0_uvec4_block_contrib(b, &in0, use_sdot, use_sdot_acc_sat);
+            let contrib1 = eval_q8_0_uvec4_block_contrib(b, &in1, use_sdot, use_sdot_acc_sat);
             let prev = b.load_var_f32(acc_var);
             let next0 = b.fadd_nc(prev, contrib0);
             let next1 = b.fadd_nc(next0, contrib1);
@@ -3399,7 +3512,8 @@ pub fn q8_0_q8_0_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
                 lane,
                 even_blocks,
             );
-            let contrib_tail = eval_q8_0_uvec4_block_contrib(b, &in_tail, use_sdot);
+            let contrib_tail =
+                eval_q8_0_uvec4_block_contrib(b, &in_tail, use_sdot, use_sdot_acc_sat);
             let prev = b.load_var_f32(acc_var);
             let next = b.fadd_nc(prev, contrib_tail);
             b.store_var(acc_var, next);
@@ -3427,6 +3541,7 @@ fn q8_0_q8_0_4tok_block_step(
     act_buf: u32,
     blk_act_bases: [u32; 4],
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     acc_vars: [u32; 4],
 ) {
     let act_scales = blk_act_bases.map(|gb| {
@@ -3446,8 +3561,12 @@ fn q8_0_q8_0_4tok_block_step(
             for (k, &gb) in blk_act_bases.iter().enumerate() {
                 let act_idx = b.uadd(gb, act_off);
                 let aw = b.load_sb_u32(act_buf, act_idx);
-                let dot = b.sdot_packed(w_word, aw);
-                int_sums[k] = b.iadd(int_sums[k], dot);
+                if use_sdot_acc_sat {
+                    int_sums[k] = b.sdot_acc_sat_packed(w_word, aw, int_sums[k]);
+                } else {
+                    let dot = b.sdot_packed(w_word, aw);
+                    int_sums[k] = b.iadd(int_sums[k], dot);
+                }
             }
         } else {
             let weights_i32 = unpack_packed4_s8_to_i32(b, w_word);
@@ -3477,6 +3596,15 @@ fn q8_0_q8_0_4tok_block_step(
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn q8_0_q8_0_gemm_4tok_coalesced(use_sdot: bool) -> Vec<u32> {
+    q8_0_q8_0_gemm_4tok_coalesced_with_acc_sat(use_sdot, false)
+}
+
+/// Emits coalesced 64-row × 4-token `Q8_0` × `Q8_0` GEMM SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+pub fn q8_0_q8_0_gemm_4tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -3539,6 +3667,7 @@ pub fn q8_0_q8_0_gemm_4tok_coalesced(use_sdot: bool) -> Vec<u32> {
                 act_buf,
                 blk_act_bases,
                 use_sdot,
+                use_sdot_acc_sat,
                 acc_vars,
             );
         });
@@ -3582,6 +3711,7 @@ fn emit_ptq1_q8_0_uvec4_gemv_block(
     wbase: u32,
     blk_act_vec_base: u32,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     pinned_4lane: bool,
     lane_vars: &[u32; 4],
 ) {
@@ -3626,12 +3756,21 @@ fn emit_ptq1_q8_0_uvec4_gemv_block(
             }
 
             let aw = b.composite_extract(b.u32_t, aw_vec, in_grp % 4);
-            let dot = dot_trit_lanes_with_act(b, packed_trits, aw, use_sdot);
             let lane_idx = word_idx % 4;
-            if pinned_4lane {
-                lane_sums[lane_idx] = b.iadd(lane_sums[lane_idx], dot);
+            if use_sdot && use_sdot_acc_sat {
+                let packed_w = swar_bias_minus_one(b, packed_trits);
+                if pinned_4lane {
+                    lane_sums[lane_idx] = b.sdot_acc_sat_packed(packed_w, aw, lane_sums[lane_idx]);
+                } else {
+                    isum = b.sdot_acc_sat_packed(packed_w, aw, isum);
+                }
             } else {
-                isum = b.iadd(isum, dot);
+                let dot = dot_trit_lanes_with_act(b, packed_trits, aw, use_sdot);
+                if pinned_4lane {
+                    lane_sums[lane_idx] = b.iadd(lane_sums[lane_idx], dot);
+                } else {
+                    isum = b.iadd(isum, dot);
+                }
             }
 
             if in_grp == 7 {
@@ -3667,6 +3806,16 @@ fn emit_ptq1_q8_0_uvec4_gemv_block(
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn ptq1_q8_0_gemv_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    ptq1_q8_0_gemv_coalesced_with_acc_sat(use_sdot, false, pinned_4lane)
+}
+
+/// Emits coalesced 64-row `PTQ1_0` × `Q8_0` GEMV SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+pub fn ptq1_q8_0_gemv_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    pinned_4lane: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -3733,6 +3882,7 @@ pub fn ptq1_q8_0_gemv_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> 
                 wbase,
                 blk_act_vec_base,
                 use_sdot,
+                use_sdot_acc_sat,
                 pinned_4lane,
                 &lane_vars,
             );
@@ -3754,6 +3904,16 @@ pub fn ptq1_q8_0_gemv_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> 
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn ptq1_q8_0_gemm_4tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    ptq1_q8_0_gemm_4tok_coalesced_with_acc_sat(use_sdot, false, pinned_4lane)
+}
+
+/// Emits coalesced 64-row × 4-token `PTQ1_0` × `Q8_0` GEMM SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+pub fn ptq1_q8_0_gemm_4tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    pinned_4lane: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -3828,6 +3988,7 @@ pub fn ptq1_q8_0_gemm_4tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<
                 64,
                 blk_act_bases,
                 use_sdot,
+                use_sdot_acc_sat,
                 pinned_4lane,
                 &lane_vars,
             );
@@ -3854,6 +4015,12 @@ pub fn ptq1_q8_0_gemm_4tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn ptq1_q8k_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
+    ptq1_q8k_gemv_coalesced_with_acc_sat(use_sdot, false)
+}
+
+/// Emits coalesced 64-row `PTQ1_0` × `Q8_K` GEMV SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+pub fn ptq1_q8k_gemv_coalesced_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -3920,9 +4087,14 @@ pub fn ptq1_q8k_gemv_coalesced(use_sdot: bool) -> Vec<u32> {
                     let off_c = b.const_u32(u32::try_from(word_idx).unwrap_or(0));
                     let act_idx = b.uadd(act_vals_base, off_c);
                     let act_w = b.load_sb_u32(act_buf, act_idx);
-                    let dot = dot_trit_lanes_with_act(b, lanes, act_w, use_sdot);
                     let prev = b.load_var_i32(sum_var);
-                    let next = b.iadd(prev, dot);
+                    let next = if use_sdot && use_sdot_acc_sat {
+                        let packed_w = swar_bias_minus_one(b, lanes);
+                        b.sdot_acc_sat_packed(packed_w, act_w, prev)
+                    } else {
+                        let dot = dot_trit_lanes_with_act(b, lanes, act_w, use_sdot);
+                        b.iadd(prev, dot)
+                    };
                     b.store_var(sum_var, next);
                 },
             );
@@ -4130,6 +4302,7 @@ fn emit_pq2_q8k_16tok_block(
     acc0_var: u32,
     acc1_var: u32,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     fused: bool,
 ) {
     let c0 = b.const_u32(0);
@@ -4154,27 +4327,29 @@ fn emit_pq2_q8k_16tok_block(
         let plane_off = b.uadd(c4, j4);
 
         let pbase0 = b.uadd(s_act0_base, plane_off);
-        let part0 = dot_pq2_4digits_from_loader(
+        let prev0 = b.load_var_i32(isum0_var);
+        let next0 = dot_pq2_4digits_acc_from_loader(
             b,
             q,
             |b, idx| b.load_wg_u32(smem_act, idx),
             pbase0,
+            prev0,
             use_sdot,
+            use_sdot_acc_sat,
         );
-        let prev0 = b.load_var_i32(isum0_var);
-        let next0 = b.iadd(prev0, part0);
         b.store_var(isum0_var, next0);
 
         let pbase1 = b.uadd(s_act1_base, plane_off);
-        let part1 = dot_pq2_4digits_from_loader(
+        let prev1 = b.load_var_i32(isum1_var);
+        let next1 = dot_pq2_4digits_acc_from_loader(
             b,
             q,
             |b, idx| b.load_wg_u32(smem_act, idx),
             pbase1,
+            prev1,
             use_sdot,
+            use_sdot_acc_sat,
         );
-        let prev1 = b.load_var_i32(isum1_var);
-        let next1 = b.iadd(prev1, part1);
         b.store_var(isum1_var, next1);
     });
 
@@ -4212,6 +4387,21 @@ fn emit_pq2_q8k_16tok_block(
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn pq2_q8k_gemm_16tok_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    pq2_q8k_gemm_16tok_coalesced_with_acc_sat(use_sdot, false, fused, has_residual)
+}
+
+/// Emits 16-token shared-weight `PQ2_0` × 4-plane `Q8_K` prefill GEMM SPIR-V 1.6 (`(64, 8, 1)`) with optional `OpSDotAccSat`.
+#[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Four orthogonal shader specialization flags (sdot, acc_sat, fused, residual)."
+)]
+pub fn pq2_q8k_gemm_16tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    fused: bool,
+    has_residual: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -4276,6 +4466,7 @@ pub fn pq2_q8k_gemm_16tok_coalesced(use_sdot: bool, fused: bool, has_residual: b
                 acc0_var,
                 acc1_var,
                 use_sdot,
+                use_sdot_acc_sat,
                 fused,
             );
             b.workgroup_barrier();
@@ -4306,6 +4497,7 @@ fn emit_q8_0_q8_0_16tok_block(
     acc0_var: u32,
     acc1_var: u32,
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
 ) {
     let c0 = b.const_u32(0);
     let c4 = b.const_u32(4);
@@ -4330,20 +4522,26 @@ fn emit_q8_0_q8_0_16tok_block(
         let a1_idx = b.uadd(s_act1_base, act_off);
         let aw1 = b.load_wg_u32(smem_act, a1_idx);
 
-        let (dot0, dot1) = if use_sdot {
-            (b.sdot_packed(w_word, aw0), b.sdot_packed(w_word, aw1))
-        } else {
-            let weights_i32 = unpack_packed4_s8_to_i32(b, w_word);
-            (
-                portable_dot4_i32_weights(b, weights_i32, aw0),
-                portable_dot4_i32_weights(b, weights_i32, aw1),
-            )
-        };
         let prev0 = b.load_var_i32(isum0_var);
-        let next0 = b.iadd(prev0, dot0);
-        b.store_var(isum0_var, next0);
         let prev1 = b.load_var_i32(isum1_var);
-        let next1 = b.iadd(prev1, dot1);
+        let (next0, next1) = if use_sdot && use_sdot_acc_sat {
+            (
+                b.sdot_acc_sat_packed(w_word, aw0, prev0),
+                b.sdot_acc_sat_packed(w_word, aw1, prev1),
+            )
+        } else {
+            let (dot0, dot1) = if use_sdot {
+                (b.sdot_packed(w_word, aw0), b.sdot_packed(w_word, aw1))
+            } else {
+                let weights_i32 = unpack_packed4_s8_to_i32(b, w_word);
+                (
+                    portable_dot4_i32_weights(b, weights_i32, aw0),
+                    portable_dot4_i32_weights(b, weights_i32, aw1),
+                )
+            };
+            (b.iadd(prev0, dot0), b.iadd(prev1, dot1))
+        };
+        b.store_var(isum0_var, next0);
         b.store_var(isum1_var, next1);
     });
 
@@ -4372,6 +4570,15 @@ fn emit_q8_0_q8_0_16tok_block(
 /// `word_j` loop (`0..8`). Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn q8_0_q8_0_gemm_16tok_coalesced(use_sdot: bool) -> Vec<u32> {
+    q8_0_q8_0_gemm_16tok_coalesced_with_acc_sat(use_sdot, false)
+}
+
+/// Emits 16-token shared-weight `Q8_0` × `Q8_0` prefill GEMM SPIR-V 1.6 words with optional `OpSDotAccSat`.
+#[must_use]
+pub fn q8_0_q8_0_gemm_16tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -4435,6 +4642,7 @@ pub fn q8_0_q8_0_gemm_16tok_coalesced(use_sdot: bool) -> Vec<u32> {
                 acc0_var,
                 acc1_var,
                 use_sdot,
+                use_sdot_acc_sat,
             );
             b.workgroup_barrier();
         });
@@ -4456,6 +4664,16 @@ pub fn q8_0_q8_0_gemm_16tok_coalesced(use_sdot: bool) -> Vec<u32> {
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn ptq1_q8_0_gemm_16tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    ptq1_q8_0_gemm_16tok_coalesced_with_acc_sat(use_sdot, false, pinned_4lane)
+}
+
+/// Emits 16-token shared-weight `PTQ1_0` × `Q8_0` prefill GEMM SPIR-V 1.6 words (`(64, 8, 1)`) with optional `OpSDotAccSat`.
+#[must_use]
+pub fn ptq1_q8_0_gemm_16tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    pinned_4lane: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -4530,6 +4748,7 @@ pub fn ptq1_q8_0_gemm_16tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec
                 64,
                 [s_act0_base, s_act1_base],
                 use_sdot,
+                use_sdot_acc_sat,
                 pinned_4lane,
                 &lane_vars,
             );
@@ -4732,6 +4951,82 @@ fn commit_vars_to_smem_uvec4(
     });
 }
 
+fn load_uvec4_act_to_smem(
+    b: &mut ShaderBuilder,
+    act_buf: u32,
+    smem_act: u32,
+    lane_ok: u32,
+    my_tok_act_vec_base: u32,
+    local_vec: u32,
+    my_s_rel_words: u32,
+) {
+    b.emit_if(lane_ok, |b| {
+        let g_idx = b.uadd(my_tok_act_vec_base, local_vec);
+        let vec = b.load_sb_uvec4(act_buf, g_idx);
+        for comp in 0_u32..4 {
+            let word = b.composite_extract(b.u32_t, vec, comp);
+            let s_idx = if comp == 0 {
+                my_s_rel_words
+            } else {
+                let comp_c = b.const_u32(comp);
+                b.uadd(my_s_rel_words, comp_c)
+            };
+            b.store_wg_u32(smem_act, s_idx, word);
+        }
+    });
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Prefetches one uvec4 activation block per active lane into 4 scalar registers."
+)]
+fn prefetch_uvec4_act_to_vars(
+    b: &mut ShaderBuilder,
+    act_buf: u32,
+    lane_ok: u32,
+    my_tok_act_vec_base: u32,
+    next_blk: u32,
+    vecs_per_blk: u32,
+    local_vec: u32,
+    act_pre: &[u32; 4],
+) {
+    let vecs_c = b.const_u32(vecs_per_blk);
+    let next_act_vec_off = b.umul(next_blk, vecs_c);
+    b.emit_if(lane_ok, |b| {
+        let a_off = b.uadd(next_act_vec_off, local_vec);
+        let g_idx = b.uadd(my_tok_act_vec_base, a_off);
+        let vec = b.load_sb_uvec4(act_buf, g_idx);
+        for (comp, &ap) in act_pre.iter().enumerate() {
+            let comp_u32 = u32::try_from(comp).unwrap_or(0);
+            let word = b.composite_extract(b.u32_t, vec, comp_u32);
+            b.store_var(ap, word);
+        }
+    });
+}
+
+fn commit_uvec4_act_vars_to_smem(
+    b: &mut ShaderBuilder,
+    smem_act: u32,
+    lane_ok: u32,
+    act_next_base: u32,
+    my_s_rel_words: u32,
+    act_pre: &[u32; 4],
+) {
+    b.emit_if(lane_ok, |b| {
+        let dst = b.uadd(act_next_base, my_s_rel_words);
+        for (comp, &ap) in act_pre.iter().enumerate() {
+            let word = b.load_var_u32(ap);
+            let s_idx = if comp == 0 {
+                dst
+            } else {
+                let comp_c = b.const_u32(u32::try_from(comp).unwrap_or(0));
+                b.uadd(dst, comp_c)
+            };
+            b.store_wg_u32(smem_act, s_idx, word);
+        }
+    });
+}
+
 fn store_32tok_quad_outputs<F>(
     b: &mut ShaderBuilder,
     out_buf: u32,
@@ -4764,59 +5059,45 @@ fn emit_pq2_q8k_32tok_block(
     w_smem_base: u32,
     lane: u32,
     s_act_bases: [u32; 4],
-    isum_vars: [u32; 4],
     acc_vars: [u32; 4],
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
     fused: bool,
 ) {
-    let c0 = b.const_u32(0);
     let c1 = b.const_u32(1);
-    let c4 = b.const_u32(4);
-    let c8 = b.const_u32(8);
-    let c32 = b.const_u32(32);
-    let c64 = b.const_u32(64);
-    let i_zero = b.const_i32(0);
+    let mut isums = [b.const_i32(0); 4];
 
-    for &iv in &isum_vars {
-        b.store_var(iv, i_zero);
-    }
-
-    b.emit_for_range(c0, c8, c1, |b, word_j| {
-        let j64 = b.umul(word_j, c64);
-        let w_off = b.uadd(c32, j64);
+    for word_j in 0_u32..8 {
+        let w_off = b.const_u32(32 + word_j * 64);
         let w_local = b.uadd(w_off, lane);
         let w_idx = b.uadd(w_smem_base, w_local);
         let pq_word = b.load_wg_u32(smem_w, w_idx);
         let q = coalesced_pq2_unpack_4digits(b, pq_word);
+        let plane_off = b.const_u32(4 + word_j * 4);
 
-        let j4 = b.umul(word_j, c4);
-        let plane_off = b.uadd(c4, j4);
-
-        for (&s_base, &iv) in s_act_bases.iter().zip(&isum_vars) {
+        for (&s_base, isum) in s_act_bases.iter().zip(&mut isums) {
             let pbase = b.uadd(s_base, plane_off);
-            let part = dot_pq2_4digits_from_loader(
+            *isum = dot_pq2_4digits_acc_from_loader(
                 b,
                 q,
                 |b, idx| b.load_wg_u32(smem_act, idx),
                 pbase,
+                *isum,
                 use_sdot,
+                use_sdot_acc_sat,
             );
-            let prev = b.load_var_i32(iv);
-            let next = b.iadd(prev, part);
-            b.store_var(iv, next);
         }
-    });
+    }
 
     let w_scale =
         coalesced_pq2_scale_from_loader(b, |b, idx| b.load_wg_u32(smem_w, idx), w_smem_base, lane);
 
-    for ((&s_base, &iv), &av) in s_act_bases.iter().zip(&isum_vars).zip(&acc_vars) {
+    for ((&s_base, &int_sum), &av) in s_act_bases.iter().zip(&isums).zip(&acc_vars) {
         let act_scale_u32 = b.load_wg_u32(smem_act, s_base);
         let act_scale = b.bitcast(b.f32_t, act_scale_u32);
         let hsum_idx = b.uadd(s_base, c1);
         let hsum_u32 = b.load_wg_u32(smem_act, hsum_idx);
         let half_sum = b.bitcast(b.i32_t, hsum_u32);
-        let int_sum = b.load_var_i32(iv);
         let corrected = b.isub(int_sum, half_sum);
         let float_dot = b.i32_to_f32(corrected);
         let d = b.fmul_nc(w_scale, act_scale);
@@ -4834,19 +5115,31 @@ fn emit_pq2_q8k_32tok_block(
 /// Emits 32-token double-buffered `uvec4` shared-weight `PQ2_0` × 4-plane `Q8_K` prefill GEMM SPIR-V 1.6 (`(64, 8, 1)`).
 ///
 /// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(32), 1)`.
-/// Uses `smem_w[2 * 544] + smem_act[2 * 1088]` (`13,056 B` workgroup shared memory) with
-/// 128-bit `uvec4` global weight loads and 1 barrier per K-block.
+/// Uses `smem_w[2 * 544] + smem_act[2 * 1152]` (`13,568 B` workgroup shared memory) with
+/// 128-bit `uvec4` global weight & activation loads and 1 barrier per K-block.
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Double-buffered 32-token PQ2 x Q8K GEMM with uvec4 weight staging and register prefetch."
-)]
 #[must_use]
 pub fn pq2_q8k_gemm_32tok_coalesced(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    pq2_q8k_gemm_32tok_coalesced_with_acc_sat(use_sdot, false, fused, has_residual)
+}
+
+/// Emits 32-token double-buffered `uvec4` `PQ2_0` × 4-plane `Q8_K` prefill GEMM SPIR-V 1.6 with optional `OpSDotAccSat`.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines,
+    reason = "Double-buffered 32-token PQ2 x Q8K GEMM with uvec4 weight/activation staging, SSA accumulators, and four orthogonal specialization flags."
+)]
+#[must_use]
+pub fn pq2_q8k_gemm_32tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    fused: bool,
+    has_residual: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
-    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
     let res_buf = has_residual.then(|| b.storage_buffer(3, ElemType::F32, AccessMode::ReadOnly));
 
@@ -4860,12 +5153,6 @@ pub fn pq2_q8k_gemm_32tok_coalesced(use_sdot: bool, fused: bool, has_residual: b
             b.local_f32_var(),
             b.local_f32_var(),
             b.local_f32_var(),
-        ];
-        let isum_vars = [
-            b.local_i32_var(),
-            b.local_i32_var(),
-            b.local_i32_var(),
-            b.local_i32_var(),
         ];
         let w_pre = [
             b.local_u32_var(),
@@ -4886,7 +5173,10 @@ pub fn pq2_q8k_gemm_32tok_coalesced(use_sdot: bool, fused: bool, has_residual: b
 
         let c0 = b.const_u32(0);
         let c1 = b.const_u32(1);
-        let act_half_words = b.const_u32(36);
+        let c2 = b.const_u32(2);
+        let c4 = b.const_u32(4);
+        let c9 = b.const_u32(9);
+        let c36 = b.const_u32(36);
         let c72 = b.const_u32(72);
         let c108 = b.const_u32(108);
         let w_tile_vecs = b.const_u32(136);
@@ -4894,28 +5184,35 @@ pub fn pq2_q8k_gemm_32tok_coalesced(use_sdot: bool, fused: bool, has_residual: b
         let c544 = b.const_u32(544);
         let c1152 = b.const_u32(1152);
 
-        let tok_act_bases =
-            clamp_four_token_bases_from_tks(b, ids.tks, ids.tokens, ids.act_words_per_token);
+        let act_vecs_per_token = b.ushr(ids.act_words_per_token, c2);
+        let tok_act_vec_bases =
+            clamp_four_token_bases_from_tks(b, ids.tks, ids.tokens, act_vecs_per_token);
         let wy_act_off = b.umul(ids.wy, c144);
         let s_rel_0 = wy_act_off;
-        let s_rel_1 = b.uadd(wy_act_off, act_half_words);
+        let s_rel_1 = b.uadd(wy_act_off, c36);
         let s_rel_2 = b.uadd(wy_act_off, c72);
         let s_rel_3 = b.uadd(wy_act_off, c108);
-        let s_rels = [s_rel_0, s_rel_1, s_rel_2, s_rel_3];
+
+        let lane_ok = b.u_lt(ids.lane, c36);
+        let local_t = b.udiv(ids.lane, c9);
+        let local_vec = b.umod(ids.lane, c9);
+        let my_tok_act_vec_base = select_four_u32(b, local_t, tok_act_vec_bases);
+        let lane4 = b.umul(ids.lane, c4);
+        let my_s_rel_words = b.uadd(wy_act_off, lane4);
 
         let has_any_blk = b.u_lt(c0, ids.blocks_per_row);
         b.emit_if(has_any_blk, |b| {
             // Prologue: load block 0 directly into smem[0].
             load_uvec4_to_smem(b, weights_buf, smem_w, ids.rg_vec_base, c0, ids.tid, 136);
-            let lane_ok = b.u_lt(ids.lane, act_half_words);
-            b.emit_if(lane_ok, |b| {
-                for (&t_base, &s_rel) in tok_act_bases.iter().zip(&s_rels) {
-                    let g_idx = b.uadd(t_base, ids.lane);
-                    let val = b.load_sb_u32(act_buf, g_idx);
-                    let s_idx = b.uadd(s_rel, ids.lane);
-                    b.store_wg_u32(smem_act, s_idx, val);
-                }
-            });
+            load_uvec4_act_to_smem(
+                b,
+                act_buf,
+                smem_act,
+                lane_ok,
+                my_tok_act_vec_base,
+                local_vec,
+                my_s_rel_words,
+            );
             b.workgroup_barrier();
 
             b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
@@ -4928,16 +5225,16 @@ pub fn pq2_q8k_gemm_32tok_coalesced(use_sdot: bool, fused: bool, has_residual: b
                     let next_vec_off = b.umul(next_blk, w_tile_vecs);
                     let next_vec_base = b.uadd(ids.rg_vec_base, next_vec_off);
                     prefetch_uvec4_to_vars(b, weights_buf, next_vec_base, ids.tid, 136, &w_pre);
-
-                    let next_act_off = b.umul(next_blk, act_half_words);
-                    b.emit_if(lane_ok, |b| {
-                        let a_off = b.uadd(next_act_off, ids.lane);
-                        for (&t_base, &ap) in tok_act_bases.iter().zip(&act_pre) {
-                            let g_idx = b.uadd(t_base, a_off);
-                            let val = b.load_sb_u32(act_buf, g_idx);
-                            b.store_var(ap, val);
-                        }
-                    });
+                    prefetch_uvec4_act_to_vars(
+                        b,
+                        act_buf,
+                        lane_ok,
+                        my_tok_act_vec_base,
+                        next_blk,
+                        9,
+                        local_vec,
+                        &act_pre,
+                    );
                 });
 
                 let w_cur_base = b.umul(cur_buf, c544);
@@ -4956,25 +5253,24 @@ pub fn pq2_q8k_gemm_32tok_coalesced(use_sdot: bool, fused: bool, has_residual: b
                     w_cur_base,
                     ids.lane,
                     s_cur_bases,
-                    isum_vars,
                     acc_vars,
                     use_sdot,
+                    use_sdot_acc_sat,
                     fused,
                 );
 
                 b.emit_if(has_next, |b| {
                     let w_next_base = b.umul(next_buf, c544);
                     commit_vars_to_smem_uvec4(b, smem_w, w_next_base, ids.tid, 136, &w_pre);
-
                     let act_next_base = b.umul(next_buf, c1152);
-                    b.emit_if(lane_ok, |b| {
-                        for (&s_rel, &ap) in s_rels.iter().zip(&act_pre) {
-                            let s_base = b.uadd(act_next_base, s_rel);
-                            let s_idx = b.uadd(s_base, ids.lane);
-                            let val = b.load_var_u32(ap);
-                            b.store_wg_u32(smem_act, s_idx, val);
-                        }
-                    });
+                    commit_uvec4_act_vars_to_smem(
+                        b,
+                        smem_act,
+                        lane_ok,
+                        act_next_base,
+                        my_s_rel_words,
+                        &act_pre,
+                    );
                     b.workgroup_barrier();
                 });
             });
@@ -4999,56 +5295,49 @@ fn emit_q8_0_q8_0_32tok_block(
     w_smem_base: u32,
     lane: u32,
     s_act_bases: [u32; 4],
-    isum_vars: [u32; 4],
     acc_vars: [u32; 4],
     use_sdot: bool,
+    use_sdot_acc_sat: bool,
 ) {
-    let c0 = b.const_u32(0);
-    let c1 = b.const_u32(1);
-    let c4 = b.const_u32(4);
-    let c8 = b.const_u32(8);
-    let c32 = b.const_u32(32);
-    let c64 = b.const_u32(64);
-    let i_zero = b.const_i32(0);
+    let mut isums = [b.const_i32(0); 4];
 
-    for &iv in &isum_vars {
-        b.store_var(iv, i_zero);
-    }
-
-    b.emit_for_range(c0, c8, c1, |b, word_j| {
-        let j64 = b.umul(word_j, c64);
-        let w_off = b.uadd(c32, j64);
+    for word_j in 0_u32..8 {
+        let w_off = b.const_u32(32 + word_j * 64);
         let w_local = b.uadd(w_off, lane);
         let w_idx = b.uadd(w_smem_base, w_local);
         let w_word = b.load_wg_u32(smem_w, w_idx);
-        let act_off = b.uadd(c4, word_j);
+        let act_off = b.const_u32(4 + word_j);
 
         let a_words = s_act_bases.map(|s_base| {
             let a_idx = b.uadd(s_base, act_off);
             b.load_wg_u32(smem_act, a_idx)
         });
 
-        let dots = if use_sdot {
-            a_words.map(|aw| b.sdot_packed(w_word, aw))
+        if use_sdot && use_sdot_acc_sat {
+            for (isum, aw) in isums.iter_mut().zip(a_words) {
+                *isum = b.sdot_acc_sat_packed(w_word, aw, *isum);
+            }
+        } else if use_sdot {
+            for (isum, aw) in isums.iter_mut().zip(a_words) {
+                let dot = b.sdot_packed(w_word, aw);
+                *isum = b.iadd(*isum, dot);
+            }
         } else {
             let weights_i32 = unpack_packed4_s8_to_i32(b, w_word);
-            a_words.map(|aw| portable_dot4_i32_weights(b, weights_i32, aw))
-        };
-        for (&iv, dot) in isum_vars.iter().zip(dots) {
-            let prev = b.load_var_i32(iv);
-            let next = b.iadd(prev, dot);
-            b.store_var(iv, next);
+            for (isum, aw) in isums.iter_mut().zip(a_words) {
+                let dot = portable_dot4_i32_weights(b, weights_i32, aw);
+                *isum = b.iadd(*isum, dot);
+            }
         }
-    });
+    }
 
     let w_scale =
         coalesced_pq2_scale_from_loader(b, |b, idx| b.load_wg_u32(smem_w, idx), w_smem_base, lane);
 
-    for ((&s_base, &iv), &av) in s_act_bases.iter().zip(&isum_vars).zip(&acc_vars) {
+    for ((&s_base, &int_sum), &av) in s_act_bases.iter().zip(&isums).zip(&acc_vars) {
         let act_scale_u32 = b.load_wg_u32(smem_act, s_base);
         let act_scale = b.bitcast(b.f32_t, act_scale_u32);
         let d = b.fmul_nc(w_scale, act_scale);
-        let int_sum = b.load_var_i32(iv);
         let sum_f32 = b.i32_to_f32(int_sum);
         let contrib = b.fmul_nc(d, sum_f32);
         let prev = b.load_var_f32(av);
@@ -5060,19 +5349,28 @@ fn emit_q8_0_q8_0_32tok_block(
 /// Emits 32-token double-buffered `uvec4` shared-weight `Q8_0` × `Q8_0` prefill GEMM SPIR-V 1.6 (`(64, 8, 1)`).
 ///
 /// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(32), 1)`.
-/// Uses `smem_w[2 * 544] + smem_act[2 * 288]` (`6,656 B` workgroup shared memory) with
-/// 128-bit `uvec4` global weight loads and 1 barrier per K-block.
+/// Uses `smem_w[2 * 544] + smem_act[2 * 384]` (`7,424 B` workgroup shared memory) with
+/// 128-bit `uvec4` global weight & activation loads and 1 barrier per K-block.
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Double-buffered 32-token Q8_0 x Q8_0 GEMM with uvec4 weight staging and register prefetch."
-)]
 #[must_use]
 pub fn q8_0_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
+    q8_0_q8_0_gemm_32tok_coalesced_with_acc_sat(use_sdot, false)
+}
+
+/// Emits 32-token double-buffered `uvec4` `Q8_0` × `Q8_0` prefill GEMM SPIR-V 1.6 with optional `OpSDotAccSat`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Double-buffered 32-token Q8_0 x Q8_0 GEMM with uvec4 weight/activation staging and unrolled SSA accumulators."
+)]
+#[must_use]
+pub fn q8_0_q8_0_gemm_32tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
-    let act_buf = b.storage_buffer(1, ElemType::U32, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
     let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
 
     let smem_w = b.workgroup_u32_array(2 * 544);
@@ -5086,19 +5384,18 @@ pub fn q8_0_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
             b.local_f32_var(),
             b.local_f32_var(),
         ];
-        let isum_vars = [
-            b.local_i32_var(),
-            b.local_i32_var(),
-            b.local_i32_var(),
-            b.local_i32_var(),
-        ];
         let w_pre = [
             b.local_u32_var(),
             b.local_u32_var(),
             b.local_u32_var(),
             b.local_u32_var(),
         ];
-        let act_pre = b.local_u32_var();
+        let act_pre = [
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+        ];
         let f_zero = b.const_f32(0.0);
         for &av in &acc_vars {
             b.store_var(av, f_zero);
@@ -5106,6 +5403,9 @@ pub fn q8_0_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
 
         let c0 = b.const_u32(0);
         let c1 = b.const_u32(1);
+        let c2 = b.const_u32(2);
+        let c3 = b.const_u32(3);
+        let c4 = b.const_u32(4);
         let c12 = b.const_u32(12);
         let c24 = b.const_u32(24);
         let c36 = b.const_u32(36);
@@ -5114,28 +5414,34 @@ pub fn q8_0_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
         let c384 = b.const_u32(384);
         let c544 = b.const_u32(544);
 
-        let tok_act_bases =
-            clamp_four_token_bases_from_tks(b, ids.tks, ids.tokens, ids.act_words_per_token);
+        let act_vecs_per_token = b.ushr(ids.act_words_per_token, c2);
+        let tok_act_vec_bases =
+            clamp_four_token_bases_from_tks(b, ids.tks, ids.tokens, act_vecs_per_token);
         let wy_act_off = b.umul(ids.wy, c48);
         let s_rel_0 = wy_act_off;
         let s_rel_1 = b.uadd(wy_act_off, c12);
         let s_rel_2 = b.uadd(wy_act_off, c24);
         let s_rel_3 = b.uadd(wy_act_off, c36);
 
-        let lane_ok = b.u_lt(ids.lane, c48);
-        let local_t = b.udiv(ids.lane, c12);
-        let local_w = b.umod(ids.lane, c12);
-        let my_tok_act_base = select_four_u32(b, local_t, tok_act_bases);
-        let my_s_rel = b.uadd(wy_act_off, ids.lane);
+        let lane_ok = b.u_lt(ids.lane, c12);
+        let local_t = b.udiv(ids.lane, c3);
+        let local_vec = b.umod(ids.lane, c3);
+        let my_tok_act_vec_base = select_four_u32(b, local_t, tok_act_vec_bases);
+        let lane4 = b.umul(ids.lane, c4);
+        let my_s_rel_words = b.uadd(wy_act_off, lane4);
 
         let has_any_blk = b.u_lt(c0, ids.blocks_per_row);
         b.emit_if(has_any_blk, |b| {
             load_uvec4_to_smem(b, weights_buf, smem_w, ids.rg_vec_base, c0, ids.tid, 136);
-            b.emit_if(lane_ok, |b| {
-                let g_idx = b.uadd(my_tok_act_base, local_w);
-                let val = b.load_sb_u32(act_buf, g_idx);
-                b.store_wg_u32(smem_act, my_s_rel, val);
-            });
+            load_uvec4_act_to_smem(
+                b,
+                act_buf,
+                smem_act,
+                lane_ok,
+                my_tok_act_vec_base,
+                local_vec,
+                my_s_rel_words,
+            );
             b.workgroup_barrier();
 
             b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
@@ -5148,14 +5454,16 @@ pub fn q8_0_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
                     let next_vec_off = b.umul(next_blk, w_tile_vecs);
                     let next_vec_base = b.uadd(ids.rg_vec_base, next_vec_off);
                     prefetch_uvec4_to_vars(b, weights_buf, next_vec_base, ids.tid, 136, &w_pre);
-
-                    let next_act_off = b.umul(next_blk, c12);
-                    b.emit_if(lane_ok, |b| {
-                        let a_off = b.uadd(next_act_off, local_w);
-                        let g_idx = b.uadd(my_tok_act_base, a_off);
-                        let val = b.load_sb_u32(act_buf, g_idx);
-                        b.store_var(act_pre, val);
-                    });
+                    prefetch_uvec4_act_to_vars(
+                        b,
+                        act_buf,
+                        lane_ok,
+                        my_tok_act_vec_base,
+                        next_blk,
+                        3,
+                        local_vec,
+                        &act_pre,
+                    );
                 });
 
                 let w_cur_base = b.umul(cur_buf, c544);
@@ -5174,20 +5482,300 @@ pub fn q8_0_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
                     w_cur_base,
                     ids.lane,
                     s_cur_bases,
-                    isum_vars,
                     acc_vars,
                     use_sdot,
+                    use_sdot_acc_sat,
                 );
 
                 b.emit_if(has_next, |b| {
                     let w_next_base = b.umul(next_buf, c544);
                     commit_vars_to_smem_uvec4(b, smem_w, w_next_base, ids.tid, 136, &w_pre);
-
                     let act_next_base = b.umul(next_buf, c384);
+                    commit_uvec4_act_vars_to_smem(
+                        b,
+                        smem_act,
+                        lane_ok,
+                        act_next_base,
+                        my_s_rel_words,
+                        &act_pre,
+                    );
+                    b.workgroup_barrier();
+                });
+            });
+        });
+
+        store_32tok_quad_outputs(b, out_buf, None, &ids, |b, q_idx| {
+            b.load_var_f32(acc_vars[q_idx])
+        });
+    });
+
+    b.finish_with_local_size([64, 8, 1])
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Inner double-buffered shared-memory K-block accumulation helper for 32-token PQ2 x Q8_0 GEMM."
+)]
+fn emit_pq2_q8_0_32tok_block(
+    b: &mut ShaderBuilder,
+    smem_w: u32,
+    smem_act: u32,
+    w_smem_base: u32,
+    lane: u32,
+    s_act_bases: [u32; 4],
+    acc_vars: [u32; 4],
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) {
+    let f_zero = b.const_f32(0.0);
+    let c8 = b.const_u32(8);
+    let c16 = b.const_u32(16);
+    let c24 = b.const_u32(24);
+    let mut block_sums = [f_zero; 4];
+
+    for grp in 0_u32..4 {
+        let grp_off_c = b.const_u32(grp * 9);
+        let act_scales = s_act_bases.map(|s_base| {
+            let s_idx = b.uadd(s_base, grp_off_c);
+            let u = b.load_wg_u32(smem_act, s_idx);
+            b.bitcast(b.f32_t, u)
+        });
+        let mut grp_ints = [b.const_i32(0); 4];
+
+        for pair_idx in 0_u32..2 {
+            let word_j = grp * 2 + pair_idx;
+            let w_off = b.const_u32(32 + word_j * 64);
+            let w_local = b.uadd(w_off, lane);
+            let w_idx = b.uadd(w_smem_base, w_local);
+            let pq_word = b.load_wg_u32(smem_w, w_idx);
+            let raw_bytes = [
+                pq_word,
+                b.ushr(pq_word, c8),
+                b.ushr(pq_word, c16),
+                b.ushr(pq_word, c24),
+            ];
+            let aw_base_off = grp * 9 + 1 + pair_idx * 4;
+            if use_sdot {
+                let packed_bytes = raw_bytes.map(|rb| swar_pack_4x2bit_to_4xi8(b, rb));
+                for (comp, &pb) in packed_bytes.iter().enumerate() {
+                    let aw_off = b.const_u32(aw_base_off + u32::try_from(comp).unwrap_or(0));
+                    for (&s_base, grp_int) in s_act_bases.iter().zip(&mut grp_ints) {
+                        let a_idx = b.uadd(s_base, aw_off);
+                        let aw = b.load_wg_u32(smem_act, a_idx);
+                        if use_sdot_acc_sat {
+                            *grp_int = b.sdot_acc_sat_packed(pb, aw, *grp_int);
+                        } else {
+                            let dot = b.sdot_packed(pb, aw);
+                            *grp_int = b.iadd(*grp_int, dot);
+                        }
+                    }
+                }
+            } else {
+                let unpacked = raw_bytes.map(|rb| unpack_2bit_byte_to_i32_weights(b, rb));
+                for (comp, &ws) in unpacked.iter().enumerate() {
+                    let aw_off = b.const_u32(aw_base_off + u32::try_from(comp).unwrap_or(0));
+                    for (&s_base, grp_int) in s_act_bases.iter().zip(&mut grp_ints) {
+                        let a_idx = b.uadd(s_base, aw_off);
+                        let aw = b.load_wg_u32(smem_act, a_idx);
+                        let dot = portable_dot4_i32_weights(b, ws, aw);
+                        *grp_int = b.iadd(*grp_int, dot);
+                    }
+                }
+            }
+        }
+
+        for (k, &act_scale) in act_scales.iter().enumerate() {
+            let grp_f32 = b.i32_to_f32(grp_ints[k]);
+            let scaled = b.fmul_nc(act_scale, grp_f32);
+            block_sums[k] = b.fadd_nc(block_sums[k], scaled);
+        }
+    }
+
+    let w_scale =
+        coalesced_pq2_scale_from_loader(b, |b, idx| b.load_wg_u32(smem_w, idx), w_smem_base, lane);
+    for (&acc_var, &block_sum) in acc_vars.iter().zip(&block_sums) {
+        let prev = b.load_var_f32(acc_var);
+        let contrib = b.fmul_nc(w_scale, block_sum);
+        let next = b.fadd_nc(prev, contrib);
+        b.store_var(acc_var, next);
+    }
+}
+
+/// Emits 32-token double-buffered `uvec4` shared-weight `PQ2_0` × `Q8_0` prefill GEMM SPIR-V 1.6 (`(64, 8, 1)`).
+///
+/// Dispatch grid: `(rows.div_ceil(64), tokens.div_ceil(32), 1)`.
+/// Uses `smem_w[2 * 544] + smem_act[2 * 1152]` (`13,568 B` workgroup shared memory) by stripping
+/// the 3 zero-padding words per `Q8_0` sub-block (`9` `u32`s stored per 32-element sub-block).
+/// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn pq2_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
+    pq2_q8_0_gemm_32tok_coalesced_with_acc_sat(use_sdot, false)
+}
+
+/// Emits 32-token double-buffered `uvec4` `PQ2_0` × `Q8_0` prefill GEMM SPIR-V 1.6 with optional `OpSDotAccSat`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Double-buffered 32-token PQ2 x Q8_0 GEMM with uvec4 weight/activation staging."
+)]
+#[must_use]
+pub fn pq2_q8_0_gemm_32tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
+    let push_var = push_var.unwrap_or(0);
+    let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
+    let act_buf = b.storage_buffer(1, ElemType::Uvec4, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadWrite);
+
+    let smem_w = b.workgroup_u32_array(2 * 544);
+    let smem_act = b.workgroup_u32_array(2 * 1152);
+    let ids = setup_32tok_workgroup(&mut b, push_var, 544);
+
+    b.emit_if(ids.wg_ok, |b| {
+        let acc_vars = [
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+            b.local_f32_var(),
+        ];
+        let w_pre = [
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+        ];
+        let act_pre = [
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+            b.local_u32_var(),
+        ];
+        let f_zero = b.const_f32(0.0);
+        for &av in &acc_vars {
+            b.store_var(av, f_zero);
+        }
+
+        let c0 = b.const_u32(0);
+        let c1 = b.const_u32(1);
+        let c2 = b.const_u32(2);
+        let c3 = b.const_u32(3);
+        let c5 = b.const_u32(5);
+        let c9 = b.const_u32(9);
+        let c12 = b.const_u32(12);
+        let c36 = b.const_u32(36);
+        let c48 = b.const_u32(48);
+        let c72 = b.const_u32(72);
+        let c108 = b.const_u32(108);
+        let w_tile_vecs = b.const_u32(136);
+        let c144 = b.const_u32(144);
+        let c544 = b.const_u32(544);
+        let c1152 = b.const_u32(1152);
+
+        let act_vecs_per_token = b.ushr(ids.act_words_per_token, c2);
+        let tok_act_vec_bases =
+            clamp_four_token_bases_from_tks(b, ids.tks, ids.tokens, act_vecs_per_token);
+        let wy_act_off = b.umul(ids.wy, c144);
+        let s_rel_0 = wy_act_off;
+        let s_rel_1 = b.uadd(wy_act_off, c36);
+        let s_rel_2 = b.uadd(wy_act_off, c72);
+        let s_rel_3 = b.uadd(wy_act_off, c108);
+
+        let lane_ok = b.u_lt(ids.lane, c48);
+        let local_t = b.udiv(ids.lane, c12);
+        let local_vec = b.umod(ids.lane, c12);
+        let sub_grp = b.udiv(local_vec, c3);
+        let vec_in_grp = b.umod(local_vec, c3);
+        let is_hdr = b.u_eq(vec_in_grp, c0);
+        let is_v1 = b.u_eq(vec_in_grp, c1);
+        let is_data = b.u_ne(vec_in_grp, c0);
+        let grp_off_nz = b.select(b.u32_t, is_v1, c1, c5);
+        let grp_off = b.select(b.u32_t, is_hdr, c0, grp_off_nz);
+        let sub_grp_base = b.umul(sub_grp, c9);
+        let tok_off = b.umul(local_t, c36);
+        let tok_wy_off = b.uadd(wy_act_off, tok_off);
+        let grp_base = b.uadd(tok_wy_off, sub_grp_base);
+        let my_s_rel_words = b.uadd(grp_base, grp_off);
+        let my_tok_act_vec_base = select_four_u32(b, local_t, tok_act_vec_bases);
+
+        let has_any_blk = b.u_lt(c0, ids.blocks_per_row);
+        b.emit_if(has_any_blk, |b| {
+            load_uvec4_to_smem(b, weights_buf, smem_w, ids.rg_vec_base, c0, ids.tid, 136);
+            b.emit_if(lane_ok, |b| {
+                let g_idx = b.uadd(my_tok_act_vec_base, local_vec);
+                let vec = b.load_sb_uvec4(act_buf, g_idx);
+                let w0 = b.composite_extract(b.u32_t, vec, 0);
+                b.store_wg_u32(smem_act, my_s_rel_words, w0);
+                b.emit_if(is_data, |b| {
+                    for comp in 1_u32..4 {
+                        let word = b.composite_extract(b.u32_t, vec, comp);
+                        let comp_c = b.const_u32(comp);
+                        let s_idx = b.uadd(my_s_rel_words, comp_c);
+                        b.store_wg_u32(smem_act, s_idx, word);
+                    }
+                });
+            });
+            b.workgroup_barrier();
+
+            b.emit_for_range(c0, ids.blocks_per_row, c1, |b, blk| {
+                let cur_buf = b.uand(blk, c1);
+                let next_buf = b.uxor(cur_buf, c1);
+                let next_blk = b.uadd(blk, c1);
+                let has_next = b.u_lt(next_blk, ids.blocks_per_row);
+
+                b.emit_if(has_next, |b| {
+                    let next_vec_off = b.umul(next_blk, w_tile_vecs);
+                    let next_vec_base = b.uadd(ids.rg_vec_base, next_vec_off);
+                    prefetch_uvec4_to_vars(b, weights_buf, next_vec_base, ids.tid, 136, &w_pre);
+                    prefetch_uvec4_act_to_vars(
+                        b,
+                        act_buf,
+                        lane_ok,
+                        my_tok_act_vec_base,
+                        next_blk,
+                        12,
+                        local_vec,
+                        &act_pre,
+                    );
+                });
+
+                let w_cur_base = b.umul(cur_buf, c544);
+                let act_cur_base = b.umul(cur_buf, c1152);
+                let s_cur_bases = [
+                    b.uadd(act_cur_base, s_rel_0),
+                    b.uadd(act_cur_base, s_rel_1),
+                    b.uadd(act_cur_base, s_rel_2),
+                    b.uadd(act_cur_base, s_rel_3),
+                ];
+
+                emit_pq2_q8_0_32tok_block(
+                    b,
+                    smem_w,
+                    smem_act,
+                    w_cur_base,
+                    ids.lane,
+                    s_cur_bases,
+                    acc_vars,
+                    use_sdot,
+                    use_sdot_acc_sat,
+                );
+
+                b.emit_if(has_next, |b| {
+                    let w_next_base = b.umul(next_buf, c544);
+                    commit_vars_to_smem_uvec4(b, smem_w, w_next_base, ids.tid, 136, &w_pre);
+                    let act_next_base = b.umul(next_buf, c1152);
                     b.emit_if(lane_ok, |b| {
-                        let s_idx = b.uadd(act_next_base, my_s_rel);
-                        let val = b.load_var_u32(act_pre);
-                        b.store_wg_u32(smem_act, s_idx, val);
+                        let dst = b.uadd(act_next_base, my_s_rel_words);
+                        let w0 = b.load_var_u32(act_pre[0]);
+                        b.store_wg_u32(smem_act, dst, w0);
+                        b.emit_if(is_data, |b| {
+                            for (comp, &ap) in act_pre.iter().enumerate().skip(1) {
+                                let word = b.load_var_u32(ap);
+                                let comp_c = b.const_u32(u32::try_from(comp).unwrap_or(0));
+                                let s_idx = b.uadd(dst, comp_c);
+                                b.store_wg_u32(smem_act, s_idx, word);
+                            }
+                        });
                     });
                     b.workgroup_barrier();
                 });
@@ -5208,12 +5796,22 @@ pub fn q8_0_q8_0_gemm_32tok_coalesced(use_sdot: bool) -> Vec<u32> {
 /// Uses `smem_w[2 * 448] + smem_act[2 * 1152]` (`12,800 B` workgroup shared memory) with
 /// 128-bit `uvec4` loads for both weights and activations and 1 barrier per K-block.
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
+#[must_use]
+pub fn ptq1_q8_0_gemm_32tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    ptq1_q8_0_gemm_32tok_coalesced_with_acc_sat(use_sdot, false, pinned_4lane)
+}
+
+/// Emits 32-token double-buffered `uvec4` `PTQ1_0` × `Q8_0` prefill GEMM SPIR-V 1.6 with optional `OpSDotAccSat`.
 #[expect(
     clippy::too_many_lines,
     reason = "Double-buffered 32-token PTQ1_0 x Q8_0 GEMM with uvec4 weight and activation staging."
 )]
 #[must_use]
-pub fn ptq1_q8_0_gemm_32tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+pub fn ptq1_q8_0_gemm_32tok_coalesced_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    pinned_4lane: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::Uvec4, AccessMode::ReadOnly);
@@ -5351,6 +5949,7 @@ pub fn ptq1_q8_0_gemm_32tok_coalesced(use_sdot: bool, pinned_4lane: bool) -> Vec
                     64,
                     s_cur_bases,
                     use_sdot,
+                    use_sdot_acc_sat,
                     pinned_4lane,
                     &lane_vars,
                 );
@@ -5482,6 +6081,21 @@ fn finalize_splitk_store(
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn pq2_q8k_gemv_splitk(use_sdot: bool, fused: bool, has_residual: bool) -> Vec<u32> {
+    pq2_q8k_gemv_splitk_with_acc_sat(use_sdot, false, fused, has_residual)
+}
+
+/// Emits intra-workgroup 4-way Split-K coalesced `PQ2_0` × 4-plane `Q8_K` GEMV (`(64, 4, 1)`) with optional `OpSDotAccSat`.
+#[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Four orthogonal shader specialization flags (sdot, acc_sat, fused, residual)."
+)]
+pub fn pq2_q8k_gemv_splitk_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    fused: bool,
+    has_residual: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -5522,6 +6136,7 @@ pub fn pq2_q8k_gemv_splitk(use_sdot: bool, fused: bool, has_residual: bool) -> V
                     act_blk_vec_base,
                     acc_var,
                     use_sdot,
+                    use_sdot_acc_sat,
                     fused,
                 );
             });
@@ -5540,6 +6155,12 @@ pub fn pq2_q8k_gemv_splitk(use_sdot: bool, fused: bool, has_residual: bool) -> V
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn pq2_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
+    pq2_q8_0_gemv_splitk_with_acc_sat(use_sdot, false)
+}
+
+/// Emits intra-workgroup 4-way Split-K coalesced `PQ2_0` × `Q8_0` GEMV (`(64, 4, 1)`) with optional `OpSDotAccSat`.
+#[must_use]
+pub fn pq2_q8_0_gemv_splitk_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -5579,6 +6200,7 @@ pub fn pq2_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
                     blk_act_vec_base,
                     acc_var,
                     use_sdot,
+                    use_sdot_acc_sat,
                 );
             });
         });
@@ -5596,6 +6218,12 @@ pub fn pq2_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn q8_0_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
+    q8_0_q8_0_gemv_splitk_with_acc_sat(use_sdot, false)
+}
+
+/// Emits intra-workgroup 4-way Split-K coalesced `Q8_0` × `Q8_0` GEMV (`(64, 4, 1)`) with optional `OpSDotAccSat`.
+#[must_use]
+pub fn q8_0_q8_0_gemv_splitk_with_acc_sat(use_sdot: bool, use_sdot_acc_sat: bool) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -5630,7 +6258,8 @@ pub fn q8_0_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
                     ids.lane,
                     blk,
                 );
-                let contrib = eval_q8_0_uvec4_block_contrib(b, &inputs, use_sdot);
+                let contrib =
+                    eval_q8_0_uvec4_block_contrib(b, &inputs, use_sdot, use_sdot_acc_sat);
                 let prev = b.load_var_f32(acc_var);
                 let next = b.fadd_nc(prev, contrib);
                 b.store_var(acc_var, next);
@@ -5650,6 +6279,16 @@ pub fn q8_0_q8_0_gemv_splitk(use_sdot: bool) -> Vec<u32> {
 /// Push constants (`4 × u32`): `[rows, blocks_per_row, tokens, act_words_per_token]`.
 #[must_use]
 pub fn ptq1_q8_0_gemv_splitk(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
+    ptq1_q8_0_gemv_splitk_with_acc_sat(use_sdot, false, pinned_4lane)
+}
+
+/// Emits intra-workgroup 4-way Split-K coalesced `PTQ1_0` × `Q8_0` GEMV (`(64, 4, 1)`) with optional `OpSDotAccSat`.
+#[must_use]
+pub fn ptq1_q8_0_gemv_splitk_with_acc_sat(
+    use_sdot: bool,
+    use_sdot_acc_sat: bool,
+    pinned_4lane: bool,
+) -> Vec<u32> {
     let (mut b, push_var) = ShaderBuilder::new(use_sdot, 4);
     let push_var = push_var.unwrap_or(0);
     let weights_buf = b.storage_buffer(0, ElemType::U32, AccessMode::ReadOnly);
@@ -5702,6 +6341,7 @@ pub fn ptq1_q8_0_gemv_splitk(use_sdot: bool, pinned_4lane: bool) -> Vec<u32> {
                     wbase,
                     blk_act_vec_base,
                     use_sdot,
+                    use_sdot_acc_sat,
                     pinned_4lane,
                     &lane_vars,
                 );
@@ -6570,63 +7210,22 @@ pub fn swiglu_hadamard1024_q8k_4plane_with_subgroup(
     b.finish_with_local_size([HADAMARD_1024_WG_X, 1, 1])
 }
 
-/// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8_0` SPIR-V 1.6 words.
-///
-/// Uses `local_size_x = 256` (`8` threads per `Q8_0` 32-element block, `32` blocks per `1024` block).
-/// Bindings: `0` read-only `in_f32` (`f32`), `1` read-only `sign_f32` (`f32`),
-/// `2` writable `out_q8` (`u32`).
-/// Push constants (`7 × u32`): `[cols, norm_bits, has_signs, use_permute, num_k_heads, repetitions, head_dim]`.
-/// Dispatch: `(cols / 1024, tokens, 1)`.
-#[must_use]
-pub fn fused_basis_hadamard1024_q8_0(pinned: bool, native_scale: bool) -> Vec<u32> {
-    fused_basis_hadamard1024_q8_0_with_subgroup(pinned, native_scale, false)
-}
-
-/// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8_0` with optional wave64 shuffle.
-#[must_use]
 #[expect(
-    clippy::too_many_lines,
-    reason = "Emits fused optional SSM permutation, sign scaling, Hadamard(1024) FWHT, and Q8_0 block quantization."
+    clippy::too_many_arguments,
+    reason = "Quantizes four 256-element FWHT blocks to 32-element `Q8_0` blocks after barrier."
 )]
-pub fn fused_basis_hadamard1024_q8_0_with_subgroup(
+fn emit_fused_q8_0_quant_phase(
+    b: &mut ShaderBuilder,
+    smem: u32,
+    out_buf: u32,
+    lid: u32,
+    blk1024: u32,
+    tok: u32,
+    cols: u32,
+    norm: u32,
     pinned: bool,
     native_scale: bool,
-    use_subgroup_shuffle: bool,
-) -> Vec<u32> {
-    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 7);
-    let push_var = push_var.unwrap_or(0);
-    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
-    let sign_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
-    let out_buf = b.storage_buffer(2, ElemType::U32, AccessMode::ReadWrite);
-    let smem = b.workgroup_u32_array(1024);
-
-    let lid_vec = b.local_invocation_id();
-    let wid_vec = b.workgroup_id();
-    let lid = b.load_input_component(lid_vec, 0);
-    let blk1024 = b.load_input_component(wid_vec, 0);
-    let tok = b.load_input_component(wid_vec, 1);
-    let use_permute = b.load_push(push_var, 3);
-    let num_k_heads = b.load_push(push_var, 4);
-    let repetitions = b.load_push(push_var, 5);
-    let head_dim = b.load_push(push_var, 6);
-
-    let (cols, norm) = emit_fused_basis_hadamard1024_smem_fwht(
-        &mut b,
-        Hadamard1024Input::Direct {
-            in_buf,
-            use_permute,
-            num_k_heads,
-            repetitions,
-            head_dim,
-        },
-        sign_buf,
-        smem,
-        lid,
-        blk1024,
-        tok,
-        push_var,
-    );
-
+) {
     let c0 = b.const_u32(0);
     let c1 = b.const_u32(1);
     let c2 = b.const_u32(2);
@@ -6689,13 +7288,13 @@ pub fn fused_basis_hadamard1024_q8_0_with_subgroup(
         let max_u = b.load_wg_u32(smem, grp_head);
         b.bitcast(b.f32_t, max_u)
     };
-    let (scale_bits, inv_scale, zero_blk) = emit_q8_0_scale_and_inv(&mut b, maximum, native_scale);
+    let (scale_bits, inv_scale, zero_blk) = emit_q8_0_scale_and_inv(b, maximum, native_scale);
 
     let mut qs = [0_u32; 4];
     for i in 0..4 {
-        qs[i] = emit_quantize_q8_0_lane(&mut b, vals[i], inv_scale, zero_blk, pinned);
+        qs[i] = emit_quantize_q8_0_lane(b, vals[i], inv_scale, zero_blk, pinned);
     }
-    let packed = pack_four_i8_to_u32(&mut b, qs);
+    let packed = pack_four_i8_to_u32(b, qs);
 
     let blks32_per_tok = b.ushr(cols, c5);
     let tok_blk32_off = b.umul(tok, blks32_per_tok);
@@ -6717,6 +7316,142 @@ pub fn fused_basis_hadamard1024_q8_0_with_subgroup(
         b.store_sb_u32(out_buf, p2, c0);
         b.store_sb_u32(out_buf, p3, c0);
     });
+}
+
+/// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8_0` SPIR-V 1.6 words.
+///
+/// Uses `local_size_x = 256` (`8` threads per `Q8_0` 32-element block, `32` blocks per `1024` block).
+/// Bindings: `0` read-only `in_f32` (`f32`), `1` read-only `sign_f32` (`f32`),
+/// `2` writable `out_q8` (`u32`).
+/// Push constants (`7 × u32`): `[cols, norm_bits, has_signs, use_permute, num_k_heads, repetitions, head_dim]`.
+/// Dispatch: `(cols / 1024, tokens, 1)`.
+#[must_use]
+pub fn fused_basis_hadamard1024_q8_0(pinned: bool, native_scale: bool) -> Vec<u32> {
+    fused_basis_hadamard1024_q8_0_with_subgroup(pinned, native_scale, false)
+}
+
+/// Emits fused `[Optional PermuteSSM] + MulSign + Hadamard(1024) + QuantQ8_0` with optional wave64 shuffle.
+#[must_use]
+pub fn fused_basis_hadamard1024_q8_0_with_subgroup(
+    pinned: bool,
+    native_scale: bool,
+    use_subgroup_shuffle: bool,
+) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 7);
+    let push_var = push_var.unwrap_or(0);
+    let in_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let sign_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(2, ElemType::U32, AccessMode::ReadWrite);
+    let smem = b.workgroup_u32_array(1024);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let blk1024 = b.load_input_component(wid_vec, 0);
+    let tok = b.load_input_component(wid_vec, 1);
+    let use_permute = b.load_push(push_var, 3);
+    let num_k_heads = b.load_push(push_var, 4);
+    let repetitions = b.load_push(push_var, 5);
+    let head_dim = b.load_push(push_var, 6);
+
+    let (cols, norm) = emit_fused_basis_hadamard1024_smem_fwht(
+        &mut b,
+        Hadamard1024Input::Direct {
+            in_buf,
+            use_permute,
+            num_k_heads,
+            repetitions,
+            head_dim,
+        },
+        sign_buf,
+        smem,
+        lid,
+        blk1024,
+        tok,
+        push_var,
+    );
+
+    emit_fused_q8_0_quant_phase(
+        &mut b,
+        smem,
+        out_buf,
+        lid,
+        blk1024,
+        tok,
+        cols,
+        norm,
+        pinned,
+        native_scale,
+    );
+
+    b.finish_with_local_size([HADAMARD_1024_WG_X, 1, 1])
+}
+
+/// Emits fused `SwiGLU + [Optional write mid_out] + MulSign + Hadamard(1024) + QuantQ8_0` SPIR-V 1.6 words.
+///
+/// Uses `local_size_x = 256` with a single `4 KiB` `[u32; 1024]` workgroup buffer; when `write_mid != 0`,
+/// also writes unrotated `SwiGLU(gate, up)` to `mid_out` in the same pass for `LoRA`-active `ffn_down`.
+/// Bindings: `0` read-only `gate` (`f32`), `1` read-only `up` (`f32`), `2` read-only `sign_f32` (`f32`),
+/// `3` writable `out_q8` (`u32`), `4` writable `mid_out` (`f32`).
+/// Push constants (`4 × u32`): `[cols, norm_bits, has_signs, write_mid]`.
+/// Dispatch: `(cols / 1024, tokens, 1)`.
+#[must_use]
+pub fn swiglu_hadamard1024_q8_0(pinned: bool, native_scale: bool) -> Vec<u32> {
+    swiglu_hadamard1024_q8_0_with_subgroup(pinned, native_scale, false)
+}
+
+/// Emits fused `SwiGLU + [Optional write mid_out] + MulSign + Hadamard(1024) + QuantQ8_0` with optional wave64 shuffle.
+#[must_use]
+pub fn swiglu_hadamard1024_q8_0_with_subgroup(
+    pinned: bool,
+    native_scale: bool,
+    use_subgroup_shuffle: bool,
+) -> Vec<u32> {
+    let (mut b, push_var) = ShaderBuilder::new_with_subgroup(false, use_subgroup_shuffle, 4);
+    let push_var = push_var.unwrap_or(0);
+    let gate_buf = b.storage_buffer(0, ElemType::F32, AccessMode::ReadOnly);
+    let up_buf = b.storage_buffer(1, ElemType::F32, AccessMode::ReadOnly);
+    let sign_buf = b.storage_buffer(2, ElemType::F32, AccessMode::ReadOnly);
+    let out_buf = b.storage_buffer(3, ElemType::U32, AccessMode::ReadWrite);
+    let mid_buf = b.storage_buffer(4, ElemType::F32, AccessMode::ReadWrite);
+    let smem = b.workgroup_u32_array(1024);
+
+    let lid_vec = b.local_invocation_id();
+    let wid_vec = b.workgroup_id();
+    let lid = b.load_input_component(lid_vec, 0);
+    let blk1024 = b.load_input_component(wid_vec, 0);
+    let tok = b.load_input_component(wid_vec, 1);
+    let write_mid = b.load_push(push_var, 3);
+
+    let (cols, norm) = emit_fused_basis_hadamard1024_smem_fwht(
+        &mut b,
+        Hadamard1024Input::Swiglu {
+            gate_buf,
+            up_buf,
+            mid_buf,
+            write_mid,
+            pinned,
+        },
+        sign_buf,
+        smem,
+        lid,
+        blk1024,
+        tok,
+        push_var,
+    );
+
+    emit_fused_q8_0_quant_phase(
+        &mut b,
+        smem,
+        out_buf,
+        lid,
+        blk1024,
+        tok,
+        cols,
+        norm,
+        pinned,
+        native_scale,
+    );
 
     b.finish_with_local_size([HADAMARD_1024_WG_X, 1, 1])
 }
@@ -13002,6 +13737,17 @@ pub fn validate_spirv_module(words: &[u32], expected_sdot: Option<bool>) -> Resu
                 check_id(ops[2], "OpSDot vec1")?;
                 check_id(ops[3], "OpSDot vec2")?;
             }
+            OP_S_DOT_ACC_SAT => {
+                if ops.len() < 6 {
+                    return Err(Error::InvalidInput("OpSDotAccSat truncated".to_owned()));
+                }
+                has_sdot = true;
+                check_id(ops[0], "OpSDotAccSat type")?;
+                register_result(ops[1], "OpSDotAccSat")?;
+                check_id(ops[2], "OpSDotAccSat vec1")?;
+                check_id(ops[3], "OpSDotAccSat vec2")?;
+                check_id(ops[4], "OpSDotAccSat acc")?;
+            }
             OP_GROUP_NON_UNIFORM_SHUFFLE | OP_GROUP_NON_UNIFORM_SHUFFLE_XOR => {
                 if ops.len() != 5 {
                     return Err(Error::InvalidInput(
@@ -13528,20 +14274,50 @@ mod tests {
         for (module, expected_sdot) in [
             (pq2_q8k_gemm_32tok_coalesced(true, true, false), Some(true)),
             (
+                pq2_q8k_gemm_32tok_coalesced_with_acc_sat(true, true, true, false),
+                Some(true),
+            ),
+            (
                 pq2_q8k_gemm_32tok_coalesced(false, false, true),
                 Some(false),
             ),
+            (pq2_q8_0_gemm_32tok_coalesced(true), Some(true)),
+            (
+                pq2_q8_0_gemm_32tok_coalesced_with_acc_sat(true, true),
+                Some(true),
+            ),
+            (pq2_q8_0_gemm_32tok_coalesced(false), Some(false)),
             (q8_0_q8_0_gemm_32tok_coalesced(true), Some(true)),
+            (
+                q8_0_q8_0_gemm_32tok_coalesced_with_acc_sat(true, true),
+                Some(true),
+            ),
             (q8_0_q8_0_gemm_32tok_coalesced(false), Some(false)),
             (ptq1_q8_0_gemm_32tok_coalesced(true, true), Some(true)),
+            (
+                ptq1_q8_0_gemm_32tok_coalesced_with_acc_sat(true, true, true),
+                Some(true),
+            ),
             (ptq1_q8_0_gemm_32tok_coalesced(false, false), Some(false)),
             (pq2_q8k_gemv_splitk(true, true, false), Some(true)),
+            (
+                pq2_q8k_gemv_splitk_with_acc_sat(true, true, true, false),
+                Some(true),
+            ),
             (pq2_q8k_gemv_splitk(false, false, true), Some(false)),
             (pq2_q8_0_gemv_splitk(true), Some(true)),
             (pq2_q8_0_gemv_splitk(false), Some(false)),
             (q8_0_q8_0_gemv_splitk(true), Some(true)),
+            (
+                q8_0_q8_0_gemv_splitk_with_acc_sat(true, true),
+                Some(true),
+            ),
             (q8_0_q8_0_gemv_splitk(false), Some(false)),
             (ptq1_q8_0_gemv_splitk(true, true), Some(true)),
+            (
+                ptq1_q8_0_gemv_splitk_with_acc_sat(true, true, true),
+                Some(true),
+            ),
             (ptq1_q8_0_gemv_splitk(false, false), Some(false)),
             (f16_matvec_with_subgroup(false), Some(false)),
             (f16_matvec_with_subgroup(true), Some(false)),
@@ -13659,6 +14435,12 @@ mod tests {
             swiglu_hadamard1024_q8k_4plane(true),
             swiglu_hadamard1024_q8k_4plane_with_subgroup(false, true),
             swiglu_hadamard1024_q8k_4plane_with_subgroup(true, true),
+            swiglu_hadamard1024_q8_0(false, false),
+            swiglu_hadamard1024_q8_0(true, false),
+            swiglu_hadamard1024_q8_0(true, true),
+            swiglu_hadamard1024_q8_0_with_subgroup(false, false, true),
+            swiglu_hadamard1024_q8_0_with_subgroup(true, false, true),
+            swiglu_hadamard1024_q8_0_with_subgroup(true, true, true),
         ] {
             assert_valid_spirv_structure(&module, Some(false));
             assert_eq!(shader_digest(&module)?.len(), 64);

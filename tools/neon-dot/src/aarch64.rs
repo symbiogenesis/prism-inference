@@ -3420,42 +3420,6 @@ fn accumulate_pq2_half_4x8_streaming_i8mm(
 }
 
 #[inline]
-#[target_feature(enable = "neon,i8mm")]
-fn accumulate_pq2_half_4x8_panels_i8mm(
-    raw_rows: [uint8x16_t; 4],
-    pairs: [&super::Pq2I8mmPairBlock; 4],
-    half: usize,
-    mask: uint8x16_t,
-    acc_lo: &mut [int32x4_t; 4],
-    acc_hi: &mut [int32x4_t; 4],
-) {
-    let plane_base = half * 4;
-    for plane in 0..4 {
-        let (w01_lo, w01_hi, w23_lo, w23_hi) = unpack_pq2_paired_plane(raw_rows, plane, mask);
-        let chunk = plane_base + plane;
-        let a01_lo = load_s8x16(&pairs[0].planes[chunk].0);
-        let a01_hi = load_s8x16(&pairs[0].planes[chunk].1);
-        acc_lo[0] = smmla_s32(smmla_s32(acc_lo[0], w01_lo, a01_lo), w01_hi, a01_hi);
-        acc_lo[2] = smmla_s32(smmla_s32(acc_lo[2], w23_lo, a01_lo), w23_hi, a01_hi);
-
-        let a23_lo = load_s8x16(&pairs[1].planes[chunk].0);
-        let a23_hi = load_s8x16(&pairs[1].planes[chunk].1);
-        acc_lo[1] = smmla_s32(smmla_s32(acc_lo[1], w01_lo, a23_lo), w01_hi, a23_hi);
-        acc_lo[3] = smmla_s32(smmla_s32(acc_lo[3], w23_lo, a23_lo), w23_hi, a23_hi);
-
-        let b01_lo = load_s8x16(&pairs[2].planes[chunk].0);
-        let b01_hi = load_s8x16(&pairs[2].planes[chunk].1);
-        acc_hi[0] = smmla_s32(smmla_s32(acc_hi[0], w01_lo, b01_lo), w01_hi, b01_hi);
-        acc_hi[2] = smmla_s32(smmla_s32(acc_hi[2], w23_lo, b01_lo), w23_hi, b01_hi);
-
-        let b23_lo = load_s8x16(&pairs[3].planes[chunk].0);
-        let b23_hi = load_s8x16(&pairs[3].planes[chunk].1);
-        acc_hi[1] = smmla_s32(smmla_s32(acc_hi[1], w01_lo, b23_lo), w01_hi, b23_hi);
-        acc_hi[3] = smmla_s32(smmla_s32(acc_hi[3], w23_lo, b23_lo), w23_hi, b23_hi);
-    }
-}
-
-#[inline]
 pub(super) fn pq2_append_i8mm_pair_blocks(
     t0: &[super::Pq2Activation],
     t1: &[super::Pq2Activation],
@@ -3629,7 +3593,7 @@ fn dot_scaled_8x8_chunks_i8mm<const FUSED: bool>(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "K-tiled register-resident 4x8 I8MM kernel consumes pre-packed token-pair panels with zero permutes."
+    reason = "K-tiled register-resident 4x8 I8MM kernel hoists 4-row weight unpacking across all token chunks."
 )]
 #[target_feature(enable = "neon,i8mm")]
 fn dot_scaled_8x8_chunks_panels_i8mm<const FUSED: bool>(
@@ -3638,9 +3602,10 @@ fn dot_scaled_8x8_chunks_panels_i8mm<const FUSED: bool>(
     outputs: &mut [[[f32; 8]; 8]],
 ) -> Option<()> {
     use core::arch::aarch64::{
-        vand_u16, vcvt_f32_f16, vdup_n_u16, vdupq_n_f32, vmax_u16, vmaxv_u16, vreinterpret_f16_u16,
+        vand_u16, vcvt_f32_f16, vdup_n_u16, vdupq_n_f32, vdupq_n_s8, vmax_u16, vmaxv_u16,
+        vreinterpret_f16_u16,
     };
-    const K_TILE: usize = 16;
+    const K_TILE: usize = 4;
     outputs.fill([[0.0_f32; 8]; 8]);
     let block_count = panels[0][0].len();
     let mask = vdupq_n_u8(3);
@@ -3650,8 +3615,44 @@ fn dot_scaled_8x8_chunks_panels_i8mm<const FUSED: bool>(
 
     for k_start in (0..block_count).step_by(K_TILE) {
         let k_end = (k_start + K_TILE).min(block_count);
+        let tile_len = k_end - k_start;
         for row_half in 0..2 {
             let rbase = row_half * 4;
+            let mut tile_scales = [vdupq_n_f32(0.0); K_TILE];
+            let mut tile_weights = [[[vdupq_n_s8(0); 4]; 8]; K_TILE];
+            for k_off in 0..tile_len {
+                let block_idx = k_start + k_off;
+                let blocks: [&[u8; 34]; 4] = [
+                    &row_chunks[rbase][block_idx],
+                    &row_chunks[rbase + 1][block_idx],
+                    &row_chunks[rbase + 2][block_idx],
+                    &row_chunks[rbase + 3][block_idx],
+                ];
+                if block_idx + 2 < k_end {
+                    for block in &row_chunks[rbase..rbase + 4] {
+                        prefetch_l1(block[block_idx + 2].as_ptr());
+                    }
+                }
+                let scale_u16 = load_f16_scales_x4_pq2(blocks);
+                umax_scales = vmax_u16(umax_scales, vand_u16(scale_u16, mask_7fff));
+                tile_scales[k_off] = vcvt_f32_f16(vreinterpret_f16_u16(scale_u16));
+                for half in 0..2 {
+                    let raw_rows = [
+                        load_u8x16(&blocks[0][2..].as_chunks::<16>().0[half]),
+                        load_u8x16(&blocks[1][2..].as_chunks::<16>().0[half]),
+                        load_u8x16(&blocks[2][2..].as_chunks::<16>().0[half]),
+                        load_u8x16(&blocks[3][2..].as_chunks::<16>().0[half]),
+                    ];
+                    for plane in 0..4 {
+                        tile_weights[k_off][half * 4 + plane] =
+                            unpack_pq2_paired_plane(raw_rows, plane, mask).into();
+                    }
+                }
+            }
+            if vmaxv_u16(umax_scales) >= 0x7c00 {
+                return None;
+            }
+
             for (chunk_panels, out_chunk) in panels.iter().zip(outputs.iter_mut()) {
                 let out_halves = out_chunk.as_chunks_mut::<4>().0;
                 let mut f_acc: [[core::arch::aarch64::float32x4_t; 2]; 4] = if k_start == 0 {
@@ -3662,25 +3663,13 @@ fn dot_scaled_8x8_chunks_panels_i8mm<const FUSED: bool>(
                         [load_f32x4_neon(&quads[0]), load_f32x4_neon(&quads[1])]
                     })
                 };
-                for block_idx in k_start..k_end {
-                    let blocks: [&[u8; 34]; 4] = [
-                        &row_chunks[rbase][block_idx],
-                        &row_chunks[rbase + 1][block_idx],
-                        &row_chunks[rbase + 2][block_idx],
-                        &row_chunks[rbase + 3][block_idx],
-                    ];
+                for k_off in 0..tile_len {
+                    let block_idx = k_start + k_off;
                     if block_idx + 2 < k_end {
-                        for block in &row_chunks[rbase..rbase + 4] {
-                            prefetch_l1(block[block_idx + 2].as_ptr());
-                        }
                         for pair_slice in chunk_panels {
                             prefetch_l1(pair_slice[block_idx + 2].planes.as_ptr().cast::<u8>());
                         }
                     }
-                    let scale_u16 = load_f16_scales_x4_pq2(blocks);
-                    umax_scales = vmax_u16(umax_scales, vand_u16(scale_u16, mask_7fff));
-                    let row_scales = vcvt_f32_f16(vreinterpret_f16_u16(scale_u16));
-
                     let pairs = [
                         &chunk_panels[0][block_idx],
                         &chunk_panels[1][block_idx],
@@ -3689,21 +3678,28 @@ fn dot_scaled_8x8_chunks_panels_i8mm<const FUSED: bool>(
                     ];
                     let mut acc_lo = [vdupq_n_s32(0); 4];
                     let mut acc_hi = [vdupq_n_s32(0); 4];
-                    for half in 0..2 {
-                        let raw_rows = [
-                            load_u8x16(&blocks[0][2..].as_chunks::<16>().0[half]),
-                            load_u8x16(&blocks[1][2..].as_chunks::<16>().0[half]),
-                            load_u8x16(&blocks[2][2..].as_chunks::<16>().0[half]),
-                            load_u8x16(&blocks[3][2..].as_chunks::<16>().0[half]),
-                        ];
-                        accumulate_pq2_half_4x8_panels_i8mm(
-                            raw_rows,
-                            pairs,
-                            half,
-                            mask,
-                            &mut acc_lo,
-                            &mut acc_hi,
-                        );
+                    for (chunk, &[w01_lo, w01_hi, w23_lo, w23_hi]) in
+                        tile_weights[k_off].iter().enumerate()
+                    {
+                        let a01_lo = load_s8x16(&pairs[0].planes[chunk].0);
+                        let a01_hi = load_s8x16(&pairs[0].planes[chunk].1);
+                        acc_lo[0] = smmla_s32(smmla_s32(acc_lo[0], w01_lo, a01_lo), w01_hi, a01_hi);
+                        acc_lo[2] = smmla_s32(smmla_s32(acc_lo[2], w23_lo, a01_lo), w23_hi, a01_hi);
+
+                        let a23_lo = load_s8x16(&pairs[1].planes[chunk].0);
+                        let a23_hi = load_s8x16(&pairs[1].planes[chunk].1);
+                        acc_lo[1] = smmla_s32(smmla_s32(acc_lo[1], w01_lo, a23_lo), w01_hi, a23_hi);
+                        acc_lo[3] = smmla_s32(smmla_s32(acc_lo[3], w23_lo, a23_lo), w23_hi, a23_hi);
+
+                        let b01_lo = load_s8x16(&pairs[2].planes[chunk].0);
+                        let b01_hi = load_s8x16(&pairs[2].planes[chunk].1);
+                        acc_hi[0] = smmla_s32(smmla_s32(acc_hi[0], w01_lo, b01_lo), w01_hi, b01_hi);
+                        acc_hi[2] = smmla_s32(smmla_s32(acc_hi[2], w23_lo, b01_lo), w23_hi, b01_hi);
+
+                        let b23_lo = load_s8x16(&pairs[3].planes[chunk].0);
+                        let b23_hi = load_s8x16(&pairs[3].planes[chunk].1);
+                        acc_hi[1] = smmla_s32(smmla_s32(acc_hi[1], w01_lo, b23_lo), w01_hi, b23_hi);
+                        acc_hi[3] = smmla_s32(smmla_s32(acc_hi[3], w23_lo, b23_lo), w23_hi, b23_hi);
                     }
 
                     let sums_lo = load_s32x4(&[
@@ -3731,6 +3727,7 @@ fn dot_scaled_8x8_chunks_panels_i8mm<const FUSED: bool>(
                         pairs[3].scales[1],
                     ]);
 
+                    let row_scales = tile_scales[k_off];
                     finish_reg_scaled_4x4_i8mm::<FUSED>(
                         acc_lo,
                         sums_lo,
@@ -8877,70 +8874,100 @@ fn q8_0_scaled_8x8_chunks_i8mm<const CHUNKS: usize, A: super::Q8ActivationView>(
     chunks: &[[&[A]; 8]],
     outputs: &mut [[[f32; 8]; 8]],
 ) -> Option<()> {
-    use core::arch::aarch64::{vcvtq_f32_s32, vmulq_f32};
+    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vdupq_n_s8, vmulq_f32};
 
+    const K_TILE: usize = 8;
     let block_count = chunks[0][0].len();
     let row_chunks = rows.map(|row| row.as_chunks::<34>().0);
     let mut acc_buf = [[[[0.0_f32; 4]; 4]; 4]; CHUNKS];
+    let mut out_buf = [[[0.0_f32; 8]; 8]; CHUNKS];
     let zero_s32 = vdupq_n_s32(0);
 
-    for block_idx in 0..block_count {
-        prefetch_row_blocks(&row_chunks, block_idx, block_count);
-        let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
-        let [rs_lo, rs_hi] = widen_row_scales_f16(&blocks)?;
-        let wp = [
-            load_q8_0_row_pair_packed(blocks[0], blocks[1]),
-            load_q8_0_row_pair_packed(blocks[2], blocks[3]),
-            load_q8_0_row_pair_packed(blocks[4], blocks[5]),
-            load_q8_0_row_pair_packed(blocks[6], blocks[7]),
-        ];
-        let rs_pairs = [
-            load_f32x4_neon(&[rs_lo[0], rs_lo[0], rs_lo[1], rs_lo[1]]),
-            load_f32x4_neon(&[rs_lo[2], rs_lo[2], rs_lo[3], rs_lo[3]]),
-            load_f32x4_neon(&[rs_hi[0], rs_hi[0], rs_hi[1], rs_hi[1]]),
-            load_f32x4_neon(&[rs_hi[2], rs_hi[2], rs_hi[3], rs_hi[3]]),
-        ];
+    for k_base in (0..block_count).step_by(K_TILE) {
+        let tile_len = (block_count - k_base).min(K_TILE);
+        let is_first = k_base == 0;
+        let is_last = k_base + tile_len == block_count;
+        let mut wp_tile = [[[vdupq_n_s8(0); 4]; 4]; K_TILE];
+        let mut rs_tile = [[vdupq_n_f32(0.0); 4]; K_TILE];
+        for k_off in 0..tile_len {
+            let block_idx = k_base + k_off;
+            prefetch_row_blocks(&row_chunks, block_idx, block_count);
+            let blocks: [&[u8; 34]; 8] = std::array::from_fn(|r| &row_chunks[r][block_idx]);
+            let [rs_lo, rs_hi] = widen_row_scales_f16(&blocks)?;
+            wp_tile[k_off] = [
+                load_q8_0_row_pair_packed(blocks[0], blocks[1]),
+                load_q8_0_row_pair_packed(blocks[2], blocks[3]),
+                load_q8_0_row_pair_packed(blocks[4], blocks[5]),
+                load_q8_0_row_pair_packed(blocks[6], blocks[7]),
+            ];
+            rs_tile[k_off] = [
+                load_f32x4_neon(&[rs_lo[0], rs_lo[0], rs_lo[1], rs_lo[1]]),
+                load_f32x4_neon(&[rs_lo[2], rs_lo[2], rs_lo[3], rs_lo[3]]),
+                load_f32x4_neon(&[rs_hi[0], rs_hi[0], rs_hi[1], rs_hi[1]]),
+                load_f32x4_neon(&[rs_hi[2], rs_hi[2], rs_hi[3], rs_hi[3]]),
+            ];
+        }
         for (c, chunk) in chunks.iter().take(CHUNKS).enumerate() {
             for p in 0..4 {
-                let act0 = &chunk[2 * p][block_idx];
-                let act1 = &chunk[2 * p + 1][block_idx];
-                let a0_halves = act0.values().as_chunks::<16>().0;
-                let a1_halves = act1.values().as_chunks::<16>().0;
-                let (a_h0_lo, a_h0_hi) =
-                    pair_s8_lo_hi(load_s8x16(&a0_halves[0]), load_s8x16(&a1_halves[0]));
-                let (a_h1_lo, a_h1_hi) =
-                    pair_s8_lo_hi(load_s8x16(&a0_halves[1]), load_s8x16(&a1_halves[1]));
-                let as_vec =
-                    load_f32x4_neon(&[act0.scale(), act1.scale(), act0.scale(), act1.scale()]);
-                for ((&w_packed, &rs), acc_slot) in
-                    wp.iter().zip(rs_pairs.iter()).zip(acc_buf[c][p].iter_mut())
-                {
-                    let mut int_dot = smmla_s32(zero_s32, w_packed[0], a_h0_lo);
-                    int_dot = smmla_s32(int_dot, w_packed[1], a_h0_hi);
-                    int_dot = smmla_s32(int_dot, w_packed[2], a_h1_lo);
-                    int_dot = smmla_s32(int_dot, w_packed[3], a_h1_hi);
-                    let d = vmulq_f32(rs, as_vec);
-                    let cur = load_f32x4_neon(acc_slot);
-                    let next = f32x4_scale_step::<false>(cur, d, vcvtq_f32_s32(int_dot));
-                    store_f32x4_neon(next, acc_slot);
+                let mut acc = if is_first {
+                    [vdupq_n_f32(0.0); 4]
+                } else {
+                    std::array::from_fn(|rp| load_f32x4_neon(&acc_buf[c][p][rp]))
+                };
+                for k_off in 0..tile_len {
+                    let block_idx = k_base + k_off;
+                    if k_off + 2 < tile_len {
+                        prefetch_l1(chunk[2 * p][block_idx + 2].values().as_ptr().cast::<u8>());
+                        prefetch_l1(
+                            chunk[2 * p + 1][block_idx + 2]
+                                .values()
+                                .as_ptr()
+                                .cast::<u8>(),
+                        );
+                    }
+                    let act0 = &chunk[2 * p][block_idx];
+                    let act1 = &chunk[2 * p + 1][block_idx];
+                    let a0_halves = act0.values().as_chunks::<16>().0;
+                    let a1_halves = act1.values().as_chunks::<16>().0;
+                    let (a_h0_lo, a_h0_hi) =
+                        pair_s8_lo_hi(load_s8x16(&a0_halves[0]), load_s8x16(&a1_halves[0]));
+                    let (a_h1_lo, a_h1_hi) =
+                        pair_s8_lo_hi(load_s8x16(&a0_halves[1]), load_s8x16(&a1_halves[1]));
+                    let as_vec =
+                        load_f32x4_neon(&[act0.scale(), act1.scale(), act0.scale(), act1.scale()]);
+                    for ((&w_packed, &rs), acc_reg) in wp_tile[k_off]
+                        .iter()
+                        .zip(rs_tile[k_off].iter())
+                        .zip(acc.iter_mut())
+                    {
+                        let mut int_dot = smmla_s32(zero_s32, w_packed[0], a_h0_lo);
+                        int_dot = smmla_s32(int_dot, w_packed[1], a_h0_hi);
+                        int_dot = smmla_s32(int_dot, w_packed[2], a_h1_lo);
+                        int_dot = smmla_s32(int_dot, w_packed[3], a_h1_hi);
+                        let d = vmulq_f32(rs, as_vec);
+                        *acc_reg = f32x4_scale_step::<false>(*acc_reg, d, vcvtq_f32_s32(int_dot));
+                    }
+                }
+                if is_last {
+                    for (rp, &acc_reg) in acc.iter().enumerate() {
+                        let mut vals = [0.0_f32; 4];
+                        store_f32x4_neon(acc_reg, &mut vals);
+                        let r0 = rp * 2;
+                        let r1 = r0 + 1;
+                        out_buf[c][r0][2 * p] = vals[0];
+                        out_buf[c][r0][2 * p + 1] = vals[1];
+                        out_buf[c][r1][2 * p] = vals[2];
+                        out_buf[c][r1][2 * p + 1] = vals[3];
+                    }
+                } else {
+                    for (rp, &acc_reg) in acc.iter().enumerate() {
+                        store_f32x4_neon(acc_reg, &mut acc_buf[c][p][rp]);
+                    }
                 }
             }
         }
     }
 
-    let mut out_buf = [[[0.0_f32; 8]; 8]; CHUNKS];
-    for (chunk_acc, chunk_out) in acc_buf.iter().zip(out_buf.iter_mut()) {
-        for (p, pair_acc) in chunk_acc.iter().enumerate() {
-            for (rp, vals) in pair_acc.iter().enumerate() {
-                let r0 = rp * 2;
-                let r1 = r0 + 1;
-                chunk_out[r0][2 * p] = vals[0];
-                chunk_out[r0][2 * p + 1] = vals[1];
-                chunk_out[r1][2 * p] = vals[2];
-                chunk_out[r1][2 * p + 1] = vals[3];
-            }
-        }
-    }
     if !out_buf.iter().flatten().flatten().all(|v| v.is_finite()) {
         return None;
     }

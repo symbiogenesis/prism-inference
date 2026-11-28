@@ -9812,7 +9812,11 @@ mod tests {
         assert_eq!(added, Ok(2));
 
         let err = record_and_submit_layer_chunks(&mut recorded_layers, vec![20, 21], |&chunk| {
-            if chunk == 21 { Err("submit failed") } else { Ok(()) }
+            if chunk == 21 {
+                Err("submit failed")
+            } else {
+                Ok(())
+            }
         });
         assert_eq!(err, Err("submit failed"));
         // Even the failing layer's chunks remain recorded so outer error handler frees all of them.

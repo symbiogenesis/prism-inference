@@ -1562,10 +1562,12 @@ mod warm_tests {
             fn accept(
                 &mut self,
             ) -> impl Future<Output = std::io::Result<(Self::Stream, SocketAddr)>> {
-                let (res, nodelay) = self
-                    .outcomes
-                    .pop_front()
-                    .unwrap_or_else(|| (Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)), Ok(())));
+                let (res, nodelay) = self.outcomes.pop_front().unwrap_or_else(|| {
+                    (
+                        Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+                        Ok(()),
+                    )
+                });
                 self.next_nodelay = Some(nodelay);
                 std::future::ready(res)
             }
@@ -1610,7 +1612,10 @@ mod warm_tests {
             let (s_remote, _c_remote) = duplex(64);
             outcomes.push_back((Ok((s_remote, remote)), Ok(())));
             let (s_nodelay, _c_nodelay) = duplex(64);
-            outcomes.push_back((Ok((s_nodelay, loopback)), Err(std::io::ErrorKind::ConnectionReset)));
+            outcomes.push_back((
+                Ok((s_nodelay, loopback)),
+                Err(std::io::ErrorKind::ConnectionReset),
+            ));
             let (s_ok, _c_ok) = duplex(64);
             outcomes.push_back((Ok((s_ok, loopback)), Ok(())));
 

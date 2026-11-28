@@ -8870,8 +8870,8 @@ mod tests {
     }
 
     #[test]
-    fn native_q2_supports_f32_group_checks_multi_arena_chunk_fit_and_prewarmed_savings() -> Result<()>
-    {
+    fn native_q2_supports_f32_group_checks_multi_arena_chunk_fit_and_prewarmed_savings()
+    -> Result<()> {
         let reg = hexagon_native_rpc::NativeQ2WeightRegistry::from_arena_capacities_for_profile(
             [4608, 4608, 0, 0, 0, 0],
             2,

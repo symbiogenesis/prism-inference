@@ -3444,8 +3444,7 @@ mod tests {
     static OPEN_ROLLBACK_EVENTS: Mutex<Vec<(&'static str, usize)>> = Mutex::new(Vec::new());
     static FAIL_STOP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static FAIL_QCLOSE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static FAIL_UNMAP_ADDR: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static FAIL_UNMAP_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static FAIL_CLOSE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
     fn push_open_event(tag: &'static str, addr: usize) {
@@ -3610,11 +3609,10 @@ mod tests {
         FAIL_UNMAP_ADDR.store(0x2000, Ordering::Relaxed);
         drop(populated_open_rollback());
         let stop_scalar = usize::try_from(compute::STOP_SCALARS).unwrap_or(0);
-        assert_eq!(take_open_events(), vec![
-            ("stop", stop_scalar),
-            ("qclose", 0x9000),
-            ("unmap", 0x2000),
-        ]);
+        assert_eq!(
+            take_open_events(),
+            vec![("stop", stop_scalar), ("qclose", 0x9000), ("unmap", 0x2000),]
+        );
         // Early bail at primary unmap skips close and free.
         FAIL_UNMAP_ADDR.store(0x1000, Ordering::Relaxed);
         drop(populated_open_rollback());
@@ -3629,15 +3627,18 @@ mod tests {
 
         // Full unwind cleans extra then primary in reverse acquisition order.
         drop(populated_open_rollback());
-        assert_eq!(take_open_events(), vec![
-            ("stop", stop_scalar),
-            ("qclose", 0x9000),
-            ("unmap", 0x2000),
-            ("unmap", 0x1000),
-            ("close", 7),
-            ("free", 0x2000),
-            ("free", 0x1000),
-        ]);
+        assert_eq!(
+            take_open_events(),
+            vec![
+                ("stop", stop_scalar),
+                ("qclose", 0x9000),
+                ("unmap", 0x2000),
+                ("unmap", 0x1000),
+                ("close", 7),
+                ("free", 0x2000),
+                ("free", 0x1000),
+            ]
+        );
         Ok(())
     }
 

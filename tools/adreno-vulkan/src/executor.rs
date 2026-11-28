@@ -3641,7 +3641,11 @@ fn record_cached_entry(
     *cached_bytes += bytes;
 }
 
-type ThreeMatrixDims = ((usize, usize), Option<(usize, usize)>, Option<(usize, usize)>);
+type ThreeMatrixDims = (
+    (usize, usize),
+    Option<(usize, usize)>,
+    Option<(usize, usize)>,
+);
 
 fn validate_three_pq2_matrices(
     t0: &Tensor,
@@ -3675,40 +3679,43 @@ mod tests {
         }
     }
 
+    struct TestCache {
+        cache: BTreeMap<WeightCacheKey, CachedWeight>,
+        cached_bytes: usize,
+        counter: u64,
+        freed: Vec<BufferId>,
+    }
+
+    impl TestCache {
+        fn insert(&mut self, key: WeightCacheKey, st: ResidentStorage, bytes: usize, src: &Tensor) {
+            let freed = &mut self.freed;
+            record_cached_entry(
+                &mut self.cache,
+                &mut self.cached_bytes,
+                &mut self.counter,
+                key,
+                st,
+                bytes,
+                &src.data,
+                |id| freed.push(id),
+            );
+        }
+
+        fn evict(&mut self, max: usize, upload: usize, prot: &[BufferId]) -> bool {
+            let freed = &mut self.freed;
+            evict_standalone_cache_entries(
+                &mut self.cache,
+                &mut self.cached_bytes,
+                max,
+                upload,
+                prot,
+                |id| freed.push(id),
+            )
+        }
+    }
+
     #[test]
     fn weight_cache_bookkeeping_evicts_lru_skips_protected_and_replaces_entries() {
-        struct TestCache {
-            cache: BTreeMap<WeightCacheKey, CachedWeight>,
-            cached_bytes: usize,
-            counter: u64,
-            freed: Vec<BufferId>,
-        }
-        impl TestCache {
-            fn insert(&mut self, key: WeightCacheKey, st: ResidentStorage, bytes: usize, src: &Tensor) {
-                let freed = &mut self.freed;
-                record_cached_entry(
-                    &mut self.cache,
-                    &mut self.cached_bytes,
-                    &mut self.counter,
-                    key,
-                    st,
-                    bytes,
-                    &src.data,
-                    |id| freed.push(id),
-                );
-            }
-            fn evict(&mut self, max: usize, upload: usize, prot: &[BufferId]) -> bool {
-                let freed = &mut self.freed;
-                evict_standalone_cache_entries(
-                    &mut self.cache,
-                    &mut self.cached_bytes,
-                    max,
-                    upload,
-                    prot,
-                    |id| freed.push(id),
-                )
-            }
-        }
         let mut tc = TestCache {
             cache: BTreeMap::new(),
             cached_bytes: 0,
@@ -3725,13 +3732,38 @@ mod tests {
             cols: 256,
             rows: 32,
         };
-        tc.insert(key("arena"), ResidentStorage::Arena(BufferSpan::whole(BufferId(1))), 400, &arena_t);
-        tc.insert(key("prot"), ResidentStorage::Standalone(BufferId(2)), 300, &prot_t);
-        tc.insert(key("lru"), ResidentStorage::Standalone(BufferId(3)), 200, &lru_t);
-        tc.insert(key("newer"), ResidentStorage::Standalone(BufferId(4)), 200, &newer_t);
+        tc.insert(
+            key("arena"),
+            ResidentStorage::Arena(BufferSpan::whole(BufferId(1))),
+            400,
+            &arena_t,
+        );
+        tc.insert(
+            key("prot"),
+            ResidentStorage::Standalone(BufferId(2)),
+            300,
+            &prot_t,
+        );
+        tc.insert(
+            key("lru"),
+            ResidentStorage::Standalone(BufferId(3)),
+            200,
+            &lru_t,
+        );
+        tc.insert(
+            key("newer"),
+            ResidentStorage::Standalone(BufferId(4)),
+            200,
+            &newer_t,
+        );
         assert_eq!(tc.cached_bytes, 1100);
 
-        tc.insert(key("newer"), ResidentStorage::Standalone(BufferId(5)), 250, &newer_t);
+        tc.insert(
+            key("newer"),
+            ResidentStorage::Standalone(BufferId(5)),
+            250,
+            &newer_t,
+        );
         assert_eq!(tc.freed, vec![BufferId(4)]);
         assert_eq!(tc.cached_bytes, 1150);
 
@@ -3744,7 +3776,12 @@ mod tests {
         assert_eq!(tc.cached_bytes, 700);
         assert!(tc.cache.contains_key(&key("arena")) && tc.cache.contains_key(&key("prot")));
 
-        tc.insert(key("arena"), ResidentStorage::Arena(BufferSpan::whole(BufferId(1))), 300, &arena_t);
+        tc.insert(
+            key("arena"),
+            ResidentStorage::Arena(BufferSpan::whole(BufferId(1))),
+            300,
+            &arena_t,
+        );
         assert_eq!(tc.freed.len(), 3);
         assert_eq!(tc.cached_bytes, 600);
     }

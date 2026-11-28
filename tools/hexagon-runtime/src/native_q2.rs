@@ -8868,4 +8868,56 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn native_q2_supports_f32_group_checks_multi_arena_chunk_fit_and_prewarmed_savings() -> Result<()>
+    {
+        let reg = hexagon_native_rpc::NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+            [4608, 4608, 0, 0, 0, 0],
+            2,
+            HtpArchProfile::v81(),
+        )
+        .map_err(|_| invalid("multi-arena registry"))?;
+        let limits = NativeQ2ProjectionLimits::new(128, 128, 256, Duration::from_secs(10))
+            .map_err(|_| invalid("limits"))?
+            .with_resident_weights(9216)
+            .map_err(|_| invalid("residency"))?;
+        let mut executor = NativeQ2Executor::new(
+            ArenaSubmitter {
+                registry: reg,
+                memory: vec![0xa5; 9216],
+                direct: false,
+                copies: 0,
+                initializations: 0,
+            },
+            limits,
+            1024 * 1024,
+        )
+        .with_resident_weights(9216)?;
+
+        let half_tensor = |name: &str| -> Result<Tensor> {
+            let mut block = [0x55_u8; 34];
+            block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            Ok(Tensor {
+                name: name.to_owned(),
+                dimensions: vec![128, 64],
+                kind: PTQ1_KIND,
+                data: Arc::<[u8]>::from(bonsai_ternary::pack_ptq(&block)?.repeat(64)).into(),
+            })
+        };
+        let t0 = host_release_test_tensor("blk.0.attn_q.weight", PQ2_KIND)?; // 4608 B
+        let t1 = half_tensor("blk.0.attn_k.weight")?; // 2304 B
+        let t2 = half_tensor("blk.0.attn_v.weight")?; // 2304 B
+        // Total uncached bytes = 2304 + 4608 + 2304 = 9216 == remaining_bytes(),
+        // yet `[2304, 4608, 2304]` fragments across two 4608-B arenas and fails.
+        assert!(!executor.supports_f32_group(&[&t1, &t0, &t2]));
+        assert!(executor.supports_f32_group(&[&t1, &t2]));
+
+        // Prewarming t0 places it in arena 0; uncached `[t1, t2]` fits in arena 1.
+        let mut scratch = std::mem::take(&mut executor.scratch_weights);
+        assert!(executor.prewarm_tensor_with_scratch(&t0, &mut scratch)?);
+        executor.scratch_weights = scratch;
+        assert!(executor.supports_f32_group(&[&t1, &t0, &t2]));
+        Ok(())
+    }
 }

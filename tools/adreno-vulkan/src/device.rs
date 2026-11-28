@@ -62,7 +62,7 @@ const FORBIDDEN_VK_ENV_PREFIXES: [&str; 10] = [
 
 /// Opaque handle to a GPU buffer owned by [`AdrenoVulkanDevice`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct BufferId(usize);
+pub struct BufferId(pub(crate) usize);
 
 impl BufferId {
     /// Returns the deterministic slot index for hashing or diagnostics.
@@ -2487,17 +2487,13 @@ impl AdrenoVulkanDevice {
             self.submit_cb_slot(slot_idx, cmd_buf, true)?;
             self.wait_fence_and_clear_unwaited()
         })();
-        if let Err(err) = drain_res {
-            if !self.faulted && self.unwaited_slots > 0 {
+        if drain_res.is_err() {
+            fallback_wait_idle_on_drain_error(&mut self.faulted, &mut self.unwaited_slots, || {
                 // SAFETY: Fallback drain when fenced barrier submission failed; latch fault if wait fails.
-                if unsafe { self.device.device_wait_idle() }.is_err() {
-                    self.faulted = true;
-                }
-                self.unwaited_slots = 0;
-            }
-            return Err(err);
+                unsafe { self.device.device_wait_idle() }
+            });
         }
-        Ok(())
+        drain_res
     }
 
     pub(crate) fn abort_pipelined_session(&mut self) {
@@ -2505,12 +2501,11 @@ impl AdrenoVulkanDevice {
             self.unwaited_slots = 0;
             return;
         }
-        if self.finish_pipelined_session().is_err() && !self.faulted && self.unwaited_slots > 0 {
-            // SAFETY: Fallback drain when fenced barrier submission failed; latch fault if wait fails.
-            if unsafe { self.device.device_wait_idle() }.is_err() {
-                self.faulted = true;
-            }
-            self.unwaited_slots = 0;
+        if self.finish_pipelined_session().is_err() {
+            fallback_wait_idle_on_drain_error(&mut self.faulted, &mut self.unwaited_slots, || {
+                // SAFETY: Fallback drain when fenced barrier submission failed; latch fault if wait fails.
+                unsafe { self.device.device_wait_idle() }
+            });
         }
     }
 
@@ -2561,13 +2556,12 @@ impl AdrenoVulkanDevice {
     }
 
     fn rollback_pending_persistent_sets(&mut self) {
-        let persistent_sets: Vec<vk::DescriptorSet> = self
-            .scratch_allocated_sets
-            .iter()
-            .zip(&self.scratch_allocated_persistent)
-            .filter_map(|(&set, &is_persistent)| is_persistent.then_some(set))
-            .collect();
-        if !persistent_sets.is_empty() && !self.faulted {
+        let persistent_sets = select_pending_persistent_sets(
+            self.faulted,
+            &self.scratch_allocated_sets,
+            &self.scratch_allocated_persistent,
+        );
+        if !persistent_sets.is_empty() {
             // SAFETY: Freeing uncommitted persistent descriptor sets allocated during a failed prep.
             let _ = unsafe {
                 self.device
@@ -3616,6 +3610,34 @@ fn validate_buffer_span_limits(
     Ok(())
 }
 
+fn select_pending_persistent_sets(
+    faulted: bool,
+    allocated_sets: &[vk::DescriptorSet],
+    persistent_flags: &[bool],
+) -> Vec<vk::DescriptorSet> {
+    if faulted {
+        return Vec::new();
+    }
+    allocated_sets
+        .iter()
+        .zip(persistent_flags)
+        .filter_map(|(&set, &is_persistent)| is_persistent.then_some(set))
+        .collect()
+}
+
+fn fallback_wait_idle_on_drain_error(
+    faulted: &mut bool,
+    unwaited_slots: &mut usize,
+    wait_idle: impl FnOnce() -> Result<(), vk::Result>,
+) {
+    if !*faulted && *unwaited_slots > 0 {
+        if wait_idle().is_err() {
+            *faulted = true;
+        }
+        *unwaited_slots = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3873,6 +3895,100 @@ mod tests {
         assert!(encode_pipeline_cache_envelope(&empty_shader, &raw_cache).is_err());
         assert!(decode_pipeline_cache_envelope(&encoded, &empty_shader).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn validate_buffer_span_limits_enforces_alignment_bounds_and_max_range() -> Result<(), Error> {
+        let id = BufferId(0);
+        let span = |offset, range| BufferSpan {
+            buffer: id,
+            offset,
+            range,
+        };
+        // Zero-byte span, unaligned offset, overflow, out-of-bounds, and WHOLE_SIZE at end.
+        assert!(matches!(
+            validate_buffer_span_limits(span(0, 0), 256, 16, 256),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_buffer_span_limits(span(8, 32), 256, 16, 256),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_buffer_span_limits(span(u64::MAX - 15, 32), u64::MAX, 1, u64::MAX),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_buffer_span_limits(span(128, 144), 256, 16, 256),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_buffer_span_limits(span(256, vk::WHOLE_SIZE), 256, 16, 256),
+            Err(Error::InvalidInput(_))
+        ));
+        // range > max_storage_buffer_range (explicit & WHOLE_SIZE) rejected as ResourceLimit.
+        assert!(matches!(
+            validate_buffer_span_limits(span(0, 192), 256, 16, 128),
+            Err(Error::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            validate_buffer_span_limits(span(64, vk::WHOLE_SIZE), 256, 16, 128),
+            Err(Error::ResourceLimit(_))
+        ));
+        // Exact boundaries accepted.
+        validate_buffer_span_limits(span(64, 192), 256, 16, 192)?;
+        validate_buffer_span_limits(span(64, vk::WHOLE_SIZE), 256, 16, 192)
+    }
+
+    #[test]
+    fn select_pending_persistent_sets_and_fallback_drain_behave_across_faults() {
+        use ash::vk::Handle as _;
+        let s1 = vk::DescriptorSet::from_raw(1);
+        let s2 = vk::DescriptorSet::from_raw(2);
+        let s3 = vk::DescriptorSet::from_raw(3);
+        let sets = [s1, s2, s3];
+        let flags = [false, true, true];
+        assert_eq!(
+            select_pending_persistent_sets(false, &sets, &flags),
+            vec![s2, s3]
+        );
+        assert_eq!(select_pending_persistent_sets(true, &sets, &flags), []);
+
+        let mut faulted = false;
+        let mut unwaited = 0;
+        let mut wait_calls = 0;
+        fallback_wait_idle_on_drain_error(&mut faulted, &mut unwaited, || {
+            wait_calls += 1;
+            Ok(())
+        });
+        assert_eq!(wait_calls, 0);
+        assert!(!faulted);
+
+        unwaited = 2;
+        fallback_wait_idle_on_drain_error(&mut faulted, &mut unwaited, || {
+            wait_calls += 1;
+            Ok(())
+        });
+        assert_eq!(wait_calls, 1);
+        assert_eq!(unwaited, 0);
+        assert!(!faulted);
+
+        unwaited = 3;
+        fallback_wait_idle_on_drain_error(&mut faulted, &mut unwaited, || {
+            wait_calls += 1;
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        });
+        assert_eq!(wait_calls, 2);
+        assert_eq!(unwaited, 0);
+        assert!(faulted);
+
+        unwaited = 1;
+        fallback_wait_idle_on_drain_error(&mut faulted, &mut unwaited, || {
+            wait_calls += 1;
+            Ok(())
+        });
+        assert_eq!(wait_calls, 2);
+        assert!(faulted);
     }
 
     #[test]

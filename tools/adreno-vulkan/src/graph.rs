@@ -3308,14 +3308,14 @@ impl VulkanBatchedGraphExecutor {
                                             is_final_chunk,
                                         )?
                                 {
-                                    recorded_layers.push(cb_chunks);
-                                    if let Some(layer_cb_chunks) = recorded_layers.last() {
-                                        for cb_chunk in layer_cb_chunks {
-                                            self.device.submit_cached_chunk(cb_chunk)?;
-                                            self.submits_completed =
-                                                self.submits_completed.saturating_add(1);
-                                        }
-                                    }
+                                    let added = record_and_submit_layer_chunks(
+                                        &mut recorded_layers,
+                                        cb_chunks,
+                                        |cb_chunk| self.device.submit_cached_chunk(cb_chunk),
+                                    )?;
+                                    self.submits_completed = self
+                                        .submits_completed
+                                        .saturating_add(u64::try_from(added).unwrap_or(u64::MAX));
                                     if !self.device.has_unwaited_slots() {
                                         self.staging_bank_in_flight = [false; 2];
                                     }
@@ -3433,7 +3433,7 @@ impl VulkanBatchedGraphExecutor {
         if run_result.is_err() {
             self.device.abort_pipelined_session();
             self.staging_bank_in_flight = [false; 2];
-            if mutated_gpu || had_unwaited_before {
+            if pipelined_error_requires_invalidation(mutated_gpu, had_unwaited_before) {
                 self.state_consistent = false;
                 self.kv_tracker.invalidate();
             }
@@ -8176,6 +8176,29 @@ fn f64_to_f32_ieee(value: f64) -> f32 {
     f32::from_bits(if round_up { raw + 1 } else { raw })
 }
 
+const fn pipelined_error_requires_invalidation(
+    mutated_gpu: bool,
+    had_unwaited_before: bool,
+) -> bool {
+    mutated_gpu || had_unwaited_before
+}
+
+fn record_and_submit_layer_chunks<C, E>(
+    recorded_layers: &mut Vec<Vec<C>>,
+    cb_chunks: Vec<C>,
+    mut submit: impl FnMut(&C) -> Result<(), E>,
+) -> Result<usize, E> {
+    recorded_layers.push(cb_chunks);
+    let mut submitted = 0_usize;
+    if let Some(layer_cb_chunks) = recorded_layers.last() {
+        for cb_chunk in layer_cb_chunks {
+            submit(cb_chunk)?;
+            submitted = submitted.saturating_add(1);
+        }
+    }
+    Ok(submitted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9773,5 +9796,27 @@ mod tests {
             },
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn pipelined_error_and_recorded_cb_cleanup_preserve_consistency_and_avoid_leaks() {
+        assert!(!pipelined_error_requires_invalidation(false, false));
+        assert!(pipelined_error_requires_invalidation(true, false));
+        assert!(pipelined_error_requires_invalidation(false, true));
+        assert!(pipelined_error_requires_invalidation(true, true));
+
+        let mut recorded_layers: Vec<Vec<u32>> = Vec::new();
+        let added = record_and_submit_layer_chunks(&mut recorded_layers, vec![10, 11], |_| {
+            Ok::<(), &'static str>(())
+        });
+        assert_eq!(added, Ok(2));
+
+        let err = record_and_submit_layer_chunks(&mut recorded_layers, vec![20, 21], |&chunk| {
+            if chunk == 21 { Err("submit failed") } else { Ok(()) }
+        });
+        assert_eq!(err, Err("submit failed"));
+        // Even the failing layer's chunks remain recorded so outer error handler frees all of them.
+        let freed: Vec<u32> = recorded_layers.into_iter().flatten().collect();
+        assert_eq!(freed, vec![10, 11, 20, 21]);
     }
 }

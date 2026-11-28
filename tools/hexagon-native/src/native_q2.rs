@@ -3480,6 +3480,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn can_reserve_chunks_handles_empty_overflow_alignment_overflow_and_active_arena()
+    -> Result<(), Error> {
+        struct CapStub(usize);
+        impl NativeQ2Submitter for CapStub {
+            fn residency_capacity_bytes(&self) -> usize {
+                self.0
+            }
+            fn submit(
+                &mut self,
+                _columns: usize,
+                _rows: usize,
+                _weights: &[u8],
+                _activation: &[f32],
+                _output: &mut [f32],
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let mut reg = NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+            [2048, 2048, 0, 0, 0, 0],
+            2,
+            crate::HtpArchProfile::v81(),
+        )?;
+        // Empty chunk list fits even with zero remaining capacity.
+        let zero_reg = NativeQ2WeightRegistry::from_arena_capacities_for_profile(
+            [0; NATIVE_Q2_MAX_WEIGHT_ARENAS],
+            1,
+            crate::HtpArchProfile::v81(),
+        )?;
+        assert!(zero_reg.can_reserve_chunks(&[]));
+        assert!(reg.can_reserve_chunks(&[]));
+        // Overflow in start + weight_bytes rejects cleanly.
+        assert!(!reg.can_reserve_chunks(&[usize::MAX]));
+
+        // Reserve 1152 B in arena 0 (leaving 896 B); 1024 B spills into arena 1.
+        assert!(reg.prepare_validated(128, 32, 1152)?.is_some());
+        assert!(reg.can_reserve_chunks(&[896]));
+        assert!(!reg.can_reserve_chunks(&[897, 2048]));
+        assert!(reg.can_reserve_chunks(&[897]));
+        // Advance active_arena to 1 by committing a 1152 B chunk into arena 1.
+        assert!(reg.prepare_validated(128, 32, 1152)?.is_some());
+        assert!(!reg.can_reserve_chunks(&[896, 896]));
+        assert!(reg.can_reserve_chunks(&[769]));
+        // Default trait implementation rejects usize::MAX overflow and sums boundaries.
+        let stub = CapStub(128);
+        assert!(stub.can_reserve_chunks(&[]));
+        assert!(stub.can_reserve_chunks(&[100, 28]));
+        assert!(!stub.can_reserve_chunks(&[100, 29]));
+        assert!(!CapStub(usize::MAX).can_reserve_chunks(&[usize::MAX, 1]));
+        Ok(())
+    }
+
+    #[test]
     fn native_q2_finite_output_evidence_binds_regions_and_preserves_bits() -> Result<(), Error> {
         let bits = [0, 0x8000_0000, 1, 0x807f_ffff, 0x7f7f_ffff, 0xff7f_ffff];
         let mut first = bits.map(f32::from_bits);

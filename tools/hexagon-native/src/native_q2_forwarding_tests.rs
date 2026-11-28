@@ -434,6 +434,17 @@ fn owned_session_forwards_full_ffn_chain_and_preserves_failure() -> Result<(), E
 }
 
 #[test]
+fn owned_session_forwards_can_reserve_chunks() -> Result<(), Error> {
+    let (session, _) = fixture()?;
+    assert!(session.can_reserve_chunks(&[]));
+    assert!(session.can_reserve_chunks(&[1024, 1536]));
+    assert!(session.can_reserve_chunks(&[2944]));
+    assert!(!session.can_reserve_chunks(&[2945]));
+    assert!(!session.can_reserve_chunks(&[1024, 2048]));
+    Ok(())
+}
+
+#[test]
 fn owned_session_forwards_paired_chain_capability_and_one_call() -> Result<(), Error> {
     let (mut session, handle) = fixture()?;
     assert!(session.supports_ffn_chain_multi2());

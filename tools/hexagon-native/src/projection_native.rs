@@ -3438,7 +3438,258 @@ impl Drop for NativeQ2Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, atomic::Ordering};
+
+    static OPEN_ROLLBACK_SERIAL: Mutex<()> = Mutex::new(());
+    static OPEN_ROLLBACK_EVENTS: Mutex<Vec<(&'static str, usize)>> = Mutex::new(Vec::new());
+    static FAIL_STOP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static FAIL_QCLOSE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static FAIL_UNMAP_ADDR: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static FAIL_CLOSE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    fn push_open_event(tag: &'static str, addr: usize) {
+        if let Ok(mut log) = OPEN_ROLLBACK_EVENTS.lock() {
+            log.push((tag, addr));
+        }
+    }
+
+    unsafe extern "C" fn mock_rb_open(_: *const std::ffi::c_char, _: *mut u64) -> i32 {
+        0
+    }
+    unsafe extern "C" fn mock_rb_close(handle: u64) -> i32 {
+        let addr = usize::try_from(handle).unwrap_or(0);
+        push_open_event("close", addr);
+        FAIL_CLOSE.load(Ordering::Relaxed)
+    }
+    unsafe extern "C" fn mock_rb_invoke(_: u64, scalar: u32, _: *mut RemoteBuffer) -> i32 {
+        push_open_event("stop", usize::try_from(scalar).unwrap_or(0));
+        FAIL_STOP.load(Ordering::Relaxed)
+    }
+    unsafe extern "C" fn mock_rb_alloc(_: i32, _: u32, _: i32) -> *mut c_void {
+        null_mut()
+    }
+    unsafe extern "C" fn mock_rb_free(ptr: *mut c_void) {
+        push_open_event("free", ptr.addr());
+    }
+    unsafe extern "C" fn mock_rb_to_fd(_: *mut c_void) -> i32 {
+        -1
+    }
+    unsafe extern "C" fn mock_rb_map(
+        _: i32,
+        _: i32,
+        _: *mut c_void,
+        _: i32,
+        _: usize,
+        _: i32,
+    ) -> i32 {
+        -1
+    }
+    unsafe extern "C" fn mock_rb_unmap(_: i32, _: i32, ptr: *mut c_void, _: usize) -> i32 {
+        let addr = ptr.addr();
+        push_open_event("unmap", addr);
+        if FAIL_UNMAP_ADDR.load(Ordering::Relaxed) == addr {
+            -1
+        } else {
+            0
+        }
+    }
+    unsafe extern "C" fn mock_rb_qcreate(
+        _: i32,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: super::super::Callback,
+        _: super::super::Callback,
+        _: *mut c_void,
+        _: *mut *mut c_void,
+    ) -> i32 {
+        -1
+    }
+    unsafe extern "C" fn mock_rb_qexport(_: *mut c_void, _: *mut u64) -> i32 {
+        -1
+    }
+    unsafe extern "C" fn mock_rb_qclose(queue: *mut c_void) -> i32 {
+        push_open_event("qclose", queue.addr());
+        FAIL_QCLOSE.load(Ordering::Relaxed)
+    }
+    unsafe extern "C" fn mock_rb_qwrite(
+        _: *mut c_void,
+        _: u32,
+        _: u32,
+        _: *mut QueueBuffer,
+        _: u32,
+        _: *const u8,
+    ) -> i32 {
+        -1
+    }
+    unsafe extern "C" fn mock_rb_qread(
+        _: *mut c_void,
+        _: *mut u32,
+        _: u32,
+        _: *mut u32,
+        _: *mut QueueBuffer,
+        _: u32,
+        _: *mut u32,
+        _: *mut u8,
+    ) -> i32 {
+        -1
+    }
+
+    fn mock_rollback_calls() -> super::super::Calls {
+        super::super::Calls {
+            open: mock_rb_open,
+            close: mock_rb_close,
+            invoke: mock_rb_invoke,
+            alloc: mock_rb_alloc,
+            free: mock_rb_free,
+            to_fd: mock_rb_to_fd,
+            map: mock_rb_map,
+            unmap: mock_rb_unmap,
+            queue_create: mock_rb_qcreate,
+            queue_export: mock_rb_qexport,
+            queue_close: mock_rb_qclose,
+            queue_write: WriteCall::Nonblocking(mock_rb_qwrite),
+            queue_read: mock_rb_qread,
+        }
+    }
+
+    fn take_open_events() -> Vec<(&'static str, usize)> {
+        OPEN_ROLLBACK_EVENTS
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut g| std::mem::take(&mut *g))
+    }
+
+    fn populated_open_rollback() -> NativeQ2OpenRollback {
+        let mut rb = NativeQ2OpenRollback::new(7, 3, mock_rollback_calls());
+        rb.primary = Some((std::ptr::without_provenance_mut(0x1000), 11, 4096));
+        rb.extra_arenas[0] = ExtraWeightArena {
+            memory: std::ptr::without_provenance_mut(0x2000),
+            fd: 12,
+            fd_u32: 12,
+            allocation_bytes: 4096,
+            dirty: false,
+            dsp_mapped: false,
+        };
+        rb.extra_arena_count = 1;
+        rb.queue = std::ptr::without_provenance_mut(0x9000);
+        rb.cdsp_started = true;
+        rb
+    }
+
+    #[test]
+    fn open_rollback_disarm_partial_and_early_bail_guards_prevent_uaf() -> Result<(), Error> {
+        let _guard = OPEN_ROLLBACK_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        FAIL_STOP.store(0, Ordering::Relaxed);
+        FAIL_QCLOSE.store(0, Ordering::Relaxed);
+        FAIL_UNMAP_ADDR.store(0, Ordering::Relaxed);
+        FAIL_CLOSE.store(0, Ordering::Relaxed);
+        let _ = take_open_events();
+
+        // Disarm performs zero cleanup calls.
+        let _ = populated_open_rollback().disarm()?;
+        assert_eq!(take_open_events(), []);
+
+        // Early bail at STOP_SCALARS skips queue_close, unmap, close, and free.
+        FAIL_STOP.store(-1, Ordering::Relaxed);
+        drop(populated_open_rollback());
+        let events = take_open_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "stop");
+        FAIL_STOP.store(0, Ordering::Relaxed);
+
+        // Early bail at queue_close skips unmap, close, and free.
+        FAIL_QCLOSE.store(-1, Ordering::Relaxed);
+        drop(populated_open_rollback());
+        assert_eq!(take_open_events().len(), 2);
+        FAIL_QCLOSE.store(0, Ordering::Relaxed);
+
+        // Early bail at extra arena unmap skips primary unmap, close, and free.
+        FAIL_UNMAP_ADDR.store(0x2000, Ordering::Relaxed);
+        drop(populated_open_rollback());
+        let stop_scalar = usize::try_from(compute::STOP_SCALARS).unwrap_or(0);
+        assert_eq!(take_open_events(), vec![
+            ("stop", stop_scalar),
+            ("qclose", 0x9000),
+            ("unmap", 0x2000),
+        ]);
+        // Early bail at primary unmap skips close and free.
+        FAIL_UNMAP_ADDR.store(0x1000, Ordering::Relaxed);
+        drop(populated_open_rollback());
+        assert_eq!(take_open_events().len(), 4);
+        FAIL_UNMAP_ADDR.store(0, Ordering::Relaxed);
+
+        // Early bail at close skips free.
+        FAIL_CLOSE.store(-1, Ordering::Relaxed);
+        drop(populated_open_rollback());
+        assert_eq!(take_open_events().len(), 5);
+        FAIL_CLOSE.store(0, Ordering::Relaxed);
+
+        // Full unwind cleans extra then primary in reverse acquisition order.
+        drop(populated_open_rollback());
+        assert_eq!(take_open_events(), vec![
+            ("stop", stop_scalar),
+            ("qclose", 0x9000),
+            ("unmap", 0x2000),
+            ("unmap", 0x1000),
+            ("close", 7),
+            ("free", 0x2000),
+            ("free", 0x1000),
+        ]);
+        Ok(())
+    }
+
+    #[test]
+    fn native_q2_session_with_session_latches_failed_on_panic_and_skips_drop_cleanup()
+    -> Result<(), Error> {
+        let _guard = OPEN_ROLLBACK_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = take_open_events();
+        let limits = NativeQ2ProjectionLimits::new(128, 128, 256, Duration::from_secs(10))?;
+        let mut session = NativeQ2Session {
+            handle: 7,
+            domain: 3,
+            calls: mock_rollback_calls(),
+            fd: 11,
+            allocation_bytes: 4096,
+            extra_arenas: [ExtraWeightArena::empty(); MAX_EXTRA_WEIGHT_ARENAS],
+            extra_arena_count: 0,
+            queue: std::ptr::without_provenance_mut(0x9000),
+            memory: std::ptr::without_provenance_mut(0x1000),
+            expected: QueueBuffer {
+                fd: 11,
+                size: 4096,
+                offset: 0,
+                flags: 0x90,
+                pointer: std::ptr::without_provenance_mut(0x1000),
+            },
+            limits: limits.common,
+            columns: limits.columns,
+            arch_profile: crate::HtpArchProfile::v81(),
+            resident_weights: HmxQ2WeightRegistry::new(0)?,
+            native_resident_weights: NativeQ2WeightRegistry::new(4096)?,
+            dirty_resident_weights: false,
+            work_deadline: Instant::now() + Duration::from_secs(10),
+            report: Q2ProjectionReport::new(SessionPreparationReport::new(0)),
+            failed: false,
+        };
+        let panicking = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.with_session(|_| {
+                let trigger = std::hint::black_box(true);
+                assert!(!trigger, "simulated callback unwind inside NativeQ2Session");
+            });
+        }));
+        assert!(panicking.is_err());
+        assert!(session.failed);
+        assert!(!NativeQ2Submitter::can_reserve_chunks(&session, &[128]));
+        assert_eq!(NativeQ2Submitter::residency_capacity_bytes(&session), 0);
+        drop(session);
+        assert_eq!(take_open_events(), []);
+        Ok(())
+    }
 
     struct MockState {
         writes: u32,

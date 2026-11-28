@@ -1424,27 +1424,14 @@ impl VulkanPq2Executor {
         upload_bytes: usize,
         protected: &[BufferId],
     ) -> bool {
-        while self.cached_bytes + upload_bytes > self.max_cached_weight_bytes {
-            let Some(evict_key) = self
-                .weight_cache
-                .iter()
-                .filter(|(_, entry)| match entry.storage {
-                    ResidentStorage::Standalone(id) => !protected.contains(&id),
-                    ResidentStorage::Arena(_) => false,
-                })
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(k, _)| k.clone())
-            else {
-                return false;
-            };
-            if let Some(removed) = self.weight_cache.remove(&evict_key) {
-                self.cached_bytes = self.cached_bytes.saturating_sub(removed.bytes);
-                if let ResidentStorage::Standalone(id) = removed.storage {
-                    self.device.free_buffer(id);
-                }
-            }
-        }
-        true
+        evict_standalone_cache_entries(
+            &mut self.weight_cache,
+            &mut self.cached_bytes,
+            self.max_cached_weight_bytes,
+            upload_bytes,
+            protected,
+            |id| self.device.free_buffer(id),
+        )
     }
 
     fn upload_standalone_transient(&mut self, upload_u64: u64) -> Result<WeightLease, Error> {
@@ -1463,22 +1450,16 @@ impl VulkanPq2Executor {
         bytes: usize,
         source: &TensorBytes,
     ) {
-        self.cache_access_counter += 1;
-        if let Some(prev) = self.weight_cache.insert(
+        record_cached_entry(
+            &mut self.weight_cache,
+            &mut self.cached_bytes,
+            &mut self.cache_access_counter,
             key,
-            CachedWeight {
-                storage,
-                bytes,
-                weak_source: TensorBytes::downgrade(source),
-                last_used: self.cache_access_counter,
-            },
-        ) {
-            self.cached_bytes = self.cached_bytes.saturating_sub(prev.bytes);
-            if let ResidentStorage::Standalone(id) = prev.storage {
-                self.device.free_buffer(id);
-            }
-        }
-        self.cached_bytes += bytes;
+            storage,
+            bytes,
+            source,
+            |id| self.device.free_buffer(id),
+        );
     }
 
     fn acquire_three_weights(
@@ -1487,9 +1468,7 @@ impl VulkanPq2Executor {
         t1: Option<&Tensor>,
         t2: Option<&Tensor>,
     ) -> Result<[Option<WeightLease>; 3], Error> {
-        let (c0, r0) = validate_matrix(t0, KIND_PQ2, 256)?;
-        let dims1 = t1.map(|t| validate_matrix(t, KIND_PQ2, 256)).transpose()?;
-        let dims2 = t2.map(|t| validate_matrix(t, KIND_PQ2, 256)).transpose()?;
+        let ((c0, r0), dims1, dims2) = validate_three_pq2_matrices(t0, t1, t2)?;
 
         let l0 = self.acquire_weight_buffer(t0, c0, r0, &[])?;
         let mut leases = [Some(l0), None, None];
@@ -3600,11 +3579,189 @@ fn pack_q8_blocks_into(blocks: &[Q8Block], out: &mut Vec<u32>) -> Result<(), Err
     Ok(())
 }
 
+fn evict_standalone_cache_entries(
+    weight_cache: &mut BTreeMap<WeightCacheKey, CachedWeight>,
+    cached_bytes: &mut usize,
+    max_cached_weight_bytes: usize,
+    upload_bytes: usize,
+    protected: &[BufferId],
+    mut free_buf: impl FnMut(BufferId),
+) -> bool {
+    while *cached_bytes + upload_bytes > max_cached_weight_bytes {
+        let Some(evict_key) = weight_cache
+            .iter()
+            .filter(|(_, entry)| match entry.storage {
+                ResidentStorage::Standalone(id) => !protected.contains(&id),
+                ResidentStorage::Arena(_) => false,
+            })
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(k, _)| k.clone())
+        else {
+            return false;
+        };
+        if let Some(removed) = weight_cache.remove(&evict_key) {
+            *cached_bytes = cached_bytes.saturating_sub(removed.bytes);
+            if let ResidentStorage::Standalone(id) = removed.storage {
+                free_buf(id);
+            }
+        }
+    }
+    true
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pure cache insertion bookkeeping decoupled from AdrenoVulkanDevice for unit tests."
+)]
+fn record_cached_entry(
+    weight_cache: &mut BTreeMap<WeightCacheKey, CachedWeight>,
+    cached_bytes: &mut usize,
+    cache_access_counter: &mut u64,
+    key: WeightCacheKey,
+    storage: ResidentStorage,
+    bytes: usize,
+    source: &TensorBytes,
+    mut free_buf: impl FnMut(BufferId),
+) {
+    *cache_access_counter += 1;
+    if let Some(prev) = weight_cache.insert(
+        key,
+        CachedWeight {
+            storage,
+            bytes,
+            weak_source: TensorBytes::downgrade(source),
+            last_used: *cache_access_counter,
+        },
+    ) {
+        *cached_bytes = cached_bytes.saturating_sub(prev.bytes);
+        if let ResidentStorage::Standalone(id) = prev.storage {
+            free_buf(id);
+        }
+    }
+    *cached_bytes += bytes;
+}
+
+type ThreeMatrixDims = ((usize, usize), Option<(usize, usize)>, Option<(usize, usize)>);
+
+fn validate_three_pq2_matrices(
+    t0: &Tensor,
+    t1: Option<&Tensor>,
+    t2: Option<&Tensor>,
+) -> Result<ThreeMatrixDims, Error> {
+    let dims0 = validate_matrix(t0, KIND_PQ2, 256)?;
+    let dims1 = t1.map(|t| validate_matrix(t, KIND_PQ2, 256)).transpose()?;
+    let dims2 = t2.map(|t| validate_matrix(t, KIND_PQ2, 256)).transpose()?;
+    Ok((dims0, dims1, dims2))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    fn test_pq2_tensor(name: &str, cols: usize, rows: usize) -> Tensor {
+        let blocks_per_row = cols / 128;
+        let mut raw = vec![0_u8; rows * blocks_per_row * PQ2_BLOCK_BYTES];
+        for blk in raw.as_chunks_mut::<PQ2_BLOCK_BYTES>().0 {
+            blk[0] = 0x00;
+            blk[1] = 0x3C;
+        }
+        Tensor {
+            name: name.to_owned(),
+            dimensions: vec![cols, rows],
+            kind: KIND_PQ2,
+            data: Arc::<[u8]>::from(raw).into(),
+        }
+    }
+
+    #[test]
+    fn weight_cache_bookkeeping_evicts_lru_skips_protected_and_replaces_entries() {
+        struct TestCache {
+            cache: BTreeMap<WeightCacheKey, CachedWeight>,
+            cached_bytes: usize,
+            counter: u64,
+            freed: Vec<BufferId>,
+        }
+        impl TestCache {
+            fn insert(&mut self, key: WeightCacheKey, st: ResidentStorage, bytes: usize, src: &Tensor) {
+                let freed = &mut self.freed;
+                record_cached_entry(
+                    &mut self.cache,
+                    &mut self.cached_bytes,
+                    &mut self.counter,
+                    key,
+                    st,
+                    bytes,
+                    &src.data,
+                    |id| freed.push(id),
+                );
+            }
+            fn evict(&mut self, max: usize, upload: usize, prot: &[BufferId]) -> bool {
+                let freed = &mut self.freed;
+                evict_standalone_cache_entries(
+                    &mut self.cache,
+                    &mut self.cached_bytes,
+                    max,
+                    upload,
+                    prot,
+                    |id| freed.push(id),
+                )
+            }
+        }
+        let mut tc = TestCache {
+            cache: BTreeMap::new(),
+            cached_bytes: 0,
+            counter: 0,
+            freed: Vec::new(),
+        };
+        let arena_t = test_pq2_tensor("arena", 256, 32);
+        let prot_t = test_pq2_tensor("prot", 256, 32);
+        let lru_t = test_pq2_tensor("lru", 256, 32);
+        let newer_t = test_pq2_tensor("newer", 256, 32);
+        let key = |name: &str| WeightCacheKey {
+            name: name.to_owned(),
+            kind: KIND_PQ2,
+            cols: 256,
+            rows: 32,
+        };
+        tc.insert(key("arena"), ResidentStorage::Arena(BufferSpan::whole(BufferId(1))), 400, &arena_t);
+        tc.insert(key("prot"), ResidentStorage::Standalone(BufferId(2)), 300, &prot_t);
+        tc.insert(key("lru"), ResidentStorage::Standalone(BufferId(3)), 200, &lru_t);
+        tc.insert(key("newer"), ResidentStorage::Standalone(BufferId(4)), 200, &newer_t);
+        assert_eq!(tc.cached_bytes, 1100);
+
+        tc.insert(key("newer"), ResidentStorage::Standalone(BufferId(5)), 250, &newer_t);
+        assert_eq!(tc.freed, vec![BufferId(4)]);
+        assert_eq!(tc.cached_bytes, 1150);
+
+        assert!(tc.evict(1200, 250, &[BufferId(2)]));
+        assert_eq!(tc.freed, vec![BufferId(4), BufferId(3)]);
+        assert_eq!(tc.cached_bytes, 950);
+
+        assert!(!tc.evict(800, 250, &[BufferId(2)]));
+        assert_eq!(tc.freed, vec![BufferId(4), BufferId(3), BufferId(5)]);
+        assert_eq!(tc.cached_bytes, 700);
+        assert!(tc.cache.contains_key(&key("arena")) && tc.cache.contains_key(&key("prot")));
+
+        tc.insert(key("arena"), ResidentStorage::Arena(BufferSpan::whole(BufferId(1))), 300, &arena_t);
+        assert_eq!(tc.freed.len(), 3);
+        assert_eq!(tc.cached_bytes, 600);
+    }
+
+    #[test]
+    fn three_matrix_validation_rejects_bad_mates_before_acquisition() -> Result<(), Error> {
+        let valid0 = test_pq2_tensor("t0", 256, 32);
+        let mut bad1 = test_pq2_tensor("bad1", 256, 32);
+        bad1.kind = KIND_Q8_0;
+        assert!(validate_three_pq2_matrices(&valid0, Some(&bad1), None).is_err());
+        assert!(validate_three_pq2_matrices(&valid0, Some(&valid0), Some(&bad1)).is_err());
+        assert_eq!(
+            validate_three_pq2_matrices(&valid0, Some(&valid0), Some(&valid0))?,
+            ((256, 32), Some((256, 32)), Some((256, 32)))
+        );
+        Ok(())
+    }
 
     #[test]
     fn repack_q8_0_coalesced_64_packs_scales_and_words_with_tail_zero_pad() -> Result<(), Error> {

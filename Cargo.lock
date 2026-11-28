@@ -80,7 +80,7 @@ dependencies = [
  "ash",
  "bonsai-gguf",
  "bonsai-hexagon-runtime",
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.9",
  "bonsai-ternary",
  "hex",
  "prism-inference",
@@ -99,9 +99,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-gguf"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.9",
  "bonsai-ternary",
  "hex",
  "serde_json",
@@ -117,7 +117,7 @@ version = "0.1.0"
 dependencies = [
  "bonsai-gguf",
  "bonsai-hexagon-native",
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.9",
  "bonsai-ternary",
  "bonsai-windows-process",
  "hex",
@@ -129,6 +129,16 @@ dependencies = [
 [[package]]
 name = "bonsai-native-hash"
 version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee47bfd5f30185c487ecce8ffb809d5688ee61d78c6a4dac2f485688755ce23f"
+dependencies = [
+ "sha2",
+ "windows-sys",
+]
+
+[[package]]
+name = "bonsai-native-hash"
+version = "0.1.9"
 dependencies = [
  "sha2",
  "windows-sys",
@@ -136,14 +146,14 @@ dependencies = [
 
 [[package]]
 name = "bonsai-neon-dot"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "bonsai-ternary",
 ]
 
 [[package]]
 name = "bonsai-prism"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "cbindgen",
 ]
@@ -154,7 +164,7 @@ version = "0.1.0"
 
 [[package]]
 name = "bonsai-ternary"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "bonsai-windows-credentials"
@@ -162,7 +172,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c87d0b0fbbc219c40a7abd8832be23ccb0d29b0e544a273ae7a92e7429d813"
 dependencies = [
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.8",
  "hex",
  "windows-sys",
  "zeroize",
@@ -665,7 +675,7 @@ dependencies = [
 name = "prism-conformance-policy"
 version = "0.1.0"
 dependencies = [
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.9",
  "hex",
  "serde",
  "serde_json",
@@ -678,7 +688,7 @@ dependencies = [
  "aho-corasick",
  "base64ct",
  "bonsai-gguf",
- "bonsai-native-hash",
+ "bonsai-native-hash 0.1.9",
  "bonsai-neon-dot",
  "bonsai-prism",
  "bonsai-ternary",

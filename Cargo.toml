@@ -1,7 +1,7 @@
 [package]
 name = "prism-inference"
 default-run = "prism-inference"
-version = "0.1.39"
+version = "0.1.40"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -149,8 +149,8 @@ bonsai-native-hash = { version = "=0.1.9", path = "tools/native-hash" }
 bonsai-neon-dot = { version = "=0.1.12", path = "tools/neon-dot" }
 bonsai-prism = { version = "=0.1.11", path = "tools/prism" }
 bonsai-ternary = { version = "=0.1.8", path = "tools/ternary" }
-bonsai-windows-credentials = "=0.1.9"
-bonsai-windows-process = "=0.1.8"
+bonsai-windows-credentials = "=0.1.10"
+bonsai-windows-process = "=0.1.9"
 hex = "=0.4.3"
 serde = "=1.0.229"
 serde_json = "=1.0.154"

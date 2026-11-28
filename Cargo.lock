@@ -80,7 +80,7 @@ dependencies = [
  "ash",
  "bonsai-gguf",
  "bonsai-hexagon-runtime",
- "bonsai-native-hash 0.1.9",
+ "bonsai-native-hash",
  "bonsai-ternary",
  "hex",
  "prism-inference",
@@ -101,7 +101,7 @@ dependencies = [
 name = "bonsai-gguf"
 version = "0.1.12"
 dependencies = [
- "bonsai-native-hash 0.1.9",
+ "bonsai-native-hash",
  "bonsai-ternary",
  "hex",
  "serde_json",
@@ -117,23 +117,13 @@ version = "0.1.0"
 dependencies = [
  "bonsai-gguf",
  "bonsai-hexagon-native",
- "bonsai-native-hash 0.1.9",
+ "bonsai-native-hash",
  "bonsai-ternary",
  "bonsai-windows-process",
  "hex",
  "prism-inference",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "bonsai-native-hash"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee47bfd5f30185c487ecce8ffb809d5688ee61d78c6a4dac2f485688755ce23f"
-dependencies = [
- "sha2",
- "windows-sys",
 ]
 
 [[package]]
@@ -168,11 +158,11 @@ version = "0.1.8"
 
 [[package]]
 name = "bonsai-windows-credentials"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c87d0b0fbbc219c40a7abd8832be23ccb0d29b0e544a273ae7a92e7429d813"
+checksum = "923fe8b26a4d228a010fdf94021f315cad49141ae8d7b7fd52f1908f40d5c4f1"
 dependencies = [
- "bonsai-native-hash 0.1.8",
+ "bonsai-native-hash",
  "hex",
  "windows-sys",
  "zeroize",
@@ -180,9 +170,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-windows-process"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42e04ad646eaa88fb2740d107c34cb58f9a0fe63e41738a9181e19317a74d371"
+checksum = "b3b83152c67168f19cb02cbc2de97689428a1502e7b67010178798ed9c527efb"
 dependencies = [
  "hex",
  "windows-sys",
@@ -675,7 +665,7 @@ dependencies = [
 name = "prism-conformance-policy"
 version = "0.1.0"
 dependencies = [
- "bonsai-native-hash 0.1.9",
+ "bonsai-native-hash",
  "hex",
  "serde",
  "serde_json",
@@ -683,12 +673,12 @@ dependencies = [
 
 [[package]]
 name = "prism-inference"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "aho-corasick",
  "base64ct",
  "bonsai-gguf",
- "bonsai-native-hash 0.1.9",
+ "bonsai-native-hash",
  "bonsai-neon-dot",
  "bonsai-prism",
  "bonsai-ternary",
@@ -706,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "prism-inference-server"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "bonsai-adreno-vulkan",
  "bonsai-hexagon-native",

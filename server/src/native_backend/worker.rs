@@ -1749,6 +1749,11 @@ impl Worker {
         !self.busy.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(super) fn set_busy_for_test(&self, busy: bool) {
+        self.busy.store(busy, Ordering::Release);
+    }
+
     pub(super) fn readiness(&self) -> serde_json::Value {
         self.profile
             .readiness_with_prefill_row_workers(self.seed, self.prefill_row_workers)

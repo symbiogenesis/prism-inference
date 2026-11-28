@@ -238,18 +238,63 @@ async fn serve_engine_with_options<E: worker::Engine>(
         Worker::with_prefill_options(engine, seed, placement, &options, prefill_row_workers)?;
     let policy = base_policy.with_vision(worker.profile.vision);
     let mut accept_backoff = INITIAL_ACCEPT_BACKOFF;
+    let mut listener = listener;
     loop {
-        let (client, peer) = match listener.accept().await {
+        let client = accept_next_loopback(
+            &mut listener,
+            &mut accept_backoff,
+            INITIAL_ACCEPT_BACKOFF,
+            MAX_ACCEPT_BACKOFF,
+        )
+        .await?;
+        if let Err(error) = serve_connection(client, &policy, &mut worker, None).await {
+            let _ = write_request_failure(&mut std::io::stderr().lock(), error);
+        }
+    }
+}
+
+trait AcceptSource {
+    type Stream: ConnectionStream;
+
+    fn accept(
+        &mut self,
+    ) -> impl Future<Output = std::io::Result<(Self::Stream, std::net::SocketAddr)>>;
+
+    fn set_nodelay(&self, stream: &Self::Stream) -> std::io::Result<()>;
+}
+
+impl AcceptSource for TcpListener {
+    type Stream = tokio::net::TcpStream;
+
+    fn accept(
+        &mut self,
+    ) -> impl Future<Output = std::io::Result<(Self::Stream, std::net::SocketAddr)>> {
+        Self::accept(self)
+    }
+
+    fn set_nodelay(&self, stream: &Self::Stream) -> std::io::Result<()> {
+        stream.set_nodelay(true)
+    }
+}
+
+async fn accept_next_loopback<A: AcceptSource>(
+    source: &mut A,
+    accept_backoff: &mut std::time::Duration,
+    initial_backoff: std::time::Duration,
+    max_backoff: std::time::Duration,
+) -> Result<A::Stream, NativeBackendError> {
+    loop {
+        let (client, peer) = match source.accept().await {
             Ok(accepted) => {
-                accept_backoff = INITIAL_ACCEPT_BACKOFF;
+                *accept_backoff = initial_backoff;
                 accepted
             }
             Err(error) => match classify_accept_error(&error) {
                 AcceptAction::RetryImmediate => continue,
                 AcceptAction::RetryBackoff => {
                     let _ = write_accept_failure(&mut std::io::stderr().lock(), &error);
-                    tokio::time::sleep(accept_backoff).await;
-                    accept_backoff = accept_backoff.saturating_mul(2).min(MAX_ACCEPT_BACKOFF);
+                    tokio::time::sleep(*accept_backoff).await;
+                    *accept_backoff = accept_backoff.saturating_mul(2).min(max_backoff);
                     continue;
                 }
                 AcceptAction::Fatal => return Err(NativeBackendError::Io),
@@ -258,13 +303,11 @@ async fn serve_engine_with_options<E: worker::Engine>(
         if !peer.is_ipv4() || !peer.ip().is_loopback() {
             continue;
         }
-        if let Err(error) = client.set_nodelay(true) {
+        if let Err(error) = source.set_nodelay(&client) {
             let _ = write_nodelay_failure(&mut std::io::stderr().lock(), &error);
             continue;
         }
-        if let Err(error) = serve_connection(client, &policy, &mut worker, None).await {
-            let _ = write_request_failure(&mut std::io::stderr().lock(), error);
-        }
+        return Ok(client);
     }
 }
 
@@ -1306,7 +1349,7 @@ mod warm_tests {
             );
         }
         #[cfg(unix)]
-        for code in [12, 23, 24] {
+        for code in [12, 23, 24, 55, 105] {
             assert_eq!(
                 classify_accept_error(&std::io::Error::from_raw_os_error(code)),
                 AcceptAction::RetryBackoff
@@ -1314,6 +1357,10 @@ mod warm_tests {
         }
         assert_eq!(
             classify_accept_error(&std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+            AcceptAction::Fatal
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::other("no os code")),
             AcceptAction::Fatal
         );
 
@@ -1484,6 +1531,236 @@ mod warm_tests {
                 .await??
                 .ok_or("missing stream 2")?;
             serve_connection(conn2, &policy, &mut worker, None)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+
+            assert!(endpoint.accept().await?.is_none());
+            parent
+                .join()
+                .map_err(|_| std::io::Error::other("parent thread panicked"))??;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn accept_loop_backs_off_resets_and_survives_nodelay_or_non_loopback() -> TestResult {
+        use std::{
+            collections::VecDeque,
+            net::{IpAddr, Ipv4Addr, SocketAddr},
+        };
+        type AcceptOutcome = (
+            std::io::Result<(tokio::io::DuplexStream, SocketAddr)>,
+            Result<(), std::io::ErrorKind>,
+        );
+        struct FakeAcceptSource {
+            outcomes: VecDeque<AcceptOutcome>,
+            next_nodelay: Option<Result<(), std::io::ErrorKind>>,
+        }
+        impl AcceptSource for FakeAcceptSource {
+            type Stream = tokio::io::DuplexStream;
+
+            fn accept(
+                &mut self,
+            ) -> impl Future<Output = std::io::Result<(Self::Stream, SocketAddr)>> {
+                let (res, nodelay) = self
+                    .outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| (Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)), Ok(())));
+                self.next_nodelay = Some(nodelay);
+                std::future::ready(res)
+            }
+
+            fn set_nodelay(&self, _stream: &Self::Stream) -> std::io::Result<()> {
+                match self.next_nodelay {
+                    Some(Ok(())) | None => Ok(()),
+                    Some(Err(kind)) => Err(std::io::Error::from(kind)),
+                }
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            tokio::time::pause();
+            let initial = Duration::from_millis(10);
+            let max = Duration::from_millis(100);
+            let mut backoff = initial;
+            let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+            let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 4001);
+
+            let mut outcomes = VecDeque::new();
+            // 6 RetryBackoff errors -> 10 + 20 + 40 + 80 + 100 + 100 = 350ms total elapsed,
+            // then WouldBlock + Interrupted (0ms), then non-loopback skipped, then nodelay error
+            // skipped, then healthy loopback resets backoff to 10ms, then Fatal returns Io.
+            for _ in 0..6 {
+                outcomes.push_back((
+                    Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
+                    Ok(()),
+                ));
+            }
+            outcomes.push_back((
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                Ok(()),
+            ));
+            outcomes.push_back((
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                Ok(()),
+            ));
+            let (s_remote, _c_remote) = duplex(64);
+            outcomes.push_back((Ok((s_remote, remote)), Ok(())));
+            let (s_nodelay, _c_nodelay) = duplex(64);
+            outcomes.push_back((Ok((s_nodelay, loopback)), Err(std::io::ErrorKind::ConnectionReset)));
+            let (s_ok, _c_ok) = duplex(64);
+            outcomes.push_back((Ok((s_ok, loopback)), Ok(())));
+
+            let mut source = FakeAcceptSource {
+                outcomes,
+                next_nodelay: None,
+            };
+            let start = Instant::now();
+            let accepted = accept_next_loopback(&mut source, &mut backoff, initial, max).await;
+            assert!(accepted.is_ok());
+            assert_eq!(backoff, initial);
+            let elapsed = start.elapsed();
+            assert!(
+                (Duration::from_millis(350)..Duration::from_millis(400)).contains(&elapsed),
+                "unexpected virtual backoff elapsed: {elapsed:?}"
+            );
+
+            let fatal = accept_next_loopback(&mut source, &mut backoff, initial, max).await;
+            assert!(matches!(fatal, Err(NativeBackendError::Io)));
+            Ok(())
+        })
+    }
+
+    fn drive_early_rejection_parent(
+        mut p_to_c_w: std::io::PipeWriter,
+        mut c_to_p_r: std::io::PipeReader,
+        valid_body: &[u8],
+    ) -> std::io::Result<()> {
+        use std::io::{Read as _, Write as _};
+        p_to_c_w.write_all(b"SB2PIPE1")?;
+        p_to_c_w.write_all(KEY.as_bytes())?;
+        p_to_c_w.flush()?;
+        let mut ack = [0_u8; 8];
+        c_to_p_r.read_exact(&mut ack)?;
+        if &ack != b"SB2OKAY1" || recv_pipe_frame(&mut c_to_p_r)? != (0, 5, Vec::new()) {
+            return Err(std::io::Error::other("handshake failed"));
+        }
+
+        let large = vec![b'z'; 16_384];
+        // Stream 1: unauthorized POST /v1/chat/completions with >64 trailing frames -> 401.
+        let unauth_head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            crate::broker_pipe::BROKER_PIPE_HOST_PORT,
+            valid_body.len() + 96 * large.len()
+        );
+        send_pipe_frame(&mut p_to_c_w, 1, 1, &[])?;
+        send_pipe_frame(&mut p_to_c_w, 1, 2, unauth_head.as_bytes())?;
+        send_pipe_frame(&mut p_to_c_w, 1, 2, valid_body)?;
+        for _ in 0..96 {
+            send_pipe_frame(&mut p_to_c_w, 1, 2, &large)?;
+        }
+        send_pipe_frame(&mut p_to_c_w, 1, 3, &[])?;
+        if !read_stream_reply(&mut c_to_p_r, 1)?.starts_with(b"HTTP/1.1 401 ") {
+            return Err(std::io::Error::other("expected 401 early rejection"));
+        }
+
+        // Stream 2: authorized POST /v1/chat/warm while worker busy + trailing frames -> 409.
+        let warm_head = format!(
+            "POST /v1/chat/warm HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            crate::broker_pipe::BROKER_PIPE_HOST_PORT,
+            valid_body.len()
+        );
+        send_pipe_frame(&mut p_to_c_w, 2, 1, &[])?;
+        send_pipe_frame(&mut p_to_c_w, 2, 2, warm_head.as_bytes())?;
+        send_pipe_frame(&mut p_to_c_w, 2, 2, valid_body)?;
+        for _ in 0..80 {
+            send_pipe_frame(&mut p_to_c_w, 2, 2, &large)?;
+        }
+        send_pipe_frame(&mut p_to_c_w, 2, 3, &[])?;
+        if !read_stream_reply(&mut c_to_p_r, 2)?.starts_with(b"HTTP/1.1 409 ") {
+            return Err(std::io::Error::other("expected 409 busy rejection"));
+        }
+
+        // Stream 3: subsequent /health request succeeds cleanly.
+        let health = format!(
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {KEY}\r\nConnection: close\r\n\r\n",
+            crate::broker_pipe::BROKER_PIPE_HOST_PORT
+        );
+        send_pipe_frame(&mut p_to_c_w, 3, 1, &[])?;
+        send_pipe_frame(&mut p_to_c_w, 3, 2, health.as_bytes())?;
+        send_pipe_frame(&mut p_to_c_w, 3, 3, &[])?;
+        if !read_stream_reply(&mut c_to_p_r, 3)?.starts_with(b"HTTP/1.1 200 ") {
+            return Err(std::io::Error::other("expected 200 health response"));
+        }
+        drop(p_to_c_w);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_connection_over_broker_pipe_closes_read_on_401_and_warm_409() -> TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let (p_to_c_r, p_to_c_w) = std::io::pipe()?;
+            let (c_to_p_r, c_to_p_w) = std::io::pipe()?;
+            let raw_req = serde_json::to_vec(&json!({
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_completion_tokens": 8,
+                "stream": false
+            }))?;
+            let valid_body = crate::AuthorizedHead {
+                length: raw_req.len(),
+                vision: false,
+            }
+            .prepare(&raw_req)
+            .map_err(|e| format!("{e:?}"))?
+            .body;
+
+            let parent = std::thread::spawn(move || {
+                drive_early_rejection_parent(p_to_c_w, c_to_p_r, &valid_body)
+            });
+
+            let (mut endpoint, _) =
+                crate::broker_pipe::ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+            endpoint.mark_ready()?;
+            let policy = RequestPolicy::new(crate::broker_pipe::BROKER_PIPE_HOST_PORT, KEY)
+                .map_err(|e| format!("{e:?}"))?;
+            let mut worker = Worker::with_options(
+                WarmableEngine {
+                    warmable: true,
+                    hold_until_cancel: false,
+                    warm_calls: Arc::new(AtomicUsize::new(0)),
+                    complete_calls: Arc::new(AtomicUsize::new(0)),
+                    row_workers: 1,
+                },
+                42,
+                Placement::Cpu,
+                &WorkerOptions::default(),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+
+            let conn1 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await??
+                .ok_or("missing stream 1")?;
+            let err1 = serve_connection(conn1, &policy, &mut worker, None).await;
+            assert_eq!(err1, Err(NativeBackendError::Unauthorized));
+
+            worker.set_busy_for_test(true);
+            let conn2 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await??
+                .ok_or("missing stream 2")?;
+            let err2 = serve_connection(conn2, &policy, &mut worker, None).await;
+            assert_eq!(err2, Err(NativeBackendError::Engine));
+            worker.set_busy_for_test(false);
+
+            let conn3 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await??
+                .ok_or("missing stream 3")?;
+            serve_connection(conn3, &policy, &mut worker, None)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
 

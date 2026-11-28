@@ -2887,6 +2887,33 @@ mod tests {
         startup::write_failure(&mut formatted, &error)?;
         let formatted = String::from_utf8(formatted).map_err(io::Error::other)?;
         assert!(formatted.starts_with("private-inference-startup-failed stage=memory "));
+
+        // Headroom addition succeeds (u64::MAX - 32 MiB + 16 MiB), but final sum overflows -> stage=memory.
+        cfg.daisyrose_lora
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing daisyrose config"))?
+            .bytes = u64::MAX - 32 * 1024 * 1024;
+        let sum_overflow = required_memory_bytes(&cfg)
+            .err()
+            .ok_or_else(|| io::Error::other("final memory sum overflow was accepted"))?;
+        let mut sum_formatted = Vec::new();
+        startup::write_failure(&mut sum_formatted, &sum_overflow)?;
+        assert!(
+            String::from_utf8(sum_formatted)
+                .map_err(io::Error::other)?
+                .starts_with("private-inference-startup-failed stage=memory ")
+        );
+
+        // Same with mmproj = Some(...) also rejects final sum overflow.
+        let mmproj = directory.path().join("mmproj.gguf");
+        std::fs::write(&mmproj, [])?;
+        cfg.mmproj = Some(mmproj);
+        assert!(required_memory_bytes(&cfg).is_err());
+
+        // Baseline without daisyrose_lora or mmproj succeeds.
+        cfg.mmproj = None;
+        cfg.daisyrose_lora = None;
+        assert!(required_memory_bytes(&cfg)? > 0);
         Ok(())
     }
 }

@@ -1639,4 +1639,94 @@ mod tests {
             Ok(())
         })
     }
+
+    #[test]
+    fn close_read_with_partial_buffer_is_idempotent_and_discards_extra_data() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (p_to_c_r, mut p_to_c_w) = io::pipe()?;
+            let (mut c_to_p_r, c_to_p_w) = io::pipe()?;
+            let (discarded_tx, discarded_rx) = std::sync::mpsc::sync_channel::<()>(1);
+            let writer = std::thread::spawn(move || -> io::Result<()> {
+                p_to_c_w.write_all(HANDSHAKE_REQUEST_MAGIC)?;
+                p_to_c_w.write_all(VALID_KEY.as_bytes())?;
+                p_to_c_w.flush()?;
+
+                let mut ack = [0_u8; 8];
+                c_to_p_r.read_exact(&mut ack)?;
+                if &ack != HANDSHAKE_RESPONSE_MAGIC
+                    || read_frame(&mut c_to_p_r)? != (0, KIND_SERVER_READY, Vec::new())
+                {
+                    return Err(io::Error::other("handshake failed"));
+                }
+
+                // Multi-byte initial frame so reading 1 byte leaves unread buffered data (`offset == 1`),
+                // followed by excess frames before reading reply.
+                let extra = vec![b'y'; MAX_FRAME_PAYLOAD];
+                write_frame(&mut p_to_c_w, 1, KIND_OPEN, &[])?;
+                write_frame(&mut p_to_c_w, 1, KIND_DATA, b"ABCDEF")?;
+                for _ in 0..(CHANNEL_CAPACITY + 8) {
+                    write_frame(&mut p_to_c_w, 1, KIND_DATA, &extra)?;
+                }
+                let _ = discarded_tx.send(());
+                write_frame(&mut p_to_c_w, 1, KIND_EOF, &[])?;
+
+                let (s1, k1, d1) = read_frame(&mut c_to_p_r)?;
+                let (s1_eof, k1_eof, d1_eof) = read_frame(&mut c_to_p_r)?;
+                if (s1, k1, d1.as_slice()) != (1, KIND_DATA, b"OK")
+                    || (s1_eof, k1_eof, d1_eof.as_slice()) != (1, KIND_EOF, b"")
+                {
+                    return Err(io::Error::other("unexpected stream 1 reply"));
+                }
+
+                write_frame(&mut p_to_c_w, 2, KIND_OPEN, &[])?;
+                write_frame(&mut p_to_c_w, 2, KIND_DATA, b"next")?;
+                write_frame(&mut p_to_c_w, 2, KIND_EOF, &[])?;
+                if read_frame(&mut c_to_p_r)? != (2, KIND_EOF, Vec::new()) {
+                    return Err(io::Error::other("missing stream 2 eof"));
+                }
+                drop(p_to_c_w);
+                Ok(())
+            });
+
+            let (mut endpoint, _) = ServerEndpoint::from_io(p_to_c_r, c_to_p_w)?;
+            endpoint.mark_ready()?;
+
+            let mut conn1 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "accept 1 timed out"))??
+                .ok_or_else(|| io::Error::other("missing stream 1"))?;
+            let mut one = [0_u8; 1];
+            conn1.read_exact(&mut one).await?;
+            assert_eq!(&one, b"A");
+            // close_read clears partial buffered slice and is idempotent; subsequent reads return EOF.
+            conn1.close_read();
+            conn1.close_read();
+            let mut eof_buf = [0_u8; 16];
+            assert_eq!(conn1.read(&mut eof_buf).await?, 0);
+            discarded_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            conn1.write_all(b"OK").await?;
+            conn1.shutdown().await?;
+            drop(conn1);
+
+            let mut conn2 = tokio::time::timeout(Duration::from_secs(5), endpoint.accept())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "accept 2 timed out"))??
+                .ok_or_else(|| io::Error::other("missing stream 2"))?;
+            let mut body2 = Vec::new();
+            conn2.read_to_end(&mut body2).await?;
+            assert_eq!(body2, b"next");
+            conn2.shutdown().await?;
+            drop(conn2);
+
+            writer
+                .join()
+                .map_err(|_| io::Error::other("writer panicked"))??;
+            Ok(())
+        })
+    }
 }

@@ -1571,18 +1571,8 @@ fn bf16_dot(bytes: &[u8], input: &[f32]) -> Result<f32> {
     reason = "Retain float_dot's left-to-right binary64 sum of rounded F32 products and final F32 rounding."
 )]
 pub(crate) fn f16_f64_dot_scalar(bytes: &[u8], input: &[f32]) -> Result<f32> {
-    // Match `float_dot`: NEON `float_dot` seeds `-0.0_f64`, while the non-NEON `.sum::<f64>()` seeds `0.0_f64`.
-    let mut sum = if cfg!(all(
-        feature = "experimental-neon",
-        target_arch = "aarch64",
-        target_os = "windows",
-        target_env = "msvc",
-        target_feature = "neon"
-    )) {
-        -0.0_f64
-    } else {
-        0.0_f64
-    };
+    // Match `float_dot`: both NEON `float_dot` and `std::iter::Sum<f64>` seed `-0.0_f64`.
+    let mut sum = -0.0_f64;
     for (chunk, &activation) in bytes.as_chunks::<2>().0.iter().zip(input) {
         let weight = finite(half_to_float(u16::from_le_bytes(*chunk)))?;
         sum += f64::from(weight * activation);

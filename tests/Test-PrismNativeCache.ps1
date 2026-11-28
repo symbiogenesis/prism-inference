@@ -104,4 +104,22 @@ Assert-Failure { Initialize-BonsaiPrismNativeAdapter -AdapterDirectory $adapter 
 [IO.File]::Delete($bridge)
 Assert-Failure { Initialize-BonsaiPrismNativeAdapter -AdapterDirectory $adapter -BuildDirectory $cache } 'An incomplete native adapter cache was accepted.'
 Assert-Failure { Initialize-BonsaiPrismNativeAdapter -AdapterDirectory $adapter -BuildDirectory (Join-Path $adapter 'cache') } 'Overlapping adapter and cache paths were accepted.'
+Assert (@(Get-ChildItem -LiteralPath $cache -Force -Filter '*.tmp-*').Count -eq 0) 'Successful native caching leaked temporary staging directories.'
+Assert (@(Get-ChildItem -LiteralPath (Split-Path -Parent $grammarCache) -Force -Filter '*.tmp-*').Count -eq 0) 'Grammar native caching leaked temporary staging directories.'
+
+$lockedSrc = Join-Path $scratch 'locked-src'
+$lockedCache = Join-Path $scratch 'locked-cache'
+[void][IO.Directory]::CreateDirectory($lockedSrc)
+$lockedFile = Join-Path $lockedSrc 'locked.cpp'
+[IO.File]::WriteAllText($lockedFile, 'locked source payload')
+$lockStream = [IO.File]::Open($lockedFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+try {
+    Assert-Failure { Initialize-BonsaiPrismNativeSource -SourceDirectory $lockedSrc -BuildDirectory $lockedCache } 'Mid-copy lock failure was not raised.'
+} finally {
+    $lockStream.Dispose()
+}
+Assert (-not [IO.Directory]::Exists((Join-Path $lockedCache 'source'))) 'Failed native copy published a partial source cache.'
+if ([IO.Directory]::Exists($lockedCache)) {
+    Assert (@(Get-ChildItem -LiteralPath $lockedCache -Force -Filter '*.tmp-*').Count -eq 0) 'Failed native copy leaked a temporary staging directory.'
+}
 Write-Output "Prism native cache source and adapter identity/timestamp checks passed. Evidence: $scratch"

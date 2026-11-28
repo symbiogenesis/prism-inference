@@ -47,4 +47,18 @@ $invalid = @{ AssetPrefix='fixtures/'; Files=@($lock.Files[0], @{ Path='other.bi
 $preflight = Join-Path $scratch 'preflight'
 Assert-Failure { & $materialize $assets $invalid $preflight $cache } 'An invalid complete fixture lock was accepted.'
 Assert (-not [IO.Directory]::Exists($preflight)) 'A cached file bypassed complete lock preflight.'
+Assert (@(Get-ChildItem -LiteralPath $first -Force -Recurse -Filter '*.tmp-*').Count -eq 0) 'Fixture materialization leaked temporary staging files.'
+Assert (@(Get-ChildItem -LiteralPath $second -Force -Recurse -Filter '*.tmp-*').Count -eq 0) 'Second fixture materialization leaked temporary staging files.'
+
+$lockedDest = Join-Path $scratch 'locked-dest'
+$lockStream = [IO.File]::Open($cached, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+try {
+    Assert-Failure { & $materialize $assets $lock $lockedDest $cache } 'Mid-copy locked fixture failure was not raised.'
+} finally {
+    $lockStream.Dispose()
+}
+Assert (-not [IO.File]::Exists((Join-Path $lockedDest 'fixtures/input.bin'))) 'Failed fixture copy published final artifact.'
+if ([IO.Directory]::Exists($lockedDest)) {
+    Assert (@(Get-ChildItem -LiteralPath $lockedDest -Force -Recurse -Filter '*.tmp-*').Count -eq 0) 'Failed fixture copy leaked temporary staging files.'
+}
 return "Prism fixture cache reuse, corruption and exclusive evidence checks passed. Evidence: $scratch"

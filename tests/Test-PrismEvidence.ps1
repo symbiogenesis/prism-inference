@@ -58,5 +58,16 @@ if ($IsWindows) {
     $rejectedArchive = Join-Path $scratch 'hidden-link.zip'
     Assert-Failure { & $scriptPath -EvidenceDirectory $evidence -ArchivePath $rejectedArchive -EvidenceKind $Case } 'Hidden filesystem links must be rejected.'
     Assert (-not [IO.File]::Exists($rejectedArchive)) 'Link rejection must happen before archive publication.'
+    Remove-Item -LiteralPath $link -Force
 }
+Assert (@(Get-ChildItem -LiteralPath $scratch -Force -Filter '*.tmp-*').Count -eq 0) 'Successful evidence compression leaked temporary archives.'
+$lockedArchive = Join-Path $scratch 'locked-fail.zip'
+$lockStream = [IO.File]::Open((Join-Path $evidence 'command.log'), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+try {
+    Assert-Failure { & $scriptPath -EvidenceDirectory $evidence -ArchivePath $lockedArchive -EvidenceKind $Case } 'Mid-zip locked file failure was not raised.'
+} finally {
+    $lockStream.Dispose()
+}
+Assert (-not [IO.File]::Exists($lockedArchive)) 'Failed archive compression published a partial zip.'
+Assert (@(Get-ChildItem -LiteralPath $scratch -Force -Filter '*.tmp-*').Count -eq 0) 'Failed archive compression leaked a temporary file.'
 return "Prism evidence $Case passed; evidence: $scratch"

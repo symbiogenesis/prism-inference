@@ -1467,3 +1467,29 @@ fn commit_folded_verification_prevalidation_and_mutation_atomicity() -> Result<(
     assert!(inconsistent_err.to_string().contains("inconsistent"));
     Ok(())
 }
+
+#[test]
+fn commit_folded_verification_zero_kept_clears_pending_and_bad_kept_preserves_state() -> Result<()>
+{
+    let cfg = HybridConfig::small_source();
+    let m1 = hybrid_model_with_identity(&cfg, Arithmetic::Source);
+    let mut folded = configure_folded(m1, &cfg, Arithmetic::Source, 1, KvCachePolicy::F16, false)?;
+
+    folded.evaluate(0)?;
+    let mut rows = Vec::new();
+    folded.evaluate_verification_block_folded(&[], &[1, 2], &mut rows, &|| Ok(()))?;
+    assert_eq!(folded.position, 3);
+
+    // kept > pending fails pre-validation without corrupting position or consistency.
+    assert!(folded.commit_folded_verification(3).is_err());
+    assert!(folded.state_consistent);
+    assert_eq!(folded.position, 3);
+    assert!(folded.has_pending_folded_verification());
+
+    // kept == 0 clears pending state and rewinds position to pre-verification (1) while consistent.
+    folded.commit_folded_verification(0)?;
+    assert!(folded.state_consistent);
+    assert!(!folded.has_pending_folded_verification());
+    assert_eq!(folded.position, 1);
+    Ok(())
+}

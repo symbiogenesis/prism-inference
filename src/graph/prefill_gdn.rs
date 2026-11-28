@@ -2693,4 +2693,70 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn folded_tape_validate_and_promote_enforces_carry_and_truncation() -> Result<()> {
+        let geometry = Geometry {
+            embedding: 16,
+            feed_forward: 16,
+            heads: 1,
+            kv_heads: 1,
+            head: 16,
+            rope: 4,
+            rope_sections: [2, 0, 0, 0],
+            rope_base: 10_000.0,
+            epsilon: 1e-6,
+            ssm_head: 32,
+            ssm_keys: 2,
+            ssm_values: 4,
+            convolution: 4,
+        };
+        let fill_pending = |tape: &mut FoldedRecurrentLayerTape, len: usize| {
+            tape.pending_len = len;
+            tape.pending_raw_conv.resize(len * tape.conv_width, 1.0);
+            tape.pending_keys.resize(len * tape.key_width, 2.0);
+            tape.pending_values.resize(len * tape.value_width, 3.0);
+            tape.pending_decay.resize(len * tape.ssm_values, 4.0);
+            tape.pending_beta.resize(len * tape.ssm_values, 5.0);
+        };
+
+        let mut tape = FoldedRecurrentLayerTape::new(4, &geometry)?;
+        fill_pending(&mut tape, 3);
+        tape.carried_len = 1;
+        assert!(tape.validate_pending_promotion(1).is_err());
+        tape.carried_len = 0;
+        assert!(tape.validate_pending_promotion(4).is_err());
+
+        for field in 0..5 {
+            let mut bad = FoldedRecurrentLayerTape::new(4, &geometry)?;
+            fill_pending(&mut bad, 3);
+            match field {
+                0 => bad.pending_raw_conv.pop(),
+                1 => bad.pending_keys.pop(),
+                2 => bad.pending_values.pop(),
+                3 => bad.pending_decay.pop(),
+                _ => bad.pending_beta.pop(),
+            };
+            assert!(bad.promote_pending_to_carried(3).is_err());
+            assert_eq!(bad.pending_len, 3);
+            assert_eq!(bad.carried_len, 0);
+        }
+
+        // kept == 0 clears pending without promoting carry.
+        tape.promote_pending_to_carried(0)?;
+        assert_eq!(tape.pending_len, 0);
+        assert_eq!(tape.carried_len, 0);
+
+        // kept == 2 promotes and truncates all 5 carried buffers cleanly.
+        fill_pending(&mut tape, 3);
+        tape.promote_pending_to_carried(2)?;
+        assert_eq!(tape.pending_len, 0);
+        assert_eq!(tape.carried_len, 2);
+        assert_eq!(tape.carried_raw_conv.len(), 2 * tape.conv_width);
+        assert_eq!(tape.carried_keys.len(), 2 * tape.key_width);
+        assert_eq!(tape.carried_values.len(), 2 * tape.value_width);
+        assert_eq!(tape.carried_decay.len(), 2 * tape.ssm_values);
+        assert_eq!(tape.carried_beta.len(), 2 * tape.ssm_values);
+        Ok(())
+    }
 }

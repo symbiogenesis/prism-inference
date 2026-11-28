@@ -503,4 +503,73 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn token_client_read_response_retries_multi_chunk_eintr_and_rejects_limit_and_error() {
+        struct MultiChunkBuf<'a> {
+            chunks: &'a [&'a [u8]],
+            idx: usize,
+            calls: usize,
+            fail_kind: Option<io::ErrorKind>,
+        }
+        impl Read for MultiChunkBuf<'_> {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl BufRead for MultiChunkBuf<'_> {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if let Some(kind) = self.fail_kind {
+                    return Err(io::Error::new(kind, "io fail"));
+                }
+                self.calls += 1;
+                if self.calls % 2 == 1 {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"));
+                }
+                Ok(self.chunks.get(self.idx).copied().unwrap_or(&[]))
+            }
+            fn consume(&mut self, amt: usize) {
+                if amt > 0 {
+                    self.idx += 1;
+                }
+            }
+        }
+
+        let mut buf = Vec::new();
+        let mut r = MultiChunkBuf {
+            chunks: &[
+                b"{\"type\":\"count\",",
+                b"\"id\":5,\"prompt_token_count\":12}\n",
+            ],
+            idx: 0,
+            calls: 0,
+            fail_kind: None,
+        };
+        assert!(matches!(
+            read_response(&mut r, &mut buf, 1024),
+            Ok(Response::Count {
+                id: 5,
+                prompt_token_count: 12
+            })
+        ));
+
+        let mut oversize = MultiChunkBuf {
+            chunks: &[b"{\"type\":\"count\",\"id\":5,\"prompt_token_count\":12}\n"],
+            idx: 0,
+            calls: 0,
+            fail_kind: None,
+        };
+        assert!(read_response(&mut oversize, &mut buf, 12).is_err());
+
+        let mut broken = MultiChunkBuf {
+            chunks: &[],
+            idx: 0,
+            calls: 0,
+            fail_kind: Some(io::ErrorKind::BrokenPipe),
+        };
+        assert!(matches!(
+            read_response(&mut broken, &mut buf, 1024),
+            Err(super::ClientError::Transport)
+        ));
+    }
 }

@@ -684,4 +684,91 @@ mod tests {
             Ok(Response::Reset { id: 2, ready: true })
         ));
     }
+
+    #[test]
+    fn swift_client_read_response_retries_multi_eintr_and_rejects_oversized_or_eof() {
+        struct MultiChunkEintrBuf<'a> {
+            chunks: &'a [&'a [u8]],
+            idx: usize,
+            eintr_every: usize,
+            calls: usize,
+        }
+        impl Read for MultiChunkEintrBuf<'_> {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl BufRead for MultiChunkEintrBuf<'_> {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                self.calls += 1;
+                if self.calls % self.eintr_every == 1 {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"));
+                }
+                Ok(self.chunks.get(self.idx).copied().unwrap_or(&[]))
+            }
+            fn consume(&mut self, amt: usize) {
+                if amt > 0 {
+                    self.idx += 1;
+                }
+            }
+        }
+
+        let mut client = SwiftClient {
+            input: MultiChunkEintrBuf {
+                chunks: &[b"{\"type\":\"reset\",", b"\"id\":9,\"ready\":false}\n"],
+                idx: 0,
+                eintr_every: 2,
+                calls: 0,
+            },
+            output: Sink,
+            response_limit: MAX_FRAME_BYTES,
+            healthy: true,
+            reset_required: false,
+            next_id: None,
+            request: Vec::new(),
+            response: Vec::new(),
+        };
+        assert!(matches!(
+            client.read_response(),
+            Ok(Response::Reset {
+                id: 9,
+                ready: false
+            })
+        ));
+
+        // Unterminated EOF -> InvalidResponse; oversized line -> InvalidResponse.
+        let mut eof_client = SwiftClient {
+            input: MultiChunkEintrBuf {
+                chunks: &[b"{\"type\":\"reset\""],
+                idx: 0,
+                eintr_every: 3,
+                calls: 0,
+            },
+            output: Sink,
+            response_limit: MAX_FRAME_BYTES,
+            healthy: true,
+            reset_required: false,
+            next_id: None,
+            request: Vec::new(),
+            response: Vec::new(),
+        };
+        assert!(eof_client.read_response().is_err());
+
+        let mut limit_client = SwiftClient {
+            input: MultiChunkEintrBuf {
+                chunks: &[b"{\"type\":\"reset\",\"id\":1,\"ready\":true}\n"],
+                idx: 0,
+                eintr_every: 10,
+                calls: 0,
+            },
+            output: Sink,
+            response_limit: 8,
+            healthy: true,
+            reset_required: false,
+            next_id: None,
+            request: Vec::new(),
+            response: Vec::new(),
+        };
+        assert!(limit_client.read_response().is_err());
+    }
 }

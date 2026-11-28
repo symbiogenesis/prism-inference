@@ -81,38 +81,12 @@ fn load() -> Result<SwiftSession> {
 }
 
 fn frame(input: &mut impl BufRead, bytes: &mut Vec<u8>) -> Result<bool> {
-    bytes.clear();
-    loop {
-        let available = match input.fill_buf() {
-            Ok(available) => available,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err.into()),
-        };
-        if available.is_empty() {
-            return if bytes.is_empty() {
-                Ok(false)
-            } else {
-                Err(bad())
-            };
-        }
-        let count = available
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(available.len(), |n| n + 1);
-        if bytes
-            .len()
-            .checked_add(count)
-            .is_none_or(|n| n > MAX_FRAME_BYTES)
-        {
-            return Err(bad());
-        }
-        bytes.try_reserve(count)?;
-        bytes.extend_from_slice(&available[..count]);
-        input.consume(count);
-        if bytes.last() == Some(&b'\n') {
-            return Ok(true);
-        }
-    }
+    bonsai_prism_runtime::token_worker::read_bounded_jsonl_frame(
+        input,
+        bytes,
+        MAX_FRAME_BYTES,
+        "invalid Swift worker frame",
+    )
 }
 
 fn write_readiness(session: &SwiftSession, output: &mut impl Write) -> Result<()> {

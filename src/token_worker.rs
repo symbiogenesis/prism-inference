@@ -24,7 +24,8 @@
 //! flushed, allowing clients to wait for readiness before sending any request.
 
 use std::borrow::Cow;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
+use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 
@@ -256,6 +257,152 @@ fn read_frame(input: &mut impl BufRead, frame: &mut Vec<u8>, limit: usize) -> Re
     }
 }
 
+/// Reads one LF-terminated JSONL frame up to `max_frame_bytes` (including LF), retrying `EINTR`.
+///
+/// Returns `Ok(false)` on clean EOF before any bytes arrive and `Ok(true)` when a full `\n`-ended
+/// frame is buffered into `bytes`. Rejects truncated trailing bytes at EOF or frames exceeding
+/// `max_frame_bytes` with `err_msg`.
+///
+/// # Errors
+/// Propagates non-interrupt reader I/O errors, allocation failures, oversized frames, and
+/// unterminated trailing input.
+pub fn read_bounded_jsonl_frame(
+    input: &mut impl BufRead,
+    bytes: &mut Vec<u8>,
+    max_frame_bytes: usize,
+    err_msg: &str,
+) -> Result<bool> {
+    bytes.clear();
+    loop {
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(false)
+            } else {
+                Err(invalid(err_msg))
+            };
+        }
+        let count = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(available.len(), |n| n + 1);
+        if bytes
+            .len()
+            .checked_add(count)
+            .is_none_or(|n| n > max_frame_bytes)
+        {
+            return Err(invalid(err_msg));
+        }
+        bytes.try_reserve(count)?;
+        bytes.extend_from_slice(&available[..count]);
+        input.consume(count);
+        if bytes.last() == Some(&b'\n') {
+            return Ok(true);
+        }
+    }
+}
+
+/// Channel-backed [`Read`] adapter whose reader thread retries `EINTR` without dropping chunks.
+pub struct ChannelReader {
+    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    offset: usize,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChannelReader {
+    fn pump_reader<R: Read>(mut reader: R, tx: &mpsc::SyncSender<io::Result<Vec<u8>>>) {
+        let mut buf = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if tx.send(Ok(buf[..read].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Spawns a background reader thread pumping [`io::stdin`] into a bounded sync channel.
+    ///
+    /// # Errors
+    /// Returns any thread-spawning I/O error from [`std::thread::Builder::spawn`].
+    pub fn spawn_stdin() -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
+        let handle = std::thread::Builder::new()
+            .name("token-stdin".to_owned())
+            .spawn(move || {
+                Self::pump_reader(io::stdin().lock(), &tx);
+            })?;
+        Ok(Self {
+            rx,
+            current: Vec::new(),
+            offset: 0,
+            handle: Some(handle),
+        })
+    }
+
+    /// Spawns a named background thread pumping `reader` while retrying `ErrorKind::Interrupted`.
+    ///
+    /// # Errors
+    /// Returns any thread-spawning I/O error from [`std::thread::Builder::spawn`].
+    pub fn spawn_from_reader<R: Read + Send + 'static>(reader: R) -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
+        let handle = std::thread::Builder::new()
+            .name("worker-channel-reader".to_owned())
+            .spawn(move || {
+                Self::pump_reader(reader, &tx);
+            })?;
+        Ok(Self {
+            rx,
+            current: Vec::new(),
+            offset: 0,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        while self.offset >= self.current.len() {
+            let Ok(chunk) = self.rx.recv() else {
+                return Ok(0);
+            };
+            self.current = chunk?;
+            self.offset = 0;
+        }
+        let available = &self.current[self.offset..];
+        let count = available.len().min(out.len());
+        out[..count].copy_from_slice(&available[..count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+impl Drop for ChannelReader {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && handle.is_finished()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn write_invalid_request(output: &mut impl Write) -> Result<()> {
     write_record(
         output,
@@ -353,6 +500,112 @@ mod tests {
                 _ => return Err(invalid("expected a text request")),
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn read_bounded_jsonl_frame_retries_eintr_and_rejects_oversized_or_unterminated() -> Result<()>
+    {
+        struct SplitEintrBuf<'a> {
+            chunks: &'a [&'a [u8]],
+            idx: usize,
+            calls: usize,
+        }
+        impl Read for SplitEintrBuf<'_> {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl BufRead for SplitEintrBuf<'_> {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                self.calls += 1;
+                if self.calls % 2 == 1 {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"));
+                }
+                Ok(self.chunks.get(self.idx).copied().unwrap_or(&[]))
+            }
+            fn consume(&mut self, amt: usize) {
+                if amt > 0 {
+                    self.idx += 1;
+                }
+            }
+        }
+
+        let mut frame = Vec::new();
+        let mut r = SplitEintrBuf {
+            chunks: &[b"{\"op\":", b"\"reset\"}\n"],
+            idx: 0,
+            calls: 0,
+        };
+        assert!(super::read_bounded_jsonl_frame(
+            &mut r, &mut frame, 64, "bad"
+        )?);
+        assert_eq!(frame, b"{\"op\":\"reset\"}\n");
+        assert!(!super::read_bounded_jsonl_frame(
+            &mut r, &mut frame, 64, "bad"
+        )?);
+
+        let mut partial = SplitEintrBuf {
+            chunks: &[b"unterminated"],
+            idx: 0,
+            calls: 0,
+        };
+        assert!(super::read_bounded_jsonl_frame(&mut partial, &mut frame, 64, "bad").is_err());
+
+        let mut oversize = SplitEintrBuf {
+            chunks: &[b"{\"op\":\"too_long\"}\n"],
+            idx: 0,
+            calls: 0,
+        };
+        assert!(super::read_bounded_jsonl_frame(&mut oversize, &mut frame, 8, "bad").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn channel_reader_retries_eintr_preserves_chunks_and_propagates_errors() -> io::Result<()> {
+        struct EintrSteps(Vec<io::Result<Vec<u8>>>, usize);
+        impl Read for EintrSteps {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.1 >= self.0.len() {
+                    return Ok(0);
+                }
+                let item = std::mem::replace(&mut self.0[self.1], Ok(Vec::new()));
+                self.1 += 1;
+                match item {
+                    Ok(bytes) => {
+                        let n = bytes.len().min(out.len());
+                        out[..n].copy_from_slice(&bytes[..n]);
+                        Ok(n)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+
+        let mut cr = super::ChannelReader::spawn_from_reader(EintrSteps(
+            vec![
+                Err(io::Error::new(io::ErrorKind::Interrupted, "e1")),
+                Ok(b"hello ".to_vec()),
+                Err(io::Error::new(io::ErrorKind::Interrupted, "e2")),
+                Ok(b"world\n".to_vec()),
+            ],
+            0,
+        ))?;
+        assert_eq!(cr.read(&mut [])?, 0);
+        let mut out = Vec::new();
+        cr.read_to_end(&mut out)?;
+        assert_eq!(out, b"hello world\n");
+
+        let mut failing = super::ChannelReader::spawn_from_reader(EintrSteps(
+            vec![
+                Err(io::Error::new(io::ErrorKind::Interrupted, "e3")),
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe")),
+            ],
+            0,
+        ))?;
+        let mut sink = [0_u8; 8];
+        let err = failing.read(&mut sink);
+        assert!(matches!(err, Err(e) if e.kind() == io::ErrorKind::BrokenPipe));
         Ok(())
     }
 }

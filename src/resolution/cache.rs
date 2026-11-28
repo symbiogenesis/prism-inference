@@ -784,4 +784,39 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    #[test]
+    fn temp_guard_naming_and_finalize_enforce_cache_boundary() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-cache-fin-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let ext_guard = TempFileGuard::for_target(&dir.join("weights.gguf"));
+        assert!(ext_guard.path().to_string_lossy().contains("gguf.tmp-"));
+        let raw_guard = TempFileGuard::for_target(&dir.join("weights"));
+        assert!(raw_guard.path().to_string_lossy().contains(".tmp-"));
+
+        fs::create_dir_all(&dir)?;
+        let keep_path = ext_guard.path().to_path_buf();
+        let mut disarmed = ext_guard;
+        fs::write(&keep_path, b"kept")?;
+        disarmed.disarm();
+        drop(disarmed);
+        assert!(keep_path.exists());
+
+        let resolver = Resolver::new(dir.join("store"), "http://127.0.0.1/".into())?;
+        assert_eq!(resolver.finalize(&File::default(), true, "")?, "");
+
+        let escaped = File {
+            path: "outside.gguf".into(),
+            local_path: dir.join("outside.gguf"),
+            final_path: dir.join("store").join("snapshots").join("outside.gguf"),
+            ..File::default()
+        };
+        assert!(resolver.finalize(&escaped, true, "").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

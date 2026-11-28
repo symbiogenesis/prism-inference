@@ -886,4 +886,17 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn inflate_zlib_rejects_short_overflow_and_corrupt_streams() -> Result<()> {
+        assert!(inflate_zlib(&[0x78, 0x9c, 0, 0, 0], 1).is_err());
+        assert!(inflate_zlib(&[0x78, 0x9c, 0, 0, 0, 0], usize::MAX).is_err());
+        let valid = stored_zlib(&[0, 1, 2, 3])?;
+        // Truncated before end of trailer
+        assert!(inflate_zlib(&valid[..valid.len() - 1], 4).is_err());
+        // Mismatched expected output length
+        assert!(inflate_zlib(&valid, 5).is_err());
+        assert_eq!(inflate_zlib(&valid, 4)?, vec![0, 1, 2, 3]);
+        Ok(())
+    }
 }

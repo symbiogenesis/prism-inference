@@ -2201,10 +2201,7 @@ impl SwiftSession {
                 Ok((completion, None))
             }
         })();
-        if outcome.is_err() {
-            self.sampler = saved_sampler;
-        }
-        outcome
+        restore_on_error(&mut self.sampler, saved_sampler, outcome)
     }
 
     fn complete_observed_rich(
@@ -2612,6 +2609,13 @@ fn charge_output(total: &mut usize, bytes: usize) -> Result<()> {
         .filter(|&n| n <= MAX_OUTPUT_BYTES)
         .ok_or_else(|| invalid("Swift output exceeds bounded byte allowance"))?;
     Ok(())
+}
+
+fn restore_on_error<S, T>(slot: &mut S, saved: S, outcome: Result<T>) -> Result<T> {
+    if outcome.is_err() {
+        *slot = saved;
+    }
+    outcome
 }
 
 fn check_request(cancellation: &Cancellation, deadline: Option<Instant>) -> Result<()> {
@@ -3527,6 +3531,46 @@ mod tests {
             )?;
             assert_eq!(nariq, (pq2 - pq2_fixed) + nariq_fixed);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sampler_rollback_charge_output_and_check_request_boundaries() -> Result<()> {
+        let mut val = 10_u32;
+        assert!(
+            super::restore_on_error(&mut val, 10, Err::<(), _>(crate::invalid("boom"))).is_err()
+        );
+        val = 99;
+        assert!(
+            super::restore_on_error(&mut val, 10, Err::<(), _>(crate::invalid("boom"))).is_err()
+        );
+        assert_eq!(val, 10);
+        val = 42;
+        super::restore_on_error(&mut val, 10, Ok(()))?;
+        assert_eq!(val, 42);
+
+        let mut total = super::MAX_OUTPUT_BYTES;
+        super::charge_output(&mut total, 0)?;
+        assert!(super::charge_output(&mut total, 1).is_err());
+        let mut fresh = 0_usize;
+        super::charge_output(&mut fresh, super::MAX_OUTPUT_BYTES)?;
+        assert_eq!(fresh, super::MAX_OUTPUT_BYTES);
+
+        let cancel = super::Cancellation::default();
+        super::check_request(
+            &cancel,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        )?;
+        let past = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1));
+        let Err(expired) = super::check_request(&cancel, past) else {
+            return Err(crate::invalid("expired deadline must fail"));
+        };
+        assert!(expired.to_string().contains("expired"));
+        cancel.cancel();
+        let Err(cancelled) = super::check_request(&cancel, None) else {
+            return Err(crate::invalid("cancelled request must fail"));
+        };
+        assert!(cancelled.to_string().contains("cancelled"));
         Ok(())
     }
 }

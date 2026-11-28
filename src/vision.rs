@@ -3448,4 +3448,16 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn head_sqrt_and_rgb_digest_enforce_dimension_bounds() -> Result<()> {
+        assert!(head_sqrt(0).is_err());
+        assert_eq!(head_sqrt(64)?, 8.0_f32);
+        let rgb = [10_u8, 20, 30, 40, 50, 60];
+        let a = sha256_rgb_image(&rgb, 2, 1)?;
+        let b = sha256_rgb_image(&rgb, 1, 2)?;
+        assert_ne!(a, b);
+        assert_ne!(a, sha256_bytes(&rgb)?);
+        Ok(())
+    }
 }

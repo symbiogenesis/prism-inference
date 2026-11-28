@@ -1729,4 +1729,65 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn upstream_sampling_guards_nan_typical_passthrough_and_dry_breaker() -> Result<()> {
+        let top_p = State::new(Config::TopP {
+            probability: 0.9,
+            min_keep: 1,
+        })?;
+        let mut dist = State::new(Config::Distribution(11))?;
+        let mut inf_pos = Candidates::new(
+            vec![
+                Candidate {
+                    id: 0,
+                    logit: f32::INFINITY,
+                    probability: 0.0,
+                },
+                Candidate {
+                    id: 1,
+                    logit: f32::INFINITY,
+                    probability: 0.0,
+                },
+            ],
+            -1,
+            false,
+        )?;
+        inf_pos.sort();
+        let mut weights = [0.0_f32; 2];
+        dist.apply_sorted_top_p_distribution(&top_p, &mut inf_pos, &mut weights)?;
+        assert!(
+            inf_pos
+                .data()
+                .iter()
+                .all(|e| e.probability.is_finite() && (e.probability - 0.5).abs() < 1e-6)
+        );
+
+        let mut single = Candidates::new(
+            vec![Candidate {
+                id: 7,
+                logit: 1.5,
+                probability: 0.25,
+            }],
+            -1,
+            false,
+        )?;
+        typical(&mut single, 1.0, 1);
+        assert_eq!(single.size, 1);
+        assert_eq!(single.data()[0].id, 7);
+
+        let mut history = VecDeque::new();
+        history.push_back(10_i32);
+        let mut penalties = Vec::new();
+        // history.len() == allowed (1): collect produces no penalties; with breaker matches skipped.
+        collect_dry_penalties_from_history(&history, 2.0, 1.5, 1, &[], &mut penalties);
+        assert_eq!(penalties, []);
+
+        for tok in [11_i32, 10, 11] {
+            history.push_back(tok);
+        }
+        collect_dry_penalties_from_history(&history, 2.0, 1.5, 1, &[vec![10]], &mut penalties);
+        assert_eq!(penalties, []);
+        Ok(())
+    }
 }

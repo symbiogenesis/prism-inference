@@ -349,4 +349,35 @@ mod tests {
         assert_eq!(done.state(), State::Done);
         Ok(())
     }
+
+    #[test]
+    fn utf8_is_complete_and_reasoning_budget_bounds_and_forcing_sequence() -> Result<()> {
+        assert!(utf8_is_complete(b""));
+        assert!(utf8_is_complete("hello 😀".as_bytes()));
+        assert!(!utf8_is_complete(&[0xc3]));
+        assert!(!utf8_is_complete(&[0xe2, 0x82]));
+        assert!(!utf8_is_complete(&[0xf0, 0x9f, 0x98]));
+        assert!(!utf8_is_complete(&[0x80, 0x80, 0x80, 0x80]));
+
+        let mut rb =
+            ReasoningBudget::new(vec![vec![10]], vec![vec![20]], vec![30, 20], 1, State::Done)?;
+        assert_eq!(rb.forced_token(), None);
+        rb.accept(10);
+        assert_eq!(rb.state(), State::Counting);
+        // One counted content token exhausts budget=1 and transitions to Forcing at idx 0 -> 30.
+        rb.accept(5);
+        assert_eq!(rb.state(), State::Forcing);
+        assert_eq!(rb.forced_token(), Some(30));
+
+        // Length mismatch between tokens and logits rejected by apply().
+        let mut wrong_logits = [1.0_f32; 2];
+        assert!(rb.apply(&[10, 30, 20], &mut wrong_logits).is_err());
+
+        rb.accept(30);
+        assert_eq!(rb.forced_token(), Some(20));
+        rb.accept(20);
+        assert_eq!(rb.state(), State::Done);
+        assert_eq!(rb.forced_token(), None);
+        Ok(())
+    }
 }
